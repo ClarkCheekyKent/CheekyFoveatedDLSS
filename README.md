@@ -88,6 +88,11 @@ These games have been tested; other DLSS titles may also work. Support depends o
 - Assetto Corsa Competizione
 - Hogwarts Legacy with [UEVR](https://uevr.io/) (And also flat)
 
+### Eye Tracking
+Unfortunately I only own a Quest 3 so I cant develop that and its only Fixed to center. But that is definetely the next step. If someone wants to buy me one I can try to add it :).
+
+I open sourced it, so hopefully someone either adds that in or takes the idea further.
+
 ## Support
 
 If this add-on is useful to you and you would like to buy me a coffee, you can [support me on Ko-fi](https://ko-fi.com/cheekykent).
