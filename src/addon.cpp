@@ -857,6 +857,49 @@ void draw_sr_controls(Settings& settings, bool& changed) {
 }
 
 void draw_nr_controls(Settings& settings, bool& changed) {
+    struct GeometryDrafts {
+        bool initialized{};
+        bool editing_width{};
+        bool editing_height{};
+        bool editing_working_scale{};
+        float width{};
+        float height{};
+        float working_scale{};
+    };
+    static GeometryDrafts drafts;
+    if (!drafts.initialized) {
+        drafts.width = settings.nr_width;
+        drafts.height = settings.nr_height;
+        drafts.working_scale = settings.nr_working_scale;
+        drafts.initialized = true;
+    }
+    const auto deferred_slider = [&changed](
+        const char* const label,
+        float& committed,
+        float& draft,
+        bool& editing,
+        const float minimum,
+        const float maximum,
+        const char* const format
+    ) {
+        if (!editing) draft = committed;
+        if (ImGui::SliderFloat(
+                label,
+                &draft,
+                minimum,
+                maximum,
+                format,
+                ImGuiSliderFlags_AlwaysClamp
+            )) {
+            editing = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            committed = draft;
+            editing = false;
+            changed = true;
+        }
+    };
+
     changed |= ImGui::Checkbox("Foveated DLSS-NR", &settings.nr_foveated);
     if (settings.nr_foveated) {
         changed |= ImGui::Checkbox(
@@ -868,13 +911,23 @@ void draw_nr_controls(Settings& settings, bool& changed) {
                 "Width, height, offsets, roundness, and transition follow DLSS-SR."
             );
         } else {
-            changed |= ImGui::SliderFloat(
-                "NR fovea width", &settings.nr_width,
-                0.20F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+            deferred_slider(
+                "NR fovea width",
+                settings.nr_width,
+                drafts.width,
+                drafts.editing_width,
+                0.20F,
+                1.0F,
+                "%.2f"
             );
-            changed |= ImGui::SliderFloat(
-                "NR fovea height", &settings.nr_height,
-                0.20F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+            deferred_slider(
+                "NR fovea height",
+                settings.nr_height,
+                drafts.height,
+                drafts.editing_height,
+                0.20F,
+                1.0F,
+                "%.2f"
             );
             if (has_multiple_stereo_views()) {
                 ImGui::TextDisabled(
@@ -909,9 +962,14 @@ void draw_nr_controls(Settings& settings, bool& changed) {
     );
 
     ImGui::SeparatorText("Neural rendering");
-    changed |= ImGui::SliderFloat(
-        "Working scale", &settings.nr_working_scale,
-        0.10F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+    deferred_slider(
+        "Working scale",
+        settings.nr_working_scale,
+        drafts.working_scale,
+        drafts.editing_working_scale,
+        0.10F,
+        1.0F,
+        "%.2f"
     );
     int preset = static_cast<int>(settings.nr_preset);
     if (ImGui::Combo(
@@ -1009,6 +1067,12 @@ void draw_nr_controls(Settings& settings, bool& changed) {
             defaults.nr_motion_scale_x_multiplier;
         settings.nr_motion_scale_y_multiplier =
             defaults.nr_motion_scale_y_multiplier;
+        drafts.width = defaults.nr_width;
+        drafts.height = defaults.nr_height;
+        drafts.working_scale = defaults.nr_working_scale;
+        drafts.editing_width = false;
+        drafts.editing_height = false;
+        drafts.editing_working_scale = false;
         reset_dlss_nr();
         changed = true;
     }

@@ -105,8 +105,6 @@ struct GpuResources {
     std::uint32_t height{};
     std::uint32_t working_width{};
     std::uint32_t working_height{};
-    std::uint32_t source_base_x{};
-    std::uint32_t source_base_y{};
     std::uint32_t descriptor_size{};
 };
 
@@ -627,8 +625,6 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     gpu.height = region.height;
     gpu.working_width = working_width;
     gpu.working_height = working_height;
-    gpu.source_base_x = region.base_x;
-    gpu.source_base_y = region.base_y;
     if (region.base_x + region.width > game_desc.Width ||
         region.base_y + region.height > game_desc.Height) {
         return fail("output region out of bounds", E_INVALIDARG);
@@ -1021,8 +1017,8 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         gpu.height,
         gpu.working_width,
         gpu.working_height,
-        gpu.source_base_x,
-        gpu.source_base_y
+        region.base_x,
+        region.base_y
     );
     return true;
 }
@@ -1037,9 +1033,7 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     for (auto& gpu : view.gpu_resources) {
         if (gpu.game_output == frame.color && gpu.width == region.width &&
             gpu.height == region.height && gpu.working_width == working_width &&
-            gpu.working_height == working_height &&
-            gpu.source_base_x == region.base_x &&
-            gpu.source_base_y == region.base_y) return &gpu;
+            gpu.working_height == working_height) return &gpu;
     }
     view.gpu_resources.push_back(GpuResources{});
     auto& gpu = view.gpu_resources.back();
@@ -1269,7 +1263,7 @@ void dispatch_codec(
     const CodecConstants constants{
         {gpu.width, gpu.height},
         {gpu.width, gpu.height},
-        {gpu.source_base_x, gpu.source_base_y},
+        {region.base_x, region.base_y},
         {gpu.working_width, gpu.working_height},
         settings.nr_paper_white_scale,
         settings.nr_hdr_transfer_strength,
