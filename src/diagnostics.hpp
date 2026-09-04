@@ -1,5 +1,6 @@
 #pragma once
 
+#include "d3d12_ngx_dispatch.hpp"
 #include "settings.hpp"
 
 #include <cstdint>
@@ -104,12 +105,14 @@ struct DiagnosticSnapshot {
     D3D11TransportStatus d3d11_transport_status{
         D3D11TransportStatus::not_attempted
     };
+    D3D12NgxRoute d3d12_ngx_route{D3D12NgxRoute::unknown};
 };
 
 void diagnostic_note_hook(DiagnosticApi api) noexcept;
 void diagnostic_note_runtime_loaded(DiagnosticApi api) noexcept;
 void diagnostic_note_streamline_detected() noexcept;
 void diagnostic_note_direct_detour(DiagnosticApi api) noexcept;
+void diagnostic_note_d3d12_ngx_route(D3D12NgxRoute route) noexcept;
 void diagnostic_note_create(DiagnosticApi api) noexcept;
 void diagnostic_note_evaluate(
     DiagnosticApi api,

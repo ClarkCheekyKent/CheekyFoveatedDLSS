@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
@@ -45,6 +46,41 @@ std::deque<CanonicalViewState> canonical_views;
 std::atomic<std::uint64_t> direct_preparation_sequence{};
 std::atomic<std::uint64_t> canonical_rejection_sequence{};
 std::atomic<std::uint64_t> canonical_failure_sequence{};
+
+enum class D3D12PrepareProbe : std::size_t {
+    disabled,
+    invalid_arguments,
+    missing_resources,
+    invalid_dimensions,
+    coordinated_crop,
+    get_device,
+    resource_arguments,
+    output_contract,
+    resource_allocation,
+    private_output,
+    descriptor_heap,
+    serialize_root_signature,
+    create_root_signature,
+    compile_shader,
+    create_pipeline,
+    resources_unavailable,
+    evaluation_allocation,
+    count,
+};
+
+std::array<
+    std::atomic<std::uint32_t>,
+    static_cast<std::size_t>(D3D12PrepareProbe::count)
+> d3d12_prepare_probe_counts{};
+
+[[nodiscard]] bool should_trace_prepare_rejection(
+    const D3D12PrepareProbe probe
+) noexcept {
+    const auto index = static_cast<std::size_t>(probe);
+    return d3d12_prepare_probe_counts[index].fetch_add(
+        1U, std::memory_order_relaxed
+    ) < 2U;
+}
 
 constexpr std::uint32_t dlss_feature_flag_mv_low_res = 1U << 1U;
 
@@ -377,22 +413,59 @@ void release_resources(D3D12Resources* const resources) noexcept {
 ) noexcept {
     if (device == nullptr || game_output == nullptr || output_width == 0U ||
         output_height == 0U) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::resource_arguments)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=resource_arguments "
+                "device=%p output=%p requested=%ux%u",
+                device, game_output, output_width, output_height
+            );
+        }
         return nullptr;
     }
 
     const auto output_description = game_output->GetDesc();
-    if (output_description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        output_description.MipLevels != 1U ||
-        output_description.DepthOrArraySize != 1U ||
-        output_description.SampleDesc.Count != 1U ||
-        output_description.Format == DXGI_FORMAT_UNKNOWN ||
-        (output_description.Flags &
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0U) {
+    const auto output_plan = plan_d3d12_output(
+        output_description, output_width, output_height
+    );
+    if (!output_plan.compatible) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::output_contract)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=output_contract output=%p "
+                "requested=%ux%u resource=%llux%u dimension=%u mips=%u "
+                "array=%u samples=%u format=%u flags=0x%08X uav=%s",
+                game_output,
+                output_width,
+                output_height,
+                static_cast<unsigned long long>(output_description.Width),
+                output_description.Height,
+                static_cast<unsigned>(output_description.Dimension),
+                output_description.MipLevels,
+                output_description.DepthOrArraySize,
+                output_description.SampleDesc.Count,
+                static_cast<unsigned>(output_description.Format),
+                static_cast<unsigned>(output_description.Flags),
+                (output_description.Flags &
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0U
+                    ? "yes" : "no"
+            );
+        }
         return nullptr;
     }
 
     auto* const resources = new (std::nothrow) D3D12Resources{};
     if (resources == nullptr) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::resource_allocation)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=resource_allocation "
+                "requested=%ux%u format=%u",
+                output_width,
+                output_height,
+                static_cast<unsigned>(output_description.Format)
+            );
+        }
         return nullptr;
     }
     resources->device = device;
@@ -405,9 +478,7 @@ void release_resources(D3D12Resources* const resources) noexcept {
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     heap.CreationNodeMask = 1U;
     heap.VisibleNodeMask = 1U;
-    auto private_description = output_description;
-    private_description.Width = output_width;
-    private_description.Height = output_height;
+    auto private_description = output_plan.private_description;
     private_description.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     auto result = device->CreateCommittedResource(
         &heap,
@@ -418,6 +489,18 @@ void release_resources(D3D12Resources* const resources) noexcept {
         IID_PPV_ARGS(&resources->dlss_output)
     );
     if (FAILED(result)) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::private_output)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=private_output "
+                "hr=0x%08X requested=%ux%u format=%u flags=0x%08X",
+                static_cast<unsigned>(result),
+                output_width,
+                output_height,
+                static_cast<unsigned>(private_description.Format),
+                static_cast<unsigned>(private_description.Flags)
+            );
+        }
         release_resources(resources);
         return nullptr;
     }
@@ -433,6 +516,15 @@ void release_resources(D3D12Resources* const resources) noexcept {
         IID_PPV_ARGS(&resources->descriptors)
     );
     if (FAILED(result)) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::descriptor_heap)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=descriptor_heap "
+                "hr=0x%08X descriptors=%u",
+                static_cast<unsigned>(result),
+                descriptor_description.NumDescriptors
+            );
+        }
         release_resources(resources);
         return nullptr;
     }
@@ -477,6 +569,14 @@ void release_resources(D3D12Resources* const resources) noexcept {
         signature_errors->Release();
     }
     if (FAILED(result) || serialized_signature == nullptr) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::serialize_root_signature)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=serialize_root_signature "
+                "hr=0x%08X blob=%p",
+                static_cast<unsigned>(result), serialized_signature
+            );
+        }
         if (serialized_signature != nullptr) {
             serialized_signature->Release();
         }
@@ -491,6 +591,14 @@ void release_resources(D3D12Resources* const resources) noexcept {
     );
     serialized_signature->Release();
     if (FAILED(result)) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::create_root_signature)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=create_root_signature "
+                "hr=0x%08X",
+                static_cast<unsigned>(result)
+            );
+        }
         release_resources(resources);
         return nullptr;
     }
@@ -514,6 +622,14 @@ void release_resources(D3D12Resources* const resources) noexcept {
         shader_errors->Release();
     }
     if (FAILED(result) || shader == nullptr) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::compile_shader)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=compile_shader "
+                "hr=0x%08X shader=%p",
+                static_cast<unsigned>(result), shader
+            );
+        }
         if (shader != nullptr) {
             shader->Release();
         }
@@ -531,6 +647,13 @@ void release_resources(D3D12Resources* const resources) noexcept {
     );
     shader->Release();
     if (FAILED(result)) {
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::create_pipeline)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=create_pipeline hr=0x%08X",
+                static_cast<unsigned>(result)
+            );
+        }
         release_resources(resources);
         return nullptr;
     }
@@ -895,6 +1018,8 @@ D3D12Evaluation* prepare_d3d12(
     D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav{};
     output_uav.Format = resources->output_format;
     output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    output_uav.Texture2D.MipSlice = 0U;
+    output_uav.Texture2D.PlaneSlice = 0U;
     device->CreateUnorderedAccessView(output, nullptr, &output_uav, cpu);
     device->Release();
 

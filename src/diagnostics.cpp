@@ -51,6 +51,7 @@ struct RuntimeDiagnostics {
     std::atomic<D3D11TransportStatus> d3d11_transport_status{
         D3D11TransportStatus::not_attempted
     };
+    std::atomic<D3D12NgxRoute> d3d12_ngx_route{D3D12NgxRoute::unknown};
 };
 
 std::array<RuntimeDiagnostics, 2U> diagnostics{};
@@ -158,6 +159,12 @@ void diagnostic_note_direct_detour(const DiagnosticApi api) noexcept {
     auto& data = for_api(api);
     data.hook_discovered.store(true, std::memory_order_release);
     data.direct_detour_installed.store(true, std::memory_order_release);
+}
+
+void diagnostic_note_d3d12_ngx_route(const D3D12NgxRoute route) noexcept {
+    for_api(DiagnosticApi::d3d12).d3d12_ngx_route.store(
+        route, std::memory_order_release
+    );
 }
 
 void diagnostic_note_create(const DiagnosticApi api) noexcept {
@@ -448,6 +455,7 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         data.state.load(std::memory_order_acquire),
         data.d3d11_execution_path.load(std::memory_order_acquire),
         data.d3d11_transport_status.load(std::memory_order_acquire),
+        data.d3d12_ngx_route.load(std::memory_order_acquire),
     };
 }
 
