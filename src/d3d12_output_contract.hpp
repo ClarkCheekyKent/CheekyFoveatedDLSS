@@ -11,6 +11,10 @@ struct D3D12OutputPlan {
     D3D12_RESOURCE_DESC private_description{};
 };
 
+[[nodiscard]] bool is_dlss_nr_output_compatible(
+    const D3D12_RESOURCE_DESC& game_output
+) noexcept;
+
 [[nodiscard]] D3D12OutputPlan plan_d3d12_output(
     const D3D12_RESOURCE_DESC& game_output,
     std::uint32_t private_width,

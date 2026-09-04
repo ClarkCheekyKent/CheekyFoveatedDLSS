@@ -1,5 +1,7 @@
 #include "dlss_nr.hpp"
 
+#include "d3d12_output_contract.hpp"
+#include "dlss_nr_contract.hpp"
 #include "runtime.hpp"
 
 #include <Windows.h>
@@ -612,10 +614,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     auto result = command_list->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(result) || device == nullptr) return fail("GetDevice", result);
     const auto game_desc = game_output->GetDesc();
-    if (game_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        game_desc.MipLevels != 1U || game_desc.DepthOrArraySize != 1U ||
-        game_desc.SampleDesc.Count != 1U ||
-        (game_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0U) {
+    if (!is_dlss_nr_output_compatible(game_desc)) {
         return fail("unsupported output", E_INVALIDARG);
     }
 
@@ -1058,24 +1057,17 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
 [[nodiscard]] NrRegion calculate_region(
     const Settings& settings,
     const std::uint32_t width,
-    const std::uint32_t height
+    const std::uint32_t height,
+    const FoveationGeometry* const shared_sr_crop,
+    const std::uint32_t render_width,
+    const std::uint32_t render_height
 ) noexcept {
     if (!settings.nr_foveated) {
         return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
     }
-    FoveationParameters parameters{};
-    if (settings.nr_use_sr_foveation) {
-        parameters = foveation_parameters(settings);
-    } else {
-        parameters = {
-            settings.nr_width,
-            settings.nr_height,
-            settings.nr_x_offset,
-            settings.nr_height_offset,
-            settings.nr_roundness,
-            settings.nr_transition_width,
-        };
-    }
+    const auto parameters = dlss_nr_foveation_parameters(
+        settings, shared_sr_crop, render_width, render_height
+    );
     FoveationGeometry geometry{};
     if (!calculate_foveation_geometry(
             parameters,
@@ -1296,7 +1288,9 @@ bool calculate_dlss_nr_geometry(
     DlssNrGeometry& geometry
 ) noexcept {
     if (output_width == 0U || output_height == 0U) return false;
-    const auto region = calculate_region(settings, output_width, output_height);
+    const auto region = calculate_region(
+        settings, output_width, output_height, nullptr, 0U, 0U
+    );
     if (region.width == 0U || region.height == 0U) return false;
     geometry = {
         region.base_x,
@@ -1344,17 +1338,26 @@ bool evaluate_dlss_nr(
     device->Release();
     if (!runtime_ready) return false;
 
-    const auto region = calculate_region(settings, frame.output_width, frame.output_height);
+    const auto region = calculate_region(
+        settings,
+        frame.output_width,
+        frame.output_height,
+        frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr,
+        frame.input_width,
+        frame.input_height
+    );
     const auto working_width = scaled_extent(region.width, settings.nr_working_scale);
     const auto working_height = scaled_extent(region.height, settings.nr_working_scale);
     NrRegion codec_region = region;
-    if (frame.color_is_region) {
-        codec_region.base_x = 0U;
-        codec_region.base_y = 0U;
-    } else {
-        codec_region.base_x += frame.color_base_x;
-        codec_region.base_y += frame.color_base_y;
-    }
+    const auto resource_base = dlss_nr_resource_base(
+        region.base_x,
+        region.base_y,
+        frame.color_base_x,
+        frame.color_base_y,
+        frame.color_is_region
+    );
+    codec_region.base_x = resource_base.x;
+    codec_region.base_y = resource_base.y;
     const auto color_desc = frame.color->GetDesc();
     if (codec_region.base_x + codec_region.width > color_desc.Width ||
         codec_region.base_y + codec_region.height > color_desc.Height) {
@@ -1437,7 +1440,7 @@ bool evaluate_dlss_nr(
         0U,
         4U,
         settings,
-        region
+        codec_region
     );
     uav_barrier(frame.command_list, gpu->original_output);
     uav_barrier(frame.command_list, gpu->color_proxy);
@@ -1573,7 +1576,7 @@ bool evaluate_dlss_nr(
         1U,
         6U,
         settings,
-        region
+        codec_region
     );
     uav_barrier(frame.command_list, frame.color);
     transition(

@@ -2,6 +2,16 @@
 
 namespace cheeky::foveated_dlss {
 
+bool is_dlss_nr_output_compatible(
+    const D3D12_RESOURCE_DESC& game_output
+) noexcept {
+    return game_output.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        game_output.MipLevels != 0U &&
+        game_output.DepthOrArraySize == 1U &&
+        game_output.SampleDesc.Count == 1U &&
+        (game_output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0U;
+}
+
 D3D12OutputPlan plan_d3d12_output(
     const D3D12_RESOURCE_DESC& game_output,
     const std::uint32_t private_width,
