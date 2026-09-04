@@ -1504,6 +1504,7 @@ void note_d3d12_command_list_submission_impl(
     note_peripheral_dlaa_submission(queue, command_list);
     ID3D12CommandList* motion_lists[]{command_list};
     crop_motion12_submitted(queue, 1U, motion_lists);
+    note_peripheral_dlaa_command_list_submission(queue, command_list);
     std::uint64_t frequency{};
     if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0U) return;
     std::lock_guard lock(d3d12_nr_timing_mutex);

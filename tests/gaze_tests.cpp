@@ -6,6 +6,7 @@
 #include "foveation.hpp"
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
+#include "peripheral_dlaa_generation.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -582,6 +583,25 @@ void test_dlss_nr_reuses_live_sr_crop_center() {
         "DLSS-NR follows the live SR vertical center");
 }
 
+void test_peripheral_dlaa_generation_requires_synchronization() {
+    using namespace cheeky::foveated_dlss;
+    expect(
+        peripheral_dlaa_generation_decision(false, false) ==
+            PeripheralDlaaGenerationDecision::reject,
+        "peripheral DLAA keeps its generation when synchronization fails"
+    );
+    expect(
+        peripheral_dlaa_generation_decision(false, true) ==
+            PeripheralDlaaGenerationDecision::replace,
+        "peripheral DLAA replaces a changed generation after synchronization"
+    );
+    expect(
+        peripheral_dlaa_generation_decision(true, false) ==
+            PeripheralDlaaGenerationDecision::reuse,
+        "peripheral DLAA reuses a compatible generation without synchronization"
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -603,6 +623,7 @@ int main() {
     test_multimip_game_output_is_dlss_nr_compatible();
     test_dlss_nr_maps_right_eye_region_into_packed_output();
     test_dlss_nr_reuses_live_sr_crop_center();
+    test_peripheral_dlaa_generation_requires_synchronization();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;
