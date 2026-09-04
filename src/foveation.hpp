@@ -26,8 +26,37 @@ struct FoveationGeometry {
     std::uint32_t output_height{};
 };
 
+struct FoveationCenter {
+    float u{0.5F};
+    float v{0.5F};
+    std::uint32_t quantization_pixels{1U};
+};
+
+struct FoveationOffsets {
+    float x{};
+    float y{};
+};
+
+[[nodiscard]] FoveationOffsets foveation_offsets_from_geometry(
+    const FoveationGeometry& geometry,
+    std::uint32_t render_width,
+    std::uint32_t render_height
+) noexcept;
+
 [[nodiscard]] bool calculate_foveation_geometry(
     const FoveationParameters& parameters,
+    std::uint32_t render_width,
+    std::uint32_t render_height,
+    std::uint32_t output_width,
+    std::uint32_t output_height,
+    std::uint32_t output_origin_x,
+    std::uint32_t output_origin_y,
+    FoveationGeometry& geometry
+) noexcept;
+
+[[nodiscard]] bool calculate_foveation_geometry_at_center(
+    const FoveationParameters& parameters,
+    const FoveationCenter& center,
     std::uint32_t render_width,
     std::uint32_t render_height,
     std::uint32_t output_width,

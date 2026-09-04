@@ -3,8 +3,10 @@
 #include "d3d11_peripheral_dlaa.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr.hpp"
+#include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "cheeky_gaze_abi.h"
 
 #define ImTextureID ImU64
 #include <imgui.h>
@@ -568,8 +570,111 @@ void draw_nr_performance() {
     }
 }
 
+[[nodiscard]] const char* gaze_reset_reason_name(
+    const GazeResetReason reason
+) noexcept {
+    switch (reason) {
+    case GazeResetReason::first_valid: return "First valid gaze";
+    case GazeResetReason::reacquired: return "Gaze reacquired";
+    case GazeResetReason::remapped: return "View remapped";
+    case GazeResetReason::crop_size_changed: return "Crop size changed";
+    case GazeResetReason::large_jump: return "Large gaze jump";
+    default: return "None";
+    }
+}
+
+[[nodiscard]] const char* yes_no(const bool value) noexcept {
+    return value ? "Yes" : "No";
+}
+
+void draw_openxr_gaze_diagnostics() {
+    const auto gaze = gaze_diagnostics();
+    ImGui::TextUnformatted("OpenXR eye tracking");
+    DiagnosticTable table{"OpenXRGazeDiagnostics"};
+    if (!table) return;
+    diagnostic_row(
+        "Runtime", "%s",
+        gaze.runtime_name[0] == '\0' ? "Not reported" : gaze.runtime_name
+    );
+    diagnostic_row("Layer loaded", "%s", yes_no(gaze.layer_present));
+    diagnostic_row("Snapshot ABI", "%s", yes_no(gaze.abi_compatible));
+    diagnostic_row(
+        "Eye gaze extension", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_EXTENSION_ENABLED) != 0U
+        )
+    );
+    diagnostic_row(
+        "System support", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED) != 0U
+        )
+    );
+    diagnostic_row(
+        "Session focused", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U
+        )
+    );
+    diagnostic_row(
+        "Gaze action active", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_ACTION_ACTIVE) != 0U
+        )
+    );
+    diagnostic_row(
+        "Tracking valid", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U
+        )
+    );
+    diagnostic_row(
+        "Layer mapping ready", "%s", yes_no(
+            (gaze.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U
+        )
+    );
+    diagnostic_row(
+        "Primary stereo layout", "%s", yes_no(
+            (gaze.status_flags &
+             CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) == 0U
+        )
+    );
+    diagnostic_row(
+        "Using gaze", "%s", yes_no(gaze.using_gaze)
+    );
+    diagnostic_row("Sample age", "%.1f ms", gaze.sample_age_ms);
+    diagnostic_row(
+        "Mapping ambiguity", "%s", yes_no(gaze.mapping_ambiguous)
+    );
+    for (std::size_t index{}; index < gaze.views.size(); ++index) {
+        const auto& view = gaze.views[index];
+        char label[32]{};
+        static_cast<void>(sprintf_s(
+            label, "Eye %zu center", index
+        ));
+        diagnostic_row(label, "%.4f, %.4f", view.center_u, view.center_v);
+        static_cast<void>(sprintf_s(
+            label, "Eye %zu mapping", index
+        ));
+        if (view.resource_mapped) {
+            diagnostic_row(
+                label, "DLSS view 0x%llX (%u matches, %s)",
+                static_cast<unsigned long long>(view.dlss_view_id),
+                view.stable_matches,
+                view.packed_stereo_mapping ? "packed" : "exact"
+            );
+        } else {
+            diagnostic_row(label, "Waiting (%u matches)", view.stable_matches);
+        }
+        static_cast<void>(sprintf_s(
+            label, "Eye %zu crop delta", index
+        ));
+        diagnostic_row(label, "%d, %d px", view.crop_delta_x, view.crop_delta_y);
+    }
+    diagnostic_row(
+        "Last history reset", "%s",
+        gaze_reset_reason_name(gaze.last_reset_reason)
+    );
+}
+
 void load_settings_from_reshade() noexcept {
     auto settings = current_settings();
+    auto center_mode = static_cast<std::uint32_t>(settings.center_mode);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "Enabled", settings.enabled
     ));
@@ -621,6 +726,25 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AlignmentBorder",
         settings.alignment_border_enabled
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "CenterMode", center_mode
+    ));
+    settings.center_mode = center_mode ==
+            static_cast<std::uint32_t>(FoveationCenterMode::openxr_gaze)
+        ? FoveationCenterMode::openxr_gaze
+        : FoveationCenterMode::fixed;
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "GazeSmoothingMs",
+        settings.gaze_smoothing_ms
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "GazeQuantizationPixels",
+        settings.gaze_quantization_pixels
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "GazeJumpResetRatio",
+        settings.gaze_jump_reset_ratio
     ));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrEnabled", settings.nr_enabled
@@ -764,6 +888,22 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     reshade::set_config_value(
         nullptr, config_section, "AlignmentBorder",
         settings.alignment_border_enabled
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "CenterMode",
+        static_cast<std::uint32_t>(settings.center_mode)
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "GazeSmoothingMs",
+        settings.gaze_smoothing_ms
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "GazeQuantizationPixels",
+        settings.gaze_quantization_pixels
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "GazeJumpResetRatio",
+        settings.gaze_jump_reset_ratio
     );
     reshade::set_config_value(
         nullptr, config_section, "NrEnabled", settings.nr_enabled
@@ -926,6 +1066,22 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     ImGui::TextDisabled(
         "Downscale periphery even more from original resolution"
     );
+    int center_mode = static_cast<int>(settings.center_mode);
+    if (ImGui::Combo(
+            "Foveation center",
+            &center_mode,
+            "Fixed\0OpenXR gaze\0"
+        )) {
+        settings.center_mode = center_mode == 1
+            ? FoveationCenterMode::openxr_gaze
+            : FoveationCenterMode::fixed;
+        changed = true;
+    }
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        ImGui::TextDisabled(
+            "Uses exact OpenXR resource matches; fixed offsets are the fallback."
+        );
+    }
     if (!editing_width) width_draft = settings.width;
     if (ImGui::SliderFloat(
         "Fovea width",
@@ -1003,6 +1159,45 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         "Show 5 px red alignment border",
         &settings.alignment_border_enabled
     );
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze &&
+        ImGui::TreeNode("Advanced eye tracking")) {
+        changed |= ImGui::SliderFloat(
+            "Gaze smoothing",
+            &settings.gaze_smoothing_ms,
+            0.0F,
+            100.0F,
+            "%.0f ms",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        int quantization = static_cast<int>(
+            settings.gaze_quantization_pixels
+        );
+        if (ImGui::SliderInt(
+                "Crop origin quantization",
+                &quantization,
+                1,
+                64,
+                "%d px",
+                ImGuiSliderFlags_AlwaysClamp
+            )) {
+            settings.gaze_quantization_pixels = static_cast<std::uint32_t>(
+                quantization
+            );
+            changed = true;
+        }
+        changed |= ImGui::SliderFloat(
+            "Jump reset threshold",
+            &settings.gaze_jump_reset_ratio,
+            0.01F,
+            1.0F,
+            "%.3f crop",
+            ImGuiSliderFlags_AlwaysClamp
+        );
+        ImGui::TextDisabled(
+            "History resets above max(64 px, threshold x crop dimension)."
+        );
+        ImGui::TreePop();
+    }
     ImGui::EndDisabled();
 
     ImGui::Spacing();
@@ -1023,6 +1218,11 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         settings.roundness = defaults.roundness;
         settings.transition_width = defaults.transition_width;
         settings.alignment_border_enabled = defaults.alignment_border_enabled;
+        settings.center_mode = defaults.center_mode;
+        settings.gaze_smoothing_ms = defaults.gaze_smoothing_ms;
+        settings.gaze_quantization_pixels =
+            defaults.gaze_quantization_pixels;
+        settings.gaze_jump_reset_ratio = defaults.gaze_jump_reset_ratio;
         width_draft = defaults.width;
         height_draft = defaults.height;
         editing_width = false;
@@ -1327,6 +1527,8 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
             "Diagnostics",
             ImGuiTreeNodeFlags_DefaultOpen
     )) {
+        draw_openxr_gaze_diagnostics();
+        ImGui::Spacing();
         const auto& d3d11 = displayed_diagnostics(DiagnosticApi::d3d11);
         const auto& d3d12 = displayed_diagnostics(DiagnosticApi::d3d12);
         const bool d3d11_active = d3d11.evaluate_calls != 0U;
@@ -1562,6 +1764,7 @@ extern "C" __declspec(dllexport) void AddonUninit(
     release_d3d11_resources();
     release_d3d12_resources();
     release_dlss_nr_resources();
+    reset_gaze_foveation();
     log_info("Foveated DLSS-SR and DLSS-NR interception stopped.");
     close_trace_log();
 }

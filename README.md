@@ -11,6 +11,7 @@ DLSS 5 Neural Rendering (DLSS-NR) is also supported experimentally. See [Experim
 - A Direct3D 11 or Direct3D 12 game with DLSS Super Resolution
 - The 64-bit version of ReShade **with full add-on support**
 - `CheekyFoveatedDLSS.addon64` from this project's release package
+- For eye tracking: an OpenXR runtime exposing `XR_EXT_eye_gaze_interaction`
 
 This is intended for games where ReShade add-ons and DLL replacement are allowed. Avoid using it with competitive or anti-cheat-protected games unless the game's rules explicitly permit modding.
 
@@ -21,6 +22,36 @@ This is intended for games where ReShade add-ons and DLL replacement are allowed
 3. Start the game and enable DLSS in the game's graphics settings.
 4. Open the ReShade overlay and select **Cheeky Foveated DLSS** in the **Add-ons** tab.
 5. Enable **Foveated DLSS-SR**. Changes apply live on the next DLSS evaluation.
+
+Eye tracking is optional and remains off by default. Build the project, then
+keep `CheekyOpenXRLayer.dll` and
+`XR_APILAYER_CHEEKY_foveated_dlss.json` together in `bin\Release`. Register the
+manifest as an OpenXR implicit API layer:
+
+1. Open **Registry Editor**.
+2. For the current user, navigate to
+   `HKEY_CURRENT_USER\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit`. Create any
+   missing keys. If the active OpenXR loader requires a machine-wide layer,
+   as Assetto Corsa EVO does, use
+   `HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit` instead;
+   editing this location requires administrator privileges.
+3. Create a new **DWORD (32-bit) Value**. Use the full absolute path to
+   `XR_APILAYER_CHEEKY_foveated_dlss.json` as the value name and set its data to
+   `0` to enable the layer. For example:
+   `C:\path\to\CheekyFoveatedDLSS\bin\Release\XR_APILAYER_CHEEKY_foveated_dlss.json`.
+4. Start or restart the game and open the ReShade overlay.
+5. Open the **Add-ons** tab and select **Cheeky Foveated DLSS**.
+6. Enable **Foveated DLSS-SR**, then set **Foveation center** to **OpenXR
+   gaze**.
+7. To verify eye tracking, enable the red alignment border and open
+   **Diagnostics > OpenXR eye tracking**. The layer and gaze must report as
+   available, and both eyes must acquire stable DLSS-view mappings before the
+   border follows your gaze.
+
+To unregister the layer, delete that DWORD value from the same registry key.
+As an emergency per-launch bypass, set `CHEEKY_OPENXR_LAYER_DISABLE=1` before
+starting the game. Moving the JSON or DLL after registration requires updating
+the registry value to the JSON's new absolute path.
 
 If the game ships with an older DLSS model, use [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper) to install a newer DLSS 4.5 model. Use only the official DLSS Swapper releases, and be aware that a game update may restore its original DLL.
 
@@ -55,6 +86,10 @@ The main controls are:
 | Roundness | Blends the region shape from rectangular (`0`) to elliptical (`1`). This does not affect performance. |
 | Transition width | Feathers the edge of the region. |
 | DX11 game processing path | Uses native **DX11 Direct** by default; **DX12 Transport** enables DX12-only features for DX11 games. |
+| Foveation center | Keeps the compatible fixed placement or opts into eye-tracked OpenXR placement. |
+| Gaze smoothing | Time constant for gaze motion; the default is 20 ms. |
+| Crop origin quantization | Snaps motion to render-pixel increments; the default is 8 px. |
+| Jump reset threshold | Resets DLSS history only for sufficiently large crop motion. |
 
 Press **Alt+Shift+/** to toggle foveated DLSS-SR without opening the overlay. Settings are saved through ReShade and restored the next time the game starts.
 
@@ -88,10 +123,26 @@ These games have been tested; other DLSS titles may also work. Support depends o
 - Assetto Corsa Competizione
 - Hogwarts Legacy with [UEVR](https://uevr.io/) (And also flat)
 
-### Eye Tracking
-Unfortunately I only own a Quest 3 so I cant develop that and its only Fixed to center. But that is definetely the next step. If someone wants to buy me one I can try to add it :).
+### Eye tracking
 
-I open sourced it, so hopefully someone either adds that in or takes the idea further.
+The first eye-tracked path targets Pimax Dream Air, Pimax OpenXR, and Assetto
+Corsa EVO. It uses the standard `XR_EXT_eye_gaze_interaction` pose, projects the
+gaze independently through each asymmetric OpenXR view, and only activates after
+the add-on has matched the exact DLSS output resource and rectangle for two
+consecutive display frames.
+
+The implementation intentionally falls back to the configured fixed center if
+the layer is absent, gaze becomes stale, the ABI does not match, the game uses a
+non-stereo view configuration, or resource correlation is ambiguous. Separate
+eye textures and side-by-side subrectangles are supported. Quad views, non-zero
+texture-array slices, OpenVR-only games, and transitive intermediate-resource
+tracking are deferred.
+
+For hardware validation, disable the game's built-in eye-tracked foveation,
+enable the red alignment border, and inspect **Diagnostics > OpenXR eye
+tracking**. Both eyes must show stable and different DLSS-view mappings before
+the border follows gaze. A blink holds the last sample for 100 ms and then
+returns to the fixed center over 150 ms.
 
 ## Support
 
@@ -103,7 +154,11 @@ Cheeky Foveated DLSS is free software licensed under the [GNU General Public Lic
 
 ## Development
 
-Development requires Visual Studio 2022 with the **Desktop development with C++** workload and a Windows 10/11 SDK. Minimal pinned snapshots of the ReShade API, Dear ImGui, and MinHook are vendored under [`third_party`](third_party/README.md), so normal builds do not download dependencies.
+Development requires Visual Studio 2022 or newer with the **Desktop development
+with C++** workload and a Windows 10/11 SDK. Minimal pinned snapshots of the
+ReShade API, Dear ImGui, MinHook, and OpenXR headers are vendored under
+[`third_party`](third_party/README.md), so normal builds do not download
+dependencies.
 
 Build the x64 Release add-on from PowerShell:
 
@@ -111,4 +166,9 @@ Build the x64 Release add-on from PowerShell:
 .\scripts\build.ps1
 ```
 
-The artifact is written to `bin\Release\CheekyFoveatedDLSS.addon64`. Use `-Configuration Debug` for a debug build. You can also open `CheekyFoveatedDLSS.vcxproj` in Visual Studio, or use CMake 3.24 or newer. Core implementation lives in `src`; `src/foveation.hpp` contains the renderer-independent foveation geometry calculation.
+The script builds the ReShade add-on, `CheekyOpenXRLayer.dll`, implicit-layer
+manifest, and dependency-free tests, then runs the tests. Artifacts are written
+to `bin\Release`; use `-Configuration Debug` for a debug build. You can also open
+`CheekyFoveatedDLSS.sln` in Visual Studio or use CMake 3.24 or newer. Core
+implementation lives in `src`; `src/gaze_foveation.hpp` is the add-on-side
+OpenXR seam and `src/foveation.hpp` contains renderer-independent crop geometry.

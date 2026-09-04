@@ -2,6 +2,7 @@
 #include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
+#include "gaze_foveation.hpp"
 #include "runtime.hpp"
 
 #include <d3dcompiler.h>
@@ -837,6 +838,7 @@ struct D3D12Evaluation {
     float roundness{};
     float feather{};
     bool alignment_border{};
+    bool gaze_reset{};
     std::uint64_t descriptor_offset{};
     bool diagnostic_trace{};
     std::uint64_t diagnostic_sequence{};
@@ -845,6 +847,7 @@ struct D3D12Evaluation {
 D3D12Evaluation* prepare_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxParameters* const parameters,
+    const DlssViewId view_id,
     const Settings& settings
 ) noexcept {
     if (!settings.enabled) {
@@ -855,6 +858,12 @@ D3D12Evaluation* prepare_d3d12(
             DiagnosticApi::d3d12,
             DiagnosticState::disabled
         );
+        if (should_trace_prepare_rejection(D3D12PrepareProbe::disabled)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=disabled view=%llu",
+                static_cast<unsigned long long>(view_id)
+            );
+        }
         return nullptr;
     }
     if (command_list == nullptr || parameters == nullptr) {
@@ -862,6 +871,16 @@ D3D12Evaluation* prepare_d3d12(
             DiagnosticApi::d3d12,
             DiagnosticState::invalid_arguments
         );
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::invalid_arguments)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=invalid_arguments view=%llu "
+                "command=%p parameters=%p",
+                static_cast<unsigned long long>(view_id),
+                command_list,
+                parameters
+            );
+        }
         return nullptr;
     }
 
@@ -872,15 +891,43 @@ D3D12Evaluation* prepare_d3d12(
     const auto render_height = get_ui(parameters, "Height");
     const auto output_width = get_ui(parameters, "OutWidth");
     const auto output_height = get_ui(parameters, "OutHeight");
-    if (color == nullptr || output == nullptr || color == output ||
-        render_width == 0U || render_height == 0U || output_width == 0U ||
+    if (color == nullptr || output == nullptr || color == output) {
+        diagnostic_note_state(
+            DiagnosticApi::d3d12,
+            DiagnosticState::missing_resources
+        );
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::missing_resources)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=missing_resources view=%llu "
+                "color=%p motion=%p output=%p alias=%s",
+                static_cast<unsigned long long>(view_id),
+                color,
+                motion_vectors,
+                output,
+                color != nullptr && color == output ? "yes" : "no"
+            );
+        }
+        return nullptr;
+    }
+    if (render_width == 0U || render_height == 0U || output_width == 0U ||
         output_height == 0U) {
         diagnostic_note_state(
             DiagnosticApi::d3d12,
-            color == nullptr || output == nullptr || color == output
-                ? DiagnosticState::missing_resources
-                : DiagnosticState::incompatible_contract
+            DiagnosticState::incompatible_contract
         );
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::invalid_dimensions)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=invalid_dimensions view=%llu "
+                "input=%ux%u output=%ux%u",
+                static_cast<unsigned long long>(view_id),
+                render_width,
+                render_height,
+                output_width,
+                output_height
+            );
+        }
         return nullptr;
     }
 
@@ -888,22 +935,60 @@ D3D12Evaluation* prepare_d3d12(
     const auto color_y = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.Y");
     const auto output_x = get_ui(parameters, "DLSS.Output.Subrect.Base.X");
     const auto output_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
+    auto effective_settings = settings_for_view(settings, view_id);
     CropGeometry crop{};
-    if (!calculate_crop(
+    bool gaze_reset{};
+    if (!calculate_coordinated_crop(
             settings,
+            view_id,
+            output,
             render_width,
             render_height,
             output_width,
             output_height,
             output_x,
             output_y,
-            crop
+            crop,
+            gaze_reset
         )) {
         diagnostic_note_state(
             DiagnosticApi::d3d12,
             DiagnosticState::incompatible_contract
         );
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::coordinated_crop)) {
+            const auto description = output->GetDesc();
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=coordinated_crop view=%llu "
+                "input=%ux%u output=%ux%u outputBase=%u,%u "
+                "resource=%llux%u format=%u flags=0x%08X "
+                "centerMode=%u fovea=%.3fx%.3f offset=%.3f,%.3f",
+                static_cast<unsigned long long>(view_id),
+                render_width,
+                render_height,
+                output_width,
+                output_height,
+                output_x,
+                output_y,
+                static_cast<unsigned long long>(description.Width),
+                description.Height,
+                static_cast<unsigned>(description.Format),
+                static_cast<unsigned>(description.Flags),
+                static_cast<unsigned>(settings.center_mode),
+                settings.width,
+                settings.height,
+                settings.x_offset,
+                settings.height_offset
+            );
+        }
         return nullptr;
+    }
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        const auto offsets = foveation_offsets_from_geometry(
+            crop, render_width, render_height
+        );
+        effective_settings.x_offset = offsets.x;
+        effective_settings.height_offset = offsets.y;
     }
 
     ID3D12Device* device{};
@@ -913,6 +998,16 @@ D3D12Evaluation* prepare_d3d12(
             DiagnosticApi::d3d12,
             DiagnosticState::invalid_arguments
         );
+        if (should_trace_prepare_rejection(D3D12PrepareProbe::get_device)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=get_device view=%llu "
+                "command=%p hr=0x%08X device=%p",
+                static_cast<unsigned long long>(view_id),
+                command_list,
+                static_cast<unsigned>(device_result),
+                device
+            );
+        }
         return nullptr;
     }
     auto* const resources = find_or_create_resources(
@@ -927,6 +1022,22 @@ D3D12Evaluation* prepare_d3d12(
             DiagnosticApi::d3d12,
             DiagnosticState::resource_initialization_failed
         );
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::resources_unavailable)) {
+            const auto description = output->GetDesc();
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=resources_unavailable "
+                "view=%llu device=%p output=%p crop=%ux%u "
+                "format=%u flags=0x%08X",
+                static_cast<unsigned long long>(view_id),
+                device,
+                output,
+                crop.output_width,
+                crop.output_height,
+                static_cast<unsigned>(description.Format),
+                static_cast<unsigned>(description.Flags)
+            );
+        }
         return nullptr;
     }
 
@@ -937,6 +1048,18 @@ D3D12Evaluation* prepare_d3d12(
             DiagnosticApi::d3d12,
             DiagnosticState::allocation_failed
         );
+        if (should_trace_prepare_rejection(
+                D3D12PrepareProbe::evaluation_allocation)) {
+            trace_event(
+                "[DEBUG-D3D12-PREP] reason=evaluation_allocation "
+                "view=%llu crop=%ux%u->%ux%u",
+                static_cast<unsigned long long>(view_id),
+                crop.input_width,
+                crop.input_height,
+                crop.output_width,
+                crop.output_height
+            );
+        }
         return nullptr;
     }
     evaluation->resources = resources;
@@ -980,13 +1103,14 @@ D3D12Evaluation* prepare_d3d12(
     evaluation->dlss_source_y = 0U;
     evaluation->reset = get_ui(parameters, "Reset");
     evaluation->crop = crop;
-    evaluation->shape_width = settings.width;
-    evaluation->shape_height = settings.height;
-    evaluation->shape_offset_x = settings.x_offset;
-    evaluation->shape_offset_y = settings.height_offset;
-    evaluation->roundness = settings.roundness;
-    evaluation->feather = settings.transition_width;
-    evaluation->alignment_border = settings.alignment_border_enabled;
+    evaluation->shape_width = effective_settings.width;
+    evaluation->shape_height = effective_settings.height;
+    evaluation->shape_offset_x = effective_settings.x_offset;
+    evaluation->shape_offset_y = effective_settings.height_offset;
+    evaluation->roundness = effective_settings.roundness;
+    evaluation->feather = effective_settings.transition_width;
+    evaluation->alignment_border = effective_settings.alignment_border_enabled;
+    evaluation->gaze_reset = gaze_reset;
 
     const auto descriptor_set = resources->next_descriptor_set.fetch_add(
         1U,
@@ -1112,7 +1236,7 @@ D3D12Evaluation* prepare_d3d12(
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
-    if (consume_reset(settings)) {
+    if (consume_reset(settings) || gaze_reset) {
         mutable_parameters->Set("Reset", 1U);
     }
     const auto preparation_sequence = direct_preparation_sequence.fetch_add(
@@ -1160,6 +1284,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
     const std::uint32_t color_y,
     const std::uint32_t output_x,
     const std::uint32_t output_y,
+    const DlssViewId view_id,
     const Settings& settings,
     const bool diagnostic_trace,
     const std::uint64_t diagnostic_sequence
@@ -1170,18 +1295,30 @@ D3D12Evaluation* prepare_d3d12_streamline(
         return nullptr;
     }
 
+    auto effective_settings = settings_for_view(settings, view_id);
     CropGeometry crop{};
-    if (!calculate_crop(
+    bool gaze_reset{};
+    if (!calculate_coordinated_crop(
             settings,
+            view_id,
+            output,
             render_width,
             render_height,
             output_width,
             output_height,
             output_x,
             output_y,
-            crop
+            crop,
+            gaze_reset
         )) {
         return nullptr;
+    }
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        const auto offsets = foveation_offsets_from_geometry(
+            crop, render_width, render_height
+        );
+        effective_settings.x_offset = offsets.x;
+        effective_settings.height_offset = offsets.y;
     }
 
     ID3D12Device* device{};
@@ -1230,13 +1367,14 @@ D3D12Evaluation* prepare_d3d12_streamline(
     evaluation->dlss_source_x = 0U;
     evaluation->dlss_source_y = 0U;
     evaluation->crop = crop;
-    evaluation->shape_width = settings.width;
-    evaluation->shape_height = settings.height;
-    evaluation->shape_offset_x = settings.x_offset;
-    evaluation->shape_offset_y = settings.height_offset;
-    evaluation->roundness = settings.roundness;
-    evaluation->feather = settings.transition_width;
-    evaluation->alignment_border = settings.alignment_border_enabled;
+    evaluation->shape_width = effective_settings.width;
+    evaluation->shape_height = effective_settings.height;
+    evaluation->shape_offset_x = effective_settings.x_offset;
+    evaluation->shape_offset_y = effective_settings.height_offset;
+    evaluation->roundness = effective_settings.roundness;
+    evaluation->feather = effective_settings.transition_width;
+    evaluation->alignment_border = effective_settings.alignment_border_enabled;
+    evaluation->gaze_reset = gaze_reset;
     evaluation->diagnostic_trace = diagnostic_trace;
     evaluation->diagnostic_sequence = diagnostic_sequence;
 
@@ -1327,6 +1465,12 @@ CropGeometry d3d12_evaluation_crop(
     const D3D12Evaluation* const evaluation
 ) noexcept {
     return evaluation == nullptr ? CropGeometry{} : evaluation->crop;
+}
+
+bool d3d12_evaluation_gaze_reset(
+    const D3D12Evaluation* const evaluation
+) noexcept {
+    return evaluation != nullptr && evaluation->gaze_reset;
 }
 
 void finish_d3d12(
@@ -1653,7 +1797,8 @@ NgxResult evaluate_d3d12_backend(
                     timing->begin_query_index
                 );
             }
-            if (contract.reset || key_changed || crop_changed) {
+            if (contract.reset || key_changed ||
+                (crop_changed && !contract.preserve_history_on_crop_move)) {
                 parameters->Set("Reset", 1);
             }
             result = callbacks.evaluate_feature(

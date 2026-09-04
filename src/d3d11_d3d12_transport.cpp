@@ -2,6 +2,7 @@
 
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
+#include "gaze_foveation.hpp"
 #include "runtime.hpp"
 
 #include <d3d11_4.h>
@@ -1266,7 +1267,7 @@ bool evaluate_d3d11_via_d3d12(
         transport_settings.transition_width = 0.0F;
         transport_settings.alignment_border_enabled = false;
     }
-    const auto effective_settings = settings_for_view(
+    auto effective_settings = settings_for_view(
         transport_settings,
         view_id
     );
@@ -1349,6 +1350,7 @@ bool evaluate_d3d11_via_d3d12(
     const auto output_x = get_ui(parameters, "DLSS.Output.Subrect.Base.X");
     const auto output_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
     CropGeometry crop{};
+    bool gaze_reset{};
     if (render_width == 0U || render_height == 0U || out_width == 0U ||
         out_height == 0U || color_desc.SampleDesc.Count != 1U ||
         depth_desc.SampleDesc.Count != 1U || motion_desc.SampleDesc.Count != 1U ||
@@ -1357,8 +1359,11 @@ bool evaluate_d3d11_via_d3d12(
         !in_bounds(color_y, render_height, color_desc.Height) ||
         !in_bounds(depth_x, render_width, depth_desc.Width) ||
         !in_bounds(depth_y, render_height, depth_desc.Height) ||
-        !calculate_crop(effective_settings, render_width, render_height,
-            out_width, out_height, output_x, output_y, crop) ||
+        !calculate_coordinated_crop(
+            transport_settings, view_id, output,
+            render_width, render_height, out_width, out_height,
+            output_x, output_y, crop, gaze_reset
+        ) ||
         crop.output_width < 32U || crop.output_height < 32U) {
         const bool unsupported_samples = color_desc.SampleDesc.Count != 1U ||
             depth_desc.SampleDesc.Count != 1U ||
@@ -1369,6 +1374,13 @@ bool evaluate_d3d11_via_d3d12(
                 ? D3D11TransportStatus::unsupported_resources
                 : D3D11TransportStatus::invalid_dimensions
         );
+    }
+    if (transport_settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        const auto offsets = foveation_offsets_from_geometry(
+            crop, render_width, render_height
+        );
+        effective_settings.x_offset = offsets.x;
+        effective_settings.height_offset = offsets.y;
     }
 
     const auto create_flags = get_integer_bits(parameters, "DLSS.Feature.Create.Flags");
@@ -1481,7 +1493,9 @@ bool evaluate_d3d11_via_d3d12(
     contract.motion_vectors_low_res = mv_low_res;
     contract.depth_inverted =
         (create_flags & dlss_feature_flag_depth_inverted) != 0U;
-    contract.reset = get_int(parameters, "Reset") != 0;
+    contract.reset = get_int(parameters, "Reset") != 0 || gaze_reset;
+    contract.preserve_history_on_crop_move =
+        transport_settings.center_mode == FoveationCenterMode::openxr_gaze;
     contract.create_flags = create_flags;
     contract.perf_quality = get_ui(parameters, "PerfQualityValue");
     contract.jitter_x = get_float(parameters, "Jitter.Offset.X");

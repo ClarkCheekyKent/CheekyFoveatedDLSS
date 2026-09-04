@@ -1,0 +1,11 @@
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_CHEEKY_foveated_dlss",
+    "library_path": ".\\CheekyOpenXRLayer.dll",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "Cheeky Foveated DLSS OpenXR eye-gaze bridge",
+    "disable_environment": "CHEEKY_OPENXR_LAYER_DISABLE"
+  }
+}

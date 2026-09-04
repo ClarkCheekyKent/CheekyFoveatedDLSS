@@ -29,6 +29,7 @@ struct DlssFrameContract {
     bool motion_vectors_low_res{};
     bool depth_inverted{};
     bool reset{};
+    bool preserve_history_on_crop_move{};
 
     std::uint32_t create_flags{};
     std::uint32_t perf_quality{};

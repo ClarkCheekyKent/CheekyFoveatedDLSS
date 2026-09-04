@@ -7,6 +7,11 @@
 
 namespace cheeky::foveated_dlss {
 
+enum class FoveationCenterMode : std::uint32_t {
+    fixed = 0U,
+    openxr_gaze = 1U,
+};
+
 struct Settings {
     bool enabled{true};
     bool d3d11_use_d3d12_transport{false};
@@ -22,6 +27,10 @@ struct Settings {
     float roundness{0.0F};
     float transition_width{0.04F};
     bool alignment_border_enabled{false};
+    FoveationCenterMode center_mode{FoveationCenterMode::fixed};
+    float gaze_smoothing_ms{20.0F};
+    std::uint32_t gaze_quantization_pixels{8U};
+    float gaze_jump_reset_ratio{0.125F};
 
     bool nr_enabled{false};
     bool nr_foveated{true};
@@ -72,6 +81,11 @@ struct StereoViewDetail {
     bool has_geometry{};
 };
 
+struct StereoEyeAssignment {
+    std::uint32_t eye_index{};
+    bool assigned{};
+};
+
 [[nodiscard]] Settings current_settings() noexcept;
 void update_settings(const Settings& settings) noexcept;
 
@@ -80,6 +94,9 @@ void unregister_stereo_view(std::uint64_t view_id) noexcept;
 [[nodiscard]] StereoViewStatistics stereo_view_statistics() noexcept;
 [[nodiscard]] std::vector<StereoViewDetail> stereo_view_details();
 [[nodiscard]] bool has_multiple_stereo_views() noexcept;
+[[nodiscard]] StereoEyeAssignment stereo_eye_assignment(
+    std::uint64_t view_id
+) noexcept;
 void note_stereo_view_geometry(
     std::uint64_t view_id,
     std::uint32_t render_width,
