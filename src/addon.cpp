@@ -205,13 +205,17 @@ void draw_api_diagnostics(
     if (ImGui::TreeNode("Interception details")) {
         if (DiagnosticTable table{"interception_details"}) {
             diagnostic_row(
-                "nvngx_dlss.dll loaded", "%s",
+                "NGX runtime loaded", "%s",
                 data.runtime_loaded ? "Yes" : "No"
             );
             if (api == DiagnosticApi::d3d12) {
                 diagnostic_row(
                     "Streamline detected", "%s",
                     data.streamline_detected ? "Yes" : "No"
+                );
+                diagnostic_row(
+                    "Active NGX route", "%s",
+                    d3d12_ngx_route_name(data.d3d12_ngx_route)
                 );
             }
             diagnostic_row(
