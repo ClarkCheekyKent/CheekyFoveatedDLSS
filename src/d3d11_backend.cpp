@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "diagnostics.hpp"
+#include "gaze_foveation.hpp"
 
 #include <d3dcompiler.h>
 
@@ -557,6 +558,7 @@ void restore_create_parameters(
     const NgxHandle* const game_handle,
     const NgxParameters* const parameters,
     const CropGeometry& crop,
+    const bool preserve_history_on_move,
     NgxHandle*& private_handle,
     bool& force_reset
 ) noexcept {
@@ -599,7 +601,7 @@ void restore_create_parameters(
             state->last_crop = crop;
             state->has_last_crop = true;
             private_handle = state->private_handle;
-            force_reset = crop_changed;
+            force_reset = crop_changed && !preserve_history_on_move;
             return private_handle != nullptr;
         }
 
@@ -814,11 +816,6 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
         );
         return nullptr;
     }
-    const auto effective_settings = settings_for_view(
-        settings,
-        static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(game_handle))
-    );
-
     auto* const color_resource = get_resource(parameters, "Color");
     auto* const output_resource = get_resource(parameters, "Output");
     if (color_resource == nullptr || output_resource == nullptr ||
@@ -880,7 +877,12 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     const auto output_x = read_ui(parameters, "DLSS.Output.Subrect.Base.X");
     const auto output_y = read_ui(parameters, "DLSS.Output.Subrect.Base.Y");
 
+    const auto view_id = static_cast<DlssViewId>(
+        reinterpret_cast<std::uintptr_t>(game_handle)
+    );
+    auto effective_settings = settings_for_view(settings, view_id);
     CropGeometry crop{};
+    bool gaze_reset{};
     if (width == 0U || height == 0U || out_width == 0U || out_height == 0U ||
         active_render_width == 0U || active_render_height == 0U ||
         output_desc.MipLevels != 1U || output_desc.ArraySize != 1U ||
@@ -891,21 +893,31 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
         !in_bounds(color_y, active_render_height, color_desc.Height) ||
         !in_bounds(output_x, out_width, output_desc.Width) ||
         !in_bounds(output_y, out_height, output_desc.Height) ||
-        !calculate_crop(
-            effective_settings,
+        !calculate_coordinated_crop(
+            settings,
+            view_id,
+            output_resource,
             active_render_width,
             active_render_height,
             out_width,
             out_height,
             output_x,
             output_y,
-            crop
+            crop,
+            gaze_reset
         )) {
         diagnostic_note_state(
             DiagnosticApi::d3d11,
             DiagnosticState::incompatible_contract
         );
         return nullptr;
+    }
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        const auto offsets = foveation_offsets_from_geometry(
+            crop, active_render_width, active_render_height
+        );
+        effective_settings.x_offset = offsets.x;
+        effective_settings.height_offset = offsets.y;
     }
 
     // DLSS supports output sizes down to 32x32. Do not attempt to create a
@@ -947,6 +959,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
             game_handle,
             parameters,
             crop,
+            settings.center_mode == FoveationCenterMode::openxr_gaze,
             private_handle,
             force_reset
         )) {
@@ -1102,7 +1115,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
-    if (force_reset || evaluation->reset != 0) {
+    if (force_reset || gaze_reset || evaluation->reset != 0) {
         mutable_parameters->Set("Reset", 1);
     }
 

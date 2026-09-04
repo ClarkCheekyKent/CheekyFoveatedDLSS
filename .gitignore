@@ -1,4 +1,5 @@
 /bin/
 /build/
+/docs/
 /.vs/
 *.user

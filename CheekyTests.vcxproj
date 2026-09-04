@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{66A24D10-BA28-4E06-A33E-F3C20301B260}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>CheekyTests</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries><PlatformToolset>v143</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v143</PlatformToolset><WholeProgramOptimization>true</WholeProgramOptimization><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" />
+  </ImportGroup>
+  <PropertyGroup>
+    <TargetName>CheekyTests</TargetName>
+    <OutDir>$(MSBuildThisFileDirectory)bin\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)build\msbuild\tests\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)src;$(MSBuildThisFileDirectory)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="tests\gaze_tests.cpp" />
+    <ClCompile Include="shared\gaze_math.cpp" />
+    <ClCompile Include="src\foveation.cpp" />
+    <ClCompile Include="src\gaze_policy.cpp" />
+    <ClCompile Include="src\d3d12_ngx_dispatch.cpp" />
+    <ClCompile Include="src\d3d12_output_contract.cpp" />
+    <ClCompile Include="src\diagnostics.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="shared\cheeky_gaze_abi.h" />
+    <ClInclude Include="shared\gaze_math.hpp" />
+    <ClInclude Include="src\foveation.hpp" />
+    <ClInclude Include="src\gaze_policy.hpp" />
+    <ClInclude Include="src\d3d12_ngx_dispatch.hpp" />
+    <ClInclude Include="src\d3d12_output_contract.hpp" />
+    <ClInclude Include="src\diagnostics.hpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

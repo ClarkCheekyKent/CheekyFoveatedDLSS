@@ -23,6 +23,10 @@ std::atomic<bool> invert_stereo_x_offset{false};
 std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
 std::atomic<bool> alignment_border_enabled{false};
+std::atomic<std::uint32_t> center_mode{};
+std::atomic<std::uint32_t> gaze_smoothing_ms_bits{0x41A00000U};
+std::atomic<std::uint32_t> gaze_quantization_pixels{8U};
+std::atomic<std::uint32_t> gaze_jump_reset_ratio_bits{0x3E000000U};
 std::atomic<bool> nr_enabled{false};
 std::atomic<bool> nr_foveated{true};
 std::atomic<bool> nr_use_sr_foveation{false};
@@ -114,6 +118,16 @@ Settings current_settings() noexcept {
     settings.transition_width = load_float(transition_bits);
     settings.alignment_border_enabled =
         alignment_border_enabled.load(std::memory_order_acquire);
+    settings.center_mode = static_cast<FoveationCenterMode>(
+        center_mode.load(std::memory_order_acquire)
+    );
+    settings.gaze_smoothing_ms = load_float(gaze_smoothing_ms_bits);
+    settings.gaze_quantization_pixels = gaze_quantization_pixels.load(
+        std::memory_order_acquire
+    );
+    settings.gaze_jump_reset_ratio = load_float(
+        gaze_jump_reset_ratio_bits
+    );
     settings.nr_enabled = nr_enabled.load(std::memory_order_acquire);
     settings.nr_foveated = nr_foveated.load(std::memory_order_acquire);
     settings.nr_use_sr_foveation =
@@ -194,6 +208,24 @@ void update_settings(const Settings& settings) noexcept {
     alignment_border_enabled.store(
         settings.alignment_border_enabled,
         std::memory_order_release
+    );
+    center_mode.store(
+        static_cast<std::uint32_t>(settings.center_mode) <= 1U
+            ? static_cast<std::uint32_t>(settings.center_mode)
+            : 0U,
+        std::memory_order_release
+    );
+    store_float(
+        gaze_smoothing_ms_bits,
+        std::clamp(settings.gaze_smoothing_ms, 0.0F, 100.0F)
+    );
+    gaze_quantization_pixels.store(
+        std::clamp(settings.gaze_quantization_pixels, 1U, 64U),
+        std::memory_order_release
+    );
+    store_float(
+        gaze_jump_reset_ratio_bits,
+        std::clamp(settings.gaze_jump_reset_ratio, 0.01F, 1.0F)
     );
     nr_enabled.store(settings.nr_enabled, std::memory_order_release);
     nr_foveated.store(settings.nr_foveated, std::memory_order_release);
@@ -312,6 +344,17 @@ void unregister_stereo_view(const std::uint64_t view_id) noexcept {
 bool has_multiple_stereo_views() noexcept {
     std::lock_guard lock(stereo_views_mutex);
     return eye_roles[0].view_id != 0U && eye_roles[1].view_id != 0U;
+}
+
+StereoEyeAssignment stereo_eye_assignment(
+    const std::uint64_t view_id
+) noexcept {
+    std::lock_guard lock(stereo_views_mutex);
+    if (eye_roles[0].view_id == 0U || eye_roles[1].view_id == 0U) return {};
+    for (std::uint32_t index{}; index < 2U; ++index) {
+        if (eye_roles[index].view_id == view_id) return {index, true};
+    }
+    return {};
 }
 
 StereoViewStatistics stereo_view_statistics() noexcept {

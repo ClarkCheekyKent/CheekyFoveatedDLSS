@@ -3,6 +3,7 @@
 #include "d3d11_peripheral_dlaa.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "diagnostics.hpp"
+#include "gaze_foveation.hpp"
 #include "ngx_abi.hpp"
 #include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
@@ -2197,7 +2198,8 @@ struct StreamlineEvaluation {
         color_tag.extent.top,
         output_tag.extent.left,
         output_tag.extent.top,
-        streamline_settings,
+        streamline_view_id,
+        current_settings(),
         verbose,
         sequence
     );
@@ -2417,6 +2419,9 @@ struct StreamlineEvaluation {
     if (set_constants != nullptr && frame != nullptr && has_constants) {
         auto cropped = constants;
         cropped.next = nullptr;
+        if (d3d12_evaluation_gaze_reset(evaluation.backend)) {
+            cropped.reset = 1;
+        }
         const auto mv_reference_width = evaluation.motion_vectors_output_space
             ? output_width : render_width;
         const auto mv_reference_height = evaluation.motion_vectors_output_space
@@ -2993,6 +2998,7 @@ void forget_d3d12_game_view(const NgxHandle* const handle) noexcept {
     release_peripheral_dlaa_view(view_id);
     release_d3d12_view(view_id);
     unregister_stereo_view(view_id);
+    forget_gaze_view(view_id);
 }
 
 void enable_output_subrects(
@@ -3548,9 +3554,11 @@ NgxResult hook_release_d3d11(NgxHandle* const handle) {
     release_d3d11_transport_view(handle);
     release_d3d11_peripheral_dlaa_view(handle);
     unregister_d3d11_game_feature(handle);
-    unregister_stereo_view(static_cast<DlssViewId>(
+    const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
-    ));
+    );
+    unregister_stereo_view(view_id);
+    forget_gaze_view(view_id);
     return original == nullptr ? 0xBAD00007U : original(handle);
 }
 
@@ -3559,9 +3567,11 @@ NgxResult hook_core_release_d3d11(NgxHandle* const handle) {
     release_d3d11_transport_view(handle);
     release_d3d11_peripheral_dlaa_view(handle);
     unregister_d3d11_game_feature(handle);
-    unregister_stereo_view(static_cast<DlssViewId>(
+    const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
-    ));
+    );
+    unregister_stereo_view(view_id);
+    forget_gaze_view(view_id);
     return original == nullptr ? 0xBAD00007U : original(handle);
 }
 
@@ -3857,7 +3867,8 @@ void evaluate_nr_after_native_d3d12(
     auto* const evaluation = prepare_d3d12(
         command_list,
         parameters,
-        effective_settings
+        contract.view_id,
+        settings
     );
     if (evaluation == nullptr) {
         if (peripheral_ready) {
@@ -3865,6 +3876,9 @@ void evaluate_nr_after_native_d3d12(
         }
         return false;
     }
+    contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
+    contract.preserve_history_on_crop_move =
+        settings.center_mode == FoveationCenterMode::openxr_gaze;
     private_attempted = true;
 
     if (peripheral_ready && !d3d12_set_composite_base(

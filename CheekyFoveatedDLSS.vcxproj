@@ -49,7 +49,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)third_party\reshade\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\imgui;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)third_party\reshade\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\imgui;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\src;$(MSBuildThisFileDirectory)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
@@ -65,7 +65,7 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
-      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)third_party\reshade\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\imgui;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)third_party\reshade\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\imgui;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\include;$(MSBuildThisFileDirectory)third_party\reshade\deps\minhook\src;$(MSBuildThisFileDirectory)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
@@ -84,6 +84,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\*.cpp" />
+    <ClCompile Include="shared\gaze_math.cpp" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\buffer.c" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\hook.c" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\trampoline.c" />
@@ -91,6 +92,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\*.hpp" />
+    <ClInclude Include="shared\*.h" />
+    <ClInclude Include="shared\*.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

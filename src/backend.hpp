@@ -83,6 +83,7 @@ void d3d11_set_composite_base(
 [[nodiscard]] D3D12Evaluation* prepare_d3d12(
     ID3D12GraphicsCommandList* command_list,
     const NgxParameters* parameters,
+    DlssViewId view_id,
     const Settings& settings
 ) noexcept;
 
@@ -105,6 +106,7 @@ void finish_d3d12(
     std::uint32_t color_y,
     std::uint32_t output_x,
     std::uint32_t output_y,
+    DlssViewId view_id,
     const Settings& settings,
     bool diagnostic_trace,
     std::uint64_t diagnostic_sequence
@@ -122,6 +124,10 @@ void finish_d3d12(
 ) noexcept;
 
 [[nodiscard]] CropGeometry d3d12_evaluation_crop(
+    const D3D12Evaluation* evaluation
+) noexcept;
+
+[[nodiscard]] bool d3d12_evaluation_gaze_reset(
     const D3D12Evaluation* evaluation
 ) noexcept;
 
