@@ -138,7 +138,10 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12_output_contract.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/diagnostics.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_nr_contract.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/gaze_foveation.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/settings.cpp"
 )
+add_dependencies(CheekyTests CheekyOpenXRLayer)
 target_compile_features(CheekyTests PRIVATE cxx_std_20)
 target_include_directories(
     CheekyTests PRIVATE
