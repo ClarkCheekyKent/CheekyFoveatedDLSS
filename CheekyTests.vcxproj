@@ -44,6 +44,8 @@
     <ClCompile Include="src\d3d12_output_contract.cpp" />
     <ClCompile Include="src\diagnostics.cpp" />
     <ClCompile Include="src\dlss_nr_contract.cpp" />
+    <ClCompile Include="src\gaze_foveation.cpp" />
+    <ClCompile Include="src\settings.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="shared\cheeky_gaze_abi.h" />
@@ -55,6 +57,13 @@
     <ClInclude Include="src\diagnostics.hpp" />
     <ClInclude Include="src\dlss_nr_contract.hpp" />
     <ClInclude Include="src\peripheral_dlaa_generation.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="CheekyOpenXRLayer.vcxproj">
+      <Project>{FD60ACB6-2F8A-4ED2-A210-A80D5970D166}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

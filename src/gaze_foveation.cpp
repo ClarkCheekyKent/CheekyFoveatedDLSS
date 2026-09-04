@@ -35,6 +35,7 @@ struct ViewState {
 std::mutex coordinator_mutex;
 std::vector<ViewState> view_states;
 GazeDiagnostics diagnostics{};
+HMODULE snapshot_module{};
 CheekyOpenXRGetGazeSnapshotFn snapshot_function{};
 std::uint64_t qpc_frequency{};
 
@@ -73,11 +74,17 @@ std::uint64_t qpc_frequency{};
     CheekyGazeSnapshotV1& snapshot
 ) noexcept {
     if (snapshot_function == nullptr) {
-        const auto module = GetModuleHandleW(L"CheekyOpenXRLayer.dll");
-        if (module != nullptr) {
-            snapshot_function = reinterpret_cast<CheekyOpenXRGetGazeSnapshotFn>(
+        HMODULE module{};
+        if (GetModuleHandleExW(0U, L"CheekyOpenXRLayer.dll", &module)) {
+            const auto function = reinterpret_cast<CheekyOpenXRGetGazeSnapshotFn>(
                 GetProcAddress(module, "CheekyOpenXR_GetGazeSnapshot")
             );
+            if (function != nullptr) {
+                snapshot_module = module;
+                snapshot_function = function;
+            } else {
+                static_cast<void>(FreeLibrary(module));
+            }
         }
     }
     diagnostics.layer_present = snapshot_function != nullptr;
@@ -514,6 +521,10 @@ void reset_gaze_foveation() noexcept {
     view_states.clear();
     diagnostics = {};
     snapshot_function = nullptr;
+    if (snapshot_module != nullptr) {
+        static_cast<void>(FreeLibrary(snapshot_module));
+        snapshot_module = nullptr;
+    }
 }
 
 }  // namespace cheeky::foveated_dlss

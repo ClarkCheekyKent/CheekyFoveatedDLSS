@@ -4,14 +4,23 @@
 #include "diagnostics.hpp"
 #include "dlss_nr_contract.hpp"
 #include "foveation.hpp"
+#include "gaze_foveation.hpp"
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
 #include "peripheral_dlaa_generation.hpp"
+
+#include <Windows.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+
+namespace cheeky::foveated_dlss {
+
+void trace_event(const char*, ...) noexcept {}
+
+}  // namespace cheeky::foveated_dlss
 
 namespace {
 
@@ -602,6 +611,72 @@ void test_peripheral_dlaa_generation_requires_synchronization() {
     );
 }
 
+[[nodiscard]] bool run_openxr_gaze_lookup() {
+    using namespace cheeky::foveated_dlss;
+    Settings settings{};
+    settings.center_mode = FoveationCenterMode::openxr_gaze;
+    CropGeometry crop{};
+    bool reset_history{};
+    return calculate_coordinated_crop(
+        settings,
+        1U,
+        nullptr,
+        1000U,
+        1000U,
+        2000U,
+        2000U,
+        0U,
+        0U,
+        crop,
+        reset_history
+    );
+}
+
+void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
+    using namespace cheeky::foveated_dlss;
+    constexpr wchar_t layer_name[] = L"CheekyOpenXRLayer.dll";
+
+    reset_gaze_foveation();
+    expect(GetModuleHandleW(layer_name) == nullptr,
+        "OpenXR layer starts unloaded in the test process");
+    expect(run_openxr_gaze_lookup(),
+        "gaze lookup falls back while the OpenXR layer is absent");
+    expect(!gaze_diagnostics().layer_present,
+        "absent OpenXR layer is reported as unavailable");
+
+    const auto first_loader_reference = LoadLibraryW(layer_name);
+    expect(first_loader_reference != nullptr,
+        "test loads the real OpenXR layer DLL");
+    if (first_loader_reference == nullptr) return;
+
+    expect(run_openxr_gaze_lookup(),
+        "gaze lookup caches the OpenXR layer snapshot export");
+    expect(gaze_diagnostics().layer_present,
+        "resolved OpenXR layer export is reported as present");
+    expect(FreeLibrary(first_loader_reference) != FALSE,
+        "simulated OpenXR loader releases its first layer reference");
+    expect(GetModuleHandleW(layer_name) != nullptr,
+        "cached snapshot export retains the OpenXR layer DLL");
+    expect(run_openxr_gaze_lookup(),
+        "cached snapshot export remains callable between instances");
+
+    const auto second_loader_reference = LoadLibraryW(layer_name);
+    expect(second_loader_reference != nullptr,
+        "simulated recreated OpenXR instance reloads the layer");
+    if (second_loader_reference != nullptr) {
+        expect(run_openxr_gaze_lookup(),
+            "cached snapshot export remains callable after instance recreation");
+        expect(FreeLibrary(second_loader_reference) != FALSE,
+            "simulated OpenXR loader releases its recreated layer reference");
+    }
+    expect(GetModuleHandleW(layer_name) != nullptr,
+        "add-on reference retains the layer after recreated instance teardown");
+
+    reset_gaze_foveation();
+    expect(GetModuleHandleW(layer_name) == nullptr,
+        "gaze shutdown releases the retained OpenXR layer reference");
+}
+
 }  // namespace
 
 int main() {
@@ -624,6 +699,7 @@ int main() {
     test_dlss_nr_maps_right_eye_region_into_packed_output();
     test_dlss_nr_reuses_live_sr_crop_center();
     test_peripheral_dlaa_generation_requires_synchronization();
+    test_openxr_layer_is_retained_while_snapshot_export_is_cached();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;
