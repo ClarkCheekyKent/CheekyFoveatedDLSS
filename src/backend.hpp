@@ -32,6 +32,9 @@ struct D3D12BackendCallbacks {
 
 struct D3D12BackendTiming {
     ID3D12QueryHeap* query_heap{};
+    std::uint32_t begin_query_index{};
+    std::uint32_t end_query_index{1U};
+    bool write_begin_timestamp{};
     bool sr_timestamp_written{};
 };
 
@@ -70,6 +73,13 @@ void finish_d3d11(
     NgxResult result
 ) noexcept;
 
+void d3d11_set_composite_base(
+    D3D11Evaluation* evaluation,
+    ID3D11ShaderResourceView* base_srv,
+    std::uint32_t width,
+    std::uint32_t height
+) noexcept;
+
 [[nodiscard]] D3D12Evaluation* prepare_d3d12(
     ID3D12GraphicsCommandList* command_list,
     const NgxParameters* parameters,
@@ -102,6 +112,13 @@ void finish_d3d12(
 
 [[nodiscard]] ID3D12Resource* d3d12_private_output(
     const D3D12Evaluation* evaluation
+) noexcept;
+
+[[nodiscard]] bool d3d12_set_composite_base(
+    D3D12Evaluation* evaluation,
+    ID3D12Resource* low_resolution_color,
+    std::uint32_t input_base_x = 0U,
+    std::uint32_t input_base_y = 0U
 ) noexcept;
 
 [[nodiscard]] CropGeometry d3d12_evaluation_crop(

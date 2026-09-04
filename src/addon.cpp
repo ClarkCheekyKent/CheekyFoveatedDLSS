@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "d3d11_d3d12_transport.hpp"
+#include "d3d11_peripheral_dlaa.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr.hpp"
 #include "runtime.hpp"
@@ -253,6 +254,34 @@ void draw_resolution_performance(
             data.received_output_width,
             data.received_output_height
         );
+        const auto live_settings = current_settings();
+        if (data.motion_vector_width != 0U &&
+            data.motion_vector_height != 0U) {
+            diagnostic_row(
+                "Motion vectors", "%u x %u (%s)",
+                data.motion_vector_width,
+                data.motion_vector_height,
+                motion_vector_space_name(data.motion_vector_space)
+            );
+            diagnostic_row(
+                "Peripheral DLAA", "%s",
+                !live_settings.peripheral_dlaa_enabled
+                    ? "Disabled"
+                    : data.motion_vector_space == MotionVectorSpace::output
+                        ? "Enabled (auto MV conversion)"
+                        : data.motion_vector_space == MotionVectorSpace::input
+                            ? "Enabled (direct MVs)"
+                            : "Enabled (compatibility unknown)"
+            );
+        } else {
+            diagnostic_row("Motion vectors", "Not sampled yet");
+            diagnostic_row(
+                "Peripheral DLAA", "%s",
+                live_settings.peripheral_dlaa_enabled
+                    ? "Enabled (waiting for MV info)"
+                    : "Disabled"
+            );
+        }
         if (data.passed_crop.input_width != 0U &&
             data.passed_crop.input_height != 0U) {
             diagnostic_row(
@@ -341,6 +370,23 @@ void draw_d3d11_gpu_performance(
     if (DiagnosticTable table{"dlss_timing"}) {
         timing_row("Full DLSS call", data.native_dlss_gpu_ms);
         timing_row("Foveated DLSS call", data.foveated_dlss_gpu_ms);
+        if (settings.peripheral_dlaa_enabled) {
+            const bool direct =
+                data.d3d11_execution_path == D3D11ExecutionPath::dx11_direct;
+            if (direct) {
+                timing_row(
+                    "Peripheral preparation",
+                    d3d11_peripheral_dlaa_preparation_gpu_ms()
+                );
+            }
+            timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
+            if (direct) {
+                timing_row(
+                    "Peripheral prep + DLAA total",
+                    d3d11_peripheral_dlaa_total_gpu_ms()
+                );
+            }
+        }
         if (data.native_dlss_gpu_ms > 0.0F &&
             data.foveated_dlss_gpu_ms > 0.0F) {
             const auto savings =
@@ -364,26 +410,44 @@ void draw_d3d11_gpu_performance(
         const auto nr_gpu_ms = settings.nr_foveated
             ? data.foveated_dlss_nr_gpu_ms
             : data.full_dlss_nr_gpu_ms;
+        const auto peripheral_gpu_ms = settings.peripheral_dlaa_enabled
+            ? data.peripheral_dlaa_gpu_ms
+            : 0.0F;
         const bool has_nr_time = !settings.nr_enabled || nr_gpu_ms > 0.0F;
+        const bool has_peripheral_time =
+            !settings.peripheral_dlaa_enabled || peripheral_gpu_ms > 0.0F;
         if (data.transport_gpu_ms > 0.0F &&
-            data.foveated_dlss_gpu_ms > 0.0F && has_nr_time) {
+            data.foveated_dlss_gpu_ms > 0.0F &&
+            has_nr_time && has_peripheral_time) {
             diagnostic_row(
-                "Transport overhead (excludes SR/NR)", "%.3f ms",
+                "Transport overhead (excludes DLSS)", "%.3f ms",
                 (std::max)(
                     0.0F,
                     data.transport_gpu_ms - data.foveated_dlss_gpu_ms -
+                        peripheral_gpu_ms -
                         (settings.nr_enabled ? nr_gpu_ms : 0.0F)
                 )
             );
         } else {
             diagnostic_row(
-                "Transport overhead (excludes SR/NR)", "Not sampled yet"
+                "Transport overhead (excludes DLSS)", "Not sampled yet"
             );
         }
         diagnostic_row(
             "Transport status", "%s",
             d3d11_transport_status_name(data.d3d11_transport_status)
         );
+    }
+}
+
+void draw_d3d12_gpu_performance(
+    const DiagnosticSnapshot& data,
+    const Settings& settings
+) {
+    if (!settings.peripheral_dlaa_enabled) return;
+    ImGui::SeparatorText("DLSS GPU Timing (250 ms average)");
+    if (DiagnosticTable table{"d3d12_dlss_timing"}) {
+        timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
     }
 }
 
@@ -407,8 +471,12 @@ void draw_performance() {
 
     // Frame timing is API-independent and is stored in the shared D3D11 slot.
     draw_frame_performance(d3d11);
+    const auto settings = current_settings();
     if (d3d11_active) {
-        draw_d3d11_gpu_performance(d3d11, current_settings());
+        draw_d3d11_gpu_performance(d3d11, settings);
+    }
+    if (d3d12_active) {
+        draw_d3d12_gpu_performance(d3d12, settings);
     }
 }
 
@@ -504,6 +572,22 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "D3D11D3D12Transport",
         settings.d3d11_use_d3d12_transport
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "PeripheralDlaa",
+        settings.peripheral_dlaa_enabled
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "PeripheralDlaaScale",
+        settings.peripheral_dlaa_scale
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "CenterPreset",
+        settings.center_preset
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "PeripheralDlaaPreset",
+        settings.peripheral_dlaa_preset
     ));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "Width", settings.width
@@ -633,6 +717,22 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         settings.d3d11_use_d3d12_transport
     );
     reshade::set_config_value(
+        nullptr, config_section, "PeripheralDlaa",
+        settings.peripheral_dlaa_enabled
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "PeripheralDlaaScale",
+        settings.peripheral_dlaa_scale
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "CenterPreset",
+        settings.center_preset
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "PeripheralDlaaPreset",
+        settings.peripheral_dlaa_preset
+    );
+    reshade::set_config_value(
         nullptr, config_section, "Width", settings.width
     );
     reshade::set_config_value(
@@ -746,17 +846,82 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     static bool size_drafts_initialized{};
     static bool editing_width{};
     static bool editing_height{};
+    static bool editing_peripheral_scale{};
     static float width_draft{};
     static float height_draft{};
+    static float peripheral_scale_draft{};
     if (!size_drafts_initialized) {
         width_draft = settings.width;
         height_draft = settings.height;
+        peripheral_scale_draft = settings.peripheral_dlaa_scale;
         size_drafts_initialized = true;
     }
+    const auto preset_combo = [&changed](
+        const char* const label,
+        std::uint32_t& value,
+        const bool allow_game_default
+    ) {
+        static constexpr std::uint32_t values[]{
+            0U, 5U, 11U, 12U, 13U
+        };
+        static constexpr const char* labels[]{
+            "Game/default",
+            "E (Fastest)",
+            "K",
+            "L",
+            "M",
+        };
+        const int first = allow_game_default ? 0 : 1;
+        int selected{};
+        const auto count = static_cast<int>(std::size(values));
+        for (int index = first; index < count; ++index) {
+            if (values[index] == value) {
+                selected = index - first;
+                break;
+            }
+        }
+        if (ImGui::Combo(label, &selected, labels + first, count - first)) {
+            value = values[first + selected];
+            changed = true;
+        }
+    };
     changed |= ImGui::Checkbox("Enable foveated DLSS-SR", &settings.enabled);
     ImGui::SameLine();
     ImGui::TextDisabled("(Alt+Shift+/)");
     ImGui::BeginDisabled(!settings.enabled);
+    preset_combo("Center preset", settings.center_preset, true);
+    changed |= ImGui::Checkbox(
+        "Peripheral DLAA",
+        &settings.peripheral_dlaa_enabled
+    );
+    if (!editing_peripheral_scale) {
+        peripheral_scale_draft = settings.peripheral_dlaa_scale;
+    }
+    ImGui::BeginDisabled(!settings.peripheral_dlaa_enabled);
+    preset_combo(
+        "Peripheral preset",
+        settings.peripheral_dlaa_preset,
+        false
+    );
+    if (ImGui::SliderFloat(
+        "Periphery scale",
+        &peripheral_scale_draft,
+        0.20F,
+        1.0F,
+        "%.2f",
+        ImGuiSliderFlags_AlwaysClamp
+    )) {
+        editing_peripheral_scale = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        settings.peripheral_dlaa_scale = peripheral_scale_draft;
+        editing_peripheral_scale = false;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled(
+        "Downscale periphery even more from original resolution"
+    );
     if (!editing_width) width_draft = settings.width;
     if (ImGui::SliderFloat(
         "Fovea width",
@@ -840,6 +1005,12 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::Button("Reset DLSS-SR defaults", ImVec2(0.0F, 0.0F))) {
         const Settings defaults{};
         settings.enabled = defaults.enabled;
+        settings.peripheral_dlaa_enabled = defaults.peripheral_dlaa_enabled;
+        settings.peripheral_dlaa_scale = defaults.peripheral_dlaa_scale;
+        settings.center_preset = defaults.center_preset;
+        settings.peripheral_dlaa_preset = defaults.peripheral_dlaa_preset;
+        peripheral_scale_draft = defaults.peripheral_dlaa_scale;
+        editing_peripheral_scale = false;
         settings.width = defaults.width;
         settings.height = defaults.height;
         settings.x_offset = defaults.x_offset;

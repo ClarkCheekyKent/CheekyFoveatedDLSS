@@ -1,7 +1,9 @@
 #include "backend.hpp"
 #include "d3d11_d3d12_transport.hpp"
+#include "d3d11_peripheral_dlaa.hpp"
 #include "diagnostics.hpp"
 #include "ngx_abi.hpp"
+#include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
 
@@ -227,6 +229,8 @@ constexpr std::uint32_t sl_tag_motion_vectors = 1U;
 constexpr std::uint32_t sl_tag_scaling_input = 3U;
 constexpr std::uint32_t sl_tag_scaling_output = 4U;
 constexpr std::size_t sl_tag_capacity = 73U;
+constexpr std::uint32_t sl_dlss_mode_dlaa = 6U;
+constexpr std::uint32_t peripheral_streamline_view_mask = 0x40000000U;
 
 std::atomic<GetProcAddressFn> real_get_proc_address{};
 std::atomic<InitD3D11Fn> real_init_d3d11{};
@@ -1148,6 +1152,12 @@ struct D3D11DlssTimingScope {
 
 constexpr std::size_t d3d12_nr_timing_slot_count = 6U;
 
+enum class D3D12TimingKind : std::uint32_t {
+    full_nr,
+    foveated_nr,
+    peripheral_dlaa,
+};
+
 struct D3D12NrTimingSlot {
     ID3D12Fence* fence{};
     ID3D12GraphicsCommandList* command_list{};
@@ -1155,7 +1165,7 @@ struct D3D12NrTimingSlot {
     std::uint64_t next_fence_value{};
     std::uint64_t fence_value{};
     std::uint64_t timestamp_frequency{};
-    bool foveated{};
+    D3D12TimingKind kind{D3D12TimingKind::full_nr};
     bool publish{};
     bool pending{};
     bool recording{};
@@ -1220,9 +1230,17 @@ void resolve_d3d12_nr_timing(
                 static_cast<double>(end - begin) * 1000.0 /
                 static_cast<double>(slot.timestamp_frequency)
             );
-            diagnostic_note_dlss_nr_gpu_time(
-                DiagnosticApi::d3d12, milliseconds, slot.foveated
-            );
+            if (slot.kind == D3D12TimingKind::peripheral_dlaa) {
+                diagnostic_note_peripheral_dlaa_gpu_time(
+                    DiagnosticApi::d3d12, milliseconds
+                );
+            } else {
+                diagnostic_note_dlss_nr_gpu_time(
+                    DiagnosticApi::d3d12,
+                    milliseconds,
+                    slot.kind == D3D12TimingKind::foveated_nr
+                );
+            }
         }
     }
     slot.fence_value = 0U;
@@ -1328,7 +1346,9 @@ struct D3D12NrTimingScope {
             if (candidate.pending || candidate.recording) continue;
             timer->next_slot = (index + 1U) % timer->slots.size();
             candidate.recording = true;
-            candidate.foveated = foveated;
+            candidate.kind = foveated
+                ? D3D12TimingKind::foveated_nr
+                : D3D12TimingKind::full_nr;
             slot = &candidate;
             slot_index = index;
             command_list->EndQuery(
@@ -1365,6 +1385,102 @@ struct D3D12NrTimingScope {
     }
 
     ~D3D12NrTimingScope() { finish(false); }
+};
+
+struct D3D12PeripheralTimingScope {
+    ID3D12GraphicsCommandList* command_list{};
+    D3D12NrTimer* timer{};
+    D3D12NrTimingSlot* slot{};
+    std::size_t slot_index{};
+    D3D12BackendTiming backend_timing{};
+    bool manual_begin{};
+
+    explicit D3D12PeripheralTimingScope(
+        ID3D12GraphicsCommandList* const in_command_list
+    ) noexcept : command_list(in_command_list) {
+        if (command_list == nullptr ||
+            !diagnostic_should_sample_gpu_time(
+                DiagnosticGpuTiming::d3d12_peripheral_dlaa
+            )) {
+            return;
+        }
+        std::lock_guard lock(d3d12_nr_timing_mutex);
+        timer = find_or_create_d3d12_nr_timer(command_list);
+        if (timer == nullptr) return;
+        for (std::size_t index{}; index < timer->slots.size(); ++index) {
+            resolve_d3d12_nr_timing(*timer, timer->slots[index], index);
+        }
+        for (std::size_t offset{}; offset < timer->slots.size(); ++offset) {
+            const auto index = (timer->next_slot + offset) % timer->slots.size();
+            auto& candidate = timer->slots[index];
+            if (candidate.pending || candidate.recording) continue;
+            timer->next_slot = (index + 1U) % timer->slots.size();
+            candidate.recording = true;
+            candidate.kind = D3D12TimingKind::peripheral_dlaa;
+            slot = &candidate;
+            slot_index = index;
+            backend_timing.query_heap = timer->query_heap;
+            backend_timing.begin_query_index =
+                static_cast<std::uint32_t>(index * 2U);
+            backend_timing.end_query_index =
+                static_cast<std::uint32_t>(index * 2U + 1U);
+            backend_timing.write_begin_timestamp = true;
+            break;
+        }
+    }
+
+    [[nodiscard]] D3D12BackendTiming* backend() noexcept {
+        return slot == nullptr ? nullptr : &backend_timing;
+    }
+
+    void begin() noexcept {
+        if (command_list == nullptr || timer == nullptr || slot == nullptr ||
+            manual_begin || backend_timing.sr_timestamp_written) {
+            return;
+        }
+        command_list->EndQuery(
+            timer->query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            backend_timing.begin_query_index
+        );
+        manual_begin = true;
+    }
+
+    void finish(const bool succeeded) noexcept {
+        if (command_list == nullptr || timer == nullptr || slot == nullptr) {
+            return;
+        }
+        std::lock_guard lock(d3d12_nr_timing_mutex);
+        const bool backend_recorded = backend_timing.sr_timestamp_written;
+        if (manual_begin && !backend_recorded) {
+            command_list->EndQuery(
+                timer->query_heap,
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                backend_timing.end_query_index
+            );
+        }
+        if (!manual_begin && !backend_recorded) {
+            slot->recording = false;
+            slot = nullptr;
+            return;
+        }
+        command_list->ResolveQueryData(
+            timer->query_heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            backend_timing.begin_query_index,
+            2U,
+            timer->readback,
+            sizeof(std::uint64_t) * 2U * slot_index
+        );
+        command_list->AddRef();
+        slot->command_list = command_list;
+        slot->publish = succeeded;
+        slot->recording = false;
+        slot->pending = true;
+        slot = nullptr;
+    }
+
+    ~D3D12PeripheralTimingScope() { finish(false); }
 };
 
 void note_d3d12_command_list_submission_impl(
@@ -1531,7 +1647,8 @@ void cache_streamline_tags(
 
 [[nodiscard]] bool apply_streamline_options(
     const std::uint32_t width,
-    const std::uint32_t height
+    const std::uint32_t height,
+    const std::uint32_t preset
 ) noexcept {
     const auto original = real_sl_dlss_set_options.load(
         std::memory_order_acquire
@@ -1573,6 +1690,14 @@ void cache_streamline_tags(
     const auto original_height = options.output_height;
     options.output_width = width;
     options.output_height = height;
+    if (preset != 0U) {
+        options.dlaa_preset = preset;
+        options.quality_preset = preset;
+        options.balanced_preset = preset;
+        options.performance_preset = preset;
+        options.ultra_performance_preset = preset;
+        options.ultra_quality_preset = preset;
+    }
     const auto result = original(&viewport, &options);
 
     static std::atomic<bool> apply_log_initialized{};
@@ -1644,6 +1769,15 @@ void restore_streamline_options() noexcept {
     if (original != nullptr && available) {
         options.next = nullptr;
         viewport.next = nullptr;
+        const auto preset = current_settings().center_preset;
+        if (preset != 0U) {
+            options.dlaa_preset = preset;
+            options.quality_preset = preset;
+            options.balanced_preset = preset;
+            options.performance_preset = preset;
+            options.ultra_performance_preset = preset;
+            options.ultra_quality_preset = preset;
+        }
         static_cast<void>(original(&viewport, &options));
     }
     applied_sl_output_width.store(0U, std::memory_order_release);
@@ -1658,10 +1792,283 @@ struct StreamlineEvaluation {
     SlConstants original_constants{};
     SlConstants nr_constants{};
     Settings settings{};
+    PeripheralDlaaResources peripheral{};
     bool constants_overridden{};
     bool motion_vectors_output_space{};
     bool has_nr_constants{};
+    bool peripheral_ready{};
 };
+
+[[nodiscard]] bool evaluate_streamline_peripheral_dlaa(
+    ID3D12GraphicsCommandList* const command_list,
+    const void* const frame,
+    StreamlineEvaluation& evaluation,
+    const std::uint32_t render_width,
+    const std::uint32_t render_height,
+    const std::uint32_t output_width,
+    const std::uint32_t output_height,
+    const bool verbose,
+    const std::uint64_t sequence
+) noexcept {
+    if (!evaluation.settings.peripheral_dlaa_enabled ||
+        evaluation.backend == nullptr || command_list == nullptr ||
+        frame == nullptr || render_width == 0U || render_height == 0U) {
+        return false;
+    }
+
+    const auto evaluate = real_sl_evaluate_feature.load(
+        std::memory_order_acquire
+    );
+    const auto set_options = real_sl_dlss_set_options.load(
+        std::memory_order_acquire
+    );
+    const auto set_for_frame = real_sl_set_tag_for_frame.load(
+        std::memory_order_acquire
+    );
+    const auto set_tag = real_sl_set_tag.load(std::memory_order_acquire);
+    const auto set_constants = real_sl_set_constants.load(
+        std::memory_order_acquire
+    );
+    if (evaluate == nullptr || set_options == nullptr ||
+        (set_for_frame == nullptr && set_tag == nullptr) ||
+        set_constants == nullptr) {
+        return false;
+    }
+
+    SlDlssOptions options{};
+    SlConstants constants{};
+    bool have_options{};
+    bool have_constants{};
+    AcquireSRWLockShared(&streamline_lock);
+    if (has_cached_sl_options) {
+        options = cached_sl_options;
+        have_options = true;
+    }
+    if (has_cached_sl_constants) {
+        constants = cached_sl_constants;
+        have_constants = true;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    if (!have_options || !have_constants) return false;
+
+    const auto& color_tag = evaluation.tags[0U];
+    const auto& depth_tag = evaluation.tags[1U];
+    const auto& motion_tag = evaluation.tags[2U];
+    const auto& output_tag = evaluation.tags[3U];
+
+    PeripheralDlaaRequest request{};
+    request.view_id = static_cast<DlssViewId>(evaluation.viewport.value) + 1U;
+    request.command_list = command_list;
+    request.color = static_cast<ID3D12Resource*>(color_tag.resource->native);
+    request.depth = static_cast<ID3D12Resource*>(depth_tag.resource->native);
+    request.motion_vectors =
+        static_cast<ID3D12Resource*>(motion_tag.resource->native);
+    request.output_template =
+        static_cast<ID3D12Resource*>(output_tag.resource->native);
+    request.render_width = render_width;
+    request.render_height = render_height;
+    request.source_output_width = output_width;
+    request.source_output_height = output_height;
+    request.scale = evaluation.settings.peripheral_dlaa_scale;
+    request.preset = evaluation.settings.peripheral_dlaa_preset;
+    request.color_base_x = color_tag.extent.left;
+    request.color_base_y = color_tag.extent.top;
+    request.depth_base_x = depth_tag.extent.left;
+    request.depth_base_y = depth_tag.extent.top;
+    request.mv_base_x = motion_tag.extent.left;
+    request.mv_base_y = motion_tag.extent.top;
+    request.motion_vectors_output_space =
+        evaluation.motion_vectors_output_space;
+    if (color_tag.resource->state != 0xFFFFFFFFU) {
+        request.color_state = static_cast<D3D12_RESOURCE_STATES>(
+            color_tag.resource->state
+        );
+    }
+    if (depth_tag.resource->state != 0xFFFFFFFFU) {
+        request.depth_state = static_cast<D3D12_RESOURCE_STATES>(
+            depth_tag.resource->state
+        );
+    }
+    if (motion_tag.resource->state != 0xFFFFFFFFU) {
+        request.motion_state = static_cast<D3D12_RESOURCE_STATES>(
+            motion_tag.resource->state
+        );
+    }
+
+    if (!prepare_peripheral_dlaa_resources(request, evaluation.peripheral)) {
+        return false;
+    }
+    const auto working_width = evaluation.peripheral.working_width;
+    const auto working_height = evaluation.peripheral.working_height;
+
+    const auto cleanup = [&]() noexcept {
+        finish_peripheral_dlaa_motion_read(
+            command_list,
+            evaluation.peripheral
+        );
+        evaluation.peripheral = {};
+    };
+
+    auto peripheral_viewport = evaluation.viewport;
+    peripheral_viewport.next = nullptr;
+    peripheral_viewport.value ^= peripheral_streamline_view_mask;
+
+    options.next = nullptr;
+    options.mode = sl_dlss_mode_dlaa;
+    options.output_width = working_width;
+    options.output_height = working_height;
+    options.dlaa_preset = evaluation.settings.peripheral_dlaa_preset;
+    if (set_options(&peripheral_viewport, &options) != 0U) {
+        cleanup();
+        return false;
+    }
+
+    auto resources = evaluation.resources;
+    auto tags = evaluation.tags;
+    for (std::size_t index{}; index < tags.size(); ++index) {
+        resources[index].next = nullptr;
+        tags[index].next = nullptr;
+        tags[index].resource = &resources[index];
+    }
+
+    if (evaluation.peripheral.downsampled_color) {
+        resources[0U].native = evaluation.peripheral.color;
+        resources[0U].memory = nullptr;
+        resources[0U].view = nullptr;
+        resources[0U].state =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        resources[0U].width = working_width;
+        resources[0U].height = working_height;
+        tags[0U].resource = &resources[0U];
+        tags[0U].extent = {0U, 0U, working_width, working_height};
+    }
+    if (evaluation.peripheral.downsampled_depth) {
+        resources[1U].native = evaluation.peripheral.depth;
+        resources[1U].memory = nullptr;
+        resources[1U].view = nullptr;
+        resources[1U].state =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        resources[1U].width = working_width;
+        resources[1U].height = working_height;
+        tags[1U].resource = &resources[1U];
+        tags[1U].extent = {0U, 0U, working_width, working_height};
+    }
+    if (evaluation.peripheral.converted_motion) {
+        resources[2U].native = evaluation.peripheral.motion_vectors;
+        resources[2U].memory = nullptr;
+        resources[2U].view = nullptr;
+        resources[2U].state =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        resources[2U].width = working_width;
+        resources[2U].height = working_height;
+        tags[2U].resource = &resources[2U];
+        tags[2U].extent = {0U, 0U, working_width, working_height};
+    }
+
+    resources[3U].native = evaluation.peripheral.output;
+    resources[3U].memory = nullptr;
+    resources[3U].view = nullptr;
+    resources[3U].state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    resources[3U].width = working_width;
+    resources[3U].height = working_height;
+    tags[3U].resource = &resources[3U];
+    tags[3U].extent = {0U, 0U, working_width, working_height};
+
+    std::uint32_t tag_result{0x18U};
+    if (set_for_frame != nullptr) {
+        tag_result = set_for_frame(
+            frame,
+            &peripheral_viewport,
+            tags.data(),
+            static_cast<std::uint32_t>(tags.size()),
+            command_list
+        );
+    } else {
+        tag_result = set_tag(
+            &peripheral_viewport,
+            tags.data(),
+            static_cast<std::uint32_t>(tags.size()),
+            command_list
+        );
+    }
+    if (tag_result != 0U) {
+        cleanup();
+        return false;
+    }
+
+    // Streamline's mvecScale normalizes vector values. Point-downsampling the
+    // MV texture does not change those values, so keep the game's scale here.
+    // Jitter, however, is in pixel space, so scale it to the peripheral grid.
+    constants.next = nullptr;
+    constants.jitter_offset.x *= static_cast<float>(working_width) /
+        static_cast<float>(render_width);
+    constants.jitter_offset.y *= static_cast<float>(working_height) /
+        static_cast<float>(render_height);
+    if (set_constants(&constants, frame, &peripheral_viewport) != 0U) {
+        cleanup();
+        return false;
+    }
+
+    const void* peripheral_inputs[]{&peripheral_viewport};
+    std::uint32_t peripheral_result{};
+    D3D12PeripheralTimingScope peripheral_timing{command_list};
+    peripheral_timing.begin();
+    {
+        StreamlineEvaluationScope scope;
+        peripheral_result = evaluate(
+            0U,
+            frame,
+            peripheral_inputs,
+            1U,
+            command_list
+        );
+    }
+    peripheral_timing.finish(peripheral_result == 0U);
+
+    finish_peripheral_dlaa_motion_read(
+        command_list,
+        evaluation.peripheral
+    );
+    if (peripheral_result != 0U) {
+        evaluation.peripheral = {};
+        if (verbose) {
+            trace_event(
+                "SL eval=%llu peripheral DLAA failed result=0x%08X",
+                static_cast<unsigned long long>(sequence),
+                peripheral_result
+            );
+        }
+        return false;
+    }
+
+    finish_peripheral_dlaa_write(command_list, evaluation.peripheral);
+    if (!d3d12_set_composite_base(
+            evaluation.backend,
+            evaluation.peripheral.output,
+            0U,
+            0U
+        )) {
+        restore_peripheral_dlaa_output(
+            command_list,
+            evaluation.peripheral
+        );
+        evaluation.peripheral = {};
+        return false;
+    }
+
+    evaluation.peripheral_ready = true;
+    if (verbose) {
+        trace_event(
+            "SL eval=%llu peripheral DLAA ready size=%ux%u scale=%.2f convertedMV=%s",
+            static_cast<unsigned long long>(sequence),
+            working_width,
+            working_height,
+            evaluation.settings.peripheral_dlaa_scale,
+            evaluation.peripheral.converted_motion ? "yes" : "no"
+        );
+    }
+    return true;
+}
 
 [[nodiscard]] bool prepare_streamline_evaluation(
     ID3D12GraphicsCommandList* const command_list,
@@ -1796,7 +2203,11 @@ struct StreamlineEvaluation {
             crop.output_base_y
         );
     }
-    if (!apply_streamline_options(crop.output_width, crop.output_height)) {
+    if (!apply_streamline_options(
+            crop.output_width,
+            crop.output_height,
+            streamline_settings.center_preset
+        )) {
         if (verbose) trace_event("SL eval=%llu cropped options failed", static_cast<unsigned long long>(sequence));
         finish_d3d12_streamline(command_list, evaluation.backend, false);
         evaluation.backend = nullptr;
@@ -1831,6 +2242,29 @@ struct StreamlineEvaluation {
     );
     evaluation.motion_vectors_output_space =
         mv_native_width != 0U && mv_native_height != 0U && mv_to_output < mv_to_input;
+
+    diagnostic_note_motion_vectors(
+        DiagnosticApi::d3d12,
+        mv_native_width,
+        mv_native_height,
+        mv_native_width == 0U || mv_native_height == 0U
+            ? MotionVectorSpace::unknown
+            : evaluation.motion_vectors_output_space
+                ? MotionVectorSpace::output
+                : MotionVectorSpace::input
+    );
+
+    static_cast<void>(evaluate_streamline_peripheral_dlaa(
+        command_list,
+        frame,
+        evaluation,
+        render_width,
+        render_height,
+        output_width,
+        output_height,
+        verbose,
+        sequence
+    ));
 
     if (verbose) {
         const auto& mv_tag = evaluation.tags[2U];
@@ -2424,6 +2858,12 @@ std::uint32_t hook_sl_evaluate_feature(
         evaluation.backend,
         result == 0U
     );
+    if (evaluation.peripheral_ready) {
+        restore_peripheral_dlaa_output(
+            command_list,
+            evaluation.peripheral
+        );
+    }
     if (result == 0U && live_settings.nr_enabled) {
         StreamlineEvaluation nr_evaluation{};
         if (prepare_streamline_nr_passthrough(nr_evaluation)) {
@@ -2513,6 +2953,7 @@ void forget_d3d12_game_view(const NgxHandle* const handle) noexcept {
             break;
         }
     }
+    release_peripheral_dlaa_view(view_id);
     release_d3d12_view(view_id);
     unregister_stereo_view(view_id);
 }
@@ -2658,6 +3099,95 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
     return ngx;
 }
 
+constexpr std::array<const char*, 6U> dlss_preset_parameter_names{
+    "DLSS.Hint.Render.Preset.DLAA",
+    "DLSS.Hint.Render.Preset.Quality",
+    "DLSS.Hint.Render.Preset.Balanced",
+    "DLSS.Hint.Render.Preset.Performance",
+    "DLSS.Hint.Render.Preset.UltraPerformance",
+    "DLSS.Hint.Render.Preset.UltraQuality",
+};
+
+class NgxPresetOverrideScope {
+public:
+    NgxPresetOverrideScope(
+        const NgxParameters* const parameters,
+        const std::uint32_t preset
+    ) noexcept {
+        if (parameters == nullptr || preset == 0U) return;
+        parameters_ = const_cast<NgxParameters*>(parameters);
+        for (std::size_t index{}; index < saved_.size(); ++index) {
+            int signed_value{};
+            if (ngx_succeeded(parameters_->Get(
+                    dlss_preset_parameter_names[index],
+                    &signed_value
+                ))) {
+                saved_[index] = static_cast<std::uint32_t>(signed_value);
+            } else {
+                saved_[index] = get_ui(
+                    parameters_,
+                    dlss_preset_parameter_names[index]
+                );
+            }
+            parameters_->Set(
+                dlss_preset_parameter_names[index],
+                preset
+            );
+        }
+        active_ = true;
+    }
+
+    void restore() noexcept {
+        if (!active_ || parameters_ == nullptr) return;
+        for (std::size_t index{}; index < saved_.size(); ++index) {
+            parameters_->Set(
+                dlss_preset_parameter_names[index],
+                saved_[index]
+            );
+        }
+        active_ = false;
+    }
+
+    ~NgxPresetOverrideScope() { restore(); }
+
+private:
+    NgxParameters* parameters_{};
+    std::array<std::uint32_t, 6U> saved_{};
+    bool active_{};
+};
+
+void prepare_d3d11_direct_peripheral(
+    ID3D11DeviceContext* const context,
+    const NgxHandle* const handle,
+    const NgxParameters* const parameters,
+    const Settings& settings,
+    const D3D11PeripheralEvaluateFeatureFn evaluate_feature,
+    D3D11PeripheralDlaaResult& result
+) noexcept {
+    if (!settings.enabled || !settings.peripheral_dlaa_enabled) {
+        release_d3d11_peripheral_dlaa_view(handle);
+        return;
+    }
+    auto create_feature = real_create_d3d11.load(std::memory_order_acquire);
+    if (create_feature == nullptr) {
+        create_feature = real_core_create_d3d11.load(std::memory_order_acquire);
+    }
+    auto release_feature = real_release_d3d11.load(std::memory_order_acquire);
+    if (release_feature == nullptr) {
+        release_feature = real_core_release_d3d11.load(
+            std::memory_order_acquire
+        );
+    }
+    if (create_feature == nullptr || evaluate_feature == nullptr ||
+        release_feature == nullptr) {
+        return;
+    }
+    static_cast<void>(evaluate_d3d11_peripheral_dlaa(
+        context, handle, parameters, settings,
+        create_feature, evaluate_feature, release_feature, result
+    ));
+}
+
 NgxResult hook_create_d3d11(
     ID3D11DeviceContext* const context,
     const std::uint32_t feature,
@@ -2749,25 +3279,53 @@ NgxResult hook_evaluate_d3d11(
             D3D11TransportStatus::not_attempted
         );
     }
-    if (settings.d3d11_use_d3d12_transport && evaluate_d3d11_via_d3d12(
-            context, handle, parameters, settings,
-            current_transport_ngx(), transport_result)) {
-        diagnostic_note_d3d11_execution_path(
-            D3D11ExecutionPath::dx12_transport
-        );
-        diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::active);
-        diagnostic_note_result(DiagnosticApi::d3d11, transport_result);
-        return transport_result;
+    if (settings.d3d11_use_d3d12_transport) {
+        NgxPresetOverrideScope center_preset{
+            parameters, settings.center_preset
+        };
+        if (evaluate_d3d11_via_d3d12(
+                context, handle, parameters, settings,
+                current_transport_ngx(), transport_result)) {
+            release_d3d11_peripheral_dlaa_view(handle);
+            diagnostic_note_d3d11_execution_path(
+                D3D11ExecutionPath::dx12_transport
+            );
+            diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::active);
+            diagnostic_note_result(DiagnosticApi::d3d11, transport_result);
+            return transport_result;
+        }
     }
 
+    D3D11PeripheralDlaaResult peripheral{};
+    prepare_d3d11_direct_peripheral(
+        context,
+        handle,
+        parameters,
+        settings,
+        original,
+        peripheral
+    );
+    NgxPresetOverrideScope center_preset{
+        parameters, settings.center_preset
+    };
     auto* const evaluation = prepare_d3d11_private(
         context,
         handle,
         parameters,
         settings
     );
+    if (evaluation != nullptr && peripheral.output_srv != nullptr) {
+        d3d11_set_composite_base(
+            evaluation,
+            peripheral.output_srv,
+            peripheral.working_width,
+            peripheral.working_height
+        );
+    }
+    release_d3d11_peripheral_dlaa_result(peripheral);
     const auto* const private_handle = d3d11_private_handle(evaluation);
     if (evaluation == nullptr || private_handle == nullptr) {
+        center_preset.restore();
         diagnostic_note_state(
             DiagnosticApi::d3d11,
             DiagnosticState::prepare_rejected
@@ -2791,6 +3349,7 @@ NgxResult hook_evaluate_d3d11(
         result = original(context, private_handle, parameters, callback);
     }
     finish_d3d11(context, parameters, evaluation, result);
+    center_preset.restore();
 
     // If the private feature ever rejects a frame, its parameter block has now
     // been restored by finish_d3d11. Fall back to the game's original feature
@@ -2857,25 +3416,53 @@ NgxResult hook_evaluate_d3d11_c(
             D3D11TransportStatus::not_attempted
         );
     }
-    if (settings.d3d11_use_d3d12_transport && evaluate_d3d11_via_d3d12(
-            context, handle, parameters, settings,
-            current_transport_ngx(), transport_result)) {
-        diagnostic_note_d3d11_execution_path(
-            D3D11ExecutionPath::dx12_transport
-        );
-        diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::active);
-        diagnostic_note_result(DiagnosticApi::d3d11, transport_result);
-        return transport_result;
+    if (settings.d3d11_use_d3d12_transport) {
+        NgxPresetOverrideScope center_preset{
+            parameters, settings.center_preset
+        };
+        if (evaluate_d3d11_via_d3d12(
+                context, handle, parameters, settings,
+                current_transport_ngx(), transport_result)) {
+            release_d3d11_peripheral_dlaa_view(handle);
+            diagnostic_note_d3d11_execution_path(
+                D3D11ExecutionPath::dx12_transport
+            );
+            diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::active);
+            diagnostic_note_result(DiagnosticApi::d3d11, transport_result);
+            return transport_result;
+        }
     }
 
+    D3D11PeripheralDlaaResult peripheral{};
+    prepare_d3d11_direct_peripheral(
+        context,
+        handle,
+        parameters,
+        settings,
+        real_evaluate_d3d11.load(std::memory_order_acquire),
+        peripheral
+    );
+    NgxPresetOverrideScope center_preset{
+        parameters, settings.center_preset
+    };
     auto* const evaluation = prepare_d3d11_private(
         context,
         handle,
         parameters,
         settings
     );
+    if (evaluation != nullptr && peripheral.output_srv != nullptr) {
+        d3d11_set_composite_base(
+            evaluation,
+            peripheral.output_srv,
+            peripheral.working_width,
+            peripheral.working_height
+        );
+    }
+    release_d3d11_peripheral_dlaa_result(peripheral);
     const auto* const private_handle = d3d11_private_handle(evaluation);
     if (evaluation == nullptr || private_handle == nullptr) {
+        center_preset.restore();
         diagnostic_note_state(
             DiagnosticApi::d3d11,
             DiagnosticState::prepare_rejected
@@ -2899,6 +3486,7 @@ NgxResult hook_evaluate_d3d11_c(
         result = original(context, private_handle, parameters, callback);
     }
     finish_d3d11(context, parameters, evaluation, result);
+    center_preset.restore();
     if (!ngx_succeeded(result)) {
         diagnostic_note_state(
             DiagnosticApi::d3d11,
@@ -2925,6 +3513,7 @@ NgxResult hook_evaluate_d3d11_c(
 NgxResult hook_release_d3d11(NgxHandle* const handle) {
     const auto original = real_release_d3d11.load(std::memory_order_acquire);
     release_d3d11_transport_view(handle);
+    release_d3d11_peripheral_dlaa_view(handle);
     unregister_d3d11_game_feature(handle);
     unregister_stereo_view(static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
@@ -2935,6 +3524,7 @@ NgxResult hook_release_d3d11(NgxHandle* const handle) {
 NgxResult hook_core_release_d3d11(NgxHandle* const handle) {
     const auto original = real_core_release_d3d11.load(std::memory_order_acquire);
     release_d3d11_transport_view(handle);
+    release_d3d11_peripheral_dlaa_view(handle);
     unregister_d3d11_game_feature(handle);
     unregister_stereo_view(static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
@@ -3122,13 +3712,129 @@ void evaluate_nr_after_native_d3d12(
     );
 
     const auto effective_settings = settings_for_view(settings, contract.view_id);
+
+    auto* const full_color = get_d3d12_parameter_resource(parameters, "Color");
+    auto* const full_depth = get_d3d12_parameter_resource(parameters, "Depth");
+    auto* const full_motion =
+        get_d3d12_parameter_resource(parameters, "MotionVectors");
+    auto* const full_output = get_d3d12_parameter_resource(parameters, "Output");
+    const auto full_color_x = contract.color_base_x;
+    const auto full_color_y = contract.color_base_y;
+    const auto full_depth_x = contract.depth_base_x;
+    const auto full_depth_y = contract.depth_base_y;
+    const auto full_mv_x = contract.mv_base_x;
+    const auto full_mv_y = contract.mv_base_y;
+
+    bool motion_vectors_output_space = !contract.motion_vectors_low_res;
+    if (full_motion != nullptr) {
+        const auto motion_description = full_motion->GetDesc();
+        const auto mv_width =
+            static_cast<std::uint32_t>(motion_description.Width);
+        const auto mv_height = motion_description.Height;
+        const auto distance_input = dimension_distance(
+            mv_width,
+            mv_height,
+            contract.render_width,
+            contract.render_height
+        );
+        const auto distance_output = dimension_distance(
+            mv_width,
+            mv_height,
+            contract.output_width,
+            contract.output_height
+        );
+        if (distance_input != distance_output) {
+            motion_vectors_output_space = distance_output < distance_input;
+        }
+        diagnostic_note_motion_vectors(
+            DiagnosticApi::d3d12,
+            mv_width,
+            mv_height,
+            motion_vectors_output_space
+                ? MotionVectorSpace::output
+                : MotionVectorSpace::input
+        );
+    }
+
+    D3D12BackendCallbacks callbacks{};
+    callbacks.create_feature = real_create_d3d12.load(std::memory_order_acquire);
+    callbacks.evaluate_feature = evaluate;
+    callbacks.release_feature = real_release_d3d12.load(std::memory_order_acquire);
+
+    PeripheralDlaaResources peripheral{};
+    bool peripheral_ready{};
+    if (effective_settings.peripheral_dlaa_enabled &&
+        contract.feature_id == 1U &&
+        full_color != nullptr && full_depth != nullptr &&
+        full_motion != nullptr && full_output != nullptr) {
+        PeripheralDlaaRequest peripheral_request{};
+        peripheral_request.view_id = contract.view_id;
+        peripheral_request.command_list = command_list;
+        peripheral_request.color = full_color;
+        peripheral_request.depth = full_depth;
+        peripheral_request.motion_vectors = full_motion;
+        peripheral_request.output_template = full_output;
+        peripheral_request.render_width = contract.render_width;
+        peripheral_request.render_height = contract.render_height;
+        peripheral_request.source_output_width = contract.output_width;
+        peripheral_request.source_output_height = contract.output_height;
+        peripheral_request.scale = effective_settings.peripheral_dlaa_scale;
+        peripheral_request.preset = effective_settings.peripheral_dlaa_preset;
+        peripheral_request.color_base_x = full_color_x;
+        peripheral_request.color_base_y = full_color_y;
+        peripheral_request.depth_base_x = full_depth_x;
+        peripheral_request.depth_base_y = full_depth_y;
+        peripheral_request.mv_base_x = full_mv_x;
+        peripheral_request.mv_base_y = full_mv_y;
+        peripheral_request.motion_vectors_output_space =
+            motion_vectors_output_space;
+        peripheral_request.motion_vector_scale_x =
+            contract.motion_vector_scale_x;
+        peripheral_request.motion_vector_scale_y =
+            contract.motion_vector_scale_y;
+        peripheral_request.depth_inverted = contract.depth_inverted;
+        peripheral_request.reset = contract.reset;
+        peripheral_request.create_flags = contract.create_flags;
+        peripheral_request.parameters =
+            const_cast<NgxParameters*>(parameters);
+        peripheral_request.callbacks = callbacks;
+        D3D12PeripheralTimingScope peripheral_timing{command_list};
+        NgxResult peripheral_result{};
+        peripheral_ready = evaluate_peripheral_dlaa_ngx(
+            peripheral_request,
+            peripheral,
+            peripheral_result,
+            peripheral_timing.backend()
+        );
+        peripheral_timing.finish(peripheral_ready);
+    }
+
+    NgxPresetOverrideScope center_preset{
+        parameters, effective_settings.center_preset
+    };
     auto* const evaluation = prepare_d3d12(
         command_list,
         parameters,
         effective_settings
     );
-    if (evaluation == nullptr) return false;
+    if (evaluation == nullptr) {
+        if (peripheral_ready) {
+            restore_peripheral_dlaa_output(command_list, peripheral);
+        }
+        return false;
+    }
     private_attempted = true;
+
+    if (peripheral_ready && !d3d12_set_composite_base(
+            evaluation,
+            peripheral.output,
+            0U,
+            0U
+        )) {
+        restore_peripheral_dlaa_output(command_list, peripheral);
+        peripheral_ready = false;
+    }
+
     D3D12DlssInputs inputs{};
     inputs.color = get_d3d12_parameter_resource(parameters, "Color");
     inputs.depth = get_d3d12_parameter_resource(parameters, "Depth");
@@ -3142,10 +3848,6 @@ void evaluate_nr_after_native_d3d12(
     inputs.mv_base_x = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.X");
     inputs.mv_base_y = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.Y");
 
-    D3D12BackendCallbacks callbacks{};
-    callbacks.create_feature = real_create_d3d12.load(std::memory_order_acquire);
-    callbacks.evaluate_feature = evaluate;
-    callbacks.release_feature = real_release_d3d12.load(std::memory_order_acquire);
     const auto crop = d3d12_evaluation_crop(evaluation);
     note_stereo_view_geometry(
         contract.view_id,
@@ -3162,6 +3864,9 @@ void evaluate_nr_after_native_d3d12(
     );
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
     finish_d3d12(command_list, parameters, evaluation, result);
+    if (peripheral_ready) {
+        restore_peripheral_dlaa_output(command_list, peripheral);
+    }
     if (!ngx_succeeded(result)) return false;
     evaluate_nr_after_native_d3d12(
         command_list, handle, parameters, effective_settings, result
@@ -4367,6 +5072,7 @@ void stop_interception() noexcept {
     }
     shutdown_direct_export_hooks();
     release_d3d11_dlss_timers();
+    release_d3d11_peripheral_dlaa_resources();
     release_d3d12_nr_timers();
     uninstall_early_loader_interception();
     uninstall_hook_debug_diagnostics();

@@ -684,6 +684,9 @@ struct D3D11Evaluation {
     ID3D11Texture2D* private_output{};
     ID3D11ShaderResourceView* color_srv{};
     ID3D11ShaderResourceView* dlss_srv{};
+    ID3D11ShaderResourceView* peripheral_base_srv{};
+    std::uint32_t peripheral_base_width{};
+    std::uint32_t peripheral_base_height{};
     ID3D11UnorderedAccessView* output_uav{};
     ID3D11ComputeShader* composite_shader{};
     ID3D11Buffer* constant_buffer{};
@@ -722,6 +725,7 @@ void destroy_evaluation(D3D11Evaluation* const evaluation) noexcept {
     release(evaluation->composite_shader);
     release(evaluation->output_uav);
     release(evaluation->dlss_srv);
+    release(evaluation->peripheral_base_srv);
     release(evaluation->color_srv);
     release(evaluation->private_output);
     release(evaluation->original_output);
@@ -1112,6 +1116,23 @@ extern "C" const NgxHandle* d3d11_private_handle(
     return evaluation == nullptr ? nullptr : evaluation->private_handle;
 }
 
+void d3d11_set_composite_base(
+    D3D11Evaluation* const evaluation,
+    ID3D11ShaderResourceView* const base_srv,
+    const std::uint32_t width,
+    const std::uint32_t height
+) noexcept {
+    if (evaluation == nullptr || base_srv == nullptr ||
+        width == 0U || height == 0U) {
+        return;
+    }
+    release(evaluation->peripheral_base_srv);
+    evaluation->peripheral_base_srv = base_srv;
+    evaluation->peripheral_base_srv->AddRef();
+    evaluation->peripheral_base_width = width;
+    evaluation->peripheral_base_height = height;
+}
+
 extern "C" bool is_d3d11_private_handle(
     const NgxHandle* const handle
 ) noexcept {
@@ -1194,11 +1215,25 @@ void finish_d3d11(
 
     // Destination is the centered location in the game output. Source is the
     // packed private-DLSS texture starting at (0, 0).
+    const bool has_peripheral_base =
+        evaluation->peripheral_base_srv != nullptr &&
+        evaluation->peripheral_base_width != 0U &&
+        evaluation->peripheral_base_height != 0U;
     FoveatedConstants constants{
         {evaluation->output_width, evaluation->output_height},
         {evaluation->output_x, evaluation->output_y},
-        {evaluation->color_x, evaluation->color_y},
-        {evaluation->render_width, evaluation->render_height},
+        {
+            has_peripheral_base ? 0U : evaluation->color_x,
+            has_peripheral_base ? 0U : evaluation->color_y,
+        },
+        {
+            has_peripheral_base
+                ? evaluation->peripheral_base_width
+                : evaluation->render_width,
+            has_peripheral_base
+                ? evaluation->peripheral_base_height
+                : evaluation->render_height,
+        },
         {evaluation->crop.output_base_x, evaluation->crop.output_base_y},
         {evaluation->crop.output_width, evaluation->crop.output_height},
         evaluation->settings.width,
@@ -1243,7 +1278,9 @@ void finish_d3d11(
     context->CSGetConstantBuffers(0U, 1U, &previous_constant_buffer);
 
     ID3D11ShaderResourceView* srvs[] = {
-        evaluation->color_srv,
+        has_peripheral_base
+            ? evaluation->peripheral_base_srv
+            : evaluation->color_srv,
         evaluation->dlss_srv,
     };
     context->CSSetShader(evaluation->composite_shader, nullptr, 0U);

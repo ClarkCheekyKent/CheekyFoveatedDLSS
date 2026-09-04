@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "diagnostics.hpp"
+#include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
 
 #include <d3dcompiler.h>
@@ -688,6 +689,8 @@ struct D3D12Evaluation {
     std::uint32_t original_output_subrects{};
     std::uint32_t render_width{};
     std::uint32_t render_height{};
+    std::uint32_t composite_input_width{};
+    std::uint32_t composite_input_height{};
     std::uint32_t output_width{};
     std::uint32_t output_height{};
     std::uint32_t color_x{};
@@ -836,6 +839,8 @@ D3D12Evaluation* prepare_d3d12(
     if (evaluation->render_height == 0U) {
         evaluation->render_height = render_height;
     }
+    evaluation->composite_input_width = evaluation->render_width;
+    evaluation->composite_input_height = evaluation->render_height;
     evaluation->output_width = output_width;
     evaluation->output_height = output_height;
     evaluation->color_x = color_x;
@@ -953,6 +958,17 @@ D3D12Evaluation* prepare_d3d12(
     bool motion_vectors_low_res = flag_says_low_res;
     if (low_res_fits != high_res_fits) {
         motion_vectors_low_res = low_res_fits;
+    }
+    if (motion_vectors != nullptr) {
+        const auto motion_description = motion_vectors->GetDesc();
+        diagnostic_note_motion_vectors(
+            DiagnosticApi::d3d12,
+            static_cast<std::uint32_t>(motion_description.Width),
+            motion_description.Height,
+            motion_vectors_low_res
+                ? MotionVectorSpace::input
+                : MotionVectorSpace::output
+        );
     }
     const auto motion_crop_x = motion_vectors_low_res
         ? crop.input_base_x
@@ -1076,6 +1092,8 @@ D3D12Evaluation* prepare_d3d12_streamline(
     evaluation->original_output = output;
     evaluation->render_width = render_width;
     evaluation->render_height = render_height;
+    evaluation->composite_input_width = render_width;
+    evaluation->composite_input_height = render_height;
     evaluation->output_width = output_width;
     evaluation->output_height = output_height;
     evaluation->color_x = color_x;
@@ -1140,6 +1158,44 @@ ID3D12Resource* d3d12_private_output(
     return evaluation == nullptr || evaluation->resources == nullptr
         ? nullptr
         : evaluation->resources->dlss_output;
+}
+
+bool d3d12_set_composite_base(
+    D3D12Evaluation* const evaluation,
+    ID3D12Resource* const low_resolution_color,
+    const std::uint32_t input_base_x,
+    const std::uint32_t input_base_y
+) noexcept {
+    if (evaluation == nullptr || evaluation->resources == nullptr ||
+        low_resolution_color == nullptr) {
+        return false;
+    }
+    const auto description = low_resolution_color->GetDesc();
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        description.MipLevels != 1U || description.DepthOrArraySize != 1U ||
+        description.Format == DXGI_FORMAT_UNKNOWN) {
+        return false;
+    }
+    auto* const resources = evaluation->resources;
+    auto cpu = resources->descriptors->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += evaluation->descriptor_offset;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = description.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1U;
+    resources->device->CreateShaderResourceView(
+        low_resolution_color,
+        &srv,
+        cpu
+    );
+    evaluation->color_x = input_base_x;
+    evaluation->color_y = input_base_y;
+    evaluation->composite_input_width = static_cast<std::uint32_t>(
+        description.Width
+    );
+    evaluation->composite_input_height = description.Height;
+    return true;
 }
 
 CropGeometry d3d12_evaluation_crop(
@@ -1250,7 +1306,10 @@ void finish_d3d12(
             {evaluation->output_width, evaluation->output_height},
             {evaluation->output_x, evaluation->output_y},
             {evaluation->color_x, evaluation->color_y},
-            {evaluation->render_width, evaluation->render_height},
+            {
+                evaluation->composite_input_width,
+                evaluation->composite_input_height,
+            },
             {
                 evaluation->composite_x,
                 evaluation->composite_y,
@@ -1461,6 +1520,14 @@ NgxResult evaluate_d3d12_backend(
         }
 
         if (view->private_handle != nullptr) {
+            if (timing != nullptr && timing->query_heap != nullptr &&
+                timing->write_begin_timestamp) {
+                command_list->EndQuery(
+                    timing->query_heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    timing->begin_query_index
+                );
+            }
             if (contract.reset || key_changed || crop_changed) {
                 parameters->Set("Reset", 1);
             }
@@ -1474,7 +1541,7 @@ NgxResult evaluate_d3d12_backend(
                 command_list->EndQuery(
                     timing->query_heap,
                     D3D12_QUERY_TYPE_TIMESTAMP,
-                    1U
+                    timing->end_query_index
                 );
                 timing->sr_timestamp_written = true;
             }
@@ -1548,6 +1615,8 @@ void release_d3d12_resources() noexcept {
         }
         release_d3d12_view(view_id);
     }
+
+    release_peripheral_dlaa_resources();
 
     AcquireSRWLockExclusive(&resources_lock);
     auto* current = resource_list;

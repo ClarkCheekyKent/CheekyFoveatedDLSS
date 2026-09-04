@@ -11,14 +11,22 @@ enum class DiagnosticApi : std::uint32_t {
     d3d12,
 };
 
+enum class MotionVectorSpace : std::uint32_t {
+    unknown,
+    input,
+    output,
+};
+
 enum class DiagnosticGpuTiming : std::uint32_t {
     transport_total,
     foveated_dlss,
     native_dlss,
+    peripheral_dlaa,
     full_dlss_nr,
     foveated_dlss_nr,
     d3d12_full_dlss_nr,
     d3d12_foveated_dlss_nr,
+    d3d12_peripheral_dlaa,
     count,
 };
 
@@ -76,9 +84,13 @@ struct DiagnosticSnapshot {
     std::uint32_t received_input_height{};
     std::uint32_t received_output_width{};
     std::uint32_t received_output_height{};
+    std::uint32_t motion_vector_width{};
+    std::uint32_t motion_vector_height{};
+    MotionVectorSpace motion_vector_space{MotionVectorSpace::unknown};
     CropGeometry passed_crop{};
     float transport_gpu_ms{};
     float foveated_dlss_gpu_ms{};
+    float peripheral_dlaa_gpu_ms{};
     float full_dlss_nr_gpu_ms{};
     float foveated_dlss_nr_gpu_ms{};
     float native_dlss_gpu_ms{};
@@ -106,6 +118,12 @@ void diagnostic_note_evaluate(
     std::uint32_t output_width,
     std::uint32_t output_height
 ) noexcept;
+void diagnostic_note_motion_vectors(
+    DiagnosticApi api,
+    std::uint32_t width,
+    std::uint32_t height,
+    MotionVectorSpace space
+) noexcept;
 void diagnostic_note_state(DiagnosticApi api, DiagnosticState state) noexcept;
 void diagnostic_note_activation(
     DiagnosticApi api,
@@ -122,6 +140,10 @@ void diagnostic_note_private_result(
 void diagnostic_note_result(DiagnosticApi api, std::uint32_t result) noexcept;
 void diagnostic_note_transport_gpu_time(float milliseconds) noexcept;
 void diagnostic_note_foveated_dlss_gpu_time(float milliseconds) noexcept;
+void diagnostic_note_peripheral_dlaa_gpu_time(
+    DiagnosticApi api,
+    float milliseconds
+) noexcept;
 void diagnostic_note_dlss_nr_gpu_time(
     DiagnosticApi api,
     float milliseconds,
@@ -140,6 +162,9 @@ void diagnostic_note_d3d11_transport_status(D3D11TransportStatus status) noexcep
 
 [[nodiscard]] DiagnosticSnapshot diagnostic_snapshot(
     DiagnosticApi api
+) noexcept;
+[[nodiscard]] const char* motion_vector_space_name(
+    MotionVectorSpace space
 ) noexcept;
 [[nodiscard]] const char* diagnostic_state_name(DiagnosticState state) noexcept;
 [[nodiscard]] const char* d3d11_execution_path_name(

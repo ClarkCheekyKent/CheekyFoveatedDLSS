@@ -11,13 +11,17 @@ namespace {
 
 std::atomic<bool> enabled{true};
 std::atomic<bool> d3d11_use_d3d12_transport{false};
-std::atomic<std::uint32_t> width_bits{0x3F4CCCCDU};
+std::atomic<bool> peripheral_dlaa_enabled{true};
+std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
+std::atomic<std::uint32_t> center_preset{};
+std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
+std::atomic<std::uint32_t> width_bits{0x3F0CCCCDU};
 std::atomic<std::uint32_t> height_bits{0x3EE66666U};
-std::atomic<std::uint32_t> x_offset_bits{0x3E9EB852U};
-std::atomic<std::uint32_t> height_offset_bits{0xBEE147AEU};
+std::atomic<std::uint32_t> x_offset_bits{0x3F19999AU};
+std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
 std::atomic<std::uint32_t> roundness_bits{};
-std::atomic<std::uint32_t> transition_bits{};
+std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
 std::atomic<bool> alignment_border_enabled{false};
 std::atomic<bool> nr_enabled{false};
 std::atomic<bool> nr_foveated{true};
@@ -93,6 +97,13 @@ Settings current_settings() noexcept {
     settings.enabled = enabled.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
         d3d11_use_d3d12_transport.load(std::memory_order_acquire);
+    settings.peripheral_dlaa_enabled =
+        peripheral_dlaa_enabled.load(std::memory_order_acquire);
+    settings.peripheral_dlaa_scale = load_float(peripheral_dlaa_scale_bits);
+    settings.center_preset =
+        center_preset.load(std::memory_order_acquire);
+    settings.peripheral_dlaa_preset =
+        peripheral_dlaa_preset.load(std::memory_order_acquire);
     settings.width = load_float(width_bits);
     settings.height = load_float(height_bits);
     settings.x_offset = load_float(x_offset_bits);
@@ -139,6 +150,29 @@ void update_settings(const Settings& settings) noexcept {
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(
         settings.d3d11_use_d3d12_transport,
+        std::memory_order_release
+    );
+    peripheral_dlaa_enabled.store(
+        settings.peripheral_dlaa_enabled,
+        std::memory_order_release
+    );
+    store_float(
+        peripheral_dlaa_scale_bits,
+        std::clamp(settings.peripheral_dlaa_scale, 0.20F, 1.0F)
+    );
+    const auto valid_preset = [](const std::uint32_t value) noexcept {
+        return value == 5U || value == 11U || value == 12U || value == 13U;
+    };
+    center_preset.store(
+        settings.center_preset == 0U || valid_preset(settings.center_preset)
+            ? settings.center_preset
+            : 0U,
+        std::memory_order_release
+    );
+    peripheral_dlaa_preset.store(
+        valid_preset(settings.peripheral_dlaa_preset)
+            ? settings.peripheral_dlaa_preset
+            : 5U,
         std::memory_order_release
     );
     store_float(width_bits, std::clamp(settings.width, 0.20F, 1.0F));

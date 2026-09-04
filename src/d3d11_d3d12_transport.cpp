@@ -1,6 +1,7 @@
 #include "d3d11_d3d12_transport.hpp"
 
 #include "diagnostics.hpp"
+#include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
 
 #include <d3d11_4.h>
@@ -132,6 +133,10 @@ struct TransportSlot {
     SharedTexture depth;
     SharedTexture motion_vectors;
     SharedTexture output;
+    SharedTexture peripheral_color;
+    SharedTexture peripheral_depth;
+    SharedTexture peripheral_motion_vectors;
+    SharedTexture peripheral_output;
     SharedTexture nr_color;
     SharedTexture nr_depth;
     SharedTexture nr_motion_vectors;
@@ -145,12 +150,20 @@ struct TransportSlot {
     ID3D12Resource* dlss_timing_readback{};
     bool dlss_timing_pending{};
     std::uint32_t dlss_timing_query_count{};
+    bool dlss_peripheral_timing_recorded{};
     bool dlss_nr_timing_foveated{};
     std::uint64_t done_value{};
     std::uint32_t input_width{};
     std::uint32_t input_height{};
     std::uint32_t output_width{};
     std::uint32_t output_height{};
+    std::uint32_t peripheral_render_width{};
+    std::uint32_t peripheral_render_height{};
+    std::uint32_t peripheral_output_width{};
+    std::uint32_t peripheral_output_height{};
+    std::uint32_t peripheral_motion_width{};
+    std::uint32_t peripheral_motion_height{};
+    bool peripheral_enabled{};
     std::uint32_t nr_input_width{};
     std::uint32_t nr_input_height{};
     std::uint32_t nr_output_width{};
@@ -216,6 +229,10 @@ void release_slot(TransportSlot& slot) noexcept {
     release_shared_texture(slot.motion_vectors);
     release_shared_texture(slot.depth);
     release_shared_texture(slot.color);
+    release_shared_texture(slot.peripheral_output);
+    release_shared_texture(slot.peripheral_motion_vectors);
+    release_shared_texture(slot.peripheral_depth);
+    release_shared_texture(slot.peripheral_color);
     release_shared_texture(slot.nr_motion_vectors);
     release_shared_texture(slot.nr_depth);
     release_shared_texture(slot.nr_color);
@@ -226,6 +243,7 @@ void release_slot(TransportSlot& slot) noexcept {
 
 void release_device(TransportDevice& device) noexcept {
     for (auto& view : device.views) {
+        release_peripheral_dlaa_view(view.view_id);
         release_d3d12_view(view.view_id);
     }
     if (device.ngx_parameters != nullptr) {
@@ -685,6 +703,13 @@ void trace_format_support(
     const std::uint32_t motion_width,
     const std::uint32_t motion_height,
     const bool nr_enabled,
+    const std::uint32_t peripheral_render_width,
+    const std::uint32_t peripheral_render_height,
+    const std::uint32_t peripheral_output_width,
+    const std::uint32_t peripheral_output_height,
+    const std::uint32_t peripheral_motion_width,
+    const std::uint32_t peripheral_motion_height,
+    const bool peripheral_enabled,
     const DXGI_FORMAT color_format,
     const DXGI_FORMAT motion_format,
     const DXGI_FORMAT output_format
@@ -697,6 +722,19 @@ void trace_format_support(
         slot.color_format == color_format &&
         slot.motion_format == motion_format &&
         slot.output_format == output_format &&
+        (!peripheral_enabled || (
+            slot.peripheral_enabled &&
+            slot.peripheral_color.resource12 != nullptr &&
+            slot.peripheral_depth.resource12 != nullptr &&
+            slot.peripheral_motion_vectors.resource12 != nullptr &&
+            slot.peripheral_output.resource12 != nullptr &&
+            slot.peripheral_render_width == peripheral_render_width &&
+            slot.peripheral_render_height == peripheral_render_height &&
+            slot.peripheral_output_width == peripheral_output_width &&
+            slot.peripheral_output_height == peripheral_output_height &&
+            slot.peripheral_motion_width == peripheral_motion_width &&
+            slot.peripheral_motion_height == peripheral_motion_height
+        )) &&
         (!nr_enabled || (
             slot.nr_color.resource12 != nullptr &&
             slot.nr_input_width == render_width &&
@@ -719,6 +757,13 @@ void trace_format_support(
     const std::uint32_t motion_width,
     const std::uint32_t motion_height,
     const bool nr_enabled,
+    const std::uint32_t peripheral_render_width,
+    const std::uint32_t peripheral_render_height,
+    const std::uint32_t peripheral_output_width,
+    const std::uint32_t peripheral_output_height,
+    const std::uint32_t peripheral_motion_width,
+    const std::uint32_t peripheral_motion_height,
+    const bool peripheral_enabled,
     const DXGI_FORMAT color_format,
     const DXGI_FORMAT motion_format,
     const DXGI_FORMAT output_format
@@ -763,14 +808,14 @@ void trace_format_support(
     }
     D3D12_QUERY_HEAP_DESC query_desc{};
     query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    query_desc.Count = 4U;
+    query_desc.Count = 6U;
     D3D12_HEAP_PROPERTIES readback_heap{};
     readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
     readback_heap.CreationNodeMask = 1U;
     readback_heap.VisibleNodeMask = 1U;
     D3D12_RESOURCE_DESC readback_desc{};
     readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    readback_desc.Width = sizeof(std::uint64_t) * 4U;
+    readback_desc.Width = sizeof(std::uint64_t) * 6U;
     readback_desc.Height = 1U;
     readback_desc.DepthOrArraySize = 1U;
     readback_desc.MipLevels = 1U;
@@ -809,6 +854,23 @@ void trace_format_support(
         !create_shared_texture(device, "output",
             crop.output_width, crop.output_height, output_format,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.output) ||
+        (peripheral_enabled && (
+            !create_shared_texture(device, "peripheral DLAA color",
+                peripheral_render_width, peripheral_render_height, color_format,
+                D3D12_RESOURCE_FLAG_NONE, slot.peripheral_color) ||
+            !create_shared_texture(device, "peripheral DLAA depth",
+                peripheral_render_width, peripheral_render_height,
+                DXGI_FORMAT_R32_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                slot.peripheral_depth) ||
+            !create_shared_texture(device, "peripheral DLAA motion vectors",
+                peripheral_motion_width, peripheral_motion_height, motion_format,
+                D3D12_RESOURCE_FLAG_NONE, slot.peripheral_motion_vectors) ||
+            !create_shared_texture(device, "peripheral DLAA output",
+                peripheral_output_width, peripheral_output_height, output_format,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                slot.peripheral_output)
+        )) ||
         (nr_enabled && (
             !create_shared_texture(device, "NR composited color",
                 output_width, output_height, output_format,
@@ -827,6 +889,13 @@ void trace_format_support(
     slot.input_height = crop.input_height;
     slot.output_width = crop.output_width;
     slot.output_height = crop.output_height;
+    slot.peripheral_render_width = peripheral_render_width;
+    slot.peripheral_render_height = peripheral_render_height;
+    slot.peripheral_output_width = peripheral_output_width;
+    slot.peripheral_output_height = peripheral_output_height;
+    slot.peripheral_motion_width = peripheral_motion_width;
+    slot.peripheral_motion_height = peripheral_motion_height;
+    slot.peripheral_enabled = peripheral_enabled;
     slot.nr_input_width = render_width;
     slot.nr_input_height = render_height;
     slot.nr_output_width = output_width;
@@ -992,13 +1061,20 @@ void resolve_dlss_timing(
     const auto* const timestamps = static_cast<const std::uint64_t*>(mapped);
     const auto begin = timestamps[0U];
     const auto sr_end = timestamps[1U];
-    const auto nr_begin = query_count >= 4U ? timestamps[2U] : 0U;
-    const auto nr_end = query_count >= 4U ? timestamps[3U] : 0U;
+    const bool has_peripheral = slot.dlss_peripheral_timing_recorded &&
+        query_count >= 4U;
+    const auto peripheral_begin = has_peripheral ? timestamps[2U] : 0U;
+    const auto peripheral_end = has_peripheral ? timestamps[3U] : 0U;
+    const auto nr_query_base = has_peripheral ? 4U : 2U;
+    const bool has_nr = query_count >= nr_query_base + 2U;
+    const auto nr_begin = has_nr ? timestamps[nr_query_base] : 0U;
+    const auto nr_end = has_nr ? timestamps[nr_query_base + 1U] : 0U;
     const bool nr_foveated = slot.dlss_nr_timing_foveated;
     const D3D12_RANGE written_range{0U, 0U};
     slot.dlss_timing_readback->Unmap(0U, &written_range);
     slot.dlss_timing_pending = false;
     slot.dlss_timing_query_count = 0U;
+    slot.dlss_peripheral_timing_recorded = false;
     if (sr_end >= begin) {
         const auto milliseconds = static_cast<float>(
             static_cast<double>(sr_end - begin) * 1000.0 /
@@ -1006,7 +1082,16 @@ void resolve_dlss_timing(
         );
         diagnostic_note_foveated_dlss_gpu_time(milliseconds);
     }
-    if (query_count >= 4U && nr_end >= nr_begin) {
+    if (has_peripheral && peripheral_end >= peripheral_begin) {
+        const auto milliseconds = static_cast<float>(
+            static_cast<double>(peripheral_end - peripheral_begin) * 1000.0 /
+            static_cast<double>(device.timestamp_frequency)
+        );
+        diagnostic_note_peripheral_dlaa_gpu_time(
+            DiagnosticApi::d3d11, milliseconds
+        );
+    }
+    if (has_nr && nr_end >= nr_begin) {
         const auto milliseconds = static_cast<float>(
             static_cast<double>(nr_end - nr_begin) * 1000.0 /
             static_cast<double>(device.timestamp_frequency)
@@ -1250,6 +1335,11 @@ bool evaluate_d3d11_via_d3d12(
     auto render_height = get_ui(parameters, "DLSS.Render.Subrect.Dimensions.Height");
     if (render_width == 0U) render_width = width;
     if (render_height == 0U) render_height = height;
+    const auto peripheral_dimensions = peripheral_dlaa_dimensions(
+        render_width,
+        render_height,
+        settings.peripheral_dlaa_scale
+    );
     const auto color_x = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.X");
     const auto color_y = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.Y");
     const auto depth_x = get_ui(parameters, "DLSS.Input.Depth.Subrect.Base.X");
@@ -1283,6 +1373,15 @@ bool evaluate_d3d11_via_d3d12(
 
     const auto create_flags = get_integer_bits(parameters, "DLSS.Feature.Create.Flags");
     const bool mv_low_res = (create_flags & dlss_feature_flag_mv_low_res) != 0U;
+    diagnostic_note_motion_vectors(
+        DiagnosticApi::d3d11,
+        motion_desc.Width,
+        motion_desc.Height,
+        mv_low_res
+            ? MotionVectorSpace::input
+            : MotionVectorSpace::output
+    );
+
     const auto mv_crop_x = mv_low_res
         ? crop.input_base_x
         : crop.output_base_x - output_x;
@@ -1326,6 +1425,10 @@ bool evaluate_d3d11_via_d3d12(
         : ScaledRange{};
     if (!in_bounds(mv_x + mv_crop_x, mv_width, motion_desc.Width) ||
         !in_bounds(mv_y + mv_crop_y, mv_height, motion_desc.Height) ||
+        (settings.peripheral_dlaa_enabled && (
+            !in_bounds(mv_x, nr_motion_width, motion_desc.Width) ||
+            !in_bounds(mv_y, nr_motion_height, motion_desc.Height)
+        )) ||
         (settings.nr_enabled && (
             !in_bounds(
                 mv_x + nr_mv_region_x.base,
@@ -1421,13 +1524,21 @@ bool evaluate_d3d11_via_d3d12(
             slot, crop, nr_depth_x.extent, nr_depth_y.extent,
             nr_geometry.width, nr_geometry.height,
             nr_mv_region_x.extent, nr_mv_region_y.extent, settings.nr_enabled,
+            render_width, render_height,
+            peripheral_dimensions.width, peripheral_dimensions.height,
+            nr_motion_width, nr_motion_height,
+            settings.peripheral_dlaa_enabled,
             color_desc.Format, motion_desc.Format, output_desc.Format
         ) && !initialize_slot(
             *device, slot, crop, nr_depth_x.extent, nr_depth_y.extent,
             nr_geometry.width, nr_geometry.height,
             nr_mv_region_x.extent, nr_mv_region_y.extent,
-            settings.nr_enabled, color_desc.Format,
-            motion_desc.Format, output_desc.Format
+            settings.nr_enabled,
+            render_width, render_height,
+            peripheral_dimensions.width, peripheral_dimensions.height,
+            nr_motion_width, nr_motion_height,
+            settings.peripheral_dlaa_enabled,
+            color_desc.Format, motion_desc.Format, output_desc.Format
         )) {
         release(context4);
         return reject_transport(
@@ -1455,6 +1566,41 @@ bool evaluate_d3d11_via_d3d12(
     };
     context->CopySubresourceRegion(slot.motion_vectors.texture11, 0U,
         0U, 0U, 0U, motion, 0U, &mv_box);
+
+    if (settings.peripheral_dlaa_enabled) {
+        D3D11_BOX peripheral_color_box{
+            color_x, color_y, 0U,
+            color_x + render_width,
+            color_y + render_height,
+            1U
+        };
+        context->CopySubresourceRegion(
+            slot.peripheral_color.texture11, 0U,
+            0U, 0U, 0U, color, 0U, &peripheral_color_box
+        );
+        if (!convert_depth_crop(
+                *device, context, depth, depth_desc.Format,
+                depth_x, depth_y,
+                render_width, render_height,
+                slot.peripheral_depth
+            )) {
+            release(context4);
+            return reject_transport(
+                D3D11TransportStatus::depth_conversion_failed
+            );
+        }
+        D3D11_BOX peripheral_mv_box{
+            mv_x, mv_y, 0U,
+            mv_x + nr_motion_width,
+            mv_y + nr_motion_height,
+            1U
+        };
+        context->CopySubresourceRegion(
+            slot.peripheral_motion_vectors.texture11, 0U,
+            0U, 0U, 0U, motion, 0U, &peripheral_mv_box
+        );
+    }
+
     if (settings.nr_enabled) {
         if (!convert_depth_crop(
                 *device, context, depth, depth_desc.Format,
@@ -1501,18 +1647,122 @@ bool evaluate_d3d11_via_d3d12(
     transition(device->command_list12, slot.output.resource12,
         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    D3D12DlssInputs inputs{};
-    inputs.color = slot.color.resource12;
-    inputs.depth = slot.depth.resource12;
-    inputs.motion_vectors = slot.motion_vectors.resource12;
-    inputs.output = slot.output.resource12;
-    mirror_transport_parameters(device->ngx_parameters, parameters, contract);
     const bool measure_dlss = slot.dlss_timing_heap != nullptr &&
         slot.dlss_timing_readback != nullptr &&
         device->timestamp_frequency != 0U &&
         diagnostic_should_sample_gpu_time(
             DiagnosticGpuTiming::foveated_dlss
         );
+    if (measure_dlss) {
+        slot.dlss_peripheral_timing_recorded = false;
+    }
+
+    PeripheralDlaaResources peripheral{};
+    bool peripheral_ready{};
+    if (settings.peripheral_dlaa_enabled) {
+        transition(
+            device->command_list12, slot.peripheral_color.resource12,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        );
+        transition(
+            device->command_list12, slot.peripheral_depth.resource12,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        );
+        transition(
+            device->command_list12, slot.peripheral_motion_vectors.resource12,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        );
+
+        mirror_transport_parameters(
+            device->ngx_parameters,
+            parameters,
+            contract
+        );
+        PeripheralDlaaRequest peripheral_request{};
+        peripheral_request.view_id = contract.view_id;
+        peripheral_request.command_list = device->command_list12;
+        peripheral_request.color = slot.peripheral_color.resource12;
+        peripheral_request.depth = slot.peripheral_depth.resource12;
+        peripheral_request.motion_vectors =
+            slot.peripheral_motion_vectors.resource12;
+        peripheral_request.output_template = slot.peripheral_output.resource12;
+        peripheral_request.output_override = slot.peripheral_output.resource12;
+        peripheral_request.motion_state =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        peripheral_request.output_state = D3D12_RESOURCE_STATE_COMMON;
+        peripheral_request.render_width = render_width;
+        peripheral_request.render_height = render_height;
+        peripheral_request.source_output_width = out_width;
+        peripheral_request.source_output_height = out_height;
+        peripheral_request.scale = settings.peripheral_dlaa_scale;
+        peripheral_request.preset = settings.peripheral_dlaa_preset;
+        peripheral_request.motion_vectors_output_space = !mv_low_res;
+        peripheral_request.motion_vector_scale_x =
+            contract.motion_vector_scale_x;
+        peripheral_request.motion_vector_scale_y =
+            contract.motion_vector_scale_y;
+        peripheral_request.depth_inverted = contract.depth_inverted;
+        peripheral_request.reset = contract.reset;
+        peripheral_request.create_flags = contract.create_flags;
+        peripheral_request.parameters = device->ngx_parameters;
+        peripheral_request.callbacks = ngx.backend;
+        D3D12BackendTiming peripheral_timing{};
+        peripheral_timing.query_heap =
+            measure_dlss ? slot.dlss_timing_heap : nullptr;
+        peripheral_timing.begin_query_index = 2U;
+        peripheral_timing.end_query_index = 3U;
+        peripheral_timing.write_begin_timestamp = true;
+        NgxResult peripheral_result{};
+        peripheral_ready = evaluate_peripheral_dlaa_ngx(
+            peripheral_request,
+            peripheral,
+            peripheral_result,
+            &peripheral_timing
+        );
+        slot.dlss_peripheral_timing_recorded =
+            peripheral_timing.sr_timestamp_written;
+        if (measure_dlss && slot.dlss_peripheral_timing_recorded) {
+            device->command_list12->ResolveQueryData(
+                slot.dlss_timing_heap,
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                2U, 2U, slot.dlss_timing_readback,
+                sizeof(std::uint64_t) * 2U
+            );
+            slot.dlss_timing_query_count = 4U;
+        }
+        if (peripheral_ready) {
+            restore_peripheral_dlaa_output(
+                device->command_list12,
+                peripheral
+            );
+        }
+
+        transition(
+            device->command_list12, slot.peripheral_motion_vectors.resource12,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON
+        );
+        transition(
+            device->command_list12, slot.peripheral_depth.resource12,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON
+        );
+        transition(
+            device->command_list12, slot.peripheral_color.resource12,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON
+        );
+    }
+
+    D3D12DlssInputs inputs{};
+    inputs.color = slot.color.resource12;
+    inputs.depth = slot.depth.resource12;
+    inputs.motion_vectors = slot.motion_vectors.resource12;
+    inputs.output = slot.output.resource12;
+    mirror_transport_parameters(device->ngx_parameters, parameters, contract);
     if (measure_dlss) {
         device->command_list12->EndQuery(
             slot.dlss_timing_heap,
@@ -1543,7 +1793,8 @@ bool evaluate_d3d11_via_d3d12(
             slot.dlss_timing_readback,
             0U
         );
-        slot.dlss_timing_query_count = 2U;
+        slot.dlss_timing_query_count =
+            slot.dlss_peripheral_timing_recorded ? 4U : 2U;
     }
 
     transition(device->command_list12, slot.output.resource12,
@@ -1571,8 +1822,24 @@ bool evaluate_d3d11_via_d3d12(
         release(context4);
         return reject_transport(D3D11TransportStatus::ngx_evaluation_failed);
     }
-    if (!composite_d3d11_crop(context, color, output, slot.output.texture11,
-            contract, crop, effective_settings)) {
+    auto composite_contract = contract;
+    ID3D11Resource* composite_base = color;
+    if (peripheral_ready) {
+        composite_base = slot.peripheral_output.texture11;
+        composite_contract.color_base_x = 0U;
+        composite_contract.color_base_y = 0U;
+        composite_contract.render_width = peripheral.working_width;
+        composite_contract.render_height = peripheral.working_height;
+    }
+    if (!composite_d3d11_crop(
+            context,
+            composite_base,
+            output,
+            slot.output.texture11,
+            composite_contract,
+            crop,
+            effective_settings
+        )) {
         slot.dlss_timing_pending = measure_dlss;
         release(context4);
         return reject_transport(D3D11TransportStatus::compositing_failed);
@@ -1617,11 +1884,13 @@ bool evaluate_d3d11_via_d3d12(
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             );
+            const auto nr_query_base =
+                slot.dlss_peripheral_timing_recorded ? 4U : 2U;
             if (measure_dlss) {
                 device->command_list12->EndQuery(
                     slot.dlss_timing_heap,
                     D3D12_QUERY_TYPE_TIMESTAMP,
-                    2U
+                    nr_query_base
                 );
             }
             const DlssNrFrame nr_frame{
@@ -1658,17 +1927,17 @@ bool evaluate_d3d11_via_d3d12(
                 device->command_list12->EndQuery(
                     slot.dlss_timing_heap,
                     D3D12_QUERY_TYPE_TIMESTAMP,
-                    3U
+                    nr_query_base + 1U
                 );
                 device->command_list12->ResolveQueryData(
                     slot.dlss_timing_heap,
                     D3D12_QUERY_TYPE_TIMESTAMP,
-                    2U,
+                    nr_query_base,
                     2U,
                     slot.dlss_timing_readback,
-                    sizeof(std::uint64_t) * 2U
+                    sizeof(std::uint64_t) * nr_query_base
                 );
-                slot.dlss_timing_query_count = 4U;
+                slot.dlss_timing_query_count = nr_query_base + 2U;
                 slot.dlss_nr_timing_foveated = nr_settings.nr_foveated;
             }
             transition(
@@ -1735,6 +2004,7 @@ void release_d3d11_transport_view(const NgxHandle* const game_handle) noexcept {
         for (auto iterator = device.views.begin();
              iterator != device.views.end(); ++iterator) {
             if (iterator->view_id != view_id) continue;
+            release_peripheral_dlaa_view(view_id);
             release_d3d12_view(view_id);
             for (auto& slot : iterator->slots) release_slot(slot);
             device.views.erase(iterator);

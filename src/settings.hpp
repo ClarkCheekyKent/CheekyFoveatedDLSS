@@ -10,13 +10,17 @@ namespace cheeky::foveated_dlss {
 struct Settings {
     bool enabled{true};
     bool d3d11_use_d3d12_transport{false};
-    float width{0.80F};
+    bool peripheral_dlaa_enabled{true};
+    float peripheral_dlaa_scale{0.75F};
+    std::uint32_t center_preset{};
+    std::uint32_t peripheral_dlaa_preset{5U};
+    float width{0.55F};
     float height{0.45F};
-    float x_offset{0.31F};
-    float height_offset{-0.44F};
+    float x_offset{0.60F};
+    float height_offset{-0.45F};
     bool invert_stereo_x_offset{false};
     float roundness{0.0F};
-    float transition_width{0.0F};
+    float transition_width{0.04F};
     bool alignment_border_enabled{false};
 
     bool nr_enabled{false};

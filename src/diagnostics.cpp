@@ -20,6 +20,11 @@ struct RuntimeDiagnostics {
     std::atomic<std::uint32_t> received_input_height{};
     std::atomic<std::uint32_t> received_output_width{};
     std::atomic<std::uint32_t> received_output_height{};
+    std::atomic<std::uint32_t> motion_vector_width{};
+    std::atomic<std::uint32_t> motion_vector_height{};
+    std::atomic<MotionVectorSpace> motion_vector_space{
+        MotionVectorSpace::unknown
+    };
     std::atomic<std::uint32_t> crop_input_base_x{};
     std::atomic<std::uint32_t> crop_input_base_y{};
     std::atomic<std::uint32_t> crop_input_width{};
@@ -30,6 +35,7 @@ struct RuntimeDiagnostics {
     std::atomic<std::uint32_t> crop_output_height{};
     std::atomic<std::uint32_t> transport_gpu_ms_bits{};
     std::atomic<std::uint32_t> foveated_dlss_gpu_ms_bits{};
+    std::atomic<std::uint32_t> peripheral_dlaa_gpu_ms_bits{};
     std::atomic<std::uint32_t> full_dlss_nr_gpu_ms_bits{};
     std::atomic<std::uint32_t> foveated_dlss_nr_gpu_ms_bits{};
     std::atomic<std::uint32_t> native_dlss_gpu_ms_bits{};
@@ -173,6 +179,18 @@ void diagnostic_note_evaluate(
     data.received_output_height.store(output_height, std::memory_order_release);
 }
 
+void diagnostic_note_motion_vectors(
+    const DiagnosticApi api,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const MotionVectorSpace space
+) noexcept {
+    auto& data = for_api(api);
+    data.motion_vector_width.store(width, std::memory_order_release);
+    data.motion_vector_height.store(height, std::memory_order_release);
+    data.motion_vector_space.store(space, std::memory_order_release);
+}
+
 void diagnostic_note_state(
     const DiagnosticApi api,
     const DiagnosticState state
@@ -235,6 +253,19 @@ void diagnostic_note_foveated_dlss_gpu_time(
     note_averaged_gpu_time(
         DiagnosticGpuTiming::foveated_dlss,
         for_api(DiagnosticApi::d3d11).foveated_dlss_gpu_ms_bits,
+        milliseconds
+    );
+}
+
+void diagnostic_note_peripheral_dlaa_gpu_time(
+    const DiagnosticApi api,
+    const float milliseconds
+) noexcept {
+    note_averaged_gpu_time(
+        api == DiagnosticApi::d3d12
+            ? DiagnosticGpuTiming::d3d12_peripheral_dlaa
+            : DiagnosticGpuTiming::peripheral_dlaa,
+        for_api(api).peripheral_dlaa_gpu_ms_bits,
         milliseconds
     );
 }
@@ -362,6 +393,9 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
     const auto foveated_dlss_gpu_ms = load_gpu_time(
         data.foveated_dlss_gpu_ms_bits
     );
+    const auto peripheral_dlaa_gpu_ms = load_gpu_time(
+        data.peripheral_dlaa_gpu_ms_bits
+    );
     const auto full_dlss_nr_gpu_ms = load_gpu_time(
         data.full_dlss_nr_gpu_ms_bits
     );
@@ -387,6 +421,9 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         data.received_input_height.load(std::memory_order_acquire),
         data.received_output_width.load(std::memory_order_acquire),
         data.received_output_height.load(std::memory_order_acquire),
+        data.motion_vector_width.load(std::memory_order_acquire),
+        data.motion_vector_height.load(std::memory_order_acquire),
+        data.motion_vector_space.load(std::memory_order_acquire),
         {
             data.crop_input_base_x.load(std::memory_order_acquire),
             data.crop_input_base_y.load(std::memory_order_acquire),
@@ -399,6 +436,7 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         },
         transport_gpu_ms,
         foveated_dlss_gpu_ms,
+        peripheral_dlaa_gpu_ms,
         full_dlss_nr_gpu_ms,
         foveated_dlss_nr_gpu_ms,
         native_dlss_gpu_ms,
@@ -411,6 +449,18 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         data.d3d11_execution_path.load(std::memory_order_acquire),
         data.d3d11_transport_status.load(std::memory_order_acquire),
     };
+}
+
+const char* motion_vector_space_name(
+    const MotionVectorSpace space
+) noexcept {
+    switch (space) {
+    case MotionVectorSpace::input: return "Input-resolution";
+    case MotionVectorSpace::output: return "Output-resolution";
+    case MotionVectorSpace::unknown:
+    default:
+        return "Unknown";
+    }
 }
 
 const char* diagnostic_state_name(const DiagnosticState state) noexcept {
