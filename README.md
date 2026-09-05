@@ -20,7 +20,7 @@ This is intended for games where ReShade add-ons and DLL replacement are allowed
 2. Copy `CheekyFoveatedDLSS.addon64` into the game directory containing the ReShade DLL and game executable.
 3. Start the game and enable DLSS in the game's graphics settings.
 4. Open the ReShade overlay and select **Cheeky Foveated DLSS** in the **Add-ons** tab.
-5. Enable **Foveated DLSS-SR**. Changes apply live on the next DLSS evaluation.
+5. Confirm that **Foveated DLSS-SR** is enabled (it is on by default). Changes apply live on the next DLSS evaluation.
 
 If the game ships with an older DLSS model, use [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper) to install a newer DLSS 4.5 model. Use only the official DLSS Swapper releases, and be aware that a game update may restore its original DLL.
 
@@ -44,17 +44,23 @@ Start with the defaults, then tune the region while looking at a representative 
 4. In VR, adjust **Stereo X offset** until the region is centered correctly in both eyes. Enable **Invert stereo eye order** if the offsets move in the wrong directions.
 5. Turn the red alignment border off when calibration is complete.
 
-The main controls are:
+The main controls and their defaults are:
 
-| Control | Purpose |
-| --- | --- |
-| Fovea width / height | Sets the normalized size of the DLSS-processed region. |
-| Stereo X offset | Moves the two eye regions in equal and opposite horizontal directions. It appears after two views are detected. |
-| Invert stereo eye order | Swaps the stereo offset directions for games that report the right eye first. |
-| Height offset | Moves the region from the top (`-1`) through center (`0`) to bottom (`+1`). |
-| Roundness | Blends the region shape from rectangular (`0`) to elliptical (`1`). This does not affect performance. |
-| Transition width | Feathers the edge of the region. |
-| DX11 game processing path | Uses native **DX11 Direct** by default; **DX12 Transport** enables DX12-only features for DX11 games. |
+| Control | Default | Purpose |
+| --- | --- | --- |
+| Enable foveated DLSS-SR | On | Enables the main foveated Super Resolution path. |
+| Center preset | Game/default | Preserves the game's DLSS preset or overrides it with E, K, L, or M. |
+| Peripheral DLAA | On | Enables the auxiliary DLAA pass for the area outside the fovea. |
+| Peripheral preset | E (Fastest) | Selects E, K, L, or M for the peripheral DLAA pass. |
+| Periphery scale | `0.75` | Downscales the periphery further from the original render resolution. |
+| Fovea width / height | `0.55` / `0.45` | Sets the normalized size of the DLSS-processed region. |
+| Stereo X offset | `0.60` | Moves the two eye regions in equal and opposite horizontal directions. It appears after two views are detected. |
+| Invert stereo eye order | Off | Swaps the stereo offset directions for games that report the right eye first. |
+| Height offset | `-0.45` | Moves the region from the top (`-1`) through center (`0`) to bottom (`+1`). |
+| Roundness | `0.00` | Blends the region shape from rectangular (`0`) to elliptical (`1`). This does not affect performance. |
+| Transition width | `0.040` | Feathers the edge of the region. |
+| Show 5 px red alignment border | Off | Displays the processed region while calibrating the fovea. |
+| DX11 game processing path | DX11 Direct | **DX12 Transport** enables DX12-only features for DX11 games. |
 
 Press **Alt+Shift+/** to toggle foveated DLSS-SR without opening the overlay. Settings are saved through ReShade and restored the next time the game starts.
 
