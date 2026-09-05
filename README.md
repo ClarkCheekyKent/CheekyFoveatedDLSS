@@ -54,12 +54,6 @@ the shared layer and its registration for all games; the add-on remains in
 each game and falls back to fixed foveation. As an emergency per-launch bypass,
 set `CHEEKY_OPENXR_LAYER_DISABLE=1` before starting the game.
 
-If you previously registered a development build manually, remove that old
-manifest's DWORD value from the `SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit`
-key in the hive you used (`HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE`) before
-using the installer. Do not remove other layers' entries. The installer manages
-only its own registration in the 64-bit machine-wide registry.
-
 If the game ships with an older DLSS model, use [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper) to install a newer DLSS 4.5 model. Use only the official DLSS Swapper releases, and be aware that a game update may restore its original DLL.
 
 ## Recommended settings

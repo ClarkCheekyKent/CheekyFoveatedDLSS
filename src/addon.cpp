@@ -1094,7 +1094,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::Combo(
             "Foveation center",
             &center_mode,
-            "Fixed\0OpenXR gaze\0Simulated gaze\0"
+            "Fixed\0OpenXR gaze\0Simulated gaze (debug)\0"
         )) {
         settings.center_mode = static_cast<FoveationCenterMode>(center_mode);
         changed = true;

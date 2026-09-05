@@ -4,6 +4,7 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
+#include "crop_motion.hpp"
 #include "ngx_abi.hpp"
 #include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
@@ -1501,6 +1502,8 @@ void note_d3d12_command_list_submission_impl(
 ) noexcept {
     if (queue == nullptr || command_list == nullptr) return;
     note_peripheral_dlaa_submission(queue, command_list);
+    ID3D12CommandList* motion_lists[]{command_list};
+    crop_motion12_submitted(queue, 1U, motion_lists);
     std::uint64_t frequency{};
     if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0U) return;
     std::lock_guard lock(d3d12_nr_timing_mutex);
@@ -1523,6 +1526,7 @@ void note_d3d12_present_impl(
     ID3D12CommandQueue* const present_queue
 ) noexcept {
     collect_peripheral_dlaa_resources();
+    collect_crop_motion12();
     std::uint64_t present_frequency{};
     if (present_queue != nullptr) {
         static_cast<void>(present_queue->GetTimestampFrequency(&present_frequency));

@@ -3,6 +3,7 @@
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
+#include "crop_motion.hpp"
 #include "runtime.hpp"
 
 #include <d3dcompiler.h>
@@ -1827,7 +1828,27 @@ NgxResult evaluate_d3d12_backend(
                     timing->begin_query_index
                 );
             }
-            if (contract.reset || key_changed ||
+            bool motion_reset = !view->has_crop;
+            if (!contract.reset && !key_changed && view->has_crop && crop_changed &&
+                contract.preserve_history_on_crop_move) {
+                CropMotionOffset offset{};
+                ID3D12Resource* corrected{};
+                if (crop_motion_offset(view->last_crop, crop, contract.motion_vectors_low_res,
+                    contract.motion_vector_scale_x, contract.motion_vector_scale_y, offset)) {
+                    corrected = prepare_crop_motion12(command_list, inputs.motion_vectors,
+                        inputs.mv_base_x, inputs.mv_base_y,
+                        contract.motion_vectors_low_res ? crop.input_width : crop.output_width,
+                        contract.motion_vectors_low_res ? crop.input_height : crop.output_height, offset);
+                }
+                if (corrected) {
+                    parameters->Set("MotionVectors", corrected);
+                    parameters->Set("DLSS.Input.MV.Subrect.Base.X", 0U);
+                    parameters->Set("DLSS.Input.MV.Subrect.Base.Y", 0U);
+                } else {
+                    motion_reset = true;
+                }
+            }
+            if (contract.reset || key_changed || motion_reset ||
                 (crop_changed && !contract.preserve_history_on_crop_move)) {
                 parameters->Set("Reset", 1);
             }
@@ -1877,7 +1898,7 @@ NgxResult evaluate_d3d12_backend(
                 }
             }
             view->last_crop = crop;
-            view->has_crop = true;
+            view->has_crop = ngx_succeeded(result);
         }
     }
 
@@ -1906,6 +1927,7 @@ void release_d3d12_view(const DlssViewId view_id) noexcept {
 }
 
 void release_d3d12_resources() noexcept {
+    release_crop_motion12();
     for (;;) {
         DlssViewId view_id{};
         {

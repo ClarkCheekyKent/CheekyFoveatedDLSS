@@ -1,6 +1,7 @@
 #include "backend.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
+#include "crop_motion.hpp"
 
 #include <d3dcompiler.h>
 
@@ -82,6 +83,8 @@ struct FeatureState {
     CropGeometry last_crop{};
     bool has_private_key{};
     bool has_last_crop{};
+    CropGeometry history_crop{};
+    bool has_history_crop{};
 };
 
 std::mutex resources_mutex;
@@ -699,6 +702,9 @@ void restore_create_parameters(
 }  // namespace
 
 struct D3D11Evaluation {
+    const NgxHandle* game_handle{};
+    ID3D11Resource* original_motion{};
+    std::shared_ptr<CropMotion11> corrected_motion;
     const NgxHandle* private_handle{};
     ID3D11Resource* original_output{};
     ID3D11Texture2D* private_output{};
@@ -741,6 +747,7 @@ void destroy_evaluation(D3D11Evaluation* const evaluation) noexcept {
     if (evaluation == nullptr) {
         return;
     }
+    release(evaluation->original_motion);
     release(evaluation->constant_buffer);
     release(evaluation->composite_shader);
     release(evaluation->output_uav);
@@ -1020,6 +1027,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     release(device);
 
     evaluation->private_handle = private_handle;
+    evaluation->game_handle = game_handle;
     evaluation->original_output = output_resource;
     evaluation->original_output->AddRef();
     evaluation->private_output = resources->dlss_output;
@@ -1134,6 +1142,44 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
+    if (!force_reset && !gaze_reset && evaluation->reset == 0 &&
+        settings.center_mode != FoveationCenterMode::fixed) {
+        CropGeometry previous{};
+        bool has_history{};
+        {
+            std::lock_guard lock(features_mutex);
+            if (const auto* state = find_feature_state_locked(game_handle)) {
+                previous = state->history_crop;
+                has_history = state->has_history_crop;
+            }
+        }
+        if (!has_history) {
+            force_reset = true;
+        } else if (!same_crop(previous, crop)) {
+            float scale_x = 1.0F, scale_y = 1.0F;
+            parameters->Get("MV.Scale.X", &scale_x);
+            parameters->Get("MV.Scale.Y", &scale_y);
+            CropMotionOffset offset{};
+            ID3D11Resource* motion{};
+            parameters->Get("MotionVectors", &motion);
+            if (crop_motion_offset(previous, crop, motion_vectors_low_res, scale_x, scale_y, offset)) {
+                evaluation->corrected_motion = create_crop_motion11(context, motion,
+                    evaluation->motion_x + motion_crop_x, evaluation->motion_y + motion_crop_y,
+                    motion_vectors_low_res ? crop.input_width : crop.output_width,
+                    motion_vectors_low_res ? crop.input_height : crop.output_height, offset);
+            }
+            if (evaluation->corrected_motion) {
+                evaluation->original_motion = motion;
+                motion->AddRef();
+                mutable_parameters->Set("MotionVectors", crop_motion_resource(evaluation->corrected_motion));
+                mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.X", 0U);
+                mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.Y", 0U);
+            } else {
+                // Unsupported vector formats must not reuse misaligned history.
+                force_reset = true;
+            }
+        }
+    }
     if (force_reset || gaze_reset || evaluation->reset != 0) {
         mutable_parameters->Set("Reset", 1);
     }
@@ -1186,8 +1232,17 @@ void finish_d3d11(
         return;
     }
 
+    {
+        std::lock_guard lock(features_mutex);
+        if (auto* state = find_feature_state_locked(evaluation->game_handle)) {
+            state->history_crop = evaluation->crop;
+            state->has_history_crop = ngx_succeeded(result);
+        }
+    }
+
     if (parameters != nullptr) {
         auto* const mutable_parameters = const_cast<NgxParameters*>(parameters);
+        if (evaluation->original_motion) mutable_parameters->Set("MotionVectors", evaluation->original_motion);
         mutable_parameters->Set("Output", evaluation->original_output);
         mutable_parameters->Set("Width", evaluation->original_width);
         mutable_parameters->Set("Height", evaluation->original_height);
@@ -1493,6 +1548,7 @@ D3D11Evaluation* prepare_d3d11(
 }
 
 void release_d3d11_resources() noexcept {
+    release_crop_motion11();
     std::deque<FeatureState> states_to_release;
     {
         std::lock_guard lock(features_mutex);

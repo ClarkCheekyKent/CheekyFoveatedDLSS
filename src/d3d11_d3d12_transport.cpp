@@ -7,6 +7,7 @@
 
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
+#include "crop_motion.hpp"
 #include <dxgi1_4.h>
 
 #include <algorithm>
@@ -1826,6 +1827,8 @@ bool evaluate_d3d11_via_d3d12(
     }
     ID3D12CommandList* lists[]{device->command_list12};
     device->queue12->ExecuteCommandLists(1U, lists);
+    crop_motion12_submitted(device->queue12, 1U, lists);
+    collect_crop_motion12();
     slot.done_value = device->next_fence_value++;
     if (FAILED(device->queue12->Signal(device->fence12, slot.done_value)) ||
         FAILED(context4->Wait(device->fence11, slot.done_value))) {
