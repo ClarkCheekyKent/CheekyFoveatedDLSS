@@ -3775,11 +3775,6 @@ void evaluate_nr_after_native_d3d12(
         );
     }
 
-    D3D12BackendCallbacks callbacks{};
-    callbacks.create_feature = real_create_d3d12.load(std::memory_order_acquire);
-    callbacks.evaluate_feature = evaluate;
-    callbacks.release_feature = real_release_d3d12.load(std::memory_order_acquire);
-
     PeripheralDlaaResources peripheral{};
     bool peripheral_ready{};
     if (effective_settings.peripheral_dlaa_enabled &&
