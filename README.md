@@ -201,11 +201,24 @@ not real eye tracker acquisition or latency.
 
 ### Building the eye-tracking installer
 
-Install [Inno Setup 6.3 or newer](https://jrsoftware.org/isdl.php), then run:
+With [Inno Setup 6.3 or newer](https://jrsoftware.org/isdl.php) installed in a
+standard location or available on PATH, run from the repository root:
 
 ```powershell
-.\scripts\build-installer.ps1 -Version 0.1.0
+.\scripts\build-installer.ps1 -Version 0.2.0
 ```
+
+If you already have the portable compiler in `build\installer-tools\inno`,
+use this command instead; no additional Inno Setup installation is needed:
+
+```powershell
+.\scripts\build-installer.ps1 -Version 0.2.0 -IsccPath .\build\installer-tools\inno\ISCC.exe
+```
+
+The script does not automatically search that portable directory. The compiler
+is a local build tool and is not included in the repository; on a fresh checkout,
+install Inno Setup or pass `-IsccPath` pointing to your own compiler. Set
+`-Version` to the release version you are packaging.
 
 This builds and tests Release artifacts and produces
 `bin\installer\CheekyEyeTrackingSetup.exe`. Pass `-IsccPath` if `ISCC.exe` is
