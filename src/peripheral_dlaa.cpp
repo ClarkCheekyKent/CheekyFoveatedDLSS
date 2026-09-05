@@ -1,10 +1,12 @@
 #include "peripheral_dlaa.hpp"
+#include "peripheral_dlaa_generation.hpp"
 
 #include "runtime.hpp"
 
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -124,6 +126,29 @@ void uav_barrier(
 }
 
 constexpr std::uint32_t converter_descriptor_set_count = 256U;
+constexpr DWORD generation_wait_timeout_ms = 5000U;
+constexpr GUID peripheral_submission_token_guid{
+    0x6a4c69b3U,
+    0x2e17U,
+    0x4f68U,
+    {0xa8U, 0xc1U, 0x94U, 0x0dU, 0x8dU, 0xefU, 0x56U, 0x3bU},
+};
+
+struct PeripheralDeviceSync {
+    ID3D12Device* device{};
+    ID3D12Device* fence_device{};
+    ID3D12Fence* fence{};
+    HANDLE completion_event{};
+    std::deque<ID3D12CommandQueue*> queues;
+    std::uint64_t next_fence_value{};
+    std::uint64_t pending_fence_value{};
+};
+
+struct PendingPeripheralSubmission {
+    std::uint64_t token{};
+    ID3D12GraphicsCommandList* command_list{};
+    PeripheralDeviceSync* device_sync{};
+};
 
 struct PeripheralGpuUse {
     ID3D12GraphicsCommandList* command_list{};
@@ -152,9 +177,13 @@ struct PeripheralViewState {
     DXGI_FORMAT depth_format{DXGI_FORMAT_UNKNOWN};
     DXGI_FORMAT output_format{DXGI_FORMAT_UNKNOWN};
     DXGI_FORMAT motion_format{DXGI_FORMAT_UNKNOWN};
+    std::uint32_t scale_bits{};
+    std::uint32_t create_flags{};
+    std::array<std::uint32_t, 6U> presets{};
     std::uint32_t descriptor_size{};
     std::uint32_t next_descriptor_set{};
     std::deque<PeripheralGpuUse> gpu_uses;
+    bool safe_to_replace{};
 };
 
 std::mutex state_mutex;
@@ -175,6 +204,165 @@ void record_gpu_use(
     }
     command_list->AddRef();
     state.gpu_uses.push_back({command_list});
+}
+
+std::mutex submission_mutex;
+std::deque<PeripheralDeviceSync> device_sync_states;
+std::deque<PendingPeripheralSubmission> pending_submissions;
+std::uint64_t next_submission_token{};
+std::uint64_t generation_rejection_sequence{};
+
+[[nodiscard]] PeripheralDeviceSync* find_device_sync(
+    ID3D12Device* const device
+) noexcept {
+    for (auto& sync : device_sync_states) {
+        if (sync.device == device) return &sync;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] PeripheralDeviceSync* find_or_create_device_sync(
+    ID3D12Device* const device
+) noexcept {
+    if (device == nullptr) return nullptr;
+    if (auto* const existing = find_device_sync(device); existing != nullptr) {
+        return existing;
+    }
+    device_sync_states.push_back({});
+    auto& created = device_sync_states.back();
+    device->AddRef();
+    created.device = device;
+    return &created;
+}
+
+[[nodiscard]] bool note_peripheral_command_list(
+    ID3D12GraphicsCommandList* const command_list,
+    ID3D12Device* const device
+) noexcept {
+    if (command_list == nullptr || device == nullptr) return false;
+    std::lock_guard lock(submission_mutex);
+    auto* const sync = find_or_create_device_sync(device);
+    if (sync == nullptr) return false;
+    for (const auto& pending : pending_submissions) {
+        if (pending.command_list == command_list) return true;
+    }
+    auto token = ++next_submission_token;
+    if (token == 0U) token = ++next_submission_token;
+    if (FAILED(command_list->SetPrivateData(
+            peripheral_submission_token_guid,
+            static_cast<UINT>(sizeof(token)),
+            &token
+        ))) {
+        return false;
+    }
+    command_list->AddRef();
+    pending_submissions.push_back({token, command_list, sync});
+    return true;
+}
+
+[[nodiscard]] bool wait_for_peripheral_fence(
+    PeripheralDeviceSync& sync
+) noexcept {
+    const auto value = sync.pending_fence_value;
+    if (value == 0U || sync.fence == nullptr) return false;
+    const auto completed = sync.fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return false;
+    if (completed >= value) {
+        sync.pending_fence_value = 0U;
+        return true;
+    }
+    if (sync.completion_event == nullptr) {
+        sync.completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (sync.completion_event == nullptr) return false;
+    }
+    if (!ResetEvent(sync.completion_event)) return false;
+    if (FAILED(sync.fence->SetEventOnCompletion(
+            value,
+            sync.completion_event
+        ))) {
+        return false;
+    }
+    if (WaitForSingleObject(
+            sync.completion_event,
+            generation_wait_timeout_ms
+        ) != WAIT_OBJECT_0) {
+        return false;
+    }
+    const auto completed_after_wait = sync.fence->GetCompletedValue();
+    if (completed_after_wait == UINT64_MAX || completed_after_wait < value) {
+        return false;
+    }
+    sync.pending_fence_value = 0U;
+    return true;
+}
+
+[[nodiscard]] bool synchronize_peripheral_device(
+    ID3D12Device* const device
+) noexcept {
+    if (device == nullptr) return false;
+    // Submission callbacks can precede ExecuteCommandLists. Upstream marks
+    // uses as signaled at present, after the queued work has been submitted.
+    for (const auto& state : states) {
+        if (state.device != device) continue;
+        for (const auto& use : state.gpu_uses) {
+            if (!use.signaled) return false;
+        }
+    }
+    std::lock_guard lock(submission_mutex);
+    auto* const sync = find_device_sync(device);
+    if (sync == nullptr || sync->fence_device == nullptr ||
+        sync->queues.empty()) {
+        return false;
+    }
+    for (const auto& pending : pending_submissions) {
+        if (pending.device_sync == sync) return false;
+    }
+
+    if (sync->pending_fence_value != 0U) {
+        return wait_for_peripheral_fence(*sync);
+    }
+    if (sync->fence == nullptr && FAILED(sync->fence_device->CreateFence(
+            0U,
+            D3D12_FENCE_FLAG_NONE,
+            IID_PPV_ARGS(&sync->fence)
+        ))) {
+        return false;
+    }
+
+    std::uint64_t previous_value{};
+    for (auto* const queue : sync->queues) {
+        const auto value = ++sync->next_fence_value;
+        if (previous_value != 0U && FAILED(queue->Wait(
+                sync->fence,
+                previous_value
+            ))) {
+            return false;
+        }
+        if (FAILED(queue->Signal(sync->fence, value))) return false;
+        previous_value = value;
+    }
+    sync->pending_fence_value = previous_value;
+    return wait_for_peripheral_fence(*sync);
+}
+
+void release_submission_tracking() noexcept {
+    std::lock_guard lock(submission_mutex);
+    for (auto& pending : pending_submissions) {
+        release(pending.command_list);
+    }
+    pending_submissions.clear();
+    for (auto& sync : device_sync_states) {
+        for (auto*& queue : sync.queues) release(queue);
+        sync.queues.clear();
+        release(sync.fence);
+        if (sync.completion_event != nullptr) {
+            CloseHandle(sync.completion_event);
+            sync.completion_event = nullptr;
+        }
+        release(sync.device);
+        release(sync.fence_device);
+    }
+    device_sync_states.clear();
 }
 
 void release_state(PeripheralViewState& state) noexcept {
@@ -396,6 +584,28 @@ void release_state(PeripheralViewState& state) noexcept {
     }
 }
 
+[[nodiscard]] std::array<std::uint32_t, 6U> generation_presets(
+    const PeripheralDlaaRequest& request
+) noexcept {
+    std::array<std::uint32_t, 6U> presets{};
+    presets[0] = request.preset;
+    if (request.parameters == nullptr) return presets;
+    constexpr std::array<const char*, 5U> names{
+        "DLSS.Hint.Render.Preset.Quality",
+        "DLSS.Hint.Render.Preset.Balanced",
+        "DLSS.Hint.Render.Preset.Performance",
+        "DLSS.Hint.Render.Preset.UltraPerformance",
+        "DLSS.Hint.Render.Preset.UltraQuality",
+    };
+    for (std::size_t index{}; index < names.size(); ++index) {
+        presets[index + 1U] = get_ngx_integer_bits(
+            request.parameters,
+            names[index]
+        );
+    }
+    return presets;
+}
+
 [[nodiscard]] PeripheralViewState* find_or_create_state(
     const PeripheralDlaaRequest& request
 ) noexcept {
@@ -426,6 +636,9 @@ void release_state(PeripheralViewState& state) noexcept {
     const auto color_format = typed_resource_format(color_desc.Format);
     const auto depth_format = depth_srv_format(depth_desc.Format);
     const auto motion_format = typed_resource_format(motion_desc.Format);
+    const auto presets = generation_presets(request);
+    std::uint32_t scale_bits{};
+    std::memcpy(&scale_bits, &request.scale, sizeof(scale_bits));
 
     std::lock_guard lock(state_mutex);
     for (auto& state : states) {
@@ -438,16 +651,58 @@ void release_state(PeripheralViewState& state) noexcept {
             state.color_format == color_format &&
             state.depth_format == depth_format &&
             state.output_format == output_desc.Format &&
-            state.motion_format == motion_format;
-        if (compatible) {
+            state.motion_format == motion_format &&
+            state.scale_bits == scale_bits &&
+            state.create_flags == request.create_flags &&
+            state.presets == presets;
+        bool synchronized = compatible || state.safe_to_replace;
+        if (!synchronized && synchronize_peripheral_device(state.device)) {
+            synchronized = true;
+            for (auto& synchronized_state : states) {
+                if (synchronized_state.device == state.device) {
+                    synchronized_state.safe_to_replace = true;
+                }
+            }
+        }
+        const auto decision = peripheral_dlaa_generation_decision(
+            compatible,
+            synchronized
+        );
+        if (decision == PeripheralDlaaGenerationDecision::reuse) {
+            state.safe_to_replace = false;
             device->Release();
             record_gpu_use(state, request.command_list);
             return &state;
         }
+        if (decision == PeripheralDlaaGenerationDecision::reject) {
+            const auto rejection = ++generation_rejection_sequence;
+            if (rejection <= 8U || rejection % 600U == 0U) {
+                trace_event(
+                    "Peripheral DLAA generation change rejected seq=%llu "
+                    "view=%llu: submission queue synchronization unavailable",
+                    static_cast<unsigned long long>(rejection),
+                    static_cast<unsigned long long>(request.view_id)
+                );
+            }
+            device->Release();
+            return nullptr;
+        }
+        trace_event(
+            "Peripheral DLAA generation synchronized view=%llu "
+            "size=%ux%u->%ux%u preset=%u->%u",
+            static_cast<unsigned long long>(request.view_id),
+            state.working_width,
+            state.working_height,
+            dimensions.width,
+            dimensions.height,
+            state.presets[0],
+            request.preset
+        );
         // Recorded command lists do not retain the resources referenced by
         // their descriptors. Keep the old generation until its queues finish.
         retired_states.push_back(std::move(state));
         state = {};
+        release_d3d12_view(peripheral_dlaa_view_id(request.view_id));
         state.view_id = request.view_id;
         state.device = device;
         state.render_width = request.render_width;
@@ -459,6 +714,9 @@ void release_state(PeripheralViewState& state) noexcept {
         state.output_format = output_desc.Format;
         state.motion_format = motion_format;
         record_gpu_use(state, request.command_list);
+        state.scale_bits = scale_bits;
+        state.create_flags = request.create_flags;
+        state.presets = presets;
         return &state;
     }
 
@@ -475,6 +733,9 @@ void release_state(PeripheralViewState& state) noexcept {
     state.output_format = output_desc.Format;
     state.motion_format = motion_format;
     record_gpu_use(state, request.command_list);
+    state.scale_bits = scale_bits;
+    state.create_flags = request.create_flags;
+    state.presets = presets;
     return &state;
 }
 
@@ -802,6 +1063,9 @@ bool prepare_peripheral_dlaa_resources(
     }
     auto* const state = find_or_create_state(request);
     if (state == nullptr || !ensure_output(*state, request)) return false;
+    if (!note_peripheral_command_list(request.command_list, state->device)) {
+        return false;
+    }
 
     resources.working_width = state->working_width;
     resources.working_height = state->working_height;
@@ -1103,6 +1367,52 @@ void restore_peripheral_dlaa_output(
     );
 }
 
+void note_peripheral_dlaa_command_list_submission(
+    ID3D12CommandQueue* const queue,
+    ID3D12GraphicsCommandList* const command_list
+) noexcept {
+    if (queue == nullptr || command_list == nullptr) return;
+    std::uint64_t token{};
+    UINT token_size = static_cast<UINT>(sizeof(token));
+    if (FAILED(command_list->GetPrivateData(
+            peripheral_submission_token_guid,
+            &token_size,
+            &token
+        )) || token_size != static_cast<UINT>(sizeof(token)) || token == 0U) {
+        return;
+    }
+    ID3D12Device* queue_device{};
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&queue_device))) ||
+        queue_device == nullptr) {
+        return;
+    }
+
+    std::lock_guard lock(submission_mutex);
+    for (auto iterator = pending_submissions.begin();
+         iterator != pending_submissions.end();) {
+        if (iterator->token != token || iterator->device_sync == nullptr) {
+            ++iterator;
+            continue;
+        }
+        auto& sync = *iterator->device_sync;
+        if (sync.fence_device == nullptr) {
+            sync.fence_device = queue_device;
+            queue_device = nullptr;
+        } else if (sync.fence_device != queue_device) {
+            break;
+        }
+        auto& queues = sync.queues;
+        if (std::find(queues.begin(), queues.end(), queue) == queues.end()) {
+            queue->AddRef();
+            queues.push_back(queue);
+        }
+        release(iterator->command_list);
+        iterator = pending_submissions.erase(iterator);
+        break;
+    }
+    release(queue_device);
+}
+
 void release_peripheral_dlaa_view(const DlssViewId view_id) noexcept {
     {
         std::lock_guard lock(state_mutex);
@@ -1131,6 +1441,7 @@ void release_peripheral_dlaa_resources() noexcept {
     for (const auto view_id : view_ids) {
         release_d3d12_view(peripheral_dlaa_view_id(view_id));
     }
+    release_submission_tracking();
 }
 
 void note_peripheral_dlaa_submission(

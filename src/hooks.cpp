@@ -1504,6 +1504,7 @@ void note_d3d12_command_list_submission_impl(
     note_peripheral_dlaa_submission(queue, command_list);
     ID3D12CommandList* motion_lists[]{command_list};
     crop_motion12_submitted(queue, 1U, motion_lists);
+    note_peripheral_dlaa_command_list_submission(queue, command_list);
     std::uint64_t frequency{};
     if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0U) return;
     std::lock_guard lock(d3d12_nr_timing_mutex);
@@ -3761,7 +3762,8 @@ void evaluate_nr_after_native_d3d12(
     const NgxHandle* const handle,
     const NgxParameters* const parameters,
     const Settings& settings,
-    const NgxResult result
+    const NgxResult result,
+    const CropGeometry* const shared_sr_crop = nullptr
 ) noexcept {
     if (!settings.nr_enabled || !ngx_succeeded(result) ||
         command_list == nullptr || handle == nullptr || parameters == nullptr ||
@@ -3779,7 +3781,7 @@ void evaluate_nr_after_native_d3d12(
     const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
     );
-    const DlssNrFrame frame{
+    DlssNrFrame frame{
         view_id,
         DlssNrRoute::d3d12_native,
         command_list,
@@ -3808,6 +3810,10 @@ void evaluate_nr_after_native_d3d12(
         get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
         false,
     };
+    if (shared_sr_crop != nullptr) {
+        frame.shared_sr_crop = *shared_sr_crop;
+        frame.has_shared_sr_crop = true;
+    }
     const auto view_settings = settings_for_view(settings, view_id);
     D3D12NrTimingScope timing{command_list, view_settings.nr_foveated};
     const bool evaluated = evaluate_dlss_nr(
@@ -4042,7 +4048,7 @@ void evaluate_nr_after_native_d3d12(
     }
     if (!ngx_succeeded(result)) return false;
     evaluate_nr_after_native_d3d12(
-        command_list, handle, parameters, effective_settings, result
+        command_list, handle, parameters, settings, result, &crop
     );
     diagnostic_note_activation(DiagnosticApi::d3d12, crop);
     return true;

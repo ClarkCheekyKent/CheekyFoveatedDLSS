@@ -2,9 +2,11 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
+#include "dlss_nr_contract.hpp"
 #include "foveation.hpp"
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
+#include "peripheral_dlaa_generation.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -527,6 +529,79 @@ void test_multimip_game_output_uses_single_mip_private_output() {
         "private D3D12 output preserves the game output format");
 }
 
+void test_multimip_game_output_is_dlss_nr_compatible() {
+    using namespace cheeky::foveated_dlss;
+    D3D12_RESOURCE_DESC game_output{};
+    game_output.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    game_output.Width = 10380U;
+    game_output.Height = 4168U;
+    game_output.DepthOrArraySize = 1U;
+    game_output.MipLevels = 4U;
+    game_output.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    game_output.SampleDesc.Count = 1U;
+    game_output.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    expect(is_dlss_nr_output_compatible(game_output),
+        "DLSS-NR accepts the multi-mip mip-zero output used by ACE");
+}
+
+void test_dlss_nr_maps_right_eye_region_into_packed_output() {
+    using namespace cheeky::foveated_dlss;
+    const auto base = dlss_nr_resource_base(
+        2544U, 928U, 5190U, 0U, false
+    );
+    expect(base.x == 7734U && base.y == 928U,
+        "right-eye DLSS-NR region includes the packed output base");
+    const auto isolated = dlss_nr_resource_base(
+        2544U, 928U, 5190U, 0U, true
+    );
+    expect(isolated.x == 2544U && isolated.y == 928U,
+        "isolated DLSS-NR region remains resource-local");
+}
+
+void test_dlss_nr_reuses_live_sr_crop_center() {
+    using namespace cheeky::foveated_dlss;
+    Settings settings{};
+    settings.nr_use_sr_foveation = true;
+    settings.width = 0.5F;
+    settings.height = 0.5F;
+    settings.x_offset = -0.8F;
+    settings.height_offset = -0.8F;
+    const FoveationGeometry live_sr_crop{
+        1000U, 600U, 1000U, 800U,
+        2000U, 1200U, 2000U, 1600U,
+    };
+    const auto expected = foveation_offsets_from_geometry(
+        live_sr_crop, 3000U, 2000U
+    );
+    const auto parameters = dlss_nr_foveation_parameters(
+        settings, &live_sr_crop, 3000U, 2000U
+    );
+    expect_near(parameters.x_offset, expected.x, 0.0001F,
+        "DLSS-NR follows the live SR horizontal center");
+    expect_near(parameters.y_offset, expected.y, 0.0001F,
+        "DLSS-NR follows the live SR vertical center");
+}
+
+void test_peripheral_dlaa_generation_requires_synchronization() {
+    using namespace cheeky::foveated_dlss;
+    expect(
+        peripheral_dlaa_generation_decision(false, false) ==
+            PeripheralDlaaGenerationDecision::reject,
+        "peripheral DLAA keeps its generation when synchronization fails"
+    );
+    expect(
+        peripheral_dlaa_generation_decision(false, true) ==
+            PeripheralDlaaGenerationDecision::replace,
+        "peripheral DLAA replaces a changed generation after synchronization"
+    );
+    expect(
+        peripheral_dlaa_generation_decision(true, false) ==
+            PeripheralDlaaGenerationDecision::reuse,
+        "peripheral DLAA reuses a compatible generation without synchronization"
+    );
+}
+
 }  // namespace
 
 int main() {
@@ -545,6 +620,10 @@ int main() {
     test_nested_d3d12_lifecycle_scope_is_passthrough();
     test_core_d3d12_route_is_published_to_diagnostics();
     test_multimip_game_output_uses_single_mip_private_output();
+    test_multimip_game_output_is_dlss_nr_compatible();
+    test_dlss_nr_maps_right_eye_region_into_packed_output();
+    test_dlss_nr_reuses_live_sr_crop_center();
+    test_peripheral_dlaa_generation_requires_synchronization();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

@@ -43,6 +43,7 @@
     <ClCompile Include="src\d3d12_ngx_dispatch.cpp" />
     <ClCompile Include="src\d3d12_output_contract.cpp" />
     <ClCompile Include="src\diagnostics.cpp" />
+    <ClCompile Include="src\dlss_nr_contract.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="shared\cheeky_gaze_abi.h" />
@@ -52,6 +53,8 @@
     <ClInclude Include="src\d3d12_ngx_dispatch.hpp" />
     <ClInclude Include="src\d3d12_output_contract.hpp" />
     <ClInclude Include="src\diagnostics.hpp" />
+    <ClInclude Include="src\dlss_nr_contract.hpp" />
+    <ClInclude Include="src\peripheral_dlaa_generation.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
