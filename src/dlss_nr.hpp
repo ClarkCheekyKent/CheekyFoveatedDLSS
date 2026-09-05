@@ -54,6 +54,8 @@ struct DlssNrFrame {
     std::uint32_t color_base_x{};
     std::uint32_t color_base_y{};
     bool color_is_region{};
+    FoveationGeometry shared_sr_crop{};
+    bool has_shared_sr_crop{};
 };
 
 struct DlssNrGeometry {
