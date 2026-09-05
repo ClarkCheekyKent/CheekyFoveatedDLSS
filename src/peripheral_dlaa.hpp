@@ -107,6 +107,11 @@ void restore_peripheral_dlaa_output(
     const PeripheralDlaaResources& resources
 ) noexcept;
 
+void note_peripheral_dlaa_command_list_submission(
+    ID3D12CommandQueue* queue,
+    ID3D12GraphicsCommandList* command_list
+) noexcept;
+
 void release_peripheral_dlaa_view(DlssViewId view_id) noexcept;
 void release_peripheral_dlaa_resources() noexcept;
 void note_peripheral_dlaa_submission(
