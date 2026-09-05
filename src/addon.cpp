@@ -448,10 +448,13 @@ void draw_d3d12_gpu_performance(
     const DiagnosticSnapshot& data,
     const Settings& settings
 ) {
-    if (!settings.peripheral_dlaa_enabled) return;
     ImGui::SeparatorText("DLSS GPU Timing (250 ms average)");
     if (DiagnosticTable table{"d3d12_dlss_timing"}) {
-        timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
+        timing_row("Foveated DLSS call", data.foveated_dlss_gpu_ms);
+        timing_row("Native DLSS call", data.native_dlss_gpu_ms);
+        if (settings.peripheral_dlaa_enabled) {
+            timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
+        }
     }
 }
 

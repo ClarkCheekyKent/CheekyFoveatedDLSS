@@ -307,6 +307,18 @@ void diagnostic_note_native_dlss_gpu_time(
     );
 }
 
+void diagnostic_note_d3d12_dlss_gpu_time(
+    const float milliseconds, const bool foveated
+) noexcept {
+    note_averaged_gpu_time(
+        foveated ? DiagnosticGpuTiming::d3d12_foveated_dlss
+                 : DiagnosticGpuTiming::d3d12_native_dlss,
+        foveated ? for_api(DiagnosticApi::d3d12).foveated_dlss_gpu_ms_bits
+                 : for_api(DiagnosticApi::d3d12).native_dlss_gpu_ms_bits,
+        milliseconds
+    );
+}
+
 void diagnostic_note_frame_rate(
     const float frames_per_second,
     const bool foveated_enabled

@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <utility>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -124,6 +125,13 @@ void uav_barrier(
 
 constexpr std::uint32_t converter_descriptor_set_count = 256U;
 
+struct PeripheralGpuUse {
+    ID3D12GraphicsCommandList* command_list{};
+    ID3D12CommandQueue* queue{};
+    ID3D12Fence* fence{};
+    bool signaled{};
+};
+
 struct PeripheralViewState {
     DlssViewId view_id{};
     ID3D12Device* device{};
@@ -146,12 +154,31 @@ struct PeripheralViewState {
     DXGI_FORMAT motion_format{DXGI_FORMAT_UNKNOWN};
     std::uint32_t descriptor_size{};
     std::uint32_t next_descriptor_set{};
+    std::deque<PeripheralGpuUse> gpu_uses;
 };
 
 std::mutex state_mutex;
 std::deque<PeripheralViewState> states;
+std::deque<PeripheralViewState> retired_states;
+
+void release_gpu_use(PeripheralGpuUse& use) noexcept {
+    release(use.command_list);
+    release(use.queue);
+    release(use.fence);
+}
+
+void record_gpu_use(
+    PeripheralViewState& state, ID3D12GraphicsCommandList* command_list
+) noexcept {
+    for (const auto& use : state.gpu_uses) {
+        if (use.command_list == command_list) return;
+    }
+    command_list->AddRef();
+    state.gpu_uses.push_back({command_list});
+}
 
 void release_state(PeripheralViewState& state) noexcept {
+    for (auto& use : state.gpu_uses) release_gpu_use(use);
     release(state.depth_pipeline);
     release(state.color_pipeline);
     release(state.converter_pipeline);
@@ -414,9 +441,13 @@ void release_state(PeripheralViewState& state) noexcept {
             state.motion_format == motion_format;
         if (compatible) {
             device->Release();
+            record_gpu_use(state, request.command_list);
             return &state;
         }
-        release_state(state);
+        // Recorded command lists do not retain the resources referenced by
+        // their descriptors. Keep the old generation until its queues finish.
+        retired_states.push_back(std::move(state));
+        state = {};
         state.view_id = request.view_id;
         state.device = device;
         state.render_width = request.render_width;
@@ -427,6 +458,7 @@ void release_state(PeripheralViewState& state) noexcept {
         state.depth_format = depth_format;
         state.output_format = output_desc.Format;
         state.motion_format = motion_format;
+        record_gpu_use(state, request.command_list);
         return &state;
     }
 
@@ -442,6 +474,7 @@ void release_state(PeripheralViewState& state) noexcept {
     state.depth_format = depth_format;
     state.output_format = output_desc.Format;
     state.motion_format = motion_format;
+    record_gpu_use(state, request.command_list);
     return &state;
 }
 
@@ -1075,7 +1108,7 @@ void release_peripheral_dlaa_view(const DlssViewId view_id) noexcept {
         std::lock_guard lock(state_mutex);
         for (auto iterator = states.begin(); iterator != states.end(); ++iterator) {
             if (iterator->view_id != view_id) continue;
-            release_state(*iterator);
+            retired_states.push_back(std::move(*iterator));
             states.erase(iterator);
             break;
         }
@@ -1092,9 +1125,70 @@ void release_peripheral_dlaa_resources() noexcept {
             release_state(state);
         }
         states.clear();
+        for (auto& state : retired_states) release_state(state);
+        retired_states.clear();
     }
     for (const auto view_id : view_ids) {
         release_d3d12_view(peripheral_dlaa_view_id(view_id));
+    }
+}
+
+void note_peripheral_dlaa_submission(
+    ID3D12CommandQueue* const queue,
+    ID3D12GraphicsCommandList* const command_list
+) noexcept {
+    if (queue == nullptr || command_list == nullptr) return;
+    std::lock_guard lock(state_mutex);
+    const auto mark = [&](auto& collection) {
+        for (auto& state : collection) {
+            for (auto& use : state.gpu_uses) {
+                if (use.command_list != command_list || use.queue != nullptr) continue;
+                queue->AddRef();
+                use.queue = queue;
+                // Submission notification can precede ExecuteCommandLists.
+                // Signal at present, after this queue has received the work.
+                release(use.command_list);
+            }
+        }
+    };
+    mark(states);
+    mark(retired_states);
+}
+
+void collect_peripheral_dlaa_resources() noexcept {
+    std::lock_guard lock(state_mutex);
+    const auto collect = [](auto& collection) {
+        for (auto& state : collection) {
+            for (auto it = state.gpu_uses.begin(); it != state.gpu_uses.end();) {
+                auto& use = *it;
+                if (use.queue != nullptr && !use.signaled) {
+                    if (use.fence == nullptr) {
+                        static_cast<void>(state.device->CreateFence(
+                            0U, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&use.fence)
+                        ));
+                    }
+                    if (use.fence != nullptr) {
+                        use.signaled = SUCCEEDED(use.queue->Signal(use.fence, 1U));
+                    }
+                }
+                if (use.signaled && use.fence->GetCompletedValue() >= 1U) {
+                    release_gpu_use(use);
+                    it = state.gpu_uses.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    };
+    collect(states);
+    collect(retired_states);
+    for (auto it = retired_states.begin(); it != retired_states.end();) {
+        if (it->gpu_uses.empty()) {
+            release_state(*it);
+            it = retired_states.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 

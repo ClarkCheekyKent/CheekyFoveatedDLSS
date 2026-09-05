@@ -273,6 +273,7 @@ SRWLOCK streamline_lock = SRWLOCK_INIT;
 std::array<CachedSlTag, sl_tag_capacity> cached_sl_tags{};
 SlViewportHandle cached_sl_viewport{};
 bool has_cached_sl_viewport{};
+bool cached_sl_frame_tagging{};
 SlConstants cached_sl_constants{};
 bool has_cached_sl_constants{};
 SlDlssOptions cached_sl_options{};
@@ -1154,6 +1155,8 @@ enum class D3D12TimingKind : std::uint32_t {
     full_nr,
     foveated_nr,
     peripheral_dlaa,
+    foveated_dlss,
+    native_dlss,
 };
 
 struct D3D12NrTimingSlot {
@@ -1231,6 +1234,11 @@ void resolve_d3d12_nr_timing(
             if (slot.kind == D3D12TimingKind::peripheral_dlaa) {
                 diagnostic_note_peripheral_dlaa_gpu_time(
                     DiagnosticApi::d3d12, milliseconds
+                );
+            } else if (slot.kind == D3D12TimingKind::foveated_dlss ||
+                       slot.kind == D3D12TimingKind::native_dlss) {
+                diagnostic_note_d3d12_dlss_gpu_time(
+                    milliseconds, slot.kind == D3D12TimingKind::foveated_dlss
                 );
             } else {
                 diagnostic_note_dlss_nr_gpu_time(
@@ -1394,11 +1402,16 @@ struct D3D12PeripheralTimingScope {
     bool manual_begin{};
 
     explicit D3D12PeripheralTimingScope(
-        ID3D12GraphicsCommandList* const in_command_list
+        ID3D12GraphicsCommandList* const in_command_list,
+        const D3D12TimingKind kind = D3D12TimingKind::peripheral_dlaa
     ) noexcept : command_list(in_command_list) {
         if (command_list == nullptr ||
             !diagnostic_should_sample_gpu_time(
-                DiagnosticGpuTiming::d3d12_peripheral_dlaa
+                kind == D3D12TimingKind::foveated_dlss
+                    ? DiagnosticGpuTiming::d3d12_foveated_dlss
+                    : kind == D3D12TimingKind::native_dlss
+                        ? DiagnosticGpuTiming::d3d12_native_dlss
+                        : DiagnosticGpuTiming::d3d12_peripheral_dlaa
             )) {
             return;
         }
@@ -1414,7 +1427,7 @@ struct D3D12PeripheralTimingScope {
             if (candidate.pending || candidate.recording) continue;
             timer->next_slot = (index + 1U) % timer->slots.size();
             candidate.recording = true;
-            candidate.kind = D3D12TimingKind::peripheral_dlaa;
+            candidate.kind = kind;
             slot = &candidate;
             slot_index = index;
             backend_timing.query_heap = timer->query_heap;
@@ -1486,6 +1499,7 @@ void note_d3d12_command_list_submission_impl(
     ID3D12GraphicsCommandList* const command_list
 ) noexcept {
     if (queue == nullptr || command_list == nullptr) return;
+    note_peripheral_dlaa_submission(queue, command_list);
     std::uint64_t frequency{};
     if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0U) return;
     std::lock_guard lock(d3d12_nr_timing_mutex);
@@ -1507,6 +1521,7 @@ void note_d3d12_command_list_submission_impl(
 void note_d3d12_present_impl(
     ID3D12CommandQueue* const present_queue
 ) noexcept {
+    collect_peripheral_dlaa_resources();
     std::uint64_t present_frequency{};
     if (present_queue != nullptr) {
         static_cast<void>(present_queue->GetTimestampFrequency(&present_frequency));
@@ -1569,7 +1584,8 @@ void note_d3d12_present_impl(
 void cache_streamline_tags(
     const void* const viewport,
     const void* const tags,
-    const std::uint32_t count
+    const std::uint32_t count,
+    const bool frame_tagging
 ) noexcept {
     if (viewport == nullptr || tags == nullptr) return;
     const auto* const typed = static_cast<const SlResourceTag*>(tags);
@@ -1577,6 +1593,7 @@ void cache_streamline_tags(
     cached_sl_viewport = *static_cast<const SlViewportHandle*>(viewport);
     cached_sl_viewport.next = nullptr;
     has_cached_sl_viewport = true;
+    cached_sl_frame_tagging = frame_tagging;
     for (std::uint32_t index{}; index < count; ++index) {
         const auto& source = typed[index];
         if (source.type >= cached_sl_tags.size() || source.resource == nullptr) {
@@ -1704,6 +1721,8 @@ void cache_streamline_tags(
     static std::atomic<std::uint32_t> logged_apply_original_height{};
     static std::atomic<std::uint32_t> logged_apply_width{};
     static std::atomic<std::uint32_t> logged_apply_height{};
+    static std::atomic<std::uint32_t> logged_apply_preset{0xFFFFFFFFU};
+    const auto previous_apply_preset = logged_apply_preset.exchange(preset);
     const bool first_apply_state =
         !apply_log_initialized.exchange(true, std::memory_order_relaxed);
     const auto previous_apply_mode = logged_apply_mode.exchange(
@@ -1726,20 +1745,21 @@ void cache_streamline_tags(
         height,
         std::memory_order_relaxed
     );
-    if (result != 0U || first_apply_state ||
+    if (result != 0U || first_apply_state || previous_apply_preset != preset ||
         previous_apply_mode != options.mode ||
         previous_apply_original_width != original_width ||
         previous_apply_original_height != original_height ||
         previous_apply_width != width ||
         previous_apply_height != height) {
         trace_event(
-            "SL options apply viewport=%u mode=%u original=%ux%u requested=%ux%u result=0x%08X",
+            "SL options apply viewport=%u mode=%u original=%ux%u requested=%ux%u preset=%u result=0x%08X",
             viewport.value,
             options.mode,
             original_width,
             original_height,
             width,
             height,
+            preset,
             result
         );
     }
@@ -1795,7 +1815,27 @@ struct StreamlineEvaluation {
     bool motion_vectors_output_space{};
     bool has_nr_constants{};
     bool peripheral_ready{};
+    bool frame_tagging{};
 };
+
+// Export availability does not indicate the tagging mode enabled by the game.
+[[nodiscard]] std::uint32_t submit_streamline_tags(
+    const bool frame_tagging,
+    const void* const frame,
+    const SlViewportHandle& viewport,
+    const SlResourceTag* const tags,
+    const std::uint32_t count,
+    ID3D12GraphicsCommandList* const command_list
+) noexcept {
+    if (frame_tagging) {
+        const auto submit = real_sl_set_tag_for_frame.load(std::memory_order_acquire);
+        return submit != nullptr && frame != nullptr
+            ? submit(frame, &viewport, tags, count, command_list) : 0x18U;
+    }
+    const auto submit = real_sl_set_tag.load(std::memory_order_acquire);
+    return submit != nullptr
+        ? submit(&viewport, tags, count, command_list) : 0x18U;
+}
 
 [[nodiscard]] bool evaluate_streamline_peripheral_dlaa(
     ID3D12GraphicsCommandList* const command_list,
@@ -1972,24 +2012,12 @@ struct StreamlineEvaluation {
     tags[3U].resource = &resources[3U];
     tags[3U].extent = {0U, 0U, working_width, working_height};
 
-    std::uint32_t tag_result{0x18U};
-    if (set_for_frame != nullptr) {
-        tag_result = set_for_frame(
-            frame,
-            &peripheral_viewport,
-            tags.data(),
-            static_cast<std::uint32_t>(tags.size()),
-            command_list
-        );
-    } else {
-        tag_result = set_tag(
-            &peripheral_viewport,
-            tags.data(),
-            static_cast<std::uint32_t>(tags.size()),
-            command_list
-        );
-    }
+    const auto tag_result = submit_streamline_tags(
+        evaluation.frame_tagging, frame, peripheral_viewport, tags.data(),
+        static_cast<std::uint32_t>(tags.size()), command_list
+    );
     if (tag_result != 0U) {
+        if (verbose) trace_event("SL eval=%llu peripheral DLAA tag submission failed result=0x%08X", static_cast<unsigned long long>(sequence), tag_result);
         cleanup();
         return false;
     }
@@ -2086,6 +2114,7 @@ struct StreamlineEvaluation {
     if (has_cached_sl_viewport) {
         cached = true;
         evaluation.viewport = cached_sl_viewport;
+        evaluation.frame_tagging = cached_sl_frame_tagging;
         for (std::size_t index{}; index < required.size(); ++index) {
             const auto& source = cached_sl_tags[required[index]];
             if (!source.present || source.resource.native == nullptr) {
@@ -2201,22 +2230,6 @@ struct StreamlineEvaluation {
             crop.output_base_y
         );
     }
-    if (!apply_streamline_options(
-            crop.output_width,
-            crop.output_height,
-            streamline_settings.center_preset
-        )) {
-        if (verbose) trace_event("SL eval=%llu cropped options failed", static_cast<unsigned long long>(sequence));
-        finish_d3d12_streamline(command_list, evaluation.backend, false);
-        evaluation.backend = nullptr;
-        diagnostic_note_state(
-            DiagnosticApi::d3d12,
-            DiagnosticState::prepare_rejected
-        );
-        return false;
-    }
-    if (verbose) trace_event("SL eval=%llu cropped options applied", static_cast<unsigned long long>(sequence));
-
     // Match the Hogwarts/native NGX fix: infer MV coordinate space from the
     // actual motion-vector texture dimensions rather than assuming low-res MVs.
     // The tag extent is still the region we crop *within*; native dimensions are
@@ -2263,6 +2276,20 @@ struct StreamlineEvaluation {
         verbose,
         sequence
     ));
+
+    // Streamline shares NGX preset parameters across viewports. The peripheral
+    // options must not be the last options submitted before the center call.
+    if (!apply_streamline_options(
+            crop.output_width, crop.output_height,
+            streamline_settings.center_preset
+        )) {
+        if (verbose) trace_event("SL eval=%llu cropped options failed", static_cast<unsigned long long>(sequence));
+        finish_d3d12_streamline(command_list, evaluation.backend, false);
+        evaluation.backend = nullptr;
+        diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::prepare_rejected);
+        return false;
+    }
+    if (verbose) trace_event("SL eval=%llu cropped options applied", static_cast<unsigned long long>(sequence));
 
     if (verbose) {
         const auto& mv_tag = evaluation.tags[2U];
@@ -2356,27 +2383,10 @@ struct StreamlineEvaluation {
     output_tag.extent = {0U, 0U, crop.output_width, crop.output_height};
     if (verbose) trace_event("SL eval=%llu cropped tags prepared", static_cast<unsigned long long>(sequence));
 
-    std::uint32_t tag_result{0x18U};
-    const auto set_for_frame = real_sl_set_tag_for_frame.load(
-        std::memory_order_acquire
+    const auto tag_result = submit_streamline_tags(
+        evaluation.frame_tagging, frame, evaluation.viewport, evaluation.tags.data(),
+        static_cast<std::uint32_t>(evaluation.tags.size()), command_list
     );
-    const auto set_tag = real_sl_set_tag.load(std::memory_order_acquire);
-    if (set_for_frame != nullptr && frame != nullptr) {
-        tag_result = set_for_frame(
-            frame,
-            &evaluation.viewport,
-            evaluation.tags.data(),
-            static_cast<std::uint32_t>(evaluation.tags.size()),
-            command_list
-        );
-    } else if (set_tag != nullptr) {
-        tag_result = set_tag(
-            &evaluation.viewport,
-            evaluation.tags.data(),
-            static_cast<std::uint32_t>(evaluation.tags.size()),
-            command_list
-        );
-    }
     if (tag_result != 0U) {
         trace_event(
             "SL eval=%llu cropped tag submission failed result=0x%08X",
@@ -2621,7 +2631,7 @@ std::uint32_t hook_sl_set_tag(
             command_buffer
         );
     }
-    cache_streamline_tags(viewport, tags, count);
+    cache_streamline_tags(viewport, tags, count, false);
     if (log_index < 8U) trace_event("slSetTag cache complete index=%u", log_index);
     const auto original = real_sl_set_tag.load(std::memory_order_acquire);
     const auto result = original == nullptr
@@ -2652,7 +2662,7 @@ std::uint32_t hook_sl_set_tag_for_frame(
             command_buffer
         );
     }
-    cache_streamline_tags(viewport, tags, count);
+    cache_streamline_tags(viewport, tags, count, true);
     if (log_index < 8U) trace_event("slSetTagForFrame cache complete index=%u", log_index);
     const auto original = real_sl_set_tag_for_frame.load(
         std::memory_order_acquire
@@ -2795,6 +2805,11 @@ std::uint32_t hook_sl_evaluate_feature(
             static_cast<void>(prepare_streamline_nr_passthrough(nr_evaluation));
         }
         StreamlineEvaluationScope scope;
+        D3D12PeripheralTimingScope sr_timing{
+            static_cast<ID3D12GraphicsCommandList*>(command_buffer),
+            D3D12TimingKind::native_dlss
+        };
+        sr_timing.begin();
         const auto result = original(
             feature,
             frame,
@@ -2802,6 +2817,7 @@ std::uint32_t hook_sl_evaluate_feature(
             input_count,
             command_buffer
         );
+        sr_timing.finish(result == 0U);
         evaluate_streamline_nr(
             static_cast<ID3D12GraphicsCommandList*>(command_buffer),
             nr_evaluation,
@@ -2815,13 +2831,24 @@ std::uint32_t hook_sl_evaluate_feature(
     auto* const command_list = static_cast<ID3D12GraphicsCommandList*>(
         command_buffer
     );
-    static_cast<void>(prepare_streamline_evaluation(
+    const bool prepared = prepare_streamline_evaluation(
         command_list,
         frame,
         evaluation,
         verbose,
         sequence
-    ));
+    );
+    if (!prepared) {
+        // Preparation may have changed output dimensions before a later failure.
+        // Restore them before forwarding the game's uncropped evaluation.
+        restore_streamline_options();
+        streamline_foveation_active.store(false, std::memory_order_release);
+    }
+    D3D12PeripheralTimingScope sr_timing{
+        command_list, prepared ? D3D12TimingKind::foveated_dlss
+                               : D3D12TimingKind::native_dlss
+    };
+    sr_timing.begin();
     if (verbose) trace_event("SL eval=%llu original begin foveated=%s", static_cast<unsigned long long>(sequence), evaluation.backend != nullptr ? "yes" : "no");
     std::uint32_t result{};
     {
@@ -2834,6 +2861,7 @@ std::uint32_t hook_sl_evaluate_feature(
             command_buffer
         );
     }
+    sr_timing.finish(result == 0U);
     if (verbose) trace_event("SL eval=%llu original end result=0x%08X", static_cast<unsigned long long>(sequence), result);
     if (evaluation.constants_overridden) {
         const auto set_constants = real_sl_set_constants.load(
@@ -3871,11 +3899,15 @@ void evaluate_nr_after_native_d3d12(
         contract.output_height,
         crop
     );
+    D3D12PeripheralTimingScope sr_timing{
+        command_list, D3D12TimingKind::foveated_dlss
+    };
     result = evaluate_d3d12_backend(
         command_list, contract, inputs,
         const_cast<NgxParameters*>(parameters),
-        crop, callbacks
+        crop, callbacks, sr_timing.backend()
     );
+    sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
     finish_d3d12(command_list, parameters, evaluation, result);
     if (peripheral_ready) {
@@ -3995,12 +4027,17 @@ NgxResult process_d3d12_evaluation(
         : private_attempted ? DiagnosticState::ngx_evaluation_failed
                             : DiagnosticState::prepare_rejected
     );
+    D3D12PeripheralTimingScope sr_timing{
+        call.command_list, D3D12TimingKind::native_dlss
+    };
+    sr_timing.begin();
     result = original(
         call.command_list,
         call.handle,
         call.parameters,
         call.callback
     );
+    sr_timing.finish(ngx_succeeded(result));
     evaluate_nr_after_native_d3d12(
         call.command_list, call.handle, call.parameters, settings, result
     );
@@ -4103,7 +4140,12 @@ NgxResult hook_evaluate_d3d12_c(
         : private_attempted ? DiagnosticState::ngx_evaluation_failed
                             : DiagnosticState::prepare_rejected
     );
+    D3D12PeripheralTimingScope sr_timing{
+        command_list, D3D12TimingKind::native_dlss
+    };
+    sr_timing.begin();
     result = original(command_list, handle, parameters, callback);
+    sr_timing.finish(ngx_succeeded(result));
     evaluate_nr_after_native_d3d12(
         command_list, handle, parameters, settings, result
     );

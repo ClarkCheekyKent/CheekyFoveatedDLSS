@@ -109,5 +109,9 @@ void restore_peripheral_dlaa_output(
 
 void release_peripheral_dlaa_view(DlssViewId view_id) noexcept;
 void release_peripheral_dlaa_resources() noexcept;
+void note_peripheral_dlaa_submission(
+    ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* command_list
+) noexcept;
+void collect_peripheral_dlaa_resources() noexcept;
 
 }  // namespace cheeky::foveated_dlss

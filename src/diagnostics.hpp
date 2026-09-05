@@ -28,6 +28,8 @@ enum class DiagnosticGpuTiming : std::uint32_t {
     d3d12_full_dlss_nr,
     d3d12_foveated_dlss_nr,
     d3d12_peripheral_dlaa,
+    d3d12_foveated_dlss,
+    d3d12_native_dlss,
     count,
 };
 
@@ -153,6 +155,7 @@ void diagnostic_note_dlss_nr_gpu_time(
     bool foveated
 ) noexcept;
 void diagnostic_note_native_dlss_gpu_time(float milliseconds) noexcept;
+void diagnostic_note_d3d12_dlss_gpu_time(float milliseconds, bool foveated) noexcept;
 void diagnostic_note_frame_rate(
     float frames_per_second,
     bool foveated_enabled
