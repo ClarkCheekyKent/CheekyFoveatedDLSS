@@ -23,7 +23,7 @@ This is intended for games where ReShade add-ons and DLL replacement are allowed
 4. Open the ReShade overlay and select **Cheeky Foveated DLSS** in the **Add-ons** tab.
 5. Confirm that **Foveated DLSS-SR** is enabled (it is on by default). Changes apply live on the next DLSS evaluation.
 
-### Optional eye tracking
+### Optional eye tracking (Experimental)
 
 Eye tracking is optional and remains off by default. If you only want fixed
 foveation, the add-on installation above is all you need.
@@ -132,11 +132,9 @@ These games have been tested; other DLSS titles may also work. Support depends o
 
 ### Eye tracking
 
-The first eye-tracked path targets Pimax Dream Air, Pimax OpenXR, and Assetto
-Corsa EVO. It uses the standard `XR_EXT_eye_gaze_interaction` pose, projects the
-gaze independently through each asymmetric OpenXR view, and only activates after
-the add-on has matched the exact DLSS output resource and rectangle for two
-consecutive display frames.
+I do not own an eye tracked headset, however due to the open source nature of the
+project @Williem3 was able to add in the initial implementaiton. I cannot fully validate 
+the eye tracking experience but rely on community reports if there are issues.
 
 The implementation intentionally falls back to the configured fixed center if
 the layer is absent, gaze becomes stale, the ABI does not match, the game uses a
@@ -151,29 +149,10 @@ tracking**. Both eyes must show stable and different DLSS-view mappings before
 the border follows gaze. A blink holds the last sample for 100 ms and then
 returns to the fixed center over 150 ms.
 
-### Simulated gaze (no eye tracker required)
-
-For Quest 3 PC VR testing, install the add-on and the matching OpenXR
-eye-tracking installer as described above. In the ReShade add-on panel, select **Foveation
-center > Simulated gaze** and enable **Show 5 px red alignment border**.
-The simulated direction follows a repeating eight-second figure eight relative
-to your head. Both eyes use the real OpenXR views and the existing projection,
-resource mapping, smoothing, crop quantization, and DLSS history reset logic.
-No eye tracking extension or eye tracking hardware is required for this mode.
-The game still needs a supported OpenXR stereo and DLSS rendering path.
-
-Under **Diagnostics > OpenXR eye tracking**, check **Simulated gaze**, gaze
-validity, the per-eye mappings, and **Using gaze**. Hardware support and eye
-gaze extension indicators may correctly remain off. If the layer is missing or
-mapping fails, the region stays at its fixed fallback. Use the matching newly
-built layer DLL; older layer builds do not implement simulation.
-Choose **Fixed** to stop or **OpenXR gaze** to return to actual tracking.
-The selected mode is saved with the other settings. This tests synthetic motion,
-not real eye tracker acquisition or latency.
-
 ## Support
 
-If this add-on is useful to you and you would like to buy me a coffee, you can [support me on Ko-fi](https://ko-fi.com/cheekykent).
+If this add-on is useful to you and you would like to buy me a coffee (or help fund an eye tracked headset for me), 
+you can [support me on Ko-fi](https://ko-fi.com/cheekykent).
 
 ## License
 
@@ -200,6 +179,26 @@ to `bin\Release`; use `-Configuration Debug` for a debug build. You can also ope
 implementation lives in `src`; `src/gaze_foveation.hpp` is the add-on-side
 OpenXR seam and `src/foveation.hpp` contains renderer-independent crop geometry.
 
+### Simulated gaze (no eye tracker required)
+
+For Quest 3 PC VR testing, install the add-on and the matching OpenXR
+eye-tracking installer as described above. In the ReShade add-on panel, select **Foveation
+center > Simulated gaze** and enable **Show 5 px red alignment border**.
+The simulated direction follows a repeating pattern relative
+to your head. Both eyes use the real OpenXR views and the existing projection,
+resource mapping, smoothing, crop quantization, and DLSS history reset logic.
+No eye tracking extension or eye tracking hardware is required for this mode.
+The game still needs a supported OpenXR stereo and DLSS rendering path.
+
+Under **Diagnostics > OpenXR eye tracking**, check **Simulated gaze**, gaze
+validity, the per-eye mappings, and **Using gaze**. Hardware support and eye
+gaze extension indicators may correctly remain off. If the layer is missing or
+mapping fails, the region stays at its fixed fallback. Use the matching newly
+built layer DLL; older layer builds do not implement simulation.
+Choose **Fixed** to stop or **OpenXR gaze** to return to actual tracking.
+The selected mode is saved with the other settings. This tests synthetic motion,
+not real eye tracker acquisition or latency.
+
 ### Building the eye-tracking installer
 
 Install [Inno Setup 6.3 or newer](https://jrsoftware.org/isdl.php), then run:
@@ -224,23 +223,3 @@ and uninstall on a Windows test machine; verify that the manifest's DWORD is
 only that value and the installed files. Verify gaze in a supported game after
 restarting it. Release signing, when available, should be applied to the DLL
 before packaging and to the final installer EXE before publishing.
-
-### Simulation patterns
-
-With **Foveation center > Simulated gaze**, choose **Simulation pattern**:
-
-- **Figure eight (8 s)**: continuous motion on both axes.
-- **Slow sweep (20 s)**: horizontal motion for inspecting transitions.
-- **Jump every 2 s / Jump every 8 s**: hold center and four corner targets in sequence.
-- **Tracking loss**: move for four seconds, invalidate gaze for one second, then recover. Tests the existing hold and fixed-center fallback.
-- **Hold center**: stationary head-relative direction for stereo alignment.
-
-Pattern changes restart the sequence and are saved. Jumps still use the configured
-gaze smoothing; set smoothing to zero when testing abrupt crop changes.
-These patterns require the updated OpenXR layer as well as the updated add-on.
-
-For either jump pattern, **Show next jump target (green)** previews the upcoming
-foveation outline in each eye. It is enabled by default and follows crop limits,
-quantization, and roundness. It advances at each jump, including the wrap back to
-center. Both the add-on and OpenXR layer must be updated together for this feature
-(the gaze snapshot ABI is now version 2).
