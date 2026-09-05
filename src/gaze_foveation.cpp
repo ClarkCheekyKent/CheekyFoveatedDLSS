@@ -25,6 +25,10 @@ struct ViewState {
     std::int64_t last_snapshot_display_time{};
     std::uint64_t last_snapshot_qpc{};
     bool has_crop{};
+    bool next_jump_visible{};
+    FoveationOffsets next_jump_offsets{};
+    unsigned mapping_log_count{};
+    std::uint64_t last_mapping_log_qpc{};
     CropGeometry last_crop{};
 };
 
@@ -156,6 +160,11 @@ void update_diagnostics_view(
     auto& target = diagnostics.views[index];
     target.center_u = snapshot.views[index].center_u;
     target.center_v = snapshot.views[index].center_v;
+    const auto& source = snapshot.views[index];
+    target.xr_resource = source.resource_identity;
+    target.xr_x = source.image_rect_x; target.xr_y = source.image_rect_y;
+    target.xr_width = source.image_rect_width; target.xr_height = source.image_rect_height;
+    target.xr_array = source.array_index;
 }
 
 }  // namespace
@@ -180,6 +189,9 @@ bool calculate_coordinated_crop(
         using SetSimulationFn = void(__cdecl*)(std::uint32_t);
         const auto set_simulation = reinterpret_cast<SetSimulationFn>(
             GetProcAddress(module, "CheekyOpenXR_SetSimulatedGaze"));
+        const auto set_pattern = reinterpret_cast<SetSimulationFn>(
+            GetProcAddress(module, "CheekyOpenXR_SetSimulationPattern"));
+        if (set_pattern != nullptr) set_pattern(settings.simulation_pattern);
         if (set_simulation != nullptr) {
             set_simulation(settings.center_mode == FoveationCenterMode::simulated_gaze ? 1U : 0U);
         }
@@ -192,6 +204,7 @@ bool calculate_coordinated_crop(
     }
 
     std::lock_guard lock(coordinator_mutex);
+    state_for_view(view_id).next_jump_visible = false;
     if (qpc_frequency == 0U) {
         LARGE_INTEGER frequency{};
         QueryPerformanceFrequency(&frequency);
@@ -264,6 +277,22 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
+    // Capture actual inputs on a bounded schedule, including intermediate outputs.
+    if (match_count == 0U && state.mapping_log_count < 8U &&
+        (state.mapping_log_count == 0U || seconds_between(now, state.last_mapping_log_qpc) >= 2.0)) {
+        ++state.mapping_log_count;
+        state.last_mapping_log_qpc = now;
+        trace_event("Gaze mapping rejected DLSS view=%llu resource=0x%llX rect=(%u,%u %ux%u) stereo_assigned=%u eye=%u flags=0x%X views=%u",
+            static_cast<unsigned long long>(view_id), static_cast<unsigned long long>(resource_identity),
+            output_origin_x, output_origin_y, output_width, output_height,
+            eye_assignment.assigned ? 1U : 0U, eye_assignment.eye_index, snapshot.status_flags, snapshot.view_count);
+        for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
+            const auto& v = snapshot.views[i];
+            trace_event("Gaze mapping XR eye=%u resource=0x%llX swapchain=0x%llX rect=(%d,%d %ux%u) array=%u flags=0x%X",
+                i, static_cast<unsigned long long>(v.resource_identity), static_cast<unsigned long long>(v.swapchain_identity),
+                v.image_rect_x, v.image_rect_y, v.image_rect_width, v.image_rect_height, v.array_index, v.flags);
+        }
+    }
     if (state.last_snapshot_display_time != snapshot.predicted_display_time) {
         state.last_snapshot_display_time = snapshot.predicted_display_time;
         state.last_snapshot_qpc = now;
@@ -313,6 +342,13 @@ bool calculate_coordinated_crop(
             diagnostics.views[index].packed_stereo_mapping = false;
         }
     }
+    if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
+        auto& candidate = diagnostics.views[eye_assignment.eye_index];
+        candidate.has_candidate = true;
+        candidate.candidate_view = view_id; candidate.candidate_resource = resource_identity;
+        candidate.candidate_x = output_origin_x; candidate.candidate_y = output_origin_y;
+        candidate.candidate_width = output_width; candidate.candidate_height = output_height;
+    }
     if (state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS) {
         auto& view_diagnostics = diagnostics.views[state.mapping.view_index];
         view_diagnostics.dlss_view_id = state.view_id;
@@ -331,6 +367,20 @@ bool calculate_coordinated_crop(
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
         sample_age_seconds <= gaze_stale_seconds;
     const bool use_sample = mapping_stable && snapshot_valid;
+    if (use_sample && settings.show_next_jump_target &&
+        settings.center_mode == FoveationCenterMode::simulated_gaze &&
+        (settings.simulation_pattern == 2U || settings.simulation_pattern == 3U)) {
+        const auto& target = snapshot.views[state.mapping.view_index];
+        CropGeometry next_crop{};
+        if ((target.flags & CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID) != 0U &&
+            calculate_foveation_geometry_at_center(foveation_parameters(fixed_settings),
+                {target.next_jump_u, target.next_jump_v, settings.gaze_quantization_pixels},
+                render_width, render_height, output_width, output_height,
+                output_origin_x, output_origin_y, next_crop)) {
+            state.next_jump_visible = true;
+            state.next_jump_offsets = foveation_offsets_from_geometry(next_crop, render_width, render_height);
+        }
+    }
     const auto fallback = fixed_center(
         fixed_settings, render_width, render_height
     );
@@ -406,6 +456,13 @@ bool calculate_coordinated_crop(
             static_cast<unsigned int>(reset_result.reason)
         );
     }
+    if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
+        auto& candidate = diagnostics.views[eye_assignment.eye_index];
+        candidate.has_candidate = true;
+        candidate.candidate_view = view_id; candidate.candidate_resource = resource_identity;
+        candidate.candidate_x = output_origin_x; candidate.candidate_y = output_origin_y;
+        candidate.candidate_width = output_width; candidate.candidate_height = output_height;
+    }
     if (state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS) {
         auto& view_diagnostics = diagnostics.views[state.mapping.view_index];
         view_diagnostics.crop_delta_x = static_cast<std::int32_t>(
@@ -418,6 +475,18 @@ bool calculate_coordinated_crop(
     state.last_crop = crop;
     state.has_crop = true;
     return true;
+}
+
+void apply_next_jump_preview(Settings& settings, const DlssViewId view_id) noexcept {
+    settings.next_jump_visible = false;
+    if (!settings.show_next_jump_target || settings.center_mode != FoveationCenterMode::simulated_gaze) return;
+    std::lock_guard lock(coordinator_mutex);
+    for (const auto& state : view_states) if (state.view_id == view_id) {
+        settings.next_jump_visible = state.next_jump_visible;
+        settings.next_jump_offset_x = state.next_jump_offsets.x;
+        settings.next_jump_offset_y = state.next_jump_offsets.y;
+        break;
+    }
 }
 
 GazeDiagnostics gaze_diagnostics() noexcept {

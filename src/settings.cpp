@@ -24,6 +24,8 @@ std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
 std::atomic<bool> alignment_border_enabled{false};
 std::atomic<std::uint32_t> center_mode{};
+std::atomic<std::uint32_t> simulation_pattern{};
+std::atomic<bool> show_next_jump_target{true};
 std::atomic<std::uint32_t> gaze_smoothing_ms_bits{0x41A00000U};
 std::atomic<std::uint32_t> gaze_quantization_pixels{8U};
 std::atomic<std::uint32_t> gaze_jump_reset_ratio_bits{0x3E000000U};
@@ -121,6 +123,8 @@ Settings current_settings() noexcept {
     settings.center_mode = static_cast<FoveationCenterMode>(
         center_mode.load(std::memory_order_acquire)
     );
+    settings.show_next_jump_target = show_next_jump_target.load(std::memory_order_acquire);
+    settings.simulation_pattern = simulation_pattern.load(std::memory_order_acquire);
     settings.gaze_smoothing_ms = load_float(gaze_smoothing_ms_bits);
     settings.gaze_quantization_pixels = gaze_quantization_pixels.load(
         std::memory_order_acquire
@@ -215,6 +219,8 @@ void update_settings(const Settings& settings) noexcept {
             : 0U,
         std::memory_order_release
     );
+    show_next_jump_target.store(settings.show_next_jump_target, std::memory_order_release);
+    simulation_pattern.store(std::min(settings.simulation_pattern, 5U), std::memory_order_release);
     store_float(
         gaze_smoothing_ms_bits,
         std::clamp(settings.gaze_smoothing_ms, 0.0F, 100.0F)

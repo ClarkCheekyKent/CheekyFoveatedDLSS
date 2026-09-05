@@ -18,6 +18,12 @@ struct GazeViewDiagnostics {
     std::uint32_t stable_matches{};
     std::int32_t crop_delta_x{};
     std::int32_t crop_delta_y{};
+    std::uint64_t xr_resource{};
+    std::int32_t xr_x{}, xr_y{};
+    std::uint32_t xr_width{}, xr_height{}, xr_array{};
+    std::uint64_t candidate_view{}, candidate_resource{};
+    std::uint32_t candidate_x{}, candidate_y{}, candidate_width{}, candidate_height{};
+    bool has_candidate{};
     bool resource_mapped{};
     bool packed_stereo_mapping{};
 };
@@ -48,6 +54,7 @@ struct GazeDiagnostics {
     bool& reset_history
 ) noexcept;
 
+void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
 [[nodiscard]] GazeDiagnostics gaze_diagnostics() noexcept;
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;

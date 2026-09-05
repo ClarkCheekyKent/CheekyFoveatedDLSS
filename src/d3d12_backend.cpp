@@ -263,9 +263,12 @@ struct CompositeConstants {
     float feather;
     std::uint32_t dlss_origin[2];
     std::uint32_t show_alignment_border;
+    float next_jump_offset_x;
+    float next_jump_offset_y;
+    std::uint32_t show_next_jump;
 };
 
-static_assert(sizeof(CompositeConstants) == 21U * sizeof(std::uint32_t));
+static_assert(sizeof(CompositeConstants) == 24U * sizeof(std::uint32_t));
 
 SRWLOCK resources_lock = SRWLOCK_INIT;
 D3D12Resources* resource_list{};
@@ -299,6 +302,9 @@ cbuffer Constants : register(b0) {
     float Feather;
     uint2 DlssOrigin;
     uint ShowAlignmentBorder;
+    float NextJumpOffsetX;
+    float NextJumpOffsetY;
+    uint ShowNextJump;
 };
 
 float ShapeDistance(float2 centered) {
@@ -356,6 +362,18 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         abs(ShapeDistance(centered + float2(0.0, pixel_size.y)) -
             distance_from_center)
     );
+    if (ShowNextJump != 0U) {
+        float2 next_centered = (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
+        next_centered -= float2(NextJumpOffsetX * (1.0 - ShapeWidth), NextJumpOffsetY * (1.0 - ShapeHeight));
+        const float next_distance = ShapeDistance(next_centered);
+        const float next_pixel_distance = max(
+            abs(ShapeDistance(next_centered + float2(pixel_size.x, 0.0)) - next_distance),
+            abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
+        if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
+            GameOutput[output_pixel] = float4(0.0, 1.0, 0.0, 1.0);
+            return;
+        }
+    }
     const bool alignment_border = ShowAlignmentBorder != 0U &&
         distance_from_center <= 1.0 &&
         distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
@@ -552,7 +570,7 @@ void release_resources(D3D12Resources* const resources) noexcept {
     root_parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
     root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[2].Constants.ShaderRegister = 0U;
-    root_parameters[2].Constants.Num32BitValues = 21U;
+    root_parameters[2].Constants.Num32BitValues = 24U;
 
     D3D12_ROOT_SIGNATURE_DESC root_description{};
     root_description.NumParameters = 3U;
@@ -838,6 +856,8 @@ struct D3D12Evaluation {
     float roundness{};
     float feather{};
     bool alignment_border{};
+    bool next_jump_visible{};
+    float next_jump_offset_x{}, next_jump_offset_y{};
     bool gaze_reset{};
     std::uint64_t descriptor_offset{};
     bool diagnostic_trace{};
@@ -983,12 +1003,13 @@ D3D12Evaluation* prepare_d3d12(
         }
         return nullptr;
     }
-    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+    if (settings.center_mode != FoveationCenterMode::fixed) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
+        apply_next_jump_preview(effective_settings, view_id);
     }
 
     ID3D12Device* device{};
@@ -1110,6 +1131,9 @@ D3D12Evaluation* prepare_d3d12(
     evaluation->roundness = effective_settings.roundness;
     evaluation->feather = effective_settings.transition_width;
     evaluation->alignment_border = effective_settings.alignment_border_enabled;
+    evaluation->next_jump_visible = effective_settings.next_jump_visible;
+    evaluation->next_jump_offset_x = effective_settings.next_jump_offset_x;
+    evaluation->next_jump_offset_y = effective_settings.next_jump_offset_y;
     evaluation->gaze_reset = gaze_reset;
 
     const auto descriptor_set = resources->next_descriptor_set.fetch_add(
@@ -1313,12 +1337,13 @@ D3D12Evaluation* prepare_d3d12_streamline(
         )) {
         return nullptr;
     }
-    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+    if (settings.center_mode != FoveationCenterMode::fixed) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
+        apply_next_jump_preview(effective_settings, view_id);
     }
 
     ID3D12Device* device{};
@@ -1374,6 +1399,9 @@ D3D12Evaluation* prepare_d3d12_streamline(
     evaluation->roundness = effective_settings.roundness;
     evaluation->feather = effective_settings.transition_width;
     evaluation->alignment_border = effective_settings.alignment_border_enabled;
+    evaluation->next_jump_visible = effective_settings.next_jump_visible;
+    evaluation->next_jump_offset_x = effective_settings.next_jump_offset_x;
+    evaluation->next_jump_offset_y = effective_settings.next_jump_offset_y;
     evaluation->gaze_reset = gaze_reset;
     evaluation->diagnostic_trace = diagnostic_trace;
     evaluation->diagnostic_sequence = diagnostic_sequence;
@@ -1595,6 +1623,8 @@ void finish_d3d12(
                 evaluation->dlss_source_y,
             },
             evaluation->alignment_border ? 1U : 0U,
+            evaluation->next_jump_offset_x, evaluation->next_jump_offset_y,
+            evaluation->next_jump_visible ? 1U : 0U,
         };
 
         ID3D12DescriptorHeap* heaps[] = {resources->descriptors};
@@ -1608,7 +1638,7 @@ void finish_d3d12(
         command_list->SetComputeRootDescriptorTable(1U, gpu);
         command_list->SetComputeRoot32BitConstants(
             2U,
-            21U,
+            24U,
             &constants,
             0U
         );

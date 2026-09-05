@@ -139,7 +139,10 @@ struct SessionState {
     bool action_active{};
     bool gaze_valid{};
     bool simulated{};
+    bool next_jump_valid{};
+    std::array<float, 2> next_jump_u{}, next_jump_v{};
     XrTime simulation_start{};
+    unsigned simulation_pattern{};
     bool unsupported_view_configuration{};
     bool ambiguous_resource{};
     XrTime predicted_display_time{};
@@ -174,6 +177,7 @@ struct InstanceState {
 };
 
 std::atomic<bool> simulated_gaze_enabled{};
+std::atomic<unsigned> simulation_pattern{};
 std::mutex state_mutex;
 std::unordered_map<XrInstance, InstanceState> instances;
 std::unordered_map<XrSession, SessionState> sessions;
@@ -267,6 +271,9 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
             target.center_u = session->center_u[index];
             target.center_v = session->center_v[index];
             target.flags = session->gaze_location_flags & 0xFU;
+            if (session->next_jump_valid) target.flags |= CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID;
+            target.next_jump_u = session->next_jump_u[index];
+            target.next_jump_v = session->next_jump_v[index];
             target.array_index = source.array_index;
             target.image_rect_x = source.rect.offset.x;
             target.image_rect_y = source.rect.offset.y;
@@ -455,6 +462,11 @@ void update_view_resource_locked(
 }
 
 }  // namespace
+
+extern "C" __declspec(dllexport) void __cdecl
+CheekyOpenXR_SetSimulationPattern(const std::uint32_t pattern) {
+    simulation_pattern.store((std::min)(pattern, 5U), std::memory_order_release);
+}
 
 extern "C" __declspec(dllexport) void __cdecl
 CheekyOpenXR_SetSimulatedGaze(const std::uint32_t enabled) {
@@ -1162,6 +1174,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         }
     }
 
+    cheeky::gaze_math::Pose next_jump_pose{};
+    bool next_jump_valid{};
+    std::array<float, 2> next_jump_u{}, next_jump_v{};
+    const unsigned pattern = simulation_pattern.load(std::memory_order_acquire);
     const bool simulated = simulated_gaze_enabled.load(std::memory_order_acquire);
     if (simulated && view_state != nullptr &&
         (view_state->viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0) {
@@ -1169,7 +1185,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         {
             std::lock_guard lock(state_mutex);
             auto& state = sessions.at(session);
-            if (!state.simulated) state.simulation_start = locate_info->displayTime;
+            if (!state.simulated || state.simulation_pattern != pattern) state.simulation_start = locate_info->displayTime;
+            state.simulation_pattern = pattern;
             elapsed = static_cast<double>(locate_info->displayTime - state.simulation_start) * 1e-9;
         }
         // Average the eye orientations (same hemisphere) for a head-relative pose.
@@ -1182,9 +1199,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         const float length = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
         if (length > 0.0001F) {
             q = {q.x/length, q.y/length, q.z/length, q.w/length};
-            const auto pose = cheeky::gaze_math::simulated_gaze_pose(head, elapsed);
+            const auto pose = cheeky::gaze_math::simulated_gaze_pose(head, elapsed, pattern);
+            next_jump_valid = pattern == 2U || pattern == 3U;
+            if (next_jump_valid) next_jump_pose = cheeky::gaze_math::simulated_gaze_pose(
+                head, cheeky::gaze_math::next_simulated_jump_time(elapsed, pattern), pattern);
             gaze_location.pose.orientation = {pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w};
-            gaze_location.locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            gaze_location.locationFlags = cheeky::gaze_math::simulated_gaze_valid(elapsed, pattern)
+                ? XR_SPACE_LOCATION_ORIENTATION_VALID_BIT : 0;
             sample_time.time = locate_info->displayTime;
             action_active = true;
         }
@@ -1208,6 +1229,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
                 views[index].fov.angleUp,
                 views[index].fov.angleDown,
             };
+            if (next_jump_valid) next_jump_valid &= cheeky::gaze_math::project_gaze_to_view(
+                next_jump_pose, convert_pose(views[index].pose), fov, next_jump_u[index], next_jump_v[index]);
             projections_valid &= cheeky::gaze_math::project_gaze_to_view(
                 gaze_pose,
                 convert_pose(views[index].pose),
@@ -1227,6 +1250,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
                 locate_info->viewConfigurationType !=
                 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             state.predicted_display_time = locate_info->displayTime;
+            state.next_jump_valid = next_jump_valid;
+            state.next_jump_u = next_jump_u; state.next_jump_v = next_jump_v;
             state.simulated = simulated;
             state.sample_time = sample_time.time;
             state.action_active = action_active;

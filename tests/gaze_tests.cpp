@@ -99,6 +99,35 @@ void test_simulated_gaze() {
         "mock moves on both axes");
 }
 
+void test_simulation_patterns() {
+    using namespace cheeky::gaze_math;
+    for (unsigned pattern : {2U, 3U}) {
+        const double interval = pattern == 2U ? 2.0 : 8.0;
+        expect(next_simulated_jump_time(0.0, pattern) == interval, "preview selects first upcoming jump");
+        expect(next_simulated_jump_time(interval - 0.001, pattern) == interval, "preview stays at upcoming target until jump");
+        expect(next_simulated_jump_time(interval, pattern) == interval * 2.0, "preview advances when jump occurs");
+        const auto preview = simulated_gaze_pose({}, next_simulated_jump_time(interval * 4.0, pattern), pattern).orientation;
+        expect_near(preview.w, 1.0F, 0.00001F, "preview wraps to center after last corner");
+        const auto start = simulated_gaze_pose({}, 0.0, pattern).orientation;
+        const auto held = simulated_gaze_pose({}, interval - 0.001, pattern).orientation;
+        const auto jumped = simulated_gaze_pose({}, interval, pattern).orientation;
+        expect_near(start.y, held.y, 0.00001F, "jump target stays still for requested interval");
+        expect(std::fabs(jumped.y - held.y) > 0.1F, "jump happens at interval boundary");
+        const auto repeat = simulated_gaze_pose({}, interval * 5.0, pattern).orientation;
+        expect_near(start.y, repeat.y, 0.00001F, "five targets repeat");
+    }
+    const auto sweep = simulated_gaze_pose({}, 5.0, 1U).orientation;
+    expect(std::fabs(sweep.y) > 0.1F, "slow sweep reaches side after five seconds");
+    expect_near(sweep.x, 0.0F, 0.00001F, "slow sweep stays horizontal");
+    const auto center = simulated_gaze_pose({}, 7.0, 5U).orientation;
+    expect_near(center.w, 1.0F, 0.00001F, "center pattern holds forward gaze");
+    expect(simulated_gaze_valid(3.999, 4U), "tracking stays valid before dropout");
+    expect(!simulated_gaze_valid(4.0, 4U), "tracking drops at four seconds");
+    expect(!simulated_gaze_valid(4.999, 4U), "dropout lasts one second");
+    expect(simulated_gaze_valid(5.0, 4U), "tracking recovers at five seconds");
+    expect(simulated_gaze_valid(4.5, 0U), "ordinary figure eight does not drop tracking");
+}
+
 void test_projection() {
     using namespace cheeky::gaze_math;
     const Pose identity{};
@@ -257,6 +286,25 @@ void test_packed_stereo_mapping_policy() {
     input.views[1].resource_identity = 0x101U;
     expect(select_packed_stereo_gaze_view(input) == unmapped_gaze_view,
         "separate OpenXR resources do not use the packed fallback");
+    input.views[1].swapchain_identity = 0x201U;
+    expect(select_packed_stereo_gaze_view(input) == 1U,
+        "ACC split swapchains preserve the second eye's packed layout");
+    input.dlss_eye_index = 0U;
+    expect(select_packed_stereo_gaze_view(input) == 0U,
+        "ACC split swapchains map the first stereo role");
+    input.invert_eye_order = true;
+    expect(select_packed_stereo_gaze_view(input) == 1U,
+        "split swapchain mapping honors eye inversion");
+    input.invert_eye_order = false;
+    input.views[1].rect_x = 0;
+    expect(select_packed_stereo_gaze_view(input) == unmapped_gaze_view,
+        "split swapchains still require complementary packed rectangles");
+    input.views[1].rect_x = 3894;
+    input.views[1].array_index = 1U;
+    expect(select_packed_stereo_gaze_view(input) == unmapped_gaze_view,
+        "split swapchains reject unsupported array slices");
+    input.views[1].array_index = 0U;
+    input.views[1].swapchain_identity = 0x200U;
     input.views[1].resource_identity = 0x100U;
     input.views[1].rect_x = 4000;
     expect(select_packed_stereo_gaze_view(input) == unmapped_gaze_view,
@@ -360,12 +408,12 @@ void test_reset_policy() {
 
 void test_abi() {
     static_assert(CHEEKY_GAZE_MAX_VIEWS == 2U);
-    static_assert(sizeof(CheekyGazeViewV1) == 56U);
-    static_assert(sizeof(CheekyGazeSnapshotV1) == 304U);
+    static_assert(sizeof(CheekyGazeViewV1) == 64U);
+    static_assert(sizeof(CheekyGazeSnapshotV1) == 320U);
     CheekyGazeSnapshotV1 snapshot{};
     snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
     snapshot.structure_size = sizeof(snapshot);
-    expect(snapshot.abi_version == 1U &&
+    expect(snapshot.abi_version == 2U &&
         snapshot.structure_size >= sizeof(CheekyGazeSnapshotV1),
         "snapshot ABI version and size are self-describing");
 }
@@ -483,6 +531,7 @@ void test_multimip_game_output_uses_single_mip_private_output() {
 
 int main() {
     test_simulated_gaze();
+    test_simulation_patterns();
     test_projection();
     test_geometry();
     test_mapping_policy();

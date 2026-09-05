@@ -670,6 +670,18 @@ void draw_openxr_gaze_diagnostics() {
             label, "Eye %zu crop delta", index
         ));
         diagnostic_row(label, "%d, %d px", view.crop_delta_x, view.crop_delta_y);
+        static_cast<void>(sprintf_s(label, "Eye %zu XR texture", index));
+        diagnostic_row(label, "0x%llX (%d,%d %ux%u) slice %u",
+            static_cast<unsigned long long>(view.xr_resource), view.xr_x, view.xr_y,
+            view.xr_width, view.xr_height, view.xr_array);
+        static_cast<void>(sprintf_s(label, "Eye %zu DLSS candidate", index));
+        if (view.has_candidate) {
+            diagnostic_row(label, "0x%llX (%u,%u %ux%u)",
+                static_cast<unsigned long long>(view.candidate_resource), view.candidate_x,
+                view.candidate_y, view.candidate_width, view.candidate_height);
+        } else {
+            diagnostic_row(label, "No stereo eye assigned");
+        }
     }
     diagnostic_row(
         "Last history reset", "%s",
@@ -738,6 +750,10 @@ void load_settings_from_reshade() noexcept {
     settings.center_mode = center_mode <= 2U
         ? static_cast<FoveationCenterMode>(center_mode)
         : FoveationCenterMode::fixed;
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "ShowNextJumpTarget", settings.show_next_jump_target));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "SimulationPattern", settings.simulation_pattern));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "GazeSmoothingMs",
         settings.gaze_smoothing_ms
@@ -897,6 +913,10 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "CenterMode",
         static_cast<std::uint32_t>(settings.center_mode)
     );
+    reshade::set_config_value(
+        nullptr, config_section, "ShowNextJumpTarget", settings.show_next_jump_target);
+    reshade::set_config_value(
+        nullptr, config_section, "SimulationPattern", settings.simulation_pattern);
     reshade::set_config_value(
         nullptr, config_section, "GazeSmoothingMs",
         settings.gaze_smoothing_ms
@@ -1085,7 +1105,16 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         );
     }
     if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
-        ImGui::TextDisabled("Synthetic gaze: 8-second loop. Enable the red border to inspect motion.");
+        int pattern = static_cast<int>(settings.simulation_pattern);
+        if (ImGui::Combo("Simulation pattern", &pattern,
+            "Figure eight (8 s)\0Slow sweep (20 s)\0Jump every 2 s\0Jump every 8 s\0Tracking loss\0Hold center\0")) {
+            settings.simulation_pattern = static_cast<std::uint32_t>(pattern);
+            changed = true;
+        }
+        ImGui::TextDisabled("Patterns restart when changed. Enable the red border to inspect motion.");
+        if (pattern == 4) ImGui::TextDisabled("Moves for 4 s, loses tracking for 1 s, then recovers.");
+        if (pattern == 2 || pattern == 3) changed |= ImGui::Checkbox("Show next jump target (green)", &settings.show_next_jump_target);
+        if (pattern == 2 || pattern == 3) ImGui::TextDisabled("Jumps between center and four corners; gaze smoothing still applies.");
     }
     if (!editing_width) width_draft = settings.width;
     if (ImGui::SliderFloat(
@@ -1224,6 +1253,8 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         settings.transition_width = defaults.transition_width;
         settings.alignment_border_enabled = defaults.alignment_border_enabled;
         settings.center_mode = defaults.center_mode;
+        settings.show_next_jump_target = defaults.show_next_jump_target;
+        settings.simulation_pattern = defaults.simulation_pattern;
         settings.gaze_smoothing_ms = defaults.gaze_smoothing_ms;
         settings.gaze_quantization_pixels =
             defaults.gaze_quantization_pixels;

@@ -42,9 +42,12 @@ struct FoveatedConstants {
     float feather;
     std::uint32_t dlss_origin[2];
     std::uint32_t show_alignment_border;
+    float next_jump_offset_x;
+    float next_jump_offset_y;
+    std::uint32_t show_next_jump;
 };
 
-static_assert(sizeof(FoveatedConstants) == 21U * sizeof(std::uint32_t));
+static_assert(sizeof(FoveatedConstants) == 24U * sizeof(std::uint32_t));
 
 struct ResourceSet {
     ID3D11DeviceContext* context{};
@@ -109,6 +112,9 @@ cbuffer Constants : register(b0) {
     float Feather;
     uint2 DlssOrigin;
     uint ShowAlignmentBorder;
+    float NextJumpOffsetX;
+    float NextJumpOffsetY;
+    uint ShowNextJump;
 };
 
 float ShapeDistance(float2 centered) {
@@ -166,6 +172,18 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         abs(ShapeDistance(centered + float2(0.0, pixel_size.y)) -
             distance_from_center)
     );
+    if (ShowNextJump != 0U) {
+        float2 next_centered = (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
+        next_centered -= float2(NextJumpOffsetX * (1.0 - ShapeWidth), NextJumpOffsetY * (1.0 - ShapeHeight));
+        const float next_distance = ShapeDistance(next_centered);
+        const float next_pixel_distance = max(
+            abs(ShapeDistance(next_centered + float2(pixel_size.x, 0.0)) - next_distance),
+            abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
+        if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
+            GameOutput[output_pixel] = float4(0.0, 1.0, 0.0, 1.0);
+            return;
+        }
+    }
     const bool alignment_border = ShowAlignmentBorder != 0U &&
         distance_from_center <= 1.0 &&
         distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
@@ -912,12 +930,13 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
         );
         return nullptr;
     }
-    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+    if (settings.center_mode != FoveationCenterMode::fixed) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, active_render_width, active_render_height
         );
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
+        apply_next_jump_preview(effective_settings, view_id);
     }
 
     // DLSS supports output sizes down to 32x32. Do not attempt to create a
@@ -959,7 +978,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
             game_handle,
             parameters,
             crop,
-            settings.center_mode == FoveationCenterMode::openxr_gaze,
+            settings.center_mode != FoveationCenterMode::fixed,
             private_handle,
             force_reset
         )) {
@@ -1257,6 +1276,8 @@ void finish_d3d11(
         evaluation->settings.transition_width,
         {0U, 0U},
         evaluation->settings.alignment_border_enabled ? 1U : 0U,
+        evaluation->settings.next_jump_offset_x, evaluation->settings.next_jump_offset_y,
+        evaluation->settings.next_jump_visible ? 1U : 0U,
     };
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -1397,6 +1418,8 @@ bool composite_d3d11_crop(
         settings.roundness, settings.transition_width,
         {0U, 0U},
         settings.alignment_border_enabled ? 1U : 0U,
+        settings.next_jump_offset_x, settings.next_jump_offset_y,
+        settings.next_jump_visible ? 1U : 0U,
     };
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context->Map(resources->constant_buffer, 0U,

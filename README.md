@@ -23,35 +23,42 @@ This is intended for games where ReShade add-ons and DLL replacement are allowed
 4. Open the ReShade overlay and select **Cheeky Foveated DLSS** in the **Add-ons** tab.
 5. Confirm that **Foveated DLSS-SR** is enabled (it is on by default). Changes apply live on the next DLSS evaluation.
 
-Eye tracking is optional and remains off by default. Build the project, then
-keep `CheekyOpenXRLayer.dll` and
-`XR_APILAYER_CHEEKY_foveated_dlss.json` together in `bin\Release`. Register the
-manifest as an OpenXR implicit API layer:
+### Optional eye tracking
 
-1. Open **Registry Editor**.
-2. For the current user, navigate to
-   `HKEY_CURRENT_USER\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit`. Create any
-   missing keys. If the active OpenXR loader requires a machine-wide layer,
-   as Assetto Corsa EVO does, use
-   `HKEY_LOCAL_MACHINE\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit` instead;
-   editing this location requires administrator privileges.
-3. Create a new **DWORD (32-bit) Value**. Use the full absolute path to
-   `XR_APILAYER_CHEEKY_foveated_dlss.json` as the value name and set its data to
-   `0` to enable the layer. For example:
-   `C:\path\to\CheekyFoveatedDLSS\bin\Release\XR_APILAYER_CHEEKY_foveated_dlss.json`.
-4. Start or restart the game and open the ReShade overlay.
-5. Open the **Add-ons** tab and select **Cheeky Foveated DLSS**.
-6. Enable **Foveated DLSS-SR**, then set **Foveation center** to **OpenXR
+Eye tracking is optional and remains off by default. If you only want fixed
+foveation, the add-on installation above is all you need.
+
+1. Download and run **CheekyEyeTrackingSetup.exe** from the release package.
+   Close OpenXR games first and accept the Windows administrator prompt.
+2. The installer places one shared copy of the OpenXR layer in
+   `C:\Program Files\CheekyFoveatedDLSS\OpenXR` (on the Windows system drive)
+   and registers it automatically. No game-folder selection is needed.
+3. Start or restart the game and open **Add-ons > Cheeky Foveated DLSS** in
+   the ReShade overlay.
+4. Enable **Foveated DLSS-SR**, then set **Foveation center** to **OpenXR
    gaze**.
-7. To verify eye tracking, enable the red alignment border and open
+5. To verify eye tracking, enable the red alignment border and open
    **Diagnostics > OpenXR eye tracking**. The layer and gaze must report as
    available, and both eyes must acquire stable DLSS-view mappings before the
    border follows your gaze.
 
-To unregister the layer, delete that DWORD value from the same registry key.
-As an emergency per-launch bypass, set `CHEEKY_OPENXR_LAYER_DISABLE=1` before
-starting the game. Moving the JSON or DLL after registration requires updating
-the registry value to the JSON's new absolute path.
+The installer only installs the shared OpenXR layer; it does not include or
+modify `CheekyFoveatedDLSS.addon64`, install ReShade, or change game files.
+For each additional game, install ReShade with full add-on support, copy the
+add-on into its game folder, and select **OpenXR gaze**. The game and runtime
+must support the OpenXR eye-tracking path described below.
+
+To update, close OpenXR games and run the newer installer. To uninstall, remove
+**Cheeky OpenXR Eye Tracking** through Windows **Settings > Apps**. This removes
+the shared layer and its registration for all games; the add-on remains in
+each game and falls back to fixed foveation. As an emergency per-launch bypass,
+set `CHEEKY_OPENXR_LAYER_DISABLE=1` before starting the game.
+
+If you previously registered a development build manually, remove that old
+manifest's DWORD value from the `SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit`
+key in the hive you used (`HKEY_CURRENT_USER` or `HKEY_LOCAL_MACHINE`) before
+using the installer. Do not remove other layers' entries. The installer manages
+only its own registration in the 64-bit machine-wide registry.
 
 If the game ships with an older DLSS model, use [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper) to install a newer DLSS 4.5 model. Use only the official DLSS Swapper releases, and be aware that a game update may restore its original DLL.
 
@@ -152,8 +159,8 @@ returns to the fixed center over 150 ms.
 
 ### Simulated gaze (no eye tracker required)
 
-For Quest 3 PC VR testing, install the newly built add-on and OpenXR layer using
-the registration steps above. In the ReShade add-on panel, select **Foveation
+For Quest 3 PC VR testing, install the add-on and the matching OpenXR
+eye-tracking installer as described above. In the ReShade add-on panel, select **Foveation
 center > Simulated gaze** and enable **Show 5 px red alignment border**.
 The simulated direction follows a repeating eight-second figure eight relative
 to your head. Both eyes use the real OpenXR views and the existing projection,
@@ -198,3 +205,48 @@ to `bin\Release`; use `-Configuration Debug` for a debug build. You can also ope
 `CheekyFoveatedDLSS.sln` in Visual Studio or use CMake 3.24 or newer. Core
 implementation lives in `src`; `src/gaze_foveation.hpp` is the add-on-side
 OpenXR seam and `src/foveation.hpp` contains renderer-independent crop geometry.
+
+### Building the eye-tracking installer
+
+Install [Inno Setup 6.3 or newer](https://jrsoftware.org/isdl.php), then run:
+
+```powershell
+.\scripts\build-installer.ps1 -Version 0.1.0
+```
+
+This builds and tests Release artifacts and produces
+`bin\installer\CheekyEyeTrackingSetup.exe`. Pass `-IsccPath` if `ISCC.exe` is
+not installed in a standard location. To package an existing Release build,
+use `-SkipBuild`; for CMake output also pass `-ArtifactsDirectory` with the
+directory containing the layer DLL and manifest. The Release layer links the
+Visual C++ runtime statically, so the installer needs no redistributable download.
+
+Publish the installer and `CheekyFoveatedDLSS.addon64` as separate release
+downloads. The installer payload is explicitly limited to the OpenXR layer,
+manifest, and licenses. Keep its AppId stable across releases so updates reuse
+the installation and uninstall entry. Before releasing, test install, upgrade,
+and uninstall on a Windows test machine; verify that the manifest's DWORD is
+`0` in the 64-bit HKLM OpenXR implicit-layer key, and that uninstall removes
+only that value and the installed files. Verify gaze in a supported game after
+restarting it. Release signing, when available, should be applied to the DLL
+before packaging and to the final installer EXE before publishing.
+
+### Simulation patterns
+
+With **Foveation center > Simulated gaze**, choose **Simulation pattern**:
+
+- **Figure eight (8 s)**: continuous motion on both axes.
+- **Slow sweep (20 s)**: horizontal motion for inspecting transitions.
+- **Jump every 2 s / Jump every 8 s**: hold center and four corner targets in sequence.
+- **Tracking loss**: move for four seconds, invalidate gaze for one second, then recover. Tests the existing hold and fixed-center fallback.
+- **Hold center**: stationary head-relative direction for stereo alignment.
+
+Pattern changes restart the sequence and are saved. Jumps still use the configured
+gaze smoothing; set smoothing to zero when testing abrupt crop changes.
+These patterns require the updated OpenXR layer as well as the updated add-on.
+
+For either jump pattern, **Show next jump target (green)** previews the upcoming
+foveation outline in each eye. It is enabled by default and follows crop limits,
+quantization, and roundness. It advances at each jump, including the wrap back to
+center. Both the add-on and OpenXR layer must be updated together for this feature
+(the gaze snapshot ABI is now version 2).

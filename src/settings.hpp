@@ -29,6 +29,11 @@ struct Settings {
     float transition_width{0.04F};
     bool alignment_border_enabled{false};
     FoveationCenterMode center_mode{FoveationCenterMode::fixed};
+    std::uint32_t simulation_pattern{};
+    bool show_next_jump_target{true};
+    // Per-evaluation preview geometry; never persisted.
+    bool next_jump_visible{};
+    float next_jump_offset_x{}, next_jump_offset_y{};
     float gaze_smoothing_ms{20.0F};
     std::uint32_t gaze_quantization_pixels{8U};
     float gaze_jump_reset_ratio{0.125F};

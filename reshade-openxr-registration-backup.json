@@ -1,0 +1,6 @@
+{
+  "RegistryPath": "HKLM:\\SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit",
+  "ValueName": "C:\\ProgramData\\ReShade\\ReShade64_XR.json",
+  "OriginalValue": 0,
+  "RestoreCommand": "Set-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit' -Name 'C:\\ProgramData\\ReShade\\ReShade64_XR.json' -Value 0"
+}

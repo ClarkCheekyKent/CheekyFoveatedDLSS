@@ -54,9 +54,9 @@ std::uint32_t select_packed_stereo_gaze_view(
     if (!first.resource_valid || !second.resource_valid ||
         first.array_index != 0U || second.array_index != 0U ||
         first.resource_identity == 0U ||
-        first.resource_identity != second.resource_identity ||
+        second.resource_identity == 0U ||
         first.swapchain_identity == 0U ||
-        first.swapchain_identity != second.swapchain_identity ||
+        second.swapchain_identity == 0U ||
         first.rect_x < 0 || second.rect_x < 0 ||
         first.rect_y != 0 || second.rect_y != 0 ||
         first.rect_width != input.output_width ||
@@ -65,6 +65,13 @@ std::uint32_t select_packed_stereo_gaze_view(
         second.rect_height != input.output_height) {
         return unmapped_gaze_view;
     }
+
+    // OpenVR-to-OpenXR bridges can submit the two halves of a packed
+    // layout through separate swapchains. Match the layout using the existing
+    // DLSS eye roles; resource equality is only required within one swapchain.
+    const bool same_swapchain = first.swapchain_identity == second.swapchain_identity;
+    const bool same_resource = first.resource_identity == second.resource_identity;
+    if (same_swapchain != same_resource) return unmapped_gaze_view;
 
     const auto first_x = static_cast<std::uint32_t>(first.rect_x);
     const auto second_x = static_cast<std::uint32_t>(second.rect_x);

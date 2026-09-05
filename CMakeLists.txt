@@ -110,6 +110,7 @@ set_target_properties(
         CXX_EXTENSIONS OFF
         PREFIX ""
         OUTPUT_NAME "CheekyOpenXRLayer"
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
 )

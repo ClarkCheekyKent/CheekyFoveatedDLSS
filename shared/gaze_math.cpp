@@ -34,10 +34,31 @@ namespace {
 
 }  // namespace
 
-Pose simulated_gaze_pose(const Pose& head, const double seconds) noexcept {
+double next_simulated_jump_time(const double seconds, const unsigned pattern) noexcept {
+    const double interval = pattern == 3U ? 8.0 : 2.0;
+    return (std::floor(std::max(seconds, 0.0) / interval) + 1.0) * interval;
+}
+
+bool simulated_gaze_valid(const double seconds, const unsigned pattern) noexcept {
+    return pattern != 4U || std::fmod(std::max(seconds, 0.0), 5.0) < 4.0;
+}
+
+Pose simulated_gaze_pose(const Pose& head, const double seconds, const unsigned pattern) noexcept {
     const double phase = std::fmod(seconds, 8.0) * 0.7853981633974483;
-    const float yaw = 0.30F * static_cast<float>(std::sin(phase));
-    const float pitch = 0.22F * static_cast<float>(std::sin(2.0 * phase));
+    float yaw = 0.30F * static_cast<float>(std::sin(phase));
+    float pitch = 0.22F * static_cast<float>(std::sin(2.0 * phase));
+    if (pattern == 1U) {
+        yaw = 0.35F * static_cast<float>(std::sin(seconds * 0.3141592653589793));
+        pitch = 0.0F;
+    } else if (pattern == 2U || pattern == 3U) {
+        const double interval = pattern == 2U ? 2.0 : 8.0;
+        const unsigned target = static_cast<unsigned>(std::fmod(std::floor(std::max(seconds, 0.0) / interval), 5.0));
+        constexpr float yaw_targets[]{0.0F, -0.35F, 0.35F, -0.35F, 0.35F};
+        constexpr float pitch_targets[]{0.0F, 0.25F, -0.25F, -0.25F, 0.25F};
+        yaw = yaw_targets[target]; pitch = pitch_targets[target];
+    } else if (pattern == 5U) {
+        yaw = 0.0F; pitch = 0.0F;
+    }
     const float sy = std::sin(yaw * 0.5F), cy = std::cos(yaw * 0.5F);
     const float sx = std::sin(pitch * 0.5F), cx = std::cos(pitch * 0.5F);
     const Quaternion b{cy * sx, sy * cx, -sy * sx, cy * cx};

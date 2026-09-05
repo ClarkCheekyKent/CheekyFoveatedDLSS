@@ -3878,7 +3878,7 @@ void evaluate_nr_after_native_d3d12(
     }
     contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
     contract.preserve_history_on_crop_move =
-        settings.center_mode == FoveationCenterMode::openxr_gaze;
+        settings.center_mode != FoveationCenterMode::fixed;
     private_attempted = true;
 
     if (peripheral_ready && !d3d12_set_composite_base(
