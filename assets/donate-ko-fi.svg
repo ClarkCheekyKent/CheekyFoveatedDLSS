@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="220" height="48" viewBox="0 0 220 48" role="img" aria-labelledby="title">
+  <title id="title">Donate on Ko-fi</title>
+  <rect width="220" height="48" rx="10" fill="#d94355"/>
+  <rect x="0.5" y="0.5" width="219" height="47" rx="9.5" fill="none" stroke="#000" stroke-opacity=".1"/>
+  <path d="M30 33s-11-6.5-11-13a6 6 0 0 1 11-3 6 6 0 0 1 11 3c0 6.5-11 13-11 13Z" fill="#fff"/>
+  <text x="55" y="30" fill="#fff" font-family="Segoe UI, Arial, sans-serif" font-size="17" font-weight="600">Donate on Ko-fi</text>
+</svg>
