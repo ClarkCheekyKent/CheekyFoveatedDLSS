@@ -1568,6 +1568,103 @@ void note_d3d12_present_impl(
     return false;
 }
 
+[[nodiscard]] bool has_pe_export_name(
+    const HMODULE module,
+    const char* const expected_name
+) noexcept {
+    if (module == nullptr || expected_name == nullptr) return false;
+
+    MODULEINFO info{};
+    if (!K32GetModuleInformation(
+            GetCurrentProcess(), module, &info, sizeof(info)) ||
+        info.SizeOfImage < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+
+    const auto image_size = static_cast<std::size_t>(info.SizeOfImage);
+    const auto* const image = reinterpret_cast<const std::byte*>(module);
+    const auto contains = [image_size](
+        const std::size_t offset,
+        const std::size_t size
+    ) noexcept {
+        return offset <= image_size && size <= image_size - offset;
+    };
+
+    const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+        !contains(
+            static_cast<std::size_t>(dos->e_lfanew),
+            sizeof(IMAGE_NT_HEADERS64)
+        )) {
+        return false;
+    }
+
+    const auto* const headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        image + dos->e_lfanew
+    );
+    if (headers->Signature != IMAGE_NT_SIGNATURE ||
+        headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+
+    const auto& exports = headers->OptionalHeader.DataDirectory[
+        IMAGE_DIRECTORY_ENTRY_EXPORT
+    ];
+    if (exports.VirtualAddress == 0U ||
+        !contains(exports.VirtualAddress, sizeof(IMAGE_EXPORT_DIRECTORY))) {
+        return false;
+    }
+
+    const auto* const directory =
+        reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
+            image + exports.VirtualAddress
+        );
+    if (directory->Name == 0U || !contains(directory->Name, 1U)) return false;
+
+    const auto* const name = reinterpret_cast<const char*>(
+        image + directory->Name
+    );
+    const auto capacity = image_size - directory->Name;
+    const auto length = strnlen_s(name, capacity);
+    return length < capacity && _stricmp(name, expected_name) == 0;
+}
+
+[[nodiscard]] HMODULE find_loaded_module_by_export_name(
+    const char* const export_name
+) noexcept {
+    std::array<HMODULE, 1024> modules{};
+    DWORD required{};
+    if (!K32EnumProcessModules(
+            GetCurrentProcess(),
+            modules.data(),
+            static_cast<DWORD>(sizeof(modules)),
+            &required
+        )) {
+        return nullptr;
+    }
+
+    const auto count = (std::min)(
+        modules.size(),
+        static_cast<std::size_t>(required / sizeof(HMODULE))
+    );
+    for (std::size_t index{}; index < count; ++index) {
+        if (has_pe_export_name(modules[index], export_name)) {
+            return modules[index];
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] HMODULE find_public_ngx_runtime() noexcept {
+    // New NVIDIA drivers can load the selected DLSS model from the NGX model
+    // store under an opaque file name such as "160_*.bin". Its PE export name
+    // remains "nvngx_dlss.dll", so use that stable identity as a fallback.
+    const auto named = GetModuleHandleW(L"nvngx_dlss.dll");
+    return named != nullptr
+        ? named
+        : find_loaded_module_by_export_name("nvngx_dlss.dll");
+}
+
 void cache_streamline_tags(
     const void* const viewport,
     const void* const tags,
@@ -3087,7 +3184,7 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
             std::memory_order_acquire
         );
     }
-    const auto public_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto public_runtime = find_public_ngx_runtime();
     if (public_runtime != nullptr) {
         ngx.get_application_id = reinterpret_cast<NgxGetApplicationIdFn>(
             GetProcAddress(public_runtime, "NVSDK_NGX_GetApplicationId")
@@ -4343,7 +4440,7 @@ template <typename T>
     if (!minhook_initialized.load(std::memory_order_acquire)) return false;
     bool installed{};
 
-    const auto observed_public_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto observed_public_runtime = find_public_ngx_runtime();
     const auto public_runtime = runtime_ready_for_direct_hooks(
         observed_public_runtime,
         public_runtime_stability,
@@ -4751,11 +4848,13 @@ FARPROC WINAPI hook_get_proc_address(
     ];
     if (imports.VirtualAddress == 0U || imports.Size == 0U) return false;
 
-    // Do not patch the host executable's GetProcAddress import. Routing the
-    // process-wide resolver through an add-on wrapper is unnecessarily invasive
-    // and can perturb startup even when every lookup is passed through unchanged.
-    // Runtime polling plus direct NGX and Streamline interception cover discovery.
-    const bool patch_get_proc = false;
+    // Streamline is commonly loaded after the add-on and caches export pointers
+    // immediately. Patch only the modules that can perform those lookups so the
+    // first pointer returned for a supported Streamline/NGX export is already our
+    // replacement. All unrelated GetProcAddress calls pass through unchanged.
+    // Polling and inline detours remain as fallbacks for integrations that do not
+    // resolve exports through one of these imports.
+    const bool patch_get_proc = is_get_proc_candidate(module);
     bool patched{};
     auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
         image + imports.VirtualAddress
@@ -5017,11 +5116,11 @@ bool start_interception() noexcept {
         }
     }
     trace_event(
-        "HOOKDBG GetProcAddress IAT interception disabled; Streamline interception remains enabled"
+        "GetProcAddress IAT interception enabled for executable/Streamline modules"
     );
     const auto patched = install_early_loader_interception();
     trace_event(
-        "Initial executable IAT patch complete patched=%s getProcAddress=disabled",
+        "Initial executable IAT patch complete patched=%s getProcAddress=enabled",
         patched ? "yes" : "no"
     );
     const auto detoured = install_direct_export_hooks();
