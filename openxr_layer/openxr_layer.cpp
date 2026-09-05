@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -137,6 +138,8 @@ struct SessionState {
     bool action_attached{};
     bool action_active{};
     bool gaze_valid{};
+    bool simulated{};
+    XrTime simulation_start{};
     bool unsupported_view_configuration{};
     bool ambiguous_resource{};
     XrTime predicted_display_time{};
@@ -170,6 +173,7 @@ struct InstanceState {
     bool gaze_binding_submitted{};
 };
 
+std::atomic<bool> simulated_gaze_enabled{};
 std::mutex state_mutex;
 std::unordered_map<XrInstance, InstanceState> instances;
 std::unordered_map<XrSession, SessionState> sessions;
@@ -230,6 +234,7 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
     }
 
     if (session != nullptr) {
+        if (session->simulated) snapshot.status_flags |= CHEEKY_GAZE_STATUS_SIMULATED;
         snapshot.session_generation = session->generation;
         snapshot.predicted_display_time = session->predicted_display_time;
         snapshot.sample_time = session->sample_time;
@@ -450,6 +455,11 @@ void update_view_resource_locked(
 }
 
 }  // namespace
+
+extern "C" __declspec(dllexport) void __cdecl
+CheekyOpenXR_SetSimulatedGaze(const std::uint32_t enabled) {
+    simulated_gaze_enabled.store(enabled != 0U, std::memory_order_release);
+}
 
 extern "C" __declspec(dllexport) std::uint32_t __cdecl
 CheekyOpenXR_GetGazeSnapshot(
@@ -1152,6 +1162,37 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         }
     }
 
+    const bool simulated = simulated_gaze_enabled.load(std::memory_order_acquire);
+    if (simulated && view_state != nullptr &&
+        (view_state->viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0) {
+        double elapsed{};
+        {
+            std::lock_guard lock(state_mutex);
+            auto& state = sessions.at(session);
+            if (!state.simulated) state.simulation_start = locate_info->displayTime;
+            elapsed = static_cast<double>(locate_info->displayTime - state.simulation_start) * 1e-9;
+        }
+        // Average the eye orientations (same hemisphere) for a head-relative pose.
+        auto head = convert_pose(views[0].pose);
+        auto right = convert_pose(views[1].pose).orientation;
+        auto& q = head.orientation;
+        const float dot = q.x*right.x + q.y*right.y + q.z*right.z + q.w*right.w;
+        const float sign = dot < 0.0F ? -1.0F : 1.0F;
+        q = {q.x + sign*right.x, q.y + sign*right.y, q.z + sign*right.z, q.w + sign*right.w};
+        const float length = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+        if (length > 0.0001F) {
+            q = {q.x/length, q.y/length, q.z/length, q.w/length};
+            const auto pose = cheeky::gaze_math::simulated_gaze_pose(head, elapsed);
+            gaze_location.pose.orientation = {pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w};
+            gaze_location.locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            sample_time.time = locate_info->displayTime;
+            action_active = true;
+        }
+    } else if (simulated) {
+        action_active = false;
+        gaze_location.locationFlags = 0;
+    }
+
     const bool orientation_valid =
         (gaze_location.locationFlags &
          XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0;
@@ -1186,6 +1227,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
                 locate_info->viewConfigurationType !=
                 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             state.predicted_display_time = locate_info->displayTime;
+            state.simulated = simulated;
             state.sample_time = sample_time.time;
             state.action_active = action_active;
             state.gaze_location_flags = static_cast<std::uint32_t>(

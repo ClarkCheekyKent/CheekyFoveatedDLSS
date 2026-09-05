@@ -77,6 +77,28 @@ void expect_near(
     expect(std::fabs(actual - expected) <= tolerance, message);
 }
 
+void test_simulated_gaze() {
+    using namespace cheeky::gaze_math;
+    const Fov fov{-0.8F, 0.8F, 0.8F, -0.8F};
+    const Pose head{{0.0F, 0.70710678F, 0.0F, 0.70710678F}, {}};
+    float u{}, v{}, turned_u{}, turned_v{};
+    for (int step = 0; step <= 32; ++step) {
+        const double t = step * 0.25;
+        expect(project_gaze_to_view(simulated_gaze_pose({}, t), {}, fov, u, v),
+            "mock projects throughout its loop");
+        expect(project_gaze_to_view(simulated_gaze_pose(head, t), head, fov, turned_u, turned_v),
+            "mock projects with head rotation");
+        expect_near(u, turned_u, 0.0001F, "mock horizontal motion follows head");
+        expect_near(v, turned_v, 0.0001F, "mock vertical motion follows head");
+        expect(u > 0.0F && u < 1.0F && v > 0.0F && v < 1.0F, "mock stays in view");
+    }
+    expect_near(u, 0.5F, 0.0001F, "mock loop returns to horizontal center");
+    expect_near(v, 0.5F, 0.0001F, "mock loop returns to vertical center");
+    expect(project_gaze_to_view(simulated_gaze_pose({}, 1.0), {}, fov, u, v), "mock motion projects");
+    expect(std::fabs(u - 0.5F) > 0.05F && std::fabs(v - 0.5F) > 0.05F,
+        "mock moves on both axes");
+}
+
 void test_projection() {
     using namespace cheeky::gaze_math;
     const Pose identity{};
@@ -460,6 +482,7 @@ void test_multimip_game_output_uses_single_mip_private_output() {
 }  // namespace
 
 int main() {
+    test_simulated_gaze();
     test_projection();
     test_geometry();
     test_mapping_policy();

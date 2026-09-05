@@ -34,6 +34,22 @@ namespace {
 
 }  // namespace
 
+Pose simulated_gaze_pose(const Pose& head, const double seconds) noexcept {
+    const double phase = std::fmod(seconds, 8.0) * 0.7853981633974483;
+    const float yaw = 0.30F * static_cast<float>(std::sin(phase));
+    const float pitch = 0.22F * static_cast<float>(std::sin(2.0 * phase));
+    const float sy = std::sin(yaw * 0.5F), cy = std::cos(yaw * 0.5F);
+    const float sx = std::sin(pitch * 0.5F), cx = std::cos(pitch * 0.5F);
+    const Quaternion b{cy * sx, sy * cx, -sy * sx, cy * cx};
+    const auto& a = head.orientation;
+    return {{
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    }, head.position};
+}
+
 bool project_gaze_to_view(
     const Pose& gaze_pose,
     const Pose& view_pose,

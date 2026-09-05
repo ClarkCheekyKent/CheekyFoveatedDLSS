@@ -150,6 +150,26 @@ tracking**. Both eyes must show stable and different DLSS-view mappings before
 the border follows gaze. A blink holds the last sample for 100 ms and then
 returns to the fixed center over 150 ms.
 
+### Simulated gaze (no eye tracker required)
+
+For Quest 3 PC VR testing, install the newly built add-on and OpenXR layer using
+the registration steps above. In the ReShade add-on panel, select **Foveation
+center > Simulated gaze** and enable **Show 5 px red alignment border**.
+The simulated direction follows a repeating eight-second figure eight relative
+to your head. Both eyes use the real OpenXR views and the existing projection,
+resource mapping, smoothing, crop quantization, and DLSS history reset logic.
+No eye tracking extension or eye tracking hardware is required for this mode.
+The game still needs a supported OpenXR stereo and DLSS rendering path.
+
+Under **Diagnostics > OpenXR eye tracking**, check **Simulated gaze**, gaze
+validity, the per-eye mappings, and **Using gaze**. Hardware support and eye
+gaze extension indicators may correctly remain off. If the layer is missing or
+mapping fails, the region stays at its fixed fallback. Use the matching newly
+built layer DLL; older layer builds do not implement simulation.
+Choose **Fixed** to stop or **OpenXR gaze** to return to actual tracking.
+The selected mode is saved with the other settings. This tests synthetic motion,
+not real eye tracker acquisition or latency.
+
 ## Support
 
 If this add-on is useful to you and you would like to buy me a coffee, you can [support me on Ko-fi](https://ko-fi.com/cheekykent).

@@ -27,6 +27,9 @@ struct Fov {
     float angle_down{};
 };
 
+// Head-relative synthetic gaze, repeating every eight seconds.
+[[nodiscard]] Pose simulated_gaze_pose(const Pose& head, double seconds) noexcept;
+
 [[nodiscard]] bool project_gaze_to_view(
     const Pose& gaze_pose,
     const Pose& view_pose,

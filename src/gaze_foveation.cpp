@@ -176,7 +176,15 @@ bool calculate_coordinated_crop(
     reset_history = false;
     const auto fixed_settings = settings_for_view(settings, view_id);
     const auto eye_assignment = stereo_eye_assignment(view_id);
-    if (settings.center_mode != FoveationCenterMode::openxr_gaze) {
+    if (const auto module = GetModuleHandleW(L"CheekyOpenXRLayer.dll")) {
+        using SetSimulationFn = void(__cdecl*)(std::uint32_t);
+        const auto set_simulation = reinterpret_cast<SetSimulationFn>(
+            GetProcAddress(module, "CheekyOpenXR_SetSimulatedGaze"));
+        if (set_simulation != nullptr) {
+            set_simulation(settings.center_mode == FoveationCenterMode::simulated_gaze ? 1U : 0U);
+        }
+    }
+    if (settings.center_mode == FoveationCenterMode::fixed) {
         return calculate_crop(
             fixed_settings, render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop
@@ -314,7 +322,10 @@ bool calculate_coordinated_crop(
     }
     const bool mapping_stable = mapping_result.stable &&
         state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS;
-    const bool snapshot_valid =
+    const bool source_matches =
+        ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U) ==
+        (settings.center_mode == FoveationCenterMode::simulated_gaze);
+    const bool snapshot_valid = source_matches &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&

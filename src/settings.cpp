@@ -210,7 +210,7 @@ void update_settings(const Settings& settings) noexcept {
         std::memory_order_release
     );
     center_mode.store(
-        static_cast<std::uint32_t>(settings.center_mode) <= 1U
+        static_cast<std::uint32_t>(settings.center_mode) <= 2U
             ? static_cast<std::uint32_t>(settings.center_mode)
             : 0U,
         std::memory_order_release

@@ -599,6 +599,8 @@ void draw_openxr_gaze_diagnostics() {
         "Runtime", "%s",
         gaze.runtime_name[0] == '\0' ? "Not reported" : gaze.runtime_name
     );
+    diagnostic_row("Simulated gaze", "%s", yes_no(
+        (gaze.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U));
     diagnostic_row("Layer loaded", "%s", yes_no(gaze.layer_present));
     diagnostic_row("Snapshot ABI", "%s", yes_no(gaze.abi_compatible));
     diagnostic_row(
@@ -733,9 +735,8 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "CenterMode", center_mode
     ));
-    settings.center_mode = center_mode ==
-            static_cast<std::uint32_t>(FoveationCenterMode::openxr_gaze)
-        ? FoveationCenterMode::openxr_gaze
+    settings.center_mode = center_mode <= 2U
+        ? static_cast<FoveationCenterMode>(center_mode)
         : FoveationCenterMode::fixed;
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "GazeSmoothingMs",
@@ -1073,17 +1074,18 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::Combo(
             "Foveation center",
             &center_mode,
-            "Fixed\0OpenXR gaze\0"
+            "Fixed\0OpenXR gaze\0Simulated gaze\0"
         )) {
-        settings.center_mode = center_mode == 1
-            ? FoveationCenterMode::openxr_gaze
-            : FoveationCenterMode::fixed;
+        settings.center_mode = static_cast<FoveationCenterMode>(center_mode);
         changed = true;
     }
-    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+    if (settings.center_mode != FoveationCenterMode::fixed) {
         ImGui::TextDisabled(
-            "Uses exact OpenXR resource matches; fixed offsets are the fallback."
+            "Requires the OpenXR layer; fixed offsets are the fallback."
         );
+    }
+    if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
+        ImGui::TextDisabled("Synthetic gaze: 8-second loop. Enable the red border to inspect motion.");
     }
     if (!editing_width) width_draft = settings.width;
     if (ImGui::SliderFloat(
@@ -1162,7 +1164,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         "Show 5 px red alignment border",
         &settings.alignment_border_enabled
     );
-    if (settings.center_mode == FoveationCenterMode::openxr_gaze &&
+    if (settings.center_mode != FoveationCenterMode::fixed &&
         ImGui::TreeNode("Advanced eye tracking")) {
         changed |= ImGui::SliderFloat(
             "Gaze smoothing",
