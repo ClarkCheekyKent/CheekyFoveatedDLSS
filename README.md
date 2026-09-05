@@ -2,8 +2,6 @@
 
 Cheeky Foveated DLSS is a 64-bit [ReShade](https://reshade.me/) add-on that reduces the cost of DLSS Super Resolution by applying it to the part of the image that matters most. It supports Direct3D 11 and Direct3D 12 games, including stereo rendering for VR.
 
-**Enjoying smoother games or VR?** [Help fund an eye-tracked headset for development on Ko-fi](https://ko-fi.com/cheekykent) · [Why it helps](#support)
-
 DLSS 5 Neural Rendering (DLSS-NR) is also supported experimentally. See [Experimental DLSS-NR support](#experimental-dlss-nr-support) before enabling it.
 
 ## Requirements
