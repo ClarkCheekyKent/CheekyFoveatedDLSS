@@ -131,6 +131,8 @@ void finish_d3d12(
     const D3D12Evaluation* evaluation
 ) noexcept;
 
+[[nodiscard]] bool d3d12_evaluation_low_res_motion(const D3D12Evaluation*) noexcept;
+
 void finish_d3d12_streamline(
     ID3D12GraphicsCommandList* command_list,
     D3D12Evaluation* evaluation,

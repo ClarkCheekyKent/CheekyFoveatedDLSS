@@ -860,6 +860,7 @@ struct D3D12Evaluation {
     bool next_jump_visible{};
     float next_jump_offset_x{}, next_jump_offset_y{};
     bool gaze_reset{};
+    bool low_res_motion{};
     std::uint64_t descriptor_offset{};
     bool diagnostic_trace{};
     std::uint64_t diagnostic_sequence{};
@@ -1230,9 +1231,21 @@ D3D12Evaluation* prepare_d3d12(
         crop.output_height
     );
     bool motion_vectors_low_res = flag_says_low_res;
+    if (motion_vectors != nullptr) {
+        const auto desc = motion_vectors->GetDesc();
+        const auto distance = [&](std::uint32_t w, std::uint32_t h) {
+            return std::abs(static_cast<double>(desc.Width) - w) +
+                std::abs(static_cast<double>(desc.Height) - h);
+        };
+        const auto input_distance = distance(render_width, render_height);
+        const auto output_distance = distance(output_width, output_height);
+        if (input_distance != output_distance)
+            motion_vectors_low_res = input_distance < output_distance;
+    }
     if (low_res_fits != high_res_fits) {
         motion_vectors_low_res = low_res_fits;
     }
+    evaluation->low_res_motion = motion_vectors_low_res;
     if (motion_vectors != nullptr) {
         const auto motion_description = motion_vectors->GetDesc();
         diagnostic_note_motion_vectors(
@@ -1500,6 +1513,10 @@ bool d3d12_evaluation_gaze_reset(
     const D3D12Evaluation* const evaluation
 ) noexcept {
     return evaluation != nullptr && evaluation->gaze_reset;
+}
+
+bool d3d12_evaluation_low_res_motion(const D3D12Evaluation* evaluation) noexcept {
+    return evaluation != nullptr && evaluation->low_res_motion;
 }
 
 void finish_d3d12(
@@ -1847,6 +1864,13 @@ NgxResult evaluate_d3d12_backend(
                 } else {
                     motion_reset = true;
                 }
+                static std::atomic<unsigned> motion_logs{};
+                const auto log_index = motion_logs.fetch_add(1U, std::memory_order_relaxed);
+                if (log_index < 16U || (motion_reset && log_index % 300U == 0U))
+                    trace_event("D3D12 crop motion view=%llu space=%s offset=%.6f,%.6f corrected=%s reset=%s",
+                        static_cast<unsigned long long>(contract.view_id),
+                        contract.motion_vectors_low_res ? "input" : "output", offset.x, offset.y,
+                        corrected ? "yes" : "no", motion_reset ? "yes" : "no");
             }
             if (contract.reset || key_changed || motion_reset ||
                 (crop_changed && !contract.preserve_history_on_crop_move)) {

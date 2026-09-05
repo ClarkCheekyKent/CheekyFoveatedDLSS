@@ -1,4 +1,5 @@
 #include "crop_motion.hpp"
+#include "runtime.hpp"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
@@ -172,9 +173,24 @@ struct Pass12 {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
     unsigned width{}, height{};
+    std::uint64_t list_token{};
 };
 std::mutex mutex12;
 std::deque<std::shared_ptr<Pass12>> pending12, available12;
+// Private data belongs to the underlying D3D12 object. Unlike interface pointer
+// equality, this also matches submissions seen through ReShade/Streamline proxies.
+constexpr GUID motion_list_token_guid =
+    {0x47d571bd, 0xda36, 0x4bfc, {0x9a, 0x07, 0x62, 0x85, 0x45, 0x19, 0x30, 0xe2}};
+std::uint64_t next_list_token{};
+std::uint64_t list_token(ID3D12CommandList* list, bool create) noexcept {
+    std::uint64_t token{};
+    UINT size = sizeof(token);
+    if (SUCCEEDED(list->GetPrivateData(motion_list_token_guid, &size, &token)) &&
+        size == sizeof(token) && token != 0) return token;
+    if (!create) return 0;
+    token = ++next_list_token;
+    return SUCCEEDED(list->SetPrivateData(motion_list_token_guid, sizeof(token), &token)) ? token : 0;
+}
 
 void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) noexcept {
@@ -191,7 +207,8 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width; desc.Height = height;
-    desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R32G32_FLOAT;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_HEAP_PROPERTIES hp{};
@@ -239,7 +256,7 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
 }
 ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     ID3D12Resource* source, unsigned x, unsigned y, unsigned width, unsigned height,
-    CropMotionOffset offset) noexcept {
+    CropMotionOffset offset, D3D12_RESOURCE_STATES source_state) noexcept {
     if (!list || !source) return nullptr;
     const auto desc = source->GetDesc();
     const auto format = srv_format(desc.Format);
@@ -258,12 +275,24 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     }
     // An unsubmitted list cannot be recycled safely; bound memory if a caller
     // abandons command lists without ever submitting them.
-    if (pending12.size() >= 64) return nullptr;
+    if (pending12.size() >= 64) {
+        static unsigned exhausted_logs{};
+        if (exhausted_logs++ % 300U == 0U) {
+            std::size_t unsubmitted{};
+            for (const auto& pending : pending12) if (!pending->queue) ++unsubmitted;
+            trace_event("D3D12 crop motion unavailable: pending=%zu unsubmitted=%zu",
+                pending12.size(), unsubmitted);
+        }
+        return nullptr;
+    }
     if (!pass) pass = make_pass12(device.Get(), source, width, height, format);
     if (!pass) return nullptr;
     pass->list = list;
+    pass->list_token = list_token(list, true);
     pass->fence.Reset();
     pending12.push_back(pass);
+    if (source_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        transition(list, source, source_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(list, pass->output.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const Constants data{x, y, width, height, offset.x, offset.y};
@@ -273,6 +302,8 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     list->SetComputeRootDescriptorTable(0, pass->heap->GetGPUDescriptorHandleForHeapStart());
     list->SetComputeRoot32BitConstants(1, sizeof(data) / 4, &data, 0);
     list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    if (source_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        transition(list, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, source_state);
     transition(list, pass->output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return pass->output.Get();
@@ -284,10 +315,17 @@ void crop_motion12_submitted(ID3D12CommandQueue* queue, unsigned count,
     for (auto& pass : pending12) {
         if (pass->queue) continue;
         bool found{};
-        for (unsigned i = 0; i < count; ++i) if (pass->list.Get() == lists[i]) found = true;
+        for (unsigned i = 0; i < count; ++i) {
+            if (lists[i] && (pass->list.Get() == lists[i] ||
+                (pass->list_token != 0 && pass->list_token == list_token(lists[i], false)))) found = true;
+        }
         if (!found) continue;
         // ReShade can notify before execution. Signal only at present.
         pass->queue = queue;
+        static unsigned submission_logs{};
+        if (submission_logs++ < 8U)
+            trace_event("D3D12 crop motion submission matched token=%llu queue=%p",
+                static_cast<unsigned long long>(pass->list_token), queue);
         pass->list.Reset();
     }
 }

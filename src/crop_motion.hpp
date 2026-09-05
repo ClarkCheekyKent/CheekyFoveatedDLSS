@@ -38,7 +38,8 @@ void release_crop_motion11() noexcept;
 // D3D12 passes are retained until the command list's submission fence completes.
 ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList*,
     ID3D12Resource*, unsigned x, unsigned y, unsigned width, unsigned height,
-    CropMotionOffset) noexcept;
+    CropMotionOffset, D3D12_RESOURCE_STATES source_state =
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) noexcept;
 void crop_motion12_submitted(ID3D12CommandQueue*, unsigned, ID3D12CommandList* const*) noexcept;
 void collect_crop_motion12() noexcept;
 void release_crop_motion12() noexcept;

@@ -1807,7 +1807,21 @@ void restore_streamline_options() noexcept {
     applied_sl_output_height.store(0U, std::memory_order_release);
 }
 
+struct StreamlineCropHistory {
+    std::uint32_t viewport{};
+    CropGeometry crop{};
+    std::uint32_t render_width{}, render_height{}, output_width{}, output_height{};
+    bool output_space{};
+    bool valid{};
+};
+// Accessed under streamline_evaluation_lock; never advance on a failed call.
+std::deque<StreamlineCropHistory> streamline_crop_history;
+
 struct StreamlineEvaluation {
+    StreamlineCropHistory history{};
+    std::array<SlResource, 4U> original_resources{};
+    std::array<SlResourceTag, 4U> original_tags{};
+    bool has_original_tags{};
     D3D12Evaluation* backend{};
     std::array<SlResource, 4U> resources{};
     std::array<SlResourceTag, 4U> tags{};
@@ -2317,6 +2331,44 @@ struct StreamlineEvaluation {
         );
     }
 
+    const auto set_constants = real_sl_set_constants.load(std::memory_order_acquire);
+    SlConstants constants{};
+    bool has_constants{};
+    AcquireSRWLockShared(&streamline_lock);
+    if (has_cached_sl_constants) {
+        constants = cached_sl_constants;
+        has_constants = true;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    // Cropped vectors are only meaningful with the matching cropped constants.
+    if (!has_constants || !set_constants || !frame) {
+        finish_d3d12_streamline(command_list, evaluation.backend, false);
+        evaluation.backend = nullptr;
+        return false;
+    }
+
+    evaluation.original_resources = evaluation.resources;
+    evaluation.original_tags = evaluation.tags;
+    for (std::size_t i{}; i < evaluation.original_tags.size(); ++i)
+        evaluation.original_tags[i].resource = &evaluation.original_resources[i];
+    evaluation.has_original_tags = true;
+    auto history_crop = crop;
+    history_crop.output_base_x -= output_tag.extent.left;
+    history_crop.output_base_y -= output_tag.extent.top;
+    evaluation.history = {evaluation.viewport.value, history_crop, render_width,
+        render_height, output_width, output_height, evaluation.motion_vectors_output_space, true};
+    const StreamlineCropHistory* previous{};
+    for (const auto& item : streamline_crop_history)
+        if (item.viewport == evaluation.viewport.value) { previous = &item; break; }
+    bool motion_reset = !previous || !previous->valid;
+    if (previous && previous->valid) {
+        motion_reset = previous->render_width != render_width || previous->render_height != render_height ||
+            previous->output_width != output_width || previous->output_height != output_height ||
+            previous->output_space != evaluation.motion_vectors_output_space ||
+            previous->crop.input_width != crop.input_width || previous->crop.input_height != crop.input_height ||
+            previous->crop.output_width != crop.output_width || previous->crop.output_height != crop.output_height;
+    }
+
     for (std::size_t index{}; index < 3U; ++index) {
         auto& tag = evaluation.tags[index];
         const auto width = resource_width(tag);
@@ -2389,6 +2441,46 @@ struct StreamlineEvaluation {
     output_tag.extent = {0U, 0U, crop.output_width, crop.output_height};
     if (verbose) trace_event("SL eval=%llu cropped tags prepared", static_cast<unsigned long long>(sequence));
 
+    if (!motion_reset && !constants.reset && !d3d12_evaluation_gaze_reset(evaluation.backend)) {
+        CropMotionOffset offset{};
+        const auto reference_width = evaluation.motion_vectors_output_space ? output_width : render_width;
+        const auto reference_height = evaluation.motion_vectors_output_space ? output_height : render_height;
+        const bool valid_offset = !constants.motion_vectors_3d && crop_motion_offset(
+            previous->crop, history_crop, !evaluation.motion_vectors_output_space,
+            constants.motion_vector_scale.x * reference_width,
+            constants.motion_vector_scale.y * reference_height, offset);
+        if (!valid_offset) {
+            motion_reset = true;
+        } else if (offset.x != 0.0F || offset.y != 0.0F) {
+            auto& motion = evaluation.resources[2U];
+            auto& tag = evaluation.tags[2U];
+            ID3D12Resource* corrected{};
+            if (motion.state != 0xFFFFFFFFU) {
+                corrected = prepare_crop_motion12(command_list,
+                    static_cast<ID3D12Resource*>(motion.native), tag.extent.left, tag.extent.top,
+                    tag.extent.width, tag.extent.height, offset,
+                    static_cast<D3D12_RESOURCE_STATES>(motion.state));
+            }
+            if (corrected) {
+                motion.native = corrected;
+                motion.memory = nullptr; motion.view = nullptr;
+                motion.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                motion.width = tag.extent.width; motion.height = tag.extent.height;
+                motion.native_format = DXGI_FORMAT_R32G32_FLOAT;
+                motion.mip_levels = motion.array_layers = 1U;
+                tag.extent.left = tag.extent.top = 0U;
+            } else {
+                motion_reset = true;
+            }
+            static std::atomic<unsigned> motion_logs{};
+            const auto log_index = motion_logs.fetch_add(1U, std::memory_order_relaxed);
+            if (log_index < 16U || (motion_reset && log_index % 300U == 0U))
+                trace_event("SL crop motion viewport=%u offset=%.6f,%.6f corrected=%s reset=%s",
+                    evaluation.viewport.value, offset.x, offset.y, corrected ? "yes" : "no",
+                    motion_reset ? "yes" : "no");
+        }
+    }
+
     const auto tag_result = submit_streamline_tags(
         evaluation.frame_tagging, frame, evaluation.viewport, evaluation.tags.data(),
         static_cast<std::uint32_t>(evaluation.tags.size()), command_list
@@ -2409,21 +2501,10 @@ struct StreamlineEvaluation {
     }
     if (verbose) trace_event("SL eval=%llu cropped tags submitted", static_cast<unsigned long long>(sequence));
 
-    const auto set_constants = real_sl_set_constants.load(
-        std::memory_order_acquire
-    );
-    SlConstants constants{};
-    bool has_constants{};
-    AcquireSRWLockShared(&streamline_lock);
-    if (has_cached_sl_constants) {
-        constants = cached_sl_constants;
-        has_constants = true;
-    }
-    ReleaseSRWLockShared(&streamline_lock);
     if (set_constants != nullptr && frame != nullptr && has_constants) {
         auto cropped = constants;
         cropped.next = nullptr;
-        if (d3d12_evaluation_gaze_reset(evaluation.backend)) {
+        if (motion_reset || d3d12_evaluation_gaze_reset(evaluation.backend)) {
             cropped.reset = 1;
         }
         const auto mv_reference_width = evaluation.motion_vectors_output_space
@@ -2454,6 +2535,10 @@ struct StreamlineEvaluation {
             evaluation.original_constants = constants;
             evaluation.constants_overridden = true;
             if (verbose) trace_event("SL eval=%llu motion constants applied", static_cast<unsigned long long>(sequence));
+        } else {
+            finish_d3d12_streamline(command_list, evaluation.backend, false);
+            evaluation.backend = nullptr;
+            return false;
         }
     } else if (has_constants) {
         evaluation.nr_constants = constants;
@@ -2806,6 +2891,7 @@ std::uint32_t hook_sl_evaluate_feature(
     }
     const auto live_settings = current_settings();
     if (!live_settings.enabled) {
+        streamline_crop_history.clear();
         restore_streamline_options();
         streamline_foveation_active.store(false, std::memory_order_release);
         diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::disabled);
@@ -2851,6 +2937,11 @@ std::uint32_t hook_sl_evaluate_feature(
         // Preparation may have changed output dimensions before a later failure.
         // Restore them before forwarding the game's uncropped evaluation.
         restore_streamline_options();
+        if (evaluation.has_original_tags) {
+            static_cast<void>(submit_streamline_tags(evaluation.frame_tagging, frame,
+                evaluation.viewport, evaluation.original_tags.data(),
+                static_cast<std::uint32_t>(evaluation.original_tags.size()), command_list));
+        }
         streamline_foveation_active.store(false, std::memory_order_release);
     }
     D3D12PeripheralTimingScope sr_timing{
@@ -2872,6 +2963,17 @@ std::uint32_t hook_sl_evaluate_feature(
     }
     sr_timing.finish(result == 0U);
     if (verbose) trace_event("SL eval=%llu original end result=0x%08X", static_cast<unsigned long long>(sequence), result);
+    evaluation.history.valid = prepared && result == 0U;
+    bool updated_history{};
+    for (auto& item : streamline_crop_history) {
+        if (item.viewport == evaluation.viewport.value) {
+            item = evaluation.history;
+            item.viewport = evaluation.viewport.value;
+            updated_history = true;
+            break;
+        }
+    }
+    if (!updated_history && prepared) streamline_crop_history.push_back(evaluation.history);
     if (evaluation.constants_overridden) {
         const auto set_constants = real_sl_set_constants.load(
             std::memory_order_acquire
@@ -3881,6 +3983,7 @@ void evaluate_nr_after_native_d3d12(
         return false;
     }
     contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
+    contract.motion_vectors_low_res = d3d12_evaluation_low_res_motion(evaluation);
     contract.preserve_history_on_crop_move =
         settings.center_mode != FoveationCenterMode::fixed;
     private_attempted = true;
@@ -3920,11 +4023,17 @@ void evaluate_nr_after_native_d3d12(
     D3D12PeripheralTimingScope sr_timing{
         command_list, D3D12TimingKind::foveated_dlss
     };
+    const auto original_create_flags = contract.create_flags;
+    contract.create_flags = contract.motion_vectors_low_res
+        ? contract.create_flags | (1U << 1U) : contract.create_flags & ~(1U << 1U);
+    auto* mutable_parameters = const_cast<NgxParameters*>(parameters);
+    mutable_parameters->Set("DLSS.Feature.Create.Flags", contract.create_flags);
     result = evaluate_d3d12_backend(
         command_list, contract, inputs,
         const_cast<NgxParameters*>(parameters),
         crop, callbacks, sr_timing.backend()
     );
+    mutable_parameters->Set("DLSS.Feature.Create.Flags", original_create_flags);
     sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
     finish_d3d12(command_list, parameters, evaluation, result);
