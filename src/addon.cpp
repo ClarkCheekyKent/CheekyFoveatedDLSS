@@ -643,6 +643,8 @@ void draw_openxr_gaze_diagnostics() {
         "Using gaze", "%s", yes_no(gaze.using_gaze)
     );
     diagnostic_row("Sample age", "%.1f ms", gaze.sample_age_ms);
+    diagnostic_row("Submitted texture copies", "%llu",
+        static_cast<unsigned long long>(gaze.submitted_copies));
     diagnostic_row(
         "Mapping ambiguity", "%s", yes_no(gaze.mapping_ambiguous)
     );
@@ -661,7 +663,7 @@ void draw_openxr_gaze_diagnostics() {
                 label, "DLSS view 0x%llX (%u matches, %s)",
                 static_cast<unsigned long long>(view.dlss_view_id),
                 view.stable_matches,
-                view.packed_stereo_mapping ? "packed" : "exact"
+                view.projection_mapping ? "projection" : view.copy_mapping ? "copy" : view.packed_stereo_mapping ? "packed" : "exact"
             );
         } else {
             diagnostic_row(label, "Waiting (%u matches)", view.stable_matches);
@@ -1615,6 +1617,80 @@ void on_present(
     }
 }
 
+std::uint64_t gaze_resource_identity(reshade::api::resource resource) {
+    if (!resource.handle) return 0;
+    auto* object = reinterpret_cast<IUnknown*>(resource.handle);
+    IUnknown* identity{};
+    if (FAILED(object->QueryInterface(IID_PPV_ARGS(&identity)))) return 0;
+    const auto result = reinterpret_cast<std::uint64_t>(identity);
+    identity->Release();
+    return result;
+}
+
+bool gaze_copy_region(reshade::api::device* device, reshade::api::resource resource,
+    std::uint32_t subresource, const reshade::api::subresource_box* box,
+    GazeCopyRegion& region) {
+    if (!resource.handle || subresource != 0) return false;
+    const auto desc = device->get_resource_desc(resource);
+    if (desc.type != reshade::api::resource_type::texture_2d) return false;
+    region = {gaze_resource_identity(resource), subresource, 0, 0,
+        desc.texture.width, desc.texture.height};
+    if (box) {
+        if (box->front != 0 || box->back != 1 || box->left >= box->right ||
+            box->top >= box->bottom || box->right > region.width || box->bottom > region.height) return false;
+        region.x = box->left; region.y = box->top;
+        region.width = box->right - box->left; region.height = box->bottom - box->top;
+    }
+    return region.resource != 0;
+}
+
+bool on_gaze_copy_texture(reshade::api::command_list* list, reshade::api::resource source,
+    std::uint32_t source_subresource, const reshade::api::subresource_box* source_box,
+    reshade::api::resource destination, std::uint32_t destination_subresource,
+    const reshade::api::subresource_box* destination_box, reshade::api::filter_mode) {
+    auto* device = list->get_device();
+    if (device->get_api() != reshade::api::device_api::d3d12 ||
+        current_settings().center_mode == FoveationCenterMode::fixed) return false;
+    GazeCopyEdge edge{};
+    if (gaze_copy_region(device, source, source_subresource, source_box, edge.source) &&
+        gaze_copy_region(device, destination, destination_subresource, destination_box, edge.destination) &&
+        edge.source.width == edge.destination.width && edge.source.height == edge.destination.height) {
+        record_gaze_copy(list->get_native(), edge);
+    }
+    return false;
+}
+
+bool on_gaze_copy_resource(reshade::api::command_list* list, reshade::api::resource source,
+    reshade::api::resource destination) {
+    return on_gaze_copy_texture(list, source, 0, nullptr, destination, 0, nullptr,
+        static_cast<reshade::api::filter_mode>(0));
+}
+
+bool on_gaze_resolve(reshade::api::command_list* list, reshade::api::resource source,
+    std::uint32_t source_subresource, const reshade::api::subresource_box* source_box,
+    reshade::api::resource destination, std::uint32_t destination_subresource,
+    std::uint32_t x, std::uint32_t y, std::uint32_t z, reshade::api::format) {
+    if (list->get_device()->get_api() != reshade::api::device_api::d3d12 ||
+        current_settings().center_mode == FoveationCenterMode::fixed) return false;
+    GazeCopyRegion source_region{};
+    if (z != 0 || !gaze_copy_region(list->get_device(), source, source_subresource, source_box, source_region)) return false;
+    if (std::uint64_t(x) + source_region.width > UINT32_MAX ||
+        std::uint64_t(y) + source_region.height > UINT32_MAX) return false;
+    const reshade::api::subresource_box destination_box{x, y, z,
+        x + source_region.width, y + source_region.height, 1};
+    return on_gaze_copy_texture(list, source, source_subresource, source_box,
+        destination, destination_subresource, &destination_box, static_cast<reshade::api::filter_mode>(0));
+}
+
+void on_gaze_reset_list(reshade::api::command_list* list) {
+    reset_gaze_copies(list->get_native());
+}
+
+void on_gaze_destroy_resource(reshade::api::device* device, reshade::api::resource resource) {
+    if (device->get_api() == reshade::api::device_api::d3d12)
+        forget_gaze_resource(gaze_resource_identity(resource));
+}
+
 void on_execute_command_list(
     reshade::api::command_queue* const queue,
     reshade::api::command_list* const command_list
@@ -1624,6 +1700,7 @@ void on_execute_command_list(
         queue->get_device()->get_api() != reshade::api::device_api::d3d12) {
         return;
     }
+    submit_gaze_copies(command_list->get_native());
     note_d3d12_command_list_submission(
         reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()),
         reinterpret_cast<ID3D12GraphicsCommandList*>(command_list->get_native())
@@ -1780,6 +1857,12 @@ extern "C" __declspec(dllexport) bool AddonInit(
         &on_execute_command_list
     );
     reshade::register_event<reshade::addon_event::present>(&on_present);
+    reshade::register_event<reshade::addon_event::copy_resource>(&on_gaze_copy_resource);
+    reshade::register_event<reshade::addon_event::copy_texture_region>(&on_gaze_copy_texture);
+    reshade::register_event<reshade::addon_event::resolve_texture_region>(&on_gaze_resolve);
+    reshade::register_event<reshade::addon_event::reset_command_list>(&on_gaze_reset_list);
+    reshade::register_event<reshade::addon_event::destroy_command_list>(&on_gaze_reset_list);
+    reshade::register_event<reshade::addon_event::destroy_resource>(&on_gaze_destroy_resource);
     log_info("Foveated DLSS-SR and DLSS-NR interception started for D3D11 and D3D12.");
     trace_event("AddonInit complete");
     return true;
@@ -1791,6 +1874,12 @@ extern "C" __declspec(dllexport) void AddonUninit(
 ) {
     using namespace cheeky::foveated_dlss;
     reshade::unregister_event<reshade::addon_event::present>(&on_present);
+    reshade::unregister_event<reshade::addon_event::copy_resource>(&on_gaze_copy_resource);
+    reshade::unregister_event<reshade::addon_event::copy_texture_region>(&on_gaze_copy_texture);
+    reshade::unregister_event<reshade::addon_event::resolve_texture_region>(&on_gaze_resolve);
+    reshade::unregister_event<reshade::addon_event::reset_command_list>(&on_gaze_reset_list);
+    reshade::unregister_event<reshade::addon_event::destroy_command_list>(&on_gaze_reset_list);
+    reshade::unregister_event<reshade::addon_event::destroy_resource>(&on_gaze_destroy_resource);
     reshade::unregister_event<reshade::addon_event::execute_command_list>(
         &on_execute_command_list
     );

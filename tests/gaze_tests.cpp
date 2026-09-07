@@ -419,12 +419,12 @@ void test_reset_policy() {
 
 void test_abi() {
     static_assert(CHEEKY_GAZE_MAX_VIEWS == 2U);
-    static_assert(sizeof(CheekyGazeViewV1) == 64U);
-    static_assert(sizeof(CheekyGazeSnapshotV1) == 320U);
+    static_assert(sizeof(CheekyGazeViewV1) == 80U);
+    static_assert(sizeof(CheekyGazeSnapshotV1) == 352U);
     CheekyGazeSnapshotV1 snapshot{};
     snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
     snapshot.structure_size = sizeof(snapshot);
-    expect(snapshot.abi_version == 2U &&
+    expect(snapshot.abi_version == 3U &&
         snapshot.structure_size >= sizeof(CheekyGazeSnapshotV1),
         "snapshot ABI version and size are self-describing");
 }
@@ -706,6 +706,18 @@ void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
         "test loads the real OpenXR layer DLL");
     if (first_loader_reference == nullptr) return;
 
+    const auto snapshot_export = reinterpret_cast<CheekyOpenXRGetGazeSnapshotFn>(
+        GetProcAddress(first_loader_reference, "CheekyOpenXR_GetGazeSnapshot"));
+    expect(snapshot_export != nullptr, "layer exports the versioned snapshot function");
+    if (snapshot_export) {
+        CheekyGazeSnapshotV1 snapshot{};
+        snapshot.sequence = 123;
+        expect(snapshot_export(2U, &snapshot, 320U) == 0U && snapshot.sequence == 123,
+            "old ABI buffer is rejected without being overwritten");
+        expect(snapshot_export(3U, &snapshot, sizeof(snapshot)) != 0U && snapshot.abi_version == 3U,
+            "new layer and add-on agree on projection snapshot ABI");
+    }
+
     expect(run_openxr_gaze_lookup(),
         "gaze lookup caches the OpenXR layer snapshot export");
     expect(gaze_diagnostics().layer_present,
@@ -736,6 +748,92 @@ void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
 
 }  // namespace
 
+void test_gaze_camera_projection() {
+    using namespace cheeky::foveated_dlss;
+    const GazeProjection left{-1.2F, 0.8F, 1.F, -0.9F, true};
+    const GazeProjection right{-0.8F, 1.2F, 1.F, -0.9F, true};
+    expect(match_gaze_projection_eyes(left, {left, right}).count == 1U &&
+        match_gaze_projection_eyes(left, {left, right}).index == 0U,
+        "two distinct XR projections give a unique eye match");
+    const auto ambiguous = match_gaze_projection_eyes(left, {left, left});
+    GazeMappingPolicyState mapping{};
+    expect(!update_gaze_mapping(mapping, ambiguous.count, ambiguous.index, 1, 1).stable &&
+        !update_gaze_mapping(mapping, ambiguous.count, ambiguous.index, 1, 2).stable,
+        "identical eye projections never establish a stable eye mapping");
+    expect(match_gaze_projection_eyes(left, {left, {}}).count == 0,
+        "missing other eye projection cannot establish uniqueness");
+    // Independent off-center perspective matrix, with a near=0.1 far=100 range.
+    std::array<float, 16> matrix{1,0,0,0, 0,2.F/1.9F,0,0,
+        0.2F,-0.1F/1.9F,100.F/99.9F,1, 0,0,-10.F/99.9F,0};
+    auto camera = gaze_projection_from_matrix(matrix.data());
+    expect(gaze_projection_matches(camera, left) && !gaze_projection_matches(camera, right),
+        "asymmetric projection uniquely identifies left eye independent of viewport number");
+    matrix[8] = -0.2F;
+    camera = gaze_projection_from_matrix(matrix.data());
+    expect(gaze_projection_matches(camera, right) && !gaze_projection_matches(camera, left),
+        "opposite off-center projection identifies right eye");
+    matrix[8] *= -1; matrix[9] *= -1; matrix[10] *= -1; matrix[11] = -1;
+    expect(gaze_projection_matches(gaze_projection_from_matrix(matrix.data()), right),
+        "right-handed projection retains physical eye identity");
+    matrix[10] = 0; matrix[14] = 0.1F;
+    expect(gaze_projection_matches(gaze_projection_from_matrix(matrix.data()), right),
+        "reversed infinite depth does not change eye identification");
+    matrix[8] = 0;
+    expect(!gaze_projection_matches(gaze_projection_from_matrix(matrix.data()), left) &&
+        !gaze_projection_matches(gaze_projection_from_matrix(matrix.data()), right),
+        "symmetric desktop projection cannot match asymmetric VR eyes");
+    matrix[11] = 0; matrix[15] = 1;
+    expect(!gaze_projection_from_matrix(matrix.data()).valid, "orthographic matrix rejected");
+    matrix[0] = std::numeric_limits<float>::quiet_NaN();
+    expect(!gaze_projection_from_matrix(matrix.data()).valid, "non-finite matrix rejected");
+    GazeProjectionCache cache;
+    cache.record(42, 7, 100, left); cache.record(1, 7, 101, right);
+    expect(gaze_projection_matches(cache.find(42, 7, 102), left),
+        "another viewport's constants do not overwrite the eye projection");
+    expect(!cache.find(42, 8, 102).valid && !cache.find(42, 7, 201).valid,
+        "wrong frame index and stale constants rejected");
+    cache.record(42, 8, 202, {});
+    expect(!cache.find(42, 8, 203).valid, "rejected constants invalidate previous projection");
+    {
+        ScopedGazeProjection scope(43, left);
+        expect(active_gaze_projection.view == 43, "projection scoped to actual evaluated view");
+        { ScopedGazeProjection nested(2, right); }
+        expect(active_gaze_projection.view == 43, "nested scope restores outer camera");
+    }
+    expect(!active_gaze_projection.projection.valid, "camera does not leak into other evaluation paths");
+}
+
+void test_gaze_copy_routes() {
+    using namespace cheeky::foveated_dlss;
+    const GazeCopyRegion source{1, 0, 0, 0, 100, 80};
+    const GazeCopyRegion intermediate{2, 0, 10, 20, 100, 80};
+    const GazeCopyRegion left{3, 0, 0, 0, 100, 80};
+    const GazeCopyRegion right{4, 0, 0, 0, 100, 80};
+    GazeCopyGraph graph;
+    expect(!graph.reaches(source, left, 100), "same dimensions alone do not map an eye");
+    graph.record({source, intermediate}, 100);
+    graph.record({intermediate, left}, 101);
+    expect(graph.reaches(source, left, 102), "submitted two-hop copy translates regions");
+    expect(!graph.reaches(source, right, 102), "copy route identifies only its destination eye");
+    auto wrong_slice = left; wrong_slice.subresource = 1;
+    expect(!graph.reaches(source, wrong_slice, 102), "copy mapping preserves subresource identity");
+    graph.record({intermediate, right}, 103);
+    expect(graph.reaches(source, left, 104) && graph.reaches(source, right, 104),
+        "shared output exposes both matches so coordinator rejects ambiguity");
+    graph.forget(intermediate.resource);
+    expect(!graph.reaches(source, left, 104), "destroying intermediate invalidates route");
+    graph.record({source, left}, 200);
+    expect(!graph.reaches(source, left, 701), "old copy routes expire");
+    graph.clear();
+    graph.record({intermediate, left}, 800);
+    graph.record({source, intermediate}, 801);
+    expect(!graph.reaches(source, left, 802), "reversed copy order cannot establish provenance");
+    graph.clear();
+    auto scaled = left; scaled.width = 200;
+    graph.record({source, scaled}, 900);
+    expect(!graph.reaches(source, scaled, 900), "scaled copies are not treated as pixel translations");
+}
+
 int run_d3d12_composite_tests();
 
 int main(int argc, char** argv) {
@@ -743,6 +841,8 @@ int main(int argc, char** argv) {
         return run_d3d12_composite_tests();
     }
     test_simulated_gaze();
+    test_gaze_copy_routes();
+    test_gaze_camera_projection();
     test_simulation_patterns();
     test_projection();
     test_geometry();

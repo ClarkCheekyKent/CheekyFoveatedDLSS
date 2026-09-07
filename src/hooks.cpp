@@ -113,6 +113,16 @@ struct SlBaseStructure {
     std::size_t struct_version{};
 };
 
+// Streamline FrameToken's public ABI exposes the frame index through this
+// virtual conversion (include/sl_core_types.h). Token objects are reused.
+struct SlFrameToken : SlBaseStructure {
+    virtual operator std::uint32_t() const = 0;
+};
+std::uintptr_t gaze_frame_key(const void* frame) {
+    return frame ? static_cast<std::uintptr_t>(
+        static_cast<std::uint32_t>(*static_cast<const SlFrameToken*>(frame))) + 1U : 0U;
+}
+
 struct SlExtent {
     std::uint32_t top{};
     std::uint32_t left{};
@@ -279,6 +289,7 @@ bool has_cached_sl_viewport{};
 bool cached_sl_frame_tagging{};
 SlConstants cached_sl_constants{};
 bool has_cached_sl_constants{};
+GazeProjectionCache streamline_gaze_projections; // Protected by streamline_lock.
 SlDlssOptions cached_sl_options{};
 SlViewportHandle cached_sl_options_viewport{};
 bool has_cached_sl_options{};
@@ -2215,6 +2226,14 @@ struct StreamlineEvaluation {
         streamline_view_id
     );
     evaluation.settings = streamline_settings;
+    GazeProjection gaze_projection{};
+    const auto camera_frame_key = gaze_frame_key(frame);
+    AcquireSRWLockShared(&streamline_lock);
+    gaze_projection = streamline_gaze_projections.find(evaluation.viewport.value,
+        camera_frame_key, GetTickCount64());
+    ReleaseSRWLockShared(&streamline_lock);
+    {
+    const ScopedGazeProjection projection_scope(streamline_view_id, gaze_projection);
     evaluation.backend = prepare_d3d12_streamline(
         command_list,
         static_cast<ID3D12Resource*>(color_tag.resource->native),
@@ -2232,6 +2251,7 @@ struct StreamlineEvaluation {
         verbose,
         sequence
     );
+    }
     if (evaluation.backend == nullptr) {
         if (verbose) trace_event("SL eval=%llu backend prepare rejected", static_cast<unsigned long long>(sequence));
         return false;
@@ -2817,6 +2837,17 @@ std::uint32_t hook_sl_set_constants(
         std::memory_order_acquire
     );
     const auto result = original == nullptr ? 0x18U : original(values, frame, viewport);
+    if (values && viewport && frame) {
+        const auto id = static_cast<const SlViewportHandle*>(viewport)->value;
+        auto projection = gaze_projection_from_matrix(
+            static_cast<const SlConstants*>(values)->camera_view_to_clip.values);
+        if (result != 0U || static_cast<const SlConstants*>(values)->orthographic_projection != 0)
+            projection = {};
+        const auto camera_frame_key = gaze_frame_key(frame);
+        AcquireSRWLockExclusive(&streamline_lock);
+        streamline_gaze_projections.record(id, camera_frame_key, GetTickCount64(), projection);
+        ReleaseSRWLockExclusive(&streamline_lock);
+    }
     const auto n = constant_entry_logs.load(std::memory_order_relaxed);
     if (n <= 4U) {
         trace_event("slSetConstants forwarded n=%u result=0x%08X", n, result);

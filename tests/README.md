@@ -39,3 +39,39 @@ preservation of unrelated inputs, and rejection of ambiguous/stale viewport
 inputs. This models write-once constants; it does not execute Streamline itself.
 In a fresh game log, verify `motion constants applied`, `prepare complete`,
 and `original begin foveated=yes`. A failure now logs the constants result code.
+# D3D12 gaze copy mapping
+
+The normal test executable checks copy-chain translation, subresource isolation,
+ambiguous destinations, destruction, expiry, reversed order, and rejection of
+scaled copies. These tests validate the matching policy, not MSFS's rendering path.
+
+For an in-game check, select simulated gaze in normal VR gameplay. Both eye
+mapping rows should become stable with the `copy` route, and the alignment borders
+should move. The submitted-texture-copy counter confirms observation of eligible
+D3D12 copies/resolves; a rising count alone does not prove an eye route exists.
+This implementation follows up to four equal-size mip-zero/slice-zero copies,
+keeps at most 512 edges for 500 ms, and rejects routes reaching both eyes.
+Shader blits, scaled copies and other array slices are not handled by this route.
+
+## Streamline camera projection mapping
+
+ABI 3 adds the OpenXR eye fields of view; update both the add-on and the layer DLL.
+The fallback compares the unjittered Streamline perspective projection with both
+XR eye frusta. It requires a unique match, matching full-eye output dimensions,
+and two distinct snapshot display times. Symmetric or mismatched projections,
+missing data, non-perspective matrices and stale/wrong-frame constants cannot
+activate this route. Existing resource routes still take precedence.
+
+Constants are cached per viewport and actual frame index (token pointers are reused),
+with a 100 ms freshness limit, and exposed only during the corresponding SR prepare.
+Matrix and frame-token ABI follow NVIDIA's
+[Streamline guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuide.md)
+and [public frame token definition](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_core_types.h).
+Tests cover handedness, reversed depth, distinct and ambiguous eyes, invalid matrices,
+cache isolation/expiry, scoped context restoration, and rejection of the old snapshot ABI.
+
+In MSFS normal VR gameplay, select simulated gaze and show the alignment borders.
+Expected: `Snapshot ABI: Yes`, both eye mappings stable with `projection`, and moving
+borders. If mapping remains waiting, capture 15 seconds of gameplay: bounded
+`Gaze projection` lines show the Streamline and XR tangent comparisons. These tests
+validate policy and ABI; they do not establish MSFS compatibility without a game test.

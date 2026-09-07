@@ -28,11 +28,15 @@ struct ViewState {
     bool next_jump_visible{};
     FoveationOffsets next_jump_offsets{};
     unsigned mapping_log_count{};
+    bool logged_mapping_ready{};
     std::uint64_t last_mapping_log_qpc{};
     CropGeometry last_crop{};
 };
 
 std::mutex coordinator_mutex;
+GazeCopyGraph copy_graph;
+struct PendingCopy { std::uint64_t command_list; GazeCopyEdge edge; };
+std::deque<PendingCopy> pending_copies;
 std::vector<ViewState> view_states;
 GazeDiagnostics diagnostics{};
 HMODULE snapshot_module{};
@@ -237,6 +241,16 @@ bool calculate_coordinated_crop(
     std::uint32_t matched_index{UINT32_MAX};
     std::uint32_t match_count{};
     bool packed_stereo_match{};
+    bool copy_match{};
+    bool projection_match{};
+    const auto camera = active_gaze_projection.view == view_id ?
+        active_gaze_projection.projection : GazeProjection{};
+    std::array<GazeProjection, 2> xr_projections{};
+    for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
+        const auto& v = snapshot.views[i];
+        xr_projections[i] = {std::tan(v.fov_left), std::tan(v.fov_right),
+            std::tan(v.fov_up), std::tan(v.fov_down), (v.flags & CHEEKY_GAZE_VIEW_FOV_VALID) != 0U};
+    }
     for (std::uint32_t index{};
          index < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS);
          ++index) {
@@ -247,6 +261,38 @@ bool calculate_coordinated_crop(
             )) {
             matched_index = index;
             ++match_count;
+        }
+    }
+    if (match_count == 0U) {
+        const GazeCopyRegion source{resource_identity, 0U, output_origin_x,
+            output_origin_y, output_width, output_height};
+        for (std::uint32_t index{}; index < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++index) {
+            const auto& target = snapshot.views[index];
+            if ((target.flags & CHEEKY_GAZE_VIEW_RESOURCE_VALID) == 0U ||
+                target.array_index != 0U || target.image_rect_x < 0 || target.image_rect_y < 0) continue;
+            if (copy_graph.reaches(source, {target.resource_identity, 0U,
+                    static_cast<std::uint32_t>(target.image_rect_x),
+                    static_cast<std::uint32_t>(target.image_rect_y),
+                    target.image_rect_width, target.image_rect_height}, GetTickCount64())) {
+                matched_index = index;
+                ++match_count;
+                copy_match = true;
+            }
+        }
+    }
+    if (match_count == 0U && camera.valid && snapshot.view_count == 2 &&
+        xr_projections[0].valid && xr_projections[1].valid &&
+        output_origin_x == 0 && output_origin_y == 0 &&
+        (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
+        (snapshot.status_flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) == 0U) {
+        const auto projection_result = match_gaze_projection_eyes(camera, xr_projections);
+        match_count = projection_result.count;
+        matched_index = projection_result.index;
+        if (match_count == 1U) {
+            const auto& v = snapshot.views[matched_index];
+            if (v.image_rect_width == output_width && v.image_rect_height == output_height)
+                projection_match = true;
+            else match_count = 0U;
         }
     }
     if (match_count == 0U && eye_assignment.assigned &&
@@ -284,11 +330,21 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
+    const bool mapping_ready = (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U;
+    if (mapping_ready != state.logged_mapping_ready) {
+        state.logged_mapping_ready = mapping_ready;
+        state.mapping_log_count = 0U;
+    }
     // Capture actual inputs on a bounded schedule, including intermediate outputs.
-    if (match_count == 0U && state.mapping_log_count < 8U &&
+    if (match_count != 1U && state.mapping_log_count < 8U &&
         (state.mapping_log_count == 0U || seconds_between(now, state.last_mapping_log_qpc) >= 2.0)) {
         ++state.mapping_log_count;
         state.last_mapping_log_qpc = now;
+        trace_event("Gaze projection view=%llu valid=%u tangents=(%.6f,%.6f,%.6f,%.6f) XR0 valid=%u tangents=(%.6f,%.6f,%.6f,%.6f) XR1 valid=%u tangents=(%.6f,%.6f,%.6f,%.6f)",
+            static_cast<unsigned long long>(view_id), camera.valid ? 1U : 0U,
+            camera.left, camera.right, camera.up, camera.down,
+            xr_projections[0].valid ? 1U : 0U, xr_projections[0].left, xr_projections[0].right, xr_projections[0].up, xr_projections[0].down,
+            xr_projections[1].valid ? 1U : 0U, xr_projections[1].left, xr_projections[1].right, xr_projections[1].up, xr_projections[1].down);
         trace_event("Gaze mapping rejected DLSS view=%llu resource=0x%llX rect=(%u,%u %ux%u) stereo_assigned=%u eye=%u flags=0x%X views=%u",
             static_cast<unsigned long long>(view_id), static_cast<unsigned long long>(resource_identity),
             output_origin_x, output_origin_y, output_width, output_height,
@@ -298,6 +354,26 @@ bool calculate_coordinated_crop(
             trace_event("Gaze mapping XR eye=%u resource=0x%llX swapchain=0x%llX rect=(%d,%d %ux%u) array=%u flags=0x%X",
                 i, static_cast<unsigned long long>(v.resource_identity), static_cast<unsigned long long>(v.swapchain_identity),
                 v.image_rect_x, v.image_rect_y, v.image_rect_width, v.image_rect_height, v.array_index, v.flags);
+        }
+        // One bounded graph dump per view after VR has settled. This captures
+        // intermediate resources as well as the two endpoints; a total-copy
+        // counter alone cannot explain why a route was rejected.
+        if (mapping_ready && state.mapping_log_count == 4U) {
+            const auto copy_now = GetTickCount64();
+            const auto& edges = copy_graph.recent_edges(copy_now);
+            trace_event("Gaze copy graph view=%llu retained=%llu capacity=512 pending=%llu pendingCapacity=2048 submitted=%llu maxAgeMs=500 maxHops=4",
+                static_cast<unsigned long long>(view_id),
+                static_cast<unsigned long long>(edges.size()),
+                static_cast<unsigned long long>(pending_copies.size()),
+                static_cast<unsigned long long>(diagnostics.submitted_copies));
+            for (const auto& edge : edges) {
+                const auto& s = edge.source; const auto& d = edge.destination;
+                trace_event("Gaze copy edge seq=%llu ageMs=%llu src=0x%llX sub=%u rect=(%u,%u %ux%u) dst=0x%llX sub=%u rect=(%u,%u %ux%u)",
+                    static_cast<unsigned long long>(edge.sequence),
+                    static_cast<unsigned long long>(copy_now - edge.time_ms),
+                    static_cast<unsigned long long>(s.resource), s.subresource, s.x, s.y, s.width, s.height,
+                    static_cast<unsigned long long>(d.resource), d.subresource, d.x, d.y, d.width, d.height);
+            }
         }
     }
     if (state.last_snapshot_display_time != snapshot.predicted_display_time) {
@@ -337,7 +413,7 @@ bool calculate_coordinated_crop(
             "OpenXR gaze mapping established view=%llu eye=%u route=%s",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
-            packed_stereo_match ? "packed-stereo" : "exact-resource"
+            projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : "exact-resource"
         );
     }
 
@@ -347,6 +423,8 @@ bool calculate_coordinated_crop(
             diagnostics.views[index].resource_mapped = false;
             diagnostics.views[index].stable_matches = 0U;
             diagnostics.views[index].packed_stereo_mapping = false;
+            diagnostics.views[index].copy_mapping = false;
+            diagnostics.views[index].projection_mapping = false;
         }
     }
     if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
@@ -362,6 +440,8 @@ bool calculate_coordinated_crop(
         view_diagnostics.stable_matches = state.mapping.consecutive_matches;
         view_diagnostics.resource_mapped = mapping_result.stable;
         view_diagnostics.packed_stereo_mapping = packed_stereo_match;
+        view_diagnostics.copy_mapping = copy_match;
+        view_diagnostics.projection_mapping = projection_match;
     }
     const bool mapping_stable = mapping_result.stable &&
         state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS;
@@ -519,12 +599,43 @@ void forget_gaze_view(const DlssViewId view_id) noexcept {
 void reset_gaze_foveation() noexcept {
     std::lock_guard lock(coordinator_mutex);
     view_states.clear();
+    copy_graph.clear();
+    pending_copies.clear();
     diagnostics = {};
     snapshot_function = nullptr;
     if (snapshot_module != nullptr) {
         static_cast<void>(FreeLibrary(snapshot_module));
         snapshot_module = nullptr;
     }
+}
+
+void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept {
+    std::lock_guard lock(coordinator_mutex);
+    pending_copies.push_back({command_list, edge});
+    if (pending_copies.size() > 2048U) pending_copies.pop_front();
+}
+void submit_gaze_copies(std::uint64_t command_list) noexcept {
+    std::lock_guard lock(coordinator_mutex);
+    const auto now = GetTickCount64();
+    // Closed lists can be submitted again without being recorded again.
+    // Retain their edges until reset/destruction, subject to the bounded cache.
+    for (const auto& pending : pending_copies) {
+        if (pending.command_list == command_list) {
+            copy_graph.record(pending.edge, now);
+            ++diagnostics.submitted_copies;
+        }
+    }
+}
+void reset_gaze_copies(std::uint64_t command_list) noexcept {
+    std::lock_guard lock(coordinator_mutex);
+    std::erase_if(pending_copies, [=](const auto& p) { return p.command_list == command_list; });
+}
+void forget_gaze_resource(std::uint64_t resource) noexcept {
+    std::lock_guard lock(coordinator_mutex);
+    copy_graph.forget(resource);
+    std::erase_if(pending_copies, [=](const auto& p) {
+        return p.edge.source.resource == resource || p.edge.destination.resource == resource;
+    });
 }
 
 }  // namespace cheeky::foveated_dlss

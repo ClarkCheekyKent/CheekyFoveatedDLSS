@@ -3,6 +3,8 @@
 #include "frame_contract.hpp"
 #include "gaze_policy.hpp"
 #include "settings.hpp"
+#include "gaze_copy_graph.hpp"
+#include "gaze_projection.hpp"
 
 #include <Unknwn.h>
 
@@ -26,9 +28,12 @@ struct GazeViewDiagnostics {
     bool has_candidate{};
     bool resource_mapped{};
     bool packed_stereo_mapping{};
+    bool copy_mapping{};
+    bool projection_mapping{};
 };
 
 struct GazeDiagnostics {
+    std::uint64_t submitted_copies{};
     char runtime_name[128]{};
     std::uint32_t status_flags{};
     float sample_age_ms{};
@@ -58,5 +63,9 @@ void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
 [[nodiscard]] GazeDiagnostics gaze_diagnostics() noexcept;
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;
+void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept;
+void submit_gaze_copies(std::uint64_t command_list) noexcept;
+void reset_gaze_copies(std::uint64_t command_list) noexcept;
+void forget_gaze_resource(std::uint64_t resource) noexcept;
 
 }  // namespace cheeky::foveated_dlss

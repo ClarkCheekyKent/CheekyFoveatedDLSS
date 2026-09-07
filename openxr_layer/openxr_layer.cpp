@@ -150,6 +150,8 @@ struct SessionState {
     std::uint32_t gaze_location_flags{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_u{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_v{};
+    std::array<XrFovf, CHEEKY_GAZE_MAX_VIEWS> eye_fov{};
+    bool eye_fov_valid{};
     std::array<SubmittedView, CHEEKY_GAZE_MAX_VIEWS> submitted_views{};
 };
 
@@ -271,6 +273,12 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
             target.center_u = session->center_u[index];
             target.center_v = session->center_v[index];
             target.flags = session->gaze_location_flags & 0xFU;
+            if (session->eye_fov_valid) {
+                const auto& fov = session->eye_fov[index];
+                target.fov_left = fov.angleLeft; target.fov_right = fov.angleRight;
+                target.fov_up = fov.angleUp; target.fov_down = fov.angleDown;
+                target.flags |= CHEEKY_GAZE_VIEW_FOV_VALID;
+            }
             if (session->next_jump_valid) target.flags |= CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID;
             target.next_jump_u = session->next_jump_u[index];
             target.next_jump_v = session->next_jump_v[index];
@@ -1250,6 +1258,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
                 locate_info->viewConfigurationType !=
                 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             state.predicted_display_time = locate_info->displayTime;
+            state.eye_fov_valid = !state.unsupported_view_configuration;
+            for (unsigned i = 0; i < CHEEKY_GAZE_MAX_VIEWS; ++i) state.eye_fov[i] = views[i].fov;
             state.next_jump_valid = next_jump_valid;
             state.next_jump_u = next_jump_u; state.next_jump_v = next_jump_v;
             state.simulated = simulated;

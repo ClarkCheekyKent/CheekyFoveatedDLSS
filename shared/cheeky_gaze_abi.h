@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#define CHEEKY_GAZE_ABI_VERSION 2U
+#define CHEEKY_GAZE_ABI_VERSION 3U
 #define CHEEKY_GAZE_MAX_VIEWS 2U
 #define CHEEKY_GAZE_RUNTIME_NAME_SIZE 128U
 
@@ -24,6 +24,7 @@
 #define CHEEKY_GAZE_VIEW_POSITION_TRACKED (1U << 3U)
 #define CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID (1U << 5U)
 #define CHEEKY_GAZE_VIEW_RESOURCE_VALID (1U << 4U)
+#define CHEEKY_GAZE_VIEW_FOV_VALID (1U << 6U)
 
 typedef struct CheekyGazeViewV1 {
     uint32_t structure_size;
@@ -40,6 +41,7 @@ typedef struct CheekyGazeViewV1 {
     uint64_t swapchain_identity;
     float next_jump_u;
     float next_jump_v;
+    float fov_left, fov_right, fov_up, fov_down;
 } CheekyGazeViewV1;
 
 typedef struct CheekyGazeSnapshotV1 {
