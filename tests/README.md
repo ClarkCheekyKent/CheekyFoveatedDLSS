@@ -97,3 +97,22 @@ packed layout with unrelated DLSS resources and no camera projection. It verifie
 stable mapping and automatic centers in Fixed, automatic fallback in OpenXR gaze,
 valid real/simulated gaze without double offsets, manual override, and invalid
 layout rejection. This is a synthetic snapshot replay, not headset validation.
+# OpenVR adapter
+
+The normal test executable checks known compositor slot layouts, rejects unknown
+versions and invalid/fractional/flipped submission bounds, validates NDC-to-UV
+conversion, asymmetric frusta and canted-eye projection, and replays the packed
+coordinator scenario through both OpenXR and OpenVR snapshot acquisition paths.
+Live runtime discovery is replaced with a snapshot fixture in these unit tests.
+
+`tools/steamvr-mock/adapter_probe.cpp` builds the actual adapter into a separate
+background application. On SteamVR 2.16.7 it successfully armed interfaces
+022/027/028/029, observed the legacy 022 WaitGetPoses call, and invalidated its
+snapshot on runtime shutdown. Result 103 from WaitGetPoses is expected for that
+background probe without scene focus. This does not validate scene submissions.
+
+In ACC, test Runtime gaze with driver mock off, center, sweep, dropout, then off.
+Check both eye mappings, crop placement, loss/recovery, and automatic alignment.
+Also test the internal Simulated gaze mode with the driver off. Re-enter VR and
+change render resolution to check mapping rebuilds. Missing mappings must keep
+fixed fallback. Keep the previous add-on available for rollback.

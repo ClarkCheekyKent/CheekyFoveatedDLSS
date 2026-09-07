@@ -593,7 +593,7 @@ void draw_nr_performance() {
 
 void draw_openxr_gaze_diagnostics() {
     const auto gaze = gaze_diagnostics();
-    ImGui::TextUnformatted("OpenXR eye tracking");
+    ImGui::TextUnformatted("VR eye tracking");
     DiagnosticTable table{"OpenXRGazeDiagnostics"};
     if (!table) return;
     diagnostic_row(
@@ -602,13 +602,12 @@ void draw_openxr_gaze_diagnostics() {
     );
     diagnostic_row("Simulated gaze", "%s", yes_no(
         (gaze.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U));
-    diagnostic_row("Layer loaded", "%s", yes_no(gaze.layer_present));
+    diagnostic_row("Runtime adapter loaded", "%s", yes_no(gaze.layer_present));
+    diagnostic_row("Backend", "%s", (gaze.status_flags & CHEEKY_GAZE_STATUS_OPENVR) ? "OpenVR" : gaze.layer_present ? "OpenXR" : "Not detected");
     diagnostic_row("Snapshot ABI", "%s", yes_no(gaze.abi_compatible));
-    diagnostic_row(
-        "Eye gaze extension", "%s", yes_no(
-            (gaze.status_flags & CHEEKY_GAZE_STATUS_EXTENSION_ENABLED) != 0U
-        )
-    );
+    diagnostic_row("Eye gaze extension", "%s",
+        (gaze.status_flags & CHEEKY_GAZE_STATUS_OPENVR) ? "N/A (native OpenVR)" :
+        yes_no((gaze.status_flags & CHEEKY_GAZE_STATUS_EXTENSION_ENABLED) != 0U));
     diagnostic_row(
         "System support", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED) != 0U
@@ -620,7 +619,7 @@ void draw_openxr_gaze_diagnostics() {
         )
     );
     diagnostic_row(
-        "Gaze action active", "%s", yes_no(
+        "Gaze input active", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_ACTION_ACTIVE) != 0U
         )
     );
@@ -630,7 +629,7 @@ void draw_openxr_gaze_diagnostics() {
         )
     );
     diagnostic_row(
-        "Layer mapping ready", "%s", yes_no(
+        "Submission mapping ready", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U
         )
     );
@@ -654,7 +653,7 @@ void draw_openxr_gaze_diagnostics() {
         char label[32]{};
         static_cast<void>(sprintf_s(label, "Eye %zu alignment", index));
         diagnostic_row(label, "%s (%.4f, %.4f)",
-            view.alignment_source == 2U ? "OpenXR" :
+            view.alignment_source == 3U ? "OpenVR" : view.alignment_source == 2U ? "OpenXR" :
             view.alignment_source == 1U ? "Streamline" : "Manual fallback",
             view.aligned_u, view.aligned_v);
         static_cast<void>(sprintf_s(
@@ -681,7 +680,7 @@ void draw_openxr_gaze_diagnostics() {
             label, "Eye %zu crop delta", index
         ));
         diagnostic_row(label, "%d, %d px", view.crop_delta_x, view.crop_delta_y);
-        static_cast<void>(sprintf_s(label, "Eye %zu XR texture", index));
+        static_cast<void>(sprintf_s(label, "Eye %zu VR texture", index));
         diagnostic_row(label, "0x%llX (%d,%d %ux%u) slice %u",
             static_cast<unsigned long long>(view.xr_resource), view.xr_x, view.xr_y,
             view.xr_width, view.xr_height, view.xr_array);
@@ -1093,7 +1092,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::Combo(
             "Foveation center",
             &center_mode,
-            "Fixed\0OpenXR gaze\0Simulated gaze (debug)\0"
+            "Fixed\0Runtime gaze (OpenXR / OpenVR)\0Simulated gaze (debug)\0"
         )) {
         settings.center_mode = static_cast<FoveationCenterMode>(center_mode);
         changed = true;
@@ -1102,7 +1101,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         const auto gaze = gaze_diagnostics();
         const char* unavailable{};
         if (!gaze.layer_present)
-            unavailable = "Eye tracking not detected: OpenXR layer is not loaded. Using fixed placement.";
+            unavailable = "Eye tracking unavailable: no active OpenXR layer or supported OpenVR adapter. Using fixed placement.";
         else if (!gaze.abi_compatible)
             unavailable = "Eye tracking unavailable: update the OpenXR layer to match this add-on.";
         else if ((gaze.status_flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED) == 0U)
@@ -1121,11 +1120,11 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (settings.auto_stereo_alignment) {
         ImGui::TextDisabled("Aligns fixed placement and the fallback when gaze is unavailable.");
         const auto source = gaze_diagnostics().alignment_source;
-        ImGui::TextDisabled("Latest alignment: %s", source == 2U ? "OpenXR" :
+        ImGui::TextDisabled("Latest alignment: %s", source == 3U ? "OpenVR" : source == 2U ? "OpenXR" :
             source == 1U ? "Streamline projection" : "Manual fallback");
     }
     if (settings.center_mode != FoveationCenterMode::fixed) {
-        ImGui::TextDisabled("Gaze requires the OpenXR layer; alignment needs no eye tracker.");
+        ImGui::TextDisabled("Gaze uses the active OpenXR layer or OpenVR adapter; alignment needs no eye tracker.");
     }
     if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
         int pattern = static_cast<int>(settings.simulation_pattern);

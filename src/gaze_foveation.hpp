@@ -43,7 +43,7 @@ struct GazeDiagnostics {
     bool layer_present{};
     bool abi_compatible{};
     bool using_gaze{};
-    // Latest evaluated view: 0 manual fallback, 1 Streamline, 2 OpenXR.
+    // Latest evaluated view: 0 manual fallback, 1 Streamline, 2 OpenXR, 3 OpenVR.
     unsigned alignment_source{};
     bool mapping_ambiguous{};
     GazeResetReason last_reset_reason{GazeResetReason::none};

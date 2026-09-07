@@ -2,6 +2,7 @@
 
 #include "cheeky_gaze_abi.h"
 #include "runtime.hpp"
+#include "openvr_gaze.hpp"
 
 #include <Windows.h>
 
@@ -238,7 +239,8 @@ bool calculate_coordinated_crop(
         unsigned source{};
         if (automatic && xr_view && (xr_view->flags & CHEEKY_GAZE_VIEW_FORWARD_VALID) != 0U &&
             std::isfinite(xr_view->forward_u) && std::isfinite(xr_view->forward_v)) {
-            u = xr_view->forward_u; v = xr_view->forward_v; source = 2U;
+            u = xr_view->forward_u; v = xr_view->forward_v;
+            source = (diagnostics.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U ? 3U : 2U;
         } else if (automatic && has_multiple_stereo_views() && output_origin_x == 0U && output_origin_y == 0U &&
             projection_forward_center(camera, u, v)) {
             source = 1U;
@@ -287,10 +289,17 @@ bool calculate_coordinated_crop(
     }
     CheekyGazeSnapshotV1 snapshot{};
     // Callers can supply a frame snapshot; otherwise read the live layer.
-    const bool loaded = supplied_snapshot
+    bool loaded = supplied_snapshot
         ? (snapshot = *supplied_snapshot, snapshot.abi_version == CHEEKY_GAZE_ABI_VERSION &&
             snapshot.structure_size >= sizeof(snapshot))
         : load_snapshot(snapshot);
+    if (!supplied_snapshot && (!loaded || snapshot.session_generation == 0U)) {
+        if (read_openvr_gaze(settings, output_resource, snapshot)) {
+            loaded = true;
+            diagnostics.layer_present = true; // Runtime adapter present; UI labels this generically.
+            diagnostics.abi_compatible = true;
+        }
+    }
     if (!loaded) {
         if (automatic) return auto_crop(nullptr);
         diagnostics.using_gaze = false;
@@ -466,19 +475,19 @@ bool calculate_coordinated_crop(
     );
     if (mapping_result.invalidated) {
         trace_event(
-            "OpenXR gaze mapping invalidated view=%llu",
+            "VR gaze mapping invalidated view=%llu",
             static_cast<unsigned long long>(view_id)
         );
     } else if (mapping_result.changed) {
         trace_event(
-            "OpenXR gaze mapping changed view=%llu eye=%u generation=%llu",
+            "VR gaze mapping changed view=%llu eye=%u generation=%llu",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
             static_cast<unsigned long long>(state.mapping.generation)
         );
     } else if (mapping_result.stable && !mapping_was_stable) {
         trace_event(
-            "OpenXR gaze mapping established view=%llu eye=%u route=%s",
+            "VR gaze mapping established view=%llu eye=%u route=%s",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
             projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : "exact-resource"
@@ -614,7 +623,7 @@ bool calculate_coordinated_crop(
     if (reset_history) {
         diagnostics.last_reset_reason = reset_result.reason;
         trace_event(
-            "OpenXR gaze history reset view=%llu reason=%u",
+            "VR gaze history reset view=%llu reason=%u",
             static_cast<unsigned long long>(view_id),
             static_cast<unsigned int>(reset_result.reason)
         );

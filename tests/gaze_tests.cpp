@@ -8,6 +8,8 @@
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
 #include "streamline_viewport.hpp"
+#include "openvr_gaze.hpp"
+#include "openvr_gaze_math.hpp"
 
 #include <Windows.h>
 
@@ -19,6 +21,14 @@
 namespace cheeky::foveated_dlss {
 
 void trace_event(const char*, ...) noexcept {}
+// Runtime discovery is excluded from deterministic coordinator tests. Live
+// OpenVR acquisition is tested separately, with snapshots exercising shared policy here.
+const CheekyGazeSnapshotV1* test_openvr_snapshot{};
+bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1& output) noexcept {
+    if (!test_openvr_snapshot) return false;
+    output=*test_openvr_snapshot;
+    return true;
+}
 
 }  // namespace cheeky::foveated_dlss
 
@@ -716,7 +726,7 @@ void test_dlss_nr_independent_size_shares_sr_center() {
         "full-frame NR uses zero offsets without division by zero");
 }
 
-void test_packed_alignment_coordinator() {
+void test_packed_alignment_coordinator(bool openvr = false) {
     using namespace cheeky::foveated_dlss;
     reset_gaze_foveation();
     register_stereo_view(951U); register_stereo_view(952U);
@@ -729,6 +739,8 @@ void test_packed_alignment_coordinator() {
     snapshot.view_count = 2U;
     snapshot.swapchain_generation = 1U;
     snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    if (openvr) test_openvr_snapshot=&snapshot;
     for (unsigned i = 0; i < 2; ++i) {
         auto& eye = snapshot.views[i];
         eye.view_index = i;
@@ -750,7 +762,7 @@ void test_packed_alignment_coordinator() {
         for (unsigned i = 0; i < 2; ++i) {
             bool reset{};
             expect(calculate_coordinated_crop(settings, 951U + i, nullptr,
-                1512U, 1418U, 3024U, 2836U, 0U, 0U, crops[i], reset, &snapshot),
+                1512U, 1418U, 3024U, 2836U, 0U, 0U, crops[i], reset, openvr ? nullptr : &snapshot),
                 "split packed bridge produces coordinated crop without matching resource or camera");
         }
     };
@@ -759,7 +771,7 @@ void test_packed_alignment_coordinator() {
     for (unsigned i = 0; i < 2; ++i) {
         expect(diagnostics.views[i].resource_mapped && diagnostics.views[i].packed_stereo_mapping,
             "screenshot split-texture layout stabilizes through packed mapping");
-        expect(diagnostics.views[i].alignment_source == 2U,
+        expect(diagnostics.views[i].alignment_source == (openvr ? 3U : 2U),
             "fixed mode aligns through OpenXR without eye tracking support");
         const float actual = (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F;
         expect_near(actual, snapshot.views[i].forward_u, 0.001F, "each eye uses its own forward center");
@@ -777,7 +789,7 @@ void test_packed_alignment_coordinator() {
     settings.height = 0.4F;
     settings.center_mode = FoveationCenterMode::openxr_gaze;
     frame();
-    expect(gaze_diagnostics().alignment_source == 2U && !gaze_diagnostics().using_gaze,
+    expect(gaze_diagnostics().alignment_source == (openvr ? 3U : 2U) && !gaze_diagnostics().using_gaze,
         "gaze mode uses automatic fixed fallback when tracker is unavailable");
     expect_near((crops[0].input_base_y + crops[0].input_height * 0.5F) / 1418.F, 0.4F, 0.004F,
         "gaze fallback retains fixed height preference");
@@ -805,6 +817,7 @@ void test_packed_alignment_coordinator() {
     frame();
     expect(gaze_diagnostics().alignment_source == 0U, "invalid packed layout falls back instead of using stale mapping");
     unregister_stereo_view(951U); unregister_stereo_view(952U);
+    test_openvr_snapshot=nullptr;
     reset_gaze_foveation();
 }
 
@@ -1044,8 +1057,39 @@ void test_gaze_copy_routes() {
 
 int run_d3d12_composite_tests();
 
+void test_openvr_geometry() {
+    using namespace cheeky::foveated_dlss;
+    expect(openvr_submit_slot("IVRCompositor_022")==5 && openvr_submit_slot("IVRCompositor_029")==6,
+        "legacy and current compositor layouts use verified slots");
+    expect(openvr_submit_slot("IVRCompositor_030")==0 && openvr_submit_slot(nullptr)==0,
+        "unknown compositor ABI is rejected");
+    float u{},v{};
+    expect(openvr_ndc_center(0.5F,0.5F,u,v), "native gaze converts to texture coordinates");
+    expect_near(u,0.75F,0.0001F,"NDC right maps right");
+    expect_near(v,0.25F,0.0001F,"NDC up maps up");
+    expect(!openvr_ndc_center(NAN,0,u,v),"nonfinite gaze is invalid");
+    std::int32_t x{}; std::uint32_t width{};
+    expect(openvr_bounds(0.5F,1.F,3024,x,width) && x==1512 && width==1512,"packed eye bounds become exact pixel rectangles");
+    expect(!openvr_bounds(1.F,0.F,3024,x,width),"flipped submission bounds fail safely");
+    expect(!openvr_bounds(0.1F,0.9F,11,x,width),"fractional pixel bounds fail safely");
+    const float identity[3][4]{{1,0,0,0},{0,1,0,0},{0,0,1,0}};
+    const float up[3]{0,0.5F,-1};
+    expect(openvr_project_direction(identity,-1,1,-1,1,up,u,v),"synthetic gaze projects through OpenVR frustum");
+    expect_near(v,0.25F,0.0001F,"raw OpenVR top/bottom sign is converted correctly");
+    const float forward[3]{0,0,-1};
+    expect(openvr_project_direction(identity,-0.8F,1.2F,-0.9F,1.1F,forward,u,v),"asymmetric alignment projects");
+    expect_near(u,0.4F,0.0001F,"asymmetric horizontal center");
+    expect_near(v,0.45F,0.0001F,"asymmetric vertical center");
+    const float c=std::cos(0.2F),s=std::sin(0.2F);
+    const float canted[3][4]{{c,0,s,0},{0,1,0,0},{-s,0,c,0}};
+    expect(openvr_project_direction(canted,-1,1,-1,1,forward,u,v),"eye cant is included");
+    expect_near(u,(1.F+std::tan(0.2F))*0.5F,0.0001F,"inverse eye rotation projects head forward");
+}
+
 int main(int argc, char** argv) {
     test_packed_alignment_coordinator();
+    test_packed_alignment_coordinator(true);
+    test_openvr_geometry();
     test_auto_alignment();
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {
         return run_d3d12_composite_tests();

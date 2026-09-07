@@ -8,6 +8,7 @@ This directory contains minimal, pinned source snapshots needed to build the add
 | Dear ImGui | 1.92.5, commit `3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c` | `imgui.h` and `imconfig.h` | https://github.com/ocornut/imgui |
 | MinHook | commit `8fda4f5481fed5797dc2651cd91e238e9b3928c6` | Public header and x64 implementation | https://github.com/TsudaKageyu/minhook |
 | OpenXR SDK | 1.1.61, tag `release-1.1.61` | Core, platform, and API-layer negotiation headers | https://github.com/KhronosGroup/OpenXR-SDK |
+| OpenVR SDK | 2.15.6, commit `0924064316de3effbcd1acf1e309182a2deb1c05` | Public `openvr.h`; no runtime DLL replacement | https://github.com/ValveSoftware/openvr |
 
 Upstream license files are retained beside each dependency.
 

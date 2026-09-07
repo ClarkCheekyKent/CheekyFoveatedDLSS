@@ -49,6 +49,7 @@ target_include_directories(
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade/deps/minhook/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshade/deps/minhook/src"
         "${CMAKE_CURRENT_SOURCE_DIR}/shared"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/include"
 )
 target_compile_definitions(
     CheekyFoveatedDLSS

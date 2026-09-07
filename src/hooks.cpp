@@ -4,6 +4,7 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
+#include "openvr_gaze.hpp"
 #include "crop_motion.hpp"
 #include "ngx_abi.hpp"
 #include "peripheral_dlaa.hpp"
@@ -5266,6 +5267,7 @@ DWORD WINAPI interception_worker(void*) noexcept {
     while (event != nullptr &&
            WaitForSingleObject(event, 250U) == WAIT_TIMEOUT) {
         drain_hook_debug_loader_events();
+        poll_openvr_hooks();
         if (worker_tick < 20U) trace_event("HOOKDBG worker tick=%u begin tid=%lu", worker_tick, static_cast<unsigned long>(GetCurrentThreadId()));
         if (streamline_loaded()) {
             if (!streamline_inline_mode.load(std::memory_order_acquire) &&
@@ -5444,6 +5446,7 @@ void stop_interception() noexcept {
         CloseHandle(thread);
     }
     if (event != nullptr) CloseHandle(event);
+    stop_openvr_hooks();
     restore_streamline_options();
     if (streamline_hook_lock_ready.load(std::memory_order_acquire)) {
         uninstall_streamline_inline_hooks();
