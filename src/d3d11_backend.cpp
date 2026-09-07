@@ -937,7 +937,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
         );
         return nullptr;
     }
-    if (settings.center_mode != FoveationCenterMode::fixed) {
+    if (uses_coordinated_center(settings)) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, active_render_width, active_render_height
         );
@@ -985,7 +985,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
             game_handle,
             parameters,
             crop,
-            settings.center_mode != FoveationCenterMode::fixed,
+            uses_coordinated_center(settings),
             private_handle,
             force_reset
         )) {
@@ -1143,7 +1143,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
     if (!force_reset && !gaze_reset && evaluation->reset == 0 &&
-        settings.center_mode != FoveationCenterMode::fixed) {
+        uses_coordinated_center(settings)) {
         CropGeometry previous{};
         bool has_history{};
         {

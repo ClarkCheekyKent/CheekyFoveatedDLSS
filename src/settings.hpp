@@ -25,6 +25,8 @@ struct Settings {
     float x_offset{0.60F};
     float height_offset{-0.45F};
     bool invert_stereo_x_offset{false};
+    bool auto_stereo_alignment{true};
+    float aligned_height_offset{0.0F};
     float roundness{0.0F};
     float transition_width{0.04F};
     bool alignment_border_enabled{false};
@@ -65,6 +67,10 @@ struct Settings {
     float nr_motion_scale_x_multiplier{1.0F};
     float nr_motion_scale_y_multiplier{1.0F};
 };
+
+inline bool uses_coordinated_center(const Settings& settings) noexcept {
+    return settings.auto_stereo_alignment || settings.center_mode != FoveationCenterMode::fixed;
+}
 
 using CropGeometry = FoveationGeometry;
 

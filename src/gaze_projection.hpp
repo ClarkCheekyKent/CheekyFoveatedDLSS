@@ -13,6 +13,15 @@ struct GazeProjection {
     bool valid{};
 };
 
+inline bool projection_forward_center(const GazeProjection& p, float& u, float& v) {
+    if (!p.valid || !std::isfinite(p.left) || !std::isfinite(p.right) ||
+        !std::isfinite(p.up) || !std::isfinite(p.down) ||
+        p.left >= 0.F || p.right <= 0.F || p.down >= 0.F || p.up <= 0.F) return false;
+    u = -p.left / (p.right - p.left);
+    v = p.up / (p.up - p.down);
+    return std::isfinite(u) && std::isfinite(v);
+}
+
 inline GazeProjection gaze_projection_from_matrix(const float* m) {
     for (unsigned i = 0; i < 16; ++i) if (!std::isfinite(m[i])) return {};
     // Streamline uses row vectors and row-major, unjittered matrices.

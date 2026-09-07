@@ -152,6 +152,8 @@ struct SessionState {
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_v{};
     std::array<XrFovf, CHEEKY_GAZE_MAX_VIEWS> eye_fov{};
     bool eye_fov_valid{};
+    bool forward_valid{};
+    std::array<float, 2> forward_u{}, forward_v{};
     std::array<SubmittedView, CHEEKY_GAZE_MAX_VIEWS> submitted_views{};
 };
 
@@ -273,6 +275,9 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
             target.center_u = session->center_u[index];
             target.center_v = session->center_v[index];
             target.flags = session->gaze_location_flags & 0xFU;
+            if (session->forward_valid) target.flags |= CHEEKY_GAZE_VIEW_FORWARD_VALID;
+            target.forward_u = session->forward_u[index];
+            target.forward_v = session->forward_v[index];
             if (session->eye_fov_valid) {
                 const auto& fov = session->eye_fov[index];
                 target.fov_left = fov.angleLeft; target.fov_right = fov.angleRight;
@@ -1160,6 +1165,20 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         return result;
     }
 
+    cheeky::gaze_math::Pose forward_pose{};
+    std::array<float, 2> forward_u{}, forward_v{};
+    bool forward_valid = view_state != nullptr &&
+        (view_state->viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
+        cheeky::gaze_math::stereo_forward_pose(convert_pose(views[0].pose), convert_pose(views[1].pose), forward_pose);
+    if (forward_valid) {
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto& f = views[i].fov;
+            forward_valid &= cheeky::gaze_math::project_gaze_to_view(forward_pose,
+                convert_pose(views[i].pose), {f.angleLeft, f.angleRight, f.angleUp, f.angleDown},
+                forward_u[i], forward_v[i]);
+        }
+    }
+
     bool action_active{};
     XrSpaceLocation gaze_location{XR_TYPE_SPACE_LOCATION};
     XrEyeGazeSampleTimeEXT sample_time{XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT};
@@ -1259,6 +1278,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
                 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
             state.predicted_display_time = locate_info->displayTime;
             state.eye_fov_valid = !state.unsupported_view_configuration;
+            state.forward_valid = forward_valid && !state.unsupported_view_configuration;
+            state.forward_u = forward_u; state.forward_v = forward_v;
             for (unsigned i = 0; i < CHEEKY_GAZE_MAX_VIEWS; ++i) state.eye_fov[i] = views[i].fov;
             state.next_jump_valid = next_jump_valid;
             state.next_jump_u = next_jump_u; state.next_jump_v = next_jump_v;

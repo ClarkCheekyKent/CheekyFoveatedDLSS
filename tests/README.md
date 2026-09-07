@@ -55,7 +55,7 @@ Shader blits, scaled copies and other array slices are not handled by this route
 
 ## Streamline camera projection mapping
 
-ABI 3 adds the OpenXR eye fields of view; update both the add-on and the layer DLL.
+ABI 4 includes OpenXR eye fields of view and head-forward centers; update both the add-on and the layer DLL.
 The fallback compares the unjittered Streamline perspective projection with both
 XR eye frusta. It requires a unique match, matching full-eye output dimensions,
 and two distinct snapshot display times. Symmetric or mismatched projections,
@@ -75,3 +75,25 @@ Expected: `Snapshot ABI: Yes`, both eye mappings stable with `projection`, and m
 borders. If mapping remains waiting, capture 15 seconds of gameplay: bounded
 `Gaze projection` lines show the Streamline and XR tangent comparisons. These tests
 validate policy and ABI; they do not establish MSFS compatibility without a game test.
+
+## Automatic alignment
+
+The default test run covers asymmetric projection placement without the layer,
+right-first evaluation, independence from manual inversion, center preservation
+when resizing, edge clamping, history reset on crop changes and fallback, missing
+or wrong-view camera data, canted-eye forward projection, quaternion hemisphere
+handling, and rejection of ABI 3 buffers by the real layer DLL.
+
+In game, leave **Automatic stereo alignment** enabled and enable the red border.
+With the updated layer, confirm the latest-view status reports OpenXR head-forward
+and inspect both eyes. Repeat with different crop sizes and after leaving and
+re-entering VR. On a Streamline route, verify projection alignment without the
+layer. Unsupported paths should report manual fallback and retain their saved
+offsets. No eye tracker is needed. Hardware validation remains required; these
+tests do not execute a game's rendering or headset presentation.
+
+The coordinator regression also replays the reported 3024x2836 split-swapchain
+packed layout with unrelated DLSS resources and no camera projection. It verifies
+stable mapping and automatic centers in Fixed, automatic fallback in OpenXR gaze,
+valid real/simulated gaze without double offsets, manual override, and invalid
+layout rejection. This is a synthetic snapshot replay, not headset validation.

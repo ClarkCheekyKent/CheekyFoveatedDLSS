@@ -77,7 +77,7 @@ Start with the defaults, then tune the region while looking at a representative 
 1. Turn on **Show 5 px red alignment border** so the processed region is visible.
 2. Adjust **Fovea width** and **Fovea height**. Smaller values improve performance but make the transition easier to notice.
 3. Use **Height offset** to move the region vertically and **Transition width** to soften its boundary.
-4. In VR, adjust **Stereo X offset** until the region is centered correctly in both eyes. Enable **Invert stereo eye order** if the offsets move in the wrong directions.
+4. In VR, leave **Automatic stereo alignment** enabled to center each eye using available projection data. If the status reports manual fallback, adjust **Stereo X offset** until the region is centered correctly in both eyes. Enable **Invert stereo eye order** if the offsets move in the wrong directions.
 5. Turn the red alignment border off when calibration is complete.
 
 The main controls and their defaults are:
@@ -97,12 +97,39 @@ The main controls and their defaults are:
 | Transition width | `0.040` | Feathers the edge of the region. |
 | Show 5 px red alignment border | Off | Displays the processed region while calibrating the fovea. |
 | DX11 game processing path | DX11 Direct | **DX12 Transport** enables DX12-only features for DX11 games. |
-| Foveation center | Fixed | Keeps the compatible fixed placement or opts into eye-tracked OpenXR placement. |
+| Foveation center | Fixed | Selects fixed placement, OpenXR gaze, or simulated gaze. |
 | Gaze smoothing | `20 ms` | Sets the time constant for gaze motion. |
 | Crop origin quantization | `8 px` | Snaps motion to render-pixel increments. |
 | Jump reset threshold | `0.125 crop` | Resets DLSS history above the larger of 64 px or 12.5% of the crop dimension. |
 
 Press **Alt+Shift+/** to toggle foveated DLSS-SR without opening the overlay. Settings are saved through ReShade and restored the next time the game starts.
+
+**Automatic stereo alignment** is enabled by default and needs no eye tracker.
+It aligns fixed placement and the fallback center when gaze is unavailable;
+valid gaze already provides per-eye projected centers and is used directly. With the updated OpenXR layer, it
+projects a shared forward direction into each eye, including eye-view cant and
+asymmetric fields of view. The layer must reliably match each DLSS output to an
+OpenXR eye. Without that mapping, a valid current-view Streamline projection can
+provide the eye's optical-axis center instead; that fallback cannot infer headset
+cant. The panel reports the source used for the latest evaluated view.
+
+Automatic alignment controls both horizontal and vertical placement, keeping the
+center stable when the fovea size changes, except where the crop reaches an image
+edge. With automatic alignment enabled, **Height offset** adjusts the fixed center up
+or down; zero preserves the detected center. This preference starts at zero and
+is saved separately from legacy manual placement. In gaze modes it is labeled
+**Fallback height offset** and never shifts valid gaze. **Stereo X offset** is
+shown only for manual fixed placement. An advanced **Stereo mapping override**
+retains eye-order inversion for reversed packed layouts.
+Existing fixed/gaze selections are preserved. The previous experimental Auto
+alignment mode is migrated to Fixed with automatic alignment enabled. OpenVR-only games without usable
+Streamline projections still require manual alignment. DLSS-NR follows the
+automatic SR crop when **Use DLSS-SR foveation values** is enabled; independent
+NR placement remains manual.
+
+The automatic OpenXR route uses snapshot ABI 4: update both
+`CheekyFoveatedDLSS.addon64` and `CheekyOpenXRLayer.dll` together. An older layer
+is rejected safely and cannot supply OpenXR alignment or gaze to this build.
 
 The **Diagnostics** and **Performance** panels show whether DLSS interception is active, the received resolutions and crop, call counts, GPU timing, and the last NGX result. If the panel remains on “Waiting for the first DLSS evaluation,” confirm that DLSS is enabled in the game and that ReShade was installed for the correct API.
 
@@ -245,3 +272,8 @@ and uninstall on a Windows test machine; verify that the manifest's DWORD is
 only that value and the installed files. Verify gaze in a supported game after
 restarting it. Release signing, when available, should be applied to the DLL
 before packaging and to the final installer EXE before publishing.
+
+Real OpenXR gaze requires an eye-tracked headset exposed by the runtime.
+Quest 3 has no eye-tracking hardware: use Fixed with automatic alignment and
+Height offset, or simulated gaze for testing. The gaze panel reports why real
+gaze is unavailable instead of showing old sample coordinates as current.

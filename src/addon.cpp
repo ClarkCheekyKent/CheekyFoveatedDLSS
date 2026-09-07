@@ -651,10 +651,18 @@ void draw_openxr_gaze_diagnostics() {
     for (std::size_t index{}; index < gaze.views.size(); ++index) {
         const auto& view = gaze.views[index];
         char label[32]{};
+        static_cast<void>(sprintf_s(label, "Eye %zu alignment", index));
+        diagnostic_row(label, "%s (%.4f, %.4f)",
+            view.alignment_source == 2U ? "OpenXR" :
+            view.alignment_source == 1U ? "Streamline" : "Manual fallback",
+            view.aligned_u, view.aligned_v);
         static_cast<void>(sprintf_s(
-            label, "Eye %zu center", index
+            label, "Eye %zu gaze sample", index
         ));
-        diagnostic_row(label, "%.4f, %.4f", view.center_u, view.center_v);
+        if ((gaze.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U)
+            diagnostic_row(label, "%.4f, %.4f", view.center_u, view.center_v);
+        else
+            diagnostic_row(label, "Unavailable");
         static_cast<void>(sprintf_s(
             label, "Eye %zu mapping", index
         ));
@@ -749,6 +757,10 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "CenterMode", center_mode
     ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset));
     settings.center_mode = center_mode <= 2U
         ? static_cast<FoveationCenterMode>(center_mode)
         : FoveationCenterMode::fixed;
@@ -911,6 +923,8 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "AlignmentBorder",
         settings.alignment_border_enabled
     );
+    reshade::set_config_value(nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment);
+    reshade::set_config_value(nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset);
     reshade::set_config_value(
         nullptr, config_section, "CenterMode",
         static_cast<std::uint32_t>(settings.center_mode)
@@ -1101,10 +1115,34 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         settings.center_mode = static_cast<FoveationCenterMode>(center_mode);
         changed = true;
     }
+    if (settings.center_mode == FoveationCenterMode::openxr_gaze) {
+        const auto gaze = gaze_diagnostics();
+        const char* unavailable{};
+        if (!gaze.layer_present)
+            unavailable = "Eye tracking not detected: OpenXR layer is not loaded. Using fixed placement.";
+        else if (!gaze.abi_compatible)
+            unavailable = "Eye tracking unavailable: update the OpenXR layer to match this add-on.";
+        else if ((gaze.status_flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED) == 0U)
+            unavailable = "Eye tracking not detected. Using fixed placement.";
+        else if ((gaze.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) == 0U)
+            unavailable = "No valid eye-tracking signal. Using fixed fallback.";
+        else if (!gaze.using_gaze)
+            unavailable = "Eye tracking is not driving foveation: waiting for eye mapping.";
+        if (unavailable != nullptr) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, 0.25F, 0.25F, 1.0F));
+            ImGui::TextWrapped("%s", unavailable);
+            ImGui::PopStyleColor();
+        }
+    }
+    changed |= ImGui::Checkbox("Automatic stereo alignment", &settings.auto_stereo_alignment);
+    if (settings.auto_stereo_alignment) {
+        ImGui::TextDisabled("Aligns fixed placement and the fallback when gaze is unavailable.");
+        const auto source = gaze_diagnostics().alignment_source;
+        ImGui::TextDisabled("Latest alignment: %s", source == 2U ? "OpenXR" :
+            source == 1U ? "Streamline projection" : "Manual fallback");
+    }
     if (settings.center_mode != FoveationCenterMode::fixed) {
-        ImGui::TextDisabled(
-            "Requires the OpenXR layer; fixed offsets are the fallback."
-        );
+        ImGui::TextDisabled("Gaze requires the OpenXR layer; alignment needs no eye tracker.");
     }
     if (settings.center_mode == FoveationCenterMode::simulated_gaze) {
         int pattern = static_cast<int>(settings.simulation_pattern);
@@ -1150,7 +1188,8 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         editing_height = false;
         changed = true;
     }
-    if (has_multiple_stereo_views()) {
+    if (has_multiple_stereo_views() && !settings.auto_stereo_alignment &&
+        settings.center_mode == FoveationCenterMode::fixed) {
         ImGui::TextDisabled(
             "Applies equal and opposite X offsets to the two stereo views."
         );
@@ -1162,19 +1201,26 @@ void draw_sr_controls(Settings& settings, bool& changed) {
             "%.2f",
             ImGuiSliderFlags_AlwaysClamp
         );
-        changed |= ImGui::Checkbox(
-            "Invert stereo eye order",
-            &settings.invert_stereo_x_offset
-        );
+    }
+    if (has_multiple_stereo_views() && ImGui::TreeNode("Stereo mapping override")) {
+        changed |= ImGui::Checkbox("Invert stereo eye order", &settings.invert_stereo_x_offset);
+        ImGui::TextDisabled("For packed layouts with reversed eye order; normally leave off.");
+        ImGui::TreePop();
     }
     changed |= ImGui::SliderFloat(
-        "Height offset",
-        &settings.height_offset,
+        settings.center_mode == FoveationCenterMode::fixed ? "Height offset" : "Fallback height offset",
+        settings.auto_stereo_alignment ? &settings.aligned_height_offset : &settings.height_offset,
         -1.0F,
         1.0F,
         "%.2f",
         ImGuiSliderFlags_AlwaysClamp
     );
+    if (settings.center_mode != FoveationCenterMode::fixed)
+        ImGui::TextDisabled("Adjusts fixed placement when gaze is unavailable; does not shift valid gaze.");
+    else if (settings.auto_stereo_alignment)
+        ImGui::TextDisabled("Negative moves up, positive moves down. Zero keeps the automatic center.");
+    else
+        ImGui::TextDisabled("Negative moves up, positive moves down.");
     changed |= ImGui::SliderFloat(
         "Roundness",
         &settings.roundness,
@@ -1195,7 +1241,8 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         "Show 5 px red alignment border",
         &settings.alignment_border_enabled
     );
-    if (settings.center_mode != FoveationCenterMode::fixed &&
+    if ((settings.center_mode == FoveationCenterMode::openxr_gaze ||
+         settings.center_mode == FoveationCenterMode::simulated_gaze) &&
         ImGui::TreeNode("Advanced eye tracking")) {
         changed |= ImGui::SliderFloat(
             "Gaze smoothing",
@@ -1255,6 +1302,8 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         settings.transition_width = defaults.transition_width;
         settings.alignment_border_enabled = defaults.alignment_border_enabled;
         settings.center_mode = defaults.center_mode;
+        settings.auto_stereo_alignment = defaults.auto_stereo_alignment;
+        settings.aligned_height_offset = defaults.aligned_height_offset;
         settings.show_next_jump_target = defaults.show_next_jump_target;
         settings.simulation_pattern = defaults.simulation_pattern;
         settings.gaze_smoothing_ms = defaults.gaze_smoothing_ms;
@@ -1650,7 +1699,7 @@ bool on_gaze_copy_texture(reshade::api::command_list* list, reshade::api::resour
     const reshade::api::subresource_box* destination_box, reshade::api::filter_mode) {
     auto* device = list->get_device();
     if (device->get_api() != reshade::api::device_api::d3d12 ||
-        current_settings().center_mode == FoveationCenterMode::fixed) return false;
+        !uses_coordinated_center(current_settings())) return false;
     GazeCopyEdge edge{};
     if (gaze_copy_region(device, source, source_subresource, source_box, edge.source) &&
         gaze_copy_region(device, destination, destination_subresource, destination_box, edge.destination) &&
@@ -1671,7 +1720,7 @@ bool on_gaze_resolve(reshade::api::command_list* list, reshade::api::resource so
     reshade::api::resource destination, std::uint32_t destination_subresource,
     std::uint32_t x, std::uint32_t y, std::uint32_t z, reshade::api::format) {
     if (list->get_device()->get_api() != reshade::api::device_api::d3d12 ||
-        current_settings().center_mode == FoveationCenterMode::fixed) return false;
+        !uses_coordinated_center(current_settings())) return false;
     GazeCopyRegion source_region{};
     if (z != 0 || !gaze_copy_region(list->get_device(), source, source_subresource, source_box, source_region)) return false;
     if (std::uint64_t(x) + source_region.width > UINT32_MAX ||

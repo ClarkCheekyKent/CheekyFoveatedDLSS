@@ -191,7 +191,8 @@ bool calculate_coordinated_crop(
     const std::uint32_t output_origin_x,
     const std::uint32_t output_origin_y,
     CropGeometry& crop,
-    bool& reset_history
+    bool& reset_history,
+    const CheekyGazeSnapshotV1* supplied_snapshot
 ) noexcept {
     reset_history = false;
     const auto fixed_settings = settings_for_view(settings, view_id);
@@ -207,7 +208,16 @@ bool calculate_coordinated_crop(
             set_simulation(settings.center_mode == FoveationCenterMode::simulated_gaze ? 1U : 0U);
         }
     }
-    if (settings.center_mode == FoveationCenterMode::fixed) {
+    if (!uses_coordinated_center(settings)) {
+        std::lock_guard lock(coordinator_mutex);
+        diagnostics.alignment_source = 0U;
+        diagnostics.using_gaze = false;
+        if (eye_assignment.assigned && eye_assignment.eye_index < diagnostics.views.size()) {
+            auto& view = diagnostics.views[eye_assignment.eye_index];
+            const auto center = fixed_center(fixed_settings, render_width, render_height);
+            view.alignment_source = 0U;
+            view.aligned_u = center.u; view.aligned_v = center.v;
+        }
         return calculate_crop(
             fixed_settings, render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop
@@ -216,13 +226,73 @@ bool calculate_coordinated_crop(
 
     std::lock_guard lock(coordinator_mutex);
     state_for_view(view_id).next_jump_visible = false;
+    const bool automatic = settings.auto_stereo_alignment;
+    const auto camera = active_gaze_projection.view == view_id ?
+        active_gaze_projection.projection : GazeProjection{};
+    // A projection belongs to the current DLSS view, so this route does not
+    // depend on guessed left/right evaluation order. Require stereo and a
+    // full local view; packed subrect projections need explicit XR mapping.
+    const auto aligned_center = [&](const CheekyGazeViewV1* xr_view) {
+        auto center = fixed_center(fixed_settings, render_width, render_height);
+        float u{}, v{};
+        unsigned source{};
+        if (automatic && xr_view && (xr_view->flags & CHEEKY_GAZE_VIEW_FORWARD_VALID) != 0U &&
+            std::isfinite(xr_view->forward_u) && std::isfinite(xr_view->forward_v)) {
+            u = xr_view->forward_u; v = xr_view->forward_v; source = 2U;
+        } else if (automatic && has_multiple_stereo_views() && output_origin_x == 0U && output_origin_y == 0U &&
+            projection_forward_center(camera, u, v)) {
+            source = 1U;
+        }
+        diagnostics.alignment_source = source;
+        if (source != 0U) center = {u, v, 1U};
+        // A user bias for fixed placement (including gaze-loss fallback),
+        // never added to a valid gaze sample. Independent of fovea size.
+        if (automatic) {
+            center.v = std::clamp(center.v + 0.5F * settings.aligned_height_offset, 0.F, 1.F);
+            center.quantization_pixels = 1U;
+        }
+        const auto index = xr_view ? xr_view->view_index : eye_assignment.eye_index;
+        if ((xr_view || eye_assignment.assigned) && index < diagnostics.views.size()) {
+            auto& view = diagnostics.views[index];
+            view.alignment_source = source;
+            view.aligned_u = center.u; view.aligned_v = center.v;
+        }
+        return center;
+    };
+    const auto auto_crop = [&](const CheekyGazeViewV1* xr_view) {
+        const auto center = aligned_center(xr_view);
+        const bool valid = diagnostics.alignment_source == 0U && settings.aligned_height_offset == 0.F
+            ? calculate_crop(fixed_settings, render_width, render_height, output_width,
+                output_height, output_origin_x, output_origin_y, crop)
+            : calculate_foveation_geometry_at_center(foveation_parameters(fixed_settings),
+                center, render_width, render_height, output_width, output_height,
+                output_origin_x, output_origin_y, crop);
+        diagnostics.using_gaze = false;
+        if (valid) {
+            auto& state = state_for_view(view_id);
+            reset_history = state.has_crop &&
+                (state.last_crop.input_base_x != crop.input_base_x ||
+                 state.last_crop.input_base_y != crop.input_base_y ||
+                 state.last_crop.input_width != crop.input_width ||
+                 state.last_crop.input_height != crop.input_height);
+            state.last_crop = crop;
+            state.has_crop = true;
+        }
+        return valid;
+    };
     if (qpc_frequency == 0U) {
         LARGE_INTEGER frequency{};
         QueryPerformanceFrequency(&frequency);
         qpc_frequency = static_cast<std::uint64_t>(frequency.QuadPart);
     }
     CheekyGazeSnapshotV1 snapshot{};
-    if (!load_snapshot(snapshot)) {
+    // Callers can supply a frame snapshot; otherwise read the live layer.
+    const bool loaded = supplied_snapshot
+        ? (snapshot = *supplied_snapshot, snapshot.abi_version == CHEEKY_GAZE_ABI_VERSION &&
+            snapshot.structure_size >= sizeof(snapshot))
+        : load_snapshot(snapshot);
+    if (!loaded) {
+        if (automatic) return auto_crop(nullptr);
         diagnostics.using_gaze = false;
         return calculate_crop(
             fixed_settings, render_width, render_height,
@@ -243,8 +313,6 @@ bool calculate_coordinated_crop(
     bool packed_stereo_match{};
     bool copy_match{};
     bool projection_match{};
-    const auto camera = active_gaze_projection.view == view_id ?
-        active_gaze_projection.projection : GazeProjection{};
     std::array<GazeProjection, 2> xr_projections{};
     for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
         const auto& v = snapshot.views[i];
@@ -445,6 +513,19 @@ bool calculate_coordinated_crop(
     }
     const bool mapping_stable = mapping_result.stable &&
         state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS;
+    // Alignment is independent of gaze availability. The packed bridge route
+    // uses the existing eye roles (and manual inversion override).
+    const bool usable = mapping_stable && snapshot.view_count == 2U &&
+            (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
+            (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
+            (snapshot.status_flags & (CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG |
+                CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE)) == 0U &&
+            snapshot.predicted_display_time != 0 && snapshot.publication_qpc != 0U &&
+            now >= snapshot.publication_qpc &&
+            seconds_between(now, snapshot.publication_qpc) <= gaze_stale_seconds &&
+            sample_age_seconds <= gaze_stale_seconds;
+    if (settings.center_mode == FoveationCenterMode::fixed)
+        return auto_crop(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     const bool source_matches =
         ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U) ==
         (settings.center_mode == FoveationCenterMode::simulated_gaze);
@@ -468,9 +549,7 @@ bool calculate_coordinated_crop(
             state.next_jump_offsets = foveation_offsets_from_geometry(next_crop, render_width, render_height);
         }
     }
-    const auto fallback = fixed_center(
-        fixed_settings, render_width, render_height
-    );
+    const auto fallback = aligned_center(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     float raw_u = fallback.u;
     float raw_v = fallback.v;
     if (use_sample) {
@@ -495,10 +574,7 @@ bool calculate_coordinated_crop(
     );
     diagnostics.using_gaze = temporal_result.using_gaze;
     if (!state.temporal.has_filtered) {
-        return calculate_crop(
-            fixed_settings, render_width, render_height,
-            output_width, output_height, output_origin_x, output_origin_y, crop
-        );
+        return auto_crop(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     }
 
     if (!calculate_foveation_geometry_at_center(

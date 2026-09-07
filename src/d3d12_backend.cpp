@@ -896,7 +896,7 @@ D3D12Evaluation* prepare_d3d12(
         }
         return nullptr;
     }
-    if (settings.center_mode != FoveationCenterMode::fixed) {
+    if (uses_coordinated_center(settings)) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );
@@ -1230,7 +1230,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
         )) {
         return nullptr;
     }
-    if (settings.center_mode != FoveationCenterMode::fixed) {
+    if (uses_coordinated_center(settings)) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );

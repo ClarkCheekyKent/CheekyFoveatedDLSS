@@ -71,6 +71,18 @@ Pose simulated_gaze_pose(const Pose& head, const double seconds, const unsigned 
     }, head.position};
 }
 
+bool stereo_forward_pose(const Pose& left, const Pose& right, Pose& head) noexcept {
+    const auto& a = left.orientation;
+    const auto& b = right.orientation;
+    const float sign = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w < 0.F ? -1.F : 1.F;
+    Quaternion q{a.x + sign*b.x, a.y + sign*b.y, a.z + sign*b.z, a.w + sign*b.w};
+    const float length = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (!std::isfinite(length) || length < 0.0001F) return false;
+    head = {};
+    head.orientation = {q.x/length, q.y/length, q.z/length, q.w/length};
+    return true;
+}
+
 bool project_gaze_to_view(
     const Pose& gaze_pose,
     const Pose& view_pose,

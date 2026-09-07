@@ -27,6 +27,9 @@ struct Fov {
     float angle_down{};
 };
 
+// Shared forward orientation, including symmetric canted eye views.
+[[nodiscard]] bool stereo_forward_pose(const Pose& left, const Pose& right, Pose& head) noexcept;
+
 // Head-relative synthetic gaze, repeating every eight seconds.
 // Pattern IDs: 0 figure eight, 1 slow sweep, 2/3 jumps (2/8 s),
 // 4 tracking loss, 5 stationary center.

@@ -5,6 +5,7 @@
 #include "settings.hpp"
 #include "gaze_copy_graph.hpp"
 #include "gaze_projection.hpp"
+#include "cheeky_gaze_abi.h"
 
 #include <Unknwn.h>
 
@@ -30,6 +31,8 @@ struct GazeViewDiagnostics {
     bool packed_stereo_mapping{};
     bool copy_mapping{};
     bool projection_mapping{};
+    unsigned alignment_source{};
+    float aligned_u{}, aligned_v{};
 };
 
 struct GazeDiagnostics {
@@ -40,6 +43,8 @@ struct GazeDiagnostics {
     bool layer_present{};
     bool abi_compatible{};
     bool using_gaze{};
+    // Latest evaluated view: 0 manual fallback, 1 Streamline, 2 OpenXR.
+    unsigned alignment_source{};
     bool mapping_ambiguous{};
     GazeResetReason last_reset_reason{GazeResetReason::none};
     std::array<GazeViewDiagnostics, 2U> views{};
@@ -56,7 +61,8 @@ struct GazeDiagnostics {
     std::uint32_t output_origin_x,
     std::uint32_t output_origin_y,
     CropGeometry& crop,
-    bool& reset_history
+    bool& reset_history,
+    const CheekyGazeSnapshotV1* supplied_snapshot = nullptr
 ) noexcept;
 
 void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;

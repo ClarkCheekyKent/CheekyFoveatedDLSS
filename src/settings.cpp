@@ -20,6 +20,8 @@ std::atomic<std::uint32_t> height_bits{0x3EE66666U};
 std::atomic<std::uint32_t> x_offset_bits{0x3F19999AU};
 std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
+std::atomic<bool> auto_stereo_alignment{true};
+std::atomic<std::uint32_t> aligned_height_offset_bits{};
 std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
 std::atomic<bool> alignment_border_enabled{false};
@@ -120,6 +122,8 @@ Settings current_settings() noexcept {
     settings.transition_width = load_float(transition_bits);
     settings.alignment_border_enabled =
         alignment_border_enabled.load(std::memory_order_acquire);
+    settings.auto_stereo_alignment = auto_stereo_alignment.load(std::memory_order_acquire);
+    settings.aligned_height_offset = load_float(aligned_height_offset_bits);
     settings.center_mode = static_cast<FoveationCenterMode>(
         center_mode.load(std::memory_order_acquire)
     );
@@ -213,6 +217,8 @@ void update_settings(const Settings& settings) noexcept {
         settings.alignment_border_enabled,
         std::memory_order_release
     );
+    auto_stereo_alignment.store(settings.auto_stereo_alignment, std::memory_order_release);
+    store_float(aligned_height_offset_bits, std::clamp(settings.aligned_height_offset, -1.0F, 1.0F));
     center_mode.store(
         static_cast<std::uint32_t>(settings.center_mode) <= 2U
             ? static_cast<std::uint32_t>(settings.center_mode)

@@ -419,12 +419,12 @@ void test_reset_policy() {
 
 void test_abi() {
     static_assert(CHEEKY_GAZE_MAX_VIEWS == 2U);
-    static_assert(sizeof(CheekyGazeViewV1) == 80U);
-    static_assert(sizeof(CheekyGazeSnapshotV1) == 352U);
+    static_assert(sizeof(CheekyGazeViewV1) == 88U);
+    static_assert(sizeof(CheekyGazeSnapshotV1) == 368U);
     CheekyGazeSnapshotV1 snapshot{};
     snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
     snapshot.structure_size = sizeof(snapshot);
-    expect(snapshot.abi_version == 3U &&
+    expect(snapshot.abi_version == 4U &&
         snapshot.structure_size >= sizeof(CheekyGazeSnapshotV1),
         "snapshot ABI version and size are self-describing");
 }
@@ -668,6 +668,164 @@ void test_dlss_nr_reuses_live_sr_crop_center() {
         "DLSS-NR follows the live SR vertical center");
 }
 
+void test_packed_alignment_coordinator() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation();
+    register_stereo_view(951U); register_stereo_view(952U);
+    Settings settings{};
+    settings.width = settings.height = 0.4F;
+    settings.gaze_smoothing_ms = 0.F;
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    snapshot.structure_size = sizeof(snapshot);
+    snapshot.view_count = 2U;
+    snapshot.swapchain_generation = 1U;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& eye = snapshot.views[i];
+        eye.view_index = i;
+        eye.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID;
+        eye.image_rect_x = i * 3024;
+        eye.image_rect_width = 3024U; eye.image_rect_height = 2836U;
+        eye.resource_identity = 0x2AC4ED30820ULL + i * 0xC0ULL;
+        eye.swapchain_identity = 100U + i;
+        eye.forward_u = i == 0 ? 0.62F : 0.38F;
+        eye.forward_v = 0.5F;
+        eye.center_u = i == 0 ? 0.72F : 0.28F;
+        eye.center_v = 0.6F;
+    }
+    CropGeometry crops[2]{};
+    const auto frame = [&]() {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart;
+        ++snapshot.predicted_display_time;
+        for (unsigned i = 0; i < 2; ++i) {
+            bool reset{};
+            expect(calculate_coordinated_crop(settings, 951U + i, nullptr,
+                1512U, 1418U, 3024U, 2836U, 0U, 0U, crops[i], reset, &snapshot),
+                "split packed bridge produces coordinated crop without matching resource or camera");
+        }
+    };
+    frame(); frame(); frame();
+    auto diagnostics = gaze_diagnostics();
+    for (unsigned i = 0; i < 2; ++i) {
+        expect(diagnostics.views[i].resource_mapped && diagnostics.views[i].packed_stereo_mapping,
+            "screenshot split-texture layout stabilizes through packed mapping");
+        expect(diagnostics.views[i].alignment_source == 2U,
+            "fixed mode aligns through OpenXR without eye tracking support");
+        const float actual = (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F;
+        expect_near(actual, snapshot.views[i].forward_u, 0.001F, "each eye uses its own forward center");
+    }
+    settings.aligned_height_offset = -0.2F;
+    frame();
+    for (const auto& crop : crops) {
+        expect_near((crop.input_base_y + crop.input_height * 0.5F) / 1418.F, 0.4F, 0.001F,
+            "fixed automatic placement accepts upward user height bias");
+    }
+    settings.height = 0.6F;
+    frame();
+    expect_near((crops[0].input_base_y + crops[0].input_height * 0.5F) / 1418.F, 0.4F, 0.001F,
+        "height bias keeps its screen position when fovea height changes");
+    settings.height = 0.4F;
+    settings.center_mode = FoveationCenterMode::openxr_gaze;
+    frame();
+    expect(gaze_diagnostics().alignment_source == 2U && !gaze_diagnostics().using_gaze,
+        "gaze mode uses automatic fixed fallback when tracker is unavailable");
+    expect_near((crops[0].input_base_y + crops[0].input_height * 0.5F) / 1418.F, 0.4F, 0.004F,
+        "gaze fallback retains fixed height preference");
+    snapshot.status_flags |= CHEEKY_GAZE_STATUS_GAZE_VALID;
+    frame();
+    expect(gaze_diagnostics().using_gaze, "valid gaze remains active with automatic alignment enabled");
+    for (unsigned i = 0; i < 2; ++i) {
+        const float actual = (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F;
+        expect_near(actual, snapshot.views[i].center_u, 0.004F, "gaze center is not offset a second time");
+        expect_near((crops[i].input_base_y + crops[i].input_height * 0.5F) / 1418.F,
+            snapshot.views[i].center_v, 0.004F, "fixed height bias never shifts valid gaze");
+    }
+    settings.center_mode = FoveationCenterMode::simulated_gaze;
+    snapshot.status_flags |= CHEEKY_GAZE_STATUS_SIMULATED;
+    frame();
+    expect(gaze_diagnostics().using_gaze, "simulated gaze coexists with automatic alignment");
+    settings.center_mode = FoveationCenterMode::fixed;
+    settings.auto_stereo_alignment = false;
+    frame();
+    CropGeometry manual{};
+    expect(calculate_crop(settings_for_view(settings, 951U), 1512U, 1418U, 3024U, 2836U, 0U, 0U, manual) &&
+        crops[0].input_base_x == manual.input_base_x, "manual override retains configured placement");
+    settings.auto_stereo_alignment = true;
+    snapshot.views[1].image_rect_x = 0;
+    frame();
+    expect(gaze_diagnostics().alignment_source == 0U, "invalid packed layout falls back instead of using stale mapping");
+    unregister_stereo_view(951U); unregister_stereo_view(952U);
+    reset_gaze_foveation();
+}
+
+void test_auto_alignment() {
+    using namespace cheeky::foveated_dlss;
+    using namespace cheeky::gaze_math;
+    Pose head{};
+    const Pose left{{0.F, std::sin(0.1F), 0.F, std::cos(0.1F)}, {}};
+    const Pose right{{0.F, -std::sin(0.1F), 0.F, std::cos(0.1F)}, {}};
+    expect(stereo_forward_pose(left, right, head), "canted stereo has shared forward");
+    expect_near(head.orientation.y, 0.F, 0.0001F, "opposite eye cants cancel");
+    Pose negative_right = right;
+    negative_right.orientation.y *= -1.F;
+    negative_right.orientation.w *= -1.F;
+    Pose same_head{};
+    expect(stereo_forward_pose(left, negative_right, same_head), "quaternion hemisphere is handled");
+    expect_near(same_head.orientation.y, 0.F, 0.0001F, "quaternion sign does not change forward");
+    float u{}, v{}, right_u{};
+    const Fov fov{-0.8F, 0.8F, 0.8F, -0.8F};
+    expect(project_gaze_to_view(head, left, fov, u, v) &&
+        project_gaze_to_view(head, right, fov, right_u, v), "shared forward projects into both canted eyes");
+    expect_near(u + right_u, 1.F, 0.0001F, "canted eyes receive opposite horizontal centers");
+    expect(std::abs(u - 0.5F) > 0.05F, "cant correction differs from individual optical axis");
+
+    reset_gaze_foveation();
+    Settings settings{};
+    settings.center_mode = FoveationCenterMode::fixed;
+    settings.auto_stereo_alignment = true;
+    settings.width = settings.height = 0.5F;
+    update_settings(settings);
+    expect(current_settings().auto_stereo_alignment, "automatic alignment survives settings validation");
+    register_stereo_view(901U); register_stereo_view(902U);
+    (void)settings_for_view(settings, 902U); // Right-first evaluation must not change projection placement.
+    CropGeometry crop{};
+    bool reset{};
+    const auto calculate = [&]() { return calculate_coordinated_crop(settings, 901U, nullptr,
+        1000U, 1000U, 2000U, 2000U, 0U, 0U, crop, reset); };
+    {
+        ScopedGazeProjection scope(901U, {-0.8F, 1.2F, 1.2F, -0.8F, true});
+        expect(calculate(), "automatic Streamline crop needs no XR layer");
+        expect(crop.input_base_x == 150U && crop.input_base_y == 350U,
+            "asymmetric projection aligns both axes");
+        expect(gaze_diagnostics().alignment_source == 1U, "projection alignment is reported");
+        settings.invert_stereo_x_offset = true;
+        expect(calculate() && crop.input_base_x == 150U && !reset,
+            "manual eye inversion does not affect automatic alignment");
+        settings.width = 0.3F;
+        expect(calculate() && crop.input_base_x == 250U && reset,
+            "resizing preserves center and resets changed crop history");
+        expect(calculate() && !reset, "stable auto placement keeps history");
+        settings.width = 0.9F;
+        expect(calculate() && crop.input_base_x == 0U,
+            "large crop stays within texture bounds");
+    }
+    expect(calculate() && gaze_diagnostics().alignment_source == 0U && reset,
+        "missing projection returns to manual fallback and resets history");
+    const auto fallback = crop;
+    {
+        ScopedGazeProjection wrong_view(902U, {-0.8F, 1.2F, 1.2F, -0.8F, true});
+        expect(calculate() && crop.input_base_x == fallback.input_base_x &&
+            gaze_diagnostics().alignment_source == 0U, "another view's projection is rejected");
+    }
+    expect(!projection_forward_center({0.F, 0.F, 0.F, 0.F, true}, u, v),
+        "invalid frustum cannot activate auto alignment");
+    unregister_stereo_view(901U); unregister_stereo_view(902U);
+    update_settings(Settings{});
+    reset_gaze_foveation();
+}
+
 [[nodiscard]] bool run_openxr_gaze_lookup() {
     using namespace cheeky::foveated_dlss;
     Settings settings{};
@@ -714,7 +872,9 @@ void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
         snapshot.sequence = 123;
         expect(snapshot_export(2U, &snapshot, 320U) == 0U && snapshot.sequence == 123,
             "old ABI buffer is rejected without being overwritten");
-        expect(snapshot_export(3U, &snapshot, sizeof(snapshot)) != 0U && snapshot.abi_version == 3U,
+        expect(snapshot_export(3U, &snapshot, 352U) == 0U && snapshot.sequence == 123,
+            "previous projection ABI is rejected without overwriting its buffer");
+        expect(snapshot_export(4U, &snapshot, sizeof(snapshot)) != 0U && snapshot.abi_version == 4U,
             "new layer and add-on agree on projection snapshot ABI");
     }
 
@@ -837,6 +997,8 @@ void test_gaze_copy_routes() {
 int run_d3d12_composite_tests();
 
 int main(int argc, char** argv) {
+    test_packed_alignment_coordinator();
+    test_auto_alignment();
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {
         return run_d3d12_composite_tests();
     }

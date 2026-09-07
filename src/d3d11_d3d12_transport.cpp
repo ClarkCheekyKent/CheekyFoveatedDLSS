@@ -1376,7 +1376,7 @@ bool evaluate_d3d11_via_d3d12(
                 : D3D11TransportStatus::invalid_dimensions
         );
     }
-    if (transport_settings.center_mode != FoveationCenterMode::fixed) {
+    if (uses_coordinated_center(transport_settings)) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );
@@ -1497,7 +1497,7 @@ bool evaluate_d3d11_via_d3d12(
         (create_flags & dlss_feature_flag_depth_inverted) != 0U;
     contract.reset = get_int(parameters, "Reset") != 0 || gaze_reset;
     contract.preserve_history_on_crop_move =
-        transport_settings.center_mode != FoveationCenterMode::fixed;
+        uses_coordinated_center(transport_settings);
     contract.create_flags = create_flags;
     contract.perf_quality = get_ui(parameters, "PerfQualityValue");
     contract.jitter_x = get_float(parameters, "Jitter.Offset.X");

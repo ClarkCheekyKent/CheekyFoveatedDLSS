@@ -4027,7 +4027,7 @@ void evaluate_nr_after_native_d3d12(
     contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
     contract.motion_vectors_low_res = d3d12_evaluation_low_res_motion(evaluation);
     contract.preserve_history_on_crop_move =
-        settings.center_mode != FoveationCenterMode::fixed;
+        uses_coordinated_center(settings);
     private_attempted = true;
 
     if (peripheral_ready && !d3d12_set_composite_base(
