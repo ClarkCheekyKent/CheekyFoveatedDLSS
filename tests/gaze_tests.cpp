@@ -553,6 +553,40 @@ void test_multimip_game_output_is_dlss_nr_compatible() {
         "DLSS-NR accepts the multi-mip mip-zero output used by ACE");
 }
 
+void test_msfs_array_output_contract() {
+    using namespace cheeky::foveated_dlss;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 3024;
+    desc.Height = 2836;
+    desc.MipLevels = 12;
+    desc.DepthOrArraySize = 2;
+    desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    for (const auto slices : {2U, 4U}) {
+        desc.DepthOrArraySize = static_cast<UINT16>(slices);
+        const auto plan = plan_d3d12_output(desc, 1664, 1276);
+        expect(plan.compatible, "MSFS array output accepted for SR");
+        expect(plan.private_description.DepthOrArraySize == 1 &&
+            plan.private_description.MipLevels == 1 &&
+            plan.private_description.Width == 1664 &&
+            plan.private_description.Height == 1276,
+            "SR scratch is a single-slice single-mip crop");
+        expect(!is_dlss_nr_output_compatible(desc),
+            "SR array support does not silently enable unsupported NR arrays");
+    }
+    desc.SampleDesc.Count = 2;
+    expect(!plan_d3d12_output(desc, 1664, 1276).compatible, "MSAA stays rejected");
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    expect(!plan_d3d12_output(desc, 1664, 1276).compatible, "missing UAV stays rejected");
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    expect(!plan_d3d12_output(desc, 1664, 1276).compatible, "3D output stays rejected");
+}
+
 void test_dlss_nr_maps_right_eye_region_into_packed_output() {
     using namespace cheeky::foveated_dlss;
     const auto base = dlss_nr_resource_base(
@@ -659,7 +693,12 @@ void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
 
 }  // namespace
 
-int main() {
+int run_d3d12_composite_tests();
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {
+        return run_d3d12_composite_tests();
+    }
     test_simulated_gaze();
     test_simulation_patterns();
     test_projection();
@@ -675,6 +714,7 @@ int main() {
     test_nested_d3d12_lifecycle_scope_is_passthrough();
     test_core_d3d12_route_is_published_to_diagnostics();
     test_multimip_game_output_uses_single_mip_private_output();
+    test_msfs_array_output_contract();
     test_multimip_game_output_is_dlss_nr_compatible();
     test_dlss_nr_maps_right_eye_region_into_packed_output();
     test_dlss_nr_reuses_live_sr_crop_center();

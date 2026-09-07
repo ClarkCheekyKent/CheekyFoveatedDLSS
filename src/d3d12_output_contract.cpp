@@ -21,7 +21,7 @@ D3D12OutputPlan plan_d3d12_output(
     plan.compatible = private_width != 0U && private_height != 0U &&
         game_output.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         game_output.MipLevels != 0U &&
-        game_output.DepthOrArraySize == 1U &&
+        game_output.DepthOrArraySize != 0U &&
         game_output.SampleDesc.Count == 1U &&
         game_output.Format != DXGI_FORMAT_UNKNOWN &&
         (game_output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0U;
@@ -31,7 +31,26 @@ D3D12OutputPlan plan_d3d12_output(
     plan.private_description.Width = private_width;
     plan.private_description.Height = private_height;
     plan.private_description.MipLevels = 1U;
+    plan.private_description.DepthOrArraySize = 1U;
     return plan;
+}
+
+D3D12_SHADER_RESOURCE_VIEW_DESC d3d12_composite_srv(const DXGI_FORMAT format) noexcept {
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format = format;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Texture2DArray.MipLevels = 1U;
+    view.Texture2DArray.ArraySize = 1U;
+    return view;
+}
+
+D3D12_UNORDERED_ACCESS_VIEW_DESC d3d12_composite_uav(const DXGI_FORMAT format) noexcept {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.Format = format;
+    view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+    view.Texture2DArray.ArraySize = 1U;
+    return view;
 }
 
 }  // namespace cheeky::foveated_dlss

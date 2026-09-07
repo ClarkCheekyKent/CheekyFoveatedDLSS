@@ -2437,6 +2437,8 @@ struct StreamlineEvaluation {
     output_resource.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     output_resource.width = output_width;
     output_resource.height = output_height;
+    output_resource.mip_levels = 1U;
+    output_resource.array_layers = 1U;
     output_tag.resource = &output_resource;
     output_tag.extent = {0U, 0U, crop.output_width, crop.output_height};
     if (verbose) trace_event("SL eval=%llu cropped tags prepared", static_cast<unsigned long long>(sequence));

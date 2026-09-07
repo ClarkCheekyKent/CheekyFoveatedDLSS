@@ -1,5 +1,6 @@
 #include "backend.hpp"
 #include "d3d12_output_contract.hpp"
+#include "d3d12_composite_shader.hpp"
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
@@ -283,125 +284,7 @@ std::uint32_t last_height_bits{};
 std::uint32_t last_height_offset_bits{};
 std::uint32_t last_roundness_bits{};
 
-constexpr char composite_shader_source[] = R"(
-Texture2D<float4> LowResolutionColor : register(t0);
-Texture2D<float4> DlssColor : register(t1);
-RWTexture2D<float4> GameOutput : register(u0);
 
-cbuffer Constants : register(b0) {
-    uint2 OutputSize;
-    uint2 OutputOrigin;
-    uint2 InputBase;
-    uint2 InputSize;
-    uint2 RectBase;
-    uint2 RectSize;
-    float ShapeWidth;
-    float ShapeHeight;
-    float ShapeOffsetX;
-    float ShapeOffsetY;
-    float ShapeRoundness;
-    float Feather;
-    uint2 DlssOrigin;
-    uint ShowAlignmentBorder;
-    float NextJumpOffsetX;
-    float NextJumpOffsetY;
-    uint ShowNextJump;
-};
-
-float ShapeDistance(float2 centered) {
-    const float2 shape_size = max(
-        float2(ShapeWidth, ShapeHeight),
-        float2(0.0001, 0.0001)
-    );
-    const float2 scaled = abs(centered) / shape_size;
-    return lerp(
-        max(scaled.x, scaled.y),
-        length(scaled),
-        saturate(ShapeRoundness)
-    );
-}
-
-float4 LoadInputBilinear(float2 position) {
-    const float2 base = floor(position);
-    const float2 fraction = position - base;
-    const int2 minimum = int2(InputBase);
-    const int2 maximum = minimum + int2(InputSize) - 1;
-    const int2 p00 = clamp(int2(base), minimum, maximum);
-    const int2 p10 = clamp(p00 + int2(1, 0), minimum, maximum);
-    const int2 p01 = clamp(p00 + int2(0, 1), minimum, maximum);
-    const int2 p11 = clamp(p00 + int2(1, 1), minimum, maximum);
-    return lerp(
-        lerp(LowResolutionColor.Load(int3(p00, 0)),
-             LowResolutionColor.Load(int3(p10, 0)), fraction.x),
-        lerp(LowResolutionColor.Load(int3(p01, 0)),
-             LowResolutionColor.Load(int3(p11, 0)), fraction.x),
-        fraction.y
-    );
-}
-
-float2 InputPosition(uint2 local_pixel) {
-    return float2(InputBase) +
-        (float2(local_pixel) + 0.5) * float2(InputSize) /
-        float2(OutputSize) - 0.5;
-}
-
-[numthreads(16, 16, 1)]
-void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
-    if (any(dispatch_id.xy >= OutputSize)) return;
-    const uint2 local_pixel = dispatch_id.xy;
-    const uint2 output_pixel = OutputOrigin + local_pixel;
-    const float4 bilinear = LoadInputBilinear(InputPosition(local_pixel));
-    float2 centered =
-        (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
-    centered.x -= ShapeOffsetX * (1.0 - ShapeWidth);
-    centered.y -= ShapeOffsetY * (1.0 - ShapeHeight);
-    const float distance_from_center = ShapeDistance(centered);
-    const float2 pixel_size = 2.0 / float2(OutputSize);
-    const float distance_per_pixel = max(
-        abs(ShapeDistance(centered + float2(pixel_size.x, 0.0)) -
-            distance_from_center),
-        abs(ShapeDistance(centered + float2(0.0, pixel_size.y)) -
-            distance_from_center)
-    );
-    if (ShowNextJump != 0U) {
-        float2 next_centered = (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
-        next_centered -= float2(NextJumpOffsetX * (1.0 - ShapeWidth), NextJumpOffsetY * (1.0 - ShapeHeight));
-        const float next_distance = ShapeDistance(next_centered);
-        const float next_pixel_distance = max(
-            abs(ShapeDistance(next_centered + float2(pixel_size.x, 0.0)) - next_distance),
-            abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
-        if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
-            GameOutput[output_pixel] = float4(0.0, 1.0, 0.0, 1.0);
-            return;
-        }
-    }
-    const bool alignment_border = ShowAlignmentBorder != 0U &&
-        distance_from_center <= 1.0 &&
-        distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
-    if (alignment_border) {
-        GameOutput[output_pixel] = float4(1.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    const float normalized_feather = Feather /
-        max(0.0001, min(ShapeWidth, ShapeHeight));
-    const float weight = Feather <= 0.0
-        ? (distance_from_center <= 1.0 ? 1.0 : 0.0)
-        : 1.0 - smoothstep(
-            max(0.0, 1.0 - normalized_feather),
-            1.0,
-            distance_from_center
-        );
-    const bool inside_rect = all(output_pixel >= RectBase) &&
-        all(output_pixel < RectBase + RectSize);
-    if (!inside_rect || weight <= 0.0) {
-        GameOutput[output_pixel] = bilinear;
-        return;
-    }
-    const uint2 dlss_pixel = DlssOrigin + (output_pixel - RectBase);
-    const float4 dlss = DlssColor.Load(int3(dlss_pixel, 0));
-    GameOutput[output_pixel] = lerp(bilinear, dlss, weight);
-}
-)";
 
 void release_resources(D3D12Resources* const resources) noexcept {
     if (resources == nullptr) {
@@ -525,6 +408,14 @@ void release_resources(D3D12Resources* const resources) noexcept {
         return nullptr;
     }
     resources->dlss_output->SetName(L"Cheeky Foveated DLSS-SR output");
+    if (output_description.DepthOrArraySize > 1U) {
+        trace_event(
+            "D3D12 SR array output accepted slices=%u mips=%u compositeSlice=0 "
+            "private=%ux%u privateSlices=1 privateMips=1",
+            output_description.DepthOrArraySize, output_description.MipLevels,
+            output_width, output_height
+        );
+    }
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_description{};
     descriptor_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1149,27 +1040,15 @@ D3D12Evaluation* prepare_d3d12(
     auto cpu = resources->descriptors->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += evaluation->descriptor_offset;
     const auto color_description = color->GetDesc();
-    D3D12_SHADER_RESOURCE_VIEW_DESC color_srv{};
-    color_srv.Format = color_description.Format;
-    color_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    color_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    color_srv.Texture2D.MipLevels = 1U;
+    const auto color_srv = d3d12_composite_srv(color_description.Format);
     device->CreateShaderResourceView(color, &color_srv, cpu);
     cpu.ptr += resources->descriptor_size;
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC dlss_srv{};
-    dlss_srv.Format = resources->output_format;
-    dlss_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    dlss_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    dlss_srv.Texture2D.MipLevels = 1U;
+    const auto dlss_srv = d3d12_composite_srv(resources->output_format);
     device->CreateShaderResourceView(resources->dlss_output, &dlss_srv, cpu);
     cpu.ptr += resources->descriptor_size;
 
-    D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav{};
-    output_uav.Format = resources->output_format;
-    output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    output_uav.Texture2D.MipSlice = 0U;
-    output_uav.Texture2D.PlaneSlice = 0U;
+    const auto output_uav = d3d12_composite_uav(resources->output_format);
     device->CreateUnorderedAccessView(output, nullptr, &output_uav, cpu);
     device->Release();
 
@@ -1431,25 +1310,15 @@ D3D12Evaluation* prepare_d3d12_streamline(
     auto cpu = resources->descriptors->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += evaluation->descriptor_offset;
     const auto color_description = color->GetDesc();
-    D3D12_SHADER_RESOURCE_VIEW_DESC color_srv{};
-    color_srv.Format = color_description.Format;
-    color_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    color_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    color_srv.Texture2D.MipLevels = 1U;
+    const auto color_srv = d3d12_composite_srv(color_description.Format);
     device->CreateShaderResourceView(color, &color_srv, cpu);
     cpu.ptr += resources->descriptor_size;
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC dlss_srv{};
-    dlss_srv.Format = resources->output_format;
-    dlss_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    dlss_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    dlss_srv.Texture2D.MipLevels = 1U;
+    const auto dlss_srv = d3d12_composite_srv(resources->output_format);
     device->CreateShaderResourceView(resources->dlss_output, &dlss_srv, cpu);
     cpu.ptr += resources->descriptor_size;
 
-    D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav{};
-    output_uav.Format = resources->output_format;
-    output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    const auto output_uav = d3d12_composite_uav(resources->output_format);
     device->CreateUnorderedAccessView(output, nullptr, &output_uav, cpu);
     device->Release();
 
@@ -1484,11 +1353,7 @@ bool d3d12_set_composite_base(
     auto* const resources = evaluation->resources;
     auto cpu = resources->descriptors->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += evaluation->descriptor_offset;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = description.Format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1U;
+    const auto srv = d3d12_composite_srv(description.Format);
     resources->device->CreateShaderResourceView(
         low_resolution_color,
         &srv,
