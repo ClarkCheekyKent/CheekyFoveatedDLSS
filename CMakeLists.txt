@@ -161,6 +161,26 @@ set_target_properties(
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
 )
 if(MSVC)
-    target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
+
+add_executable(CheekyMotionRegionTests tests/motion_region_tests.cpp)
+target_compile_features(CheekyMotionRegionTests PRIVATE cxx_std_20)
+target_include_directories(CheekyMotionRegionTests PRIVATE src)
+target_compile_definitions(CheekyMotionRegionTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+add_test(NAME CheekyMotionRegionTests COMMAND CheekyMotionRegionTests)
+
+add_executable(CheekyMotionBackendTests tests/motion_backend_tests.cpp
+    src/d3d12_backend.cpp src/peripheral_dlaa.cpp src/crop_motion.cpp
+    src/d3d12_output_contract.cpp src/foveation.cpp src/settings.cpp
+    src/gaze_foveation.cpp src/gaze_policy.cpp src/diagnostics.cpp shared/gaze_math.cpp)
+target_compile_features(CheekyMotionBackendTests PRIVATE cxx_std_20)
+target_include_directories(CheekyMotionBackendTests PRIVATE src shared)
+target_compile_definitions(CheekyMotionBackendTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+    target_compile_options(CheekyMotionRegionTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_compile_options(CheekyMotionBackendTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+endif()
+target_link_libraries(CheekyMotionBackendTests PRIVATE d3d11 d3d12 dxgi d3dcompiler)
+add_test(NAME CheekyMotionBackendTests COMMAND CheekyMotionBackendTests)

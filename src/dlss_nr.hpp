@@ -101,6 +101,8 @@ struct DlssNrSnapshot {
 void release_dlss_nr_view(DlssViewId view_id) noexcept;
 void release_dlss_nr_resources() noexcept;
 void reset_dlss_nr() noexcept;
+// Invalidate a skipped view without changing settings or retiring its feature.
+void skip_dlss_nr_history(DlssViewId view_id) noexcept;
 
 [[nodiscard]] DlssNrSnapshot dlss_nr_snapshot() noexcept;
 [[nodiscard]] const char* dlss_nr_state_name(DlssNrState state) noexcept;

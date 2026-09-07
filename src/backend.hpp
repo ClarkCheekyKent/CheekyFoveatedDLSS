@@ -1,4 +1,5 @@
 #pragma once
+#include "motion_region.hpp"
 
 #include "ngx_abi.hpp"
 #include "frame_contract.hpp"
@@ -47,6 +48,10 @@ struct D3D12BackendTiming {
     const D3D12BackendCallbacks& callbacks,
     D3D12BackendTiming* timing = nullptr
 ) noexcept;
+
+void skip_d3d12_history(DlssViewId view_id) noexcept;
+[[nodiscard]] MotionRegion validate_d3d12_regions(const NgxParameters* parameters,
+    DlssViewId view_id, const CropGeometry& crop) noexcept;
 
 void release_d3d12_view(DlssViewId view_id) noexcept;
 

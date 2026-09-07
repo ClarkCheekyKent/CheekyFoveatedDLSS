@@ -1649,6 +1649,12 @@ void release_dlss_nr_resources() noexcept {
     diagnostics = {};
 }
 
+void skip_dlss_nr_history(const DlssViewId view_id) noexcept {
+    std::lock_guard lock(nr_mutex);
+    for (auto& view : views)
+        if (view.view_id == view_id) view.was_enabled = false;
+}
+
 void reset_dlss_nr() noexcept {
     requested_reset_generation.fetch_add(1U, std::memory_order_acq_rel);
     std::lock_guard lock(nr_mutex);

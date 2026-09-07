@@ -5,6 +5,7 @@
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
 #include "crop_motion.hpp"
+#include "motion_region.hpp"
 #include "runtime.hpp"
 
 #include <d3dcompiler.h>
@@ -85,7 +86,6 @@ std::array<
     ) < 2U;
 }
 
-constexpr std::uint32_t dlss_feature_flag_mv_low_res = 1U << 1U;
 
 [[nodiscard]] bool same_key(
     const CanonicalFeatureKey& left,
@@ -757,6 +757,73 @@ struct D3D12Evaluation {
     std::uint64_t diagnostic_sequence{};
 };
 
+void skip_d3d12_history(const DlssViewId view_id) noexcept {
+    std::lock_guard lock(canonical_views_mutex);
+    if (auto* view = find_view(view_id)) view->has_crop = false;
+}
+
+MotionRegion validate_d3d12_regions(const NgxParameters* parameters,
+    DlssViewId view_id, const CropGeometry& crop) noexcept {
+    std::uint32_t flags{};
+    const bool declared = try_get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags", flags);
+    auto* mv = get_resource(parameters, "MotionVectors");
+    const auto desc = mv ? mv->GetDesc() : D3D12_RESOURCE_DESC{};
+    const auto mx = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.X");
+    const auto my = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.Y");
+    auto result = resolve_motion_region(declared, flags,
+        mv && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D, desc.Width, desc.Height,
+        mx, my, crop, get_ui(parameters, "Width"), get_ui(parameters, "Height"),
+        get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
+        get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"));
+    const char* rejection = motion_region_reason(result.status);
+    if (result.valid() && get_resource(parameters, "Color") == get_resource(parameters, "Output")) {
+        result.status = MotionRegionStatus::outside_texture;
+        rejection = "color_output_alias";
+    }
+    if (result.valid()) {
+        const auto ox = get_ui(parameters, "DLSS.Output.Subrect.Base.X");
+        const auto oy = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
+        if (std::uint64_t{crop.input_base_x} + crop.input_width > get_ui(parameters, "Width") ||
+            std::uint64_t{crop.input_base_y} + crop.input_height > get_ui(parameters, "Height") ||
+            crop.output_base_x < ox || crop.output_base_y < oy ||
+            std::uint64_t{crop.output_base_x} + crop.output_width > std::uint64_t{ox} + get_ui(parameters, "OutWidth") ||
+            std::uint64_t{crop.output_base_y} + crop.output_height > std::uint64_t{oy} + get_ui(parameters, "OutHeight")) {
+            result.status = MotionRegionStatus::outside_view;
+            rejection = "crop_outside_view";
+        }
+    }
+    if (result.valid()) {
+        const auto check = [&](const char* resource, const char* bx, const char* by,
+                               std::uint32_t dx, std::uint32_t dy, std::uint32_t w, std::uint32_t h) {
+            const auto x = std::uint64_t{get_ui(parameters, bx)} + dx;
+            const auto y = std::uint64_t{get_ui(parameters, by)} + dy;
+            return x + w <= UINT32_MAX && y + h <= UINT32_MAX &&
+                texture_region_fits(get_resource(parameters, resource),
+                    static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), w, h);
+        };
+        if (!check("Color", "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+                crop.input_base_x, crop.input_base_y, crop.input_width, crop.input_height)) rejection = "color_region";
+        else if (!check("Depth", "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y",
+                crop.input_base_x, crop.input_base_y, crop.input_width, crop.input_height)) rejection = "depth_region";
+        else if (!texture_region_fits(get_resource(parameters, "Output"), crop.output_base_x,
+                crop.output_base_y, crop.output_width, crop.output_height)) rejection = "output_region";
+        if (std::strcmp(rejection, "valid") != 0) result.status = MotionRegionStatus::outside_texture;
+    }
+    const auto seq = direct_preparation_sequence.fetch_add(1U, std::memory_order_relaxed);
+    static std::atomic<unsigned> rejections{};
+    const auto rejected = !result.valid() ? rejections.fetch_add(1U) : 0U;
+    if (seq < 16U || seq % 600U == 0U || (!result.valid() && (rejected < 16U || rejected % 300U == 0U)))
+        trace_event("D3D12 MV view=%llu declared=%s flags=0x%08X space=%s texture=%llux%u base=%u,%u rect=%u,%u %ux%u reason=%s",
+            static_cast<unsigned long long>(view_id), declared ? "yes" : "no", flags,
+            !declared ? "unknown" : result.space == DeclaredMotionSpace::input ? "input" : "output",
+            static_cast<unsigned long long>(desc.Width), desc.Height, mx, my,
+            result.rectangle.x, result.rectangle.y, result.rectangle.width, result.rectangle.height, rejection);
+    diagnostic_note_motion_vectors(DiagnosticApi::d3d12,
+        desc.Width <= UINT32_MAX ? static_cast<std::uint32_t>(desc.Width) : 0U, desc.Height,
+        !declared ? MotionVectorSpace::unknown : result.space == DeclaredMotionSpace::input ? MotionVectorSpace::input : MotionVectorSpace::output);
+    return result;
+}
+
 D3D12Evaluation* prepare_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxParameters* const parameters,
@@ -905,6 +972,13 @@ D3D12Evaluation* prepare_d3d12(
         apply_next_jump_preview(effective_settings, view_id);
     }
 
+    const auto motion_region = validate_d3d12_regions(parameters, view_id, crop);
+    if (!motion_region.valid()) {
+        skip_d3d12_history(view_id);
+        skip_d3d12_history(peripheral_dlaa_view_id(view_id));
+        return nullptr;
+    }
+
     ID3D12Device* device{};
     const auto device_result = command_list->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(device_result) || device == nullptr) {
@@ -993,14 +1067,8 @@ D3D12Evaluation* prepare_d3d12(
         parameters,
         "DLSS.Render.Subrect.Dimensions.Height"
     );
-    if (evaluation->render_width == 0U) {
-        evaluation->render_width = render_width;
-    }
-    if (evaluation->render_height == 0U) {
-        evaluation->render_height = render_height;
-    }
-    evaluation->composite_input_width = evaluation->render_width;
-    evaluation->composite_input_height = evaluation->render_height;
+    evaluation->composite_input_width = evaluation->render_width != 0U ? evaluation->render_width : render_width;
+    evaluation->composite_input_height = evaluation->render_height != 0U ? evaluation->render_height : render_height;
     evaluation->output_width = output_width;
     evaluation->output_height = output_height;
     evaluation->color_x = color_x;
@@ -1082,108 +1150,14 @@ D3D12Evaluation* prepare_d3d12(
         "DLSS.Input.Depth.Subrect.Base.Y",
         evaluation->depth_y + crop.input_base_y
     );
-    const auto create_flags = get_ngx_integer_bits(
-        parameters, "DLSS.Feature.Create.Flags"
-    );
-    const bool flag_says_low_res =
-        (create_flags & dlss_feature_flag_mv_low_res) != 0U;
-    const auto low_res_motion_x =
-        evaluation->motion_x + crop.input_base_x;
-    const auto low_res_motion_y =
-        evaluation->motion_y + crop.input_base_y;
-    const auto high_res_motion_x =
-        evaluation->motion_x + crop.output_base_x - output_x;
-    const auto high_res_motion_y =
-        evaluation->motion_y + crop.output_base_y - output_y;
-    const bool low_res_fits = texture_region_fits(
-        motion_vectors,
-        low_res_motion_x,
-        low_res_motion_y,
-        crop.input_width,
-        crop.input_height
-    );
-    const bool high_res_fits = texture_region_fits(
-        motion_vectors,
-        high_res_motion_x,
-        high_res_motion_y,
-        crop.output_width,
-        crop.output_height
-    );
-    bool motion_vectors_low_res = flag_says_low_res;
-    if (motion_vectors != nullptr) {
-        const auto desc = motion_vectors->GetDesc();
-        const auto distance = [&](std::uint32_t w, std::uint32_t h) {
-            return std::abs(static_cast<double>(desc.Width) - w) +
-                std::abs(static_cast<double>(desc.Height) - h);
-        };
-        const auto input_distance = distance(render_width, render_height);
-        const auto output_distance = distance(output_width, output_height);
-        if (input_distance != output_distance)
-            motion_vectors_low_res = input_distance < output_distance;
-    }
-    if (low_res_fits != high_res_fits) {
-        motion_vectors_low_res = low_res_fits;
-    }
-    evaluation->low_res_motion = motion_vectors_low_res;
-    if (motion_vectors != nullptr) {
-        const auto motion_description = motion_vectors->GetDesc();
-        diagnostic_note_motion_vectors(
-            DiagnosticApi::d3d12,
-            static_cast<std::uint32_t>(motion_description.Width),
-            motion_description.Height,
-            motion_vectors_low_res
-                ? MotionVectorSpace::input
-                : MotionVectorSpace::output
-        );
-    }
-    const auto motion_crop_x = motion_vectors_low_res
-        ? crop.input_base_x
-        : crop.output_base_x - output_x;
-    const auto motion_crop_y = motion_vectors_low_res
-        ? crop.input_base_y
-        : crop.output_base_y - output_y;
-    mutable_parameters->Set(
-        "DLSS.Input.MV.Subrect.Base.X",
-        evaluation->motion_x + motion_crop_x
-    );
-    mutable_parameters->Set(
-        "DLSS.Input.MV.Subrect.Base.Y",
-        evaluation->motion_y + motion_crop_y
-    );
+    evaluation->low_res_motion = motion_region.space == DeclaredMotionSpace::input;
+    mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.X", motion_region.rectangle.x);
+    mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.Y", motion_region.rectangle.y);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
     if (consume_reset(settings) || gaze_reset) {
         mutable_parameters->Set("Reset", 1U);
-    }
-    const auto preparation_sequence = direct_preparation_sequence.fetch_add(
-        1U, std::memory_order_relaxed
-    );
-    if (preparation_sequence < 8U || preparation_sequence % 600U == 0U) {
-        const auto motion_description = motion_vectors != nullptr
-            ? motion_vectors->GetDesc()
-            : D3D12_RESOURCE_DESC{};
-        trace_event(
-            "D3D12 crop prepare seq=%llu flags=0x%08X flagMV=%s "
-            "mv=%llux%u low=(%u,%u %ux%u fit=%s) "
-            "high=(%u,%u %ux%u fit=%s) selected=%s",
-            static_cast<unsigned long long>(preparation_sequence),
-            create_flags,
-            flag_says_low_res ? "low" : "high",
-            static_cast<unsigned long long>(motion_description.Width),
-            motion_description.Height,
-            low_res_motion_x,
-            low_res_motion_y,
-            crop.input_width,
-            crop.input_height,
-            low_res_fits ? "yes" : "no",
-            high_res_motion_x,
-            high_res_motion_y,
-            crop.output_width,
-            crop.output_height,
-            high_res_fits ? "yes" : "no",
-            motion_vectors_low_res ? "low" : "high"
-        );
     }
     diagnostic_note_crop(DiagnosticApi::d3d12, crop);
     return evaluation;
@@ -1662,6 +1636,19 @@ NgxResult evaluate_d3d12_backend(
         const bool key_changed = !view->has_key || !same_key(view->key, key);
         const bool crop_changed = !view->has_crop ||
             std::memcmp(&view->last_crop, &crop, sizeof(crop)) != 0;
+        if (key_changed) {
+            const auto& old = view->key;
+            trace_event("D3D12 feature key view=%llu initial=%s feature=%u->%u input=%ux%u->%ux%u output=%ux%u->%ux%u flags=0x%08X->0x%08X quality=%u->%u presetsChanged=%s cropMoved=%s",
+                static_cast<unsigned long long>(contract.view_id), view->has_key ? "no" : "yes",
+                old.feature, key.feature, old.input_width, old.input_height, key.input_width, key.input_height,
+                old.output_width, old.output_height, key.output_width, key.output_height,
+                old.create_flags, key.create_flags, old.perf_quality, key.perf_quality,
+                old.presets != key.presets ? "yes" : "no", crop_changed ? "yes" : "no");
+            for (std::size_t i = 0; i < key.presets.size(); ++i)
+                if (old.presets[i] != key.presets[i])
+                    trace_event("D3D12 feature preset view=%llu index=%zu value=%u->%u",
+                        static_cast<unsigned long long>(contract.view_id), i, old.presets[i], key.presets[i]);
+        }
         if (key_changed && view->private_handle != nullptr &&
             view->release_feature != nullptr) {
             static_cast<void>(view->release_feature(view->private_handle));

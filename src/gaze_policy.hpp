@@ -110,6 +110,7 @@ struct GazeCropPolicyState {
 };
 
 struct GazeResetPolicyResult {
+    std::uint32_t threshold_x{}, threshold_y{};
     GazeResetReason reason{GazeResetReason::none};
     std::uint32_t delta_x{};
     std::uint32_t delta_y{};

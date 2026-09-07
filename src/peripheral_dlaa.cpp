@@ -800,6 +800,44 @@ bool prepare_peripheral_dlaa_resources(
         request.render_height == 0U) {
         return false;
     }
+    const auto mv_desc = request.motion_vectors->GetDesc();
+    const FoveationGeometry full_region{0U, 0U, request.render_width, request.render_height,
+        0U, 0U, request.source_output_width, request.source_output_height};
+    // Native requests carry the game's flags. Streamline retains its existing
+    // source-space contract; this change does not alter Streamline inference.
+    const auto flags = request.parameters ? request.create_flags :
+        (request.motion_vectors_output_space ? 0U : 2U);
+    std::uint32_t declared_flags{};
+    const bool declared = !request.parameters ||
+        try_get_ngx_integer_bits(request.parameters, "DLSS.Feature.Create.Flags", declared_flags);
+    const auto region = resolve_motion_region(declared, flags,
+        mv_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D, mv_desc.Width, mv_desc.Height,
+        request.mv_base_x, request.mv_base_y, full_region, request.render_width, request.render_height,
+        request.source_output_width, request.source_output_height, 0U, 0U);
+    const auto fits = [](ID3D12Resource* resource, std::uint32_t x, std::uint32_t y,
+                         std::uint32_t width, std::uint32_t height) {
+        if (!resource) return false;
+        const auto desc = resource->GetDesc();
+        return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            std::uint64_t{x} + width <= desc.Width && std::uint64_t{y} + height <= desc.Height &&
+            std::uint64_t{x} + width <= UINT32_MAX && std::uint64_t{y} + height <= UINT32_MAX;
+    };
+    const bool sources_valid = region.valid() &&
+        fits(request.color, request.color_base_x, request.color_base_y, request.render_width, request.render_height) &&
+        fits(request.depth, request.depth_base_x, request.depth_base_y, request.render_width, request.render_height);
+    static std::atomic<unsigned> mapping_logs{};
+    const auto log = mapping_logs.fetch_add(1U);
+    if (log < 16U || log % 300U == 0U)
+        trace_event("D3D12 peripheral MV view=%llu declared=%s flags=0x%08X space=%s texture=%llux%u base=%u,%u rect=%u,%u %ux%u reason=%s",
+            static_cast<unsigned long long>(request.view_id), declared ? "yes" : "no", flags,
+            !declared ? "unknown" : region.space == DeclaredMotionSpace::input ? "input" : "output",
+            static_cast<unsigned long long>(mv_desc.Width), mv_desc.Height, request.mv_base_x, request.mv_base_y,
+            region.rectangle.x, region.rectangle.y, region.rectangle.width, region.rectangle.height,
+            !region.valid() ? motion_region_reason(region.status) : sources_valid ? "valid" : "color_depth_region");
+    if (!sources_valid) {
+        skip_d3d12_history(peripheral_dlaa_view_id(request.view_id));
+        return false;
+    }
     auto* const state = find_or_create_state(request);
     if (state == nullptr || !ensure_output(*state, request)) return false;
 
@@ -890,6 +928,7 @@ bool evaluate_peripheral_dlaa_ngx(
         request.callbacks.evaluate_feature == nullptr ||
         request.callbacks.release_feature == nullptr ||
         !prepare_peripheral_dlaa_resources(request, resources)) {
+        skip_d3d12_history(peripheral_dlaa_view_id(request.view_id));
         return false;
     }
 
@@ -906,10 +945,12 @@ bool evaluate_peripheral_dlaa_ngx(
     contract.depth_base_y = resources.depth_base_y;
     contract.mv_base_x = resources.mv_base_x;
     contract.mv_base_y = resources.mv_base_y;
-    contract.motion_vectors_low_res = true;
+    contract.motion_vectors_low_res = (request.create_flags & dlss_feature_flag_mv_low_res) != 0U;
     contract.depth_inverted = request.depth_inverted;
     contract.reset = request.reset;
-    contract.create_flags = request.create_flags | dlss_feature_flag_mv_low_res;
+    // Working input/output sizes are equal, so converted vectors satisfy either
+    // declared space. Preserve the game flag, including explicit high-res.
+    contract.create_flags = request.create_flags;
     contract.perf_quality = perf_quality_dlaa;
 
     D3D12DlssInputs inputs{};

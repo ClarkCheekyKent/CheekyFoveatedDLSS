@@ -50,6 +50,23 @@ using NgxProgressCallbackC = void (*)(float, bool*);
         : 0U;
 }
 
+// A successful zero is an explicit declaration, not an unavailable parameter.
+[[nodiscard]] inline bool try_get_ngx_integer_bits(
+    const NgxParameters* parameters, const char* name, std::uint32_t& value
+) noexcept {
+    value = 0U;
+    if (!parameters) return false;
+    int signed_value{};
+    if (ngx_succeeded(parameters->Get(name, &signed_value))) {
+        value = static_cast<std::uint32_t>(signed_value);
+        return true;
+    }
+    unsigned int unsigned_value{};
+    if (!ngx_succeeded(parameters->Get(name, &unsigned_value))) return false;
+    value = unsigned_value;
+    return true;
+}
+
 // NGX integer parameters are not consistently exposed through the same signed
 // overload by every integration. Preserve their bits regardless of which
 // integer overload the title used when setting the value.
@@ -57,12 +74,9 @@ using NgxProgressCallbackC = void (*)(float, bool*);
     const NgxParameters* const parameters,
     const char* const name
 ) noexcept {
-    int signed_value{};
-    if (parameters != nullptr &&
-        ngx_succeeded(parameters->Get(name, &signed_value))) {
-        return static_cast<std::uint32_t>(signed_value);
-    }
-    return get_ui(parameters, name);
+    std::uint32_t value{};
+    static_cast<void>(try_get_ngx_integer_bits(parameters, name, value));
+    return value;
 }
 
 }  // namespace cheeky::foveated_dlss

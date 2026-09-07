@@ -50,6 +50,17 @@ struct GazeDiagnostics {
     std::array<GazeViewDiagnostics, 2U> views{};
 };
 
+// Pin a crop within a scope, including deterministic backend regression tests.
+struct ScopedCoordinatedCrop {
+    DlssViewId view_id{};
+    CropGeometry crop{};
+    bool reset{};
+    const ScopedCoordinatedCrop* previous{};
+    ScopedCoordinatedCrop(DlssViewId view, const CropGeometry& value, bool reset_history) noexcept;
+    ~ScopedCoordinatedCrop();
+    ScopedCoordinatedCrop(const ScopedCoordinatedCrop&) = delete;
+};
+
 [[nodiscard]] bool calculate_coordinated_crop(
     const Settings& settings,
     DlssViewId view_id,

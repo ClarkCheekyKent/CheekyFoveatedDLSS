@@ -29,6 +29,7 @@ struct ViewState {
     bool next_jump_visible{};
     FoveationOffsets next_jump_offsets{};
     unsigned mapping_log_count{};
+    unsigned reset_log_count{};
     bool logged_mapping_ready{};
     std::uint64_t last_mapping_log_qpc{};
     CropGeometry last_crop{};
@@ -181,6 +182,12 @@ void update_diagnostics_view(
 
 }  // namespace
 
+thread_local const ScopedCoordinatedCrop* coordinated_crop_override{};
+ScopedCoordinatedCrop::ScopedCoordinatedCrop(DlssViewId view, const CropGeometry& value,
+    bool reset_history) noexcept : view_id(view), crop(value), reset(reset_history),
+    previous(coordinated_crop_override) { coordinated_crop_override = this; }
+ScopedCoordinatedCrop::~ScopedCoordinatedCrop() { coordinated_crop_override = previous; }
+
 bool calculate_coordinated_crop(
     const Settings& settings,
     const DlssViewId view_id,
@@ -195,6 +202,11 @@ bool calculate_coordinated_crop(
     bool& reset_history,
     const CheekyGazeSnapshotV1* supplied_snapshot
 ) noexcept {
+    if (coordinated_crop_override && coordinated_crop_override->view_id == view_id && view_id != 0U) {
+        crop = coordinated_crop_override->crop;
+        reset_history = coordinated_crop_override->reset;
+        return true;
+    }
     reset_history = false;
     const auto fixed_settings = settings_for_view(settings, view_id);
     const auto eye_assignment = stereo_eye_assignment(view_id);
@@ -622,11 +634,12 @@ bool calculate_coordinated_crop(
     reset_history = reset_result.reason != GazeResetReason::none;
     if (reset_history) {
         diagnostics.last_reset_reason = reset_result.reason;
-        trace_event(
-            "VR gaze history reset view=%llu reason=%u",
-            static_cast<unsigned long long>(view_id),
-            static_cast<unsigned int>(reset_result.reason)
-        );
+        const auto log = state.reset_log_count++;
+        if (log < 16U || log % 300U == 0U)
+            trace_event("VR gaze history reset view=%llu reason=%u delta=%u,%u previous=%ux%u crop=%ux%u threshold=%u,%u",
+                static_cast<unsigned long long>(view_id), static_cast<unsigned>(reset_result.reason),
+                reset_result.delta_x, reset_result.delta_y, state.last_crop.input_width, state.last_crop.input_height,
+                crop.input_width, crop.input_height, reset_result.threshold_x, reset_result.threshold_y);
     }
     if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
         auto& candidate = diagnostics.views[eye_assignment.eye_index];

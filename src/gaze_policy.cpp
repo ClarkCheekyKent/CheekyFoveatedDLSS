@@ -184,6 +184,9 @@ GazeResetPolicyResult evaluate_gaze_reset(
     const float jump_reset_ratio
 ) noexcept {
     GazeResetPolicyResult result{};
+    const auto ratio = std::max(jump_reset_ratio, 0.0F);
+    result.threshold_x = (std::max)(64U, static_cast<std::uint32_t>(std::lround(current.width * ratio)));
+    result.threshold_y = (std::max)(64U, static_cast<std::uint32_t>(std::lround(current.height * ratio)));
     if (previous.valid) {
         result.delta_x = previous.base_x > current.base_x
             ? previous.base_x - current.base_x
@@ -203,16 +206,7 @@ GazeResetPolicyResult evaluate_gaze_reset(
                 previous.height != current.height)) {
         result.reason = GazeResetReason::crop_size_changed;
     } else if (previous.valid) {
-        const auto ratio = std::max(jump_reset_ratio, 0.0F);
-        const auto threshold_x = (std::max)(
-            64U,
-            static_cast<std::uint32_t>(std::lround(current.width * ratio))
-        );
-        const auto threshold_y = (std::max)(
-            64U,
-            static_cast<std::uint32_t>(std::lround(current.height * ratio))
-        );
-        if (result.delta_x > threshold_x || result.delta_y > threshold_y) {
+        if (result.delta_x > result.threshold_x || result.delta_y > result.threshold_y) {
             result.reason = GazeResetReason::large_jump;
         }
     }
