@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include "streamline_viewport.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -1668,7 +1669,8 @@ void cache_streamline_tags(
 [[nodiscard]] bool apply_streamline_options(
     const std::uint32_t width,
     const std::uint32_t height,
-    const std::uint32_t preset
+    const std::uint32_t preset,
+    const SlViewportHandle* const target_viewport = nullptr
 ) noexcept {
     const auto original = real_sl_dlss_set_options.load(
         std::memory_order_acquire
@@ -1704,6 +1706,7 @@ void cache_streamline_tags(
         return false;
     }
 
+    if (target_viewport != nullptr) viewport = *target_viewport;
     options.next = nullptr;
     viewport.next = nullptr;
     const auto original_width = options.output_width;
@@ -1768,7 +1771,7 @@ void cache_streamline_tags(
             result
         );
     }
-    if (result == 0U) {
+    if (result == 0U && target_viewport == nullptr) {
         applied_sl_output_width.store(width, std::memory_order_release);
         applied_sl_output_height.store(height, std::memory_order_release);
     }
@@ -1826,11 +1829,11 @@ struct StreamlineEvaluation {
     std::array<SlResource, 4U> resources{};
     std::array<SlResourceTag, 4U> tags{};
     SlViewportHandle viewport{};
-    SlConstants original_constants{};
+    SlViewportHandle cropped_viewport{};
+    std::array<const void*, 16U> cropped_inputs{};
     SlConstants nr_constants{};
     Settings settings{};
     PeripheralDlaaResources peripheral{};
-    bool constants_overridden{};
     bool motion_vectors_output_space{};
     bool has_nr_constants{};
     bool peripheral_ready{};
@@ -2118,6 +2121,8 @@ struct StreamlineEvaluation {
 [[nodiscard]] bool prepare_streamline_evaluation(
     ID3D12GraphicsCommandList* const command_list,
     const void* const frame,
+    const void* const* const inputs,
+    const std::uint32_t input_count,
     StreamlineEvaluation& evaluation,
     const bool verbose,
     const std::uint64_t sequence
@@ -2164,6 +2169,12 @@ struct StreamlineEvaluation {
         );
         return false;
     }
+
+    // Constants are write-once per frame/viewport in some Streamline versions.
+    // Keep the game's viewport untouched and use a separate SR feature instance.
+    // Do not collide with the peripheral namespace or infer an eye from the ID.
+    if (!prepare_streamline_sr_inputs(inputs, input_count, evaluation.viewport,
+            evaluation.cropped_viewport, evaluation.cropped_inputs)) return false;
 
     auto& color_tag = evaluation.tags[0U];
     auto& output_tag = evaluation.tags[3U];
@@ -2301,7 +2312,7 @@ struct StreamlineEvaluation {
     // options must not be the last options submitted before the center call.
     if (!apply_streamline_options(
             crop.output_width, crop.output_height,
-            streamline_settings.center_preset
+            streamline_settings.center_preset, &evaluation.cropped_viewport
         )) {
         if (verbose) trace_event("SL eval=%llu cropped options failed", static_cast<unsigned long long>(sequence));
         finish_d3d12_streamline(command_list, evaluation.backend, false);
@@ -2484,7 +2495,7 @@ struct StreamlineEvaluation {
     }
 
     const auto tag_result = submit_streamline_tags(
-        evaluation.frame_tagging, frame, evaluation.viewport, evaluation.tags.data(),
+        evaluation.frame_tagging, frame, evaluation.cropped_viewport, evaluation.tags.data(),
         static_cast<std::uint32_t>(evaluation.tags.size()), command_list
     );
     if (tag_result != 0U) {
@@ -2533,11 +2544,16 @@ struct StreamlineEvaluation {
                 cropped.motion_vector_scale.y
             );
         }
-        if (set_constants(&cropped, frame, &evaluation.viewport) == 0U) {
-            evaluation.original_constants = constants;
-            evaluation.constants_overridden = true;
+        const auto constants_result = set_constants(&cropped, frame, &evaluation.cropped_viewport);
+        if (constants_result == 0U) {
             if (verbose) trace_event("SL eval=%llu motion constants applied", static_cast<unsigned long long>(sequence));
         } else {
+            static std::atomic<unsigned> failures{};
+            const auto failure = failures.fetch_add(1U);
+            if (failure < 8U || failure % 600U == 0U) {
+                trace_event("SL cropped constants rejected viewport=%u private=%u result=0x%08X",
+                    evaluation.viewport.value, evaluation.cropped_viewport.value, constants_result);
+            }
             finish_d3d12_streamline(command_list, evaluation.backend, false);
             evaluation.backend = nullptr;
             return false;
@@ -2931,6 +2947,8 @@ std::uint32_t hook_sl_evaluate_feature(
     const bool prepared = prepare_streamline_evaluation(
         command_list,
         frame,
+        inputs,
+        input_count,
         evaluation,
         verbose,
         sequence
@@ -2958,7 +2976,7 @@ std::uint32_t hook_sl_evaluate_feature(
         result = original(
             feature,
             frame,
-            inputs,
+            prepared ? evaluation.cropped_inputs.data() : inputs,
             input_count,
             command_buffer
         );
@@ -2976,20 +2994,6 @@ std::uint32_t hook_sl_evaluate_feature(
         }
     }
     if (!updated_history && prepared) streamline_crop_history.push_back(evaluation.history);
-    if (evaluation.constants_overridden) {
-        const auto set_constants = real_sl_set_constants.load(
-            std::memory_order_acquire
-        );
-        if (set_constants != nullptr) {
-            evaluation.original_constants.next = nullptr;
-            static_cast<void>(set_constants(
-                &evaluation.original_constants,
-                frame,
-                &evaluation.viewport
-            ));
-            if (verbose) trace_event("SL eval=%llu constants restored", static_cast<unsigned long long>(sequence));
-        }
-    }
     const bool foveated = evaluation.backend != nullptr;
     if (verbose) trace_event("SL eval=%llu composite begin", static_cast<unsigned long long>(sequence));
     finish_d3d12_streamline(

@@ -29,3 +29,13 @@ scratch resources for an array output. Repeat a flat-to-VR transition.
 Compare with peripheral DLAA off first to isolate the separate PR #4
 synchronization rejection. WARP tests do not validate NVIDIA evaluation or
 the game's presentation path; those still require this in-game check.
+
+The SR Streamline route also uses a private viewport (host ID | 0x20000000),
+separate from the peripheral namespace. Some runtimes reject a second constants
+submission for the same frame/viewport. Cropped options, tags, constants and
+the evaluation input must all select that private viewport; host constants stay
+untouched. Unit coverage exercises host IDs 0 and 32 from the MSFS trace,
+preservation of unrelated inputs, and rejection of ambiguous/stale viewport
+inputs. This models write-once constants; it does not execute Streamline itself.
+In a fresh game log, verify `motion constants applied`, `prepare complete`,
+and `original begin foveated=yes`. A failure now logs the constants result code.

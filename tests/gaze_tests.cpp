@@ -7,6 +7,7 @@
 #include "gaze_foveation.hpp"
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
+#include "streamline_viewport.hpp"
 
 #include <Windows.h>
 
@@ -587,6 +588,48 @@ void test_msfs_array_output_contract() {
     expect(!plan_d3d12_output(desc, 1664, 1276).compatible, "3D output stays rejected");
 }
 
+void test_streamline_private_sr_viewport() {
+    using namespace cheeky::foveated_dlss;
+    struct Viewport {
+        void* next{};
+        std::uint32_t struct_type{1};
+        std::uint32_t value{};
+    };
+    for (const auto id : {0U, 32U}) {
+        Viewport host{nullptr, 1, id}, other{nullptr, 2, 77}, cropped{};
+        const void* inputs[]{&other, &host};
+        std::array<const void*, 2> redirected{};
+        expect(prepare_streamline_sr_inputs(inputs, 2, host, cropped, redirected),
+            "MSFS viewports route to private SR instances");
+        expect(redirected[0] == &other && redirected[1] == &cropped &&
+            inputs[1] == &host && host.value == id,
+            "redirect only the viewport input, leaving host and other inputs intact");
+        expect(cropped.value != host.value &&
+            cropped.value != (host.value ^ 0x40000000U),
+            "cropped constants do not collide with host or peripheral constants");
+        // Model a runtime where a second write to the same frame/viewport fails.
+        std::array<std::uint32_t, 3> written{};
+        std::size_t used{};
+        const auto submit = [&](std::uint32_t viewport) {
+            for (std::size_t i{}; i < used; ++i) if (written[i] == viewport) return false;
+            written[used++] = viewport;
+            return true;
+        };
+        expect(submit(host.value) && !submit(host.value),
+            "same-frame host constants cannot be overwritten");
+        expect(submit(cropped.value), "cropped constants can be submitted independently");
+        expect(static_cast<const Viewport*>(redirected[1])->value == written[1],
+            "evaluation consumes the viewport that received cropped constants");
+        Viewport mismatch{nullptr, 1, id + 1U};
+        const void* mismatched[]{&mismatch};
+        expect(!prepare_streamline_sr_inputs(mismatched, 1, host, cropped, redirected),
+            "stale viewport cache is rejected before modifying Streamline state");
+        const void* duplicate[]{&host, &host};
+        expect(!prepare_streamline_sr_inputs(duplicate, 2, host, cropped, redirected),
+            "ambiguous viewport inputs are rejected");
+    }
+}
+
 void test_dlss_nr_maps_right_eye_region_into_packed_output() {
     using namespace cheeky::foveated_dlss;
     const auto base = dlss_nr_resource_base(
@@ -715,6 +758,7 @@ int main(int argc, char** argv) {
     test_core_d3d12_route_is_published_to_diagnostics();
     test_multimip_game_output_uses_single_mip_private_output();
     test_msfs_array_output_contract();
+    test_streamline_private_sr_viewport();
     test_multimip_game_output_is_dlss_nr_compatible();
     test_dlss_nr_maps_right_eye_region_into_packed_output();
     test_dlss_nr_reuses_live_sr_crop_center();
