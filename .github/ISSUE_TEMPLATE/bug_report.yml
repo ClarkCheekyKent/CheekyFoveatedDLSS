@@ -24,7 +24,7 @@ body:
     id: problem
     attributes:
       label: What happened?
-      description: Replace the prompts below with your observations. Leave anything you have not checked as "Not tested".
+      description: Confirm the detected game/mode, supply the headset model if using VR, and replace the remaining prompts with your observations. Leave unchecked items as "Not tested".
       value: |
         **Game and mode:** [Game name; desktop or VR; headset if relevant]
 

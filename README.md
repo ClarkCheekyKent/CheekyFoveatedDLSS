@@ -310,6 +310,11 @@ paste this extended version if desired. Exceptionally large reports exceeding
 the 7,800-character encoded URL budget display explicit paste instructions
 instead of opening a broken link. Logs are never placed in the issue URL.
 
+The description and reproduction prompts prefill the game executable and VR mode
+when compatible OpenXR session/mapping activity is detected. Otherwise the user
+is asked to confirm desktop or VR. The runtime name is shown separately; the
+current diagnostic interface does not expose a headset model, so users supply it.
+
 The issue destination is defined in `src/support_report.cpp`. Publish
 `.github/ISSUE_TEMPLATE/bug_report.yml` to that repository's default branch
 before distributing the add-on. Local builds alone do not publish the template.

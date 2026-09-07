@@ -1,4 +1,5 @@
 #include "support_summary.hpp"
+#include "support_prompts.hpp"
 #include <iostream>
 
 int run_support_summary_tests() {
@@ -27,5 +28,10 @@ int run_support_summary_tests() {
     enabled.replace(enabled.find("nr_enabled=false"), 16, "nr_enabled=true");
     const auto enabled_report = support_summary(system, diagnostics, enabled);
     check(enabled_report.find("[DLSS-NR]") != std::string::npos && enabled_report.find("nvngx_dlssnr.dll") != std::string::npos, "retain enabled NR details and dependency");
+    const auto prompts = cheeky::foveated_dlss::support_prompts("TestGame.exe", true, "Pimax OpenXR");
+    check(prompts.problem.find("TestGame.exe") != std::string::npos && prompts.steps.find("Launch TestGame.exe in VR mode") != std::string::npos, "prefill game and detected VR");
+    check(prompts.problem.find("**OpenXR runtime:** Pimax OpenXR") != std::string::npos && prompts.problem.find("**Headset:** Not detected") != std::string::npos, "do not mistake runtime for headset model");
+    const auto unknown = cheeky::foveated_dlss::support_prompts("TestGame.exe", false, "");
+    check(unknown.problem.find("confirm desktop or VR") != std::string::npos, "absence of OpenXR is not proof of desktop mode");
     return failures;
 }

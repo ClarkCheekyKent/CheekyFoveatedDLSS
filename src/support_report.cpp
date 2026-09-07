@@ -1,6 +1,7 @@
 #include "support_report.hpp"
 #include "support_zip.hpp"
 #include "support_summary.hpp"
+#include "support_prompts.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr.hpp"
 #include "gaze_foveation.hpp"
@@ -34,6 +35,7 @@ fs::path last_zip;
 std::string last_markdown;
 std::string status;
 std::string pending_summary, last_summary;
+SupportPrompts pending_prompts, last_prompts;
 
 std::wstring url_encode(const std::string& text) {
     constexpr wchar_t hex[] = L"0123456789ABCDEF";
@@ -408,7 +410,8 @@ void show_zip() {
 
 std::wstring issue_url() {
     auto url = std::wstring(issue_base) + L"&title=Bug%20report&report=" +
-        url_encode(utf8(last_zip.filename().wstring())) + L"&environment=" + url_encode(last_summary);
+        url_encode(utf8(last_zip.filename().wstring())) + L"&environment=" + url_encode(last_summary) +
+        L"&problem=" + url_encode(last_prompts.problem) + L"&steps=" + url_encode(last_prompts.steps);
     // Settings and diagnostics fit in a normal issue URL. Keep the potentially
     // huge log excerpts and capture manifest in the ZIP/copyable report only.
     const auto end = last_markdown.find("### Capture details and log availability");
@@ -436,6 +439,7 @@ void draw_support_report(HMODULE addon) {
             last_zip = std::move(report.zip);
             last_markdown = std::move(report.markdown);
             last_summary = pending_summary;
+            last_prompts = pending_prompts;
             status = "Diagnostics and settings are prefilled on GitHub. Review them, then drag the selected ZIP into Support ZIP.";
             open_issue();
             show_zip();
@@ -450,6 +454,13 @@ void draw_support_report(HMODULE addon) {
             const auto game_file = module_path(nullptr);
             auto settings = settings_text(current_settings());
             auto diagnostics = diagnostics_text();
+            const auto gaze = gaze_diagnostics();
+            const bool openxr_activity = gaze.layer_present && gaze.abi_compatible &&
+                ((gaze.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U ||
+                 std::any_of(gaze.views.begin(), gaze.views.end(),
+                     [](const auto& view) { return view.resource_mapped; }));
+            pending_prompts = support_prompts(utf8(game_file.filename().wstring()),
+                openxr_activity, gaze.runtime_name);
             pending_summary = std::string("Add-on: ") + CHEEKY_VERSION +
                 "\nGame: " + utf8(game_file.filename().wstring()) +
                 "\nDX11: " + diagnostic_state_name(diagnostic_snapshot(DiagnosticApi::d3d11).state) +
