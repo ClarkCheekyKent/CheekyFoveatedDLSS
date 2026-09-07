@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a problem with Cheeky Foveated DLSS
+title: "Bug report"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        In the ReShade add-on, click **Report an issue...** to collect a support ZIP.
+        Review the ZIP before sharing: logs can contain personal paths or identifiers.
+        Drag the ZIP selected in Explorer into the **Support ZIP** field below.
+  - type: input
+    id: report
+    attributes:
+      label: Report filename
+      description: Filled automatically when opened from the add-on.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Filled automatically by the add-on. The ZIP contains the full diagnostic snapshot.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the game name, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include whether disabling the add-on fixes the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Support ZIP
+      description: Drag the generated ZIP here and wait for the upload to finish. If collection failed, describe the error instead.
+    validations:
+      required: true

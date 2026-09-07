@@ -67,6 +67,8 @@ target_link_libraries(
         d3dcompiler
         dxgi
         dxguid
+        shell32
+        version
 )
 
 set_target_properties(

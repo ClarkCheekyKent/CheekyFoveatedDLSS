@@ -277,3 +277,24 @@ and uninstall on a Windows test machine; verify that the manifest's DWORD is
 only that value and the installed files. Verify gaze in a supported game after
 restarting it. Release signing, when available, should be applied to the DLL
 before packaging and to the final installer EXE before publishing.
+
+## Reporting a problem
+
+In the ReShade add-on panel, click **Report an issue...**. The add-on prepares a
+support ZIP in `%TEMP%\CheekySupport`, opens a GitHub bug report with a short
+game/version/graphics summary, and selects the
+ZIP in Explorer. Review the archive, drag it into the **Support ZIP** field, wait
+for the upload to finish, describe the problem, and submit the issue. Nothing is
+uploaded automatically. A GitHub account is required to submit.
+
+The archive includes live add-on settings, DX11/DX12 and OpenXR diagnostics,
+system and loaded DLL version information, and available add-on, ReShade, and
+crash logs. Each log is limited to its last 4 MiB; `README.txt` records missing
+or truncated logs. The crash log may be from an earlier session. Logs are not
+automatically redacted and may contain personal paths or identifiers; the full
+ReShade configuration is not included. Reports stay on disk until you delete
+them. **Show ZIP** and **Open GitHub issue** let you reopen a prepared report.
+
+The issue destination is defined in `src/support_report.cpp`. Publish
+`.github/ISSUE_TEMPLATE/bug_report.yml` to that repository's default branch
+before distributing the add-on. Local builds alone do not publish the template.

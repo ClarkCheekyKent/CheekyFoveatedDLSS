@@ -6,6 +6,7 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "support_report.hpp"
 #include "cheeky_gaze_abi.h"
 #include "version.h"
 
@@ -1576,6 +1577,8 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         save_settings_to_reshade(settings);
     }
 
+    draw_support_report(addon_module.load(std::memory_order_acquire));
+
     if (ImGui::CollapsingHeader(
             "Diagnostics",
             ImGuiTreeNodeFlags_DefaultOpen
@@ -1899,6 +1902,7 @@ extern "C" __declspec(dllexport) void AddonUninit(
         &on_execute_command_list
     );
     reshade::unregister_overlay(nullptr, &draw_settings_overlay);
+    finish_support_report();
     stop_interception();
     release_d3d11_d3d12_transport();
     release_d3d11_resources();
