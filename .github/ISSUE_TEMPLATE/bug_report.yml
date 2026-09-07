@@ -38,7 +38,7 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics and settings
-      description: Filled automatically with system/runtime versions, graphics and OpenXR diagnostics, and all add-on settings. Review before submitting. If the add-on reports a link-size limit, use Copy detailed report and paste it here.
+      description: Filled automatically with system details, feature status, relevant diagnostics, and collapsible settings. The ZIP retains the full diagnostic dump. Review before submitting. If the add-on reports a link-size limit, use Copy detailed report and paste it here.
     validations:
       required: true
   - type: textarea

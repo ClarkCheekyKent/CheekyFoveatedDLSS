@@ -1,5 +1,6 @@
 #include "support_report.hpp"
 #include "support_zip.hpp"
+#include "support_summary.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr.hpp"
 #include "gaze_foveation.hpp"
@@ -285,17 +286,12 @@ std::string code_block(const std::string& text) {
 }
 
 std::string issue_markdown(const std::vector<SupportFile>& files) {
-    std::string report = "## Automatically collected report\n\n";
-    for (const auto& section : {
-            std::pair{"system.txt", "System and runtime versions"},
-            std::pair{"diagnostics.txt", "Graphics, DLSS and OpenXR diagnostics"},
-            std::pair{"settings.ini", "All current add-on settings"},
-            std::pair{"README.txt", "Capture details and log availability"}}) {
-        for (const auto& file : files) {
-            if (file.name == section.first)
-                report += std::string("### ") + section.second + "\n\n" + code_block(file.contents);
-        }
-    }
+    auto contents = [&](const char* name) {
+        for (const auto& file : files) if (file.name == name) return file.contents;
+        return std::string{};
+    };
+    std::string report = support_summary(contents("system.txt"), contents("diagnostics.txt"), contents("settings.ini"));
+    report += "### Capture details and log availability\n\n" + code_block(contents("README.txt"));
     report += "### Recent log excerpts\n\nFull captured logs are in the attached ZIP. "
               "Excerpts below contain up to the last 2 KiB of each available log.\n\n";
     bool has_logs{};

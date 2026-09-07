@@ -296,8 +296,14 @@ automatically redacted and may contain personal paths or identifiers; the full
 ReShade configuration is not included. Reports stay on disk until you delete
 them. **Show ZIP** and **Open GitHub issue** let you reopen a prepared report.
 
-The prefilled report includes system and runtime versions, full graphics/OpenXR
-diagnostics and all current add-on settings. `issue-report.md`, saved beside and
+The prefilled report includes system and relevant runtime versions, feature status,
+active graphics-path diagnostics, readable OpenXR status, and all current add-on
+settings in a collapsible section. It flags requested gaze/alignment that was not
+observed at capture time. Unused APIs and disabled DLSS-NR are reduced to status
+lines; duplicate GPU entries, resource addresses, mapping counters, and routine
+system DLL details are omitted from the issue. Zero timings are marked unavailable
+rather than presented as measured zero cost. The full original diagnostic dump
+and system inventory remain in the ZIP. `issue-report.md`, saved beside and
 inside the ZIP, additionally includes log availability and up to 2 KiB of recent
 text from each log. **Review report** opens it; **Copy detailed report** lets you
 paste this extended version if desired. Exceptionally large reports exceeding

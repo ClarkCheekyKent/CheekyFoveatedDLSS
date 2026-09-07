@@ -1043,6 +1043,7 @@ void test_gaze_copy_routes() {
 }
 
 int run_d3d12_composite_tests();
+int run_support_summary_tests();
 
 int main(int argc, char** argv) {
     test_packed_alignment_coordinator();
@@ -1075,6 +1076,7 @@ int main(int argc, char** argv) {
     test_dlss_nr_reuses_live_sr_crop_center();
     test_dlss_nr_independent_size_shares_sr_center();
     test_openxr_layer_is_retained_while_snapshot_export_is_cached();
+    failures += run_support_summary_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;
