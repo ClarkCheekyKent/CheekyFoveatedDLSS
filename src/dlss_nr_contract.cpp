@@ -1,5 +1,7 @@
 #include "dlss_nr_contract.hpp"
 
+#include <algorithm>
+
 namespace cheeky::foveated_dlss {
 
 DlssNrResourceBase dlss_nr_resource_base(
@@ -23,33 +25,30 @@ FoveationParameters dlss_nr_foveation_parameters(
     const std::uint32_t render_width,
     const std::uint32_t render_height
 ) noexcept {
-    if (settings.nr_use_sr_foveation) {
-        FoveationParameters parameters{
-            settings.width,
-            settings.height,
-            settings.x_offset,
-            settings.height_offset,
-            settings.roundness,
-            settings.transition_width,
-        };
-        if (shared_sr_crop != nullptr && render_width != 0U &&
-            render_height != 0U) {
-            const auto offsets = foveation_offsets_from_geometry(
-                *shared_sr_crop, render_width, render_height
-            );
-            parameters.x_offset = offsets.x;
-            parameters.y_offset = offsets.y;
-        }
-        return parameters;
-    }
-    return {
-        settings.nr_width,
-        settings.nr_height,
-        settings.nr_x_offset,
-        settings.nr_height_offset,
-        settings.nr_roundness,
-        settings.nr_transition_width,
+    FoveationParameters parameters{
+        settings.nr_use_sr_foveation ? settings.width : settings.nr_width,
+        settings.nr_use_sr_foveation ? settings.height : settings.nr_height,
+        0.0F,
+        0.0F,
+        settings.nr_use_sr_foveation ? settings.roundness : settings.nr_roundness,
+        settings.nr_use_sr_foveation
+            ? settings.transition_width : settings.nr_transition_width,
     };
+    // Offsets are fractions of the space left around a crop, not absolute
+    // centers. Convert through the SR center so changing NR size cannot move it.
+    float center_x = settings.x_offset * (1.0F - settings.width);
+    float center_y = settings.height_offset * (1.0F - settings.height);
+    if (shared_sr_crop != nullptr && render_width != 0U && render_height != 0U) {
+        center_x = (2.0F * shared_sr_crop->input_base_x +
+            shared_sr_crop->input_width) / render_width - 1.0F;
+        center_y = (2.0F * shared_sr_crop->input_base_y +
+            shared_sr_crop->input_height) / render_height - 1.0F;
+    }
+    parameters.x_offset = parameters.width < 1.0F
+        ? std::clamp(center_x / (1.0F - parameters.width), -1.0F, 1.0F) : 0.0F;
+    parameters.y_offset = parameters.height < 1.0F
+        ? std::clamp(center_y / (1.0F - parameters.height), -1.0F, 1.0F) : 0.0F;
+    return parameters;
 }
 
 }  // namespace cheeky::foveated_dlss

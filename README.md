@@ -123,9 +123,9 @@ shown only for manual fixed placement. An advanced **Stereo mapping override**
 retains eye-order inversion for reversed packed layouts.
 Existing fixed/gaze selections are preserved. The previous experimental Auto
 alignment mode is migrated to Fixed with automatic alignment enabled. OpenVR-only games without usable
-Streamline projections still require manual alignment. DLSS-NR follows the
-automatic SR crop when **Use DLSS-SR foveation values** is enabled; independent
-NR placement remains manual.
+Streamline projections still require manual alignment. DLSS-NR inherits the SR center, including automatic alignment and gaze on
+routes that supply the live SR crop. **Use DLSS-SR size and shape** also links
+width, height, roundness, and transition; otherwise those remain independent.
 
 The automatic OpenXR route uses snapshot ABI 4: update both
 `CheekyFoveatedDLSS.addon64` and `CheekyOpenXRLayer.dll` together. An older layer
@@ -143,7 +143,7 @@ Additional notes:
 
 - DLSS-NR is off by default.
 - Direct3D 11 games require the **DX12 Transport** processing path for DLSS-NR.
-- DLSS-NR has independent foveation controls and a green alignment border, or it can reuse the DLSS-SR foveation values.
+- DLSS-NR follows the DLSS-SR center and stereo alignment. Its fovea width, height, roundness, and transition can be adjusted independently or linked to DLSS-SR, with a green alignment border for checking the region.
 - A DLSS-NR failure leaves the composited DLSS-SR result intact.
 - RDR 2 currently does not work well with DLSS-NR.
 

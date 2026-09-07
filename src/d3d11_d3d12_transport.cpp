@@ -1272,7 +1272,7 @@ bool evaluate_d3d11_via_d3d12(
         transport_settings,
         view_id
     );
-    const auto nr_settings = settings_for_view(settings, view_id);
+    auto nr_settings = settings_for_view(settings, view_id);
     if (ngx.runtime_module == nullptr || ngx.init_ext == nullptr ||
         ngx.allocate_parameters == nullptr ||
         ngx.shutdown == nullptr ||
@@ -1383,6 +1383,18 @@ bool evaluate_d3d11_via_d3d12(
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
         apply_next_jump_preview(effective_settings, view_id);
+    }
+
+    if (settings.enabled) {
+        // Both NR texture allocation and evaluation must use the same live SR
+        // center, including automatic alignment and gaze movement.
+        const auto offsets = foveation_offsets_from_geometry(
+            crop, render_width, render_height
+        );
+        nr_settings.width = static_cast<float>(crop.input_width) / render_width;
+        nr_settings.height = static_cast<float>(crop.input_height) / render_height;
+        nr_settings.x_offset = offsets.x;
+        nr_settings.height_offset = offsets.y;
     }
 
     const auto create_flags = get_integer_bits(parameters, "DLSS.Feature.Create.Flags");

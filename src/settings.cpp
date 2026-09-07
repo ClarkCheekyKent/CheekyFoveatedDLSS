@@ -37,9 +37,6 @@ std::atomic<bool> nr_use_sr_foveation{false};
 std::atomic<bool> nr_alignment_border_enabled{false};
 std::atomic<std::uint32_t> nr_width_bits{0x3F0F5C29U};
 std::atomic<std::uint32_t> nr_height_bits{0x3F0F5C29U};
-std::atomic<std::uint32_t> nr_x_offset_bits{0x3E9EB852U};
-std::atomic<std::uint32_t> nr_height_offset_bits{0xBEE147AEU};
-std::atomic<bool> nr_invert_stereo_x_offset{false};
 std::atomic<std::uint32_t> nr_roundness_bits{};
 std::atomic<std::uint32_t> nr_transition_bits{0x3DA3D70AU};
 std::atomic<std::uint32_t> nr_working_scale_bits{0x3F4CCCCDU};
@@ -144,10 +141,6 @@ Settings current_settings() noexcept {
         nr_alignment_border_enabled.load(std::memory_order_acquire);
     settings.nr_width = load_float(nr_width_bits);
     settings.nr_height = load_float(nr_height_bits);
-    settings.nr_x_offset = load_float(nr_x_offset_bits);
-    settings.nr_height_offset = load_float(nr_height_offset_bits);
-    settings.nr_invert_stereo_x_offset =
-        nr_invert_stereo_x_offset.load(std::memory_order_acquire);
     settings.nr_roundness = load_float(nr_roundness_bits);
     settings.nr_transition_width = load_float(nr_transition_bits);
     settings.nr_working_scale = load_float(nr_working_scale_bits);
@@ -251,18 +244,6 @@ void update_settings(const Settings& settings) noexcept {
     );
     store_float(nr_width_bits, std::clamp(settings.nr_width, 0.20F, 1.0F));
     store_float(nr_height_bits, std::clamp(settings.nr_height, 0.20F, 1.0F));
-    store_float(
-        nr_x_offset_bits,
-        std::clamp(settings.nr_x_offset, -1.0F, 1.0F)
-    );
-    store_float(
-        nr_height_offset_bits,
-        std::clamp(settings.nr_height_offset, -1.0F, 1.0F)
-    );
-    nr_invert_stereo_x_offset.store(
-        settings.nr_invert_stereo_x_offset,
-        std::memory_order_release
-    );
     store_float(
         nr_roundness_bits,
         std::clamp(settings.nr_roundness, 0.0F, 1.0F)
@@ -436,7 +417,6 @@ Settings settings_for_view(
     }
     if (matched_view == nullptr) {
         result.x_offset = 0.0F;
-        result.nr_x_offset = 0.0F;
         return result;
     }
 
@@ -472,17 +452,11 @@ Settings settings_for_view(
 
     if (eye_roles[0].view_id == 0U || eye_roles[1].view_id == 0U) {
         result.x_offset = 0.0F;
-        result.nr_x_offset = 0.0F;
         return result;
     }
     const bool negative = matched_view->second_eye !=
         settings.invert_stereo_x_offset;
     result.x_offset = negative ? -settings.x_offset : settings.x_offset;
-    const bool nr_negative = matched_view->second_eye !=
-        settings.nr_invert_stereo_x_offset;
-    result.nr_x_offset = nr_negative
-        ? -settings.nr_x_offset
-        : settings.nr_x_offset;
     return result;
 }
 

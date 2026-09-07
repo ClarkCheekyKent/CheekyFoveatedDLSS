@@ -681,6 +681,41 @@ void test_dlss_nr_reuses_live_sr_crop_center() {
         "DLSS-NR follows the live SR vertical center");
 }
 
+void test_dlss_nr_independent_size_shares_sr_center() {
+    using namespace cheeky::foveated_dlss;
+    Settings settings{};
+    settings.nr_use_sr_foveation = false;
+    settings.width = 0.5F;
+    settings.height = 0.6F;
+    settings.height_offset = -0.25F;
+    settings.nr_width = 0.7F;
+    settings.nr_height = 0.3F;
+    settings.nr_roundness = 0.4F;
+    settings.nr_transition_width = 0.12F;
+    for (const float eye_offset : {-0.3F, 0.3F}) {
+        settings.x_offset = eye_offset;
+        const auto nr = dlss_nr_foveation_parameters(settings, nullptr, 0U, 0U);
+        expect_near(nr.width, 0.7F, 0.0001F, "NR retains independent width");
+        expect_near(nr.height, 0.3F, 0.0001F, "NR retains independent height");
+        expect_near(nr.roundness, 0.4F, 0.0001F, "NR retains independent roundness");
+        expect_near(nr.transition_width, 0.12F, 0.0001F, "NR retains independent transition");
+        expect_near(nr.x_offset * (1.F - nr.width), eye_offset * (1.F - settings.width),
+            0.0001F, "different NR width preserves each SR eye center");
+        expect_near(nr.y_offset * (1.F - nr.height), -0.1F,
+            0.0001F, "different NR height preserves SR vertical center");
+    }
+    const FoveationGeometry live{900U, 300U, 1000U, 800U};
+    const auto nr = dlss_nr_foveation_parameters(settings, &live, 3000U, 2000U);
+    expect_near(nr.x_offset * (1.F - nr.width), 2800.F / 3000.F - 1.F,
+        0.0001F, "independent NR follows live horizontal center");
+    expect_near(nr.y_offset * (1.F - nr.height), -0.3F,
+        0.0001F, "independent NR follows live vertical center");
+    settings.nr_width = settings.nr_height = 1.F;
+    const auto full = dlss_nr_foveation_parameters(settings, &live, 3000U, 2000U);
+    expect(full.x_offset == 0.F && full.y_offset == 0.F,
+        "full-frame NR uses zero offsets without division by zero");
+}
+
 void test_packed_alignment_coordinator() {
     using namespace cheeky::foveated_dlss;
     reset_gaze_foveation();
@@ -1038,6 +1073,7 @@ int main(int argc, char** argv) {
     test_dlss_nr_maps_right_eye_region_into_packed_output();
     test_dlss_nr_transport_crop_fits_resource();
     test_dlss_nr_reuses_live_sr_crop_center();
+    test_dlss_nr_independent_size_shares_sr_center();
     test_openxr_layer_is_retained_while_snapshot_export_is_cached();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

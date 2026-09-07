@@ -801,16 +801,6 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "NrHeight", settings.nr_height
     ));
     static_cast<void>(reshade::get_config_value(
-        nullptr, config_section, "NrXOffset", settings.nr_x_offset
-    ));
-    static_cast<void>(reshade::get_config_value(
-        nullptr, config_section, "NrHeightOffset", settings.nr_height_offset
-    ));
-    static_cast<void>(reshade::get_config_value(
-        nullptr, config_section, "NrInvertStereoXOffset",
-        settings.nr_invert_stereo_x_offset
-    ));
-    static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrRoundness", settings.nr_roundness
     ));
     static_cast<void>(reshade::get_config_value(
@@ -961,14 +951,6 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     );
     reshade::set_config_value(nullptr, config_section, "NrWidth", settings.nr_width);
     reshade::set_config_value(nullptr, config_section, "NrHeight", settings.nr_height);
-    reshade::set_config_value(nullptr, config_section, "NrXOffset", settings.nr_x_offset);
-    reshade::set_config_value(
-        nullptr, config_section, "NrHeightOffset", settings.nr_height_offset
-    );
-    reshade::set_config_value(
-        nullptr, config_section, "NrInvertStereoXOffset",
-        settings.nr_invert_stereo_x_offset
-    );
     reshade::set_config_value(
         nullptr, config_section, "NrRoundness", settings.nr_roundness
     );
@@ -1364,13 +1346,14 @@ void draw_nr_controls(Settings& settings, bool& changed) {
 
     changed |= ImGui::Checkbox("Foveated DLSS-NR", &settings.nr_foveated);
     if (settings.nr_foveated) {
+        ImGui::TextDisabled("Position follows DLSS-SR; NR size and shape can differ.");
         changed |= ImGui::Checkbox(
-            "Use DLSS-SR foveation values",
+            "Use DLSS-SR size and shape",
             &settings.nr_use_sr_foveation
         );
         if (settings.nr_use_sr_foveation) {
             ImGui::TextDisabled(
-                "Width, height, offsets, roundness, and transition follow DLSS-SR."
+                "Width, height, roundness, and transition follow DLSS-SR."
             );
         } else {
             deferred_slider(
@@ -1390,23 +1373,6 @@ void draw_nr_controls(Settings& settings, bool& changed) {
                 0.20F,
                 1.0F,
                 "%.2f"
-            );
-            if (has_multiple_stereo_views()) {
-                ImGui::TextDisabled(
-                    "Applies equal and opposite NR X offsets to both stereo views."
-                );
-                changed |= ImGui::SliderFloat(
-                    "NR stereo X offset", &settings.nr_x_offset,
-                    -1.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
-                );
-                changed |= ImGui::Checkbox(
-                    "Invert NR stereo eye order",
-                    &settings.nr_invert_stereo_x_offset
-                );
-            }
-            changed |= ImGui::SliderFloat(
-                "NR height offset", &settings.nr_height_offset,
-                -1.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
             );
             changed |= ImGui::SliderFloat(
                 "NR roundness", &settings.nr_roundness,
@@ -1508,9 +1474,6 @@ void draw_nr_controls(Settings& settings, bool& changed) {
             defaults.nr_alignment_border_enabled;
         settings.nr_width = defaults.nr_width;
         settings.nr_height = defaults.nr_height;
-        settings.nr_x_offset = defaults.nr_x_offset;
-        settings.nr_height_offset = defaults.nr_height_offset;
-        settings.nr_invert_stereo_x_offset = defaults.nr_invert_stereo_x_offset;
         settings.nr_roundness = defaults.nr_roundness;
         settings.nr_transition_width = defaults.nr_transition_width;
         settings.nr_working_scale = defaults.nr_working_scale;

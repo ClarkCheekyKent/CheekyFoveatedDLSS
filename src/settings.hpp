@@ -46,9 +46,6 @@ struct Settings {
     bool nr_alignment_border_enabled{false};
     float nr_width{0.56F};
     float nr_height{0.56F};
-    float nr_x_offset{0.31F};
-    float nr_height_offset{-0.44F};
-    bool nr_invert_stereo_x_offset{false};
     float nr_roundness{0.0F};
     float nr_transition_width{0.08F};
     float nr_working_scale{0.80F};
