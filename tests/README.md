@@ -178,6 +178,8 @@ output-space gaze offsets. GPU readback verifies this numerical behavior; an
 ACC moving-head A/B comparison against 1x is still required.
 ## NR rendering order
 
+Run `bin/Release/CheekyTests.exe --nr-processing` to run the NR contracts independently.
+
 The standard suite tests processing-resolution selection, Working scale, crop
 centers, independent resource origins, render/output-resolution motion fields,
 per-eye history changes, and restoration of NGX parameters and Streamline tags

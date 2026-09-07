@@ -8,19 +8,21 @@ class NgxNrInputSubstitution {
     NgxParameters* parameters_{};
     ID3D12Resource* color_{};
     std::uint32_t reset_{};
+    bool color_changed_{}, reset_changed_{};
 public:
     NgxNrInputSubstitution(const NgxParameters* parameters, ID3D12Resource* original,
         ID3D12Resource* processed, bool reset) noexcept
-        : parameters_(const_cast<NgxParameters*>(parameters)), color_(original),
-          reset_(get_ui(parameters, "Reset")) {
+        : parameters_(const_cast<NgxParameters*>(parameters)), color_(original) {
         if (!parameters_) return;
-        if (processed) parameters_->Set("Color", processed);
-        if (reset) parameters_->Set("Reset", 1U);
+        color_changed_ = processed != nullptr;
+        reset_changed_ = reset && ngx_succeeded(parameters_->Get("Reset", &reset_));
+        if (color_changed_) parameters_->Set("Color", processed);
+        if (reset_changed_) parameters_->Set("Reset", 1U);
     }
     ~NgxNrInputSubstitution() {
         if (!parameters_) return;
-        parameters_->Set("Color", color_);
-        parameters_->Set("Reset", reset_);
+        if (color_changed_) parameters_->Set("Color", color_);
+        if (reset_changed_) parameters_->Set("Reset", reset_);
     }
     NgxNrInputSubstitution(const NgxNrInputSubstitution&) = delete;
     NgxNrInputSubstitution& operator=(const NgxNrInputSubstitution&) = delete;
@@ -75,7 +77,9 @@ public:
 [[nodiscard]] ID3D12Resource* prepare_dlss_nr_input(
     DlssNrFrame frame, const Settings& settings) noexcept;
 void note_dlss_nr_input_submission(ID3D12CommandQueue* queue,
-    ID3D12GraphicsCommandList* command_list) noexcept;
+    ID3D12Object* command_list) noexcept;
+// Call at present, after notified command lists have been submitted.
+void collect_dlss_nr_input_submissions() noexcept;
 void release_dlss_nr_inputs(DlssViewId view_id = 0U) noexcept;
 // Per-view transitions invalidate both SR histories, including fallback->NR.
 [[nodiscard]] bool dlss_nr_input_history_compatible(DlssViewId view_id,

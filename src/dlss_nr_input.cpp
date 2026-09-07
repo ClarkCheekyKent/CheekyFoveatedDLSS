@@ -1,4 +1,7 @@
 #include "dlss_nr_input.hpp"
+#include "d3d12_submission_identity.hpp"
+#include "runtime.hpp"
+#include <atomic>
 #include <deque>
 #include <mutex>
 
@@ -10,6 +13,8 @@ struct Input {
     ID3D12Device* device{}; // Kept alive by color.
     ID3D12Fence* fence{};
     ID3D12GraphicsCommandList* recording{};
+    std::uint64_t recording_identity{};
+    ID3D12CommandQueue* queue{};
     std::uint64_t value{};
     bool retired{};
     D3D12_RESOURCE_STATES state{};
@@ -24,7 +29,7 @@ std::mutex mutex;
 std::deque<Input> inputs;
 std::deque<History> histories;
 bool complete(const Input& input) noexcept {
-    return input.recording == nullptr && input.fence->GetCompletedValue() >= input.value;
+    return input.recording == nullptr && input.queue == nullptr && input.fence->GetCompletedValue() >= input.value;
 }
 void collect() noexcept {
     for (auto it = inputs.begin(); it != inputs.end();) {
@@ -112,13 +117,20 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
             }
         }
         if (selected) {
+            if (selected->value == 1 || (selected->value && selected->value % 300 == 0))
+                trace_event("DLSS-NR Before input recycled view=%llu completed=%llu", frame.view_id, selected->value);
             selected->recording = frame.command_list;
+            selected->recording_identity = d3d12_submission_identity(frame.command_list, true);
             frame.command_list->AddRef();
             private_color = selected->color;
         }
     }
     frame_device->Release();
     if (!private_color) {
+        static std::atomic<std::uint64_t> skips{};
+        const auto skipped = ++skips;
+        if (skipped == 1 || skipped % 300 == 0)
+            trace_event("DLSS-NR Before input unavailable view=%llu skips=%llu", frame.view_id, skipped);
         frame.color = nullptr;
         static_cast<void>(evaluate_dlss_nr(frame, settings));
         return nullptr;
@@ -141,15 +153,29 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
     return evaluate_dlss_nr(frame, processing_settings) ? private_color : nullptr;
 }
 void note_dlss_nr_input_submission(ID3D12CommandQueue* queue,
-    ID3D12GraphicsCommandList* command_list) noexcept {
+    ID3D12Object* command_list) noexcept {
     if (!queue || !command_list) return;
+    const auto identity = d3d12_submission_identity(command_list);
     std::lock_guard lock(mutex);
     for (auto& input : inputs) {
-        if (input.recording != command_list) continue;
-        if (SUCCEEDED(queue->Signal(input.fence, input.value + 1U))) {
+        if (!input.recording || (input.recording != command_list &&
+            (!identity || input.recording_identity != identity))) continue;
+        if (input.value == 0)
+            trace_event("DLSS-NR Before submission matched view=%llu aliased=%s", input.view,
+                input.recording != command_list ? "yes" : "no");
+        queue->AddRef();
+        input.queue = queue;
+        input.recording->Release();
+        input.recording = nullptr;
+    }
+}
+void collect_dlss_nr_input_submissions() noexcept {
+    std::lock_guard lock(mutex);
+    for (auto& input : inputs) {
+        if (input.queue && SUCCEEDED(input.queue->Signal(input.fence, input.value + 1U))) {
             ++input.value;
-            input.recording->Release();
-            input.recording = nullptr;
+            input.queue->Release();
+            input.queue = nullptr;
         }
     }
     collect();

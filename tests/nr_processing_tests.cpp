@@ -1,5 +1,6 @@
 #include "dlss_nr_input.hpp"
 #include "gaze_foveation.hpp"
+#include "mock_ngx_parameters.hpp"
 #include <iostream>
 #include <stdexcept>
 
@@ -58,6 +59,11 @@ int run_nr_processing_tests() {
         const auto require = [](bool value, const char* why) {
             if (!value) throw std::runtime_error(why);
         };
+        {
+            MockNgxParameters missing;
+            { NgxNrInputSubstitution unchanged(&missing, nullptr, nullptr, true); }
+            require(missing.values.empty(), "NR fallback invented missing host parameters");
+        }
         {
             CropGeometry cached{};
             cached.input_width = 64U;

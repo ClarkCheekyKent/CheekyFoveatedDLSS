@@ -96,7 +96,9 @@ struct DlssNrSnapshot {
 ) noexcept;
 
 void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const char* reason) noexcept;
-void note_dlss_nr_submission(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list) noexcept;
+void note_dlss_nr_submission(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list,
+    bool already_submitted = false) noexcept;
+void collect_dlss_nr_submissions() noexcept;
 void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noexcept;
 
 void release_dlss_nr_view(DlssViewId view_id) noexcept;

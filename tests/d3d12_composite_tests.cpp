@@ -35,6 +35,118 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 
+// Interposers may expose a different COM pointer while forwarding object data.
+// Only the object interface is used by the submission bookkeeping.
+class ObjectAlias final : public ID3D12Object {
+    ID3D12Object* object_;
+public:
+    explicit ObjectAlias(ID3D12Object* object) : object_(object) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override { return object_->QueryInterface(id, out); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return object_->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override { return object_->Release(); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID id, UINT* size, void* data) override { return object_->GetPrivateData(id, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID id, UINT size, const void* data) override { return object_->SetPrivateData(id, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID id, const IUnknown* data) override { return object_->SetPrivateDataInterface(id, data); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return object_->SetName(name); }
+};
+
+void run_nr_recycling(ID3D12Device* device, bool alias) {
+    ComPtr<ID3D12InfoQueue> messages;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) messages->ClearStoredMessages();
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC q{};
+    check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 32;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ComPtr<ID3D12Resource> color;
+    check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&color)));
+    ComPtr<ID3D12Fence> done;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)));
+    ComPtr<ID3D12Fence> gate;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+    Settings settings{};
+    settings.nr_enabled = true;
+    settings.nr_processing_order = NrProcessingOrder::before_upscaling;
+    DlssNrFrame frame{};
+    frame.view_id = 501;
+    frame.command_list = list.Get();
+    frame.color = color.Get();
+    frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    frame.input_width = frame.input_height = 32;
+    frame.output_width = frame.output_height = 64;
+    ObjectAlias submitted(list.Get());
+    for (UINT64 iteration = 1; iteration <= 24; ++iteration) {
+        if (iteration != 1) {
+            check(allocator->Reset());
+            check(list->Reset(allocator.Get(), nullptr));
+        }
+        require(prepare_dlss_nr_input(frame, settings) != nullptr,
+            "Before NR exhausted its input pool across aliased submissions");
+        if (iteration == 1) {
+            for (unsigned slot = 1; slot < 8; ++slot)
+                require(prepare_dlss_nr_input(frame, settings) != nullptr, "Could not fill NR pool");
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "NR reused an input whose commands were still being recorded");
+        }
+        check(list->Close());
+        // ReShade notifies BEFORE ExecuteCommandLists.
+        note_dlss_nr_input_submission(queue.Get(), alias ? static_cast<ID3D12Object*>(&submitted) : list.Get());
+        if (iteration == 1) {
+            // An idle queue must not make a pre-submission notification complete.
+            check(queue->Signal(done.Get(), 1));
+            HANDLE idle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            require(idle != nullptr, "CreateEvent failed");
+            check(done->SetEventOnCompletion(1, idle));
+            const auto waited = WaitForSingleObject(idle, 10000);
+            CloseHandle(idle);
+            require(waited == WAIT_OBJECT_0, "Idle queue timed out");
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "NR recycled an input before ExecuteCommandLists");
+            check(queue->Wait(gate.Get(), 1));
+        }
+        ID3D12CommandList* lists[]{list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        collect_dlss_nr_input_submissions();
+        if (iteration == 1) {
+            const bool held = prepare_dlss_nr_input(frame, settings) == nullptr;
+            check(gate->Signal(1));
+            require(held, "NR recycled an input before GPU completion");
+        }
+        check(queue->Signal(done.Get(), iteration + 1));
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        require(event != nullptr, "CreateEvent failed");
+        check(done->SetEventOnCompletion(iteration + 1, event));
+        const auto waited = WaitForSingleObject(event, 10000);
+        CloseHandle(event);
+        require(waited == WAIT_OBJECT_0, "NR recycling test timed out");
+    }
+    release_dlss_nr_inputs(501);
+    if (messages) {
+        for (UINT64 index = 0; index < messages->GetNumStoredMessages(); ++index) {
+            SIZE_T size{};
+            check(messages->GetMessage(index, nullptr, &size));
+            std::vector<unsigned char> storage(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            check(messages->GetMessage(index, message, &size));
+            require(message->Severity > D3D12_MESSAGE_SEVERITY_ERROR,
+                "D3D12 debug layer reported an NR recycling error");
+        }
+    }
+    std::cout << "Before NR recycled inputs across 24 submissions; aliased=" << alias
+        << "; pending GPU inputs protected\n";
+}
+
 ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE type) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = type;
@@ -288,6 +400,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     ID3D12CommandList* lists[]{list.Get()};
     queue->ExecuteCommandLists(1, lists);
     note_dlss_nr_input_submission(queue.Get(), list.Get());
+    collect_dlss_nr_input_submissions();
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
     check(queue->Signal(fence.Get(), 1));
@@ -405,6 +518,8 @@ int run_d3d12_composite_tests() {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
         ComPtr<ID3D12Device> device;
         check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+        run_nr_recycling(device.Get(), true);
+        run_nr_recycling(device.Get(), false);
         run_case(device.Get(), 1, 1);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, true);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, false);

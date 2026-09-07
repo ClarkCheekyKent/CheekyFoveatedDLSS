@@ -1486,6 +1486,9 @@ void test_native_dynamic_resolution_extent() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--nr-processing") == 0) {
+        return run_nr_processing_tests();
+    }
     test_native_dynamic_resolution_extent();
     if (argc == 2 && std::strcmp(argv[1], "--calibration-formats") == 0) {
         failures += run_openxr_calibration_format_tests();

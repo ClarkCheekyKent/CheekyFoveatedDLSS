@@ -1531,6 +1531,8 @@ void note_d3d12_command_list_submission_impl(
 void note_d3d12_present_impl(
     ID3D12CommandQueue* const present_queue
 ) noexcept {
+    collect_dlss_nr_input_submissions();
+    collect_dlss_nr_submissions();
     collect_peripheral_dlaa_resources();
     collect_crop_motion12();
     std::uint64_t present_frequency{};
