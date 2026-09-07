@@ -24,14 +24,32 @@ body:
     id: problem
     attributes:
       label: What happened?
-      description: Include the game name, what you expected, and what happened instead.
+      description: Replace the prompts below with your observations. Leave anything you have not checked as "Not tested".
+      value: |
+        **Game and mode:** [Game name; desktop or VR; headset if relevant]
+
+        **What I expected:** [Describe the expected result]
+
+        **What actually happened:** [Describe the visual issue, performance problem, crash, or error message]
+
+        **How often it happens:** [Every time / sometimes / once]
+
+        **With the add-on disabled:** Not tested
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
       label: Steps to reproduce
-      description: Include whether disabling the add-on fixes the problem.
+      description: Replace these suggestions with the shortest sequence that reproduces the problem. Include any relevant setting changes.
+      value: |
+        1. Launch [game] in [desktop / VR] mode.
+        2. Load [track, level, save, or scene].
+        3. Enable or change [relevant DLSS-SR, DLSS-NR, or eye-tracking settings].
+        4. [Action that triggers the problem].
+        5. Observe [the specific symptom].
+
+        **Workaround, if any:** [Describe it, or write "None known"]
     validations:
       required: true
   - type: textarea
