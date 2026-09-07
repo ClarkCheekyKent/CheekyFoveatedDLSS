@@ -42,4 +42,4 @@ Root: HKLM64; Subkey: "SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"; ValueType:
 
 [Messages]
 WelcomeLabel2=This installs shared OpenXR eye-tracking support for Cheeky Foveated DLSS.%n%nClose your OpenXR games before installing or updating.%n%nFor each game, install ReShade with full add-on support and copy CheekyFoveatedDLSS.addon64 into the game folder separately. This installer does not install ReShade or the add-on.
-FinishedLabel=OpenXR eye-tracking support has been installed.%n%nStart or restart your game, open the Cheeky Foveated DLSS add-on in ReShade, and select Foveation center > OpenXR gaze.%n%nEye tracking requires a supported OpenXR game and runtime. This installation is shared by all your games.
+FinishedLabel=OpenXR eye-tracking support has been installed.%n%nStart or restart your game, open the Cheeky Foveated DLSS add-on in ReShade, and select Foveation center > Runtime gaze (OpenXR / OpenVR).%n%nEye tracking requires a supported OpenXR game and runtime. This installation is shared by all your games.
