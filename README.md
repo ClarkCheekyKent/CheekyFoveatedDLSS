@@ -282,9 +282,9 @@ before packaging and to the final installer EXE before publishing.
 
 In the ReShade add-on panel, click **Report an issue...**. The add-on prepares a
 support ZIP in `%TEMP%\CheekySupport`, opens a GitHub bug report with a short
-game/version/graphics summary, copies a detailed Markdown report to the clipboard,
-and selects the ZIP in Explorer. Paste the report into **Diagnostics and settings**
-with Ctrl+V, review it, then drag the ZIP into **Support ZIP**. Wait for the upload
+game/version/graphics summary and prefilled **Diagnostics and settings**,
+and selects the ZIP in Explorer. Review the populated report, then drag the ZIP
+into **Support ZIP**. Wait for the upload
 to finish, describe the problem, and submit the issue. Nothing is
 uploaded automatically. A GitHub account is required to submit.
 
@@ -296,12 +296,13 @@ automatically redacted and may contain personal paths or identifiers; the full
 ReShade configuration is not included. Reports stay on disk until you delete
 them. **Show ZIP** and **Open GitHub issue** let you reopen a prepared report.
 
-The pasted report includes system and runtime versions, full graphics/OpenXR
-diagnostics, all current add-on settings, log availability, and up to 2 KiB of
-recent text from each captured log. `issue-report.md` is saved beside the ZIP
-and inside it. **Review report** opens that file; **Copy detailed report** copies
-it again. The detailed report uses the clipboard because GitHub issue links
-cannot reliably carry this much text without exceeding URL limits.
+The prefilled report includes system and runtime versions, full graphics/OpenXR
+diagnostics and all current add-on settings. `issue-report.md`, saved beside and
+inside the ZIP, additionally includes log availability and up to 2 KiB of recent
+text from each log. **Review report** opens it; **Copy detailed report** lets you
+paste this extended version if desired. Exceptionally large reports exceeding
+the 7,800-character encoded URL budget display explicit paste instructions
+instead of opening a broken link. Logs are never placed in the issue URL.
 
 The issue destination is defined in `src/support_report.cpp`. Publish
 `.github/ISSUE_TEMPLATE/bug_report.yml` to that repository's default branch

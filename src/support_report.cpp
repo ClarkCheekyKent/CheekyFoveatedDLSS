@@ -411,12 +411,24 @@ void show_zip() {
 }
 
 std::wstring issue_url() {
-    return std::wstring(issue_base) + L"&title=Bug%20report&report=" +
+    auto url = std::wstring(issue_base) + L"&title=Bug%20report&report=" +
         url_encode(utf8(last_zip.filename().wstring())) + L"&environment=" + url_encode(last_summary);
+    // Settings and diagnostics fit in a normal issue URL. Keep the potentially
+    // huge log excerpts and capture manifest in the ZIP/copyable report only.
+    const auto end = last_markdown.find("### Capture details and log availability");
+    const auto details = last_markdown.substr(0, end);
+    const auto populated = url + L"&diagnostics=" + url_encode(details);
+    if (populated.size() <= 7800) return populated;
+    // Exceptional oversized hardware/runtime descriptions must not produce a
+    // broken GitHub URL. Make the fallback visible in the field and overlay.
+    return url + L"&diagnostics=" + url_encode(
+        "This report exceeds the issue-link size limit. Use Copy detailed report in the add-on and paste it here.");
 }
 
 void open_issue() {
     const auto url = issue_url();
+    if (url.find(L"exceeds%20the%20issue-link") != std::wstring::npos)
+        status = "Report exceeds the link size limit. Use Copy detailed report and paste into Diagnostics and settings; attach the ZIP.";
     if (!open_target(url.c_str())) status = "Could not open browser. Use Copy issue link and open it manually.";
 }
 }
@@ -428,13 +440,12 @@ void draw_support_report(HMODULE addon) {
             last_zip = std::move(report.zip);
             last_markdown = std::move(report.markdown);
             last_summary = pending_summary;
-            ImGui::SetClipboardText(last_markdown.c_str());
-            status = "Report copied. Paste (Ctrl+V) into Diagnostics and settings on GitHub, then drag the selected ZIP into Support ZIP.";
+            status = "Diagnostics and settings are prefilled on GitHub. Review them, then drag the selected ZIP into Support ZIP.";
             open_issue();
             show_zip();
         }
         ImGui::SeparatorText("Report a problem");
-        ImGui::TextWrapped("Prepare a detailed issue report and ZIP. The report is copied to your clipboard for pasting into GitHub. Review before sharing; logs may contain personal paths. Nothing uploads automatically.");
+        ImGui::TextWrapped("Open a GitHub issue with system information, diagnostics and settings filled in, and prepare a ZIP of the logs. Review before submitting; logs may contain personal paths.");
         ImGui::BeginDisabled(pending.valid());
         const bool clicked = ImGui::Button("Report an issue...");
         ImGui::EndDisabled();

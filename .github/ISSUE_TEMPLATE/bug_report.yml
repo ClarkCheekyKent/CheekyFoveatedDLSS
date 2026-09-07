@@ -7,8 +7,8 @@ body:
       value: |
         In the ReShade add-on, click **Report an issue...** to collect a support ZIP.
         Review the ZIP before sharing: logs can contain personal paths or identifiers.
-        The add-on copies a detailed report to your clipboard. Paste it into
-        **Diagnostics and settings** with Ctrl+V (or use **Copy detailed report** in the add-on).
+        **Diagnostics and settings** is filled automatically by the add-on.
+        **Copy detailed report** also includes recent log excerpts if you want to paste those.
         Drag the ZIP selected in Explorer into the **Support ZIP** field below.
   - type: input
     id: report
@@ -38,7 +38,7 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics and settings
-      description: Paste the report copied by the add-on here. It includes system/runtime versions, graphics and OpenXR diagnostics, all add-on settings, and recent log excerpts. Review it before submitting. If collection failed, describe the error.
+      description: Filled automatically with system/runtime versions, graphics and OpenXR diagnostics, and all add-on settings. Review before submitting. If the add-on reports a link-size limit, use Copy detailed report and paste it here.
     validations:
       required: true
   - type: textarea
