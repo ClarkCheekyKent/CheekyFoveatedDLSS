@@ -10,7 +10,7 @@ DlssNrResourceBase dlss_nr_resource_base(
     const bool color_is_region
 ) noexcept {
     return color_is_region
-        ? DlssNrResourceBase{local_x, local_y}
+        ? DlssNrResourceBase{0U, 0U}
         : DlssNrResourceBase{
             color_base_x + local_x,
             color_base_y + local_y,

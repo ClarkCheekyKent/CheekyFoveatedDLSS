@@ -53,6 +53,7 @@ struct DlssNrFrame {
     std::uint32_t create_flags{};
     std::uint32_t color_base_x{};
     std::uint32_t color_base_y{};
+    // Color, depth and motion textures already contain only the NR region.
     bool color_is_region{};
     FoveationGeometry shared_sr_crop{};
     bool has_shared_sr_crop{};

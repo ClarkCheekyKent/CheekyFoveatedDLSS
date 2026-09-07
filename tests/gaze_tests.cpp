@@ -637,11 +637,24 @@ void test_dlss_nr_maps_right_eye_region_into_packed_output() {
     );
     expect(base.x == 7734U && base.y == 928U,
         "right-eye DLSS-NR region includes the packed output base");
-    const auto isolated = dlss_nr_resource_base(
-        2544U, 928U, 5190U, 0U, true
+    const auto isolated_eye = dlss_nr_resource_base(
+        2544U, 928U, 0U, 0U, false
     );
-    expect(isolated.x == 2544U && isolated.y == 928U,
-        "isolated DLSS-NR region remains resource-local");
+    expect(isolated_eye.x == 2544U && isolated_eye.y == 928U,
+        "uncropped isolated eye retains the NR crop offset");
+}
+
+void test_dlss_nr_transport_crop_fits_resource() {
+    using namespace cheeky::foveated_dlss;
+    // Transport copies only the NR region into a texture of this exact size.
+    // Its original position in the eye image must not be applied a second time.
+    constexpr std::uint32_t width = 2120U;
+    constexpr std::uint32_t height = 1848U;
+    const auto cropped = dlss_nr_resource_base(452U, 494U, 0U, 0U, true);
+    expect(cropped.x == 0U && cropped.y == 0U,
+        "pre-cropped transport color begins at the resource origin");
+    expect(cropped.x + width <= width && cropped.y + height <= height,
+        "NR region fits the transport texture without double-applying the crop");
 }
 
 void test_dlss_nr_reuses_live_sr_crop_center() {
@@ -1023,6 +1036,7 @@ int main(int argc, char** argv) {
     test_streamline_private_sr_viewport();
     test_multimip_game_output_is_dlss_nr_compatible();
     test_dlss_nr_maps_right_eye_region_into_packed_output();
+    test_dlss_nr_transport_crop_fits_resource();
     test_dlss_nr_reuses_live_sr_crop_center();
     test_openxr_layer_is_retained_while_snapshot_export_is_cached();
     if (failures != 0) {

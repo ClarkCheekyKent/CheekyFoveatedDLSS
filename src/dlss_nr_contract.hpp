@@ -11,6 +11,8 @@ struct DlssNrResourceBase {
     std::uint32_t y{};
 };
 
+// color_is_region means the texture already contains only the NR crop, whose
+// resource origin is zero. Otherwise add the eye/output base to the crop offset.
 [[nodiscard]] DlssNrResourceBase dlss_nr_resource_base(
     std::uint32_t local_x,
     std::uint32_t local_y,
