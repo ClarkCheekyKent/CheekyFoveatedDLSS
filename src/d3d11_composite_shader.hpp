@@ -25,8 +25,17 @@ cbuffer Constants : register(b0) {
     float NextJumpOffsetX;
     float NextJumpOffsetY;
     uint ShowNextJump;
+    uint2 NrBase;
+    uint2 NrSize;
+    float NrRoundness;
+    uint ShowNrBorder;
+    uint2 NrPadding;
 };
 
+float NrDistance(float2 pixel) {
+    const float2 scaled = abs((pixel - float2(NrBase) + 0.5) / (0.5 * max(float2(NrSize), 1.0)) - 1.0);
+    return lerp(max(scaled.x, scaled.y), length(scaled), saturate(NrRoundness));
+}
 float ShapeDistance(float2 centered) {
     const float2 shape_size = max(
         float2(ShapeWidth, ShapeHeight),
@@ -132,6 +141,15 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
         if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
             GameOutput[output_pixel] = float4(0.0, 1.0, 0.0, 1.0);
+            return;
+        }
+    }
+    if (ShowNrBorder != 0U) {
+        const float distance = NrDistance(local_pixel);
+        const float step = max(abs(NrDistance(float2(local_pixel) + float2(1, 0)) - distance),
+            abs(NrDistance(float2(local_pixel) + float2(0, 1)) - distance));
+        if (distance <= 1.0 && distance >= 1.0 - 5.0 * step) {
+            GameOutput[output_pixel] = float4(0, 1, 0, 1);
             return;
         }
     }

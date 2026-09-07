@@ -176,3 +176,25 @@ ACC DX11 reported heavy head-motion blur away from 1x with unscaled output vecto
 The correction scales displacement with the resized output grid and restores
 output-space gaze offsets. GPU readback verifies this numerical behavior; an
 ACC moving-head A/B comparison against 1x is still required.
+## NR rendering order
+
+The standard suite tests processing-resolution selection, Working scale, crop
+centers, independent resource origins, render/output-resolution motion fields,
+per-eye history changes, and restoration of NGX parameters and Streamline tags
+on success and failure. NVIDIA evaluation is stubbed in the test executable.
+Both CMake and MSBuild register the new sources.
+
+`CheekyTests.exe --d3d12-composite` also exercises the production private-color
+copy on WARP. A nonzero-origin render region in a mipmapped source is copied,
+then the private color is changed and passed through the production compositor.
+Readback checks the original source and every unrelated mip/slice, plus both
+successful private-input propagation and failed-NR fallback. This does not
+execute the full game/Streamline/transport hooks or NVIDIA feature 18.
+
+NVIDIA acceptance is still pending for native DX12, Streamline, and DX11
+Transport. On each route compare the same scene/settings in both orders across
+NR full/foveated, linked/independent shapes, SR foveation on/off, peripheral DLAA
+on/off, live switches, resize/dynamic resolution, stereo, and moving gaze.
+Record the displayed processing/working dimensions, NR and total pipeline GPU
+milliseconds, and image-quality observations. Test missing NR runtime and
+unsupported resources too: SR must use original color without post-SR NR.

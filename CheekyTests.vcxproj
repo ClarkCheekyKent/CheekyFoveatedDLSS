@@ -46,6 +46,8 @@
     <ClCompile Include="tests\motion_resample_tests.cpp" />
     <ClCompile Include="src\crop_motion.cpp" />
     <ClCompile Include="tests\support_summary_tests.cpp" />
+    <ClCompile Include="tests\nr_processing_tests.cpp" />
+    <ClCompile Include="src\dlss_nr_input.cpp" />
     <ClCompile Include="shared\gaze_math.cpp" />
     <ClCompile Include="src\foveation.cpp" />
     <ClCompile Include="src\gaze_policy.cpp" />

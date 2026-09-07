@@ -88,4 +88,99 @@ FoveationParameters dlss_nr_foveation_parameters(
     return parameters;
 }
 
+[[nodiscard]] NrRegion calculate_region(
+    const Settings& settings,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const FoveationGeometry* const shared_sr_crop,
+    const std::uint32_t render_width,
+    const std::uint32_t render_height,
+    const FoveationCenter* center
+) noexcept {
+    if (!settings.nr_foveated) {
+        return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
+    }
+    const auto parameters = center ? dlss_nr_foveation_parameters(settings, center)
+        : dlss_nr_foveation_parameters(settings, shared_sr_crop, render_width, render_height);
+    FoveationGeometry geometry{};
+    if (!calculate_foveation_geometry(
+            parameters,
+            width,
+            height,
+            width,
+            height,
+            0U,
+            0U,
+            geometry
+        )) {
+        return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
+    }
+    const auto x = dlss_nr_aligned_axis(geometry.output_base_x, geometry.output_width, width);
+    const auto y = dlss_nr_aligned_axis(geometry.output_base_y, geometry.output_height, height);
+    return {
+        x.base, y.base, x.extent, y.extent,
+        parameters.width,
+        parameters.height,
+        parameters.roundness,
+        parameters.transition_width,
+    };
+}
+
+[[nodiscard]] std::uint32_t scaled_extent(
+    const std::uint32_t extent,
+    const float scale
+) noexcept {
+    const auto requested = (std::max)(
+        32U,
+        static_cast<std::uint32_t>(
+            static_cast<float>(extent) * std::clamp(scale, 0.1F, 1.0F) + 0.5F
+        )
+    );
+    return (requested + 7U) / 8U * 8U;
+}
+
+[[nodiscard]] ScaledSubrect scale_subrect(
+    const std::uint32_t region_base,
+    const std::uint32_t region_extent,
+    const std::uint32_t source_base,
+    const std::uint32_t source_extent,
+    const std::uint32_t output_extent
+) noexcept {
+    if (!output_extent || !source_extent || region_base >= output_extent || !region_extent) return {source_base, 0U};
+    const auto base = static_cast<std::uint32_t>(std::floor(
+        static_cast<double>(region_base) * source_extent / output_extent
+    ));
+    const auto end = (std::min)(
+        source_extent,
+        static_cast<std::uint32_t>(std::ceil(
+            static_cast<double>(region_base + region_extent) * source_extent /
+                output_extent
+        ))
+    );
+    return {source_base + base, (std::max)(1U, end - base)};
+}
+
+bool calculate_dlss_nr_geometry(
+    const Settings& settings,
+    const std::uint32_t output_width,
+    const std::uint32_t output_height,
+    DlssNrGeometry& geometry,
+    const FoveationCenter* center
+) noexcept {
+    if (output_width == 0U || output_height == 0U) return false;
+    const auto region = calculate_region(
+        settings, output_width, output_height, nullptr, 0U, 0U, center
+    );
+    if (region.width == 0U || region.height == 0U) return false;
+    geometry = {
+        region.base_x,
+        region.base_y,
+        region.width,
+        region.height,
+        scaled_extent(region.width, settings.nr_working_scale),
+        scaled_extent(region.height, settings.nr_working_scale),
+    };
+    return true;
+}
+
 }  // namespace cheeky::foveated_dlss

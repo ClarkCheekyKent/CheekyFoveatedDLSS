@@ -146,6 +146,8 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/motion_resample_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/crop_motion.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/support_summary_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/nr_processing_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_nr_input.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shared/gaze_math.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/foveation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gaze_policy.cpp"

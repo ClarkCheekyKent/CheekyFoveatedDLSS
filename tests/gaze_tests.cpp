@@ -1366,6 +1366,7 @@ int run_d3d12_composite_tests();
 int run_eye_calibration_tests();
 int run_openxr_calibration_tests();
 int run_support_summary_tests();
+int run_nr_processing_tests();
 
 void test_openvr_geometry() {
     using namespace cheeky::foveated_dlss;
@@ -1537,6 +1538,7 @@ int main(int argc, char** argv) {
     failures += run_eye_calibration_tests();
     failures += run_openxr_calibration_tests();
     failures += run_openxr_calibration_format_tests();
+    failures += run_nr_processing_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

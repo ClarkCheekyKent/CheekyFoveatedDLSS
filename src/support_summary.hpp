@@ -109,6 +109,10 @@ inline std::string support_summary(const std::string& system,
         if (setting("peripheral_dlaa_enabled") == "true") timing(api, "peripheral_dlaa_gpu_ms", "Peripheral DLAA GPU");
         timing(api, "native_dlss_gpu_ms", "Native DLSS GPU");
         if (nr) {
+            timing(api, "before_full_nr_gpu_ms", "Before: full NR GPU");
+            timing(api, "before_foveated_nr_gpu_ms", "Before: foveated NR GPU");
+            timing(api, "before_pipeline_gpu_ms", "Before: total pipeline GPU");
+            timing(api, "after_pipeline_gpu_ms", "After: total pipeline GPU");
             timing(api, "full_dlss_nr_gpu_ms", "Full DLSS-NR GPU");
             timing(api, "foveated_dlss_nr_gpu_ms", "Foveated DLSS-NR GPU");
         }
@@ -150,7 +154,7 @@ inline std::string support_summary(const std::string& system,
     }
     if (nr) {
         out << "\n[DLSS-NR]\n";
-        for (const auto key : {"state", "route", "evaluation_calls", "failed_calls", "last_result", "region_width", "region_height", "working_width", "working_height"})
+        for (const auto key : {"state", "route", "evaluation_calls", "failed_calls", "last_result", "processing_order", "processing_width", "processing_height", "skip_reason", "region_width", "region_height", "working_width", "working_height"})
             row("DLSS-NR", key, key);
     }
     out << fence << "\n\n<details>\n<summary>All current add-on settings</summary>\n\n" << fence << "ini\n"

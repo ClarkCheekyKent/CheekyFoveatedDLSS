@@ -1,3 +1,4 @@
+#include "dlss_nr_input.hpp"
 #include "d3d12_composite_shader.hpp"
 #include "d3d11_composite_shader.hpp"
 #include "d3d12_output_contract.hpp"
@@ -13,6 +14,12 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+
+namespace cheeky::foveated_dlss {
+extern int nr_test_evaluations;
+extern bool nr_test_succeeds;
+extern DlssNrFrame nr_test_frame;
+}
 
 namespace {
 using Microsoft::WRL::ComPtr;
@@ -104,7 +111,7 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
-    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false) {
+    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false, bool before_nr = false, bool nr_success = true) {
     ComPtr<ID3D12InfoQueue> messages;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) {
         messages->ClearStoredMessages();
@@ -127,6 +134,64 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     transition(list.Get(), dlss.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    ID3D12Resource* composite_color = color.resource.Get();
+    ComPtr<ID3D12Resource> copy_probe;
+    ComPtr<ID3D12DescriptorHeap> clear_heap, clear_cpu_heap;
+    if (before_nr) {
+        Settings settings{};
+        settings.nr_enabled = true;
+        settings.nr_processing_order = NrProcessingOrder::before_upscaling;
+        DlssNrFrame frame{};
+        frame.view_id = 500U;
+        frame.command_list = list.Get();
+        frame.color = color.resource.Get();
+        frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        frame.input_width = 24U; frame.input_height = 20U;
+        frame.output_width = 48U; frame.output_height = 40U;
+        frame.color_base_x = 4U; frame.color_base_y = 2U;
+        nr_test_succeeds = nr_success;
+        const auto calls = nr_test_evaluations;
+        auto* processed = prepare_dlss_nr_input(frame, settings);
+        require(nr_test_evaluations == calls + 1, "Before NR was not evaluated exactly once");
+        require(nr_test_frame.processing_width == 24U && nr_test_frame.processing_height == 20U,
+            "Before NR received display dimensions");
+        require(nr_test_frame.color != color.resource.Get(), "NR received game-owned color");
+        if (!nr_success) require(processed == nullptr, "Failed NR propagated private color");
+        if (processed) {
+            require((processed->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0U,
+                "Private NR color lacks UAV capability");
+            composite_color = processed;
+            copy_probe = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
+            transition(list.Get(), processed, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+            source.pResource = processed;
+            source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.pResource = copy_probe.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            destination.PlacedFootprint = color.footprints[0];
+            list->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
+            transition(list.Get(), processed, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            D3D12_DESCRIPTOR_HEAP_DESC clear_desc{};
+            clear_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            clear_desc.NumDescriptors = 1U;
+            clear_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            check(device->CreateDescriptorHeap(&clear_desc, IID_PPV_ARGS(&clear_heap)));
+            clear_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            check(device->CreateDescriptorHeap(&clear_desc, IID_PPV_ARGS(&clear_cpu_heap)));
+            D3D12_UNORDERED_ACCESS_VIEW_DESC clear_view{};
+            clear_view.Format = format;
+            clear_view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            device->CreateUnorderedAccessView(processed, nullptr, &clear_view, clear_heap->GetCPUDescriptorHandleForHeapStart());
+            device->CreateUnorderedAccessView(processed, nullptr, &clear_view, clear_cpu_heap->GetCPUDescriptorHandleForHeapStart());
+            ID3D12DescriptorHeap* clear_heaps[]{clear_heap.Get()};
+            list->SetDescriptorHeaps(1U, clear_heaps);
+            const float green_color[]{0.0F, 1.0F, 0.0F, 1.0F};
+            list->ClearUnorderedAccessViewFloat(clear_heap->GetGPUDescriptorHandleForHeapStart(),
+                clear_cpu_heap->GetCPUDescriptorHandleForHeapStart(), processed, green_color, 0U, nullptr);
+            transition(list.Get(), processed, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+    }
+
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = 3;
@@ -143,7 +208,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
     }
-    device->CreateShaderResourceView(color.resource.Get(), &srv, cpu);
+    device->CreateShaderResourceView(composite_color, &srv, cpu);
     cpu.ptr += increment;
     device->CreateShaderResourceView(dlss.resource.Get(), &srv, cpu);
     cpu.ptr += increment;
@@ -164,7 +229,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         params[i].DescriptorTable = {1, &ranges[i]};
     }
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[2].Constants = {0, 0, 24};
+    params[2].Constants = {0, 0, 32};
     D3D12_ROOT_SIGNATURE_DESC rd{};
     rd.NumParameters = 3;
     rd.pParameters = params;
@@ -190,11 +255,12 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     list->SetComputeRootDescriptorTable(0, gpu);
     gpu.ptr += 2ULL * increment;
     list->SetComputeRootDescriptorTable(1, gpu);
-    std::array<UINT32, 24> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
+    std::array<UINT32, 32> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
+    if (before_nr) { constants[4] = 4U; constants[5] = 2U; constants[6] = 24U; constants[7] = 20U; }
     const float one = 1.0F;
     std::memcpy(&constants[12], &one, sizeof(one));
     std::memcpy(&constants[13], &one, sizeof(one));
-    list->SetComputeRoot32BitConstants(2, 24, constants.data(), 0);
+    list->SetComputeRoot32BitConstants(2, 32, constants.data(), 0);
     list->Dispatch(2, 2, 1);
     transition(list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     auto readback = buffer(device, output.bytes, D3D12_HEAP_TYPE_READBACK);
@@ -208,9 +274,20 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         dst.PlacedFootprint = output.footprints[i];
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
+    auto original_readback = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
+    transition(list.Get(), color.resource.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT i = 0; i < color.footprints.size(); ++i) {
+        D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+        source.pResource = color.resource.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source.SubresourceIndex = i;
+        destination.pResource = original_readback.Get(); destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        destination.PlacedFootprint = color.footprints[i];
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
     check(list->Close());
     ID3D12CommandList* lists[]{list.Get()};
     queue->ExecuteCommandLists(1, lists);
+    note_dlss_nr_input_submission(queue.Get(), list.Get());
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
     check(queue->Signal(fence.Get(), 1));
@@ -230,7 +307,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
             for (UINT x = 0; x < f.Footprint.Width; ++x) {
                 UINT32 expected = sentinel;
                 if (i == 0 && x >= 4 && x < 28 && y >= 2 && y < 22) {
-                    expected = x >= 12 && x < 20 && y >= 8 && y < 16 ? green : blue;
+                    expected = (before_nr && nr_success) || (x >= 12 && x < 20 && y >= 8 && y < 16) ? green : blue;
                 }
                 if (checker && i == 0 && x >= 12 && x < 20 && y >= 8 && y < 16) {
                     // Independent CPU reference: integrate every source cell's
@@ -272,6 +349,28 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     }
     readback->Unmap(0, nullptr);
     require(correct, "Composite pixels incorrect or another slice/mip was modified");
+    check(original_readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
+    bool source_unchanged = true;
+    for (const auto& footprint : color.footprints)
+        for (UINT y = 0; y < footprint.Footprint.Height; ++y) {
+            const auto* row = reinterpret_cast<const UINT32*>(mapped + footprint.Offset + y * footprint.Footprint.RowPitch);
+            for (UINT x = 0; x < footprint.Footprint.Width; ++x) source_unchanged &= row[x] == blue;
+        }
+    original_readback->Unmap(0, nullptr);
+    require(source_unchanged, "NR modified original color or unrelated source subresources");
+    if (copy_probe) {
+        check(copy_probe->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
+        bool copied = true;
+        const auto& footprint = color.footprints[0];
+        for (UINT y = 2; y < 22; ++y) {
+            const auto* row = reinterpret_cast<const UINT32*>(mapped + footprint.Offset + y * footprint.Footprint.RowPitch);
+            for (UINT x = 4; x < 28; ++x) copied &= row[x] == blue;
+        }
+        copy_probe->Unmap(0, nullptr);
+        require(copied, "Private color copy lost the active region or origin");
+    }
+    release_dlss_nr_inputs(500U);
+    nr_test_succeeds = true;
     if (messages) {
         for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
             SIZE_T size{};
@@ -307,6 +406,8 @@ int run_d3d12_composite_tests() {
         ComPtr<ID3D12Device> device;
         check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
         run_case(device.Get(), 1, 1);
+        run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, true);
+        run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, false);
         run_case(device.Get(), 2, 5);
         run_case(device.Get(), 4, 5);
         run_case(device.Get(), 2, 5, DXGI_FORMAT_R11G11B10_FLOAT);
