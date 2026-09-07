@@ -27,8 +27,10 @@ namespace {
 namespace fs = std::filesystem;
 constexpr wchar_t issue_base[] =
     L"https://github.com/Williem3/CheekyFoveatedDLSS/issues/new?template=bug_report.yml";
-std::future<fs::path> pending;
+struct PreparedReport { fs::path zip; std::string markdown; };
+std::future<PreparedReport> pending;
 fs::path last_zip;
+std::string last_markdown;
 std::string status;
 std::string pending_summary, last_summary;
 
@@ -150,7 +152,7 @@ std::string diagnostics_text() {
         out << "received_output_height=" << d.received_output_height << '\n';
         out << "motion_vector_width=" << d.motion_vector_width << '\n';
         out << "motion_vector_height=" << d.motion_vector_height << '\n';
-        out << "motion_vector_space=" << static_cast<unsigned>(d.motion_vector_space) << '\n';
+        out << "motion_vector_space=" << motion_vector_space_name(d.motion_vector_space) << '\n';
         out << "transport_gpu_ms=" << d.transport_gpu_ms << '\n';
         out << "foveated_dlss_gpu_ms=" << d.foveated_dlss_gpu_ms << '\n';
         out << "peripheral_dlaa_gpu_ms=" << d.peripheral_dlaa_gpu_ms << '\n';
@@ -161,11 +163,11 @@ std::string diagnostics_text() {
         out << "native_frame_ms=" << d.native_frame_ms << '\n';
         out << "has_private_result=" << d.has_private_result << '\n';
         out << "last_private_result=" << d.last_private_result << '\n';
-        out << "last_result=" << d.last_result << '\n';
+        out << "last_result=0x" << std::hex << d.last_result << std::dec << '\n';
         out << "state=" << static_cast<unsigned>(d.state) << '\n';
         out << "d3d11_execution_path=" << static_cast<unsigned>(d.d3d11_execution_path) << '\n';
         out << "d3d11_transport_status=" << static_cast<unsigned>(d.d3d11_transport_status) << '\n';
-        out << "d3d12_ngx_route=" << static_cast<unsigned>(d.d3d12_ngx_route) << '\n';
+        out << "d3d12_ngx_route=" << d3d12_ngx_route_name(d.d3d12_ngx_route) << '\n';
         out << "state_name=" << diagnostic_state_name(d.state) << '\n'
             << "execution_path=" << d3d11_execution_path_name(d.d3d11_execution_path) << '\n'
             << "transport_status=" << d3d11_transport_status_name(d.d3d11_transport_status) << '\n';
@@ -187,8 +189,9 @@ std::string diagnostics_text() {
     out << "using_gaze=" << g.using_gaze << '\n';
     out << "mapping_ambiguous=" << g.mapping_ambiguous << '\n';
     out << "last_reset_reason=" << static_cast<unsigned>(g.last_reset_reason) << '\n';
-    for (const auto& v : g.views) {
-        out << "\n[Eye]\n";
+    for (std::size_t eye = 0; eye < g.views.size(); ++eye) {
+        const auto& v = g.views[eye];
+        out << "\n[Eye " << eye << "]\n";
         out << "center_u=" << v.center_u << '\n';
         out << "center_v=" << v.center_v << '\n';
         out << "dlss_view_id=" << v.dlss_view_id << '\n';
@@ -219,7 +222,7 @@ std::string diagnostics_text() {
     const auto nr = dlss_nr_snapshot();
     out << "\n[DLSS-NR]\n";
     out << "state=" << dlss_nr_state_name(nr.state) << '\n';
-    out << "route=" << static_cast<unsigned>(nr.route) << '\n';
+    out << "route=" << dlss_nr_route_name(nr.route) << '\n';
     out << "candidate_calls=" << nr.candidate_calls << '\n';
     out << "evaluation_calls=" << nr.evaluation_calls << '\n';
     out << "failed_calls=" << nr.failed_calls << '\n';
@@ -269,7 +272,49 @@ void collect_log(std::vector<SupportFile>& files, std::ostringstream& manifest,
     files.push_back({name, std::move(contents)});
 }
 
-fs::path create_report(const fs::path& addon, const fs::path& game,
+// Use a fence longer than any backtick run in captured text, so logs cannot
+// accidentally terminate a code block and alter the report's Markdown structure.
+std::string code_block(const std::string& text) {
+    std::size_t longest{}, run{};
+    for (const char c : text) {
+        run = c == '`' ? run + 1 : 0;
+        longest = (std::max)(longest, run);
+    }
+    const std::string fence((std::max)(std::size_t{3}, longest + 1), '`');
+    return fence + "text\n" + text + "\n" + fence + "\n\n";
+}
+
+std::string issue_markdown(const std::vector<SupportFile>& files) {
+    std::string report = "## Automatically collected report\n\n";
+    for (const auto& section : {
+            std::pair{"system.txt", "System and runtime versions"},
+            std::pair{"diagnostics.txt", "Graphics, DLSS and OpenXR diagnostics"},
+            std::pair{"settings.ini", "All current add-on settings"},
+            std::pair{"README.txt", "Capture details and log availability"}}) {
+        for (const auto& file : files) {
+            if (file.name == section.first)
+                report += std::string("### ") + section.second + "\n\n" + code_block(file.contents);
+        }
+    }
+    report += "### Recent log excerpts\n\nFull captured logs are in the attached ZIP. "
+              "Excerpts below contain up to the last 2 KiB of each available log.\n\n";
+    bool has_logs{};
+    for (const auto& file : files) {
+        if (!file.name.ends_with(".log")) continue;
+        has_logs = true;
+        auto excerpt = file.contents.substr(file.contents.size() > 2048 ? file.contents.size() - 2048 : 0);
+        if (file.contents.size() > 2048) {
+            const auto newline = excerpt.find('\n');
+            if (newline != std::string::npos) excerpt.erase(0, newline + 1);
+            excerpt = "[earlier log content omitted]\n" + excerpt;
+        }
+        report += "#### " + file.name + "\n\n" + code_block(excerpt.empty() ? "(empty)" : excerpt);
+    }
+    if (!has_logs) report += "No logs were available; see capture details above.\n";
+    return report;
+}
+
+PreparedReport create_report(const fs::path& addon, const fs::path& game,
                        std::string settings, std::string diagnostics) {
     std::array<wchar_t, 32768> temp{};
     const auto size = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
@@ -299,7 +344,7 @@ fs::path create_report(const fs::path& addon, const fs::path& game,
 
     std::ostringstream system;
     system << "Game: " << utf8(game.filename().wstring()) << "\nGame version: " << file_version(game)
-           << "\nAdd-on version: " << file_version(addon) << '\n';
+           << "\nAdd-on version: " << CHEEKY_VERSION << "\nArchitecture: 64-bit\n";
     using RtlVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
     const auto rtl = reinterpret_cast<RtlVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
     RTL_OSVERSIONINFOW os{};
@@ -323,17 +368,37 @@ fs::path create_report(const fs::path& addon, const fs::path& game,
         }
         factory->Release();
     }
-    for (const auto dll : {L"nvngx_dlss.dll", L"nvngx_dlssnr.dll", L"CheekyOpenXRLayer.dll", L"dxgi.dll", L"d3d11.dll"}) {
-        if (const auto module = GetModuleHandleW(dll))
-            system << utf8(dll) << ": " << file_version(module_path(module)) << '\n';
+    system << "\nRelevant runtime files (loaded status and on-disk presence are separate):\n";
+    for (const auto dll : {L"nvngx_dlss.dll", L"nvngx_dlssnr.dll", L"CheekyOpenXRLayer.dll",
+                           L"ReShade64.dll", L"dxgi.dll", L"d3d11.dll", L"sl.interposer.dll", L"sl.dlss.dll"}) {
+        system << utf8(dll) << ": ";
+        if (const auto module = GetModuleHandleW(dll)) {
+            system << "loaded, version " << file_version(module_path(module));
+        } else {
+            system << "not loaded";
+        }
+        std::error_code error;
+        const bool by_game = fs::exists(game.parent_path() / dll, error);
+        error.clear();
+        const bool by_addon = fs::exists(addon.parent_path() / dll, error);
+        system << "; beside game=" << (by_game ? "present" : "absent")
+               << "; beside add-on=" << (by_addon ? "present" : "absent") << '\n';
     }
     files.push_back({"system.txt", system.str()});
     files.push_back({"README.txt", manifest.str()});
+    auto markdown = issue_markdown(files);
+    {
+        std::ofstream preview(folder / L"issue-report.md", std::ios::binary);
+        preview.exceptions(std::ios::failbit | std::ios::badbit);
+        preview.write(markdown.data(), markdown.size());
+        preview.close();
+    }
+    files.push_back({"issue-report.md", markdown});
     const auto partial = folder / L"report.partial";
     const auto zip = folder / (std::wstring(name) + L".zip");
     write_support_zip(partial, files);
     fs::rename(partial, zip);
-    return zip;
+    return {zip, std::move(markdown)};
 }
 
 bool open_target(const wchar_t* target, const wchar_t* args = nullptr) {
@@ -359,14 +424,17 @@ void open_issue() {
 void draw_support_report(HMODULE addon) {
     try {
         if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            last_zip = pending.get();
+            auto report = pending.get();
+            last_zip = std::move(report.zip);
+            last_markdown = std::move(report.markdown);
             last_summary = pending_summary;
-            status = "Report prepared. Drag the selected ZIP into the GitHub issue, describe the problem, then submit.";
+            ImGui::SetClipboardText(last_markdown.c_str());
+            status = "Report copied. Paste (Ctrl+V) into Diagnostics and settings on GitHub, then drag the selected ZIP into Support ZIP.";
             open_issue();
             show_zip();
         }
         ImGui::SeparatorText("Report a problem");
-        ImGui::TextWrapped("Collect logs, settings and diagnostics into a ZIP. Review it before attaching; logs may contain personal paths. Nothing uploads automatically.");
+        ImGui::TextWrapped("Prepare a detailed issue report and ZIP. The report is copied to your clipboard for pasting into GitHub. Review before sharing; logs may contain personal paths. Nothing uploads automatically.");
         ImGui::BeginDisabled(pending.valid());
         const bool clicked = ImGui::Button("Report an issue...");
         ImGui::EndDisabled();
@@ -387,6 +455,15 @@ void draw_support_report(HMODULE addon) {
         if (!last_zip.empty()) {
             ImGui::TextWrapped("%s", utf8(last_zip.wstring()).c_str());
             if (ImGui::Button("Show ZIP")) show_zip();
+            ImGui::SameLine();
+            if (ImGui::Button("Copy detailed report")) {
+                ImGui::SetClipboardText(last_markdown.c_str());
+                status = "Detailed report copied. Paste into Diagnostics and settings on GitHub.";
+            }
+            if (ImGui::Button("Review report")) {
+                const auto preview = last_zip.parent_path() / L"issue-report.md";
+                if (!open_target(preview.c_str())) status = "Could not open report. Find issue-report.md beside the ZIP.";
+            }
             ImGui::SameLine();
             if (ImGui::Button("Open GitHub issue")) open_issue();
             ImGui::SameLine();
