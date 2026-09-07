@@ -28,7 +28,7 @@ namespace cheeky::foveated_dlss {
 namespace {
 namespace fs = std::filesystem;
 constexpr wchar_t issue_base[] =
-    L"https://github.com/Williem3/CheekyFoveatedDLSS/issues/new?template=bug_report.yml";
+    L"https://github.com/ClarkCheekyKent/CheekyFoveatedDLSS/issues/new?template=bug_report.yml";
 struct PreparedReport { fs::path zip; std::string markdown; };
 std::future<PreparedReport> pending;
 fs::path last_zip;
