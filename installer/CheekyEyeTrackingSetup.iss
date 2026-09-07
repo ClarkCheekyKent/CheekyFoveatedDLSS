@@ -1,6 +1,6 @@
 ; Compile with scripts/build-installer.ps1 and Inno Setup 6.3 or newer.
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #error Build with scripts/build-installer.ps1 to supply the shared release version.
 #endif
 #ifndef SourceDir
   #define SourceDir "..\bin\Release"

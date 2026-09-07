@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+(\.\d+)?$')]
-    [string]$Version = '0.1.0',
+    [string]$Version,
     [string]$IsccPath,
     # Use only after building Release artifacts (also supports CMake output).
     [switch]$SkipBuild,
@@ -11,6 +11,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+
+$versionHeader = Get-Content -LiteralPath (Join-Path $projectRoot 'shared\version.h') -Raw
+if ($versionHeader -notmatch '(?m)^#define CHEEKY_VERSION "(\d+\.\d+\.\d+)"') {
+    throw 'Could not read the release version from shared/version.h.'
+}
+$sourceVersion = $Matches[1]
+if ($Version -and $Version -ne $sourceVersion) {
+    throw "Installer version $Version does not match shared/version.h ($sourceVersion)."
+}
+$Version = $sourceVersion
 
 if (-not $IsccPath) {
     $compiler = Get-Command ISCC.exe -ErrorAction SilentlyContinue

@@ -7,6 +7,7 @@
 #include "runtime.hpp"
 #include "settings.hpp"
 #include "cheeky_gaze_abi.h"
+#include "version.h"
 
 #define ImTextureID ImU64
 #include <imgui.h>
@@ -1511,6 +1512,8 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
     );
     bool changed{};
 
+    ImGui::TextDisabled("Cheeky Foveated DLSS v" CHEEKY_VERSION);
+    ImGui::Separator();
     ImGui::TextUnformatted("Changes apply live to the next DLSS evaluation.");
     ImGui::TextDisabled("DX12 Transport enables DX12 features for DX11 games.");
     int d3d11_path = settings.d3d11_use_d3d12_transport ? 1 : 0;

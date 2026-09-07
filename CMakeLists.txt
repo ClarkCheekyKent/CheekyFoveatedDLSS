@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
 
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "shared/version.h")
+file(STRINGS "shared/version.h" CHEEKY_VERSION_LINE REGEX "^#define CHEEKY_VERSION ")
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" CHEEKY_VERSION "${CHEEKY_VERSION_LINE}")
+
 project(
     CheekyFoveatedDLSS
-    VERSION 0.1.0
+    VERSION ${CHEEKY_VERSION}
     DESCRIPTION "Foveated DLSS-SR and DLSS-NR ReShade add-on"
     LANGUAGES C CXX
 )
