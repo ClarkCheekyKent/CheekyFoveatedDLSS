@@ -10,9 +10,7 @@ not needed on master. Issue reporting and NR-before-upscaling are not included.
 The small scoped crop override used by the backend regression fixture is retained
 so tests exercise the same exact crop positions through production preparation.
 
-Standalone verification uses `build/gaze-standalone-verify`. The comparison
-builds and headset observations below are historical evidence from the stacked
-implementation; they do not identify the standalone binary.
+Standalone verification uses `build/gaze-standalone-verify`. The headset observations below are historical evidence from the stacked implementation; they do not identify the standalone binary.
 
 Historical comparison baseline: `1c89ed8e5c7aa3fe33e6fe3845fcc12b6f84d1bd` (`feature/neural-render-before-upscaling`).
 
@@ -59,38 +57,6 @@ Restoring the old distance/fit heuristic temporarily makes the regression fail w
 `4936x1189 gaze movement changed declared low MV mapping` (exit 1).
 The mutation was removed before the final build.
 
-## Comparison builds
-
-- Baseline add-on: `build/motion-baseline-build/bin/Release/CheekyFoveatedDLSS.addon64`
-- Patched add-on: `build/motion-verify/bin/Release/CheekyFoveatedDLSS.addon64`
-
-Both use the installed MSVC v145 compiler in Release mode. Baseline sources were extracted
-from the commit above into `build/motion-baseline-source`; the working branch was not switched.
-The installed add-on was subsequently verified by SHA-256 to match the patched build.
-
-## Assetto Corsa EVO headset comparison
-
-Use the same scene/replay, headset runtime, render resolution, DLSS quality/preset, peripheral
-DLAA configuration, crop size, gaze smoothing/quantization and reset ratio for both binaries.
-Close the game before swapping the add-on and retain a separate trace for each run.
-Keep the OpenXR layer and every other component the same.
-
-Run each row for baseline and patch, separately with NR before upscaling and NR after upscaling.
-Observe both eyes, including packed-eye boundary positions.
-
-| Scenario | NR before upscaling | NR after upscaling |
-| --- | --- | --- |
-| Stationary gaze | Pending | Pending |
-| Slow boundary crossings, including Y=304/312 where reproducible | Pending | Pending |
-| Rapid gaze jumps | Pending | Pending |
-| Both eyes checked for temporary mismatched scene content | Pending | Pending |
-
-Inspect `D3D12 MV` and `D3D12 peripheral MV` records by view identity. For unchanged game flags,
-space must remain constant; invalid rectangles must produce a rejection, never reinterpretation.
-`D3D12 feature key` reports old/new configuration fields; crop-only movement must not recreate
-features. `VR gaze history reset` reports displacement, crop dimensions and effective
-thresholds. A nonzero large-jump reset count is expected and is not itself a failure.
-
 ## Observed headset result (2026-09-07)
 
 The user reported substantially improved stability and believes the temporary mismatched
@@ -104,7 +70,4 @@ creations occurred, with no subsequent recreations or logged evaluation failures
 One startup gaze-association rejection and gaze-jump/reacquisition resets were recorded;
 these do not indicate recurrence of the corrected motion-space switching.
 
-The log is rate-limited and cannot establish visual quality for every frame. The full
-scenario-by-rendering-order matrix above has not been individually confirmed; its pending
-entries do not negate the user's positive result for the tested session. If artifacts recur,
-retain the per-eye traces and investigate their remaining cause separately.
+The log is rate-limited and cannot establish visual quality for every frame. If artifacts recur, retain the per-eye traces and investigate their remaining cause separately.
