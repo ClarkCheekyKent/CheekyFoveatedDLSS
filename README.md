@@ -15,7 +15,8 @@ Create an issue if you encounter problem with game compatibility, bugs, or have 
 - A Direct3D 11 or Direct3D 12 game with DLSS Super Resolution
 - The 64-bit version of ReShade **with full add-on support**
 - `CheekyFoveatedDLSS.addon64` from this project's release package
-- For eye tracking: an OpenXR runtime exposing `XR_EXT_eye_gaze_interaction`
+- For VR: `CheekyEyeTrackingSetup.exe` from the matching release to install the OpenXR layer for automatic stereo alignment and gaze; automatic alignment needs no eye tracker
+- For real eye tracking: the OpenXR layer, an eye-tracked headset, and a runtime exposing usable `XR_EXT_eye_gaze_interaction` input
 
 This is intended for games where ReShade add-ons and DLL replacement are allowed. Avoid using it with competitive or anti-cheat-protected games unless the game's rules explicitly permit modding.
 
@@ -23,40 +24,31 @@ This is intended for games where ReShade add-ons and DLL replacement are allowed
 
 1. Install the 64-bit **ReShade with full add-on support** build into the game. Select the game's correct rendering API when prompted.
 2. Copy `CheekyFoveatedDLSS.addon64` into the game directory containing the ReShade DLL and game executable.
-3. Start the game and enable DLSS in the game's graphics settings.
-4. Open the ReShade overlay and select **Cheeky Foveated DLSS** in the **Add-ons** tab.
-5. Confirm that **Foveated DLSS-SR** is enabled (it is on by default). Changes apply live on the next DLSS evaluation.
+3. For VR, close OpenXR games and run **CheekyEyeTrackingSetup.exe** from the matching release. Accept the Windows administrator prompt. This installs and registers the OpenXR layer used for automatic stereo alignment, including on headsets without eye tracking. It only needs to be installed once for all games.
+4. Start the game and enable DLSS in the game's graphics settings.
+5. Open the ReShade overlay and select **Cheeky Foveated DLSS** in the **Add-ons** tab. Confirm that **Foveated DLSS-SR** is enabled (it is on by default).
+6. Leave **Foveation center** set to **Fixed** and **Automatic stereo alignment** enabled. Use **Height offset** to move the region up or down. If you have an eye-tracked headset and a compatible runtime, select **OpenXR gaze** to follow your eyes instead.
+7. In VR, enable the red alignment border and check **Diagnostics > OpenXR eye tracking** for stable per-eye mappings and **OpenXR** alignment. Eye-tracking indicators can remain **No** during fixed placement. Turn off the border when finished.
 
-### Optional eye tracking (Experimental)
+The layer installer places a shared copy in
+`C:\Program Files\CheekyFoveatedDLSS\OpenXR` and registers it automatically;
+no game-folder selection is needed. Install ReShade and the add-on separately
+for each game. Changes in the overlay apply live on the next DLSS evaluation.
 
-Eye tracking is optional and remains off by default. If you only want fixed
-foveation, the add-on installation above is all you need.
+Quest 3 has no eye-tracking hardware: use Fixed with automatic alignment and
+Height offset. Real gaze requires an eye-tracked headset; otherwise the panel
+shows a red message and falls back to fixed placement. Automatic alignment
+requires a supported OpenXR rendering path or usable Streamline projection
+data from the game; when neither is available, manual offsets are used.
 
-1. Download and run **CheekyEyeTrackingSetup.exe** from the release package.
-   Close OpenXR games first and accept the Windows administrator prompt.
-2. The installer places one shared copy of the OpenXR layer in
-   `C:\Program Files\CheekyFoveatedDLSS\OpenXR` (on the Windows system drive)
-   and registers it automatically. No game-folder selection is needed.
-3. Start or restart the game and open **Add-ons > Cheeky Foveated DLSS** in
-   the ReShade overlay.
-4. Enable **Foveated DLSS-SR**, then set **Foveation center** to **OpenXR
-   gaze**.
-5. To verify eye tracking, enable the red alignment border and open
-   **Diagnostics > OpenXR eye tracking**. The layer and gaze must report as
-   available, and both eyes must acquire stable DLSS-view mappings before the
-   border follows your gaze.
-
-The installer only installs the shared OpenXR layer; it does not include or
-modify `CheekyFoveatedDLSS.addon64`, install ReShade, or change game files.
-For each additional game, install ReShade with full add-on support, copy the
-add-on into its game folder, and select **OpenXR gaze**. The game and runtime
-must support the OpenXR eye-tracking path described below.
-
-To update, close OpenXR games and run the newer installer. To uninstall, remove
+To update, close OpenXR games, run the newer installer, and update the add-on in
+each game folder from the matching release. To uninstall the layer, remove
 **Cheeky OpenXR Eye Tracking** through Windows **Settings > Apps**. This removes
-the shared layer and its registration for all games; the add-on remains in
-each game and falls back to fixed foveation. As an emergency per-launch bypass,
-set `CHEEKY_OPENXR_LAYER_DISABLE=1` before starting the game.
+the shared layer and its registration for all games; the add-on remains in each
+game. OpenXR alignment and gaze then become unavailable; usable Streamline
+projection data can still provide automatic alignment, otherwise manual fixed
+placement is used. As an emergency per-launch bypass, set
+`CHEEKY_OPENXR_LAYER_DISABLE=1` before starting the game.
 
 If the game ships with an older DLSS model, use [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper) to install a newer DLSS 4.5 model. Use only the official DLSS Swapper releases, and be aware that a game update may restore its original DLL.
 
@@ -77,7 +69,7 @@ Start with the defaults, then tune the region while looking at a representative 
 1. Turn on **Show 5 px red alignment border** so the processed region is visible.
 2. Adjust **Fovea width** and **Fovea height**. Smaller values improve performance but make the transition easier to notice.
 3. Use **Height offset** to move the region vertically and **Transition width** to soften its boundary.
-4. In VR, leave **Automatic stereo alignment** enabled to center each eye using available projection data. If the status reports manual fallback, adjust **Stereo X offset** until the region is centered correctly in both eyes. Enable **Invert stereo eye order** if the offsets move in the wrong directions.
+4. In VR, leave **Automatic stereo alignment** enabled to center each eye using available projection data. If the status reports manual fallback, install or update the OpenXR layer first. If the rendering path is unsupported, select **Fixed** and disable **Automatic stereo alignment** to expose **Stereo X offset** for manual adjustment. For reversed packed eye order, use **Stereo mapping override > Invert stereo eye order**.
 5. Turn the red alignment border off when calibration is complete.
 
 The main controls and their defaults are:
@@ -90,9 +82,10 @@ The main controls and their defaults are:
 | Peripheral preset | E (Fastest) | Selects E, K, L, or M for the peripheral DLAA pass. |
 | Periphery scale | `0.75` | Downscales the periphery further from the original render resolution. |
 | Fovea width / height | `0.55` / `0.45` | Sets the normalized size of the DLSS-processed region. |
-| Stereo X offset | `0.60` | Moves the two eye regions in equal and opposite horizontal directions. It appears after two views are detected. |
-| Invert stereo eye order | Off | Swaps the stereo offset directions for games that report the right eye first. |
-| Height offset | `-0.45` | Moves the region from the top (`-1`) through center (`0`) to bottom (`+1`). |
+| Automatic stereo alignment | On | Uses OpenXR or usable Streamline projection data to align each eye without manual X adjustment. |
+| Stereo X offset | `0.60` | Manual horizontal placement; shown when two views are detected, Fixed is selected, and automatic alignment is off. |
+| Invert stereo eye order | Off | Advanced override under Stereo mapping override for reversed packed eye order and manual stereo offsets. |
+| Height offset | `0.00` with automatic alignment; `-0.45` in manual placement | Moves fixed placement up (negative) or down (positive). With automatic alignment, zero preserves the detected center. In gaze modes this is Fallback height offset and does not shift valid gaze. |
 | Roundness | `0.00` | Blends the region shape from rectangular (`0`) to elliptical (`1`). This does not affect performance. |
 | Transition width | `0.040` | Feathers the edge of the region. |
 | Show 5 px red alignment border | Off | Displays the processed region while calibrating the fovea. |
@@ -161,24 +154,36 @@ These games have been tested; other DLSS titles may also work. Support depends o
 - Assetto Corsa Competizione
 - Hogwarts Legacy with [UEVR](https://uevr.io/) (And also flat)
 
-### Eye tracking
+### Eye tracking (experimental)
 
 I do not own an eye tracked headset, however due to the open source nature of the
 project @Williem3 was able to add in the initial implementaiton. I cannot fully validate 
 the eye tracking experience but rely on community reports if there are issues.
 
-The implementation intentionally falls back to the configured fixed center if
-the layer is absent, gaze becomes stale, the ABI does not match, the game uses a
-non-stereo view configuration, or resource correlation is ambiguous. Separate
-eye textures and side-by-side subrectangles are supported. Quad views, non-zero
-texture-array slices, OpenVR-only games, and transitive intermediate-resource
-tracking are deferred.
+Eye tracking uses the OpenXR layer installed in the [main installation steps](#installation).
+It requires an eye-tracked headset and a runtime that supplies usable gaze input.
+Automatic stereo alignment works without eye tracking; Quest 3 users should use
+**Fixed** with **Automatic stereo alignment** and adjust **Height offset** as needed.
 
-For hardware validation, disable the game's built-in eye-tracked foveation,
-enable the red alignment border, and inspect **Diagnostics > OpenXR eye
-tracking**. Both eyes must show stable and different DLSS-view mappings before
-the border follows gaze. A blink holds the last sample for 100 ms and then
-returns to the fixed center over 150 ms.
+To enable real tracking, select **Foveation center > OpenXR gaze**. For validation,
+disable the game's built-in eye-tracked foveation, enable the red alignment border,
+and open **Diagnostics > OpenXR eye tracking**. Check **System support**, **Gaze
+action active**, **Tracking valid**, and **Using gaze**, along with stable, distinct
+DLSS-view mappings for both eyes. **Eye gaze extension: Yes** alone does not mean
+the headset supplies eye tracking.
+
+Valid gaze sets both eye centers directly; it needs no manual stereo X offset.
+**Fallback height offset** only adjusts fixed placement when gaze is unavailable
+and does not shift valid gaze. If tracking is unavailable, a red message appears
+directly below the selector and the add-on falls back to fixed placement, using
+automatic alignment where available and saved manual placement otherwise.
+Temporary signal loss holds the last valid gaze for 100 ms, then returns toward
+the fixed fallback over 150 ms.
+
+Separate eye textures and supported packed stereo layouts can be mapped. Quad
+views, non-zero texture-array slices, and OpenVR-only gaze paths are not supported.
+Missing, stale, or ambiguous data also causes fallback. To test motion without an
+eye tracker, use [Simulated gaze](#simulated-gaze-no-eye-tracker-required); this does not validate real eye-tracker input or latency.
 
 ## Support
 
@@ -218,7 +223,7 @@ OpenXR seam and `src/foveation.hpp` contains renderer-independent crop geometry.
 ### Simulated gaze (no eye tracker required)
 
 For Quest 3 PC VR testing, install the add-on and the matching OpenXR
-eye-tracking installer as described above. In the ReShade add-on panel, select **Foveation
+layer installer as described above. In the ReShade add-on panel, select **Foveation
 center > Simulated gaze** and enable **Show 5 px red alignment border**.
 The simulated direction follows a repeating pattern relative
 to your head. Both eyes use the real OpenXR views and the existing projection,
@@ -235,7 +240,7 @@ Choose **Fixed** to stop or **OpenXR gaze** to return to actual tracking.
 The selected mode is saved with the other settings. This tests synthetic motion,
 not real eye tracker acquisition or latency.
 
-### Building the eye-tracking installer
+### Building the OpenXR layer installer
 
 With [Inno Setup 6.3 or newer](https://jrsoftware.org/isdl.php) installed in a
 standard location or available on PATH, run from the repository root:
@@ -272,8 +277,3 @@ and uninstall on a Windows test machine; verify that the manifest's DWORD is
 only that value and the installed files. Verify gaze in a supported game after
 restarting it. Release signing, when available, should be applied to the DLL
 before packaging and to the final installer EXE before publishing.
-
-Real OpenXR gaze requires an eye-tracked headset exposed by the runtime.
-Quest 3 has no eye-tracking hardware: use Fixed with automatic alignment and
-Height offset, or simulated gaze for testing. The gaze panel reports why real
-gaze is unavailable instead of showing old sample coordinates as current.
