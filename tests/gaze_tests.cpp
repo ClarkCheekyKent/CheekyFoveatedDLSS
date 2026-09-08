@@ -13,6 +13,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -640,6 +641,52 @@ void test_streamline_private_sr_viewport() {
     }
 }
 
+void test_dlss_nr_stable_crop_and_history() {
+    using namespace cheeky::foveated_dlss;
+    // Sweep every pixel, including both edges and a non-aligned capacity.
+    for (const auto extent : {400U, 403U, 999U, 1003U}) {
+        const auto expected = (std::min)(1003U, (extent + 7U) / 8U * 8U);
+        for (unsigned position = 0U; position <= 1003U - extent; ++position) {
+            const auto axis = dlss_nr_aligned_axis(position, extent, 1003U);
+            expect(axis.extent == expected, "NR extent stays constant throughout gaze sweep");
+            expect(axis.base + axis.extent <= 1003U, "NR stays in bounds at image edges");
+        }
+    }
+    DlssNrHistory previous{80U, 160U, 400U, 240U, 2000U, 1200U, 200U, 120U, 2.0F, -4.0F};
+    auto current = previous;
+    current.x += 8U;
+    current.y -= 8U;
+    float x{}, y{};
+    expect(dlss_nr_motion_offset(previous, current, x, y), "small NR crop move preserves history");
+    expect_near(x, 4.0F, 0.0001F, "NR origin motion uses output-pixel MV scale");
+    expect_near(y, 2.0F, 0.0001F, "NR origin motion respects negative vertical scale");
+    // Static scene point: current-local + corrected MV = previous-local,
+    // including a half-resolution NR working texture.
+    expect_near((100.0F - 8.0F) * 0.5F + x * current.scale_x * 0.5F,
+        100.0F * 0.5F, 0.0001F, "NR reprojects overlapping static pixels at working scale");
+    expect(dlss_nr_motion_offset(current, current, x, y) && x == 0.0F && y == 0.0F,
+        "stationary NR region needs no correction");
+    current = previous;
+    current.width += 8U;
+    expect(!dlss_nr_motion_offset(previous, current, x, y), "NR dimension change resets history");
+    current = previous;
+    current.working_width += 8U;
+    expect(!dlss_nr_motion_offset(previous, current, x, y), "NR working dimension change resets history");
+    current = previous;
+    current.output_width += 8U;
+    expect(!dlss_nr_motion_offset(previous, current, x, y), "NR output dimension change resets history");
+    current = previous;
+    current.x += current.width;
+    expect(!dlss_nr_motion_offset(previous, current, x, y), "nonoverlapping NR jump resets history");
+    current = previous;
+    current.scale_x *= 2.0F;
+    expect(!dlss_nr_motion_offset(previous, current, x, y), "changed NR motion scale resets history");
+    previous.scale_x = 0.0F;
+    current = previous;
+    current.x += 8U;
+    expect(!dlss_nr_motion_offset(previous, current, x, y), "invalid NR motion scale rejects crop correction");
+}
+
 void test_dlss_nr_maps_right_eye_region_into_packed_output() {
     using namespace cheeky::foveated_dlss;
     const auto base = dlss_nr_resource_base(
@@ -1116,6 +1163,7 @@ int main(int argc, char** argv) {
     test_streamline_private_sr_viewport();
     test_multimip_game_output_is_dlss_nr_compatible();
     test_dlss_nr_maps_right_eye_region_into_packed_output();
+    test_dlss_nr_stable_crop_and_history();
     test_dlss_nr_transport_crop_fits_resource();
     test_dlss_nr_reuses_live_sr_crop_center();
     test_dlss_nr_independent_size_shares_sr_center();

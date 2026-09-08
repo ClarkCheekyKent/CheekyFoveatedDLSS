@@ -1987,6 +1987,8 @@ bool evaluate_d3d11_via_d3d12(
             );
             if (SUCCEEDED(device->command_list12->Close())) {
                 device->queue12->ExecuteCommandLists(1U, lists);
+                crop_motion12_submitted(device->queue12, 1U, lists);
+                collect_crop_motion12();
                 const auto nr_done_value = device->next_fence_value++;
                 if (SUCCEEDED(device->queue12->Signal(
                         device->fence12, nr_done_value

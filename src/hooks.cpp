@@ -2652,7 +2652,7 @@ void evaluate_streamline_nr(
     const auto motion_width = resource_width(motion);
     const auto motion_height = resource_height(motion);
     const auto view_id = static_cast<DlssViewId>(evaluation.viewport.value) + 1U;
-    const DlssNrFrame frame{
+    DlssNrFrame frame{
         view_id,
         DlssNrRoute::streamline,
         command_list,
@@ -2681,6 +2681,8 @@ void evaluate_streamline_nr(
         output.extent.top,
         false,
     };
+    frame.motion_state = static_cast<D3D12_RESOURCE_STATES>(motion.resource->state);
+    frame.motion_vectors_3d = evaluation.nr_constants.motion_vectors_3d != 0;
     D3D12NrTimingScope timing{command_list, evaluation.settings.nr_foveated};
     const bool evaluated = evaluate_dlss_nr(frame, evaluation.settings);
     timing.finish(evaluated);

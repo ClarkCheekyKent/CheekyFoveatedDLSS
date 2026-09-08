@@ -1,8 +1,39 @@
 #include "dlss_nr_contract.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace cheeky::foveated_dlss {
+
+DlssNrAxis dlss_nr_aligned_axis(const std::uint32_t base,
+    const std::uint32_t extent, const std::uint32_t capacity) noexcept {
+    const auto size = static_cast<std::uint32_t>((std::min)(
+        static_cast<std::uint64_t>(capacity),
+        (static_cast<std::uint64_t>(extent) + 7U) / 8U * 8U));
+    return {(std::min)(base - base % 8U, capacity - size), size};
+}
+
+bool dlss_nr_motion_offset(const DlssNrHistory& previous,
+    const DlssNrHistory& current, float& x, float& y) noexcept {
+    x = y = 0.0F;
+    if (previous.width != current.width || previous.height != current.height ||
+        previous.output_width != current.output_width ||
+        previous.output_height != current.output_height ||
+        previous.working_width != current.working_width ||
+        previous.working_height != current.working_height ||
+        previous.scale_x != current.scale_x || previous.scale_y != current.scale_y ||
+        current.width == 0U || current.height == 0U) return false;
+    const auto dx = static_cast<double>(current.x) - previous.x;
+    const auto dy = static_cast<double>(current.y) - previous.y;
+    // There is no reusable overlap after a jump larger than the region.
+    if (std::abs(dx) >= current.width || std::abs(dy) >= current.height) return false;
+    if (dx == 0.0 && dy == 0.0) return true;
+    if (!std::isfinite(current.scale_x) || !std::isfinite(current.scale_y) ||
+        current.scale_x == 0.0F || current.scale_y == 0.0F) return false;
+    x = static_cast<float>(dx / current.scale_x);
+    y = static_cast<float>(dy / current.scale_y);
+    return std::isfinite(x) && std::isfinite(y);
+}
 
 DlssNrResourceBase dlss_nr_resource_base(
     const std::uint32_t local_x,

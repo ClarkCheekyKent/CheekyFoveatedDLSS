@@ -46,6 +46,7 @@ struct DlssNrFrame {
     std::uint32_t motion_base_y{};
     std::uint32_t motion_width{};
     std::uint32_t motion_height{};
+    // Stored motion vectors to full-output pixels (before NR working scaling).
     float motion_scale_x{1.0F};
     float motion_scale_y{1.0F};
     bool depth_inverted{};
@@ -57,6 +58,8 @@ struct DlssNrFrame {
     bool color_is_region{};
     FoveationGeometry shared_sr_crop{};
     bool has_shared_sr_crop{};
+    D3D12_RESOURCE_STATES motion_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    bool motion_vectors_3d{};
 };
 
 struct DlssNrGeometry {
