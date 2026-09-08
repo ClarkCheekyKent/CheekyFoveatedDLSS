@@ -68,6 +68,8 @@ target_link_libraries(
         d3dcompiler
         dxgi
         dxguid
+        shell32
+        version
 )
 
 set_target_properties(
@@ -137,6 +139,7 @@ add_executable(
     CheekyTests
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gaze_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_composite_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/support_summary_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shared/gaze_math.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/foveation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gaze_policy.cpp"
