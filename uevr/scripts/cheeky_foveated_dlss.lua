@@ -196,6 +196,12 @@ uevr.sdk.callbacks.on_draw_ui(function()
     if imgui.tree_node("Diagnostics and support") then
         text("Renderer: " .. (status.renderer == 1 and "DX12" or "DX11 direct"))
         text("Settings revision " .. tostring(status.revision) .. "; saved " .. tostring(status.saved_revision))
+        local attach = status.late_attach or {}
+        text("Streamline options hook: " .. tostring(attach.options_hooked) .. "; options observed: " .. tostring(attach.options_seen))
+        if attach.native_fallback then
+            text("Streamline is forwarding to native NGX (options unavailable or renderer requires the native path).")
+            text("Check Active/evaluation counters below. A fallback attempt alone does not confirm foveation.")
+        end
         local o, g = status.observer or {}, status.gaze or {}
         text("D3D12 observer ready: " .. tostring(o.ready) .. "; submissions: " .. tostring(o.submissions) .. "; copies: " .. tostring(o.copies))
         text("Eye views: " .. tostring(g.views) .. "; left mapped: " .. tostring(g.left_mapped) .. "; right mapped: " .. tostring(g.right_mapped))
@@ -208,7 +214,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
             text(tostring(d.input_width) .. "x" .. tostring(d.input_height) .. " -> " .. tostring(d.output_width) .. "x" .. tostring(d.output_height))
             text(string.format("DLSS %.3f ms; native %.3f ms; peripheral %.3f ms", d.foveated_ms or 0, d.native_ms or 0, d.peripheral_ms or 0))
         end
-        text("Zero timings may mean unavailable samples. Waiting after late injection: try toggling the game's DLSS.")
+        text("Zero timings may mean unavailable samples. If processing stays inactive after injection, save a diagnostic report.")
         if imgui.button("Write diagnostic report") then send("report") end
         if imgui.button("Refresh status") then send("get") end
         text("Files are saved in this game's UEVR configuration folder.")

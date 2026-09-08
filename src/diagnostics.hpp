@@ -46,6 +46,8 @@ enum class DiagnosticState : std::uint32_t {
     streamline_direct_path_suppressed,
     active,
     ngx_evaluation_failed,
+    late_attach_incomplete,
+    streamline_waiting_for_ngx,
 };
 
 enum class D3D11ExecutionPath : std::uint32_t {

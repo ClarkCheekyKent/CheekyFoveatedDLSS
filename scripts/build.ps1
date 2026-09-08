@@ -69,6 +69,10 @@ if ($LASTEXITCODE -ne 0) { throw "UEVR host tests failed with exit code $LASTEXI
 if ($LASTEXITCODE -ne 0) { throw "UEVR ownership test failed with exit code $LASTEXITCODE." }
 & $uevrTest --dx11
 if ($LASTEXITCODE -ne 0) { throw "UEVR DX11 test failed with exit code $LASTEXITCODE." }
+foreach ($mode in @("dx11", "dx11-c", "dx12", "dx12-c", "streamline", "streamline-dx11")) {
+    & $uevrTest "--late-$mode"
+    if ($LASTEXITCODE -ne 0) { throw "UEVR late attachment ($mode) failed with exit code $LASTEXITCODE." }
+}
 
 Write-Host "Built and tested:"
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.dll")

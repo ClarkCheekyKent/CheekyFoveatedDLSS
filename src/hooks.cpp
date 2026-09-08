@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include "streamline_viewport.hpp"
+#include "streamline_abi.hpp"
 #include "streamline_create_extent.hpp"
 #include <atomic>
 #include <cstddef>
@@ -42,6 +43,9 @@ void register_d3d11_game_feature(
 ) noexcept;
 
 void unregister_d3d11_game_feature(const NgxHandle*) noexcept;
+bool adopt_d3d11_game_feature(const NgxHandle*, const NgxParameters*,
+    NgxResult (*)(ID3D11DeviceContext*, std::uint32_t, NgxParameters*, NgxHandle**),
+    NgxResult (*)(NgxHandle*)) noexcept;
 
 D3D11Evaluation* prepare_d3d11_private(
     ID3D11DeviceContext*,
@@ -102,120 +106,6 @@ using EvaluateD3D12CFn = NgxResult (*)(
 );
 using ReleaseD3D12Fn = NgxResult (*)(NgxHandle*);
 
-struct SlStructType {
-    std::uint32_t data1{};
-    std::uint16_t data2{};
-    std::uint16_t data3{};
-    std::uint8_t data4[8]{};
-};
-
-struct SlBaseStructure {
-    SlBaseStructure* next{};
-    SlStructType struct_type{};
-    std::size_t struct_version{};
-};
-
-// Streamline FrameToken's public ABI exposes the frame index through this
-// virtual conversion (include/sl_core_types.h). Token objects are reused.
-struct SlFrameToken : SlBaseStructure {
-    virtual operator std::uint32_t() const = 0;
-};
-std::uintptr_t gaze_frame_key(const void* frame) {
-    return frame ? static_cast<std::uintptr_t>(
-        static_cast<std::uint32_t>(*static_cast<const SlFrameToken*>(frame))) + 1U : 0U;
-}
-
-struct SlExtent {
-    std::uint32_t top{};
-    std::uint32_t left{};
-    std::uint32_t width{};
-    std::uint32_t height{};
-};
-
-enum class SlResourceType : char {
-    texture_2d = 0,
-};
-
-struct SlResource : SlBaseStructure {
-    SlResourceType type{SlResourceType::texture_2d};
-    void* native{};
-    void* memory{};
-    void* view{};
-    std::uint32_t state{0xFFFFFFFFU};
-    std::uint32_t width{};
-    std::uint32_t height{};
-    std::uint32_t native_format{};
-    std::uint32_t mip_levels{};
-    std::uint32_t array_layers{};
-    std::uint64_t gpu_virtual_address{};
-    std::uint32_t flags{};
-    std::uint32_t usage{};
-    std::uint32_t reserved{};
-};
-
-struct SlResourceTag : SlBaseStructure {
-    SlResource* resource{};
-    std::uint32_t type{};
-    std::uint32_t lifecycle{};
-    SlExtent extent{};
-};
-
-struct SlFloat2 { float x{}; float y{}; };
-struct SlFloat3 { float x{}; float y{}; float z{}; };
-struct SlFloat4x4 { float values[16]{}; };
-
-struct SlConstants : SlBaseStructure {
-    SlFloat4x4 camera_view_to_clip{};
-    SlFloat4x4 clip_to_camera_view{};
-    SlFloat4x4 clip_to_lens_clip{};
-    SlFloat4x4 clip_to_prev_clip{};
-    SlFloat4x4 prev_clip_to_clip{};
-    SlFloat2 jitter_offset{};
-    SlFloat2 motion_vector_scale{};
-    SlFloat2 camera_pinhole_offset{};
-    SlFloat3 camera_position{};
-    SlFloat3 camera_up{};
-    SlFloat3 camera_right{};
-    SlFloat3 camera_forward{};
-    float camera_near{};
-    float camera_far{};
-    float camera_fov{};
-    float camera_aspect_ratio{};
-    float motion_vectors_invalid_value{};
-    char depth_inverted{};
-    char camera_motion_included{};
-    char motion_vectors_3d{};
-    char reset{};
-    char orthographic_projection{};
-    char motion_vectors_dilated{};
-    char motion_vectors_jittered{};
-    float minimum_relative_linear_depth_object_separation{};
-};
-
-struct SlDlssOptions : SlBaseStructure {
-    std::uint32_t mode{};
-    std::uint32_t output_width{};
-    std::uint32_t output_height{};
-    float sharpness{};
-    float pre_exposure{};
-    float exposure_scale{};
-    char color_buffers_hdr{};
-    char indicator_invert_axis_x{};
-    char indicator_invert_axis_y{};
-    std::uint32_t dlaa_preset{};
-    std::uint32_t quality_preset{};
-    std::uint32_t balanced_preset{};
-    std::uint32_t performance_preset{};
-    std::uint32_t ultra_performance_preset{};
-    std::uint32_t ultra_quality_preset{};
-    char use_auto_exposure{};
-    char alpha_upscaling_enabled{};
-};
-
-struct SlViewportHandle : SlBaseStructure {
-    std::uint32_t value{0xFFFFFFFFU};
-};
-
 using SlEvaluateFeatureFn = std::uint32_t (*)(
     std::uint32_t, const void*, const void* const*, std::uint32_t, void*
 );
@@ -269,6 +159,12 @@ std::atomic<SlSetTagForFrameFn> real_sl_set_tag_for_frame{};
 std::atomic<SlSetConstantsFn> real_sl_set_constants{};
 std::atomic<SlGetFeatureFunctionFn> real_sl_get_feature_function{};
 std::atomic<SlDlssSetOptionsFn> real_sl_dlss_set_options{};
+SRWLOCK streamline_options_hook_lock = SRWLOCK_INIT;
+std::atomic<void*> streamline_options_target{};
+std::atomic<std::uint64_t> streamline_native_fallback_calls{};
+std::atomic<bool> streamline_native_fallback_active{};
+bool capture_streamline_options_target(void* target) noexcept;
+void bootstrap_streamline_options_hook() noexcept;
 
 struct D3D12GameView {
     const NgxHandle* handle{};
@@ -2712,16 +2608,20 @@ std::uint32_t hook_sl_dlss_set_options(
         std::memory_order_acquire
     );
     if (original == nullptr) return 0x18U;
-    if (viewport == nullptr || options == nullptr) {
-        return original(viewport, options);
-    }
+    // Preserve the game's complete options and extension chain. Our cropped
+    // passes have separate viewports and use the trampoline directly.
+    const auto result = original(viewport, options);
+    if (result != 0U || viewport == nullptr || options == nullptr) return result;
+    // The local layout describes v3. Never overread an older version, truncate
+    // an unknown version, or reconstruct an extension chain we do not own.
+    const auto* view = static_cast<const SlViewportHandle*>(viewport);
+    const bool supported = options->struct_version == 3 && options->next == nullptr &&
+        view->struct_version == 1 && view->next == nullptr;
     AcquireSRWLockExclusive(&streamline_lock);
-    cached_sl_options = *options;
-    cached_sl_options.next = nullptr;
-    cached_sl_options_viewport = *static_cast<const SlViewportHandle*>(viewport);
-    cached_sl_options_viewport.next = nullptr;
-    has_cached_sl_options = true;
+    has_cached_sl_options = supported;
+    if (supported) { cached_sl_options = *options; cached_sl_options_viewport = *view; }
     ReleaseSRWLockExclusive(&streamline_lock);
+    if (!supported) return result;
 
     static std::atomic<bool> logged_state_initialized{};
     static std::atomic<std::uint32_t> logged_state_mode{0xFFFFFFFFU};
@@ -2753,16 +2653,7 @@ std::uint32_t hook_sl_dlss_set_options(
         );
     }
 
-    auto forwarded = *options;
-    const auto width = applied_sl_output_width.load(std::memory_order_acquire);
-    const auto height = applied_sl_output_height.load(std::memory_order_acquire);
-    if (current_settings().enabled && width != 0U && height != 0U) {
-        forwarded.next = nullptr;
-        forwarded.output_width = width;
-        forwarded.output_height = height;
-        return original(viewport, &forwarded);
-    }
-    return original(viewport, options);
+    return result;
 }
 
 std::uint32_t hook_sl_set_tag(
@@ -2898,8 +2789,9 @@ std::uint32_t hook_sl_get_feature_function(
         std::strcmp(name, "slDLSSSetOptions") == 0) {
         const auto target = reinterpret_cast<SlDlssSetOptionsFn>(*function);
         if (target != &hook_sl_dlss_set_options) {
-            real_sl_dlss_set_options.store(target, std::memory_order_release);
-            *function = reinterpret_cast<void*>(&hook_sl_dlss_set_options);
+            // Detour the returned code address: previously cached pointers
+            // must be intercepted too. Do not overwrite its trampoline later.
+            static_cast<void>(capture_streamline_options_target(*function));
         }
         trace_event(
             "slGetFeatureFunction captured slDLSSSetOptions target=%p returned_wrapper=%p",
@@ -2940,6 +2832,39 @@ std::uint32_t hook_sl_evaluate_feature(
         return passthrough;
     }
     EnterCriticalSection(&streamline_evaluation_lock);
+    bootstrap_streamline_options_hook();
+    bool have_matching_options{};
+    AcquireSRWLockShared(&streamline_lock);
+    if (has_cached_sl_options && inputs && input_count <= 32U) {
+        for (std::uint32_t i = 0; i < input_count; ++i) {
+            const auto* base = static_cast<const SlBaseStructure*>(inputs[i]);
+            if (base && std::memcmp(&base->struct_type, &cached_sl_options_viewport.struct_type,
+                    sizeof(SlStructType)) == 0 &&
+                static_cast<const SlViewportHandle*>(inputs[i])->value == cached_sl_options_viewport.value) {
+                have_matching_options = true;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    if (have_matching_options) {
+        ID3D12GraphicsCommandList* dx12{};
+        const bool supported_renderer = command_buffer && SUCCEEDED(
+            static_cast<IUnknown*>(command_buffer)->QueryInterface(IID_PPV_ARGS(&dx12)));
+        if (dx12) dx12->Release();
+        have_matching_options = supported_renderer;
+    }
+    streamline_native_fallback_active = !have_matching_options;
+    if (!have_matching_options) {
+        ++streamline_native_fallback_calls;
+        diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::streamline_waiting_for_ngx);
+        // We did not observe this viewport's options. Forward the original
+        // Streamline call unchanged WITHOUT suppressing the nested NGX hooks.
+        // Those can build private features from complete evaluation metadata.
+        // If no compatible NGX call occurs, the game continues in passthrough.
+        const auto result = original(feature, frame, inputs, input_count, command_buffer);
+        LeaveCriticalSection(&streamline_evaluation_lock);
+        return result;
+    }
     static std::atomic<std::uint64_t> evaluation_sequence{};
     const auto sequence = evaluation_sequence.fetch_add(
         1U,
@@ -3456,6 +3381,12 @@ NgxResult hook_evaluate_d3d11(
     if (original == nullptr) return 0xBAD00007U;
     note_evaluation_begin(DiagnosticApi::d3d11, parameters);
     if (!is_d3d11_private_handle(handle)) {
+        if (!adopt_d3d11_game_feature(handle, parameters,
+                real_create_d3d11.load(std::memory_order_acquire),
+                real_release_d3d11.load(std::memory_order_acquire))) {
+            diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::late_attach_incomplete);
+            return original(context, handle, parameters, callback);
+        }
         register_stereo_view(static_cast<DlssViewId>(
             reinterpret_cast<std::uintptr_t>(handle)
         ));
@@ -3593,6 +3524,12 @@ NgxResult hook_evaluate_d3d11_c(
     if (original == nullptr) return 0xBAD00007U;
     note_evaluation_begin(DiagnosticApi::d3d11, parameters);
     if (!is_d3d11_private_handle(handle)) {
+        if (!adopt_d3d11_game_feature(handle, parameters,
+                real_create_d3d11.load(std::memory_order_acquire),
+                real_release_d3d11.load(std::memory_order_acquire))) {
+            diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::late_attach_incomplete);
+            return original(context, handle, parameters, callback);
+        }
         register_stereo_view(static_cast<DlssViewId>(
             reinterpret_cast<std::uintptr_t>(handle)
         ));
@@ -3935,6 +3872,8 @@ void evaluate_nr_after_native_d3d12(
     if (subrect_height != 0U) contract.render_height = subrect_height;
     contract.output_width = get_ui(parameters, "OutWidth");
     contract.output_height = get_ui(parameters, "OutHeight");
+    if (!contract.render_width || !contract.render_height ||
+        !contract.output_width || !contract.output_height) return false;
     contract.color_base_x = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.X");
     contract.color_base_y = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.Y");
     contract.depth_base_x = get_ui(parameters, "DLSS.Input.Depth.Subrect.Base.X");
@@ -3949,9 +3888,8 @@ void evaluate_nr_after_native_d3d12(
         (contract.create_flags & (1U << 1U)) != 0U;
     contract.depth_inverted = (contract.create_flags & (1U << 3U)) != 0U;
     contract.reset = get_ui(parameters, "Reset") != 0U;
-    contract.perf_quality = get_ngx_integer_bits(
-        parameters, "PerfQualityValue"
-    );
+    if (!try_get_ngx_integer_bits(parameters, "PerfQualityValue", contract.perf_quality))
+        return false;
     contract.motion_vector_scale_x = get_d3d12_parameter_float(
         parameters, "MV.Scale.X", 1.0F
     );
@@ -3966,6 +3904,7 @@ void evaluate_nr_after_native_d3d12(
     auto* const full_motion =
         get_d3d12_parameter_resource(parameters, "MotionVectors");
     auto* const full_output = get_d3d12_parameter_resource(parameters, "Output");
+    if (!full_color || !full_depth || !full_motion || !full_output) return false;
     const auto full_color_x = contract.color_base_x;
     const auto full_color_y = contract.color_base_y;
     const auto full_depth_x = contract.depth_base_x;
@@ -4141,8 +4080,7 @@ NgxResult process_d3d12_evaluation(
     const D3D12NgxEvaluateFn original,
     void*
 ) {
-    if (call.route == D3D12NgxRoute::core_runtime &&
-        !has_d3d12_game_view(call.handle)) {
+    if (!has_d3d12_game_view(call.handle)) {
         if (!recognizable_d3d12_dlss_evaluation(call)) {
             return original(
                 call.command_list,
@@ -4151,9 +4089,8 @@ NgxResult process_d3d12_evaluation(
                 call.callback
             );
         }
-        // Core runtimes may initialize and create the game feature before the
-        // delayed direct hooks are admitted. Adopt that feature on its first
-        // recognizable evaluation so stereo and per-view cleanup still work.
+        // Both public and core runtimes can predate injection. Track adopted
+        // game handles so release also cleans up private views and GPU state.
         remember_d3d12_game_view(call.handle, 1U);
     }
     note_evaluation_begin(DiagnosticApi::d3d12, call.parameters);
@@ -4285,6 +4222,13 @@ NgxResult hook_evaluate_d3d12_c(
     if (!scope.outermost()) {
         return original(command_list, handle, parameters, callback);
     }
+    if (!has_d3d12_game_view(handle)) {
+        const D3D12NgxEvaluationCall call{D3D12NgxRoute::public_runtime,
+            command_list, handle, parameters, nullptr};
+        if (!recognizable_d3d12_dlss_evaluation(call))
+            return original(command_list, handle, parameters, callback);
+        remember_d3d12_game_view(handle, 1U);
+    }
     note_evaluation_begin(DiagnosticApi::d3d12, parameters);
     diagnostic_note_d3d12_ngx_route(D3D12NgxRoute::public_runtime);
     if (inside_streamline_evaluation) {
@@ -4399,6 +4343,35 @@ template <typename Function>
     return true;
 }
 
+bool capture_streamline_options_target(void* target) noexcept {
+    if (!target || target == reinterpret_cast<void*>(&hook_sl_dlss_set_options)) return false;
+    AcquireSRWLockExclusive(&streamline_options_hook_lock);
+    const auto installed = streamline_options_target.load(std::memory_order_acquire);
+    bool result = installed == target;
+    if (!installed) {
+        result = install_streamline_minhook("slDLSSSetOptions", target,
+            reinterpret_cast<void*>(&hook_sl_dlss_set_options), real_sl_dlss_set_options);
+        if (result) streamline_options_target.store(target, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&streamline_options_hook_lock);
+    return result;
+}
+
+void bootstrap_streamline_options_hook() noexcept {
+    if (streamline_options_target.load(std::memory_order_acquire)) return;
+    static ULONGLONG next_attempt{}; // Serialized by streamline_evaluation_lock.
+    const auto now = GetTickCount64();
+    if (now < next_attempt) return;
+    next_attempt = now + 1000;
+    const auto get = real_sl_get_feature_function.load(std::memory_order_acquire);
+    if (!get) return;
+    void* target{};
+    // Called on a game SL evaluation, after its initialization. Resolve only;
+    // never invent historical options or initialize Streamline a second time.
+    if (get(0U, "slDLSSSetOptions", &target) == 0U && target)
+        static_cast<void>(capture_streamline_options_target(target));
+}
+
 [[nodiscard]] bool install_streamline_inline_hooks() noexcept {
     if (streamline_inline_mode.load(std::memory_order_acquire)) return true;
     if (streamline_inline_install_failed.load(std::memory_order_acquire)) {
@@ -4477,6 +4450,10 @@ template <typename Function>
 }
 
 void uninstall_streamline_inline_hooks() noexcept {
+    if (const auto target = streamline_options_target.exchange(nullptr)) {
+        static_cast<void>(MH_DisableHook(target));
+        static_cast<void>(MH_RemoveHook(target));
+    }
     const auto module = GetModuleHandleW(L"sl.interposer.dll");
     if (module != nullptr) {
         constexpr const char* names[] = {
@@ -5368,6 +5345,14 @@ bool install_early_loader_interception() noexcept {
 void uninstall_early_loader_interception() noexcept {
     restore_patched_slots();
     early_loader_interception.store(false, std::memory_order_release);
+}
+
+LateAttachStatus late_attach_status() noexcept {
+    AcquireSRWLockShared(&streamline_lock);
+    const bool seen = has_cached_sl_options;
+    ReleaseSRWLockShared(&streamline_lock);
+    return {streamline_options_target.load() != nullptr, seen,
+        streamline_native_fallback_active.load(), streamline_native_fallback_calls.load()};
 }
 
 bool start_interception() noexcept {

@@ -4,6 +4,41 @@ This preview runs Cheeky's DLSS processing from a UEVR plugin and puts its
 controls in UEVR's LuaLoader menu. ReShade is not required. The original ReShade
 add-on remains a separate build. Actual UEVR/game/headset validation is pending.
 
+## Checkpoint and broader build
+
+The original preview is preserved at commit `0ed7d4d`, with the separately named
+`CheekyFoveatedDLSS-0.2.4-UEVR-checkpoint-0ed7d4d.zip` and matching symbols.
+The subsequent `late-attach` package adds:
+
+- DX11 adoption of an existing DLSS-SR handle when a complete evaluation is first
+  observed, covering both exported callback variants and preserving known callback
+  pairs. Incomplete metadata is forwarded without creating a private feature.
+- Public DX12 handle adoption and cleanup on release, including the C callback
+  variant. Missing creation flags, quality, dimensions or required resources cause
+  passthrough before the private processing path changes parameters.
+- Streamline setter discovery from a future evaluation, followed by an inline
+  detour that also covers pointers cached before injection. Historical options
+  are not guessed. When this viewport's options are unavailable, the original
+  Streamline call can reach native NGX processing instead of suppressing it.
+- Game options are forwarded unchanged. Local Streamline reconstruction accepts
+  the known v3 options/v1 viewport layout without extension chains; other layouts,
+  another viewport's options, and DX11 command contexts use the native fallback.
+  Discovery failures are retried at most once a second during evaluation.
+- Diagnostics distinguish setter interception, observed options and attempted
+  native fallback. A fallback counter alone does not prove active processing.
+
+The native fallback requires the game to reach an intercepted NGX evaluation with
+enough metadata. Hidden/inlined entry points, incompatible wrappers, missing
+metadata, core-only DX11 evaluation and runtime DLL replacement remain compatibility
+limits. This is broader coverage, not universal game support. OptiScaler and
+DX11-to-DX12 transport remain outside this change.
+
+For comparison, test the checkpoint first. Save its log/report, exit the game
+fully, replace both DLLs and the Lua script with the later package, and repeat
+the same scene, settings and injection timing. Keep the same INI for a comparable
+run. `BUILD.txt` inside each ZIP identifies its source commit. Each test uses one
+complete package; changing versions requires a fresh game process.
+
 ## Install for the first Hogwarts Legacy test
 
 1. Close the game. Use a UEVR build with plugin API **2.39.0 or compatible newer
@@ -60,9 +95,11 @@ and Discard are available for pending or rejected edits. Alt+Shift+/ toggles SR.
 3. Toggle SR off/on and verify the effect in both eyes. Check that evaluation and
    active counters increase. Compare GPU timings after the scene settles; zero
    timing samples can mean unavailable measurements.
-4. If the plugin reports no evaluations after late injection, toggle the game's
-   DLSS off/on to recreate its feature. Injection after DLSS creation can miss
-   metadata; this must be validated in Hogwarts rather than assumed supported.
+4. First check whether processing activates after injection without changing
+   DLSS settings. If it does not, retain a diagnostic report before trying a
+   DLSS off/on toggle. The broader build should adopt existing features when
+   their evaluations contain the required metadata; a toggle is a diagnostic
+   experiment rather than a prerequisite or guaranteed workaround.
 5. Restart the game and confirm settings persist. Then test pause menus and
    loading transitions. Try real/simulated gaze only after fixed alignment works.
 
@@ -116,6 +153,14 @@ the DX11 host path; `--hardware` repeats native observer checks on the default G
 Neither starts UEVR or a game. CMake also builds these targets and registers the
 host tests with CTest. These tests do not evaluate NVIDIA DLSS.
 
+The build also runs `--late-dx11`, `--late-dx11-c`, `--late-dx12`, `--late-dx12-c`,
+`--late-streamline` and `--late-streamline-dx11`. These load local fake NGX and
+Streamline DLLs before the actual plugin, initialize/create/evaluate beforehand,
+then continue through cached pointers after hook installation. Missing metadata,
+reuse, release/recreation, setter interception and per-viewport fallback are checked.
+The fake DLLs are isolated in `test-fixtures` and excluded from install ZIPs.
+Use `./scripts/package-uevr.ps1 -Label late-attach-<commit>` for a distinct package.
+
 For Lua behavior tests, optionally install `lupa==2.8` into `build/test-python`
 and run `python tests/uevr_menu_tests.py` after the Release host test. This tests
 the actual script under LuaJIT and Lua 5.4 with mocked UI bindings, including
@@ -141,3 +186,6 @@ Upstream references: [UEVR plugin loading](https://docs.uevr.io/plugins/getting_
 [Lua callbacks](https://docs.uevr.io/plugins/lua/callbacks.html),
 [ImGui bindings including is_item_active](https://docs.uevr.io/plugins/lua/additional-bindings/imgui.html),
 [pinned public API](https://github.com/praydog/UEVR/blob/4ee5c6b6162dee2291fc75f9dfc57667f6d45a2d/include/uevr/API.h).
+Streamline's [public DLSS header](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_dlss.h)
+defines the options layout and a state getter containing a VRAM estimate, rather
+than historical options; the fallback therefore relies on future NGX evaluations.

@@ -497,6 +497,8 @@ const char* diagnostic_state_name(const DiagnosticState state) noexcept {
     case DiagnosticState::streamline_direct_path_suppressed: return "Direct NGX path suppressed because Streamline is active";
     case DiagnosticState::active: return "Active";
     case DiagnosticState::ngx_evaluation_failed: return "NGX evaluation returned failure";
+    case DiagnosticState::late_attach_incomplete: return "Late attachment: waiting for complete DLSS metadata and callbacks";
+    case DiagnosticState::streamline_waiting_for_ngx: return "Streamline options unavailable: waiting for underlying NGX evaluation";
     }
     return "Unknown";
 }

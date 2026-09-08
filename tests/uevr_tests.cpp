@@ -1,6 +1,7 @@
 #include "runtime_api.hpp"
 #include "settings_io.hpp"
 #include "processing_owner.hpp"
+#include "late_attach_tests.hpp"
 #include <uevr/API.h>
 #include <d3d12.h>
 #include <d3d11.h>
@@ -95,7 +96,9 @@ int main(int argc, char** argv) {
         settings_tests(root);
         const bool conflict_mode = argc > 1 && std::string(argv[1]) == "--conflict";
         const bool hardware = argc > 1 && std::string(argv[1]) == "--hardware";
-        const bool dx11 = argc > 1 && std::string(argv[1]) == "--dx11";
+        const std::string mode = argc > 1 ? argv[1] : "";
+        const bool late = mode.starts_with("--late-");
+        const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
         require(!conflict_mode || conflict, "Create conflicting owner");
         ComPtr<IDXGIFactory4> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
@@ -118,6 +121,7 @@ int main(int argc, char** argv) {
         }
         UEVR_PluginInitializeParam api{}; api.version = &version; api.functions = &functions; api.callbacks = &callbacks; api.renderer = &renderer;
         const auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
+        if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
         require(init != nullptr, "Plugin entry export");
@@ -139,6 +143,11 @@ int main(int argc, char** argv) {
             puts("UEVR ownership conflict test passed"); return 0;
         }
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
+        if (late) {
+            command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
+            verify_late_attach_test(get);
+            return 0;
+        }
         if (dx11) {
             command("1\n10\nset\nD3D11D3D12Transport=true");
             require(received.find("transport is unavailable")!=received.npos,"DX11 transport rejected explicitly");

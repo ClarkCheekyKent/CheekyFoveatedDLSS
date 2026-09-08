@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <cstdint>
 
 struct ID3D12CommandQueue;
 struct ID3D12GraphicsCommandList;
@@ -22,6 +23,11 @@ void note_d3d12_command_list_submission(
 void note_d3d12_present(ID3D12CommandQueue* queue) noexcept;
 
 [[nodiscard]] bool start_interception() noexcept;
+struct LateAttachStatus {
+    bool streamline_options_hooked{}, streamline_options_seen{}, streamline_native_fallback{};
+    std::uint64_t streamline_fallback_calls{};
+};
+LateAttachStatus late_attach_status() noexcept;
 void stop_interception() noexcept;
 [[nodiscard]] bool install_early_loader_interception() noexcept;
 void uninstall_early_loader_interception() noexcept;

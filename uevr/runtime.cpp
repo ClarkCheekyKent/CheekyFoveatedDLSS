@@ -46,13 +46,18 @@ std::string snapshot_locked(State& s) {
     const auto gaze = gaze_diagnostics();
     const auto views = stereo_view_statistics();
     const auto nr = dlss_nr_snapshot();
-    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-preview\",\"request\":" << s.request
+    const auto attach = late_attach_status();
+    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-late-attach-preview\",\"request\":" << s.request
         << ",\"revision\":" << s.revision << ",\"saved_revision\":" << s.saved_revision
         << ",\"applied_request\":" << s.applied_request
         << ",\"attached\":" << adapter_attached.load() << ",\"ready\":" << (s.started && s.graphics_ready)
         << ",\"processing\":" << current_settings().enabled
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
+        << ",\"late_attach\":{\"options_hooked\":" << attach.streamline_options_hooked
+        << ",\"options_seen\":" << attach.streamline_options_seen
+        << ",\"native_fallback\":" << attach.streamline_native_fallback
+        << ",\"fallback_calls\":" << attach.streamline_fallback_calls << '}'
         << ",\"observer\":{\"ready\":" << observer.ready << ",\"submissions\":" << observer.submissions
         << ",\"copies\":" << observer.copies << ",\"resets\":" << observer.resets << ",\"destroyed\":" << observer.destroyed << '}'
         << ",\"gaze\":{\"layer\":" << gaze.layer_present << ",\"abi\":" << gaze.abi_compatible
@@ -115,7 +120,7 @@ bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* qu
     }
     if (renderer > 1) { s.graphics_ready = false; return false; }
     s.observed_device = device; s.observed_queue = queue; s.graphics_ready = true;
-    s.message = "Ready. Enable DLSS in the game; if evaluation stays unavailable after late injection, toggle DLSS off/on.";
+    s.message = "Ready. Enable DLSS in the game; complete future evaluations can be adopted after injection. Check diagnostics if processing is waiting.";
     return true;
 }
 }

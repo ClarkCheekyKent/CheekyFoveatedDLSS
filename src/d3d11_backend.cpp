@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "runtime.hpp"
 #include "d3d11_composite_shader.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
@@ -668,6 +669,35 @@ extern "C" void register_d3d11_game_feature(
     state.create_feature = create_feature;
     state.release_feature = release_feature;
     feature_states.push_back(state);
+}
+
+// Preserve the callback pair captured during CreateFeature. Late adoption may
+// only fill an absent game entry, never rewrite an existing or private feature.
+extern "C" bool adopt_d3d11_game_feature(
+    const NgxHandle* game_handle, const NgxParameters* parameters,
+    D3D11CreateFeatureFn create_feature, D3D11ReleaseFeatureFn release_feature
+) noexcept {
+    if (!game_handle || !parameters) return false;
+    std::lock_guard lock(features_mutex);
+    for (const auto& entry : feature_states) {
+        if (entry.private_handle == game_handle) return false;
+    }
+    if (!create_feature || !release_feature ||
+        !get_ui(parameters, "Width") || !get_ui(parameters, "Height") ||
+        !get_ui(parameters, "OutWidth") || !get_ui(parameters, "OutHeight")) return false;
+    std::uint32_t flags{}, quality{};
+    if (!try_get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags", flags) ||
+        !try_get_ngx_integer_bits(parameters, "PerfQualityValue", quality)) return false;
+    for (const auto* name : {"Color", "Depth", "MotionVectors", "Output"}) {
+        if (!get_resource(parameters, name)) return false;
+    }
+    if (find_feature_state_locked(game_handle)) return true;
+    FeatureState state{};
+    state.game_handle = game_handle; state.feature = 1U;
+    state.create_feature = create_feature; state.release_feature = release_feature;
+    feature_states.push_back(state);
+    trace_event("Adopted existing DX11 DLSS feature on evaluation handle=%p", game_handle);
+    return true;
 }
 
 extern "C" void unregister_d3d11_game_feature(
