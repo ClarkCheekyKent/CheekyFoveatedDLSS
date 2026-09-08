@@ -97,7 +97,11 @@ struct StereoEyeAssignment {
 };
 
 [[nodiscard]] Settings current_settings() noexcept;
+[[nodiscard]] Settings configured_settings() noexcept;
 void update_settings(const Settings& settings) noexcept;
+// A host can stop processing on detach without taking locks under DllMain.
+// User preferences remain intact; snapshots consumed by rendering are gated.
+void set_processing_allowed(bool allowed) noexcept;
 
 void register_stereo_view(std::uint64_t view_id) noexcept;
 void unregister_stereo_view(std::uint64_t view_id) noexcept;

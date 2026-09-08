@@ -10,6 +10,9 @@
 namespace cheeky::foveated_dlss {
 namespace {
 
+std::mutex settings_mutex;
+std::atomic<bool> processing_allowed{true};
+
 std::atomic<bool> enabled{true};
 std::atomic<bool> d3d11_use_d3d12_transport{false};
 std::atomic<bool> peripheral_dlaa_enabled{true};
@@ -99,7 +102,8 @@ void store_float(std::atomic<std::uint32_t>& destination, float value) noexcept 
 
 }  // namespace
 
-Settings current_settings() noexcept {
+Settings configured_settings() noexcept {
+    std::lock_guard lock(settings_mutex);
     Settings settings{};
     settings.enabled = enabled.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
@@ -164,7 +168,17 @@ Settings current_settings() noexcept {
     return settings;
 }
 
+Settings current_settings() noexcept {
+    auto settings = configured_settings();
+    if (!processing_allowed.load(std::memory_order_acquire)) {
+        settings.enabled = false;
+        settings.nr_enabled = false;
+    }
+    return settings;
+}
+
 void update_settings(const Settings& settings) noexcept {
+    std::lock_guard lock(settings_mutex);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(
         settings.d3d11_use_d3d12_transport,
@@ -301,6 +315,10 @@ void update_settings(const Settings& settings) noexcept {
         nr_motion_scale_y_bits,
         std::clamp(settings.nr_motion_scale_y_multiplier, -4.0F, 4.0F)
     );
+}
+
+void set_processing_allowed(bool allowed) noexcept {
+    processing_allowed.store(allowed, std::memory_order_release);
 }
 
 void register_stereo_view(const std::uint64_t view_id) noexcept {

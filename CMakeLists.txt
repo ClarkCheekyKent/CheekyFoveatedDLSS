@@ -169,3 +169,37 @@ if(MSVC)
     target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
+
+option(CHEEKY_BUILD_UEVR "Build the UEVR plugin, resident runtime and host harness" ON)
+if(CHEEKY_BUILD_UEVR)
+    set(CHEEKY_RUNTIME_SOURCES ${CHEEKY_FOVEATED_DLSS_SOURCES})
+    list(FILTER CHEEKY_RUNTIME_SOURCES EXCLUDE REGEX "/(addon|support_report)\\.cpp$")
+    add_library(CheekyFoveatedDLSSRuntime MODULE ${CHEEKY_RUNTIME_SOURCES}
+        uevr/runtime.cpp uevr/settings_io.cpp uevr/graphics_observer.cpp)
+    add_library(CheekyFoveatedDLSSUEVR MODULE uevr/plugin.cpp)
+    add_executable(CheekyUEVRTests tests/uevr_tests.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp)
+    foreach(target CheekyFoveatedDLSSRuntime CheekyFoveatedDLSSUEVR CheekyUEVRTests)
+        target_compile_features(${target} PRIVATE cxx_std_20)
+        target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+        target_include_directories(${target} PRIVATE src shared uevr third_party/uevr/include
+            third_party/openvr/include third_party/reshade/deps/minhook/include)
+        target_link_libraries(${target} PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid)
+        set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF PREFIX ""
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+        endif()
+    endforeach()
+    set_target_properties(CheekyFoveatedDLSSRuntime PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/CheekyFoveatedDLSS"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/CheekyFoveatedDLSS")
+    set_target_properties(CheekyFoveatedDLSSUEVR PROPERTIES OUTPUT_NAME "CheekyFoveatedDLSS"
+        ARCHIVE_OUTPUT_NAME "CheekyFoveatedDLSSUEVR" PDB_NAME "CheekyFoveatedDLSSUEVR")
+    add_dependencies(CheekyFoveatedDLSSUEVR CheekyFoveatedDLSSRuntime)
+    add_dependencies(CheekyUEVRTests CheekyFoveatedDLSSUEVR)
+    add_test(NAME CheekyUEVRHost COMMAND CheekyUEVRTests)
+    add_test(NAME CheekyUEVROwnership COMMAND CheekyUEVRTests --conflict)
+    add_test(NAME CheekyUEVRDX11 COMMAND CheekyUEVRTests --dx11)
+endif()

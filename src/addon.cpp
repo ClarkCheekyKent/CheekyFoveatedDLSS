@@ -9,6 +9,7 @@
 #include "support_report.hpp"
 #include "cheeky_gaze_abi.h"
 #include "version.h"
+#include "processing_owner.hpp"
 
 #define ImTextureID ImU64
 #include <imgui.h>
@@ -34,6 +35,7 @@ SRWLOCK trace_log_lock = SRWLOCK_INIT;
 
 constexpr char config_section[] = "CheekyFoveatedDLSS";
 std::atomic<bool> toggle_hotkey_down{};
+HANDLE processing_owner{};
 
 struct DiagnosticDisplayCache {
     DiagnosticSnapshot snapshot{};
@@ -1891,9 +1893,16 @@ extern "C" __declspec(dllexport) bool AddonInit(
 ) {
     using namespace cheeky::foveated_dlss;
     set_addon_modules(addon, reshade);
+    processing_owner = claim_processing_owner();
+    if (!processing_owner) {
+        log_error("Another Cheeky integration owns processing. Use either the UEVR plugin or the ReShade add-on, then restart the game.");
+        return false;
+    }
     trace_event("AddonInit begin module=%p reshade=%p", addon, reshade);
     load_settings_from_reshade();
     if (!start_interception()) {
+        CloseHandle(processing_owner);
+        processing_owner = nullptr;
         log_error("Failed to start NGX interception.");
         return false;
     }
@@ -1938,6 +1947,8 @@ extern "C" __declspec(dllexport) void AddonUninit(
     reset_gaze_foveation();
     log_info("Foveated DLSS-SR and DLSS-NR interception stopped.");
     close_trace_log();
+    if (processing_owner) CloseHandle(processing_owner);
+    processing_owner = nullptr;
 }
 
 BOOL APIENTRY DllMain(

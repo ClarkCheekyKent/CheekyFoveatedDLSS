@@ -62,7 +62,17 @@ if ($LASTEXITCODE -ne 0) {
     throw "Tests failed with exit code $LASTEXITCODE."
 }
 
+$uevrTest = Join-Path $projectRoot "bin\$Configuration\CheekyUEVRTests.exe"
+& $uevrTest
+if ($LASTEXITCODE -ne 0) { throw "UEVR host tests failed with exit code $LASTEXITCODE." }
+& $uevrTest --conflict
+if ($LASTEXITCODE -ne 0) { throw "UEVR ownership test failed with exit code $LASTEXITCODE." }
+& $uevrTest --dx11
+if ($LASTEXITCODE -ne 0) { throw "UEVR DX11 test failed with exit code $LASTEXITCODE." }
+
 Write-Host "Built and tested:"
+Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.dll")
+Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.addon64")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRLayer.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\XR_APILAYER_CHEEKY_foveated_dlss.json")

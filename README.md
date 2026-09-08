@@ -4,6 +4,10 @@ Cheeky Foveated DLSS is a 64-bit [ReShade](https://reshade.me/) add-on that redu
 
 DLSS 5 Neural Rendering (DLSS-NR) is also supported experimentally. See [Experimental DLSS-NR support](#experimental-dlss-nr-support) before enabling it.
 
+A **UEVR plugin preview** is now available as a separate local build, with controls
+inside UEVR and no ReShade requirement. See [UEVR installation and testing](uevr/README.md).
+It has passed game-free harness tests; actual UEVR/game/headset testing is pending.
+
 ## Future Plans
 I plan to try to expand this technique to as many integrations as possible (UEVR plugin, no reshade depedency, etc.) so that it works with as many games as possible and plays well with other mods.
 Create an issue if you encounter problem with game compatibility, bugs, or have an idea for an improvement so we can continue to improve this project!
