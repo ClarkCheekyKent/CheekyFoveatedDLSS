@@ -157,6 +157,7 @@ struct TransportSlot {
     std::uint64_t done_value{};
     std::uint32_t input_width{};
     std::uint32_t input_height{};
+    std::uint32_t sr_motion_width{}, sr_motion_height{};
     std::uint32_t output_width{};
     std::uint32_t output_height{};
     std::uint32_t peripheral_render_width{};
@@ -698,6 +699,8 @@ void trace_format_support(
 [[nodiscard]] bool slot_matches(
     const TransportSlot& slot,
     const CropGeometry& crop,
+    const std::uint32_t sr_motion_width,
+    const std::uint32_t sr_motion_height,
     const std::uint32_t render_width,
     const std::uint32_t render_height,
     const std::uint32_t output_width,
@@ -721,6 +724,7 @@ void trace_format_support(
         slot.input_height == crop.input_height &&
         slot.output_width == crop.output_width &&
         slot.output_height == crop.output_height &&
+        slot.sr_motion_width == sr_motion_width && slot.sr_motion_height == sr_motion_height &&
         slot.color_format == color_format &&
         slot.motion_format == motion_format &&
         slot.output_format == output_format &&
@@ -752,6 +756,8 @@ void trace_format_support(
     TransportDevice& device,
     TransportSlot& slot,
     const CropGeometry& crop,
+    const std::uint32_t sr_motion_width,
+    const std::uint32_t sr_motion_height,
     const std::uint32_t render_width,
     const std::uint32_t render_height,
     const std::uint32_t output_width,
@@ -851,7 +857,7 @@ void trace_format_support(
             crop.input_width, crop.input_height, DXGI_FORMAT_R32_FLOAT,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.depth) ||
         !create_shared_texture(device, "motion vectors",
-            crop.output_width, crop.output_height, motion_format,
+            sr_motion_width, sr_motion_height, motion_format,
             D3D12_RESOURCE_FLAG_NONE, slot.motion_vectors) ||
         !create_shared_texture(device, "output",
             crop.output_width, crop.output_height, output_format,
@@ -891,6 +897,7 @@ void trace_format_support(
     slot.input_height = crop.input_height;
     slot.output_width = crop.output_width;
     slot.output_height = crop.output_height;
+    slot.sr_motion_width = sr_motion_width; slot.sr_motion_height = sr_motion_height;
     slot.peripheral_render_width = peripheral_render_width;
     slot.peripheral_render_height = peripheral_render_height;
     slot.peripheral_output_width = peripheral_output_width;
@@ -1408,6 +1415,9 @@ bool evaluate_d3d11_via_d3d12(
             : MotionVectorSpace::output
     );
 
+    const auto reconstruction = supersampled_crop(crop,
+        settings.enabled ? settings.center_supersampling : 1.0F);
+
     const auto mv_crop_x = mv_low_res
         ? crop.input_base_x
         : crop.output_base_x - output_x;
@@ -1549,7 +1559,7 @@ bool evaluate_d3d11_via_d3d12(
     resolve_timing(context, slot);
     resolve_dlss_timing(*device, slot);
     if (!slot_matches(
-            slot, crop, nr_depth_x.extent, nr_depth_y.extent,
+            slot, reconstruction, mv_width, mv_height, nr_depth_x.extent, nr_depth_y.extent,
             nr_geometry.width, nr_geometry.height,
             nr_mv_region_x.extent, nr_mv_region_y.extent, settings.nr_enabled,
             render_width, render_height,
@@ -1558,7 +1568,7 @@ bool evaluate_d3d11_via_d3d12(
             settings.peripheral_dlaa_enabled,
             color_desc.Format, motion_desc.Format, output_desc.Format
         ) && !initialize_slot(
-            *device, slot, crop, nr_depth_x.extent, nr_depth_y.extent,
+            *device, slot, reconstruction, mv_width, mv_height, nr_depth_x.extent, nr_depth_y.extent,
             nr_geometry.width, nr_geometry.height,
             nr_mv_region_x.extent, nr_mv_region_y.extent,
             settings.nr_enabled,
@@ -1802,8 +1812,8 @@ bool evaluate_d3d11_via_d3d12(
     backend_timing.query_heap = measure_dlss ? slot.dlss_timing_heap : nullptr;
     result = evaluate_d3d12_backend(
         device->command_list12, contract, inputs,
-        device->ngx_parameters, crop, ngx.backend,
-        &backend_timing
+        device->ngx_parameters, reconstruction, ngx.backend,
+        &backend_timing, &crop
     );
     if (measure_dlss) {
         if (!backend_timing.sr_timestamp_written) {

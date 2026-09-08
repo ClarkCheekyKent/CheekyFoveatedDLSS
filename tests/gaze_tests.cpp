@@ -8,6 +8,7 @@
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
 #include "streamline_viewport.hpp"
+#include "streamline_create_extent.hpp"
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
 
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 
 namespace cheeky::foveated_dlss {
 
@@ -599,6 +601,45 @@ void test_msfs_array_output_contract() {
     expect(!plan_d3d12_output(desc, 1664, 1276).compatible, "3D output stays rejected");
 }
 
+void test_streamline_supersampling_creation() {
+    using namespace cheeky::foveated_dlss;
+    struct Parameters {
+        unsigned width{688}, height{288}, output_width{1376}, output_height{576};
+        unsigned writes{};
+        bool missing_height{};
+        NgxResult Get(const char* name, unsigned* value) const {
+            if (std::strcmp(name, "Height") == 0 && missing_height) return 0xBAD00005U;
+            *value = std::strcmp(name, "Width") == 0 ? width : height;
+            return 1U;
+        }
+        void Set(const char* name, unsigned value) {
+            ++writes;
+            (std::strcmp(name, "Width") == 0 ? width : height) = value;
+        }
+    } parameters;
+    // MSFS Performance mode at 2x: SL proposes 688x288, but the input crop
+    // (including low-resolution motion) still contains only 344x144 pixels.
+    {
+        StreamlineCreateExtentScope scope(&parameters, 344U, 144U);
+        expect(parameters.width == 344U && parameters.height == 144U,
+            "scaled SL feature uses actual color/depth/low-res MV input dimensions");
+        expect(parameters.output_width == 1376U && parameters.output_height == 576U,
+            "scaled SL feature retains supersampled output dimensions");
+        {
+            StreamlineCreateExtentScope nested(&parameters, 0U, 0U);
+            expect(parameters.width == 344U, "inactive nested override leaves creation untouched");
+        }
+    }
+    expect(parameters.width == 688U && parameters.height == 288U,
+        "SL shared parameters restored after feature creation");
+    parameters.writes = 0;
+    { StreamlineCreateExtentScope off(&parameters, 0U, 0U); }
+    expect(parameters.writes == 0, "1x and unrelated evaluations do not write creation dimensions");
+    parameters.missing_height = true;
+    { StreamlineCreateExtentScope invalid(&parameters, 344U, 144U); }
+    expect(parameters.writes == 0, "unreadable creation dimensions are not partially overridden");
+}
+
 void test_streamline_private_sr_viewport() {
     using namespace cheeky::foveated_dlss;
     struct Viewport {
@@ -1134,7 +1175,56 @@ void test_openvr_geometry() {
     expect_near(u,(1.F+std::tan(0.2F))*0.5F,0.0001F,"inverse eye rotation projects head forward");
 }
 
+void test_center_supersampling() {
+    using namespace cheeky::foveated_dlss;
+    const FoveationGeometry crop{100, 50, 501, 301, 1200, 100, 1002, 602};
+    const auto reduced = supersampled_crop(crop, 0.5F);
+    expect(reduced.output_width == crop.output_width && reduced.output_height == crop.output_height,
+        "legacy sub-1x requests clamp to the original output resolution");
+    const auto enlarged = supersampled_crop(crop, 1.5F);
+    expect(enlarged.output_width == 1503 && enlarged.output_height == 903,
+        "supersampling enlarges only the reconstruction resolution");
+    expect(enlarged.input_width == crop.input_width && enlarged.input_height == crop.input_height &&
+        enlarged.input_base_x == crop.input_base_x && enlarged.input_base_y == crop.input_base_y &&
+        enlarged.output_base_x == crop.output_base_x && enlarged.output_base_y == crop.output_base_y,
+        "supersampling retains input crop and packed-eye placement");
+    expect(supersampled_crop(crop, 2.0F).output_width == 2004,
+        "supersampling is independent of motion-vector resolution");
+    expect(supersampled_crop(crop, 1.0F).output_width == crop.output_width,
+        "1x retains the original DLSS contract");
+    expect(supersampled_crop(crop, std::numeric_limits<float>::quiet_NaN()).output_width == crop.output_width,
+        "non-finite scale falls back to 1x");
+    auto large = crop;
+    large.output_width = 12000; large.output_height = 6000;
+    const auto bounded = supersampled_crop(large, 2.0F);
+    expect(bounded.output_width == 16384 && bounded.output_height == 8192,
+        "texture limit bounds both axes with a shared scale");
+    const auto saved = current_settings();
+    auto settings = saved;
+    settings.center_supersampling = 1.25F;
+    update_settings(settings);
+    expect(current_settings().center_supersampling == 1.25F, "supersampling setting round trips");
+    settings.center_supersampling = 0.5F;
+    update_settings(settings);
+    expect(current_settings().center_supersampling == 1.0F, "legacy 0.5x settings migrate to 1x");
+    settings.center_supersampling = 0.0F;
+    update_settings(settings);
+    expect(current_settings().center_supersampling == 1.0F, "scale clamps to the 1x lower limit");
+    settings.center_supersampling = 20.0F;
+    update_settings(settings);
+    expect(current_settings().center_supersampling == 2.0F, "supersampling setting is bounded");
+    settings.center_supersampling = std::numeric_limits<float>::quiet_NaN();
+    update_settings(settings);
+    expect(current_settings().center_supersampling == 1.0F, "invalid supersampling setting is disabled");
+    update_settings(saved);
+}
+
+int run_motion_resample_tests();
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--motion-resample") == 0)
+        return run_motion_resample_tests();
+    test_center_supersampling();
     test_packed_alignment_coordinator();
     test_packed_alignment_coordinator(true);
     test_openvr_geometry();
@@ -1161,6 +1251,7 @@ int main(int argc, char** argv) {
     test_multimip_game_output_uses_single_mip_private_output();
     test_msfs_array_output_contract();
     test_streamline_private_sr_viewport();
+    test_streamline_supersampling_creation();
     test_multimip_game_output_is_dlss_nr_compatible();
     test_dlss_nr_maps_right_eye_region_into_packed_output();
     test_dlss_nr_stable_crop_and_history();

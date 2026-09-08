@@ -953,11 +953,12 @@ D3D12Evaluation* prepare_d3d12(
         }
         return nullptr;
     }
+    const auto reconstruction = supersampled_crop(crop, settings.center_supersampling);
     auto* const resources = find_or_create_resources(
         device,
         output,
-        crop.output_width,
-        crop.output_height
+        reconstruction.output_width,
+        reconstruction.output_height
     );
     if (resources == nullptr) {
         device->Release();
@@ -1085,8 +1086,8 @@ D3D12Evaluation* prepare_d3d12(
     mutable_parameters->Set("Output", resources->dlss_output);
     mutable_parameters->Set("Width", crop.input_width);
     mutable_parameters->Set("Height", crop.input_height);
-    mutable_parameters->Set("OutWidth", crop.output_width);
-    mutable_parameters->Set("OutHeight", crop.output_height);
+    mutable_parameters->Set("OutWidth", reconstruction.output_width);
+    mutable_parameters->Set("OutHeight", reconstruction.output_height);
     mutable_parameters->Set(
         "DLSS.Render.Subrect.Dimensions.Width",
         crop.input_width
@@ -1189,11 +1190,12 @@ D3D12Evaluation* prepare_d3d12_streamline(
         device == nullptr) {
         return nullptr;
     }
+    const auto reconstruction = supersampled_crop(crop, settings.center_supersampling);
     auto* const resources = find_or_create_resources(
         device,
         output,
-        output_width,
-        output_height
+        reconstruction.output_width,
+        reconstruction.output_height
     );
     if (resources == nullptr) {
         device->Release();
@@ -1269,6 +1271,14 @@ D3D12Evaluation* prepare_d3d12_streamline(
 
     diagnostic_note_activation(DiagnosticApi::d3d12, crop);
     return evaluation;
+}
+
+CropGeometry d3d12_reconstruction_crop(const D3D12Evaluation* evaluation) noexcept {
+    if (!evaluation || !evaluation->resources) return {};
+    auto result = evaluation->crop;
+    result.output_width = evaluation->resources->output_width;
+    result.output_height = evaluation->resources->output_height;
+    return result;
 }
 
 ID3D12Resource* d3d12_private_output(
@@ -1533,7 +1543,8 @@ NgxResult evaluate_d3d12_backend(
     NgxParameters* const parameters,
     const CropGeometry& crop,
     const D3D12BackendCallbacks& callbacks,
-    D3D12BackendTiming* const timing
+    D3D12BackendTiming* const timing,
+    const CropGeometry* const display_crop
 ) noexcept {
     if (command_list == nullptr || parameters == nullptr ||
         inputs.color == nullptr || inputs.depth == nullptr ||
@@ -1656,42 +1667,45 @@ NgxResult evaluate_d3d12_backend(
                 );
             }
             bool motion_reset = !view->has_crop;
+            const auto& source_crop = display_crop ? *display_crop : crop;
+            const bool resize_motion = !contract.motion_vectors_low_res &&
+                (source_crop.output_width != crop.output_width || source_crop.output_height != crop.output_height);
+            CropMotionOffset offset{};
+            bool correct_motion{};
+            bool motion_ready = true;
             if (!contract.reset && !key_changed && view->has_crop && crop_changed &&
                 contract.preserve_history_on_crop_move) {
-                CropMotionOffset offset{};
-                ID3D12Resource* corrected{};
-                if (crop_motion_offset(view->last_crop, crop, contract.motion_vectors_low_res,
-                    contract.motion_vector_scale_x, contract.motion_vector_scale_y, offset)) {
-                    corrected = prepare_crop_motion12(command_list, inputs.motion_vectors,
-                        inputs.mv_base_x, inputs.mv_base_y,
-                        contract.motion_vectors_low_res ? crop.input_width : crop.output_width,
-                        contract.motion_vectors_low_res ? crop.input_height : crop.output_height, offset);
-                }
+                correct_motion = crop_motion_offset(view->last_crop, crop, contract.motion_vectors_low_res,
+                    contract.motion_vector_scale_x, contract.motion_vector_scale_y, offset);
+                if (!correct_motion) { motion_reset = true; offset = {}; }
+            }
+            if (resize_motion || correct_motion) {
+                auto* corrected = prepare_crop_motion12(command_list, inputs.motion_vectors,
+                    inputs.mv_base_x, inputs.mv_base_y,
+                    contract.motion_vectors_low_res ? crop.input_width : source_crop.output_width,
+                    contract.motion_vectors_low_res ? crop.input_height : source_crop.output_height, offset,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    contract.motion_vectors_low_res ? crop.input_width : crop.output_width,
+                    contract.motion_vectors_low_res ? crop.input_height : crop.output_height);
                 if (corrected) {
                     parameters->Set("MotionVectors", corrected);
                     parameters->Set("DLSS.Input.MV.Subrect.Base.X", 0U);
                     parameters->Set("DLSS.Input.MV.Subrect.Base.Y", 0U);
                 } else {
                     motion_reset = true;
+                    motion_ready = !resize_motion;
                 }
-                static std::atomic<unsigned> motion_logs{};
-                const auto log_index = motion_logs.fetch_add(1U, std::memory_order_relaxed);
-                if (log_index < 16U || (motion_reset && log_index % 300U == 0U))
-                    trace_event("D3D12 crop motion view=%llu space=%s offset=%.6f,%.6f corrected=%s reset=%s",
-                        static_cast<unsigned long long>(contract.view_id),
-                        contract.motion_vectors_low_res ? "input" : "output", offset.x, offset.y,
-                        corrected ? "yes" : "no", motion_reset ? "yes" : "no");
             }
             if (contract.reset || key_changed || motion_reset ||
                 (crop_changed && !contract.preserve_history_on_crop_move)) {
                 parameters->Set("Reset", 1);
             }
-            result = callbacks.evaluate_feature(
+            result = motion_ready ? callbacks.evaluate_feature(
                 command_list,
                 view->private_handle,
                 parameters,
                 nullptr
-            );
+            ) : 0xBAD00005U;
             if (timing != nullptr && timing->query_heap != nullptr) {
                 command_list->EndQuery(
                     timing->query_heap,

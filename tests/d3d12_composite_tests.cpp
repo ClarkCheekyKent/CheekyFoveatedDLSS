@@ -1,4 +1,5 @@
 #include "d3d12_composite_shader.hpp"
+#include "d3d11_composite_shader.hpp"
 #include "d3d12_output_contract.hpp"
 
 #include <d3dcompiler.h>
@@ -7,6 +8,8 @@
 #include <wrl/client.h>
 #include <array>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -57,7 +60,7 @@ struct Texture {
 };
 
 Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
-    UINT width, UINT height, UINT16 slices, UINT16 mips, UINT32 value, DXGI_FORMAT format) {
+    UINT width, UINT height, UINT16 slices, UINT16 mips, UINT32 value, DXGI_FORMAT format, bool checker = false) {
     Texture t;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -82,7 +85,8 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
         const auto& f = t.footprints[i];
         for (UINT y = 0; y < f.Footprint.Height; ++y) {
             auto* row = reinterpret_cast<UINT32*>(mapped + f.Offset + y * f.Footprint.RowPitch);
-            for (UINT x = 0; x < f.Footprint.Width; ++x) row[x] = value;
+            for (UINT x = 0; x < f.Footprint.Width; ++x)
+                row[x] = checker && ((x + y) % 2 == 0) ? 0xff000000U : value;
         }
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = t.upload.Get();
@@ -99,7 +103,8 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 }
 
 void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
-    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
+    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false) {
     ComPtr<ID3D12InfoQueue> messages;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) {
         messages->ClearStoredMessages();
@@ -116,7 +121,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     const UINT32 green = hdr ? (0x3c0U << 11) : 0xff00ff00U;
     const UINT32 sentinel = hdr ? 0x3c0U : 0xff332211U;
     auto color = texture(device, list.Get(), 32, 24, slices, mips, blue, format);
-    auto dlss = texture(device, list.Get(), 8, 8, 1, 1, green, format);
+    auto dlss = texture(device, list.Get(), source_width, source_height, 1, 1, green, format, checker);
     auto output = texture(device, list.Get(), 32, 24, slices, mips, sentinel, format);
     transition(list.Get(), color.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(list.Get(), dlss.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -131,11 +136,23 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     const auto increment = device->GetDescriptorHandleIncrementSize(hd.Type);
     auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
     auto srv = d3d12_composite_srv(format);
+    if (direct11) {
+        srv = {};
+        srv.Format = format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+    }
     device->CreateShaderResourceView(color.resource.Get(), &srv, cpu);
     cpu.ptr += increment;
     device->CreateShaderResourceView(dlss.resource.Get(), &srv, cpu);
     cpu.ptr += increment;
     auto uav = d3d12_composite_uav(format);
+    if (direct11) {
+        uav = {};
+        uav.Format = format;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    }
     device->CreateUnorderedAccessView(output.resource.Get(), nullptr, &uav, cpu);
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
@@ -155,8 +172,11 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     check(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors));
     ComPtr<ID3D12RootSignature> root;
     check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root)));
-    check(D3DCompile(composite_shader_source, sizeof(composite_shader_source) - 1, nullptr,
-        nullptr, nullptr, "CompositeMain", "cs_5_1", 0, 0, &shader, &errors));
+    const char* source = direct11 ? d3d11_composite_shader_source : composite_shader_source;
+    const auto compiled = D3DCompile(source, std::strlen(source), nullptr,
+        nullptr, nullptr, "CompositeMain", direct11 ? "cs_5_0" : "cs_5_1", 0, 0, &shader, &errors);
+    if (FAILED(compiled) && errors) std::cerr << static_cast<const char*>(errors->GetBufferPointer());
+    check(compiled);
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();
     pd.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
@@ -212,7 +232,41 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
                 if (i == 0 && x >= 4 && x < 28 && y >= 2 && y < 22) {
                     expected = x >= 12 && x < 20 && y >= 8 && y < 16 ? green : blue;
                 }
-                correct &= row[x] == expected;
+                if (checker && i == 0 && x >= 12 && x < 20 && y >= 8 && y < 16) {
+                    // Independent CPU reference: integrate every source cell's
+                    // overlap with this destination pixel, using double precision.
+                    const double left = (x - 12) * source_width / 8.0;
+                    const double right = (x - 11) * source_width / 8.0;
+                    const double top = (y - 8) * source_height / 8.0;
+                    const double bottom = (y - 7) * source_height / 8.0;
+                    double green_area = 0;
+                    for (UINT sy = 0; sy < source_height; ++sy) {
+                        for (UINT sx = 0; sx < source_width; ++sx) {
+                            if ((sx + sy) % 2 == 0) continue;
+                            green_area += (std::max)(0.0, (std::min)(right, double(sx + 1)) - (std::max)(left, double(sx))) *
+                                (std::max)(0.0, (std::min)(bottom, double(sy + 1)) - (std::max)(top, double(sy)));
+                        }
+                    }
+                    double expected_fraction = green_area / ((right - left) * (bottom - top));
+                    if (source_width < 8 || source_height < 8) {
+                        const double px = (x - 12 + 0.5) * source_width / 8.0 - 0.5;
+                        const double py = (y - 8 + 0.5) * source_height / 8.0 - 0.5;
+                        const int bx = int(std::floor(px)), by = int(std::floor(py));
+                        const double fx = px - bx, fy = py - by;
+                        expected_fraction = 0;
+                        for (int dy = 0; dy <= 1; ++dy) for (int dx = 0; dx <= 1; ++dx) {
+                            const int sx = std::clamp(bx + dx, 0, int(source_width) - 1);
+                            const int sy = std::clamp(by + dy, 0, int(source_height) - 1);
+                            if ((sx + sy) % 2 != 0)
+                                expected_fraction += (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
+                        }
+                    }
+                    const int expected_green = int(std::lround(255.0 * expected_fraction));
+                    const int actual_green = int((row[x] >> 8) & 255);
+                    correct &= std::abs(actual_green - expected_green) <= 1 && (row[x] & 0xffff00ffU) == 0xff000000U;
+                } else {
+                    correct &= row[x] == expected;
+                }
             }
         }
     }
@@ -232,7 +286,8 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         }
     }
     std::cout << "Composite pixels verified: slices=" << slices << " mips=" << mips
-        << " format=" << format << '\n';
+        << " format=" << format << " source=" << source_width << "x" << source_height
+        << " shader=" << (direct11 ? "DX11" : "DX12") << '\n';
 }
 } // namespace
 
@@ -256,6 +311,15 @@ int run_d3d12_composite_tests() {
         run_case(device.Get(), 4, 5);
         run_case(device.Get(), 2, 5, DXGI_FORMAT_R11G11B10_FLOAT);
         run_case(device.Get(), 4, 5, DXGI_FORMAT_R11G11B10_FLOAT);
+        for (const bool direct11 : {false, true}) {
+            for (const UINT size : {4U, 6U, 8U, 10U, 12U, 16U})
+                run_case(device.Get(), direct11 ? 1 : 2, direct11 ? 1 : 5,
+                    DXGI_FORMAT_R8G8B8A8_UNORM, size, size, direct11, true);
+            run_case(device.Get(), direct11 ? 1 : 2, direct11 ? 1 : 5,
+                DXGI_FORMAT_R8G8B8A8_UNORM, 11, 13, direct11, true);
+            run_case(device.Get(), direct11 ? 1 : 2, direct11 ? 1 : 5,
+                DXGI_FORMAT_R11G11B10_FLOAT, 12, 12, direct11);
+        }
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

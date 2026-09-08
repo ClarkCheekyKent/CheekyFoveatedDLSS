@@ -723,6 +723,9 @@ void load_settings_from_reshade() noexcept {
         settings.center_preset
     ));
     static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "CenterSupersampling", settings.center_supersampling
+    ));
+    static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "PeripheralDlaaPreset",
         settings.peripheral_dlaa_preset
     ));
@@ -880,6 +883,9 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     reshade::set_config_value(
         nullptr, config_section, "CenterPreset",
         settings.center_preset
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "CenterSupersampling", settings.center_supersampling
     );
     reshade::set_config_value(
         nullptr, config_section, "PeripheralDlaaPreset",
@@ -1057,6 +1063,25 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     ImGui::TextDisabled("(Alt+Shift+/)");
     ImGui::BeginDisabled(!settings.enabled);
     preset_combo("Center preset", settings.center_preset, true);
+    static float supersampling_draft = 1.0F;
+    static bool editing_supersampling{};
+    if (!editing_supersampling) supersampling_draft = settings.center_supersampling;
+    if (ImGui::SliderFloat("Center supersampling", &supersampling_draft,
+            1.0F, 2.0F, "%.2fx", ImGuiSliderFlags_AlwaysClamp)) {
+        editing_supersampling = true;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        settings.center_supersampling = supersampling_draft;
+        editing_supersampling = false;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(
+        "Enlarges center DLSS output, then area-downsamples to its original size.\n"
+        "Minimum output is the DLSS input resolution or 32 pixels per dimension.\n"
+        "1.00x is off; 2.00x uses four times the center output pixels.\n"
+        "Applies on release. Output-resolution motion vectors are point-resampled with output displacement scaling.");
+    ImGui::TextDisabled("Area downsampling; 1.00x is off");
+
     changed |= ImGui::Checkbox(
         "Peripheral DLAA",
         &settings.peripheral_dlaa_enabled
@@ -1273,6 +1298,9 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         settings.peripheral_dlaa_enabled = defaults.peripheral_dlaa_enabled;
         settings.peripheral_dlaa_scale = defaults.peripheral_dlaa_scale;
         settings.center_preset = defaults.center_preset;
+        settings.center_supersampling = defaults.center_supersampling;
+        supersampling_draft = defaults.center_supersampling;
+        editing_supersampling = false;
         settings.peripheral_dlaa_preset = defaults.peripheral_dlaa_preset;
         peripheral_scale_draft = defaults.peripheral_dlaa_scale;
         editing_peripheral_scale = false;

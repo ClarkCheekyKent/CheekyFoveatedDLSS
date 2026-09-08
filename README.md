@@ -79,6 +79,7 @@ The main controls and their defaults are:
 | --- | --- | --- |
 | Enable foveated DLSS-SR | On | Enables the main foveated Super Resolution path. |
 | Center preset | Game/default | Preserves the game's DLSS preset or overrides it with E, K, L, or M. |
+| Center supersampling | `1.00x` | Scales the center DLSS output by 1-2x per dimension, then area-downsamples to its original size. Applies on slider release. Supports input- and output-resolution motion vectors. |
 | Peripheral DLAA | On | Enables the auxiliary DLAA pass for the area outside the fovea. |
 | Peripheral preset | E (Fastest) | Selects E, K, L, or M for the peripheral DLAA pass. |
 | Periphery scale | `0.75` | Downscales the periphery further from the original render resolution. |
@@ -95,6 +96,20 @@ The main controls and their defaults are:
 | Gaze smoothing | `20 ms` | Sets the time constant for gaze motion. |
 | Crop origin quantization | `8 px` | Snaps motion to render-pixel increments. |
 | Jump reset threshold | `0.125 crop` | Resets DLSS history above the larger of 64 px or 12.5% of the crop dimension. |
+
+Center supersampling leaves the game's render resolution and the fovea's screen
+size unchanged. The range is `1.00x` to `2.00x`; previously saved values below
+`1.00x` are clamped to `1.00x`. At `1.50x`, DLSS reconstructs 2.25 times as many center output
+pixels; at `2.00x`, four times as many. Area downsampling runs in the existing
+composite pass, with no sharpening or separate downscale pass. Quality gains are
+scene-dependent and cost additional GPU time and memory. The default `1.00x`
+preserves the original pixel mapping. Output-resolution motion vectors are
+point-resampled in a private compute pass with displacement scaled to the new
+output grid; gaze-crop correction is combined with that pass. This avoids blending
+unrelated velocities at object boundaries. The game's vector textures remain
+unchanged. Unsupported vector resources or 3D Streamline vectors fall back to
+the game's DLSS if resampling is required. Extremely large centers are capped
+at the GPU's 16,384-pixel texture dimension limit.
 
 Press **Alt+Shift+/** to toggle foveated DLSS-SR without opening the overlay. Settings are saved through ReShade and restored the next time the game starts.
 

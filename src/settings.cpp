@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cmath>
 #include <deque>
 #include <mutex>
 
@@ -14,6 +15,7 @@ std::atomic<bool> d3d11_use_d3d12_transport{false};
 std::atomic<bool> peripheral_dlaa_enabled{true};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
+std::atomic<std::uint32_t> center_supersampling_bits{0x3F800000U};
 std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
 std::atomic<std::uint32_t> width_bits{0x3F0CCCCDU};
 std::atomic<std::uint32_t> height_bits{0x3EE66666U};
@@ -105,6 +107,7 @@ Settings current_settings() noexcept {
     settings.peripheral_dlaa_enabled =
         peripheral_dlaa_enabled.load(std::memory_order_acquire);
     settings.peripheral_dlaa_scale = load_float(peripheral_dlaa_scale_bits);
+    settings.center_supersampling = load_float(center_supersampling_bits);
     settings.center_preset =
         center_preset.load(std::memory_order_acquire);
     settings.peripheral_dlaa_preset =
@@ -178,6 +181,8 @@ void update_settings(const Settings& settings) noexcept {
     const auto valid_preset = [](const std::uint32_t value) noexcept {
         return value == 5U || value == 11U || value == 12U || value == 13U;
     };
+    store_float(center_supersampling_bits, std::isfinite(settings.center_supersampling)
+        ? std::clamp(settings.center_supersampling, 1.0F, 2.0F) : 1.0F);
     center_preset.store(
         settings.center_preset == 0U || valid_preset(settings.center_preset)
             ? settings.center_preset

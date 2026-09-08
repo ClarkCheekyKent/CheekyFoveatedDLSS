@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include "streamline_viewport.hpp"
+#include "streamline_create_extent.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -300,15 +301,22 @@ std::atomic<bool> streamline_foveation_active{};
 std::atomic<std::uint32_t> captured_d3d12_create_flags{};
 std::atomic<bool> captured_d3d12_create_flags_valid{};
 thread_local bool inside_streamline_evaluation{};
+thread_local unsigned streamline_create_width{}, streamline_create_height{};
 
 struct StreamlineEvaluationScope {
     bool previous{};
-    StreamlineEvaluationScope() noexcept
-        : previous(inside_streamline_evaluation) {
+    unsigned previous_width{}, previous_height{};
+    StreamlineEvaluationScope(unsigned width = 0U, unsigned height = 0U) noexcept
+        : previous(inside_streamline_evaluation),
+          previous_width(streamline_create_width), previous_height(streamline_create_height) {
         inside_streamline_evaluation = true;
+        streamline_create_width = width;
+        streamline_create_height = height;
     }
     ~StreamlineEvaluationScope() {
         inside_streamline_evaluation = previous;
+        streamline_create_width = previous_width;
+        streamline_create_height = previous_height;
     }
 };
 
@@ -2222,66 +2230,10 @@ struct StreamlineEvaluation {
         evaluation.viewport.value
     ) + 1U;
     register_stereo_view(streamline_view_id);
-    const auto streamline_settings = settings_for_view(
+    auto streamline_settings = settings_for_view(
         current_settings(),
         streamline_view_id
     );
-    evaluation.settings = streamline_settings;
-    GazeProjection gaze_projection{};
-    const auto camera_frame_key = gaze_frame_key(frame);
-    AcquireSRWLockShared(&streamline_lock);
-    gaze_projection = streamline_gaze_projections.find(evaluation.viewport.value,
-        camera_frame_key, GetTickCount64());
-    ReleaseSRWLockShared(&streamline_lock);
-    {
-    const ScopedGazeProjection projection_scope(streamline_view_id, gaze_projection);
-    evaluation.backend = prepare_d3d12_streamline(
-        command_list,
-        static_cast<ID3D12Resource*>(color_tag.resource->native),
-        static_cast<ID3D12Resource*>(output_tag.resource->native),
-        render_width,
-        render_height,
-        output_width,
-        output_height,
-        color_tag.extent.left,
-        color_tag.extent.top,
-        output_tag.extent.left,
-        output_tag.extent.top,
-        streamline_view_id,
-        current_settings(),
-        verbose,
-        sequence
-    );
-    }
-    if (evaluation.backend == nullptr) {
-        if (verbose) trace_event("SL eval=%llu backend prepare rejected", static_cast<unsigned long long>(sequence));
-        return false;
-    }
-
-    const auto crop = d3d12_evaluation_crop(evaluation.backend);
-    note_stereo_view_geometry(
-        streamline_view_id,
-        render_width,
-        render_height,
-        output_width,
-        output_height,
-        crop
-    );
-    if (verbose) {
-        trace_event(
-            "SL eval=%llu backend ready scratch=%p crop input=%ux%u@%u,%u output=%ux%u@%u,%u",
-            static_cast<unsigned long long>(sequence),
-            d3d12_private_output(evaluation.backend),
-            crop.input_width,
-            crop.input_height,
-            crop.input_base_x,
-            crop.input_base_y,
-            crop.output_width,
-            crop.output_height,
-            crop.output_base_x,
-            crop.output_base_y
-        );
-    }
     // Match the Hogwarts/native NGX fix: infer MV coordinate space from the
     // actual motion-vector texture dimensions rather than assuming low-res MVs.
     // The tag extent is still the region we crop *within*; native dimensions are
@@ -2306,6 +2258,65 @@ struct StreamlineEvaluation {
     evaluation.motion_vectors_output_space =
         mv_native_width != 0U && mv_native_height != 0U && mv_to_output < mv_to_input;
 
+    evaluation.settings = streamline_settings;
+    auto backend_settings = current_settings();
+    backend_settings.center_supersampling = streamline_settings.center_supersampling;
+    GazeProjection gaze_projection{};
+    const auto camera_frame_key = gaze_frame_key(frame);
+    AcquireSRWLockShared(&streamline_lock);
+    gaze_projection = streamline_gaze_projections.find(evaluation.viewport.value,
+        camera_frame_key, GetTickCount64());
+    ReleaseSRWLockShared(&streamline_lock);
+    {
+    const ScopedGazeProjection projection_scope(streamline_view_id, gaze_projection);
+    evaluation.backend = prepare_d3d12_streamline(
+        command_list,
+        static_cast<ID3D12Resource*>(color_tag.resource->native),
+        static_cast<ID3D12Resource*>(output_tag.resource->native),
+        render_width,
+        render_height,
+        output_width,
+        output_height,
+        color_tag.extent.left,
+        color_tag.extent.top,
+        output_tag.extent.left,
+        output_tag.extent.top,
+        streamline_view_id,
+        backend_settings,
+        verbose,
+        sequence
+    );
+    }
+    if (evaluation.backend == nullptr) {
+        if (verbose) trace_event("SL eval=%llu backend prepare rejected", static_cast<unsigned long long>(sequence));
+        return false;
+    }
+
+    const auto crop = d3d12_evaluation_crop(evaluation.backend);
+    const auto reconstruction = d3d12_reconstruction_crop(evaluation.backend);
+    note_stereo_view_geometry(
+        streamline_view_id,
+        render_width,
+        render_height,
+        output_width,
+        output_height,
+        crop
+    );
+    if (verbose) {
+        trace_event(
+            "SL eval=%llu backend ready scratch=%p crop input=%ux%u@%u,%u output=%ux%u@%u,%u",
+            static_cast<unsigned long long>(sequence),
+            d3d12_private_output(evaluation.backend),
+            crop.input_width,
+            crop.input_height,
+            crop.input_base_x,
+            crop.input_base_y,
+            crop.output_width,
+            crop.output_height,
+            crop.output_base_x,
+            crop.output_base_y
+        );
+    }
     diagnostic_note_motion_vectors(
         DiagnosticApi::d3d12,
         mv_native_width,
@@ -2332,7 +2343,7 @@ struct StreamlineEvaluation {
     // Streamline shares NGX preset parameters across viewports. The peripheral
     // options must not be the last options submitted before the center call.
     if (!apply_streamline_options(
-            crop.output_width, crop.output_height,
+            reconstruction.output_width, reconstruction.output_height,
             streamline_settings.center_preset, &evaluation.cropped_viewport
         )) {
         if (verbose) trace_event("SL eval=%llu cropped options failed", static_cast<unsigned long long>(sequence));
@@ -2384,7 +2395,7 @@ struct StreamlineEvaluation {
     for (std::size_t i{}; i < evaluation.original_tags.size(); ++i)
         evaluation.original_tags[i].resource = &evaluation.original_resources[i];
     evaluation.has_original_tags = true;
-    auto history_crop = crop;
+    auto history_crop = reconstruction;
     history_crop.output_base_x -= output_tag.extent.left;
     history_crop.output_base_y -= output_tag.extent.top;
     evaluation.history = {evaluation.viewport.value, history_crop, render_width,
@@ -2398,7 +2409,7 @@ struct StreamlineEvaluation {
             previous->output_width != output_width || previous->output_height != output_height ||
             previous->output_space != evaluation.motion_vectors_output_space ||
             previous->crop.input_width != crop.input_width || previous->crop.input_height != crop.input_height ||
-            previous->crop.output_width != crop.output_width || previous->crop.output_height != crop.output_height;
+            previous->crop.output_width != reconstruction.output_width || previous->crop.output_height != reconstruction.output_height;
     }
 
     for (std::size_t index{}; index < 3U; ++index) {
@@ -2467,52 +2478,57 @@ struct StreamlineEvaluation {
     output_resource.memory = nullptr;
     output_resource.view = nullptr;
     output_resource.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    output_resource.width = output_width;
-    output_resource.height = output_height;
+    output_resource.width = reconstruction.output_width;
+    output_resource.height = reconstruction.output_height;
     output_resource.mip_levels = 1U;
     output_resource.array_layers = 1U;
     output_tag.resource = &output_resource;
-    output_tag.extent = {0U, 0U, crop.output_width, crop.output_height};
+    output_tag.extent = {0U, 0U, reconstruction.output_width, reconstruction.output_height};
     if (verbose) trace_event("SL eval=%llu cropped tags prepared", static_cast<unsigned long long>(sequence));
 
+    const bool resize_motion = evaluation.motion_vectors_output_space &&
+        (reconstruction.output_width != crop.output_width || reconstruction.output_height != crop.output_height);
+    float motion_resample_inverse_x = 1.0F, motion_resample_inverse_y = 1.0F;
+    CropMotionOffset motion_offset{};
     if (!motion_reset && !constants.reset && !d3d12_evaluation_gaze_reset(evaluation.backend)) {
-        CropMotionOffset offset{};
         const auto reference_width = evaluation.motion_vectors_output_space ? output_width : render_width;
         const auto reference_height = evaluation.motion_vectors_output_space ? output_height : render_height;
-        const bool valid_offset = !constants.motion_vectors_3d && crop_motion_offset(
-            previous->crop, history_crop, !evaluation.motion_vectors_output_space,
-            constants.motion_vector_scale.x * reference_width,
-            constants.motion_vector_scale.y * reference_height, offset);
-        if (!valid_offset) {
+        if (constants.motion_vectors_3d || !crop_motion_offset(
+                previous->crop, history_crop, !evaluation.motion_vectors_output_space,
+                constants.motion_vector_scale.x * reference_width,
+                constants.motion_vector_scale.y * reference_height, motion_offset)) {
             motion_reset = true;
-        } else if (offset.x != 0.0F || offset.y != 0.0F) {
-            auto& motion = evaluation.resources[2U];
-            auto& tag = evaluation.tags[2U];
-            ID3D12Resource* corrected{};
-            if (motion.state != 0xFFFFFFFFU) {
-                corrected = prepare_crop_motion12(command_list,
-                    static_cast<ID3D12Resource*>(motion.native), tag.extent.left, tag.extent.top,
-                    tag.extent.width, tag.extent.height, offset,
-                    static_cast<D3D12_RESOURCE_STATES>(motion.state));
-            }
-            if (corrected) {
-                motion.native = corrected;
-                motion.memory = nullptr; motion.view = nullptr;
-                motion.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                motion.width = tag.extent.width; motion.height = tag.extent.height;
-                motion.native_format = DXGI_FORMAT_R32G32_FLOAT;
-                motion.mip_levels = motion.array_layers = 1U;
-                tag.extent.left = tag.extent.top = 0U;
-            } else {
-                motion_reset = true;
-            }
-            static std::atomic<unsigned> motion_logs{};
-            const auto log_index = motion_logs.fetch_add(1U, std::memory_order_relaxed);
-            if (log_index < 16U || (motion_reset && log_index % 300U == 0U))
-                trace_event("SL crop motion viewport=%u offset=%.6f,%.6f corrected=%s reset=%s",
-                    evaluation.viewport.value, offset.x, offset.y, corrected ? "yes" : "no",
-                    motion_reset ? "yes" : "no");
+            motion_offset = {};
         }
+    }
+    if (resize_motion || motion_offset.x != 0.0F || motion_offset.y != 0.0F) {
+        auto& motion = evaluation.resources[2U];
+        auto& tag = evaluation.tags[2U];
+        const auto destination_width = resize_motion ? reconstruction.output_width : tag.extent.width;
+        const auto destination_height = resize_motion ? reconstruction.output_height : tag.extent.height;
+        ID3D12Resource* corrected{};
+        if (!constants.motion_vectors_3d && motion.state != 0xFFFFFFFFU) {
+            corrected = prepare_crop_motion12(command_list,
+                static_cast<ID3D12Resource*>(motion.native), tag.extent.left, tag.extent.top,
+                tag.extent.width, tag.extent.height, motion_offset,
+                static_cast<D3D12_RESOURCE_STATES>(motion.state), destination_width, destination_height);
+        }
+        if (corrected) {
+            motion_resample_inverse_x = static_cast<float>(tag.extent.width) / destination_width;
+            motion_resample_inverse_y = static_cast<float>(tag.extent.height) / destination_height;
+            motion.native = corrected;
+            motion.memory = nullptr; motion.view = nullptr;
+            motion.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            motion.width = destination_width; motion.height = destination_height;
+            motion.native_format = DXGI_FORMAT_R32G32_FLOAT;
+            motion.mip_levels = motion.array_layers = 1U;
+            tag.extent = {0U, 0U, destination_width, destination_height};
+        } else if (resize_motion) {
+            finish_d3d12_streamline(command_list, evaluation.backend, false);
+            evaluation.backend = nullptr;
+            diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::prepare_rejected);
+            return false;
+        } else motion_reset = true;
     }
 
     const auto tag_result = submit_streamline_tags(
@@ -2550,9 +2566,9 @@ struct StreamlineEvaluation {
         const auto mv_crop_height = evaluation.motion_vectors_output_space
             ? crop.output_height : crop.input_height;
         cropped.motion_vector_scale.x *=
-            static_cast<float>(mv_reference_width) / mv_crop_width;
+            static_cast<float>(mv_reference_width) / mv_crop_width * motion_resample_inverse_x;
         cropped.motion_vector_scale.y *=
-            static_cast<float>(mv_reference_height) / mv_crop_height;
+            static_cast<float>(mv_reference_height) / mv_crop_height * motion_resample_inverse_y;
         evaluation.nr_constants = cropped;
         evaluation.has_nr_constants = true;
         if (verbose) {
@@ -3006,7 +3022,12 @@ std::uint32_t hook_sl_evaluate_feature(
     if (verbose) trace_event("SL eval=%llu original begin foveated=%s", static_cast<unsigned long long>(sequence), evaluation.backend != nullptr ? "yes" : "no");
     std::uint32_t result{};
     {
-        StreamlineEvaluationScope scope;
+        const auto display = prepared ? d3d12_evaluation_crop(evaluation.backend) : CropGeometry{};
+        const auto reconstruction = prepared ? d3d12_reconstruction_crop(evaluation.backend) : CropGeometry{};
+        const bool scaled = prepared && (display.output_width != reconstruction.output_width ||
+            display.output_height != reconstruction.output_height);
+        StreamlineEvaluationScope scope(scaled ? display.input_width : 0U,
+            scaled ? display.input_height : 0U);
         result = original(
             feature,
             frame,
@@ -3733,6 +3754,16 @@ NgxResult hook_create_d3d12(
     if (!scope.outermost()) {
         return original(command_list, feature, parameters, handle);
     }
+    if (feature == 1U && parameters && streamline_create_width && streamline_create_height) {
+        trace_event("SL center NGX create input optimal=%ux%u actual=%ux%u output=%ux%u flags=0x%08X",
+            get_ui(parameters, "Width"), get_ui(parameters, "Height"),
+            streamline_create_width, streamline_create_height,
+            get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
+            get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags"));
+    }
+    StreamlineCreateExtentScope extent_scope(parameters,
+        feature == 1U ? streamline_create_width : 0U,
+        feature == 1U ? streamline_create_height : 0U);
     diagnostic_note_create(DiagnosticApi::d3d12);
     if (is_dlss_feature(feature) && parameters != nullptr) {
         captured_d3d12_create_flags.store(
@@ -3760,6 +3791,16 @@ NgxResult hook_core_create_d3d12(
     if (!scope.outermost()) {
         return original(command_list, feature, parameters, handle);
     }
+    if (feature == 1U && parameters && streamline_create_width && streamline_create_height) {
+        trace_event("SL center NGX create input optimal=%ux%u actual=%ux%u output=%ux%u flags=0x%08X",
+            get_ui(parameters, "Width"), get_ui(parameters, "Height"),
+            streamline_create_width, streamline_create_height,
+            get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
+            get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags"));
+    }
+    StreamlineCreateExtentScope extent_scope(parameters,
+        feature == 1U ? streamline_create_width : 0U,
+        feature == 1U ? streamline_create_height : 0U);
     diagnostic_note_create(DiagnosticApi::d3d12);
     if (is_dlss_feature(feature) && parameters != nullptr) {
         captured_d3d12_create_flags.store(
@@ -4041,7 +4082,7 @@ void evaluate_nr_after_native_d3d12(
     result = evaluate_d3d12_backend(
         command_list, contract, inputs,
         const_cast<NgxParameters*>(parameters),
-        crop, callbacks, sr_timing.backend()
+        d3d12_reconstruction_crop(evaluation), callbacks, sr_timing.backend(), &crop
     );
     sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);

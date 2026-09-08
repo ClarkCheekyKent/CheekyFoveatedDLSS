@@ -76,6 +76,25 @@ namespace {
 
 }  // namespace
 
+FoveationGeometry supersampled_crop(const FoveationGeometry& crop,
+    float scale) noexcept {
+    auto result = crop;
+    if (!std::isfinite(scale)) return result;
+    scale = std::clamp(scale, 1.0F, 2.0F);
+    // D3D11/12 texture limit. Clamp the multiplier uniformly to retain aspect.
+    const auto largest = (std::max)(crop.output_width, crop.output_height);
+    if (crop.output_width == 0U || crop.output_height == 0U || largest > 16384U) return result;
+    // Keep DLSS at or above its input resolution and minimum output extent.
+    const auto minimum_scale = (std::max)(
+        static_cast<float>((std::max)(32U, crop.input_width)) / crop.output_width,
+        static_cast<float>((std::max)(32U, crop.input_height)) / crop.output_height);
+    scale = (std::max)(scale, minimum_scale);
+    scale = (std::min)(scale, 16384.0F / largest);
+    result.output_width = static_cast<std::uint32_t>(std::lround(crop.output_width * scale));
+    result.output_height = static_cast<std::uint32_t>(std::lround(crop.output_height * scale));
+    return result;
+}
+
 FoveationOffsets foveation_offsets_from_geometry(
     const FoveationGeometry& geometry,
     const std::uint32_t render_width,

@@ -29,7 +29,7 @@
     <IntDir>$(MSBuildThisFileDirectory)build\msbuild\tests\$(Configuration)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
-    <Link><AdditionalDependencies>d3d12.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><AdditionalDependencies>d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -39,6 +39,8 @@
   <ItemGroup>
     <ClCompile Include="tests\gaze_tests.cpp" />
     <ClCompile Include="tests\d3d12_composite_tests.cpp" />
+    <ClCompile Include="tests\motion_resample_tests.cpp" />
+    <ClCompile Include="src\crop_motion.cpp" />
     <ClCompile Include="tests\support_summary_tests.cpp" />
     <ClCompile Include="shared\gaze_math.cpp" />
     <ClCompile Include="src\foveation.cpp" />

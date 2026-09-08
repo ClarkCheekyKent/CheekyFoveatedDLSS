@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "d3d11_composite_shader.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
 #include "crop_motion.hpp"
@@ -95,128 +96,7 @@ constexpr std::size_t resource_cache_capacity = 8U;
 std::mutex features_mutex;
 std::deque<FeatureState> feature_states;
 
-constexpr char composite_shader_source[] = R"(
-Texture2D<float4> LowResolutionColor : register(t0);
-Texture2D<float4> DlssColor : register(t1);
-RWTexture2D<float4> GameOutput : register(u0);
 
-cbuffer Constants : register(b0) {
-    uint2 OutputSize;
-    uint2 OutputOrigin;
-    uint2 InputBase;
-    uint2 InputSize;
-    uint2 RectBase;
-    uint2 RectSize;
-    float ShapeWidth;
-    float ShapeHeight;
-    float ShapeOffsetX;
-    float ShapeOffsetY;
-    float ShapeRoundness;
-    float Feather;
-    uint2 DlssOrigin;
-    uint ShowAlignmentBorder;
-    float NextJumpOffsetX;
-    float NextJumpOffsetY;
-    uint ShowNextJump;
-};
-
-float ShapeDistance(float2 centered) {
-    const float2 shape_size = max(
-        float2(ShapeWidth, ShapeHeight),
-        float2(0.0001, 0.0001)
-    );
-    const float2 scaled = abs(centered) / shape_size;
-    return lerp(
-        max(scaled.x, scaled.y),
-        length(scaled),
-        saturate(ShapeRoundness)
-    );
-}
-
-float4 LoadInputBilinear(float2 position) {
-    const float2 base = floor(position);
-    const float2 fraction = position - base;
-    const int2 minimum = int2(InputBase);
-    const int2 maximum = minimum + int2(InputSize) - 1;
-    const int2 p00 = clamp(int2(base), minimum, maximum);
-    const int2 p10 = clamp(p00 + int2(1, 0), minimum, maximum);
-    const int2 p01 = clamp(p00 + int2(0, 1), minimum, maximum);
-    const int2 p11 = clamp(p00 + int2(1, 1), minimum, maximum);
-    return lerp(
-        lerp(LowResolutionColor.Load(int3(p00, 0)),
-             LowResolutionColor.Load(int3(p10, 0)), fraction.x),
-        lerp(LowResolutionColor.Load(int3(p01, 0)),
-             LowResolutionColor.Load(int3(p11, 0)), fraction.x),
-        fraction.y
-    );
-}
-
-float2 InputPosition(uint2 local_pixel) {
-    return float2(InputBase) +
-        (float2(local_pixel) + 0.5) * float2(InputSize) /
-        float2(OutputSize) - 0.5;
-}
-
-[numthreads(16, 16, 1)]
-void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
-    if (any(dispatch_id.xy >= OutputSize)) return;
-    const uint2 local_pixel = dispatch_id.xy;
-    const uint2 output_pixel = OutputOrigin + local_pixel;
-    const float4 bilinear = LoadInputBilinear(InputPosition(local_pixel));
-    float2 centered =
-        (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
-    centered.x -= ShapeOffsetX * (1.0 - ShapeWidth);
-    centered.y -= ShapeOffsetY * (1.0 - ShapeHeight);
-    const float distance_from_center = ShapeDistance(centered);
-    const float2 pixel_size = 2.0 / float2(OutputSize);
-    const float distance_per_pixel = max(
-        abs(ShapeDistance(centered + float2(pixel_size.x, 0.0)) -
-            distance_from_center),
-        abs(ShapeDistance(centered + float2(0.0, pixel_size.y)) -
-            distance_from_center)
-    );
-    if (ShowNextJump != 0U) {
-        float2 next_centered = (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
-        next_centered -= float2(NextJumpOffsetX * (1.0 - ShapeWidth), NextJumpOffsetY * (1.0 - ShapeHeight));
-        const float next_distance = ShapeDistance(next_centered);
-        const float next_pixel_distance = max(
-            abs(ShapeDistance(next_centered + float2(pixel_size.x, 0.0)) - next_distance),
-            abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
-        if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
-            GameOutput[output_pixel] = float4(0.0, 1.0, 0.0, 1.0);
-            return;
-        }
-    }
-    const bool alignment_border = ShowAlignmentBorder != 0U &&
-        distance_from_center <= 1.0 &&
-        distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
-    if (alignment_border) {
-        GameOutput[output_pixel] = float4(1.0, 0.0, 0.0, 1.0);
-        return;
-    }
-    const float normalized_feather = Feather /
-        max(0.0001, min(ShapeWidth, ShapeHeight));
-    const float weight = Feather <= 0.0
-        ? (distance_from_center <= 1.0 ? 1.0 : 0.0)
-        : 1.0 - smoothstep(
-            max(0.0, 1.0 - normalized_feather),
-            1.0,
-            distance_from_center
-        );
-    const bool inside_rect = all(output_pixel >= RectBase) &&
-        all(output_pixel < RectBase + RectSize);
-    if (!inside_rect || weight <= 0.0) {
-        GameOutput[output_pixel] = bilinear;
-        return;
-    }
-
-    // The private DX11 DLSS feature writes a packed crop at scratch (0, 0).
-    // RectBase is where that crop belongs in the game's full-resolution output.
-    const uint2 dlss_pixel = DlssOrigin + (output_pixel - RectBase);
-    const float4 dlss = DlssColor.Load(int3(dlss_pixel, 0));
-    GameOutput[output_pixel] = lerp(bilinear, dlss, weight);
-}
-)";
 
 template <typename T>
 void release(T*& object) noexcept {
@@ -343,8 +223,8 @@ void release_resource_set(ResourceSet& resources) noexcept {
     }
 
     result = D3DCompile(
-        composite_shader_source,
-        sizeof(composite_shader_source) - 1U,
+        d3d11_composite_shader_source,
+        sizeof(d3d11_composite_shader_source) - 1U,
         "Cheeky Foveated DLSS-SR",
         nullptr,
         nullptr,
@@ -964,11 +844,13 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
         crop
     );
 
+    const auto reconstruction = supersampled_crop(crop, settings.center_supersampling);
+
     auto* const resources = find_or_create_resources(
         context,
         output_desc,
-        crop.output_width,
-        crop.output_height
+        reconstruction.output_width,
+        reconstruction.output_height
     );
     if (resources == nullptr) {
         diagnostic_note_state(
@@ -984,7 +866,7 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
             context,
             game_handle,
             parameters,
-            crop,
+            reconstruction,
             uses_coordinated_center(settings),
             private_handle,
             force_reset
@@ -1089,8 +971,8 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     );
     mutable_parameters->Set("Width", crop.input_width);
     mutable_parameters->Set("Height", crop.input_height);
-    mutable_parameters->Set("OutWidth", crop.output_width);
-    mutable_parameters->Set("OutHeight", crop.output_height);
+    mutable_parameters->Set("OutWidth", reconstruction.output_width);
+    mutable_parameters->Set("OutHeight", reconstruction.output_height);
     mutable_parameters->Set(
         "DLSS.Render.Subrect.Dimensions.Width",
         crop.input_width
@@ -1142,8 +1024,11 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
-    if (!force_reset && !gaze_reset && evaluation->reset == 0 &&
-        uses_coordinated_center(settings)) {
+    const bool resize_motion = !motion_vectors_low_res &&
+        (reconstruction.output_width != crop.output_width || reconstruction.output_height != crop.output_height);
+    CropMotionOffset offset{};
+    bool correct_motion{};
+    if (!force_reset && !gaze_reset && evaluation->reset == 0 && uses_coordinated_center(settings)) {
         CropGeometry previous{};
         bool has_history{};
         {
@@ -1153,32 +1038,36 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
                 has_history = state->has_history_crop;
             }
         }
-        if (!has_history) {
-            force_reset = true;
-        } else if (!same_crop(previous, crop)) {
+        if (!has_history) force_reset = true;
+        else if (!same_crop(previous, crop)) {
             float scale_x = 1.0F, scale_y = 1.0F;
             parameters->Get("MV.Scale.X", &scale_x);
             parameters->Get("MV.Scale.Y", &scale_y);
-            CropMotionOffset offset{};
-            ID3D11Resource* motion{};
-            parameters->Get("MotionVectors", &motion);
-            if (crop_motion_offset(previous, crop, motion_vectors_low_res, scale_x, scale_y, offset)) {
-                evaluation->corrected_motion = create_crop_motion11(context, motion,
-                    evaluation->motion_x + motion_crop_x, evaluation->motion_y + motion_crop_y,
-                    motion_vectors_low_res ? crop.input_width : crop.output_width,
-                    motion_vectors_low_res ? crop.input_height : crop.output_height, offset);
-            }
-            if (evaluation->corrected_motion) {
-                evaluation->original_motion = motion;
-                motion->AddRef();
-                mutable_parameters->Set("MotionVectors", crop_motion_resource(evaluation->corrected_motion));
-                mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.X", 0U);
-                mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.Y", 0U);
-            } else {
-                // Unsupported vector formats must not reuse misaligned history.
-                force_reset = true;
-            }
+            correct_motion = crop_motion_offset(previous, crop, motion_vectors_low_res, scale_x, scale_y, offset);
+            if (!correct_motion) { force_reset = true; offset = {}; }
         }
+    }
+    if (resize_motion || correct_motion) {
+        ID3D11Resource* motion{};
+        parameters->Get("MotionVectors", &motion);
+        evaluation->corrected_motion = create_crop_motion11(context, motion,
+            evaluation->motion_x + motion_crop_x, evaluation->motion_y + motion_crop_y,
+            motion_vectors_low_res ? crop.input_width : crop.output_width,
+            motion_vectors_low_res ? crop.input_height : crop.output_height, offset,
+            motion_vectors_low_res ? crop.input_width : reconstruction.output_width,
+            motion_vectors_low_res ? crop.input_height : reconstruction.output_height);
+        if (evaluation->corrected_motion) {
+            evaluation->original_motion = motion;
+            motion->AddRef();
+            mutable_parameters->Set("MotionVectors", crop_motion_resource(evaluation->corrected_motion));
+            mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.X", 0U);
+            mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.Y", 0U);
+        } else if (resize_motion) {
+            // Restore all game parameters before falling back; a reset alone
+            // cannot repair an incorrectly sized vector field.
+            finish_d3d11(context, parameters, evaluation, 0xBAD00005U);
+            return nullptr;
+        } else force_reset = true;
     }
     if (force_reset || gaze_reset || evaluation->reset != 0) {
         mutable_parameters->Set("Reset", 1);

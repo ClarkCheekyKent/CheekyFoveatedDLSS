@@ -1,4 +1,5 @@
 #include "crop_motion.hpp"
+#include "crop_motion_shader.hpp"
 #include "runtime.hpp"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -9,24 +10,10 @@
 namespace cheeky::foveated_dlss {
 using Microsoft::WRL::ComPtr;
 namespace {
-constexpr char shader_source[] = R"(
-Texture2D<float2> Source : register(t0);
-RWTexture2D<float2> Destination : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 Base; uint2 Size; float2 Offset; float2 Padding;
-};
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= Size)) return;
-    float2 mv = Source.Load(int3(Base + id.xy, 0));
-    // Preserve invalid-vector sentinels. Valid vectors naturally address outside
-    // the old crop at newly exposed edges, allowing DLSS to reject that history.
-    Destination[id.xy] = any(abs(mv) > 1e15) ? mv : mv + Offset;
-}
-)";
 struct Constants {
     unsigned x, y, width, height;
-    float dx, dy, pad0{}, pad1{};
+    float dx, dy;
+    unsigned source_width, source_height;
 };
 DXGI_FORMAT srv_format(DXGI_FORMAT format) noexcept {
     switch (format) {
@@ -47,7 +34,7 @@ bool bounds(unsigned base, unsigned extent, UINT64 size) noexcept {
 ComPtr<ID3DBlob> shader_bytecode() noexcept {
     static const ComPtr<ID3DBlob> code = [] {
         ComPtr<ID3DBlob> blob, errors;
-        D3DCompile(shader_source, sizeof(shader_source) - 1, "crop_motion",
+        D3DCompile(crop_motion_shader_source, sizeof(crop_motion_shader_source) - 1, "crop_motion",
             nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
             0, &blob, &errors);
         return blob;
@@ -77,14 +64,17 @@ void release_crop_motion11() noexcept {
 
 std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext* context,
     ID3D11Resource* source, unsigned x, unsigned y, unsigned width, unsigned height,
-    CropMotionOffset offset) noexcept {
+    CropMotionOffset offset, unsigned output_width, unsigned output_height) noexcept {
     if (!context || !source) return {};
+    if (!output_width) output_width = width;
+    if (!output_height) output_height = height;
+    if (output_width > 16384U || output_height > 16384U) return {};
     ComPtr<ID3D11Texture2D> texture;
     if (FAILED(source->QueryInterface(IID_PPV_ARGS(&texture)))) return {};
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
     const auto format = srv_format(desc.Format);
-    if (format == DXGI_FORMAT_UNKNOWN || desc.ArraySize != 1 ||
+    if (format == DXGI_FORMAT_UNKNOWN || desc.ArraySize == 0 ||
         desc.SampleDesc.Count != 1 || !(desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) ||
         !bounds(x, width, desc.Width) || !bounds(y, height, desc.Height)) return {};
     ComPtr<ID3D11Device> device;
@@ -94,23 +84,23 @@ std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext* context,
         std::lock_guard lock(mutex11);
         for (auto& cached : cache11) {
             if (cached.use_count() == 1 && cached->context.Get() == context &&
-                cached->source.Get() == source && cached->width == width && cached->height == height) {
+                cached->source.Get() == source && cached->width == output_width && cached->height == output_height) {
                 pass = cached; break;
             }
         }
     }
-    const Constants data{x, y, width, height, offset.x, offset.y};
+    const Constants data{x, y, output_width, output_height, offset.x, offset.y, width, height};
     if (!pass) {
     pass = std::make_shared<CropMotion11>();
     pass->context = context; pass->source = source;
-    pass->width = width; pass->height = height;
+    pass->width = output_width; pass->height = output_height;
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Format = format;
-    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    sd.Texture2D.MipLevels = 1;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    sd.Texture2DArray.MipLevels = 1; sd.Texture2DArray.ArraySize = 1;
     if (FAILED(device->CreateShaderResourceView(source, &sd, &pass->srv))) return {};
     desc = {};
-    desc.Width = width; desc.Height = height;
+    desc.Width = output_width; desc.Height = output_height;
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R32G32_FLOAT;
     desc.Usage = D3D11_USAGE_DEFAULT;
@@ -149,7 +139,7 @@ std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext* context,
     context->CSSetShaderResources(0, 1, pass->srv.GetAddressOf());
     context->CSSetUnorderedAccessViews(0, 1, pass->uav.GetAddressOf(), nullptr);
     context->CSSetConstantBuffers(0, 1, pass->constants.GetAddressOf());
-    context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    context->Dispatch((output_width + 7) / 8, (output_height + 7) / 8, 1);
     context->CSSetUnorderedAccessViews(0, 1, &null_uav, nullptr);
     context->CSSetShaderResources(0, 1, old_srv.GetAddressOf());
     context->CSSetUnorderedAccessViews(0, 1, old_uav.GetAddressOf(), nullptr);
@@ -222,9 +212,9 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&pass->heap)))) return {};
     auto cpu = pass->heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format = format; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Format = format; sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sd.Texture2D.MipLevels = 1;
+    sd.Texture2DArray.MipLevels = 1; sd.Texture2DArray.ArraySize = 1;
     device->CreateShaderResourceView(source, &sd, cpu);
     cpu.ptr += device->GetDescriptorHandleIncrementSize(hd.Type);
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
@@ -256,12 +246,16 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
 }
 ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     ID3D12Resource* source, unsigned x, unsigned y, unsigned width, unsigned height,
-    CropMotionOffset offset, D3D12_RESOURCE_STATES source_state) noexcept {
+    CropMotionOffset offset, D3D12_RESOURCE_STATES source_state,
+    unsigned output_width, unsigned output_height) noexcept {
     if (!list || !source) return nullptr;
+    if (!output_width) output_width = width;
+    if (!output_height) output_height = height;
+    if (output_width > 16384U || output_height > 16384U) return nullptr;
     const auto desc = source->GetDesc();
     const auto format = srv_format(desc.Format);
     if (format == DXGI_FORMAT_UNKNOWN || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 ||
+        desc.DepthOrArraySize == 0 || desc.SampleDesc.Count != 1 ||
         (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
         !bounds(x, width, desc.Width) || !bounds(y, height, desc.Height)) return nullptr;
     ComPtr<ID3D12Device> device;
@@ -269,7 +263,7 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     std::lock_guard lock(mutex12);
     std::shared_ptr<Pass12> pass;
     for (auto it = available12.begin(); it != available12.end(); ++it) {
-        if ((*it)->source.Get() == source && (*it)->width == width && (*it)->height == height) {
+        if ((*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
             pass = *it; available12.erase(it); break;
         }
     }
@@ -285,7 +279,7 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
         }
         return nullptr;
     }
-    if (!pass) pass = make_pass12(device.Get(), source, width, height, format);
+    if (!pass) pass = make_pass12(device.Get(), source, output_width, output_height, format);
     if (!pass) return nullptr;
     pass->list = list;
     pass->list_token = list_token(list, true);
@@ -295,13 +289,13 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
         transition(list, source, source_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(list, pass->output.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const Constants data{x, y, width, height, offset.x, offset.y};
+    const Constants data{x, y, output_width, output_height, offset.x, offset.y, width, height};
     list->SetDescriptorHeaps(1, pass->heap.GetAddressOf());
     list->SetComputeRootSignature(pass->root.Get());
     list->SetPipelineState(pass->pipeline.Get());
     list->SetComputeRootDescriptorTable(0, pass->heap->GetGPUDescriptorHandleForHeapStart());
     list->SetComputeRoot32BitConstants(1, sizeof(data) / 4, &data, 0);
-    list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    list->Dispatch((output_width + 7) / 8, (output_height + 7) / 8, 1);
     if (source_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         transition(list, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, source_state);
     transition(list, pass->output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

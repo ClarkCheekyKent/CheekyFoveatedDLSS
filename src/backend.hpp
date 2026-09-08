@@ -45,7 +45,8 @@ struct D3D12BackendTiming {
     NgxParameters* parameters,
     const CropGeometry& crop,
     const D3D12BackendCallbacks& callbacks,
-    D3D12BackendTiming* timing = nullptr
+    D3D12BackendTiming* timing = nullptr,
+    const CropGeometry* display_crop = nullptr
 ) noexcept;
 
 void release_d3d12_view(DlssViewId view_id) noexcept;
@@ -123,6 +124,8 @@ void finish_d3d12(
     std::uint32_t input_base_x = 0U,
     std::uint32_t input_base_y = 0U
 ) noexcept;
+
+[[nodiscard]] CropGeometry d3d12_reconstruction_crop(const D3D12Evaluation*) noexcept;
 
 [[nodiscard]] CropGeometry d3d12_evaluation_crop(
     const D3D12Evaluation* evaluation

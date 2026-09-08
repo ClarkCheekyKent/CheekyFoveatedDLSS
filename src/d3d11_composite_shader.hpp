@@ -2,10 +2,10 @@
 
 namespace cheeky::foveated_dlss {
 
-inline constexpr char composite_shader_source[] = R"(
-Texture2DArray<float4> LowResolutionColor : register(t0);
-Texture2DArray<float4> DlssColor : register(t1);
-RWTexture2DArray<float4> GameOutput : register(u0);
+inline constexpr char d3d11_composite_shader_source[] = R"(
+Texture2D<float4> LowResolutionColor : register(t0);
+Texture2D<float4> DlssColor : register(t1);
+RWTexture2D<float4> GameOutput : register(u0);
 
 cbuffer Constants : register(b0) {
     uint2 OutputSize;
@@ -50,10 +50,10 @@ float4 LoadInputBilinear(float2 position) {
     const int2 p01 = clamp(p00 + int2(0, 1), minimum, maximum);
     const int2 p11 = clamp(p00 + int2(1, 1), minimum, maximum);
     return lerp(
-        lerp(LowResolutionColor.Load(int4(p00, 0, 0)),
-             LowResolutionColor.Load(int4(p10, 0, 0)), fraction.x),
-        lerp(LowResolutionColor.Load(int4(p01, 0, 0)),
-             LowResolutionColor.Load(int4(p11, 0, 0)), fraction.x),
+        lerp(LowResolutionColor.Load(int3(p00, 0)),
+             LowResolutionColor.Load(int3(p10, 0)), fraction.x),
+        lerp(LowResolutionColor.Load(int3(p01, 0)),
+             LowResolutionColor.Load(int3(p11, 0)), fraction.x),
         fraction.y
     );
 }
@@ -68,12 +68,12 @@ float2 InputPosition(uint2 local_pixel) {
 // Integrate pixel coverage, including fractional boundaries, without negative
 // filter lobes or an extra intermediate pass. 1x retains the original load.
 float4 LoadDlssResampled(uint2 local_pixel) {
-    uint width, height, layers;
-    DlssColor.GetDimensions(width, height, layers);
+    uint width, height;
+    DlssColor.GetDimensions(width, height);
     const uint2 source_size = uint2(width, height) - DlssOrigin;
     if (all(source_size == RectSize)) {
         const int2 pixel = int2(DlssOrigin + local_pixel);
-        return DlssColor.Load(int4(pixel, 0, 0));
+        return DlssColor.Load(int3(pixel, 0));
     }
     const float2 ratio = float2(source_size) / float2(RectSize);
     if (any(source_size < RectSize)) {
@@ -85,8 +85,8 @@ float4 LoadDlssResampled(uint2 local_pixel) {
         const int2 p10 = int2(DlssOrigin) + clamp(base + int2(1, 0), int2(0, 0), maximum);
         const int2 p01 = int2(DlssOrigin) + clamp(base + int2(0, 1), int2(0, 0), maximum);
         const int2 p11 = int2(DlssOrigin) + clamp(base + int2(1, 1), int2(0, 0), maximum);
-        return lerp(lerp(DlssColor.Load(int4(p00, 0, 0)), DlssColor.Load(int4(p10, 0, 0)), fraction.x),
-            lerp(DlssColor.Load(int4(p01, 0, 0)), DlssColor.Load(int4(p11, 0, 0)), fraction.x), fraction.y);
+        return lerp(lerp(DlssColor.Load(int3(p00, 0)), DlssColor.Load(int3(p10, 0)), fraction.x),
+            lerp(DlssColor.Load(int3(p01, 0)), DlssColor.Load(int3(p11, 0)), fraction.x), fraction.y);
     }
 
     const float2 begin = float2(local_pixel) * ratio;
@@ -98,7 +98,7 @@ float4 LoadDlssResampled(uint2 local_pixel) {
         [loop] for (int x = int(floor(begin.x)); x < int(ceil(end.x)); ++x) {
             const float wx = max(0.0, min(end.x, float(x + 1)) - max(begin.x, float(x)));
             const int2 pixel = int2(DlssOrigin) + clamp(int2(x, y), int2(0, 0), int2(source_size) - 1);
-            sum += DlssColor.Load(int4(pixel, 0, 0)) * (wx * wy);
+            sum += DlssColor.Load(int3(pixel, 0)) * (wx * wy);
             total += wx * wy;
         }
     }
@@ -131,7 +131,7 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             abs(ShapeDistance(next_centered + float2(pixel_size.x, 0.0)) - next_distance),
             abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
         if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
-            GameOutput[uint3(output_pixel, 0)] = float4(0.0, 1.0, 0.0, 1.0);
+            GameOutput[output_pixel] = float4(0.0, 1.0, 0.0, 1.0);
             return;
         }
     }
@@ -139,7 +139,7 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         distance_from_center <= 1.0 &&
         distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
     if (alignment_border) {
-        GameOutput[uint3(output_pixel, 0)] = float4(1.0, 0.0, 0.0, 1.0);
+        GameOutput[output_pixel] = float4(1.0, 0.0, 0.0, 1.0);
         return;
     }
     const float normalized_feather = Feather /
@@ -154,12 +154,15 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     const bool inside_rect = all(output_pixel >= RectBase) &&
         all(output_pixel < RectBase + RectSize);
     if (!inside_rect || weight <= 0.0) {
-        GameOutput[uint3(output_pixel, 0)] = bilinear;
+        GameOutput[output_pixel] = bilinear;
         return;
     }
+
+    // The private DX11 DLSS feature writes a packed crop at scratch (0, 0).
+    // RectBase is where that crop belongs in the game's full-resolution output.
     const float4 dlss = LoadDlssResampled(output_pixel - RectBase);
-    GameOutput[uint3(output_pixel, 0)] = lerp(bilinear, dlss, weight);
+    GameOutput[output_pixel] = lerp(bilinear, dlss, weight);
 }
 )";
 
-}  // namespace cheeky::foveated_dlss
+} // namespace cheeky::foveated_dlss

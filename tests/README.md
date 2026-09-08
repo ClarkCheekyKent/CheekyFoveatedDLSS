@@ -116,3 +116,37 @@ Check both eye mappings, crop placement, loss/recovery, and automatic alignment.
 Also test the internal Simulated gaze mode with the driver off. Re-enter VR and
 change render resolution to check mapping rebuilds. Missing mappings must keep
 fixed fallback. Keep the previous add-on available for rollback.
+
+## Center supersampling
+
+The default tests check reconstruction dimensions, unchanged input/eye placement,
+settings round trips, invalid scales, texture limits, and both motion-vector
+resolution paths. `--d3d12-composite` executes both production compositor
+shaders on WARP (DX11 shader model 5.0 with 2D views, DX12 with array views).
+Checkerboard readback is compared against a double-precision area reference at
+1x, 1.25x, 1.5x, 2x, and unequal fractional dimensions. A bilinear reference
+checks the internal shader's 0.5x and 0.75x handling, including clamped texture
+edges; these scales are not exposed by the 1-2x supersampling slider. HDR constant-color cases
+check brightness preservation; existing origin, slice and mip isolation checks
+remain active. This exercises shader code, not the DX11 runtime or NVIDIA DLSS.
+
+In games with input- and output-resolution motion vectors, compare 1x/1.25x/1.5x/2x with
+fixed and moving gaze, both eyes, and peripheral DLAA on/off. Confirm unchanged
+placement, history reset on scale changes, and quality/timing while moving.
+Repeat DX11 Direct, DX11 Transport and DX12/Streamline where available. Live NVIDIA evaluation and
+visual quality require hardware validation.
+
+Run `bin/Release/CheekyTests.exe --motion-resample` for WARP tests of the actual
+DX11 and DX12 motion passes. They exercise 0.5x through 2x grids, fractional
+axis ratios, nonzero packed crop origins, gaze offsets, discontinuous velocities,
+NaN/Inf and large invalid markers, and slice-zero array SRVs. Output-space displacement
+scales with the output grid, while invalid markers stay unchanged. DX11 source readback
+checks that both array slices remain untouched. The DX12 test exercises source
+state restoration and fence-tracked pass lifetime. Native NGX crop correction tests use
+the pixel space selected by the motion-vector flag. Streamline's normalized
+scale compensates for the vector resampling ratio.
+
+ACC DX11 reported heavy head-motion blur away from 1x with unscaled output vectors.
+The correction scales displacement with the resized output grid and restores
+output-space gaze offsets. GPU readback verifies this numerical behavior; an
+ACC moving-head A/B comparison against 1x is still required.

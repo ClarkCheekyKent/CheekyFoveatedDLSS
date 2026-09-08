@@ -32,6 +32,10 @@ struct FoveationCenter {
     std::uint32_t quantization_pixels{1U};
 };
 
+// Keep placement in final-output pixels. Only this private DLSS contract grows.
+[[nodiscard]] FoveationGeometry supersampled_crop(
+    const FoveationGeometry& crop, float scale) noexcept;
+
 struct FoveationOffsets {
     float x{};
     float y{};

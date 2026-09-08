@@ -19,6 +19,7 @@ struct Settings {
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
+    float center_supersampling{1.0F};
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};
