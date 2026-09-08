@@ -49,6 +49,7 @@ struct D3D12BackendTiming {
 ) noexcept;
 
 void release_d3d12_view(DlssViewId view_id) noexcept;
+void skip_d3d12_history(DlssViewId view_id) noexcept;
 
 [[nodiscard]] bool composite_d3d11_crop(
     ID3D11DeviceContext* context,

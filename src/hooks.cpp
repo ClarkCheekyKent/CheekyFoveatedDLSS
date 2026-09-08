@@ -3900,9 +3900,8 @@ void evaluate_nr_after_native_d3d12(
     contract.mv_base_y = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.Y");
     contract.output_base_x = get_ui(parameters, "DLSS.Output.Subrect.Base.X");
     contract.output_base_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
-    contract.create_flags = get_ngx_integer_bits(
-        parameters, "DLSS.Feature.Create.Flags"
-    );
+    if (!try_get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags", contract.create_flags))
+        return false;
     contract.motion_vectors_low_res =
         (contract.create_flags & (1U << 1U)) != 0U;
     contract.depth_inverted = (contract.create_flags & (1U << 3U)) != 0U;
@@ -3931,36 +3930,7 @@ void evaluate_nr_after_native_d3d12(
     const auto full_mv_x = contract.mv_base_x;
     const auto full_mv_y = contract.mv_base_y;
 
-    bool motion_vectors_output_space = !contract.motion_vectors_low_res;
-    if (full_motion != nullptr) {
-        const auto motion_description = full_motion->GetDesc();
-        const auto mv_width =
-            static_cast<std::uint32_t>(motion_description.Width);
-        const auto mv_height = motion_description.Height;
-        const auto distance_input = dimension_distance(
-            mv_width,
-            mv_height,
-            contract.render_width,
-            contract.render_height
-        );
-        const auto distance_output = dimension_distance(
-            mv_width,
-            mv_height,
-            contract.output_width,
-            contract.output_height
-        );
-        if (distance_input != distance_output) {
-            motion_vectors_output_space = distance_output < distance_input;
-        }
-        diagnostic_note_motion_vectors(
-            DiagnosticApi::d3d12,
-            mv_width,
-            mv_height,
-            motion_vectors_output_space
-                ? MotionVectorSpace::output
-                : MotionVectorSpace::input
-        );
-    }
+    const bool motion_vectors_output_space = !contract.motion_vectors_low_res;
 
     PeripheralDlaaResources peripheral{};
     bool peripheral_ready{};
@@ -4066,17 +4036,11 @@ void evaluate_nr_after_native_d3d12(
     D3D12PeripheralTimingScope sr_timing{
         command_list, D3D12TimingKind::foveated_dlss
     };
-    const auto original_create_flags = contract.create_flags;
-    contract.create_flags = contract.motion_vectors_low_res
-        ? contract.create_flags | (1U << 1U) : contract.create_flags & ~(1U << 1U);
-    auto* mutable_parameters = const_cast<NgxParameters*>(parameters);
-    mutable_parameters->Set("DLSS.Feature.Create.Flags", contract.create_flags);
     result = evaluate_d3d12_backend(
         command_list, contract, inputs,
         const_cast<NgxParameters*>(parameters),
         crop, callbacks, sr_timing.backend()
     );
-    mutable_parameters->Set("DLSS.Feature.Create.Flags", original_create_flags);
     sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
     finish_d3d12(command_list, parameters, evaluation, result);
@@ -4191,6 +4155,9 @@ NgxResult process_d3d12_evaluation(
         diagnostic_note_result(DiagnosticApi::d3d12, result);
         return result;
     }
+    // A native fallback skips this private feature's history. Its next use
+    // cannot reproject across the missing evaluation with single-frame vectors.
+    skip_d3d12_history(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(call.handle)));
     diagnostic_note_state(
         DiagnosticApi::d3d12,
         !settings.enabled ? DiagnosticState::disabled

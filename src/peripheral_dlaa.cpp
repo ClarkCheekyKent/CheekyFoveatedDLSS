@@ -1,4 +1,5 @@
 #include "peripheral_dlaa.hpp"
+#include "motion_region.hpp"
 
 #include "runtime.hpp"
 
@@ -799,6 +800,22 @@ bool prepare_peripheral_dlaa_resources(
         request.output_template == nullptr || request.render_width == 0U ||
         request.render_height == 0U) {
         return false;
+    }
+    // Validate native NGX source vectors in the game's declared space. Keep
+    // Streamline's separate contract and the working DLAA feature flags intact.
+    if (request.parameters != nullptr) {
+        std::uint32_t flags{};
+        const bool declared = try_get_ngx_integer_bits(
+            request.parameters, "DLSS.Feature.Create.Flags", flags);
+        const auto desc = request.motion_vectors->GetDesc();
+        const FoveationGeometry full_region{0U, 0U, request.render_width, request.render_height,
+            0U, 0U, request.source_output_width, request.source_output_height};
+        const auto region = resolve_motion_region(declared, flags,
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D, desc.Width, desc.Height,
+            request.mv_base_x, request.mv_base_y, full_region,
+            request.render_width, request.render_height,
+            request.source_output_width, request.source_output_height, 0U, 0U);
+        if (!region.valid()) return false;
     }
     auto* const state = find_or_create_state(request);
     if (state == nullptr || !ensure_output(*state, request)) return false;

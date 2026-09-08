@@ -5,6 +5,7 @@
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
 #include "crop_motion.hpp"
+#include "motion_region.hpp"
 #include "runtime.hpp"
 
 #include <d3dcompiler.h>
@@ -85,7 +86,6 @@ std::array<
     ) < 2U;
 }
 
-constexpr std::uint32_t dlss_feature_flag_mv_low_res = 1U << 1U;
 
 [[nodiscard]] bool same_key(
     const CanonicalFeatureKey& left,
@@ -757,6 +757,11 @@ struct D3D12Evaluation {
     std::uint64_t diagnostic_sequence{};
 };
 
+void skip_d3d12_history(const DlssViewId view_id) noexcept {
+    std::lock_guard lock(canonical_views_mutex);
+    if (auto* view = find_view(view_id)) view->has_crop = false;
+}
+
 D3D12Evaluation* prepare_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxParameters* const parameters,
@@ -903,6 +908,30 @@ D3D12Evaluation* prepare_d3d12(
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
         apply_next_jump_preview(effective_settings, view_id);
+    }
+
+    // The allocation may contain packed views or padding. Its dimensions only
+    // validate the declared region; they cannot determine vector units.
+    std::uint32_t motion_flags{};
+    const bool motion_declared = try_get_ngx_integer_bits(
+        parameters, "DLSS.Feature.Create.Flags", motion_flags);
+    const auto motion_desc = motion_vectors ? motion_vectors->GetDesc() : D3D12_RESOURCE_DESC{};
+    const auto motion_region = resolve_motion_region(motion_declared, motion_flags,
+        motion_vectors && motion_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        motion_desc.Width, motion_desc.Height,
+        get_ui(parameters, "DLSS.Input.MV.Subrect.Base.X"),
+        get_ui(parameters, "DLSS.Input.MV.Subrect.Base.Y"),
+        crop, render_width, render_height, output_width, output_height, output_x, output_y);
+    if (!motion_region.valid()) {
+        skip_d3d12_history(view_id);
+        diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::incompatible_contract);
+        static std::atomic<unsigned> rejected_regions{};
+        const auto index = rejected_regions.fetch_add(1U, std::memory_order_relaxed);
+        if (index < 16U || index % 300U == 0U)
+            trace_event("D3D12 declared MV rejected view=%llu flags=0x%08X reason=%s",
+                static_cast<unsigned long long>(view_id), motion_flags,
+                motion_region_reason(motion_region.status));
+        return nullptr;
     }
 
     ID3D12Device* device{};
@@ -1082,108 +1111,24 @@ D3D12Evaluation* prepare_d3d12(
         "DLSS.Input.Depth.Subrect.Base.Y",
         evaluation->depth_y + crop.input_base_y
     );
-    const auto create_flags = get_ngx_integer_bits(
-        parameters, "DLSS.Feature.Create.Flags"
-    );
-    const bool flag_says_low_res =
-        (create_flags & dlss_feature_flag_mv_low_res) != 0U;
-    const auto low_res_motion_x =
-        evaluation->motion_x + crop.input_base_x;
-    const auto low_res_motion_y =
-        evaluation->motion_y + crop.input_base_y;
-    const auto high_res_motion_x =
-        evaluation->motion_x + crop.output_base_x - output_x;
-    const auto high_res_motion_y =
-        evaluation->motion_y + crop.output_base_y - output_y;
-    const bool low_res_fits = texture_region_fits(
-        motion_vectors,
-        low_res_motion_x,
-        low_res_motion_y,
-        crop.input_width,
-        crop.input_height
-    );
-    const bool high_res_fits = texture_region_fits(
-        motion_vectors,
-        high_res_motion_x,
-        high_res_motion_y,
-        crop.output_width,
-        crop.output_height
-    );
-    bool motion_vectors_low_res = flag_says_low_res;
-    if (motion_vectors != nullptr) {
-        const auto desc = motion_vectors->GetDesc();
-        const auto distance = [&](std::uint32_t w, std::uint32_t h) {
-            return std::abs(static_cast<double>(desc.Width) - w) +
-                std::abs(static_cast<double>(desc.Height) - h);
-        };
-        const auto input_distance = distance(render_width, render_height);
-        const auto output_distance = distance(output_width, output_height);
-        if (input_distance != output_distance)
-            motion_vectors_low_res = input_distance < output_distance;
-    }
-    if (low_res_fits != high_res_fits) {
-        motion_vectors_low_res = low_res_fits;
-    }
-    evaluation->low_res_motion = motion_vectors_low_res;
-    if (motion_vectors != nullptr) {
-        const auto motion_description = motion_vectors->GetDesc();
-        diagnostic_note_motion_vectors(
-            DiagnosticApi::d3d12,
-            static_cast<std::uint32_t>(motion_description.Width),
-            motion_description.Height,
-            motion_vectors_low_res
-                ? MotionVectorSpace::input
-                : MotionVectorSpace::output
-        );
-    }
-    const auto motion_crop_x = motion_vectors_low_res
-        ? crop.input_base_x
-        : crop.output_base_x - output_x;
-    const auto motion_crop_y = motion_vectors_low_res
-        ? crop.input_base_y
-        : crop.output_base_y - output_y;
-    mutable_parameters->Set(
-        "DLSS.Input.MV.Subrect.Base.X",
-        evaluation->motion_x + motion_crop_x
-    );
-    mutable_parameters->Set(
-        "DLSS.Input.MV.Subrect.Base.Y",
-        evaluation->motion_y + motion_crop_y
-    );
+    evaluation->low_res_motion = motion_region.space == DeclaredMotionSpace::input;
+    diagnostic_note_motion_vectors(DiagnosticApi::d3d12,
+        static_cast<std::uint32_t>(motion_desc.Width), motion_desc.Height,
+        evaluation->low_res_motion ? MotionVectorSpace::input : MotionVectorSpace::output);
+    const auto sequence = direct_preparation_sequence.fetch_add(1U, std::memory_order_relaxed);
+    if (sequence < 8U || sequence % 600U == 0U)
+        trace_event("D3D12 declared MV view=%llu flags=0x%08X space=%s rect=%u,%u %ux%u",
+            static_cast<unsigned long long>(view_id), motion_flags,
+            evaluation->low_res_motion ? "input" : "output",
+            motion_region.rectangle.x, motion_region.rectangle.y,
+            motion_region.rectangle.width, motion_region.rectangle.height);
+    mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.X", motion_region.rectangle.x);
+    mutable_parameters->Set("DLSS.Input.MV.Subrect.Base.Y", motion_region.rectangle.y);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
     if (consume_reset(settings) || gaze_reset) {
         mutable_parameters->Set("Reset", 1U);
-    }
-    const auto preparation_sequence = direct_preparation_sequence.fetch_add(
-        1U, std::memory_order_relaxed
-    );
-    if (preparation_sequence < 8U || preparation_sequence % 600U == 0U) {
-        const auto motion_description = motion_vectors != nullptr
-            ? motion_vectors->GetDesc()
-            : D3D12_RESOURCE_DESC{};
-        trace_event(
-            "D3D12 crop prepare seq=%llu flags=0x%08X flagMV=%s "
-            "mv=%llux%u low=(%u,%u %ux%u fit=%s) "
-            "high=(%u,%u %ux%u fit=%s) selected=%s",
-            static_cast<unsigned long long>(preparation_sequence),
-            create_flags,
-            flag_says_low_res ? "low" : "high",
-            static_cast<unsigned long long>(motion_description.Width),
-            motion_description.Height,
-            low_res_motion_x,
-            low_res_motion_y,
-            crop.input_width,
-            crop.input_height,
-            low_res_fits ? "yes" : "no",
-            high_res_motion_x,
-            high_res_motion_y,
-            crop.output_width,
-            crop.output_height,
-            high_res_fits ? "yes" : "no",
-            motion_vectors_low_res ? "low" : "high"
-        );
     }
     diagnostic_note_crop(DiagnosticApi::d3d12, crop);
     return evaluation;
