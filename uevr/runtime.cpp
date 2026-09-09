@@ -8,6 +8,7 @@
 #include "processing_owner.hpp"
 #include "runtime.hpp"
 #include "diagnostics.hpp"
+#include "eye_calibration.hpp"
 #include "gaze_foveation.hpp"
 #include "dlss_nr.hpp"
 #include "version.h"
@@ -68,6 +69,7 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"eye_calibration\":" << eye_calibration_json()
         << ",\"support\":{\"busy\":" << s.report_busy.load() << ",\"zip\":\"" << json_escape(path_utf8(s.report_zip)) << "\"}"
         << ",\"gpu_timing\":{\"recorded\":" << gpu.recorded << ",\"submitted\":" << gpu.submitted
         << ",\"completed\":" << gpu.completed << ",\"published\":" << gpu.published
@@ -97,7 +99,8 @@ std::string snapshot_locked(State& s) {
             << ",\"view_id\":\"" << v.dlss_view_id << "\",\"stable_matches\":" << v.stable_matches
             << ",\"delta_x\":" << v.crop_delta_x << ",\"delta_y\":" << v.crop_delta_y
             << ",\"mapped\":" << v.resource_mapped << ",\"packed\":" << v.packed_stereo_mapping
-            << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping << '}';
+            << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping
+            << ",\"marker\":" << v.marker_mapping << '}';
     }
     out << "]},\"nr\":\"" << json_escape(dlss_nr_state_name(nr.state)) << "\",\"nr_details\":{"
         << "\"route\":\"" << json_escape(dlss_nr_route_name(nr.route)) << "\",\"candidates\":" << nr.candidate_calls
@@ -292,6 +295,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
         active_attachment = ++s.attachment_sequence;
         *input->attachment = s.attachment_sequence;
         adapter_attached = true;
+        eye_calibration_enable(true);
         s.cadence.reset();
         set_processing_allowed(s.graphics_ready);
         request_save(s);
@@ -301,6 +305,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
 extern "C" __declspec(dllexport) void CheekyUEVR_Detach(std::uint64_t attachment) {
     if (!attachment || active_attachment.load(std::memory_order_acquire) != attachment) return;
     adapter_attached.store(false, std::memory_order_release);
+    eye_calibration_suspend();
     set_processing_allowed(false);
 }
 extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, std::uint32_t renderer, void* device, void* queue) {
@@ -308,6 +313,7 @@ extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, 
         if (!adapter_attached.load() || attachment != active_attachment.load()) return;
         auto& s = state(); std::lock_guard lock(s.mutex);
         configure_graphics(s, renderer, device, queue);
+        eye_calibration_tick();
         set_processing_allowed(s.started && s.graphics_ready);
         if (s.graphics_ready) {
             const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -342,6 +348,10 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Command(std::uint64_t attachmen
         if (parsed.ec != std::errc{} || parsed.ptr != request.data()+request.size()) return false;
         s.request = id;
         if (action == "get") return true;
+        if (action == "calibration_enable" || action == "calibration_disable") {
+            eye_calibration_enable(action == "calibration_enable"); return true;
+        }
+        if (action == "calibration_reset") { eye_calibration_reset_stats(); return true; }
         if (action == "report" || action == "report_issue") {
             if (s.report_busy.exchange(true)) return true;
             s.report_browser = action == "report_issue"; s.report_requested = true;

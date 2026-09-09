@@ -1,3 +1,4 @@
+#include "eye_calibration.hpp"
 #include "backend.hpp"
 #include "d3d11_d3d12_transport.hpp"
 #include "d3d11_peripheral_dlaa.hpp"
@@ -3403,7 +3404,7 @@ NgxResult hook_core_create_d3d11(
     return result;
 }
 
-NgxResult hook_evaluate_d3d11(
+NgxResult evaluate_d3d11_impl(
     ID3D11DeviceContext* const context,
     const NgxHandle* const handle,
     const NgxParameters* const parameters,
@@ -3546,7 +3547,7 @@ NgxResult hook_evaluate_d3d11(
     return result;
 }
 
-NgxResult hook_evaluate_d3d11_c(
+NgxResult evaluate_d3d11_c_impl(
     ID3D11DeviceContext* const context,
     const NgxHandle* const handle,
     const NgxParameters* const parameters,
@@ -3683,6 +3684,41 @@ NgxResult hook_evaluate_d3d11_c(
 
     diagnostic_note_result(DiagnosticApi::d3d11, result);
     return result;
+}
+
+thread_local unsigned calibration_evaluation_depth{};
+template<class Invoke>
+NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxHandle* handle,
+    const NgxParameters* parameters, Invoke invoke) {
+    struct Depth {
+        bool outer = calibration_evaluation_depth++ == 0;
+        ~Depth() { --calibration_evaluation_depth; }
+    } depth;
+    const auto result = invoke();
+    // All temporary NGX parameters and private composites have been restored
+    // before this point. Tag only the outer game evaluation's final output.
+    if (depth.outer && eye_calibration_enabled() && ngx_succeeded(result) && parameters && !is_d3d11_private_handle(handle)) {
+        ID3D11Resource *output{}, *color{}, *z{}, *motion{};
+        if (ngx_succeeded(parameters->Get("Output", &output)) && output &&
+            ngx_succeeded(parameters->Get("Color", &color)) && color &&
+            ngx_succeeded(parameters->Get("Depth", &z)) && z &&
+            ngx_succeeded(parameters->Get("MotionVectors", &motion)) && motion) {
+            eye_calibration_stamp(context, output, reinterpret_cast<std::uint64_t>(handle),
+                get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
+                get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"));
+        }
+    }
+    return result;
+}
+NgxResult hook_evaluate_d3d11(ID3D11DeviceContext* context, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallback callback) {
+    return evaluate_with_eye_calibration(context, handle, parameters,
+        [&] { return evaluate_d3d11_impl(context, handle, parameters, callback); });
+}
+NgxResult hook_evaluate_d3d11_c(ID3D11DeviceContext* context, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    return evaluate_with_eye_calibration(context, handle, parameters,
+        [&] { return evaluate_d3d11_c_impl(context, handle, parameters, callback); });
 }
 
 NgxResult hook_release_d3d11(NgxHandle* const handle) {

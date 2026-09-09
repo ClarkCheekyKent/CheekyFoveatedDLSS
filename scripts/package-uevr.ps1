@@ -19,6 +19,7 @@ $files = [ordered]@{
     "scripts\cheeky_foveated_dlss.lua" = Join-Path $projectRoot "uevr\scripts\cheeky_foveated_dlss.lua"
     "Cheeky-UEVR-README.md" = Join-Path $projectRoot "uevr\README.md"
     "Cheeky-UEVR-VALIDATION.md" = Join-Path $projectRoot "uevr\VALIDATION.md"
+    "EYE-CALIBRATION.md" = Join-Path $projectRoot "EYE-CALIBRATION.md"
     "licenses\Cheeky-GPLv3.txt" = Join-Path $projectRoot "LICENSE"
     "licenses\MinHook.txt" = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     "licenses\OpenVR.txt" = Join-Path $projectRoot "third_party\openvr\LICENSE"

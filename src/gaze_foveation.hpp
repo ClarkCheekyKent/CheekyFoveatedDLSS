@@ -31,6 +31,7 @@ struct GazeViewDiagnostics {
     bool packed_stereo_mapping{};
     bool copy_mapping{};
     bool projection_mapping{};
+    bool marker_mapping{};
     unsigned alignment_source{};
     float aligned_u{}, aligned_v{};
 };

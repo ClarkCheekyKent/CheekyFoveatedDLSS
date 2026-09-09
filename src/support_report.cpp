@@ -3,6 +3,7 @@
 #include "support_summary.hpp"
 #include "support_prompts.hpp"
 #include "diagnostics.hpp"
+#include "eye_calibration.hpp"
 #include "dlss_nr.hpp"
 #include "gaze_foveation.hpp"
 #include "settings.hpp"
@@ -180,6 +181,7 @@ std::string diagnostics_text() {
             << "output_crop=" << c.output_base_x << ',' << c.output_base_y << ','
             << c.output_width << ',' << c.output_height << '\n';
     }
+    out << "\n[Eye calibration]\n" << eye_calibration_json() << '\n';
     const auto g = gaze_diagnostics();
     out << "\n[OpenXR]\n";
     out << "runtime_name=" << g.runtime_name << '\n';
@@ -218,6 +220,7 @@ std::string diagnostics_text() {
         out << "candidate_height=" << v.candidate_height << '\n';
         out << "copy_mapping=" << v.copy_mapping << '\n';
         out << "projection_mapping=" << v.projection_mapping << '\n';
+        out << "marker_mapping=" << v.marker_mapping << '\n';
         out << "alignment_source=" << v.alignment_source << '\n';
         out << "aligned_u=" << v.aligned_u << '\n';
         out << "aligned_v=" << v.aligned_v << '\n';

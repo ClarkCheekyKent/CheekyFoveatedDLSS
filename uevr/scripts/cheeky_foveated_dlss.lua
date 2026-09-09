@@ -343,6 +343,24 @@ uevr.sdk.callbacks.on_draw_ui(function()
     apply_buttons("bottom")
 
     if imgui.tree_node("Diagnostics and support") then
+        if imgui.tree_node("Eye calibration") then
+            local c = status.eye_calibration or {}
+            local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
+            if changed then send(enabled and "calibration_enable" or "calibration_disable") end
+            rows("eye_calibration", {{"Backend", c.backend or "D3D11 / OpenVR"},
+                {"Status", c.status or "Unavailable in this runtime"},
+                {"Corrections applied", c.corrections or 0}, {"Confirmed mapping updates", c.applied or 0},
+                {"Valid / completed samples", string.format("%d / %d", c.valid or 0, c.completed or 0)},
+                {"Skipped / in flight", string.format("%d / %d", c.skipped or 0, c.in_flight or 0)},
+                {"CPU work", string.format("%.2f us/frame", c.cpu_us_per_frame or 0)},
+                {"GPU marker / copy work", (c.gpu_samples or 0) > 0 and string.format("%.2f us", c.gpu_us or 0) or "Not sampled / unavailable"},
+                {"Readback latency", string.format("%.2f OpenVR frames", c.latency_frames or 0)},
+                {"Last recognized left / right", tostring(c.left_view or 0) .. " / " .. tostring(c.right_view or 0)}})
+            text("Samples every frame. Corrections count changes to an existing eye assignment; confirmations do not increment it.")
+            text("GPU time covers marker and copy commands; CPU time excludes lock waiting.")
+            if imgui.button("Reset eye calibration counters") then send("calibration_reset") end
+            imgui.tree_pop()
+        end
         local a, o, g = status.late_attach or {}, status.observer or {}, status.gaze or {}
         rows("host", {{"Settings revision / saved", tostring(status.revision) .. " / " .. tostring(status.saved_revision)},
             {"Streamline options hook / observed", yes(a.options_hooked) .. " / " .. yes(a.options_seen)},
@@ -370,6 +388,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
                     {"Center U / V", string.format("%.3f / %.3f", eye.center_u or 0, eye.center_v or 0)},
                     {"Crop movement X / Y", string.format("%d / %d px", eye.delta_x or 0, eye.delta_y or 0)},
                     {"Packed / copy / projection", yes(eye.packed) .. " / " .. yes(eye.copy) .. " / " .. yes(eye.projection)}})
+                rows("eye_marker" .. i, {{"Pixel marker mapping", yes(eye.marker)}})
             end
             imgui.tree_pop()
         end

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <Windows.h>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -70,6 +71,7 @@ struct StereoView {
     std::uint32_t output_height{};
     CropGeometry crop{};
     bool has_geometry{};
+    std::uint64_t generation{};
 };
 
 std::mutex stereo_views_mutex;
@@ -84,6 +86,19 @@ struct EyeRole {
 
 EyeRole eye_roles[2]{};
 std::uint64_t stereo_evaluation_sequence{};
+std::uint64_t registration_generation{};
+struct Calibration {
+    std::uint64_t left{}, right{}, sequence{}, expires_ms{};
+} calibration;
+bool calibration_live() {
+    return calibration.left && calibration.right && GetTickCount64() <= calibration.expires_ms;
+}
+StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
+    if (!calibration_live()) return {};
+    if (view == calibration.left) return {0, true, true};
+    if (view == calibration.right) return {1, true, true};
+    return {};
+}
 
 void store_float(std::atomic<std::uint32_t>& destination, float value) noexcept {
     std::uint32_t bits{};
@@ -337,6 +352,7 @@ void register_stereo_view(const std::uint64_t view_id) noexcept {
         seen_stereo_views.push_back({view_id});
     }
     stereo_views.push_back({view_id});
+    stereo_views.back().generation = ++registration_generation;
     peak_stereo_view_count = (std::max)(
         peak_stereo_view_count,
         static_cast<std::uint32_t>(stereo_views.size())
@@ -346,6 +362,7 @@ void register_stereo_view(const std::uint64_t view_id) noexcept {
 void unregister_stereo_view(const std::uint64_t view_id) noexcept {
     if (view_id == 0U) return;
     std::lock_guard lock(stereo_views_mutex);
+    if (view_id == calibration.left || view_id == calibration.right) calibration = {};
     for (auto iterator = stereo_views.begin();
          iterator != stereo_views.end(); ++iterator) {
         if (iterator->view_id != view_id) continue;
@@ -359,6 +376,7 @@ void unregister_stereo_view(const std::uint64_t view_id) noexcept {
 
 bool has_multiple_stereo_views() noexcept {
     std::lock_guard lock(stereo_views_mutex);
+    if (calibration_live()) return true;
     return eye_roles[0].view_id != 0U && eye_roles[1].view_id != 0U;
 }
 
@@ -366,6 +384,8 @@ StereoEyeAssignment stereo_eye_assignment(
     const std::uint64_t view_id
 ) noexcept {
     std::lock_guard lock(stereo_views_mutex);
+    const auto corrected = calibrated_assignment(view_id);
+    if (corrected.assigned) return corrected;
     if (eye_roles[0].view_id == 0U || eye_roles[1].view_id == 0U) return {};
     for (std::uint32_t index{}; index < 2U; ++index) {
         if (eye_roles[index].view_id == view_id) return {index, true};
@@ -382,15 +402,61 @@ StereoViewStatistics stereo_view_statistics() noexcept {
     };
 }
 
+std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept {
+    std::lock_guard lock(stereo_views_mutex);
+    for (const auto& view : stereo_views) {
+        if (view.view_id == view_id) return view.generation;
+    }
+    return 0;
+}
+
+bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
+    std::uint64_t left_generation, std::uint64_t right_generation,
+    std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected) noexcept {
+    if (corrected) *corrected = false;
+    if (!left || !right || left == right || !left_generation || !right_generation) return false;
+    std::lock_guard lock(stereo_views_mutex);
+    const auto now = GetTickCount64();
+    constexpr std::uint64_t lifetime_ms = 1000;
+    if (captured_ms > now || now - captured_ms > lifetime_ms || sequence <= calibration.sequence) return false;
+    bool found_left{}, found_right{};
+    for (const auto& view : stereo_views) {
+        found_left |= view.view_id == left && view.generation == left_generation;
+        found_right |= view.view_id == right && view.generation == right_generation;
+    }
+    if (!found_left || !found_right) return false;
+    const auto previous_eye = [](std::uint64_t view_id) {
+        const auto corrected_role = calibrated_assignment(view_id);
+        if (corrected_role.assigned) return int(corrected_role.eye_index);
+        if (eye_roles[0].view_id && eye_roles[1].view_id) {
+            for (int eye = 0; eye < 2; ++eye) {
+                if (eye_roles[eye].view_id == view_id) return eye;
+            }
+        }
+        return -1;
+    };
+    const int previous_left = previous_eye(left), previous_right = previous_eye(right);
+    if (corrected) {
+        *corrected = (previous_left >= 0 && previous_left != 0) || (previous_right >= 0 && previous_right != 1);
+    }
+    calibration = {left, right, sequence, captured_ms + lifetime_ms};
+    return true;
+}
+void clear_stereo_calibration() noexcept {
+    std::lock_guard lock(stereo_views_mutex);
+    calibration = {};
+}
+
 std::vector<StereoViewDetail> stereo_view_details() {
     std::lock_guard lock(stereo_views_mutex);
     std::vector<StereoViewDetail> details;
     details.reserve(stereo_views.size());
     for (const auto& view : stereo_views) {
+        const auto corrected = calibrated_assignment(view.view_id);
         details.push_back({
             view.view_id,
-            view.second_eye,
-            view.has_eye_assignment,
+            corrected.assigned ? corrected.eye_index == 1 : view.second_eye,
+            corrected.assigned || view.has_eye_assignment,
             view.evaluations,
             view.render_width,
             view.render_height,
@@ -440,6 +506,16 @@ Settings settings_for_view(
     }
     if (matched_view == nullptr) {
         result.x_offset = 0.0F;
+        return result;
+    }
+
+    if (calibration_live()) {
+        const auto corrected = calibrated_assignment(view_id);
+        matched_view->has_eye_assignment = corrected.assigned;
+        matched_view->second_eye = corrected.eye_index == 1;
+        result.x_offset = corrected.assigned
+            ? ((matched_view->second_eye != settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
+            : 0.0F;
         return result;
     }
 

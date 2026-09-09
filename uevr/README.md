@@ -248,3 +248,13 @@ Upstream references: [UEVR plugin loading](https://docs.uevr.io/plugins/getting_
 Streamline's [public DLSS header](https://github.com/NVIDIA-RTX/Streamline/blob/main/include/sl_dlss.h)
 defines the options layout and a state getter containing a VRAM estimate, rather
 than historical options; the fallback therefore relies on future NGX evaluations.
+
+## Eye calibration diagnostics
+
+**Diagnostics and support > Eye calibration** exposes the shared calibration
+status, correction counter, sample backlog and CPU/GPU measurements. Counter
+reset preserves the current mapping; the enable switch applies to this session.
+The backend currently requires native OpenVR and D3D11 2D submissions. D3D12 and
+OpenXR do not gain pixel calibration from this update. Full details are in
+`EYE-CALIBRATION.md` in the package and the repository root. Support ZIP snapshots
+include the same diagnostics.

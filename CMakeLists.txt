@@ -138,6 +138,8 @@ enable_testing()
 add_executable(
     CheekyTests
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gaze_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/eye_calibration_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_composite_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/motion_resample_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/crop_motion.cpp"
@@ -155,6 +157,7 @@ add_executable(
 add_dependencies(CheekyTests CheekyOpenXRLayer)
 target_link_libraries(CheekyTests PRIVATE d3d11 d3d12 dxgi d3dcompiler)
 target_compile_features(CheekyTests PRIVATE cxx_std_20)
+target_compile_definitions(CheekyTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_include_directories(
     CheekyTests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/shared"

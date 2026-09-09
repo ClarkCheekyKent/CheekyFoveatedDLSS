@@ -1,3 +1,4 @@
+#include "eye_calibration.hpp"
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
 #include "openvr_vtable_hook.hpp"
@@ -209,15 +210,36 @@ template<unsigned N> struct CompositorHooks {
     static vr::EVRCompositorError wait_hook(void* self,vr::TrackedDevicePose_t* r,std::uint32_t nr,vr::TrackedDevicePose_t* g,std::uint32_t ng) {
         ++wait_depth;
         const auto result=wait(self,r,nr,g,ng);
-        if (--wait_depth==0) observe_frame(result==vr::VRCompositorError_None && (!r || nr==0 || r[0].bPoseIsValid));
+        if (--wait_depth==0) {
+            observe_frame(result==vr::VRCompositorError_None && (!r || nr==0 || r[0].bPoseIsValid));
+            if (result == vr::VRCompositorError_None) eye_calibration_frame();
+            eye_calibration_tick();
+        }
         return result;
     }
     static vr::EVRCompositorError submit_hook(void* self,vr::EVREye eye,const vr::Texture_t* texture,const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags) {
         ++submit_depth;
+        std::uint64_t calibration_ticket{};
+        if (submit_depth == 1 && eye_calibration_enabled()) {
+            const auto supported_flags = vr::Submit_TextureWithPose | vr::Submit_TextureWithDepth | vr::Submit_FrameDiscontinuity;
+            if (texture && texture->handle && texture->eType == vr::TextureType_DirectX &&
+                (static_cast<unsigned>(flags) & ~static_cast<unsigned>(supported_flags)) == 0) {
+                ComPtr<ID3D11Texture2D> image;
+                if (SUCCEEDED(static_cast<IUnknown*>(texture->handle)->QueryInterface(IID_PPV_ARGS(&image)))) {
+                    const vr::VRTextureBounds_t full{0, 0, 1, 1};
+                    const auto& b = bounds ? *bounds : full;
+                    // Enqueue the readback before forwarding Submit. The runtime
+                    // may consume/reuse the image after the original call.
+                    calibration_ticket = eye_calibration_submit(image.Get(), unsigned(eye), b.uMin, b.vMin, b.uMax, b.vMax);
+                } else eye_calibration_unsupported_submit();
+            } else eye_calibration_unsupported_submit();
+        }
         const auto result=submit(self,eye,texture,bounds,flags);
+        eye_calibration_result(calibration_ticket, int(result));
         if (--submit_depth==0) observe_submit(eye,texture,bounds,0,flags,result); return result;
     }
     static vr::EVRCompositorError array_hook(void* self,vr::EVREye eye,const vr::Texture_t* texture,std::uint32_t slice,const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags) {
+        eye_calibration_unsupported_submit();
         ++submit_depth;
         const auto result=array(self,eye,texture,slice,bounds,flags);
         if (--submit_depth==0) observe_submit(eye,texture,bounds,slice,flags,result); return result;
@@ -283,6 +305,7 @@ void poll_openvr_hooks() noexcept {
 }
 void stop_openvr_hooks() noexcept {
     stopping.store(true);
+    eye_calibration_stop();
     std::lock_guard hooks_lock(hook_mutex);
     for (auto it=vtable_hooks.rbegin();it!=vtable_hooks.rend();++it) it->restore();
     for (auto* target:hooks) MH_DisableHook(target);

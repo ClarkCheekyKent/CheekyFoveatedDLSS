@@ -7,6 +7,7 @@
 #include "runtime.hpp"
 #include "settings.hpp"
 #include "support_report.hpp"
+#include "eye_calibration.hpp"
 #include "cheeky_gaze_abi.h"
 #include "version.h"
 #include "processing_owner.hpp"
@@ -594,6 +595,30 @@ void draw_nr_performance() {
     return value ? "Yes" : "No";
 }
 
+void draw_eye_calibration_diagnostics() {
+    if (!ImGui::TreeNode("Eye calibration")) return;
+    const auto s = eye_calibration_stats();
+    bool enabled = s.enabled;
+    if (ImGui::Checkbox("Automatic eye calibration (this session)", &enabled))
+        eye_calibration_enable(enabled);
+    if (DiagnosticTable table{"eye_calibration"}) {
+        diagnostic_row("Backend", "%s", "D3D11 / OpenVR");
+        diagnostic_row("Status", "%s", eye_calibration_status(s));
+        diagnostic_row("Corrections applied", "%llu", s.corrections);
+        diagnostic_row("Confirmed mapping updates", "%llu", s.applied);
+        diagnostic_row("Valid / completed samples", "%llu / %llu", s.valid, s.completed);
+        diagnostic_row("Skipped / in flight", "%llu / %u", s.skipped, s.in_flight);
+        diagnostic_row("CPU work", "%.2f us/frame", s.cpu_us_per_frame);
+        if (s.gpu_samples) diagnostic_row("GPU marker / copy work", "%.2f us", s.gpu_us);
+        else diagnostic_row("GPU marker / copy work", "%s", "Not sampled / unavailable");
+        diagnostic_row("Readback latency", "%.2f OpenVR frames", s.latency_frames);
+        diagnostic_row("Last recognized left / right", "%llu / %llu", s.left_view, s.right_view);
+    }
+    ImGui::TextWrapped("Samples every frame. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
+    if (ImGui::Button("Reset eye calibration counters")) eye_calibration_reset_stats();
+    ImGui::TreePop();
+}
+
 void draw_openxr_gaze_diagnostics() {
     const auto gaze = gaze_diagnostics();
     ImGui::TextUnformatted("VR eye tracking");
@@ -674,7 +699,7 @@ void draw_openxr_gaze_diagnostics() {
                 label, "DLSS view 0x%llX (%u matches, %s)",
                 static_cast<unsigned long long>(view.dlss_view_id),
                 view.stable_matches,
-                view.projection_mapping ? "projection" : view.copy_mapping ? "copy" : view.packed_stereo_mapping ? "packed" : "exact"
+                view.marker_mapping ? "pixel marker" : view.projection_mapping ? "projection" : view.copy_mapping ? "copy" : view.packed_stereo_mapping ? "packed" : "exact"
             );
         } else {
             diagnostic_row(label, "Waiting (%u matches)", view.stable_matches);
@@ -1612,6 +1637,7 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
             "Diagnostics",
             ImGuiTreeNodeFlags_DefaultOpen
     )) {
+        draw_eye_calibration_diagnostics();
         draw_openxr_gaze_diagnostics();
         ImGui::Spacing();
         const auto& d3d11 = displayed_diagnostics(DiagnosticApi::d3d11);
@@ -1639,6 +1665,7 @@ void on_present(
     std::uint32_t,
     const reshade::api::rect*
 ) {
+    eye_calibration_tick();
     if (queue != nullptr && queue->get_device() != nullptr &&
         queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
         note_d3d12_present(
@@ -1909,6 +1936,7 @@ extern "C" __declspec(dllexport) bool AddonInit(
         return false;
     }
     reshade::register_overlay(nullptr, &draw_settings_overlay);
+    eye_calibration_enable(true);
     reshade::register_event<reshade::addon_event::execute_command_list>(
         &on_execute_command_list
     );

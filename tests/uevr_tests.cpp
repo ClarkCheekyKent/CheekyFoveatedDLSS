@@ -11,6 +11,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -94,7 +95,11 @@ int main(int argc, char** argv) {
     try {
         wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const auto bin = std::filesystem::path(exe).parent_path();
-        const auto root = bin / "uevr-test-data" / std::to_wstring(GetCurrentProcessId());
+        // Windows reuses PIDs. Keep fixtures from earlier runs from masquerading
+        // as the files and reports produced by this invocation.
+        const auto run = std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(std::chrono::system_clock::now().time_since_epoch().count());
+        const auto root = bin / "uevr-test-data" / run;
         std::filesystem::create_directories(root); directory = root.wstring();
         settings_tests(root);
         const auto issue = support_issue_url(L"report #&.zip", "state & details\n");
@@ -176,6 +181,13 @@ int main(int argc, char** argv) {
             puts("UEVR ownership conflict test passed"); return 0;
         }
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
+        require(received.find("\"eye_calibration\":{\"backend\":\"D3D11 / OpenVR\",\"enabled\":true") != received.npos,
+            "Shared eye calibration diagnostics enabled on attachment");
+        command("1\n80\ncalibration_disable");
+        require(received.find("\"status\":\"Disabled\"") != received.npos, "Calibration disable command");
+        command("1\n81\ncalibration_enable");
+        command("1\n82\ncalibration_reset");
+        require(received.find("Waiting for OpenVR (D3D11 only)") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
             command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
             verify_late_attach_test(get, command);
@@ -274,6 +286,7 @@ int main(int argc, char** argv) {
         require(GetModuleHandleW(L"CheekyFoveatedDLSS.dll")==nullptr,"Thin plugin really unloads");
         require(snapshot(get).find("\"attached\":false")!=std::string::npos,"Unload detaches resident runtime");
         require(snapshot(get).find("\"processing\":false")!=std::string::npos,"Unload disables processing");
+        require(snapshot(get).find("\"status\":\"Disabled\"")!=std::string::npos,"Unload suspends calibration without loader-lock GPU work");
         plugin=LoadLibraryW(plugin_path.c_str()); require(plugin!=nullptr,"Reload plugin");
         init=reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin,"uevr_plugin_initialize"));
         require(init(&api),"Reconnect existing runtime"); command("1\n6\nget");

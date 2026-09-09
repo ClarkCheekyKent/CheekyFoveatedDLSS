@@ -322,6 +322,9 @@ bool calculate_coordinated_crop(
     bool packed_stereo_match{};
     bool copy_match{};
     bool projection_match{};
+    const bool marker_match = eye_assignment.calibrated && snapshot.view_count == 2U &&
+        (snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U;
+    if (marker_match) { matched_index = eye_assignment.eye_index; match_count = 1U; }
     std::array<GazeProjection, 2> xr_projections{};
     for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
         const auto& v = snapshot.views[i];
@@ -331,6 +334,7 @@ bool calculate_coordinated_crop(
     for (std::uint32_t index{};
          index < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS);
          ++index) {
+        if (marker_match) break;
         if (exact_view_match(
                 snapshot.views[index], resource_identity,
                 output_origin_x, output_origin_y,
@@ -479,6 +483,7 @@ bool calculate_coordinated_crop(
             static_cast<unsigned long long>(view_id)
         );
     } else if (mapping_result.changed) {
+        if (marker_match) state.temporal = {};
         trace_event(
             "VR gaze mapping changed view=%llu eye=%u generation=%llu",
             static_cast<unsigned long long>(view_id),
@@ -490,7 +495,7 @@ bool calculate_coordinated_crop(
             "VR gaze mapping established view=%llu eye=%u route=%s",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
-            projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : "exact-resource"
+            marker_match ? "pixel-marker" : projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : "exact-resource"
         );
     }
 
@@ -502,6 +507,7 @@ bool calculate_coordinated_crop(
             diagnostics.views[index].packed_stereo_mapping = false;
             diagnostics.views[index].copy_mapping = false;
             diagnostics.views[index].projection_mapping = false;
+            diagnostics.views[index].marker_mapping = false;
         }
     }
     if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
@@ -519,6 +525,7 @@ bool calculate_coordinated_crop(
         view_diagnostics.packed_stereo_mapping = packed_stereo_match;
         view_diagnostics.copy_mapping = copy_match;
         view_diagnostics.projection_mapping = projection_match;
+        view_diagnostics.marker_mapping = marker_match;
     }
     const bool mapping_stable = mapping_result.stable &&
         state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS;

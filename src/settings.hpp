@@ -94,7 +94,16 @@ struct StereoViewDetail {
 struct StereoEyeAssignment {
     std::uint32_t eye_index{};
     bool assigned{};
+    bool calibrated{};
 };
+
+// A registration generation distinguishes a released/recreated NGX handle at
+// the same address. Calibrations are atomic pairs, ordered and time-limited.
+std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept;
+bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
+    std::uint64_t left_generation, std::uint64_t right_generation,
+    std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected = nullptr) noexcept;
+void clear_stereo_calibration() noexcept;
 
 [[nodiscard]] Settings current_settings() noexcept;
 [[nodiscard]] Settings configured_settings() noexcept;

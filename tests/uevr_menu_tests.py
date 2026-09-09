@@ -18,6 +18,9 @@ if not reports:
     raise SystemExit("Run CheekyUEVRTests.exe first to produce a real runtime snapshot.")
 baseline_path = max(reports, key=lambda p: p.stat().st_mtime)
 baseline = json.loads(baseline_path.read_text())
+assert baseline['eye_calibration']['backend'] == 'D3D11 / OpenVR'
+assert not baseline['eye_calibration']['active']
+assert 'corrections' in baseline['eye_calibration']
 bundles = list((baseline_path.parent / "support").glob("*.zip"))
 assert bundles, "Native host test must produce a support ZIP"
 with zipfile.ZipFile(max(bundles, key=lambda p: p.stat().st_mtime)) as bundle:
@@ -117,6 +120,20 @@ def run(engine):
     order = list(g.tree_order.values())
     assert order.index("Stereo and gaze") < order.index("DLSS-SR") < order.index("DLSS-NR (experimental)")
     assert g.tree_parents["Frame rate comparison"] == "DLSS-SR"
+    assert g.tree_parents["Eye calibration"] == "Diagnostics and support"
+    assert any("D3D11 / OpenVR" in str(t) for t in g.drawn.values())
+    draw("Reset eye calibration counters")
+    assert last().endswith("\ncalibration_reset")
+    draw(changes={"Automatic eye calibration (this session)": False})
+    assert last().endswith("\ncalibration_disable")
+    draw(changes={"Automatic eye calibration (this session)": True})
+    assert last().endswith("\ncalibration_enable")
+    older = copy.deepcopy(state)
+    older.pop("eye_calibration")
+    receive(older)
+    draw()
+    assert any("Unavailable in this runtime" in str(t) for t in g.drawn.values())
+    receive(state)
     state["support"] = {"busy": False, "zip": "C:/test/support/report.zip"}
     receive(state)
     for label, action in (("Report an issue...", "report_issue"), ("Create support ZIP only", "report"),

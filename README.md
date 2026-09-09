@@ -14,6 +14,10 @@ Create an issue if you encounter problem with game compatibility, bugs, or have 
 
 ## Requirements
 
+Native OpenVR/D3D11 games now calibrate eye assignments asynchronously every
+frame, including across video/menu transitions. See [Eye calibration](EYE-CALIBRATION.md)
+for supported paths, diagnostics and validation.
+
 - Windows 10 or Windows 11, 64-bit
 - An NVIDIA RTX GPU and current NVIDIA driver
 - A Direct3D 11 or Direct3D 12 game with DLSS Super Resolution
