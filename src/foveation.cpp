@@ -44,32 +44,25 @@ namespace {
     const std::uint32_t output_origin_y,
     FoveationGeometry& geometry
 ) noexcept {
-    const auto input_end_x = input_start_x + input_width;
-    const auto input_end_y = input_start_y + input_height;
+    // Scale the extent independently of placement. Rounding both edges made
+    // gaze translation toggle the output size by one pixel, recreating DLSS
+    // and discarding its temporal history. Clamp placement, never the extent.
+    const auto scaled_width = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(input_width) * output_width + render_width - 1U) / render_width);
+    const auto scaled_height = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(input_height) * output_height + render_height - 1U) / render_height);
     const auto relative_output_start_x = static_cast<std::uint32_t>(std::floor(
         static_cast<double>(input_start_x) * output_width / render_width
     ));
     const auto relative_output_start_y = static_cast<std::uint32_t>(std::floor(
         static_cast<double>(input_start_y) * output_height / render_height
     ));
-    const auto relative_output_end_x = (std::min)(
-        output_width,
-        static_cast<std::uint32_t>(std::ceil(
-            static_cast<double>(input_end_x) * output_width / render_width
-        ))
-    );
-    const auto relative_output_end_y = (std::min)(
-        output_height,
-        static_cast<std::uint32_t>(std::ceil(
-            static_cast<double>(input_end_y) * output_height / render_height
-        ))
-    );
     geometry = {
         input_start_x, input_start_y, input_width, input_height,
-        output_origin_x + relative_output_start_x,
-        output_origin_y + relative_output_start_y,
-        relative_output_end_x - relative_output_start_x,
-        relative_output_end_y - relative_output_start_y,
+        output_origin_x + (std::min)(relative_output_start_x, output_width - scaled_width),
+        output_origin_y + (std::min)(relative_output_start_y, output_height - scaled_height),
+        scaled_width,
+        scaled_height,
     };
     return geometry.output_width != 0U && geometry.output_height != 0U;
 }

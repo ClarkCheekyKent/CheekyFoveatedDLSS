@@ -105,6 +105,59 @@ void expect_near(
     expect(std::fabs(actual - expected) <= tolerance, message);
 }
 
+void test_sr_crop_dimensions_during_gaze() {
+    using namespace cheeky::foveated_dlss;
+    // Include the reported 99% crop, fractional scaling, unity scaling,
+    // packed-output origins, and full-size crops at both image boundaries.
+    for (const auto output_width : {3072U, 1782U, 1001U}) {
+        for (const float size : {0.99F, 0.68F, 1.0F}) {
+            for (const unsigned quantum : {1U, 8U}) {
+                FoveationParameters parameters{};
+                parameters.width = parameters.height = size;
+                FoveationGeometry first{};
+                expect(calculate_foveation_geometry_at_center(parameters,
+                    {0.0F, 0.0F, quantum}, 1782, 1894, output_width, 3264,
+                    3072, 17, first), "SR initial crop is valid");
+                for (unsigned step = 0; step <= 4096; ++step) {
+                    const float center = step / 4096.0F;
+                    FoveationGeometry crop{};
+                    expect(calculate_foveation_geometry_at_center(parameters,
+                        {center, center, quantum}, 1782, 1894, output_width, 3264,
+                        3072, 17, crop), "SR gaze sweep crop is valid");
+                    expect(crop.input_width == first.input_width &&
+                        crop.input_height == first.input_height &&
+                        crop.output_width == first.output_width &&
+                        crop.output_height == first.output_height,
+                        "SR dimensions stay constant throughout gaze sweep");
+                    expect(crop.output_base_x >= 3072 && crop.output_base_y >= 17 &&
+                        crop.output_base_x + crop.output_width <= 3072 + output_width &&
+                        crop.output_base_y + crop.output_height <= 17 + 3264,
+                        "SR moving crop stays inside its output viewport");
+                    const auto enlarged = supersampled_crop(crop, 1.5F);
+                    const auto first_enlarged = supersampled_crop(first, 1.5F);
+                    expect(enlarged.output_width == first_enlarged.output_width &&
+                        enlarged.output_height == first_enlarged.output_height,
+                        "supersampled SR dimensions stay constant during movement");
+                    if (step == 4096 && quantum == 1U) {
+                        expect(crop.output_base_x + crop.output_width == 3072 + output_width &&
+                            crop.output_base_y + crop.output_height == 17 + 3264,
+                            "SR crop reaches right and bottom edges without shrinking");
+                    }
+                }
+                FoveationGeometry fixed{};
+                expect(calculate_foveation_geometry(parameters, 1782, 1894,
+                    output_width, 3264, 3072, 17, fixed) &&
+                    fixed.output_width == first.output_width && fixed.output_height == first.output_height,
+                    "fixed and gaze modes use the same SR dimensions");
+                if (size == 0.99F && output_width == 3072U) {
+                    expect(first.output_width == 3041 && first.output_height == 3232,
+                        "reported SR crop retains its expected output size");
+                }
+            }
+        }
+    }
+}
+
 void test_simulated_gaze() {
     using namespace cheeky::gaze_math;
     const Fov fov{-0.8F, 0.8F, 0.8F, -0.8F};
@@ -1272,6 +1325,7 @@ int main(int argc, char** argv) {
     test_simulation_patterns();
     test_projection();
     test_geometry();
+    test_sr_crop_dimensions_during_gaze();
     test_mapping_policy();
     test_packed_stereo_mapping_policy();
     test_temporal_policy();
