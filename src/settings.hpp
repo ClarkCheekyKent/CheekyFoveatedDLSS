@@ -49,7 +49,7 @@ struct Settings {
     float nr_height{0.56F};
     float nr_roundness{0.0F};
     float nr_transition_width{0.08F};
-    float nr_working_scale{0.80F};
+    float nr_working_scale{1.0F};
     std::uint32_t nr_preset{};
     float nr_intensity{1.0F};
     float nr_local_tone_strength{1.0F};

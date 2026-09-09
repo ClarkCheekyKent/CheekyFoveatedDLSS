@@ -45,7 +45,7 @@ std::atomic<std::uint32_t> nr_width_bits{0x3F0F5C29U};
 std::atomic<std::uint32_t> nr_height_bits{0x3F0F5C29U};
 std::atomic<std::uint32_t> nr_roundness_bits{};
 std::atomic<std::uint32_t> nr_transition_bits{0x3DA3D70AU};
-std::atomic<std::uint32_t> nr_working_scale_bits{0x3F4CCCCDU};
+std::atomic<std::uint32_t> nr_working_scale_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_preset{};
 std::atomic<std::uint32_t> nr_intensity_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_local_tone_bits{0x3F800000U};
