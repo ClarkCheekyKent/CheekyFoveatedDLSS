@@ -95,6 +95,7 @@ struct StereoEyeAssignment {
     std::uint32_t eye_index{};
     bool assigned{};
     bool calibrated{};
+    std::uint64_t calibration_session{}; // 0 = OpenVR; otherwise OpenXR generation.
 };
 
 // A registration generation distinguishes a released/recreated NGX handle at
@@ -102,7 +103,8 @@ struct StereoEyeAssignment {
 std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept;
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
-    std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected = nullptr) noexcept;
+    std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected = nullptr,
+    std::uint64_t session_generation = 0) noexcept;
 void clear_stereo_calibration() noexcept;
 
 [[nodiscard]] Settings current_settings() noexcept;

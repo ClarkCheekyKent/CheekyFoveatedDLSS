@@ -18,7 +18,7 @@ if not reports:
     raise SystemExit("Run CheekyUEVRTests.exe first to produce a real runtime snapshot.")
 baseline_path = max(reports, key=lambda p: p.stat().st_mtime)
 baseline = json.loads(baseline_path.read_text())
-assert baseline['eye_calibration']['backend'] == 'D3D11 / OpenVR'
+assert baseline['eye_calibration']['backend'] == 'Waiting for VR'
 assert not baseline['eye_calibration']['active']
 assert 'corrections' in baseline['eye_calibration']
 bundles = list((baseline_path.parent / "support").glob("*.zip"))
@@ -121,7 +121,7 @@ def run(engine):
     assert order.index("Stereo and gaze") < order.index("DLSS-SR") < order.index("DLSS-NR (experimental)")
     assert g.tree_parents["Frame rate comparison"] == "DLSS-SR"
     assert g.tree_parents["Eye calibration"] == "Diagnostics and support"
-    assert any("D3D11 / OpenVR" in str(t) for t in g.drawn.values())
+    assert any("Waiting for VR" in str(t) for t in g.drawn.values())
     draw("Reset eye calibration counters")
     assert last().endswith("\ncalibration_reset")
     draw(changes={"Automatic eye calibration (this session)": False})

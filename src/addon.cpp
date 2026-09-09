@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "graphics_observer.hpp"
 #include "d3d11_d3d12_transport.hpp"
 #include "d3d11_peripheral_dlaa.hpp"
 #include "diagnostics.hpp"
@@ -602,7 +603,8 @@ void draw_eye_calibration_diagnostics() {
     if (ImGui::Checkbox("Automatic eye calibration (this session)", &enabled))
         eye_calibration_enable(enabled);
     if (DiagnosticTable table{"eye_calibration"}) {
-        diagnostic_row("Backend", "%s", "D3D11 / OpenVR");
+        diagnostic_row("Backend", "%s", eye_calibration_backend_name(s.backend));
+        diagnostic_row("Graphics API", "%s", s.graphics_api == 12 ? "D3D12" : s.graphics_api == 11 ? "D3D11" : "Waiting for DLSS");
         diagnostic_row("Status", "%s", eye_calibration_status(s));
         diagnostic_row("Corrections applied", "%llu", s.corrections);
         diagnostic_row("Confirmed mapping updates", "%llu", s.applied);
@@ -611,7 +613,7 @@ void draw_eye_calibration_diagnostics() {
         diagnostic_row("CPU work", "%.2f us/frame", s.cpu_us_per_frame);
         if (s.gpu_samples) diagnostic_row("GPU marker / copy work", "%.2f us", s.gpu_us);
         else diagnostic_row("GPU marker / copy work", "%s", "Not sampled / unavailable");
-        diagnostic_row("Readback latency", "%.2f OpenVR frames", s.latency_frames);
+        diagnostic_row("Readback latency", "%.2f VR frames", s.latency_frames);
         diagnostic_row("Last recognized left / right", "%llu / %llu", s.left_view, s.right_view);
     }
     ImGui::TextWrapped("Samples every frame. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
@@ -1776,6 +1778,7 @@ void on_execute_command_list(
         queue->get_device()->get_api() != reshade::api::device_api::d3d12) {
         return;
     }
+    if (native_observer_status().ready) return;
     submit_gaze_copies(command_list->get_native());
     note_d3d12_command_list_submission(
         reinterpret_cast<ID3D12CommandQueue*>(queue->get_native()),

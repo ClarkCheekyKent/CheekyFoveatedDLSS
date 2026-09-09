@@ -347,14 +347,15 @@ uevr.sdk.callbacks.on_draw_ui(function()
             local c = status.eye_calibration or {}
             local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
             if changed then send(enabled and "calibration_enable" or "calibration_disable") end
-            rows("eye_calibration", {{"Backend", c.backend or "D3D11 / OpenVR"},
+            rows("eye_calibration", {{"Backend", c.backend or "Waiting for VR"},
+                {"Graphics API", c.graphics_api == 12 and "D3D12" or c.graphics_api == 11 and "D3D11" or "Waiting for DLSS"},
                 {"Status", c.status or "Unavailable in this runtime"},
                 {"Corrections applied", c.corrections or 0}, {"Confirmed mapping updates", c.applied or 0},
                 {"Valid / completed samples", string.format("%d / %d", c.valid or 0, c.completed or 0)},
                 {"Skipped / in flight", string.format("%d / %d", c.skipped or 0, c.in_flight or 0)},
                 {"CPU work", string.format("%.2f us/frame", c.cpu_us_per_frame or 0)},
                 {"GPU marker / copy work", (c.gpu_samples or 0) > 0 and string.format("%.2f us", c.gpu_us or 0) or "Not sampled / unavailable"},
-                {"Readback latency", string.format("%.2f OpenVR frames", c.latency_frames or 0)},
+                {"Readback latency", string.format("%.2f VR frames", c.latency_frames or 0)},
                 {"Last recognized left / right", tostring(c.left_view or 0) .. " / " .. tostring(c.right_view or 0)}})
             text("Samples every frame. Corrections count changes to an existing eye assignment; confirmations do not increment it.")
             text("GPU time covers marker and copy commands; CPU time excludes lock waiting.")

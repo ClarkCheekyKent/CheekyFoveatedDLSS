@@ -235,7 +235,7 @@ It is pinned before detours start, so workers, detours and resource-lifetime
 callbacks cannot jump into an unloaded DLL. Detach uses an attachment token and
 atomic processing gate, without waiting for threads under the Windows loader lock.
 
-`uevr/graphics_observer.cpp` supplies D3D12 submission, copy, reset and lifetime
+`src/graphics_observer.cpp` supplies D3D12 submission, copy, reset and lifetime
 observations previously supplied by ReShade. The runtime builds without ReShade
 API or ImGui headers. The core settings API provides coherent configured/effective
 snapshots shared by both builds. A standalone host can reuse these boundaries;
@@ -254,7 +254,8 @@ than historical options; the fallback therefore relies on future NGX evaluations
 **Diagnostics and support > Eye calibration** exposes the shared calibration
 status, correction counter, sample backlog and CPU/GPU measurements. Counter
 reset preserves the current mapping; the enable switch applies to this session.
-The backend currently requires native OpenVR and D3D11 2D submissions. D3D12 and
-OpenXR do not gain pixel calibration from this update. Full details are in
+Both D3D11 and D3D12 support OpenVR and OpenXR calibration, including packed
+images and array slices. Native OpenXR requires the matching updated Cheeky
+OpenXR layer installer as well as the plugin/runtime. Full details are in
 `EYE-CALIBRATION.md` in the package and the repository root. Support ZIP snapshots
 include the same diagnostics.

@@ -8,4 +8,4 @@ struct NativeObserverStatus {
 };
 bool initialize_native_observer(ID3D12Device*, ID3D12CommandQueue*) noexcept;
 NativeObserverStatus native_observer_status() noexcept;
-}
+} // namespace cheeky::foveated_dlss

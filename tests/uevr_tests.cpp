@@ -181,13 +181,13 @@ int main(int argc, char** argv) {
             puts("UEVR ownership conflict test passed"); return 0;
         }
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
-        require(received.find("\"eye_calibration\":{\"backend\":\"D3D11 / OpenVR\",\"enabled\":true") != received.npos,
+        require(received.find("\"eye_calibration\":{\"backend\":\"Waiting for VR\",\"graphics_api\":0,\"enabled\":true") != received.npos,
             "Shared eye calibration diagnostics enabled on attachment");
         command("1\n80\ncalibration_disable");
         require(received.find("\"status\":\"Disabled\"") != received.npos, "Calibration disable command");
         command("1\n81\ncalibration_enable");
         command("1\n82\ncalibration_reset");
-        require(received.find("Waiting for OpenVR (D3D11 only)") != received.npos, "Unavailable backend must not claim active calibration");
+        require(received.find("Waiting for OpenVR or OpenXR") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
             command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
             verify_late_attach_test(get, command);

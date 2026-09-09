@@ -203,6 +203,25 @@ void observe_submit(vr::EVREye eye,const vr::Texture_t* texture,const vr::VRText
 }
 // Separate original slot values for each ABI version. Do not deduplicate by
 // implementation address: unrelated methods can share the same forwarding thunk.
+std::uint64_t capture_eye_submission(vr::EVREye eye, const vr::Texture_t* texture,
+    unsigned slice, const vr::VRTextureBounds_t* bounds, vr::EVRSubmitFlags flags) {
+    if (!eye_calibration_enabled()) return 0;
+    const auto supported = vr::Submit_TextureWithPose | vr::Submit_TextureWithDepth | vr::Submit_FrameDiscontinuity;
+    if (!texture || !texture->handle || (static_cast<unsigned>(flags) & ~static_cast<unsigned>(supported))) {
+        eye_calibration_unsupported_submit(); return 0;
+    }
+    const vr::VRTextureBounds_t full{0, 0, 1, 1}; const auto& b = bounds ? *bounds : full;
+    if (texture->eType == vr::TextureType_DirectX) {
+        ComPtr<ID3D11Texture2D> image;
+        if (SUCCEEDED(static_cast<IUnknown*>(texture->handle)->QueryInterface(IID_PPV_ARGS(&image))))
+            return eye_calibration_submit(image.Get(), unsigned(eye), b.uMin, b.vMin, b.uMax, b.vMax, slice);
+    } else if (texture->eType == vr::TextureType_DirectX12) {
+        const auto* image = static_cast<const vr::D3D12TextureData_t*>(texture->handle);
+        return eye_calibration_submit12(image->m_pResource, image->m_pCommandQueue, unsigned(eye),
+            b.uMin, b.vMin, b.uMax, b.vMax, slice);
+    }
+    eye_calibration_unsupported_submit(); return 0;
+}
 template<unsigned N> struct CompositorHooks {
     static inline Wait wait{};
     static inline Submit submit{};
@@ -219,29 +238,18 @@ template<unsigned N> struct CompositorHooks {
     }
     static vr::EVRCompositorError submit_hook(void* self,vr::EVREye eye,const vr::Texture_t* texture,const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags) {
         ++submit_depth;
-        std::uint64_t calibration_ticket{};
-        if (submit_depth == 1 && eye_calibration_enabled()) {
-            const auto supported_flags = vr::Submit_TextureWithPose | vr::Submit_TextureWithDepth | vr::Submit_FrameDiscontinuity;
-            if (texture && texture->handle && texture->eType == vr::TextureType_DirectX &&
-                (static_cast<unsigned>(flags) & ~static_cast<unsigned>(supported_flags)) == 0) {
-                ComPtr<ID3D11Texture2D> image;
-                if (SUCCEEDED(static_cast<IUnknown*>(texture->handle)->QueryInterface(IID_PPV_ARGS(&image)))) {
-                    const vr::VRTextureBounds_t full{0, 0, 1, 1};
-                    const auto& b = bounds ? *bounds : full;
-                    // Enqueue the readback before forwarding Submit. The runtime
-                    // may consume/reuse the image after the original call.
-                    calibration_ticket = eye_calibration_submit(image.Get(), unsigned(eye), b.uMin, b.vMin, b.uMax, b.vMax);
-                } else eye_calibration_unsupported_submit();
-            } else eye_calibration_unsupported_submit();
-        }
+        // Read before forwarding: the runtime owns the submitted texture after
+        // the original call. D3D12 restores the OpenVR pixel-shader state.
+        const auto calibration_ticket = submit_depth == 1 ? capture_eye_submission(eye, texture, 0, bounds, flags) : 0;
         const auto result=submit(self,eye,texture,bounds,flags);
         eye_calibration_result(calibration_ticket, int(result));
         if (--submit_depth==0) observe_submit(eye,texture,bounds,0,flags,result); return result;
     }
     static vr::EVRCompositorError array_hook(void* self,vr::EVREye eye,const vr::Texture_t* texture,std::uint32_t slice,const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags) {
-        eye_calibration_unsupported_submit();
         ++submit_depth;
+        const auto ticket = submit_depth == 1 ? capture_eye_submission(eye, texture, slice, bounds, flags) : 0;
         const auto result=array(self,eye,texture,slice,bounds,flags);
+        eye_calibration_result(ticket, int(result));
         if (--submit_depth==0) observe_submit(eye,texture,bounds,slice,flags,result); return result;
     }
 };

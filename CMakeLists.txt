@@ -139,7 +139,9 @@ add_executable(
     CheekyTests
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gaze_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/eye_calibration_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/openxr_calibration_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration_d3d12.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_composite_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/motion_resample_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/crop_motion.cpp"
@@ -178,7 +180,7 @@ if(CHEEKY_BUILD_UEVR)
     set(CHEEKY_RUNTIME_SOURCES ${CHEEKY_FOVEATED_DLSS_SOURCES})
     list(FILTER CHEEKY_RUNTIME_SOURCES EXCLUDE REGEX "/(addon|support_report)\\.cpp$")
     add_library(CheekyFoveatedDLSSRuntime MODULE ${CHEEKY_RUNTIME_SOURCES}
-        uevr/runtime.cpp uevr/settings_io.cpp uevr/graphics_observer.cpp)
+        uevr/runtime.cpp uevr/settings_io.cpp)
     add_library(CheekyFoveatedDLSSUEVR MODULE uevr/plugin.cpp)
     add_executable(CheekyUEVRTests tests/uevr_tests.cpp tests/late_attach_tests.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp)
     add_library(CheekyFakeNGX MODULE tests/fake_ngx.cpp)

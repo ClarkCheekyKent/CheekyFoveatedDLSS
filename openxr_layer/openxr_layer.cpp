@@ -11,6 +11,8 @@
 
 #include "cheeky_gaze_abi.h"
 #include "gaze_math.hpp"
+#include "eye_calibration.hpp"
+#include <deque>
 
 #include <algorithm>
 #include <array>
@@ -71,6 +73,7 @@ struct Dispatch {
     PFN_xrAcquireSwapchainImage acquire_swapchain_image{};
     PFN_xrWaitSwapchainImage wait_swapchain_image{};
     PFN_xrReleaseSwapchainImage release_swapchain_image{};
+    PFN_xrBeginFrame begin_frame{};
     PFN_xrEndFrame end_frame{};
 };
 
@@ -114,6 +117,7 @@ void populate_dispatch(
     CHEEKY_LOAD(acquire_swapchain_image, AcquireSwapchainImage);
     CHEEKY_LOAD(wait_swapchain_image, WaitSwapchainImage);
     CHEEKY_LOAD(release_swapchain_image, ReleaseSwapchainImage);
+    CHEEKY_LOAD(begin_frame, BeginFrame);
     CHEEKY_LOAD(end_frame, EndFrame);
 #undef CHEEKY_LOAD
 }
@@ -127,6 +131,9 @@ struct SubmittedView {
 };
 
 struct SessionState {
+    cheeky::openxr_calibration::Frame calibration;
+    unsigned graphics_api{};
+    void* graphics_queue{};
     XrSession session{XR_NULL_HANDLE};
     XrInstance instance{XR_NULL_HANDLE};
     XrSystemId system_id{XR_NULL_SYSTEM_ID};
@@ -162,6 +169,8 @@ struct SwapchainState {
     XrSession session{XR_NULL_HANDLE};
     XrSwapchainCreateInfo create_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     std::vector<std::uint64_t> resource_identities;
+    std::vector<void*> calibration_images;
+    std::deque<std::pair<std::uint32_t, bool>> acquired_images;
     std::uint32_t acquired_index{};
     std::uint32_t released_index{};
     bool has_acquired{};
@@ -567,6 +576,7 @@ XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitSwapchainImage(
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
     XrSwapchain, const XrSwapchainImageReleaseInfo*
 );
+XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(XrSession session, const XrFrameBeginInfo* info);
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     XrSession, const XrFrameEndInfo*
 );
@@ -614,6 +624,7 @@ namespace {
     CHEEKY_INTERCEPT(
         "xrReleaseSwapchainImage", cheeky_xrReleaseSwapchainImage
     )
+    CHEEKY_INTERCEPT("xrBeginFrame", cheeky_xrBeginFrame)
     CHEEKY_INTERCEPT("xrEndFrame", cheeky_xrEndFrame)
 #undef CHEEKY_INTERCEPT
     return false;
@@ -727,6 +738,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
         action_set = iterator->second.action_set;
         for (auto session_it = sessions.begin(); session_it != sessions.end();) {
             if (session_it->second.instance == instance) {
+                session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
                 session_it = sessions.erase(session_it);
             } else {
                 ++session_it;
@@ -812,6 +824,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     session_state.session = *session;
     session_state.instance = instance;
     session_state.system_id = info->systemId;
+    for (auto* binding = static_cast<const XrBaseInStructure*>(info->next); binding; binding = binding->next) {
+        if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) session_state.graphics_api = 11;
+        if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+            session_state.graphics_api = 12;
+            session_state.graphics_queue = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(binding)->queue;
+        }
+    }
     session_state.generation = next_session_generation.fetch_add(
         1U, std::memory_order_relaxed
     );
@@ -861,6 +880,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         if (instance_it == instances.end()) return XR_ERROR_HANDLE_INVALID;
         dispatch = instance_it->second.dispatch;
         gaze_space = session_it->second.gaze_space;
+        session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
         sessions.erase(session_it);
         for (auto iterator = swapchains.begin(); iterator != swapchains.end();) {
             if (iterator->second.session == session) {
@@ -957,6 +977,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndSession(
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.end_session;
         auto& session_state = sessions.at(session);
+        session_state.calibration.destroy(cheeky::openxr_calibration::bridge());
         session_state.action_active = false;
         session_state.gaze_valid = false;
         publish_snapshot_locked(&session_state);
@@ -1346,6 +1367,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
         next = instance->dispatch.destroy_swapchain;
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
+            auto& calibration = session_it->second.calibration;
+            for (const auto& region : calibration.history) {
+                if (region.swapchain == reinterpret_cast<std::uint64_t>(swapchain)) {
+                    calibration.destroy(cheeky::openxr_calibration::bridge());
+                    break;
+                }
+            }
             for (auto& view : session_it->second.submitted_views) {
                 if (view.swapchain == swapchain) view = {};
             }
@@ -1386,12 +1414,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEnumerateSwapchainImages(
     }
 
     std::vector<std::uint64_t> identities(*count);
+    std::vector<void*> calibration_images(*count);
     if (*count != 0U && images[0].type == XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
         const auto* typed = reinterpret_cast<const XrSwapchainImageD3D11KHR*>(
             images
         );
         for (std::uint32_t index{}; index < *count; ++index) {
             identities[index] = canonical_resource_identity(typed[index].texture);
+            calibration_images[index] = typed[index].texture;
         }
     } else if (*count != 0U &&
                images[0].type == XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) {
@@ -1400,6 +1430,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEnumerateSwapchainImages(
         );
         for (std::uint32_t index{}; index < *count; ++index) {
             identities[index] = canonical_resource_identity(typed[index].texture);
+            calibration_images[index] = typed[index].texture;
         }
     }
 
@@ -1407,6 +1438,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEnumerateSwapchainImages(
     const auto swapchain_it = swapchains.find(swapchain);
     if (swapchain_it != swapchains.end()) {
         swapchain_it->second.resource_identities = std::move(identities);
+        swapchain_it->second.calibration_images = std::move(calibration_images);
         const auto session_it = sessions.find(swapchain_it->second.session);
         if (session_it != sessions.end()) {
             update_view_resource_locked(session_it->second, swapchain);
@@ -1438,7 +1470,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAcquireSwapchainImage(
         std::lock_guard lock(state_mutex);
         const auto swapchain_it = swapchains.find(swapchain);
         if (swapchain_it != swapchains.end()) {
-            swapchain_it->second.acquired_index = *index;
+            swapchain_it->second.acquired_images.emplace_back(*index, false);
+            swapchain_it->second.acquired_index = swapchain_it->second.acquired_images.front().first;
             swapchain_it->second.has_acquired = true;
             const auto session_it = sessions.find(swapchain_it->second.session);
             if (session_it != sessions.end()) {
@@ -1465,9 +1498,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitSwapchainImage(
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.wait_swapchain_image;
     }
-    return next == nullptr
-        ? XR_ERROR_FUNCTION_UNSUPPORTED
-        : next(swapchain, wait_info);
+    if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result = next(swapchain, wait_info);
+    if (result == XR_SUCCESS || result == XR_SESSION_LOSS_PENDING) {
+        std::lock_guard lock(state_mutex);
+        auto it = swapchains.find(swapchain);
+        if (it != swapchains.end()) for (auto& image : it->second.acquired_images) {
+            if (!image.second) { image.second = true; break; }
+        }
+    }
+    return result;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
@@ -1488,22 +1528,58 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
         auto* instance = find_instance_for_session_locked(session);
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.release_swapchain_image;
+        auto& chain = swapchain_it->second;
+        auto owner = sessions.find(session);
+        if (next && owner != sessions.end() && !chain.acquired_images.empty() && chain.acquired_images.front().second &&
+            acquired_index < chain.calibration_images.size() &&
+            (chain.create_info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
+            owner->second.calibration.before_release(cheeky::openxr_calibration::bridge(),
+                reinterpret_cast<std::uint64_t>(swapchain), acquired_index, chain.calibration_images[acquired_index],
+                owner->second.graphics_queue, chain.create_info.width, chain.create_info.height);
+        }
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const auto result = next(swapchain, release_info);
+    {
+        std::lock_guard lock(state_mutex);
+        auto owner = sessions.find(session);
+        if (owner != sessions.end()) owner->second.calibration.after_release(
+            reinterpret_cast<std::uint64_t>(swapchain), acquired_index, XR_SUCCEEDED(result));
+    }
     if (XR_SUCCEEDED(result) && has_acquired) {
         std::lock_guard lock(state_mutex);
         const auto swapchain_it = swapchains.find(swapchain);
         if (swapchain_it != swapchains.end()) {
             swapchain_it->second.released_index = acquired_index;
             swapchain_it->second.has_released = true;
-            swapchain_it->second.has_acquired = false;
+            auto& chain = swapchain_it->second;
+            if (!chain.acquired_images.empty()) chain.acquired_images.pop_front();
+            chain.has_acquired = !chain.acquired_images.empty();
+            if (chain.has_acquired) chain.acquired_index = chain.acquired_images.front().first;
             const auto session_it = sessions.find(session);
             if (session_it != sessions.end()) {
                 update_view_resource_locked(session_it->second, swapchain);
                 publish_snapshot_locked(&session_it->second);
             }
         }
+    }
+    return result;
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
+    const XrSession session, const XrFrameBeginInfo* info) {
+    PFN_xrBeginFrame next{};
+    { std::lock_guard lock(state_mutex);
+      const auto* instance = find_instance_for_session_locked(session);
+      if (!instance) return XR_ERROR_HANDLE_INVALID;
+      next = instance->dispatch.begin_frame; }
+    if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result = next(session, info);
+    if (XR_SUCCEEDED(result)) {
+        std::lock_guard lock(state_mutex);
+        auto it = sessions.find(session);
+        if (it != sessions.end()) it->second.calibration.begin(cheeky::openxr_calibration::bridge(),
+            it->second.generation, it->second.graphics_api);
     }
     return result;
 }
@@ -1522,6 +1598,35 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
 
     const auto result = next(session, frame_end_info);
+    {
+        std::lock_guard lock(state_mutex);
+        auto owner = sessions.find(session);
+        if (owner != sessions.end()) {
+            std::array<cheeky::openxr_calibration::Region, 2> regions{};
+            std::array<std::uint32_t, 2> released{};
+            unsigned projections{};
+            bool valid = XR_SUCCEEDED(result) && frame_end_info &&
+                owner->second.view_configuration == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            if (valid) for (unsigned i = 0; i < frame_end_info->layerCount; ++i) {
+                const auto* layer = frame_end_info->layers[i];
+                if (!layer || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
+                ++projections;
+                const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                if (projection->viewCount != 2 || !projection->views) { valid = false; continue; }
+                for (unsigned eye = 0; eye < 2; ++eye) {
+                    const auto& image = projection->views[eye].subImage;
+                    regions[eye] = {reinterpret_cast<std::uint64_t>(image.swapchain), image.imageArrayIndex,
+                        image.imageRect.offset.x, image.imageRect.offset.y, image.imageRect.extent.width, image.imageRect.extent.height};
+                    auto chain = swapchains.find(image.swapchain);
+                    if (chain == swapchains.end() || chain->second.session != session || !chain->second.has_released)
+                        valid = false;
+                    else released[eye] = chain->second.released_index;
+                }
+            }
+            valid = valid && projections == 1;
+            owner->second.calibration.end(cheeky::openxr_calibration::bridge(), valid ? regions : decltype(regions){}, released, valid);
+        }
+    }
     if (XR_FAILED(result)) return result;
 
     if (frame_end_info != nullptr) {

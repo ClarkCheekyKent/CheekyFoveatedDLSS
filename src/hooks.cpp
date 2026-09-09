@@ -1,5 +1,6 @@
 #include "eye_calibration.hpp"
 #include "backend.hpp"
+#include "graphics_observer.hpp"
 #include "d3d11_d3d12_transport.hpp"
 #include "d3d11_peripheral_dlaa.hpp"
 #include "d3d12_ngx_dispatch.hpp"
@@ -2836,6 +2837,24 @@ std::uint32_t hook_sl_get_feature_function(
     return result;
 }
 
+void stamp_streamline_output(ID3D12GraphicsCommandList* list, std::uint32_t result) {
+    if (result || !eye_calibration_enabled() || !list) return;
+    SlResource resource{}; SlResourceTag tag{}; std::uint64_t view{};
+    AcquireSRWLockShared(&streamline_lock);
+    const auto& output = cached_sl_tags[sl_tag_scaling_output];
+    if (has_cached_sl_viewport && output.present) {
+        resource = output.resource; tag = output.tag; view = std::uint64_t(cached_sl_viewport.value) + 1;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    if (!view || !resource.native || resource.state == 0xFFFFFFFFU) return;
+    tag.resource = &resource;
+    register_stereo_view(view);
+    (void)settings_for_view(current_settings(), view);
+    eye_calibration_stamp12(list, static_cast<ID3D12Resource*>(resource.native), view,
+        tag.extent.left, tag.extent.top, resource_width(tag), resource_height(tag),
+        static_cast<D3D12_RESOURCE_STATES>(resource.state));
+}
+
 std::uint32_t hook_sl_evaluate_feature(
     const std::uint32_t feature,
     const void* const frame,
@@ -2944,6 +2963,7 @@ std::uint32_t hook_sl_evaluate_feature(
             nr_evaluation,
             result
         );
+        stamp_streamline_output(static_cast<ID3D12GraphicsCommandList*>(command_buffer), result);
         LeaveCriticalSection(&streamline_evaluation_lock);
         return result;
     }
@@ -3036,6 +3056,7 @@ std::uint32_t hook_sl_evaluate_feature(
             DiagnosticState::ngx_evaluation_failed
         );
     }
+    stamp_streamline_output(command_list, result);
     LeaveCriticalSection(&streamline_evaluation_lock);
     return result;
 }
@@ -4143,7 +4164,7 @@ void evaluate_nr_after_native_d3d12(
         get_d3d12_parameter_resource(call.parameters, "Output") != nullptr;
 }
 
-NgxResult process_d3d12_evaluation(
+NgxResult process_d3d12_evaluation_impl(
     const D3D12NgxEvaluationCall& call,
     const D3D12NgxEvaluateFn original,
     void*
@@ -4236,6 +4257,22 @@ NgxResult process_d3d12_evaluation(
     return result;
 }
 
+void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxResult result) {
+    if (!eye_calibration_enabled() || calibration_evaluation_depth || inside_streamline_evaluation || !ngx_succeeded(result)) return;
+    const D3D12NgxEvaluationCall call{D3D12NgxRoute::public_runtime, list, handle, parameters, nullptr};
+    if (!recognizable_d3d12_dlss_evaluation(call) || !has_d3d12_game_view(handle)) return;
+    eye_calibration_stamp12(list, get_d3d12_parameter_resource(parameters, "Output"), reinterpret_cast<std::uint64_t>(handle),
+        get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
+        get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"));
+}
+NgxResult process_d3d12_evaluation(const D3D12NgxEvaluationCall& call,
+    D3D12NgxEvaluateFn original, void* context) {
+    const auto result = process_d3d12_evaluation_impl(call, original, context);
+    stamp_d3d12_game_output(call.command_list, call.handle, call.parameters, result);
+    return result;
+}
+
 NgxResult hook_evaluate_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxHandle* const handle,
@@ -4278,7 +4315,7 @@ NgxResult hook_core_evaluate_d3d12(
     );
 }
 
-NgxResult hook_evaluate_d3d12_c(
+NgxResult evaluate_d3d12_c_impl(
     ID3D12GraphicsCommandList* const command_list,
     const NgxHandle* const handle,
     const NgxParameters* const parameters,
@@ -4348,6 +4385,14 @@ NgxResult hook_evaluate_d3d12_c(
             DiagnosticState::ngx_evaluation_failed
         );
     }
+    return result;
+}
+
+NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    const bool outer = !d3d12_ngx_interception_active();
+    const auto result = evaluate_d3d12_c_impl(list, handle, parameters, callback);
+    if (outer) stamp_d3d12_game_output(list, handle, parameters, result);
     return result;
 }
 
@@ -4925,9 +4970,18 @@ void shutdown_direct_export_hooks() noexcept {
     if (!minhook_initialized.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    static_cast<void>(MH_DisableHook(MH_ALL_HOOKS));
-    static_cast<void>(MH_Uninitialize());
     AcquireSRWLockExclusive(&direct_hook_lock);
+    // Recorded marker work can outlive host detach. Keep its Execute/Reset
+    // observer installed so retained GPU resources can still be retired safely.
+    if (native_observer_status().ready) {
+        for (std::size_t i = 0; i < direct_hook_count; ++i) {
+            static_cast<void>(MH_DisableHook(direct_hook_targets[i]));
+            static_cast<void>(MH_RemoveHook(direct_hook_targets[i]));
+        }
+    } else {
+        static_cast<void>(MH_DisableHook(MH_ALL_HOOKS));
+        static_cast<void>(MH_Uninitialize());
+    }
     direct_hook_count = 0U;
     direct_hook_targets.fill(nullptr);
     ReleaseSRWLockExclusive(&direct_hook_lock);

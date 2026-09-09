@@ -88,15 +88,15 @@ EyeRole eye_roles[2]{};
 std::uint64_t stereo_evaluation_sequence{};
 std::uint64_t registration_generation{};
 struct Calibration {
-    std::uint64_t left{}, right{}, sequence{}, expires_ms{};
+    std::uint64_t left{}, right{}, sequence{}, expires_ms{}, session_generation{};
 } calibration;
 bool calibration_live() {
     return calibration.left && calibration.right && GetTickCount64() <= calibration.expires_ms;
 }
 StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
-    if (view == calibration.left) return {0, true, true};
-    if (view == calibration.right) return {1, true, true};
+    if (view == calibration.left) return {0, true, true, calibration.session_generation};
+    if (view == calibration.right) return {1, true, true, calibration.session_generation};
     return {};
 }
 
@@ -412,7 +412,8 @@ std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept {
 
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
-    std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected) noexcept {
+    std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected,
+    std::uint64_t session_generation) noexcept {
     if (corrected) *corrected = false;
     if (!left || !right || left == right || !left_generation || !right_generation) return false;
     std::lock_guard lock(stereo_views_mutex);
@@ -439,7 +440,7 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     if (corrected) {
         *corrected = (previous_left >= 0 && previous_left != 0) || (previous_right >= 0 && previous_right != 1);
     }
-    calibration = {left, right, sequence, captured_ms + lifetime_ms};
+    calibration = {left, right, sequence, captured_ms + lifetime_ms, session_generation};
     return true;
 }
 void clear_stereo_calibration() noexcept {

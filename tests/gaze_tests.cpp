@@ -11,6 +11,7 @@
 #include "streamline_create_extent.hpp"
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
+#include "graphics_observer.hpp"
 
 #include <Windows.h>
 
@@ -22,6 +23,9 @@
 #include <limits>
 
 namespace cheeky::foveated_dlss {
+// The core GPU harness explicitly drives post-submit/reset notifications.
+NativeObserverStatus native_observer_status() noexcept { return {true}; }
+bool initialize_native_observer(ID3D12Device*, ID3D12CommandQueue*) noexcept { return true; }
 
 void trace_event(const char*, ...) noexcept {}
 // Runtime discovery is excluded from deterministic coordinator tests. Live
@@ -826,6 +830,7 @@ void test_packed_alignment_coordinator(bool openvr = false) {
     snapshot.structure_size = sizeof(snapshot);
     snapshot.view_count = 2U;
     snapshot.swapchain_generation = 1U;
+    snapshot.session_generation = 987U;
     snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
     if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
     if (openvr) test_openvr_snapshot=&snapshot;
@@ -904,21 +909,31 @@ void test_packed_alignment_coordinator(bool openvr = false) {
     snapshot.views[1].image_rect_x = 0;
     frame();
     expect(gaze_diagnostics().alignment_source == 0U, "invalid packed layout falls back instead of using stale mapping");
-    if (openvr) {
+    {
         snapshot.views[1].image_rect_x = 3024;
+        snapshot.status_flags |= CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE;
+        snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_MAPPING_READY;
         settings.invert_stereo_x_offset = true; // Old manual guess must not invert an observed XR eye.
         const auto a = stereo_view_generation(951), b = stereo_view_generation(952);
-        expect(publish_stereo_calibration(952, 951, b, a, 1000, GetTickCount64()), "Marker calibration accepts swapped pair");
+        const auto calibration_session = openvr ? 0ULL : snapshot.session_generation;
+        expect(publish_stereo_calibration(952, 951, b, a, 1000, GetTickCount64(), nullptr, calibration_session), "Marker calibration accepts swapped pair");
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i) {
             const float actual = (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F;
             expect_near(actual, snapshot.views[1 - i].forward_u, 0.001F, "Crop follows calibrated eye despite previous packed/manual role");
         }
-        expect(publish_stereo_calibration(951, 952, a, b, 1001, GetTickCount64()), "Marker calibration accepts a later eye transition");
+        expect(publish_stereo_calibration(951, 952, a, b, 1001, GetTickCount64(), nullptr, calibration_session), "Marker calibration accepts a later eye transition");
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i)
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
                 snapshot.views[i].forward_u, 0.001F, "Crop follows corrected mapping after the next transition");
+        clear_stereo_calibration();
+        frame(); frame();
+        expect(gaze_diagnostics().alignment_source == 0U, "Ambiguous images require a live marker calibration");
+        expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr, calibration_session + 1),
+            "Foreign-session test calibration publishes");
+        frame(); frame();
+        expect(gaze_diagnostics().alignment_source == 0U, "A calibration from another XR session cannot route crop coordinates");
         clear_stereo_calibration();
     }
     unregister_stereo_view(951U); unregister_stereo_view(952U);
@@ -1162,6 +1177,7 @@ void test_gaze_copy_routes() {
 
 int run_d3d12_composite_tests();
 int run_eye_calibration_tests();
+int run_openxr_calibration_tests();
 int run_support_summary_tests();
 
 void test_openvr_geometry() {
@@ -1279,6 +1295,7 @@ int main(int argc, char** argv) {
     test_openxr_layer_is_retained_while_snapshot_export_is_cached();
     failures += run_support_summary_tests();
     failures += run_eye_calibration_tests();
+    failures += run_openxr_calibration_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

@@ -86,7 +86,6 @@
     <ClCompile Include="src\*.cpp" Exclude="src\addon.cpp;src\support_report.cpp" />
     <ClCompile Include="uevr\runtime.cpp" />
     <ClCompile Include="uevr\settings_io.cpp" />
-    <ClCompile Include="uevr\graphics_observer.cpp" />
     <ClCompile Include="shared\gaze_math.cpp" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\buffer.c" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\hook.c" />

@@ -322,8 +322,10 @@ bool calculate_coordinated_crop(
     bool packed_stereo_match{};
     bool copy_match{};
     bool projection_match{};
+    const bool openvr_snapshot = (snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U;
     const bool marker_match = eye_assignment.calibrated && snapshot.view_count == 2U &&
-        (snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U;
+        (openvr_snapshot ? eye_assignment.calibration_session == 0 :
+            eye_assignment.calibration_session != 0 && eye_assignment.calibration_session == snapshot.session_generation);
     if (marker_match) { matched_index = eye_assignment.eye_index; match_count = 1U; }
     std::array<GazeProjection, 2> xr_projections{};
     for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
@@ -532,10 +534,10 @@ bool calculate_coordinated_crop(
     // Alignment is independent of gaze availability. The packed bridge route
     // uses the existing eye roles (and manual inversion override).
     const bool usable = mapping_stable && snapshot.view_count == 2U &&
-            (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
+            ((snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U || marker_match) &&
             (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
-            (snapshot.status_flags & (CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG |
-                CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE)) == 0U &&
+            (snapshot.status_flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) == 0U &&
+            ((snapshot.status_flags & CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE) == 0U || marker_match) &&
             snapshot.predicted_display_time != 0 && snapshot.publication_qpc != 0U &&
             now >= snapshot.publication_qpc &&
             seconds_between(now, snapshot.publication_qpc) <= gaze_stale_seconds &&

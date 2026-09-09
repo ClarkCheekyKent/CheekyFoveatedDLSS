@@ -39,7 +39,9 @@
   <ItemGroup>
     <ClCompile Include="tests\gaze_tests.cpp" />
     <ClCompile Include="tests\eye_calibration_tests.cpp" />
+    <ClCompile Include="tests\openxr_calibration_tests.cpp" />
     <ClCompile Include="src\eye_calibration.cpp" />
+    <ClCompile Include="src\eye_calibration_d3d12.cpp" />
     <ClCompile Include="tests\d3d12_composite_tests.cpp" />
     <ClCompile Include="tests\motion_resample_tests.cpp" />
     <ClCompile Include="src\crop_motion.cpp" />
