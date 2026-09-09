@@ -58,6 +58,14 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
         frame(true);
     const auto warm = eye_calibration_stats();
     if (obscure || duplicate_eye) {
+        require(warm.rejected > 0 && warm.rejected + warm.valid == warm.completed,
+                "Rejected captures must be accounted for");
+        require(warm.rejection_counts[duplicate_eye ? 2 : 7] > 0,
+                "Diagnostics must distinguish duplicate eyes from unreadable markers");
+        const auto json = eye_calibration_json();
+        require(json.find("\"rejection_counts\":{") != std::string::npos &&
+                    json.find("\"scores\":[") != std::string::npos,
+                "Support diagnostics must include rejection evidence");
         require(warm.completed > 0 && warm.valid == 0 && warm.applied == 0 &&
                     !stereo_eye_assignment(101).calibrated,
                 "Occluded or duplicate-eye submissions must never publish a mapping");
@@ -148,6 +156,13 @@ void run_calibration_policy() {
             "One handle cannot own both eyes");
     require(!publish_stereo_calibration(8001, 8002, a, b, 12, GetTickCount64() - 1100),
             "Stale readback must be rejected");
+    Sleep(1100);
+    require(stereo_eye_assignment(8001).calibrated && stereo_eye_assignment(8001).eye_index == 1 &&
+                settings_for_view(settings, 8001).x_offset < 0,
+            "Missing fresh markers must not resurrect the contradictory fallback eye role");
+    require(publish_stereo_calibration(8001, 8002, a, b, 12, GetTickCount64(), &corrected) && corrected &&
+                stereo_eye_assignment(8001).eye_index == 0,
+            "Fresh marker evidence must replace the retained identity");
     unregister_stereo_view(8001);
     register_stereo_view(8001);
     require(!stereo_eye_assignment(8002).calibrated, "Releasing a member must invalidate the pair");

@@ -88,10 +88,12 @@ EyeRole eye_roles[2]{};
 std::uint64_t stereo_evaluation_sequence{};
 std::uint64_t registration_generation{};
 struct Calibration {
-    std::uint64_t left{}, right{}, sequence{}, expires_ms{}, session_generation{};
+    std::uint64_t left{}, right{}, sequence{}, session_generation{};
 } calibration;
 bool calibration_live() {
-    return calibration.left && calibration.right && GetTickCount64() <= calibration.expires_ms;
+    // Verified identity survives missing markers. View destruction, session
+    // changes and explicit disable clear it; fresh evidence may replace it.
+    return calibration.left && calibration.right;
 }
 StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
@@ -440,7 +442,7 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     if (corrected) {
         *corrected = (previous_left >= 0 && previous_left != 0) || (previous_right >= 0 && previous_right != 1);
     }
-    calibration = {left, right, sequence, captured_ms + lifetime_ms, session_generation};
+    calibration = {left, right, sequence, session_generation};
     return true;
 }
 void clear_stereo_calibration() noexcept {

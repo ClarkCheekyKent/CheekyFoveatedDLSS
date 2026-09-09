@@ -52,6 +52,14 @@ and patch-copy commands, not the whole frame. GPU/latency averages use the lates
 ReShade's support ZIP includes calibration in `diagnostics.txt`; UEVR includes
 `eye_calibration` in `diagnostics.json`. Both report marker-based crop routing.
 Additional allocation, mismatch and maximum-cost counters remain in reports.
+Reports also include rejected-capture counts by check: capture/readback errors,
+evaluation count, eye submissions, submission results, incomplete patches,
+source marker verification, dimensions, and submitted marker recognition.
+Checks can overlap on one capture. `last_rejection` contains the newest rejected
+sequence, reasons, evaluation/submission counts and eight scores (source A
+before/after, source B before/after, then A/B in each submitted eye).
+`publication_rejected` counts valid captures that could not be applied, such as
+stale/out-of-order results, changed handle lifetimes or disabled capture epochs.
 Calibration does not automatically write images, ZIPs or logs.
 
 ## Markers and asynchronous readback
@@ -104,8 +112,10 @@ copies restore `PIXEL_SHADER_RESOURCE`, following their respective contracts:
 [OpenVR D3D12 submission](https://github.com/ValveSoftware/openvr/wiki/DirectX12).
 
 The settings layer accepts only newer results for two still-live DLSS handle
-generations. Results older than one second are rejected and mappings expire one
-second after their last accepted capture. Disabling calibration invalidates
+generations. Incoming results older than one second are rejected, but an accepted
+mapping remains authoritative through missing or invalid marker captures. It is
+replaced by fresh valid evidence or cleared by view/session destruction, backend
+or session changes, or disabling calibration. Disabling calibration invalidates
 pending results. Eye changes reset the crop's temporal filter. Asynchronous
 readback adds several frames of latency; same-frame correction is not promised.
 

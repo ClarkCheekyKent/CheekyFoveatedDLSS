@@ -91,6 +91,23 @@ State& state() {
     return *s;
 }
 std::atomic<bool> enabled{}, pending{};
+constexpr const char* rejection_names[] = {
+    "capture_or_readback", "evaluation_count", "eye_submissions", "submission_result",
+    "patches_incomplete", "source_marker", "dimensions", "submitted_markers"
+};
+void record_rejection(State& s, const Frame& f, unsigned mask) {
+    ++s.stats.rejected;
+    for (unsigned i = 0; i < s.stats.rejection_counts.size(); ++i)
+        if (mask & (1U << i)) ++s.stats.rejection_counts[i];
+    // GPU completions need not arrive in sequence order.
+    if (f.sequence < s.stats.last_rejected_sequence) return;
+    s.stats.last_rejected_sequence = f.sequence;
+    s.stats.last_rejection_mask = mask;
+    s.stats.last_evaluations = f.evaluations;
+    s.stats.last_submits = f.submits;
+    for (unsigned i = 0; i < f.patches.size(); ++i)
+        s.stats.last_rejected_scores[i] = f.patches[i].score;
+}
 double now_us() {
     static const double scale = [] {
         LARGE_INTEGER f;
@@ -188,8 +205,10 @@ void poll(State& s) {
         } else {
             if (!f.queries_started) {
                 f.busy = false;
-                if (f.sequence >= s.measurement_start)
+                if (f.sequence >= s.measurement_start) {
                     ++s.stats.completed;
+                    record_rejection(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
+                }
                 continue;
             }
             if (f.thread != GetCurrentThreadId())
@@ -199,8 +218,10 @@ void poll(State& s) {
                 continue;
             if (FAILED(hr)) {
                 f.busy = false;
-                if (f.sequence >= s.measurement_start)
+                if (f.sequence >= s.measurement_start) {
                     ++s.stats.completed;
+                    record_rejection(s, f, 1U);
+                }
                 continue;
             }
             if (f.sequence < s.measurement_start) {
@@ -268,29 +289,32 @@ void poll(State& s) {
                 }
             }
         }
-        bool valid = !f.invalid && f.evaluations == 2 && f.submits == 2 && f.eye_submits[0] == 1 &&
-                     f.eye_submits[1] == 1 && f.result[0] == 0 && f.result[1] == 0;
+        unsigned rejection = f.invalid ? 1U : 0U;
+        if (f.evaluations != 2) rejection |= 2U;
+        if (f.submits != 2 || f.eye_submits[0] != 1 || f.eye_submits[1] != 1) rejection |= 4U;
+        if (f.result[0] != 0 || f.result[1] != 0) rejection |= 8U;
         for (const auto& p : f.patches)
-            valid = valid && p.used && p.ready;
+            if (!p.used || !p.ready) rejection |= 16U;
         for (unsigned c = 0; c < 2; ++c) {
-            valid = valid && f.patches[c * 2 + 1].score >= 0.8F &&
-                    f.patches[c * 2 + 1].score - f.patches[c * 2].score >= 0.3F;
+            if (!(f.patches[c * 2 + 1].score >= 0.8F &&
+                    f.patches[c * 2 + 1].score - f.patches[c * 2].score >= 0.3F)) rejection |= 32U;
             for (unsigned eye = 0; eye < 2; ++eye) {
                 const auto& p = f.patches[4 + eye * 2 + c];
-                valid =
-                    valid && p.reference_width == f.views[c].width && p.reference_height == f.views[c].height;
+                if (p.reference_width != f.views[c].width || p.reference_height != f.views[c].height)
+                    rejection |= 64U;
             }
         }
         const auto left_slot = f.physical_eyes[0] == 0 ? 0U : 1U;
         const auto right_slot = 1U - left_slot;
-        valid = valid && f.physical_eyes[0] < 2 && f.physical_eyes[1] < 2 &&
-                f.physical_eyes[0] != f.physical_eyes[1];
+        if (f.physical_eyes[0] >= 2 || f.physical_eyes[1] >= 2 ||
+                f.physical_eyes[0] == f.physical_eyes[1]) rejection |= 4U;
         const int left =
             calibration_classify(f.patches[4 + left_slot * 2].score, f.patches[5 + left_slot * 2].score);
         const int right =
             calibration_classify(f.patches[4 + right_slot * 2].score, f.patches[5 + right_slot * 2].score);
-        valid = valid && left >= 0 && right >= 0 && left != right;
-        if (valid) {
+        if (left < 0 || right < 0 || left == right) rejection |= 128U;
+        if (rejection) record_rejection(s, f, rejection);
+        if (!rejection) {
             ++s.stats.valid;
             if (f.sequence > s.last_valid_sequence) {
                 s.stats.left_view = f.views[left].id;
@@ -310,8 +334,8 @@ void poll(State& s) {
                     ++s.stats.applied;
                     if (corrected)
                         ++s.stats.corrections;
-                }
-            }
+                } else ++s.stats.publication_rejected;
+            } else ++s.stats.publication_rejected;
         }
         ++s.stats.completed;
         s.latency.add(double(s.sequence - f.sequence));
@@ -831,6 +855,30 @@ std::string eye_calibration_json() {
         << ",\"max_cpu_call_us\":" << s.max_cpu_call_us << ",\"gpu_us\":" << s.gpu_us
         << ",\"max_gpu_us\":" << s.max_gpu_us << ",\"latency_frames\":"
         << s.latency_frames
+        << ",\"rejected\":" << s.rejected
+        << ",\"publication_rejected\":" << s.publication_rejected
+        << ",\"rejection_counts\":{";
+    for (unsigned i = 0; i < s.rejection_counts.size(); ++i) {
+        if (i) out << ',';
+        out << '\"' << rejection_names[i] << "\":" << s.rejection_counts[i];
+    }
+    out << "},\"last_rejection\":{\"sequence\":" << s.last_rejected_sequence
+        << ",\"mask\":" << s.last_rejection_mask
+        << ",\"evaluations\":" << s.last_evaluations
+        << ",\"submits\":" << s.last_submits << ",\"reasons\":[";
+    bool separator = false;
+    for (unsigned i = 0; i < s.rejection_counts.size(); ++i) {
+        if (!(s.last_rejection_mask & (1U << i))) continue;
+        if (separator) out << ',';
+        out << '\"' << rejection_names[i] << '\"';
+        separator = true;
+    }
+    out << "],\"scores\":[";
+    for (unsigned i = 0; i < s.last_rejected_scores.size(); ++i) {
+        if (i) out << ',';
+        out << s.last_rejected_scores[i];
+    }
+    out << "]}"
         // View identities are pointers; strings preserve all bits through Lua.
         << ",\"left_view\":\"" << s.left_view << "\",\"right_view\":\"" << s.right_view << "\"}";
     return out.str();

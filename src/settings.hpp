@@ -99,7 +99,8 @@ struct StereoEyeAssignment {
 };
 
 // A registration generation distinguishes a released/recreated NGX handle at
-// the same address. Calibrations are atomic pairs, ordered and time-limited.
+// the same address. Calibrations are atomic, ordered pairs retained until
+// invalidation. Incoming readbacks must still be recent.
 std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept;
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,

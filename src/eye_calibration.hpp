@@ -3,6 +3,7 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <string>
+#include <array>
 namespace cheeky::foveated_dlss {
 enum class EyeCalibrationBackend { none, openvr, openxr };
 // Asynchronous D3D11/D3D12 calibration for OpenVR and OpenXR. D3D11 work
@@ -21,6 +22,11 @@ struct EyeCalibrationStats {
     bool correction_active{};
     bool openvr_active{}, unsupported_submission{};
     std::uint64_t unsupported_submissions{};
+    // A rejected capture can fail multiple checks; counters overlap.
+    std::array<std::uint64_t, 8> rejection_counts{};
+    std::uint64_t rejected{}, publication_rejected{}, last_rejected_sequence{};
+    unsigned last_rejection_mask{}, last_evaluations{}, last_submits{};
+    std::array<float, 8> last_rejected_scores{};
 };
 const char* eye_calibration_status(const EyeCalibrationStats&) noexcept;
 const char* eye_calibration_backend_name(EyeCalibrationBackend) noexcept;
