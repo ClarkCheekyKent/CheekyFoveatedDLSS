@@ -22,11 +22,11 @@ Close the game and choose **one** integration. Do not load the Cheeky Reshade ad
 
 ### UEVR plugin
 
-1. Use UEVR with plugin API **2.39.0 or compatible newer 2.x**. Remove Cheeky's ReShade add-on from the game's add-on search locations if previously installed.
+1. Use UEVR with plugin API **2.39.0 or compatible newer 2.x**. Remove ReShade and the Cheeky ReShade add-on from the game if previously installed.
 2. Extract the UEVR ZIP into the game's **UEVR configuration directory**, normally `%APPDATA%\UnrealVRMod\<game-executable-name>`. Keep the `plugins/` and `scripts/` folders intact. Do not extract it beside the game executable. [Folder layout](uevr/README.md#installation)
 3. Complete the **required VR setup below**, start the game and inject UEVR. Open the controls under **UEVR → LuaLoader → ScriptUI → Cheeky Foveated DLSS**. You may need to enable 'Show Advanced Options' in top left to see these menus.
 
-ReShade is not required for the UEVR plugin.
+Remove ReShade from the game when using the UEVR plugin.
 
 ![UEVR Menu](assets/UEVR_Menu.png)
 

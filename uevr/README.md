@@ -1,11 +1,11 @@
 # Cheeky Foveated DLSS for UEVR
 
-Runs Cheeky's DLSS processing with controls in UEVR. ReShade is not required.
+Runs Cheeky's DLSS processing with controls in UEVR. Remove ReShade from the game before using the plugin.
 
 ## Installation
 
 1. Close the game. Use UEVR with plugin API **2.39.0 or compatible newer 2.x**.
-2. Remove `CheekyFoveatedDLSS.addon64` from the game's ReShade search locations if present. Use only one Cheeky integration per game.
+2. Uninstall ReShade from the game using the ReShade installer, and remove `CheekyFoveatedDLSS.addon64` if present.
 3. Open the game's configuration directory from UEVR—normally `%APPDATA%\UnrealVRMod\<game-executable-name>`—and extract the UEVR ZIP there, preserving this structure:
 
 ```text

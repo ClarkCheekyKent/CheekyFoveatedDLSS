@@ -18,7 +18,6 @@ $files = [ordered]@{
     "plugins\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll" = Join-Path $binaryRoot "CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll"
     "scripts\cheeky_foveated_dlss.lua" = Join-Path $projectRoot "uevr\scripts\cheeky_foveated_dlss.lua"
     "Cheeky-UEVR-README.md" = Join-Path $projectRoot "uevr\README.md"
-    "EYE-CALIBRATION.md" = Join-Path $projectRoot "EYE-CALIBRATION.md"
     "licenses\Cheeky-GPLv3.txt" = Join-Path $projectRoot "LICENSE"
     "licenses\MinHook.txt" = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     "licenses\OpenVR.txt" = Join-Path $projectRoot "third_party\openvr\LICENSE"
@@ -30,6 +29,11 @@ foreach ($entry in $files.GetEnumerator()) {
     $destination = Join-Path $stage $entry.Key
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
     Copy-Item -LiteralPath $entry.Value -Destination $destination
+    if ($entry.Key -eq "Cheeky-UEVR-README.md") {
+        $readme = [IO.File]::ReadAllText($destination)
+        $readme = $readme.Replace('[Settings reference](../USAGE.md) · [Eye calibration](../EYE-CALIBRATION.md)', '')
+        [IO.File]::WriteAllText($destination, $readme)
+    }
     $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
     $manifest += "$hash  $($entry.Key.Replace('\', '/'))"
 }
