@@ -1,4 +1,4 @@
--- Cheeky Foveated DLSS UEVR preview. The C++ runtime owns validation and all GPU work.
+-- Cheeky Foveated DLSS UEVR plugin. The C++ runtime owns validation and all GPU work.
 local protocol = 1
 local command_event = "cheeky.foveated_dlss.command.v1"
 local snapshot_event = "cheeky.foveated_dlss.snapshot.v1"
@@ -296,7 +296,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
 
     if imgui.tree_node("DLSS-NR (experimental)") then
         if status.renderer == 0 then
-            text("DLSS-NR / DX12 transport is unavailable on the DX11 path in this preview.")
+            text("DLSS-NR / DX12 transport is unavailable on the DX11 path in the UEVR plugin.")
         else
             check("Enable DLSS-NR", "NrEnabled")
             if draft.NrEnabled then

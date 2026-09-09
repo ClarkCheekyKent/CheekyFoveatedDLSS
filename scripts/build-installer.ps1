@@ -65,9 +65,9 @@ if ($manifest.api_layer.name -ne 'XR_APILAYER_CHEEKY_foveated_dlss' -or
     throw 'The manifest must identify the Cheeky layer and reference the adjacent CheekyOpenXRLayer.dll.'
 }
 
-& $IsccPath "/DAppVersion=$Version" "/DSourceDir=$ArtifactsDirectory" (Join-Path $projectRoot 'installer\CheekyEyeTrackingSetup.iss')
+& $IsccPath "/DAppVersion=$Version" "/DSourceDir=$ArtifactsDirectory" (Join-Path $projectRoot 'installer\CheekyOpenXRSetup.iss')
 if ($LASTEXITCODE -ne 0) {
     throw "Installer compilation failed with exit code $LASTEXITCODE."
 }
 Write-Host 'Built standalone OpenXR installer (no ReShade add-on included):'
-Write-Host (Join-Path $projectRoot 'bin\installer\CheekyEyeTrackingSetup.exe')
+Write-Host (Join-Path $projectRoot 'bin\installer\CheekyOpenXRSetup.exe')

@@ -61,7 +61,7 @@ std::string snapshot_locked(State& s) {
     const auto attach = late_attach_status();
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
-    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-support-preview\",\"request\":" << s.request
+    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr\",\"request\":" << s.request
         << ",\"revision\":" << s.revision << ",\"saved_revision\":" << s.saved_revision
         << ",\"applied_request\":" << s.applied_request
         << ",\"attached\":" << adapter_attached.load() << ",\"ready\":" << (s.started && s.graphics_ready)
@@ -266,7 +266,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
             HMODULE resident{};
             if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                 reinterpret_cast<LPCWSTR>(&CheekyUEVR_Start), &resident)) return false;
-            log_info("Cheeky UEVR preview " CHEEKY_VERSION " initializing; runtime remains resident until game exit");
+            log_info("Cheeky UEVR " CHEEKY_VERSION " initializing; runtime remains resident until game exit");
             if (GetModuleHandleW(L"CheekyFoveatedDLSS.addon64") || !(s.owner = claim_processing_owner())) {
                 s.message = "Another Cheeky integration is loaded. Remove its add-on and restart the game.";
                 s.failed = true; log_error(s.message.c_str()); return false;
@@ -280,7 +280,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
                 }
             }
             // DX11 transport requires observing the private transport queue,
-            // which is not exposed by UEVR. Keep this preview on DX11 direct.
+            // which is not exposed by UEVR. Use DX11 direct.
             if (input->renderer == 0) settings.d3d11_use_d3d12_transport = false;
             update_settings(settings); s.revision = 1;
             s.save_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -387,7 +387,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Command(std::uint64_t attachmen
             if (!count) return false;
         } else { s.message = "Unknown command"; return false; }
         if (s.renderer == 0 && settings.d3d11_use_d3d12_transport) {
-            s.message = "DX11-to-DX12 transport is unavailable in this UEVR preview; use DX11 direct or a DX12 game"; return false;
+            s.message = "DX11-to-DX12 transport is unavailable in the UEVR plugin; use DX11 direct or a DX12 game"; return false;
         }
         update_settings(settings); ++s.revision; s.applied_request = id;
         s.message = "Settings applied"; request_save(s); return true;

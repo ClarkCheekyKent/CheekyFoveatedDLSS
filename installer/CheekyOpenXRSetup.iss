@@ -8,7 +8,7 @@
 
 [Setup]
 AppId={{C12B3398-1446-49AE-B574-407638F641CA}
-AppName=Cheeky OpenXR Eye Tracking
+AppName=Cheeky OpenXR Support
 AppVersion={#AppVersion}
 AppPublisher=Cheeky Foveated DLSS
 DefaultDirName={commonpf}\CheekyFoveatedDLSS\OpenXR
@@ -19,15 +19,16 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
-UninstallDisplayName=Cheeky OpenXR Eye Tracking
+UninstallDisplayName=Cheeky OpenXR Support
 OutputDir=..\bin\installer
-OutputBaseFilename=CheekyEyeTrackingSetup
+OutputBaseFilename=CheekyOpenXRSetup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 LicenseFile=..\LICENSE
 CloseApplications=yes
 RestartApplications=no
+; Keep the original identity, install path and mutex for upgrades from the old name.
 SetupMutex=CheekyOpenXREyeTrackingSetup
 
 [Files]
@@ -41,5 +42,5 @@ Source: "..\third_party\openxr\LICENSE.txt"; DestDir: "{app}"; DestName: "OpenXR
 Root: HKLM64; Subkey: "SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"; ValueType: dword; ValueName: "{app}\XR_APILAYER_CHEEKY_foveated_dlss.json"; ValueData: "0"; Flags: uninsdeletevalue
 
 [Messages]
-WelcomeLabel2=This installs shared OpenXR eye-tracking support for Cheeky Foveated DLSS.%n%nClose your OpenXR games before installing or updating.%n%nFor each game, install ReShade with full add-on support and copy CheekyFoveatedDLSS.addon64 into the game folder separately. This installer does not install ReShade or the add-on.
-FinishedLabel=OpenXR eye-tracking support has been installed.%n%nStart or restart your game, open the Cheeky Foveated DLSS add-on in ReShade, and select Foveation center > Runtime gaze (OpenXR / OpenVR).%n%nEye tracking requires a supported OpenXR game and runtime. This installation is shared by all your games.
+WelcomeLabel2=This installs shared OpenXR support for Cheeky Foveated DLSS: automatic stereo alignment, eye calibration and eye tracking.%n%nClose your OpenXR games before installing or updating.%n%nInstall the Cheeky ReShade add-on or UEVR plugin separately for each game. This installer installs only the shared OpenXR layer.
+FinishedLabel=Cheeky OpenXR support has been installed.%n%nStart or restart your game with the Cheeky ReShade add-on or UEVR plugin. Open Diagnostics > Eye calibration to check automatic stereo calibration.%n%nStereo alignment and calibration do not require an eye tracker. Eye tracking requires a compatible headset and OpenXR runtime. This installation is shared by all your OpenXR games.

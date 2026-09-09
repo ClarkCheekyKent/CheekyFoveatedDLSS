@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "preview"
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build"
 )
 
 Set-StrictMode -Version Latest
@@ -18,7 +18,6 @@ $files = [ordered]@{
     "plugins\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll" = Join-Path $binaryRoot "CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll"
     "scripts\cheeky_foveated_dlss.lua" = Join-Path $projectRoot "uevr\scripts\cheeky_foveated_dlss.lua"
     "Cheeky-UEVR-README.md" = Join-Path $projectRoot "uevr\README.md"
-    "Cheeky-UEVR-VALIDATION.md" = Join-Path $projectRoot "uevr\VALIDATION.md"
     "EYE-CALIBRATION.md" = Join-Path $projectRoot "EYE-CALIBRATION.md"
     "licenses\Cheeky-GPLv3.txt" = Join-Path $projectRoot "LICENSE"
     "licenses\MinHook.txt" = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
@@ -38,7 +37,7 @@ $manifest | Set-Content -LiteralPath (Join-Path $stage "SHA256SUMS.txt") -Encodi
 $head = & git -C $projectRoot rev-parse HEAD
 $dirty = [bool](& git -C $projectRoot status --porcelain)
 @("Cheeky $version UEVR $Label ($Configuration)", "Source commit: $head", "Working tree modified: $dirty",
-  "UEVR API: 2.39.0", "Actual UEVR/game/headset validation: pending", "No NVIDIA binaries or OpenXR installer included.") |
+  "UEVR API: 2.39.0", "No NVIDIA binaries or OpenXR installer included.") |
     Set-Content -LiteralPath (Join-Path $stage "BUILD.txt") -Encoding utf8
 $archive = Join-Path $binaryRoot "CheekyFoveatedDLSS-$version-UEVR-$Label.zip"
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -Force

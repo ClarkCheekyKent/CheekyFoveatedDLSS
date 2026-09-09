@@ -117,7 +117,7 @@ extern "C" __declspec(dllexport) bool uevr_plugin_initialize(const UEVR_PluginIn
             runtime_detach(attachment); return false;
         }
         initialized = true;
-        if (api->functions->log_info) api->functions->log_info("Cheeky UEVR plugin initialized. Controls: LuaLoader > Cheeky Foveated DLSS. Game testing pending.");
+        if (api->functions->log_info) api->functions->log_info("Cheeky UEVR plugin initialized. Controls: LuaLoader > Cheeky Foveated DLSS.");
         return true;
     } catch (...) { if (runtime_detach) runtime_detach(attachment); return false; }
 }

@@ -15,7 +15,7 @@ foveation switch. It does not rewrite saved stereo or gaze preferences.
 
 The same core and diagnostics ship in ReShade and UEVR. Native OpenXR needs the
 **matching updated Cheeky OpenXR layer** installed using
-`CheekyEyeTrackingSetup.exe`, in addition to the new add-on or plugin/runtime.
+`CheekyOpenXRSetup.exe`, in addition to the new add-on or plugin/runtime.
 Close the game before installing and restart it afterward. Copying the layer DLL
 beside the game does not register an OpenXR API layer.
 
@@ -125,6 +125,4 @@ Gaze tests cover calibrated crop routing and foreign-session rejection. UEVR
 tests cover host ABI, diagnostics, reports, interception and lifecycle. The Lua
 menu tests preserve slider apply-on-release behavior in LuaJIT and Lua 5.4.
 
-The earlier D3D11 OpenVR build was confirmed in Assetto Corsa Competizione by the
-user. The added native OpenXR and D3D12 paths still need real game/headset testing;
-automated tests do not establish compatibility or performance in every game.
+Automated tests do not establish compatibility or performance in every game. Validate each integration and graphics/runtime combination in actual game/headset sessions.
