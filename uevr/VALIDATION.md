@@ -1,6 +1,6 @@
 # UEVR preview validation — 2026-09-08
 
-GPU timing update following the UI parity package (v0.2.4). The user
+UI ordering and support-report update following the GPU timing package (v0.2.4). The user
 reports the preceding UEVR plugin working in Hogwarts Legacy. During this update,
 no game was launched and no files were installed into a game or UEVR profile.
 
@@ -34,6 +34,11 @@ no game was launched and no files were installed into a game or UEVR profile.
 | Cached Streamline setter intercepted without a fresh game lookup; game output dimensions preserved | Pass |
 | Unknown options version and a different viewport use native fallback; DX11 never enters DX12 Streamline compositor | Pass |
 | ZIP payload names and SHA-256 readback | Pass |
+| Support ZIP created asynchronously by the real runtime, parsed and CRC-checked with Python | Pass; includes diagnostics, settings, summary and available logs |
+| Stereo/gaze precedes SR/NR, frame comparison is nested under SR, support button actions and busy state | Pass with mocked Lua host |
+
+Browser/Explorer launches are only triggered by the user's report/open buttons;
+the automated host tests use the ZIP-only command and do not open applications.
 
 Actual UEVR injection, DLSS-NR evaluation, the updated headset menu/controller
 input, both-eye output and performance of **this update** remain untested by the

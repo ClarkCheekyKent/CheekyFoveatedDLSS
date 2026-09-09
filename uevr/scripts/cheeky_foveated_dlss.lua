@@ -225,29 +225,6 @@ uevr.sdk.callbacks.on_draw_ui(function()
     imgui.begin_disabled(pending_apply ~= nil and pending_apply.reset_group ~= nil)
     apply_buttons("top")
 
-    if imgui.tree_node("DLSS-SR") then
-        check("Enable foveated DLSS-SR", "Enabled")
-        if draft.Enabled then
-            section("Center")
-            combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
-            slider("Center supersampling", "CenterSupersampling", 1, 2)
-            slider("Fovea width", "Width", 0.2, 1)
-            slider("Fovea height", "Height", 0.2, 1)
-            slider("Roundness", "Roundness", 0, 1)
-            slider("Transition width", "TransitionWidth", 0, 0.3)
-            check("Show red alignment border", "AlignmentBorder")
-            section("Periphery")
-            check("Peripheral DLAA", "PeripheralDlaa")
-            if draft.PeripheralDlaa then
-                combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"})
-                slider("Periphery scale", "PeripheralDlaaScale", 0.2, 1)
-            end
-        end
-        reset_group("Reset DLSS-SR defaults", "sr")
-        if imgui.tree_node("SR resolution and GPU timing") then sr_diagnostics(d); imgui.tree_pop() end
-        imgui.tree_pop()
-    end
-
     if imgui.tree_node("Stereo and gaze") then
         combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
         check("Automatic stereo alignment", "AutoStereoAlignment")
@@ -278,6 +255,42 @@ uevr.sdk.callbacks.on_draw_ui(function()
         end
         text("OpenXR alignment/gaze uses the matching Cheeky layer. Fixed alignment needs no eye tracker.")
         reset_group("Reset Stereo / gaze defaults", "gaze")
+        imgui.tree_pop()
+    end
+
+    if imgui.tree_node("DLSS-SR") then
+        check("Enable foveated DLSS-SR", "Enabled")
+        if draft.Enabled then
+            section("Center")
+            combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
+            slider("Center supersampling", "CenterSupersampling", 1, 2)
+            slider("Fovea width", "Width", 0.2, 1)
+            slider("Fovea height", "Height", 0.2, 1)
+            slider("Roundness", "Roundness", 0, 1)
+            slider("Transition width", "TransitionWidth", 0, 0.3)
+            check("Show red alignment border", "AlignmentBorder")
+            section("Periphery")
+            check("Peripheral DLAA", "PeripheralDlaa")
+            if draft.PeripheralDlaa then
+                combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"})
+                slider("Periphery scale", "PeripheralDlaaScale", 0.2, 1)
+            end
+        end
+        reset_group("Reset DLSS-SR defaults", "sr")
+        if imgui.tree_node("Frame rate comparison") then
+            rows("fps", {{"Present cadence (250 ms avg)", fps(f.present_ms)},
+                {"SR enabled", fps(f.sr_enabled_ms)}, {"SR disabled", fps(f.sr_disabled_ms)},
+                {"Frame time savings", saving(f.sr_disabled_ms, f.sr_enabled_ms)}})
+            if (f.sr_enabled_ms or 0) > 0 and (f.sr_disabled_ms or 0) > 0 then
+                text(string.format("Change: %+.1f FPS (%+.1f%%)", 1000 / f.sr_enabled_ms - 1000 / f.sr_disabled_ms,
+                    100 * (f.sr_disabled_ms / f.sr_enabled_ms - 1)))
+            end
+            text("Measures UEVR present callbacks; headset display/reprojection FPS may differ.")
+            text("Toggle SR in the same scene. Samples settle for 1 s, then average over 250 ms.")
+            text("Comparisons retain the last sample of each mode; scene and NR changes also affect frame rate.")
+            imgui.tree_pop()
+        end
+        if imgui.tree_node("SR resolution and GPU timing") then sr_diagnostics(d); imgui.tree_pop() end
         imgui.tree_pop()
     end
 
@@ -329,19 +342,6 @@ uevr.sdk.callbacks.on_draw_ui(function()
     end
     apply_buttons("bottom")
 
-    if imgui.tree_node("Frame rate comparison") then
-        rows("fps", {{"Present cadence (250 ms avg)", fps(f.present_ms)},
-            {"SR enabled", fps(f.sr_enabled_ms)}, {"SR disabled", fps(f.sr_disabled_ms)},
-            {"Frame time savings", saving(f.sr_disabled_ms, f.sr_enabled_ms)}})
-        if (f.sr_enabled_ms or 0) > 0 and (f.sr_disabled_ms or 0) > 0 then
-            text(string.format("Change: %+.1f FPS (%+.1f%%)", 1000 / f.sr_enabled_ms - 1000 / f.sr_disabled_ms,
-                100 * (f.sr_disabled_ms / f.sr_enabled_ms - 1)))
-        end
-        text("Measures UEVR present callbacks; headset display/reprojection FPS may differ.")
-        text("Toggle SR in the same scene. Samples settle for 1 s, then average over 250 ms.")
-        text("Comparisons retain the last sample of each mode; scene and NR changes also affect frame rate.")
-        imgui.tree_pop()
-    end
     if imgui.tree_node("Diagnostics and support") then
         local a, o, g = status.late_attach or {}, status.observer or {}, status.gaze or {}
         rows("host", {{"Settings revision / saved", tostring(status.revision) .. " / " .. tostring(status.saved_revision)},
@@ -392,7 +392,21 @@ uevr.sdk.callbacks.on_draw_ui(function()
                 imgui.tree_pop()
             end
         end
-        if imgui.button("Write diagnostic report") then send("report") end
+        text("Report an issue creates a ZIP, opens GitHub and selects the ZIP in Explorer.")
+        text("Review before sharing; logs may contain personal paths. Attach the ZIP and submit yourself.")
+        local support = status.support or {}
+        imgui.begin_disabled(support.busy == true)
+        if imgui.button("Report an issue...") then send("report_issue") end
+        imgui.same_line()
+        if imgui.button("Create support ZIP only") then send("report") end
+        imgui.end_disabled()
+        if support.busy then text("Preparing support ZIP...") end
+        if support.zip and support.zip ~= "" then
+            text(support.zip)
+            if imgui.button("Show ZIP") then send("show_report") end
+            imgui.same_line()
+            if imgui.button("Open GitHub issue") then send("open_issue") end
+        end
         imgui.same_line()
         if imgui.button("Refresh status") then send("get") end
         text("Reports, INI and log are in this game's UEVR configuration folder.")

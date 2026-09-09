@@ -1,6 +1,9 @@
 #include "runtime_api.hpp"
 #include "settings_io.hpp"
 #include "frame_cadence.hpp"
+#include "support_bundle.hpp"
+#include <shellapi.h>
+#pragma comment(lib, "shell32.lib")
 #include "graphics_observer.hpp"
 #include "processing_owner.hpp"
 #include "runtime.hpp"
@@ -38,6 +41,10 @@ struct State {
     ULONGLONG next_timing_log{};
     std::string message{"Not initialized"};
     std::atomic<bool> save_requested{}, report_requested{};
+    std::atomic<bool> report_busy{}, report_browser{};
+    std::atomic<unsigned> report_open{};
+    std::filesystem::path report_zip;
+    std::string report_summary;
 };
 State& state() { static auto* instance = new State; return *instance; }
 // DllMain detach uses only these atomics, never state() construction or a lock.
@@ -53,7 +60,7 @@ std::string snapshot_locked(State& s) {
     const auto attach = late_attach_status();
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
-    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-gpu-timing-preview\",\"request\":" << s.request
+    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-support-preview\",\"request\":" << s.request
         << ",\"revision\":" << s.revision << ",\"saved_revision\":" << s.saved_revision
         << ",\"applied_request\":" << s.applied_request
         << ",\"attached\":" << adapter_attached.load() << ",\"ready\":" << (s.started && s.graphics_ready)
@@ -61,6 +68,7 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"support\":{\"busy\":" << s.report_busy.load() << ",\"zip\":\"" << json_escape(path_utf8(s.report_zip)) << "\"}"
         << ",\"gpu_timing\":{\"recorded\":" << gpu.recorded << ",\"submitted\":" << gpu.submitted
         << ",\"completed\":" << gpu.completed << ",\"published\":" << gpu.published
         << ",\"discarded\":" << gpu.discarded << ",\"failures\":" << gpu.failures
@@ -151,14 +159,51 @@ DWORD WINAPI persistence_worker(void*) {
                 else { s.message = error; log_error(error.c_str()); }
             }
             if (s.report_requested.exchange(false)) {
-                std::string text;
-                { std::lock_guard lock(s.mutex); text = snapshot_locked(s); }
+                std::string text, settings, summary;
+                { std::lock_guard lock(s.mutex);
+                    text = snapshot_locked(s); settings = serialize_settings(configured_settings());
+                    const auto d = diagnostic_snapshot(s.renderer == 1 ? DiagnosticApi::d3d12 : DiagnosticApi::d3d11);
+                    std::ostringstream details;
+                    std::array<wchar_t, 32768> executable{};
+                    const auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+                    const auto game = length && length < executable.size() ? path_utf8(std::filesystem::path(executable.data()).filename()) : "Unknown";
+                    details << "Cheeky " CHEEKY_VERSION " UEVR plugin\nGame: " << game << "\nRenderer: " << (s.renderer == 1 ? "DX12" : "DX11")
+                        << "\nDLSS-SR: " << diagnostic_state_name(d.state) << "\nDLSS-NR: " << dlss_nr_state_name(dlss_nr_snapshot().state)
+                        << "\nGPU ms (native / center / peripheral): " << d.native_dlss_gpu_ms << " / " << d.foveated_dlss_gpu_ms << " / " << d.peripheral_dlaa_gpu_ms
+                        << "\n\nSettings:\n" << settings << "\nFull diagnostic snapshot and logs are in the attached ZIP.";
+                    summary = details.str();
+                }
                 std::ofstream report(s.directory / L"CheekyFoveatedDLSS-diagnostics.json", std::ios::binary);
-                report << text; report.flush();
-                std::lock_guard lock(s.mutex);
-                s.message = report ? "Diagnostics saved beside CheekyFoveatedDLSS.ini" : "Could not write diagnostics";
+                report << text; report.close();
+                if (!report) throw std::runtime_error("Could not write diagnostics JSON");
+                const auto zip = create_uevr_support_bundle(s.directory, text, settings, summary);
+                { std::lock_guard lock(s.mutex);
+                    s.report_zip = zip; s.report_summary = summary;
+                    s.message = "Support ZIP ready. Review the files, describe the problem on GitHub and attach the ZIP.";
+                }
+                if (s.report_browser.exchange(false)) s.report_open.fetch_or(3U);
+                s.report_busy = false;
             }
-        } catch (...) { log_error("UEVR persistence/report worker failed"); }
+            if (const auto action = s.report_open.exchange(0U)) {
+                std::filesystem::path zip; std::string summary;
+                { std::lock_guard lock(s.mutex); zip = s.report_zip; summary = s.report_summary; }
+                if (!zip.empty()) {
+                    bool ok = true;
+                    if (action & 2U) {
+                        const auto url = support_issue_url(zip, summary);
+                        ok = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+                    }
+                    if (action & 1U) {
+                        const auto args = L"/select,\"" + zip.wstring() + L"\"";
+                        ok = (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL)) > 32) && ok;
+                    }
+                    if (!ok) { std::lock_guard lock(s.mutex); s.message = "ZIP created, but browser or Explorer could not open. Use the displayed ZIP path."; }
+                }
+            }
+        } catch (const std::exception& error) {
+            s.report_busy = false; s.report_browser = false;
+            std::lock_guard lock(s.mutex); s.message = std::string("Save/report failed: ") + error.what(); log_error(s.message.c_str());
+        } catch (...) { s.report_busy = false; s.report_browser = false; log_error("UEVR persistence/report worker failed"); }
     }
 }
 void request_save(State& s) { s.save_requested = true; SetEvent(s.save_event); }
@@ -297,7 +342,15 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Command(std::uint64_t attachmen
         if (parsed.ec != std::errc{} || parsed.ptr != request.data()+request.size()) return false;
         s.request = id;
         if (action == "get") return true;
-        if (action == "report") { s.report_requested = true; SetEvent(s.save_event); s.message = "Preparing diagnostics"; return true; }
+        if (action == "report" || action == "report_issue") {
+            if (s.report_busy.exchange(true)) return true;
+            s.report_browser = action == "report_issue"; s.report_requested = true;
+            SetEvent(s.save_event); s.message = "Preparing support ZIP"; return true;
+        }
+        if (action == "show_report" || action == "open_issue") {
+            if (s.report_zip.empty()) { s.message = "Create a support ZIP first"; return false; }
+            s.report_open.fetch_or(action == "show_report" ? 1U : 2U); SetEvent(s.save_event); return true;
+        }
         if (action == "save") { request_save(s); return true; }
         if (action == "reset_nr") { reset_dlss_nr(); return true; }
         auto settings = configured_settings();

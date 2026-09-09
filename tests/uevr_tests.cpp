@@ -4,6 +4,7 @@
 #include "late_attach_tests.hpp"
 #include "runtime_search.hpp"
 #include "frame_cadence.hpp"
+#include "support_bundle.hpp"
 #include <uevr/API.h>
 #include <d3d12.h>
 #include <d3d11.h>
@@ -96,6 +97,10 @@ int main(int argc, char** argv) {
         const auto root = bin / "uevr-test-data" / std::to_wstring(GetCurrentProcessId());
         std::filesystem::create_directories(root); directory = root.wstring();
         settings_tests(root);
+        const auto issue = support_issue_url(L"report #&.zip", "state & details\n");
+        require(issue.starts_with(L"https://github.com/ClarkCheekyKent/CheekyFoveatedDLSS/issues/new?") &&
+            issue.find(L"report=report%20%23%26.zip") != issue.npos && issue.find(L"diagnostics=state%20%26%20details%0A") != issue.npos,
+            "Support issue link encodes user-visible summary and ZIP filename");
         {
             const auto primary = root / "runtime", executable = root / "game";
             std::filesystem::create_directories(primary); std::filesystem::create_directories(executable);
@@ -254,6 +259,12 @@ int main(int argc, char** argv) {
         command("1\n5\nreport");
         for (int i=0;i<500 && !std::filesystem::exists(root/"CheekyFoveatedDLSS-diagnostics.json");++i) Sleep(10);
         require(std::filesystem::exists(root/"CheekyFoveatedDLSS-diagnostics.json"),"Asynchronous report");
+        for (int i=0;i<500 && snapshot(get).find("\"busy\":true")!=std::string::npos;++i) Sleep(10);
+        require(snapshot(get).find("\"busy\":false")!=std::string::npos,"Support ZIP worker completed");
+        bool zip_found{};
+        if (std::filesystem::exists(root/"support")) for (const auto& entry : std::filesystem::directory_iterator(root/"support"))
+            if (entry.path().extension()==".zip" && entry.file_size()>0) zip_found=true;
+        require(zip_found,"Headless report creates a support ZIP without opening applications");
         for (int i=0;i<500 && field(snapshot(get),"saved_revision")<field(snapshot(get),"revision");++i) Sleep(10);
         Settings saved; std::string error; require(read_settings_file(root/"CheekyFoveatedDLSS.ini",saved,error),"Persisted runtime config");
         require(std::abs(saved.width-0.65f)<0.0001f && saved.enabled,"Persisted configured state");

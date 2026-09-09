@@ -7,6 +7,22 @@ in Hogwarts Legacy; this UI update still needs game/headset validation.
 
 ## UI parity update
 
+Stereo and gaze is the first settings section. Frame-rate comparison is inside
+DLSS-SR, alongside its resolution and GPU timings.
+
+**Report an issue...** now builds a support ZIP, opens a prefilled GitHub issue
+and selects the ZIP in Explorer. Add your description, drag the ZIP into the
+issue and submit it yourself. Nothing is uploaded or submitted automatically.
+The archive contains the current diagnostics JSON, configured settings, an
+issue summary, recent Cheeky/UEVR log tails and UEVR configuration when available.
+Each input log/config is capped at 2 MiB; missing files are listed in README.txt.
+ZIPs are saved under `support/` in the game's UEVR configuration folder, and
+their path is displayed in the menu. **Create support ZIP only** avoids opening
+applications; **Show ZIP** and **Open GitHub issue** let you reopen them later
+during the same runtime session. The original standalone diagnostics JSON is
+still written beside the INI. Review the bundle before sharing; logs can contain
+personal paths.
+
 The subsequent GPU-timing update fixes abandoned timestamp slots after an
 unsubmitted command list is reset, and matches forwarding graphics wrappers
 to submitted native lists using object private data. It retains fencing on the

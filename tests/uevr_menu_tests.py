@@ -9,13 +9,22 @@ import importlib
 import json
 from pathlib import Path
 import sys
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "build/test-python"))
 reports = list((ROOT / "bin/Release/uevr-test-data").glob("*/CheekyFoveatedDLSS-diagnostics.json"))
 if not reports:
     raise SystemExit("Run CheekyUEVRTests.exe first to produce a real runtime snapshot.")
-baseline = json.loads(max(reports, key=lambda p: p.stat().st_mtime).read_text())
+baseline_path = max(reports, key=lambda p: p.stat().st_mtime)
+baseline = json.loads(baseline_path.read_text())
+bundles = list((baseline_path.parent / "support").glob("*.zip"))
+assert bundles, "Native host test must produce a support ZIP"
+with zipfile.ZipFile(max(bundles, key=lambda p: p.stat().st_mtime)) as bundle:
+    assert bundle.testzip() is None, "Corrupt support ZIP"
+    assert {"diagnostics.json", "settings.ini", "issue-report.md", "README.txt", "CheekyFoveatedDLSS-UEVR.log"} <= set(bundle.namelist())
+    assert json.loads(bundle.read("diagnostics.json")) == baseline
+    assert all("/" not in name and "\\" not in name for name in bundle.namelist())
 
 
 def run(engine):
@@ -23,6 +32,7 @@ def run(engine):
     lua.execute("""
         callbacks, sent, clicked, changes, drawn, values, combos, trees = {}, {}, {}, {}, {}, {}, {}, {}
         disabled = {false}
+        tree_stack, tree_order, tree_parents = {}, {}, {}
         uevr = {api = {}, sdk = {callbacks = {}}}
         for _, name in ipairs({'on_lua_event', 'on_frame', 'on_draw_ui'}) do
             uevr.sdk.callbacks[name] = function(fn) callbacks[name] = fn end
@@ -39,7 +49,11 @@ def run(engine):
             return false, current
         end
         imgui = {
-            tree_node = function(label) trees[label] = true; return true end, tree_pop = function() end,
+            tree_node = function(label)
+                trees[label] = true; tree_parents[label] = tree_stack[#tree_stack]
+                table.insert(tree_order, label); table.insert(tree_stack, label); return true
+            end,
+            tree_pop = function() assert(#tree_stack > 0); table.remove(tree_stack) end,
             text = function(text) table.insert(drawn, text) end,
             text_colored = function(text) table.insert(drawn, text) end,
             spacing = function() end,
@@ -77,12 +91,14 @@ def run(engine):
         g.drawn = lua.table()
         g["values"] = lua.table()
         g.trees = lua.table()
+        g.tree_order, g.tree_parents = lua.table(), lua.table()
         if click:
             g.clicked[click] = True
         for key, value in (changes or {}).items():
             g.changes[key] = value
         g.callbacks.on_draw_ui()
         assert len(g.disabled) == 1, "Unbalanced disabled scope"
+        assert len(g.tree_stack) == 0, "Unbalanced tree scope"
 
     def receive(value):
         g.callbacks.on_lua_event("cheeky.foveated_dlss.snapshot.v1", json.dumps(value))
@@ -98,6 +114,22 @@ def run(engine):
     state["settings"]["Enabled"] = True
     receive(state)
     draw()  # Open every tree, validate all widget types and enum keys.
+    order = list(g.tree_order.values())
+    assert order.index("Stereo and gaze") < order.index("DLSS-SR") < order.index("DLSS-NR (experimental)")
+    assert g.tree_parents["Frame rate comparison"] == "DLSS-SR"
+    state["support"] = {"busy": False, "zip": "C:/test/support/report.zip"}
+    receive(state)
+    for label, action in (("Report an issue...", "report_issue"), ("Create support ZIP only", "report"),
+                          ("Show ZIP", "show_report"), ("Open GitHub issue", "open_issue")):
+        draw(label)
+        assert last().endswith("\n" + action), "Wrong report action"
+    state["support"]["busy"] = True
+    receive(state)
+    count = len(g.sent)
+    draw("Report an issue...")
+    assert len(g.sent) == count, "Busy report action should be disabled"
+    state["support"]["busy"] = False
+    receive(state)
     draw(changes={"Enable foveated DLSS-SR": False})
     receive(state)  # A periodic update must not overwrite a dirty false value.
     draw("Apply changes##bottom")
