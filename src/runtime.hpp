@@ -21,6 +21,12 @@ void note_d3d12_command_list_submission(
     ID3D12GraphicsCommandList* command_list
 ) noexcept;
 void note_d3d12_present(ID3D12CommandQueue* queue) noexcept;
+void note_d3d12_command_list_reset(ID3D12GraphicsCommandList* command_list) noexcept;
+struct GpuTimingStatus {
+    std::uint64_t recorded{}, submitted{}, completed{}, published{}, discarded{}, failures{};
+    std::uint32_t waiting_submission{}, waiting_gpu{}, last_error{};
+};
+GpuTimingStatus gpu_timing_status() noexcept;
 
 [[nodiscard]] bool start_interception() noexcept;
 struct LateAttachStatus {

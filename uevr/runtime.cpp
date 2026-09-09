@@ -1,5 +1,6 @@
 #include "runtime_api.hpp"
 #include "settings_io.hpp"
+#include "frame_cadence.hpp"
 #include "graphics_observer.hpp"
 #include "processing_owner.hpp"
 #include "runtime.hpp"
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <sstream>
 #include <charconv>
+#include <chrono>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -32,6 +34,8 @@ struct State {
     void* observed_queue{};
     std::uint64_t revision{}, saved_revision{}, request{}, applied_request{};
     std::uint64_t attachment_sequence{};
+    FrameCadence cadence;
+    ULONGLONG next_timing_log{};
     std::string message{"Not initialized"};
     std::atomic<bool> save_requested{}, report_requested{};
 };
@@ -47,13 +51,23 @@ std::string snapshot_locked(State& s) {
     const auto views = stereo_view_statistics();
     const auto nr = dlss_nr_snapshot();
     const auto attach = late_attach_status();
-    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-late-attach-preview\",\"request\":" << s.request
+    const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
+    const auto gpu = gpu_timing_status();
+    out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr-gpu-timing-preview\",\"request\":" << s.request
         << ",\"revision\":" << s.revision << ",\"saved_revision\":" << s.saved_revision
         << ",\"applied_request\":" << s.applied_request
         << ",\"attached\":" << adapter_attached.load() << ",\"ready\":" << (s.started && s.graphics_ready)
         << ",\"processing\":" << current_settings().enabled
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
+        << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"gpu_timing\":{\"recorded\":" << gpu.recorded << ",\"submitted\":" << gpu.submitted
+        << ",\"completed\":" << gpu.completed << ",\"published\":" << gpu.published
+        << ",\"discarded\":" << gpu.discarded << ",\"failures\":" << gpu.failures
+        << ",\"waiting_submission\":" << gpu.waiting_submission << ",\"waiting_gpu\":" << gpu.waiting_gpu
+        << ",\"last_error\":" << gpu.last_error << '}'
+        << ",\"frame\":{\"present_ms\":" << s.cadence.average_ms
+        << ",\"sr_enabled_ms\":" << frame.foveated_frame_ms << ",\"sr_disabled_ms\":" << frame.native_frame_ms << '}'
         << ",\"late_attach\":{\"options_hooked\":" << attach.streamline_options_hooked
         << ",\"options_seen\":" << attach.streamline_options_seen
         << ",\"native_fallback\":" << attach.streamline_native_fallback
@@ -64,8 +78,27 @@ std::string snapshot_locked(State& s) {
         << ",\"using_gaze\":" << gaze.using_gaze << ",\"alignment\":" << gaze.alignment_source
         << ",\"ambiguous\":" << gaze.mapping_ambiguous << ",\"views\":" << views.active
         << ",\"submitted_copies\":" << gaze.submitted_copies
-        << ",\"left_mapped\":" << gaze.views[0].resource_mapped << ",\"right_mapped\":" << gaze.views[1].resource_mapped << '}'
-        << ",\"nr\":\"" << json_escape(dlss_nr_state_name(nr.state)) << "\",\"apis\":[";
+        << ",\"left_mapped\":" << gaze.views[0].resource_mapped << ",\"right_mapped\":" << gaze.views[1].resource_mapped
+        << ",\"runtime\":\"" << json_escape(gaze.runtime_name) << "\",\"age_ms\":" << gaze.sample_age_ms
+        << ",\"status_flags\":" << gaze.status_flags << ",\"reset_reason\":" << static_cast<unsigned>(gaze.last_reset_reason)
+        << ",\"peak_views\":" << views.peak << ",\"seen_views\":" << views.seen << ",\"eyes\":[";
+    for (unsigned i = 0; i < 2; ++i) {
+        if (i) out << ',';
+        const auto& v = gaze.views[i];
+        out << "{\"center_u\":" << v.center_u << ",\"center_v\":" << v.center_v
+            << ",\"view_id\":\"" << v.dlss_view_id << "\",\"stable_matches\":" << v.stable_matches
+            << ",\"delta_x\":" << v.crop_delta_x << ",\"delta_y\":" << v.crop_delta_y
+            << ",\"mapped\":" << v.resource_mapped << ",\"packed\":" << v.packed_stereo_mapping
+            << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping << '}';
+    }
+    out << "]},\"nr\":\"" << json_escape(dlss_nr_state_name(nr.state)) << "\",\"nr_details\":{"
+        << "\"route\":\"" << json_escape(dlss_nr_route_name(nr.route)) << "\",\"candidates\":" << nr.candidate_calls
+        << ",\"evaluations\":" << nr.evaluation_calls << ",\"failures\":" << nr.failed_calls << ",\"result\":" << nr.last_result
+        << ",\"output_width\":" << nr.output_width << ",\"output_height\":" << nr.output_height
+        << ",\"region_width\":" << nr.region_width << ",\"region_height\":" << nr.region_height
+        << ",\"region_x\":" << nr.region_base_x << ",\"region_y\":" << nr.region_base_y
+        << ",\"working_width\":" << nr.working_width << ",\"working_height\":" << nr.working_height
+        << ",\"vram_bytes\":" << nr.intermediate_vram_bytes << "},\"apis\":[";
     for (unsigned index = 0; index < 2; ++index) {
         const auto d = diagnostic_snapshot(index ? DiagnosticApi::d3d12 : DiagnosticApi::d3d11);
         if (index) out << ',';
@@ -74,9 +107,34 @@ std::string snapshot_locked(State& s) {
             << ",\"input_width\":" << d.received_input_width << ",\"input_height\":" << d.received_input_height
             << ",\"output_width\":" << d.received_output_width << ",\"output_height\":" << d.received_output_height
             << ",\"foveated_ms\":" << d.foveated_dlss_gpu_ms << ",\"native_ms\":" << d.native_dlss_gpu_ms
-            << ",\"peripheral_ms\":" << d.peripheral_dlaa_gpu_ms << ",\"result\":" << d.last_result << '}';
+            << ",\"peripheral_ms\":" << d.peripheral_dlaa_gpu_ms << ",\"result\":" << d.last_result
+            << ",\"runtime_loaded\":" << d.runtime_loaded << ",\"streamline\":" << d.streamline_detected
+            << ",\"direct_detour\":" << d.direct_detour_installed << ",\"has_private_result\":" << d.has_private_result
+            << ",\"private_result\":" << d.last_private_result << ",\"nr_full_ms\":" << d.full_dlss_nr_gpu_ms
+            << ",\"nr_foveated_ms\":" << d.foveated_dlss_nr_gpu_ms
+            << ",\"motion_width\":" << d.motion_vector_width << ",\"motion_height\":" << d.motion_vector_height
+            << ",\"motion_space\":\"" << motion_vector_space_name(d.motion_vector_space)
+            << "\",\"execution_path\":\"" << json_escape(d3d11_execution_path_name(d.d3d11_execution_path))
+            << "\",\"ngx_route\":" << static_cast<unsigned>(d.d3d12_ngx_route)
+            << ",\"crop\":{\"input_width\":" << d.passed_crop.input_width << ",\"input_height\":" << d.passed_crop.input_height
+            << ",\"input_x\":" << d.passed_crop.input_base_x << ",\"input_y\":" << d.passed_crop.input_base_y
+            << ",\"output_width\":" << d.passed_crop.output_width << ",\"output_height\":" << d.passed_crop.output_height
+            << ",\"output_x\":" << d.passed_crop.output_base_x << ",\"output_y\":" << d.passed_crop.output_base_y << "}}";
     }
-    out << "]}"; return out.str();
+    out << "],\"view_details\":[";
+    const auto details = stereo_view_details();
+    // Bound the event size even in games that churn many view identities.
+    for (std::size_t i = 0; i < (std::min)(details.size(), std::size_t{16}); ++i) {
+        const auto& v = details[i];
+        if (i) out << ',';
+        out << "{\"id\":\"" << v.view_id << "\",\"eye\":\""
+            << (v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : "Unassigned")
+            << "\",\"evaluations\":" << v.evaluations
+            << ",\"input_width\":" << v.render_width << ",\"input_height\":" << v.render_height
+            << ",\"output_width\":" << v.output_width << ",\"output_height\":" << v.output_height
+            << ",\"crop_width\":" << v.crop.output_width << ",\"crop_height\":" << v.crop.output_height << '}';
+    }
+    out << "],\"view_details_total\":" << details.size() << '}'; return out.str();
 }
 DWORD WINAPI persistence_worker(void*) {
     auto& s = state();
@@ -189,6 +247,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
         active_attachment = ++s.attachment_sequence;
         *input->attachment = s.attachment_sequence;
         adapter_attached = true;
+        s.cadence.reset();
         set_processing_allowed(s.graphics_ready);
         request_save(s);
         return true;
@@ -205,7 +264,20 @@ extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, 
         auto& s = state(); std::lock_guard lock(s.mutex);
         configure_graphics(s, renderer, device, queue);
         set_processing_allowed(s.started && s.graphics_ready);
+        if (s.graphics_ready) {
+            const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            const auto enabled = current_settings().enabled;
+            const auto ms = s.cadence.sample(seconds, enabled);
+            if (ms > 0) diagnostic_note_frame_rate(static_cast<float>(1000.0 / ms), enabled);
+        } else s.cadence.reset();
         if (s.graphics_ready && renderer == 1) note_d3d12_present(nullptr);
+        if (s.graphics_ready && renderer == 1 && GetTickCount64() >= s.next_timing_log) {
+            s.next_timing_log = GetTickCount64() + 5000;
+            const auto gpu = gpu_timing_status();
+            trace_event("GPU timing recorded=%llu submitted=%llu completed=%llu valid=%llu discarded=%llu waiting_submit=%u waiting_gpu=%u failures=%llu hr=0x%08X queue_submissions=%llu",
+                gpu.recorded, gpu.submitted, gpu.completed, gpu.published, gpu.discarded,
+                gpu.waiting_submission, gpu.waiting_gpu, gpu.failures, gpu.last_error, native_observer_status().submissions);
+        }
         static bool was_down{};
         const bool down = (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_OEM_2) & 0x8000);
         if (down && !was_down) {
@@ -231,6 +303,12 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Command(std::uint64_t attachmen
         auto settings = configured_settings();
         if (action == "defaults") {
             settings = Settings{};
+            if (s.renderer == 0) settings.d3d11_use_d3d12_transport = false;
+        }
+        else if (action.starts_with("defaults_")) {
+            if (!reset_settings_group(settings, std::string_view(action).substr(9))) {
+                s.message = "Unknown settings group"; return false;
+            }
             if (s.renderer == 0) settings.d3d11_use_d3d12_transport = false;
         }
         else if (action == "set") {

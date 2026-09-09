@@ -114,7 +114,10 @@ void STDMETHODCALLTYPE execute(ID3D12CommandQueue* queue, UINT count, ID3D12Comm
 }
 HRESULT STDMETHODCALLTYPE reset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator, ID3D12PipelineState* state) {
     const auto hr = real_reset(list, allocator, state);
-    if (SUCCEEDED(hr)) { reset_gaze_copies(reinterpret_cast<std::uint64_t>(list)); ++resets; }
+    if (SUCCEEDED(hr)) {
+        note_d3d12_command_list_reset(list);
+        reset_gaze_copies(reinterpret_cast<std::uint64_t>(list)); ++resets;
+    }
     return hr;
 }
 void STDMETHODCALLTYPE copy_resource(ID3D12GraphicsCommandList* list, ID3D12Resource* destination, ID3D12Resource* source) {

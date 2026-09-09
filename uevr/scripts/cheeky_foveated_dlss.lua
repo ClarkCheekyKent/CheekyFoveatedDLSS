@@ -105,6 +105,102 @@ local function apply_buttons(id)
     if pending_apply then text("Waiting for settings acknowledgement...") end
 end
 
+
+local function section(label)
+    imgui.spacing()
+    imgui.text_colored(label, 0xFF8FC9EC)
+end
+local function rows(id, entries)
+    -- UEVR's documented table binding; keep a plain-text fallback for older hosts.
+    if not imgui.begin_table then
+        for _, row in ipairs(entries) do text(row[1] .. ": " .. tostring(row[2])) end
+    elseif imgui.begin_table(id, 2, 0, {0, 0}, 0) then
+        for _, row in ipairs(entries) do
+            imgui.table_next_row(0, 0)
+            imgui.table_next_column(); text(row[1])
+            imgui.table_next_column(); text(row[2])
+        end
+        imgui.end_table()
+    end
+end
+local function yes(value) return value and "Yes" or "No" end
+local function size(w, h)
+    if not w or not h or w == 0 or h == 0 then return "Not sampled yet" end
+    return string.format("%d x %d", w, h)
+end
+local function timing(ms)
+    return ms and ms > 0 and string.format("%.3f ms", ms) or "Not sampled / unavailable"
+end
+local function fps(ms)
+    return ms and ms > 0 and string.format("%.1f FPS  |  %.2f ms", 1000 / ms, ms) or "Not sampled yet"
+end
+local function saving(full, reduced)
+    if not full or not reduced or full <= 0 or reduced <= 0 then return "Sample both modes to compare" end
+    return string.format("%.3f ms (%.1f%%)", full - reduced, 100 * (full - reduced) / full)
+end
+local function result(value) return string.format("0x%08X", value or 0) end
+local function reset_group(label, group)
+    imgui.begin_disabled(pending_apply ~= nil or (group ~= "all" and not status.setting_groups))
+    if imgui.button(label) and not pending_apply then
+        local submitted = {}
+        for key, value in pairs(dirty) do
+            if group == "all" or status.setting_groups[key] == group then submitted[key] = value end
+        end
+        for key in pairs(draft) do
+            if group == "all" or status.setting_groups[key] == group then
+                ready_edits[key], slider_edits[key] = nil, nil
+            end
+        end
+        pending_apply = {id = send(group == "all" and "defaults" or "defaults_" .. group),
+            values = submitted, reset_group = group}
+    end
+    imgui.end_disabled()
+end
+local alignment = {[0]="Manual fallback", [1]="Streamline projection", [2]="OpenXR", [3]="OpenVR"}
+
+local function sr_diagnostics(d)
+    local c = d.crop or {}
+    section("Resolution")
+    rows("sr_resolution", {
+        {"Game input", size(d.input_width, d.input_height)},
+        {"Game output", size(d.output_width, d.output_height)},
+        {"Private DLSS input", size(c.input_width, c.input_height)},
+        {"Private DLSS output", size(c.output_width, c.output_height)},
+        {"Crop input / output origin", string.format("%d,%d / %d,%d", c.input_x or 0, c.input_y or 0, c.output_x or 0, c.output_y or 0)},
+        {"Motion vectors", size(d.motion_width, d.motion_height) .. " / " .. (d.motion_space or "Unknown")}
+    })
+    section("DLSS-SR GPU timing (250 ms average)")
+    rows("sr_timing", {
+        {"Native DLSS call", timing(d.native_ms)}, {"Foveated center DLSS", timing(d.foveated_ms)},
+        {"Peripheral DLAA", timing(d.peripheral_ms)}, {"Center call savings", saving(d.native_ms, d.foveated_ms)}
+    })
+    text("GPU call timings exclude other game work; samples are retained when a mode is disabled.")
+    local gpu = status.gpu_timing
+    if gpu and status.renderer == 1 then
+        if (gpu.waiting_submission or 0) > 0 then
+            text("Timestamp queries are waiting for their command-list submission.")
+        elseif (gpu.waiting_gpu or 0) > 0 then
+            text("Timestamp readback is waiting for GPU completion.")
+        end
+        if (gpu.failures or 0) > 0 then text("GPU timing error: " .. result(gpu.last_error) .. ". Save a diagnostic report.") end
+    end
+end
+local function nr_diagnostics(d)
+    local n = status.nr_details or {}
+    rows("nr_status", {
+        {"State", status.nr}, {"Route", n.route or "Unknown"},
+        {"Candidate / evaluated / failed", string.format("%d / %d / %d", n.candidates or 0, n.evaluations or 0, n.failures or 0)},
+        {"Last result", result(n.result)}, {"SR output", size(n.output_width, n.output_height)},
+        {"NR region", size(n.region_width, n.region_height)},
+        {"Region origin", string.format("%d,%d", n.region_x or 0, n.region_y or 0)},
+        {"NR working size", size(n.working_width, n.working_height)},
+        {"Intermediate VRAM", string.format("%.1f MiB", (n.vram_bytes or 0) / 1048576)}
+    })
+    section("DLSS-NR GPU timing (250 ms average)")
+    rows("nr_timing", {{"Full NR call", timing(d.nr_full_ms)}, {"Foveated NR call", timing(d.nr_foveated_ms)},
+        {"Foveated savings", saving(d.nr_full_ms, d.nr_foveated_ms)}})
+end
+
 uevr.sdk.callbacks.on_draw_ui(function()
     if not imgui.tree_node("Cheeky Foveated DLSS") then return end
     if error_text then text(error_text) end
@@ -119,21 +215,38 @@ uevr.sdk.callbacks.on_draw_ui(function()
     text("Cheeky " .. tostring(status.version))
     text(status.message)
     if not status.ready then text("Processing is paused. See the status and log before testing.") end
-    text("Sliders apply when released. Checkboxes and selections apply immediately; settings save automatically.")
-    text("Alt+Shift+/ toggles SR immediately.")
+    text("Sliders apply on release. Other controls apply immediately and save automatically.")
+    text("Alt+Shift+/ toggles SR.")
+    local d = (status.apis or {})[status.renderer == 1 and 2 or 1] or {}
+    local f = status.frame or {}
+    rows("overview", {{"Renderer", status.renderer == 1 and "DX12" or "DX11 direct"},
+        {"SR status", d.state or "Waiting"}, {"UEVR present cadence", fps(f.present_ms)}})
+    -- A reset is a native transaction. Wait for its authoritative snapshot before editing again.
+    imgui.begin_disabled(pending_apply ~= nil and pending_apply.reset_group ~= nil)
     apply_buttons("top")
 
-    check("Enable foveated DLSS-SR", "Enabled")
-    combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
-    slider("Center supersampling", "CenterSupersampling", 1, 2)
-    slider("Fovea width", "Width", 0.2, 1)
-    slider("Fovea height", "Height", 0.2, 1)
-    slider("Roundness", "Roundness", 0, 1)
-    slider("Transition width", "TransitionWidth", 0, 0.3)
-    check("Show red alignment border", "AlignmentBorder")
-    check("Peripheral DLAA", "PeripheralDlaa")
-    combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"})
-    slider("Periphery scale", "PeripheralDlaaScale", 0.2, 1)
+    if imgui.tree_node("DLSS-SR") then
+        check("Enable foveated DLSS-SR", "Enabled")
+        if draft.Enabled then
+            section("Center")
+            combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
+            slider("Center supersampling", "CenterSupersampling", 1, 2)
+            slider("Fovea width", "Width", 0.2, 1)
+            slider("Fovea height", "Height", 0.2, 1)
+            slider("Roundness", "Roundness", 0, 1)
+            slider("Transition width", "TransitionWidth", 0, 0.3)
+            check("Show red alignment border", "AlignmentBorder")
+            section("Periphery")
+            check("Peripheral DLAA", "PeripheralDlaa")
+            if draft.PeripheralDlaa then
+                combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"})
+                slider("Periphery scale", "PeripheralDlaaScale", 0.2, 1)
+            end
+        end
+        reset_group("Reset DLSS-SR defaults", "sr")
+        if imgui.tree_node("SR resolution and GPU timing") then sr_diagnostics(d); imgui.tree_pop() end
+        imgui.tree_pop()
+    end
 
     if imgui.tree_node("Stereo and gaze") then
         combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
@@ -145,14 +258,26 @@ uevr.sdk.callbacks.on_draw_ui(function()
         end
         check("Invert stereo eye order", "InvertStereoXOffset")
         if draft.CenterMode == 2 then
-            slider("Simulation pattern (0-5)", "SimulationPattern", 0, 5, true)
-            check("Show next jump target", "ShowNextJumpTarget")
+            combo("Simulation pattern", "SimulationPattern", {[0]="Figure eight (8 s)",[1]="Slow sweep (20 s)",
+                [2]="Jump every 2 s",[3]="Jump every 8 s",[4]="Tracking loss",[5]="Hold center"})
+            text("Patterns restart when changed. Enable the red border to inspect motion.")
+            if draft.SimulationPattern == 2 or draft.SimulationPattern == 3 then check("Show next jump target", "ShowNextJumpTarget") end
+            if draft.SimulationPattern == 4 then text("Moves for 4 s, loses tracking for 1 s, then recovers.") end
         end
-        slider("Gaze smoothing (ms)", "GazeSmoothingMs", 0, 100)
-        slider("Crop quantization (pixels)", "GazeQuantizationPixels", 1, 64, true)
-        slider("Jump reset threshold", "GazeJumpResetRatio", 0.01, 1)
-        text("OpenXR alignment/gaze uses the matching Cheeky OpenXR layer. No tracker is needed for fixed alignment.")
-        text("Missing or ambiguous eye data falls back to fixed placement.")
+        if imgui.tree_node("Advanced eye tracking") then
+            slider("Gaze smoothing (ms)", "GazeSmoothingMs", 0, 100)
+            slider("Crop quantization (pixels)", "GazeQuantizationPixels", 1, 64, true)
+            slider("Jump reset threshold", "GazeJumpResetRatio", 0.01, 1)
+            imgui.tree_pop()
+        end
+        local g = status.gaze or {}
+        rows("gaze_summary", {{"Alignment", alignment[g.alignment] or "Unknown"}, {"Gaze driving foveation", yes(g.using_gaze)},
+            {"Mapped left / right", yes(g.left_mapped) .. " / " .. yes(g.right_mapped)}})
+        if draft.CenterMode == 1 and not g.using_gaze then
+            imgui.text_colored("Eye tracking unavailable or awaiting mapping; using fixed fallback.", 0xFFFFBC70)
+        end
+        text("OpenXR alignment/gaze uses the matching Cheeky layer. Fixed alignment needs no eye tracker.")
+        reset_group("Reset Stereo / gaze defaults", "gaze")
         imgui.tree_pop()
     end
 
@@ -161,73 +286,124 @@ uevr.sdk.callbacks.on_draw_ui(function()
             text("DLSS-NR / DX12 transport is unavailable on the DX11 path in this preview.")
         else
             check("Enable DLSS-NR", "NrEnabled")
-            check("Foveated NR", "NrFoveated")
-            check("Use SR size and shape", "NrUseSrFoveation")
-            check("Show NR alignment border", "NrAlignmentBorder")
-            slider("NR width", "NrWidth", 0.2, 1)
-            slider("NR height", "NrHeight", 0.2, 1)
-            slider("NR roundness", "NrRoundness", 0, 1)
-            slider("NR transition", "NrTransitionWidth", 0, 0.3)
-            slider("NR working scale", "NrWorkingScale", 0.1, 1)
-            slider("NR preset (0 default)", "NrPreset", 0, 7, true)
-            slider("NR intensity", "NrIntensity", 0, 2)
-            if imgui.tree_node("Advanced NR") then
-                slider("Local tone", "NrLocalToneStrength", 0, 2)
-                slider("Local structure", "NrLocalStructureStrength", 0, 2)
-                slider("Skin structure", "NrSkinStructureStrength", 0, 2)
-                check("Automatic mask", "NrAutomaticMask")
-                check("UI correction", "NrUiCorrection")
-                slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
-                slider("HDR transfer", "NrHdrTransferStrength", 0, 2)
-                slider("Color strength", "NrColorStrength", 0, 2)
-                combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
-                slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
-                slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
-                imgui.tree_pop()
+            if draft.NrEnabled then
+                check("Foveated NR", "NrFoveated")
+                if draft.NrFoveated then
+                    check("Use SR size and shape", "NrUseSrFoveation")
+                    if not draft.NrUseSrFoveation then
+                        slider("NR width", "NrWidth", 0.2, 1)
+                        slider("NR height", "NrHeight", 0.2, 1)
+                        slider("NR roundness", "NrRoundness", 0, 1)
+                        slider("NR transition", "NrTransitionWidth", 0, 0.3)
+                    end
+                    check("Show NR alignment border", "NrAlignmentBorder")
+                end
+                section("Neural rendering")
+                slider("NR working scale", "NrWorkingScale", 0.1, 1)
+                combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A",[2]="Preset B",[3]="Preset C",
+                    [4]="Preset D",[5]="Preset E",[6]="Preset F",[7]="Preset G"})
+                slider("NR intensity", "NrIntensity", 0, 2)
+                if imgui.tree_node("Advanced NR") then
+                    slider("Local tone", "NrLocalToneStrength", 0, 2)
+                    slider("Local structure", "NrLocalStructureStrength", 0, 2)
+                    slider("Skin structure", "NrSkinStructureStrength", 0, 2)
+                    check("Automatic mask", "NrAutomaticMask")
+                    check("UI correction", "NrUiCorrection")
+                    slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
+                    slider("HDR transfer", "NrHdrTransferStrength", 0, 2)
+                    slider("Color strength", "NrColorStrength", 0, 2)
+                    combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
+                    slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
+                    slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
+                    imgui.tree_pop()
+                end
             end
+            text("NR: " .. tostring(status.nr))
             if imgui.button("Reset NR history / retry") then send("reset_nr") end
-            text("Supply compatible NVIDIA components yourself; see the package README.")
+            text("nvngx_dlssnr.dll: beside the runtime DLL, or beside the running game executable.")
+            text("After adding the DLL, use Reset NR history / retry. The log lists paths and loader errors.")
         end
-        text("NR: " .. tostring(status.nr))
+        reset_group("Reset DLSS-NR defaults", "nr")
+        if imgui.tree_node("NR status and GPU timing") then nr_diagnostics(d); imgui.tree_pop() end
         imgui.tree_pop()
     end
     apply_buttons("bottom")
 
+    if imgui.tree_node("Frame rate comparison") then
+        rows("fps", {{"Present cadence (250 ms avg)", fps(f.present_ms)},
+            {"SR enabled", fps(f.sr_enabled_ms)}, {"SR disabled", fps(f.sr_disabled_ms)},
+            {"Frame time savings", saving(f.sr_disabled_ms, f.sr_enabled_ms)}})
+        if (f.sr_enabled_ms or 0) > 0 and (f.sr_disabled_ms or 0) > 0 then
+            text(string.format("Change: %+.1f FPS (%+.1f%%)", 1000 / f.sr_enabled_ms - 1000 / f.sr_disabled_ms,
+                100 * (f.sr_disabled_ms / f.sr_enabled_ms - 1)))
+        end
+        text("Measures UEVR present callbacks; headset display/reprojection FPS may differ.")
+        text("Toggle SR in the same scene. Samples settle for 1 s, then average over 250 ms.")
+        text("Comparisons retain the last sample of each mode; scene and NR changes also affect frame rate.")
+        imgui.tree_pop()
+    end
     if imgui.tree_node("Diagnostics and support") then
-        text("Renderer: " .. (status.renderer == 1 and "DX12" or "DX11 direct"))
-        text("Settings revision " .. tostring(status.revision) .. "; saved " .. tostring(status.saved_revision))
-        local attach = status.late_attach or {}
-        text("Streamline options hook: " .. tostring(attach.options_hooked) .. "; options observed: " .. tostring(attach.options_seen))
-        if attach.native_fallback then
-            text("Streamline is forwarding to native NGX (options unavailable or renderer requires the native path).")
-            text("Check Active/evaluation counters below. A fallback attempt alone does not confirm foveation.")
+        local a, o, g = status.late_attach or {}, status.observer or {}, status.gaze or {}
+        rows("host", {{"Settings revision / saved", tostring(status.revision) .. " / " .. tostring(status.saved_revision)},
+            {"Streamline options hook / observed", yes(a.options_hooked) .. " / " .. yes(a.options_seen)},
+            {"Native NGX fallback calls", a.fallback_calls or 0}, {"Submission observer ready", yes(o.ready)},
+            {"Submissions / copies / resets", string.format("%d / %d / %d", o.submissions or 0, o.copies or 0, o.resets or 0)}})
+        if a.native_fallback then text("Streamline is forwarding to native NGX. Increasing active counters confirm processing.") end
+        if status.renderer == 1 and imgui.tree_node("GPU timestamp collection") then
+            local gpu = status.gpu_timing or {}
+            rows("gpu_queries", {{"Recorded / submitted", string.format("%d / %d", gpu.recorded or 0, gpu.submitted or 0)},
+                {"Completed / valid samples", string.format("%d / %d", gpu.completed or 0, gpu.published or 0)},
+                {"Waiting for submission / GPU", string.format("%d / %d", gpu.waiting_submission or 0, gpu.waiting_gpu or 0)},
+                {"Discarded recordings", gpu.discarded or 0}, {"Failures / last error", tostring(gpu.failures or 0) .. " / " .. result(gpu.last_error)}})
+            text("Save a diagnostic report if these counters stop advancing while DLSS evaluates.")
+            imgui.tree_pop()
         end
-        local o, g = status.observer or {}, status.gaze or {}
-        text("D3D12 observer ready: " .. tostring(o.ready) .. "; submissions: " .. tostring(o.submissions) .. "; copies: " .. tostring(o.copies))
-        text("Eye views: " .. tostring(g.views) .. "; left mapped: " .. tostring(g.left_mapped) .. "; right mapped: " .. tostring(g.right_mapped))
-        local alignment = {[0]="Manual",[1]="Streamline projection",[2]="OpenXR",[3]="OpenVR"}
-        text("Alignment: " .. tostring(alignment[g.alignment]) .. "; gaze active: " .. tostring(g.using_gaze))
-        text("OpenXR layer: " .. tostring(g.layer) .. "; matching ABI: " .. tostring(g.abi) .. "; ambiguous mapping: " .. tostring(g.ambiguous))
-        for i, d in ipairs(status.apis or {}) do
-            text((i == 1 and "DX11: " or "DX12: ") .. tostring(d.state))
-            text("Evaluations: " .. tostring(d.evaluations) .. "; active: " .. tostring(d.active) .. "; feature creates observed: " .. tostring(d.creates))
-            text(tostring(d.input_width) .. "x" .. tostring(d.input_height) .. " -> " .. tostring(d.output_width) .. "x" .. tostring(d.output_height))
-            text(string.format("DLSS %.3f ms; native %.3f ms; peripheral %.3f ms", d.foveated_ms or 0, d.native_ms or 0, d.peripheral_ms or 0))
+        if imgui.tree_node("Eye mapping details") then
+            rows("gaze_details", {{"Runtime", g.runtime or "Unknown"}, {"Layer or adapter / matching ABI", yes(g.layer) .. " / " .. yes(g.abi)},
+                {"Active / peak / seen views", string.format("%d / %d / %d", g.views or 0, g.peak_views or 0, g.seen_views or 0)},
+                {"Ambiguous mapping", yes(g.ambiguous)}, {"Sample age", timing(g.age_ms)}, {"Status flags", result(g.status_flags)},
+                {"History reset", ({[0]="None",[1]="First valid gaze",[2]="Tracking reacquired",[3]="Eye remapped",
+                    [4]="Crop size changed",[5]="Large gaze jump"})[g.reset_reason or 0] or "Unknown"}})
+            for i, eye in ipairs(g.eyes or {}) do
+                section(i == 1 and "Left eye" or "Right eye")
+                rows("eye" .. i, {{"DLSS view", eye.view_id}, {"Mapped / stable matches", yes(eye.mapped) .. " / " .. tostring(eye.stable_matches)},
+                    {"Center U / V", string.format("%.3f / %.3f", eye.center_u or 0, eye.center_v or 0)},
+                    {"Crop movement X / Y", string.format("%d / %d px", eye.delta_x or 0, eye.delta_y or 0)},
+                    {"Packed / copy / projection", yes(eye.packed) .. " / " .. yes(eye.copy) .. " / " .. yes(eye.projection)}})
+            end
+            imgui.tree_pop()
         end
-        text("Zero timings may mean unavailable samples. If processing stays inactive after injection, save a diagnostic report.")
+        if imgui.tree_node("DLSS view details") then
+            for _, view in ipairs(status.view_details or {}) do
+                section("View " .. view.id .. " / " .. view.eye)
+                rows("view" .. view.id, {{"Evaluations", view.evaluations},
+                    {"Input / output", size(view.input_width, view.input_height) .. " / " .. size(view.output_width, view.output_height)},
+                    {"Foveated output", size(view.crop_width, view.crop_height)}})
+            end
+            if (status.view_details_total or 0) > 16 then text("Showing the first 16 views.") end
+            imgui.tree_pop()
+        end
+        for i, api in ipairs(status.apis or {}) do
+            if imgui.tree_node(i == 1 and "DX11 interception" or "DX12 interception") then
+                rows("api" .. i, {{"State", api.state}, {"Runtime / hook / detour", yes(api.runtime_loaded) .. " / " .. yes(api.hook) .. " / " .. yes(api.direct_detour)},
+                    {"Evaluations / active / creates", string.format("%d / %d / %d", api.evaluations or 0, api.active or 0, api.creates or 0)},
+                    {"Last result", result(api.result)}, {"Private result", api.has_private_result and result(api.private_result) or "Not sampled yet"},
+                    {"Route", i == 1 and (api.execution_path or "Unknown") or ({[0]="Unknown",[1]="Public NGX",[2]="Core NGX"})[api.ngx_route or 0]}})
+                imgui.tree_pop()
+            end
+        end
         if imgui.button("Write diagnostic report") then send("report") end
+        imgui.same_line()
         if imgui.button("Refresh status") then send("get") end
-        text("Files are saved in this game's UEVR configuration folder.")
-        text("Plugin reload disables processing then reconnects. Runtime updates require restarting the game.")
+        text("Reports, INI and log are in this game's UEVR configuration folder.")
+        text("Runtime DLL updates require restarting the game.")
         imgui.tree_pop()
     end
     if imgui.tree_node("Reset settings") then
-        if imgui.button("Restore all Cheeky defaults") then
-            dirty, ready_edits, slider_edits, pending_apply = {}, {}, {}, nil
-            send("defaults")
-        end
+        reset_group("Restore all Cheeky defaults", "all")
         imgui.tree_pop()
     end
+    imgui.end_disabled()
     imgui.tree_pop()
     flush_edits()
 end)

@@ -2,7 +2,44 @@
 
 This preview runs Cheeky's DLSS processing from a UEVR plugin and puts its
 controls in UEVR's LuaLoader menu. ReShade is not required. The original ReShade
-add-on remains a separate build. Actual UEVR/game/headset validation is pending.
+add-on remains a separate build. The user reports the preceding plugin working
+in Hogwarts Legacy; this UI update still needs game/headset validation.
+
+## UI parity update
+
+The subsequent GPU-timing update fixes abandoned timestamp slots after an
+unsubmitted command list is reset, and matches forwarding graphics wrappers
+to submitted native lists using object private data. It retains fencing on the
+actual submission queue. **Diagnostics > GPU timestamp collection** and the
+log now show recorded, submitted, completed and discarded queries, outstanding
+work and errors. The log writes a timing summary every five seconds, so it is
+useful even if the game closes before you save a report.
+
+Standalone tests reproduce slot exhaustion in the old build and verify recovery,
+wrapper/native matching and native/center/peripheral GPU readback on WARP and
+the hardware GPU. These use mock NGX calls, not NVIDIA DLSS or a running game;
+the exact cause of the reported Hogwarts timing failure remains unconfirmed.
+
+- DLSS-SR, DLSS-NR and Stereo/gaze each have an expandable section and their
+  own defaults button. Resets affect only that group's settings (including its
+  enable switch); SR reset preserves gaze placement and NR settings.
+- Disabled SR/NR processing hides its tuning controls. Full-frame NR hides
+  foveation controls; using SR size/shape hides the independent NR geometry.
+  Status, retained timings and reset buttons remain accessible.
+- Simulation patterns and NR presets use named dropdowns. All float/integer
+  sliders still send one transaction on release, including keyboard edits.
+- Diagnostics use aligned label/value tables, with SR crop and motion-vector
+  sizes, GPU timings, NR route/calls/results/VRAM, per-eye mapping, individual
+  DLSS views and interception details. Zero GPU timings mean unsampled or
+  unavailable, rather than a measured zero cost.
+- FPS measures **UEVR present callback cadence**, averaged over 250 ms. It is
+  not the headset's display/reprojection rate. The SR enabled/disabled comparison
+  retains the last sample of each mode after a one-second settling period.
+  Toggle SR in the same scene and keep other settings constant when comparing.
+- The NR DLL loader also searches beside the running game executable; see
+  the placement and retry instructions below.
+
+Lua formatting uses UEVR's [documented ImGui bindings](https://docs.uevr.io/plugins/lua/additional-bindings/imgui.html).
 
 ## Checkpoint and broader build
 
@@ -122,15 +159,21 @@ happens before injection, after injection, or after changing a particular contro
   tracked. Some game-specific eye mappings may therefore fall back.
 - DX11 uses the direct processing path. DX11-to-DX12 transport and DX11 NR are
   unavailable in this preview. DX12 NR remains experimental and off by default.
-  A compatible `nvngx_dlssnr.dll`, if used, belongs beside the **runtime DLL** in
-  the nested plugin folder. NVIDIA binaries are not included.
+  A compatible `nvngx_dlssnr.dll` is searched for beside the **runtime DLL** in
+  `plugins/CheekyFoveatedDLSS/` first, then beside the **running game executable**
+  (often `Binaries/Win64`, rather than the launcher). Both paths are absolute;
+  the working directory is not searched. Each attempted path and Windows loader
+  error is logged. After adding a missing DLL, click **Reset NR history / retry**.
+  A load error can also mean an incompatible DLL or a missing dependency.
+  NVIDIA binaries are not included.
 - Start with Native Stereo. Synchronized Sequential and AFR need separate game
   validation; this preview does not establish their temporal-history correctness.
 - Reloading the adapter pauses processing and reconnects to the resident runtime.
   **Updating runtime binaries requires restarting the game.** Runtime hooks stay
   installed until process exit; unloading the adapter is not complete unhooking.
-- Existing ReShade + UEVR success in Hogwarts is useful evidence, but it does
-  not prove this plugin's hook order, late injection, UI input or eye mapping.
+- The user reports the preceding UEVR plugin build working in Hogwarts Legacy.
+  The UI-parity update still needs their game/headset test; other games and
+  stereo modes remain unverified.
 
 For rollback, close the game, remove the two plugin files and the Lua script
 listed above, restore the saved `.addon64`, and start a fresh game process.

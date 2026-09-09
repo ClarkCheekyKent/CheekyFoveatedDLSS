@@ -12,4 +12,7 @@ bool read_settings_file(const std::filesystem::path&, Settings&, std::string& er
 bool write_settings_file(const std::filesystem::path&, const Settings&, std::string& error);
 std::string json_escape(std::string_view);
 std::string settings_json(const Settings&);
+std::string_view setting_group(std::string_view key);
+bool reset_settings_group(Settings&, std::string_view group);
+std::string setting_groups_json();
 }

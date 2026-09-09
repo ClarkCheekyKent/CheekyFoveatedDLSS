@@ -43,6 +43,29 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
 #undef CHEEKY_SETTING
     return false;
 }
+std::string_view setting_group(std::string_view key) {
+    if (key.starts_with("Nr")) return "nr";
+    for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
+            "AutoStereoAlignment", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
+            "GazeSmoothingMs", "GazeQuantizationPixels", "GazeJumpResetRatio"})
+        if (key == gaze) return "gaze";
+    return "sr";
+}
+bool reset_settings_group(Settings& s, std::string_view group) {
+    if (group != "sr" && group != "nr" && group != "gaze") return false;
+    const Settings defaults;
+#define CHEEKY_SETTING(name, field) if (setting_group(name) == group) s.field = defaults.field;
+#include "settings_fields.inc"
+#undef CHEEKY_SETTING
+    return true;
+}
+std::string setting_groups_json() {
+    std::ostringstream out; out << '{'; bool first = true;
+#define CHEEKY_SETTING(name, field) if (!first) out << ','; first = false; out << '"' << name << "\":\"" << setting_group(name) << '"';
+#include "settings_fields.inc"
+#undef CHEEKY_SETTING
+    out << '}'; return out.str();
+}
 std::string serialize_settings(const Settings& s) {
     std::ostringstream out; out.imbue(std::locale::classic()); out << std::setprecision(9);
     out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\n";

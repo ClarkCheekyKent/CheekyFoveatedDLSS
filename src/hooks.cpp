@@ -1082,6 +1082,7 @@ struct D3D12NrTimingSlot {
     ID3D12Fence* fence{};
     ID3D12GraphicsCommandList* command_list{};
     ID3D12CommandQueue* queue{};
+    std::uint64_t list_identity{};
     std::uint64_t next_fence_value{};
     std::uint64_t fence_value{};
     std::uint64_t timestamp_frequency{};
@@ -1101,6 +1102,20 @@ struct D3D12NrTimer {
 
 std::mutex d3d12_nr_timing_mutex;
 std::deque<D3D12NrTimer> d3d12_nr_timers;
+GpuTimingStatus timing_status;
+constexpr GUID timing_identity_key{0xdb90124e, 0x2a6f, 0x4291, {0x8c,0x76,0x3b,0x9e,0x41,0x11,0x4d,0x7f}};
+// Called under the timing mutex. Object private data follows forwarding graphics
+// wrappers to their native list, unlike the wrapper's interface pointer.
+std::uint64_t timing_list_identity(ID3D12GraphicsCommandList* list, bool create) noexcept {
+    std::uint64_t identity{}; UINT bytes = sizeof(identity);
+    if (SUCCEEDED(list->GetPrivateData(timing_identity_key, &bytes, &identity)) && bytes == sizeof(identity) && identity) return identity;
+    if (!create) return 0;
+    static std::uint64_t next_identity{};
+    identity = ++next_identity;
+    const auto hr = list->SetPrivateData(timing_identity_key, sizeof(identity), &identity);
+    if (FAILED(hr)) { ++timing_status.failures; timing_status.last_error = hr; return 0; }
+    return identity;
+}
 
 void release_d3d12_nr_timing_slot(D3D12NrTimingSlot& slot) noexcept {
     if (slot.queue != nullptr) slot.queue->Release();
@@ -1136,7 +1151,9 @@ void resolve_d3d12_nr_timing(
         byte_offset + sizeof(std::uint64_t) * 2U
     };
     void* mapped{};
-    if (SUCCEEDED(timer.readback->Map(0U, &read_range, &mapped)) &&
+    ++timing_status.completed;
+    const auto map_result = timer.readback->Map(0U, &read_range, &mapped);
+    if (SUCCEEDED(map_result) &&
         mapped != nullptr) {
         const auto* const timestamps = reinterpret_cast<const std::uint64_t*>(
             static_cast<const std::byte*>(mapped) + byte_offset
@@ -1150,6 +1167,7 @@ void resolve_d3d12_nr_timing(
                 static_cast<double>(end - begin) * 1000.0 /
                 static_cast<double>(slot.timestamp_frequency)
             );
+            if (milliseconds > 0) ++timing_status.published;
             if (slot.kind == D3D12TimingKind::peripheral_dlaa) {
                 diagnostic_note_peripheral_dlaa_gpu_time(
                     DiagnosticApi::d3d12, milliseconds
@@ -1167,7 +1185,7 @@ void resolve_d3d12_nr_timing(
                 );
             }
         }
-    }
+    } else { ++timing_status.failures; timing_status.last_error = map_result; }
     slot.fence_value = 0U;
     slot.timestamp_frequency = 0U;
     slot.publish = false;
@@ -1231,6 +1249,7 @@ void resolve_d3d12_nr_timing(
         }
     }
     if (FAILED(result)) {
+        ++timing_status.failures; timing_status.last_error = result;
         for (auto& slot : created.slots) release_d3d12_nr_timing_slot(slot);
         if (created.readback != nullptr) created.readback->Release();
         if (created.query_heap != nullptr) created.query_heap->Release();
@@ -1303,6 +1322,8 @@ struct D3D12NrTimingScope {
         );
         command_list->AddRef();
         slot->command_list = command_list;
+        slot->list_identity = timing_list_identity(command_list, true);
+        ++timing_status.recorded;
         slot->publish = succeeded;
         slot->recording = false;
         slot->pending = true;
@@ -1404,6 +1425,8 @@ struct D3D12PeripheralTimingScope {
         );
         command_list->AddRef();
         slot->command_list = command_list;
+        slot->list_identity = timing_list_identity(command_list, true);
+        ++timing_status.recorded;
         slot->publish = succeeded;
         slot->recording = false;
         slot->pending = true;
@@ -1422,17 +1445,25 @@ void note_d3d12_command_list_submission_impl(
     ID3D12CommandList* motion_lists[]{command_list};
     crop_motion12_submitted(queue, 1U, motion_lists);
     std::uint64_t frequency{};
-    if (FAILED(queue->GetTimestampFrequency(&frequency)) || frequency == 0U) return;
     std::lock_guard lock(d3d12_nr_timing_mutex);
+    const auto identity = timing_list_identity(command_list, false);
     for (auto& timer : d3d12_nr_timers) {
         for (auto& slot : timer.slots) {
-            if (!slot.pending || slot.command_list != command_list ||
+            if (!slot.pending || (slot.command_list != command_list && (!identity || slot.list_identity != identity)) ||
+                slot.fence_value != 0U || slot.command_list == nullptr ||
                 slot.queue != nullptr) {
                 continue;
+            }
+            if (!frequency) {
+                const auto hr = queue->GetTimestampFrequency(&frequency);
+                if (FAILED(hr) || !frequency) {
+                    ++timing_status.failures; timing_status.last_error = static_cast<std::uint32_t>(hr); return;
+                }
             }
             queue->AddRef();
             slot.queue = queue;
             slot.timestamp_frequency = frequency;
+            ++timing_status.submitted;
             slot.command_list->Release();
             slot.command_list = nullptr;
         }
@@ -1469,13 +1500,14 @@ void note_d3d12_present_impl(
             }
             if (signal_queue == nullptr) continue;
             const auto value = ++slot.next_fence_value;
-            if (SUCCEEDED(signal_queue->Signal(slot.fence, value))) {
+            const auto signal_result = signal_queue->Signal(slot.fence, value);
+            if (SUCCEEDED(signal_result)) {
                 slot.fence_value = value;
                 if (slot.queue != nullptr) {
                     slot.queue->Release();
                     slot.queue = nullptr;
                 }
-            }
+            } else { ++timing_status.failures; timing_status.last_error = static_cast<std::uint32_t>(signal_result); }
         }
     }
 }
@@ -5330,6 +5362,32 @@ void note_d3d12_command_list_submission(
 
 void note_d3d12_present(ID3D12CommandQueue* const queue) noexcept {
     note_d3d12_present_impl(queue);
+}
+
+void note_d3d12_command_list_reset(ID3D12GraphicsCommandList* const list) noexcept {
+    if (!list) return;
+    std::lock_guard lock(d3d12_nr_timing_mutex);
+    const auto identity = timing_list_identity(list, false);
+    for (auto& timer : d3d12_nr_timers) for (auto& slot : timer.slots) {
+        // Reset discards only the unsubmitted recording. Submitted query data
+        // remains owned by its fence until GPU completion, even after list reset.
+        if (!slot.pending || slot.queue || slot.fence_value || !slot.command_list ||
+            (slot.command_list != list && (!identity || identity != slot.list_identity))) continue;
+        slot.command_list->Release(); slot.command_list = nullptr;
+        slot.list_identity = 0; slot.pending = false; slot.publish = false;
+        ++timing_status.discarded;
+    }
+}
+
+GpuTimingStatus gpu_timing_status() noexcept {
+    std::lock_guard lock(d3d12_nr_timing_mutex);
+    auto result = timing_status;
+    for (const auto& timer : d3d12_nr_timers) for (const auto& slot : timer.slots) {
+        if (!slot.pending) continue;
+        if (slot.queue || slot.fence_value) ++result.waiting_gpu;
+        else ++result.waiting_submission;
+    }
+    return result;
 }
 
 bool install_early_loader_interception() noexcept {

@@ -1,7 +1,8 @@
 # UEVR preview validation — 2026-09-08
 
-Broader late-attachment build following checkpoint `0ed7d4d` (v0.2.4). No game was launched and no
-files were installed into a game or UEVR profile.
+GPU timing update following the UI parity package (v0.2.4). The user
+reports the preceding UEVR plugin working in Hogwarts Legacy. During this update,
+no game was launched and no files were installed into a game or UEVR profile.
 
 | Check | Result |
 | --- | --- |
@@ -19,6 +20,13 @@ files were installed into a game or UEVR profile.
 | Actual Lua menu under LuaJIT 2.1 and Lua 5.4, using mocked UEVR/ImGui bindings | Pass |
 | Float and integer sliders: no update while dragging/holding, exactly one update on release | Pass |
 | Keyboard edits, dirty false values, rejected edits, delayed acknowledgements, reconnect | Pass |
+| SR/NR conditional visibility, simulation/NR dropdowns, group-reset draft isolation and stale slider prevention | Pass with mocked Lua host |
+| Independent native SR/NR/gaze resets, unknown group rejection, expanded JSON report | Pass |
+| Optional DLL search: executable fallback, runtime-folder precedence and missing-file error | Pass with locally authored test DLL |
+| Deterministic present cadence, pause/toggle resets and actual host callback sampling | Pass; not a game performance measurement |
+| Exhaust timestamp slots with discarded command recordings, then resume evaluations | Reproduces failure before fix; passes with reset cleanup |
+| Evaluate through a forwarding COM interface, submit its native command list | Pass; no stranded timing references |
+| Native, foveated-center and peripheral timestamps reach the runtime JSON | Pass with mock NGX on WARP and hardware GPU |
 | Fake NGX initialized, feature created/evaluated and pointers cached before plugin load: DX11/DX12, regular/C callbacks | Pass |
 | Missing create flags, quality, output dimensions or required resources: forward without changing parameters or creating features | Pass |
 | Late-adopted private feature reuse, release of game/private handles and game feature recreation | Pass |
@@ -27,8 +35,10 @@ files were installed into a game or UEVR profile.
 | Unknown options version and a different viewport use native fallback; DX11 never enters DX12 Streamline compositor | Pass |
 | ZIP payload names and SHA-256 readback | Pass |
 
-Actual UEVR injection, Hogwarts Legacy DLSS evaluation, hook coexistence, headset
-menu visibility/controller input, both-eye output and performance remain **untested**.
+Actual UEVR injection, DLSS-NR evaluation, the updated headset menu/controller
+input, both-eye output and performance of **this update** remain untested by the
+agent. The user's success report for the preceding plugin does not establish
+these results or compatibility with other games.
 The late-attachment tests load locally authored fake DLLs with NGX/Streamline
 export names. They prove interception/control flow, private-feature management
 and parameter handling, not NVIDIA's evaluation behavior or image quality.

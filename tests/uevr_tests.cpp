@@ -2,6 +2,8 @@
 #include "settings_io.hpp"
 #include "processing_owner.hpp"
 #include "late_attach_tests.hpp"
+#include "runtime_search.hpp"
+#include "frame_cadence.hpp"
 #include <uevr/API.h>
 #include <d3d12.h>
 #include <d3d11.h>
@@ -94,8 +96,34 @@ int main(int argc, char** argv) {
         const auto root = bin / "uevr-test-data" / std::to_wstring(GetCurrentProcessId());
         std::filesystem::create_directories(root); directory = root.wstring();
         settings_tests(root);
+        {
+            const auto primary = root / "runtime", executable = root / "game";
+            std::filesystem::create_directories(primary); std::filesystem::create_directories(executable);
+            const auto fixture = bin / "test-fixtures" / "nvngx_dlss.dll";
+            std::filesystem::copy_file(fixture, executable / "cheeky-loader-test.dll");
+            auto loaded = load_runtime_library(L"cheeky-loader-test.dll", primary.c_str(), executable.c_str());
+            require(loaded.module && loaded.error == 0 && std::filesystem::path(loaded.path.data()).parent_path() == executable,
+                "Optional runtime loads from executable directory when absent beside runtime");
+            FreeLibrary(loaded.module);
+            std::filesystem::copy_file(fixture, primary / "cheeky-loader-test.dll");
+            loaded = load_runtime_library(L"cheeky-loader-test.dll", primary.c_str(), executable.c_str());
+            require(loaded.module && std::filesystem::path(loaded.path.data()).parent_path() == primary, "Runtime directory takes precedence");
+            FreeLibrary(loaded.module);
+            loaded = load_runtime_library(L"cheeky-missing-test.dll", primary.c_str(), executable.c_str());
+            require(!loaded.module && loaded.error != 0, "Missing optional runtime reports loader failure");
+            FrameCadence cadence;
+            for (unsigned i = 0; i <= 100; ++i) cadence.sample(10 + i * 0.01, true);
+            require(std::abs(cadence.average_ms - 10) < 0.001, "Present cadence averages real intervals");
+            cadence.sample(12, true);
+            require(cadence.average_ms == 0, "Pause clears stale present cadence");
+            for (unsigned i = 1; i <= 100; ++i) cadence.sample(12 + i * 0.02, true);
+            require(std::abs(cadence.average_ms - 20) < 0.001, "Cadence recovers after pause");
+            cadence.sample(14.02, false);
+            require(cadence.average_ms == 0, "SR toggle starts a fresh cadence window");
+        }
         const bool conflict_mode = argc > 1 && std::string(argv[1]) == "--conflict";
-        const bool hardware = argc > 1 && std::string(argv[1]) == "--hardware";
+        bool hardware{};
+        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--hardware") hardware = true;
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
@@ -145,7 +173,7 @@ int main(int argc, char** argv) {
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
         if (late) {
             command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
-            verify_late_attach_test(get);
+            verify_late_attach_test(get, command);
             return 0;
         }
         if (dx11) {
@@ -170,6 +198,25 @@ int main(int argc, char** argv) {
         command("1\n3\nset\nWidth=0.4\nHeight=nan");
         require(field(received,"revision")==revision && std::abs(field(received,"Width")-0.65)<0.0001, "Invalid transaction is atomic");
         command("1\n4\nset\nEnabled=true");
+        command("1\n40\nset\nNrIntensity=0.4\nGazeSmoothingMs=60");
+        command("1\n41\ndefaults_nr");
+        require(std::abs(field(received,"Width")-0.65)<0.0001 && field(received,"NrIntensity")==1 && field(received,"GazeSmoothingMs")==60,
+            "NR reset preserves SR and gaze");
+        command("1\n42\nset\nNrIntensity=0.4");
+        command("1\n43\ndefaults_gaze");
+        require(std::abs(field(received,"Width")-0.65)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001 && field(received,"GazeSmoothingMs")==20,
+            "Gaze reset preserves SR and NR");
+        command("1\n44\ndefaults_sr");
+        require(std::abs(field(received,"Width")-0.55)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001,
+            "SR reset preserves NR");
+        const auto reset_revision = field(received,"revision");
+        command("1\n45\ndefaults_typo");
+        require(field(received,"revision") == reset_revision, "Unknown reset group is atomic");
+        command("1\n46\nset\nWidth=0.65\nNrIntensity=1");
+        require(received.find("\"setting_groups\":{") != received.npos && received.find("\"nr_details\":{") != received.npos &&
+            received.find("\"frame\":{") != received.npos, "Expanded diagnostic snapshot bridge");
+        for (unsigned i = 0; i < 35; ++i) { Sleep(10); present(); }
+        require(field(snapshot(get), "present_ms") > 0, "Host presents feed the exported frame cadence");
         if (!dx11) {
         const auto before = snapshot(get);
         ComPtr<ID3D12CommandAllocator> allocator; check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"Allocator");

@@ -1730,6 +1730,8 @@ bool on_gaze_resolve(reshade::api::command_list* list, reshade::api::resource so
 }
 
 void on_gaze_reset_list(reshade::api::command_list* list) {
+    if (list->get_device()->get_api() == reshade::api::device_api::d3d12)
+        note_d3d12_command_list_reset(reinterpret_cast<ID3D12GraphicsCommandList*>(list->get_native()));
     reset_gaze_copies(list->get_native());
 }
 

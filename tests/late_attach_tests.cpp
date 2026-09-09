@@ -1,6 +1,7 @@
 #include "late_attach_tests.hpp"
 #include "mock_ngx_parameters.hpp"
 #include "streamline_abi.hpp"
+#include "timing_list_alias.hpp"
 #include <wrl/client.h>
 #include <vector>
 #include <stdexcept>
@@ -85,7 +86,9 @@ void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx1
         for(unsigned i=0;i<4;++i) {
             D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC d{}; d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width=d.Height=i==3?256:128;
-            d.DepthOrArraySize=d.MipLevels=1; d.Format=DXGI_FORMAT_R16G16B16A16_FLOAT; d.SampleDesc.Count=1; d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            d.DepthOrArraySize=d.MipLevels=1;
+            d.Format = i == 1 ? DXGI_FORMAT_R32_FLOAT : i == 2 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.SampleDesc.Count=1; d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             ComPtr<ID3D12Resource> texture; check(dx12->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,i==3?D3D12_RESOURCE_STATE_UNORDERED_ACCESS:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&texture)),"Late DX12 texture");
             f.params.Set(names[i],texture.Get()); f.textures12.push_back(texture);
         }
@@ -110,7 +113,7 @@ void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx1
     require(ngx_succeeded(f.evaluate()),"Evaluate before injection");
     require(f.creates()==1 && f.evaluates()==1,"Fixture initialized before hook installation");
 }
-void verify_late_attach_test(CheekyUEVRSnapshotFn get) {
+void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     auto& f=fixture();
     // Missing metadata must forward unchanged and must not create a feature.
     const auto complete=f.params.values;
@@ -168,6 +171,56 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get) {
         else proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
     }
     require(ngx_succeeded(f.evaluate()),"Evaluate recreated game feature"); f.finish_gpu();
+    if (!f.context && !f.use_sl) {
+        command("1\n70\nset\nEnabled=false");
+        // UE can discard a recording after evaluation. Exhaust more than the
+        // entire timestamp pool without submitting those command lists.
+        for (unsigned i = 0; i < 9; ++i) {
+            Sleep(130);
+            require(ngx_succeeded(f.evaluate()), "Evaluate discarded timing recording");
+            check(f.list->Close(), "Close discarded timing recording");
+            check(f.allocator->Reset(), "Reset discarded allocator");
+            check(f.list->Reset(f.allocator.Get(), nullptr), "Discard timing recording");
+            check(f.list->Close(), "Close empty discarded list");
+            f.list.Reset(); f.allocator.Reset();
+            check(f.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&f.allocator)), "Replacement allocator");
+            check(f.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, f.allocator.Get(), nullptr, IID_PPV_ARGS(&f.list)), "Replacement list");
+        }
+        for (unsigned i = 0; i < 8; ++i) {
+            Sleep(130);
+            require(ngx_succeeded(f.evaluate()), "Evaluate native timing frame");
+            f.finish_gpu(); command("1\n71\nget");
+        }
+        const auto data = snapshot(get);
+        const auto offset = data.rfind("\"native_ms\":");
+        require(offset != data.npos && std::stod(data.substr(offset + 12)) > 0,
+            "Native GPU timings recover after discarded command lists");
+        TimingListAlias alias(f.list.Get());
+        for (unsigned i = 0; i < 8; ++i) {
+            Sleep(130);
+            const auto result = f.use_c ? f.evaluate12c(alias.get(), f.handle, &f.params, nullptr)
+                : f.evaluate12(alias.get(), f.handle, &f.params, nullptr);
+            require(ngx_succeeded(result), "Evaluate through forwarding command-list alias");
+            f.finish_gpu(); command("1\n72\nget");
+            require(alias.references == 0, "Submitted native list matches timing recorded through wrapper");
+        }
+        require(snapshot(get).find("\"waiting_submission\":0") != std::string::npos, "No stranded wrapper timestamp slots");
+        command("1\n73\nset\nEnabled=true\nPeripheralDlaa=true");
+        for (unsigned i = 0; i < 8; ++i) {
+            Sleep(130); require(ngx_succeeded(f.evaluate()), "Foveated and peripheral timing frame");
+            f.finish_gpu(); command("1\n74\nget");
+        }
+        const auto enabled_data = snapshot(get);
+        for (const auto* key : {"\"foveated_ms\":", "\"peripheral_ms\":"}) {
+            const auto position = enabled_data.rfind(key);
+            if (position == enabled_data.npos || std::stod(enabled_data.substr(position + std::strlen(key))) <= 0) {
+                printf("Missing timing: %s\n%s\n", key, enabled_data.c_str());
+            }
+            require(position != enabled_data.npos && std::stod(enabled_data.substr(position + std::strlen(key))) > 0,
+                "Foveated center and peripheral GPU timings reach snapshot");
+        }
+        puts("GPU timestamps: discarded recordings, forwarding wrapper, native/center/peripheral readback passed");
+    }
     require(ngx_succeeded(f.release(f.handle)),"Release recreated feature");
     puts("Late attachment: cached exports, pre-existing feature, missing metadata, private reuse, release/recreation passed");
 }

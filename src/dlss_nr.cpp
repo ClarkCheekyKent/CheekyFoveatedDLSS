@@ -4,6 +4,7 @@
 #include "dlss_nr_contract.hpp"
 #include "crop_motion.hpp"
 #include "runtime.hpp"
+#include "runtime_search.hpp"
 
 #include <Windows.h>
 #include <d3dcompiler.h>
@@ -321,29 +322,19 @@ DWORD WINAPI hook_nr_get_module_file_name(
         trace_event("DLSS-NR runtime initialization failed: add-on directory unavailable");
         return false;
     }
-    std::array<wchar_t, 32768U> path = directory;
-    constexpr wchar_t filename[] = L"\\nvngx_dlssnr.dll";
-    const auto used = std::wcslen(path.data());
-    if (used + std::size(filename) > path.size()) {
-        runtime.state = 3U;
-        diagnostics.state = DlssNrState::runtime_failed;
-        return false;
-    }
-    std::memcpy(path.data() + used, filename, sizeof(filename));
-    runtime.module = LoadLibraryExW(
-        path.data(),
-        nullptr,
-        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
-    );
+    std::array<wchar_t, 32768U> executable{};
+    const auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    auto* slash = length && length < executable.size() ? std::wcsrchr(executable.data(), L'\\') : nullptr;
+    if (slash) *slash = L'\0'; else executable[0] = L'\0';
+    const auto loaded = load_runtime_library(L"nvngx_dlssnr.dll", directory.data(), executable.data(),
+        [](const wchar_t* path, DWORD error) {
+            trace_event("DLSS-NR runtime search path=%ls error=%lu", path, static_cast<unsigned long>(error));
+        });
+    runtime.module = loaded.module;
     if (runtime.module == nullptr) {
         runtime.state = 2U;
         diagnostics.state = DlssNrState::runtime_missing;
-        diagnostics.last_result = GetLastError();
-        trace_event(
-            "DLSS-NR runtime missing path=%ls error=%lu",
-            path.data(),
-            static_cast<unsigned long>(GetLastError())
-        );
+        diagnostics.last_result = loaded.error;
         return false;
     }
 
@@ -1747,8 +1738,8 @@ DlssNrSnapshot dlss_nr_snapshot() noexcept {
 const char* dlss_nr_state_name(const DlssNrState state) noexcept {
     switch (state) {
     case DlssNrState::waiting: return "Waiting for a compatible DLSS frame";
-    case DlssNrState::disabled: return "Disabled in the add-on";
-    case DlssNrState::runtime_missing: return "nvngx_dlssnr.dll not found beside the add-on";
+    case DlssNrState::disabled: return "Disabled";
+    case DlssNrState::runtime_missing: return "nvngx_dlssnr.dll could not load beside the processing DLL or game executable; see log";
     case DlssNrState::runtime_failed: return "DLSS-NR runtime initialization failed";
     case DlssNrState::unsupported_resources: return "Unsupported or missing depth, motion, or output resource";
     case DlssNrState::feature_failed: return "DLSS-NR feature 18 creation failed";
