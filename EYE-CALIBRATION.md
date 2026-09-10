@@ -2,9 +2,11 @@
 
 Cheeky follows marked DLSS outputs to the physical eyes submitted to OpenVR or
 OpenXR. The sharp region can then follow the correct eye when videos, menus or
-scenes change the order of the game's stereo views. Calibration runs every frame
+scenes change the order of the game's stereo views. Calibration samples immediately when enabled, then every 10 VR frames,
 and starts enabled when ReShade or UEVR attaches, independently of DLSS-SR's
-foveation switch. It does not rewrite saved stereo or gaze preferences.
+foveation switch. Pending readbacks still drain between samples; the established
+eye mapping remains active. A changed mapping can take up to 10 frames plus
+readback latency to detect. It does not rewrite saved stereo or gaze preferences.
 
 ## Supported paths and installation
 

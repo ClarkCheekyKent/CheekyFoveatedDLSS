@@ -358,7 +358,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
                 {"GPU marker / copy work", (c.gpu_samples or 0) > 0 and string.format("%.2f us", c.gpu_us or 0) or "Not sampled / unavailable"},
                 {"Readback latency", string.format("%.2f VR frames", c.latency_frames or 0)},
                 {"Last recognized left / right", tostring(c.left_view or 0) .. " / " .. tostring(c.right_view or 0)}})
-            text("Samples every frame. Corrections count changes to an existing eye assignment; confirmations do not increment it.")
+            text("Samples every 10 VR frames. Corrections count changes to an existing eye assignment; confirmations do not increment it.")
             text("GPU time covers marker and copy commands; CPU time excludes lock waiting.")
             if imgui.button("Reset eye calibration counters") then send("calibration_reset") end
             imgui.tree_pop()

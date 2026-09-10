@@ -699,11 +699,12 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     memset(mapped, 0, 128 * 128 * 4);
     black->Unmap(0, nullptr);
     std::uint64_t warm_allocations{};
-    for (unsigned frame = 0; frame < (layer ? 65U : 64U); ++frame) {
+    for (unsigned frame = 0; frame < (layer ? 641U : 640U); ++frame) {
+        bool sampling{};
         if (layer)
             layer->begin();
         else
-            eye_calibration_frame(backend, generation, 12);
+            sampling = eye_calibration_frame(backend, generation, 12);
         gpu.begin();
         for (auto* r : {a.Get(), b.Get()}) {
             gpu.barrier(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -719,13 +720,13 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         eye_calibration_stamp12(gpu.list.Get(), a.Get(), 9101, 0, 0, 128, 128);
         eye_calibration_stamp12(gpu.list.Get(), b.Get(), 9102, 0, 0, 128, 128);
         if (scaling) {
-            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 32, flipped, ambiguous, shifted);
+            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 320, flipped, ambiguous, shifted);
         } else {
             gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gpu.barrier(target.Get(), state, D3D12_RESOURCE_STATE_COPY_DEST);
-            gpu.copy(target.Get(), 0, 0, frame < 32 ? b.Get() : a.Get());
-            gpu.copy(target.Get(), array ? 1 : 0, array ? 0 : 128, frame < 32 ? a.Get() : b.Get());
+            gpu.copy(target.Get(), 0, 0, frame < 320 ? b.Get() : a.Get());
+            gpu.copy(target.Get(), array ? 1 : 0, array ? 0 : 128, frame < 320 ? a.Get() : b.Get());
             gpu.barrier(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, state);
             gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -742,13 +743,13 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
                 const auto ticket = eye_calibration_submit12(
                     target.Get(), gpu.submit_queue.Get(), eye, array ? 0 : eye * .5F, 0,
                     array ? 1 : (eye + 1) * .5F, 1, array ? eye : 0, backend, generation);
-                require(ticket != 0, "D3D12 capture was not accepted");
+                require((ticket != 0) == sampling, "D3D12 capture must follow the frame sampling cadence");
                 eye_calibration_result(ticket, 0);
             }
         gpu.wait(gpu.submit_queue.Get());
         calibration12_retired(gpu.list.Get());
         eye_calibration_tick();
-        if (frame == 31 && !ambiguous) {
+        if (frame == 319 && !ambiguous) {
             require(eye_calibration_stats().corrections == 1 && stereo_eye_assignment(9101).eye_index == 1,
                     "D3D12 initial eye swap was not corrected once");
             warm_allocations = eye_calibration_stats().allocations;

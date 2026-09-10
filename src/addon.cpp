@@ -616,7 +616,7 @@ void draw_eye_calibration_diagnostics() {
         diagnostic_row("Readback latency", "%.2f VR frames", s.latency_frames);
         diagnostic_row("Last recognized left / right", "%llu / %llu", s.left_view, s.right_view);
     }
-    ImGui::TextWrapped("Samples every frame. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
+    ImGui::TextWrapped("Samples every 10 VR frames. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
     if (ImGui::Button("Reset eye calibration counters")) eye_calibration_reset_stats();
     ImGui::TreePop();
 }

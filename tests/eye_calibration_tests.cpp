@@ -54,7 +54,7 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
         Sleep(2);
         eye_calibration_tick(); // Explicit GPU progress is test-only.
     };
-    for (unsigned i = 0; i < 32; ++i)
+    for (unsigned i = 0; i < 320; ++i)
         frame(true);
     const auto warm = eye_calibration_stats();
     if (obscure || duplicate_eye) {
@@ -88,7 +88,7 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     require(warm.applied > 0 && warm.corrections == 1 && stereo_eye_assignment(101).calibrated &&
                 stereo_eye_assignment(101).eye_index == 1,
             "Initial reversed eye mapping was not corrected exactly once");
-    for (unsigned i = 0; i < 32; ++i)
+    for (unsigned i = 0; i < 320; ++i)
         frame(false);
     require(eye_calibration_stats().corrections == 2 && stereo_eye_assignment(101).eye_index == 0,
             "Transition must correct the mapping once, not once per confirming frame");
@@ -104,7 +104,7 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     require(result.valid > warm.valid && result.left_view == 101 && result.right_view == 202,
             "Continuous mode missed changed destinations");
     require(result.allocations == warm.allocations, "GPU objects were allocated again after pool warm-up");
-    require(result.in_flight == 0 && result.frames == 64, "Continuous readbacks did not drain");
+    require(result.in_flight == 0 && result.frames == 640 && result.captures == 64, "Continuous readbacks did not drain");
     require(!stereo_eye_assignment(101).calibrated,
             "Disabling must clear correction and reject outstanding results");
     require(result.gpu_us > 0 && result.cpu_us_per_frame > 0, "Continuous timing counters unavailable");

@@ -74,6 +74,7 @@ struct State {
     std::array<Frame, ring_size> ring;
     int current{-1};
     std::uint64_t sequence{};
+    unsigned frames_until_capture{};
     std::uint64_t measurement_start{}, last_valid_sequence{};
     std::uint64_t epoch{};
     ComPtr<ID3D11Device> device;
@@ -400,6 +401,7 @@ void eye_calibration_enable(bool value) noexcept {
     auto& s = state();
     std::lock_guard lock(s.mutex);
     if (enabled.exchange(value) != value) {
+        s.frames_until_capture = 0;
         ++s.epoch;
         clear_stereo_calibration();
     }
@@ -458,6 +460,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     if (s.backend != backend || s.session_generation != session_generation) {
         ++s.epoch;
         clear_stereo_calibration();
+        s.frames_until_capture = 0;
         s.backend = backend;
         s.session_generation = session_generation;
         s.unsupported_submission = false;
@@ -478,9 +481,15 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     if (!on)
         return false;
     ++s.stats.frames;
+    // Drain previous readbacks on every frame, but stamp/capture only one in ten.
+    if (s.frames_until_capture) {
+        --s.frames_until_capture;
+        return false;
+    }
+    s.frames_until_capture = 9;
     // Rotate through all slots so the warm-up is bounded and reproducible.
     for (unsigned n = 0; n < ring_size; ++n) {
-        const unsigned i = unsigned((s.sequence + n) % ring_size);
+        const unsigned i = unsigned((s.stats.captures + n) % ring_size);
         auto& f = s.ring[i];
         if (f.busy)
             continue;
