@@ -3,31 +3,29 @@
 #include <d3d12.h>
 #include <cstdint>
 #include <deque>
-#include <wrl/client.h>
+#include <memory>
 
 namespace cheeky::foveated_dlss {
-// Internal NR use bookkeeping. The owner serializes access and retains its
-// resources until empty(); collection is independent of owner retirement.
+struct NrRecording;
+using NrSignal = HRESULT (*)(ID3D12CommandQueue*, ID3D12Fence*, std::uint64_t);
+// All operations use calibration12_execution_mutex(), before any owner mutex.
+// A forwarding object's private data identifies the same recording generation.
+bool ensure_dlss_nr_recording(ID3D12GraphicsCommandList*) noexcept;
+void nr_recording_submitted(ID3D12CommandQueue*, ID3D12Object*, NrSignal = nullptr) noexcept;
+void nr_recording_reset(ID3D12Object*, HRESULT reset_result) noexcept;
+
+// Resources belong to recordings, not their first execution. A use drains only
+// after successful Reset/destruction and completion on every executing queue.
 class NrLifetime {
 public:
-    using Signal = HRESULT (*)(ID3D12CommandQueue*, ID3D12Fence*, std::uint64_t);
     bool record(ID3D12GraphicsCommandList*) noexcept;
-    void submitted(ID3D12CommandQueue*, ID3D12Object*, bool already_submitted) noexcept;
-    void signal_pending(Signal = signal) noexcept;
-    void collect() noexcept;
+    void collect(NrSignal = nullptr) noexcept;
     [[nodiscard]] bool empty() const noexcept { return uses_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return uses_.size(); }
-    [[nodiscard]] std::uint64_t fences_created() const noexcept { return created_; }
-    [[nodiscard]] std::uint64_t fences_released() const noexcept { return released_; }
+    [[nodiscard]] std::uint64_t fences_created() const noexcept;
+    [[nodiscard]] std::uint64_t fences_released() const noexcept;
 private:
-    static HRESULT signal(ID3D12CommandQueue*, ID3D12Fence*, std::uint64_t);
-    struct Use {
-        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
-        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-        std::uint64_t identity{};
-        Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
-    };
-    std::deque<Use> uses_;
+    std::deque<std::shared_ptr<NrRecording>> uses_;
     std::uint64_t created_{}, released_{};
 };
 } // namespace cheeky::foveated_dlss

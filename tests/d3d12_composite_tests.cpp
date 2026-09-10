@@ -1,4 +1,5 @@
 #include "dlss_nr_input.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include "d3d12_composite_shader.hpp"
 #include "d3d11_composite_shader.hpp"
 #include "d3d12_output_contract.hpp"
@@ -50,7 +51,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return object_->SetName(name); }
 };
 
-void run_nr_recycling(ID3D12Device* device, bool alias) {
+void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
     ComPtr<ID3D12InfoQueue> messages;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) messages->ClearStoredMessages();
     ComPtr<ID3D12CommandQueue> queue;
@@ -80,6 +81,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias) {
     settings.nr_processing_order = NrProcessingOrder::before_upscaling;
     DlssNrFrame frame{};
     frame.view_id = 501;
+    frame.route = route;
     frame.command_list = list.Get();
     frame.color = color.Get();
     frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -90,6 +92,9 @@ void run_nr_recycling(ID3D12Device* device, bool alias) {
         if (iteration != 1) {
             check(allocator->Reset());
             check(list->Reset(allocator.Get(), nullptr));
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+            nr_recording_reset(alias ? static_cast<ID3D12Object*>(&submitted) : list.Get(), S_OK);
+#endif
         }
         require(prepare_dlss_nr_input(frame, settings) != nullptr,
             "Before NR exhausted its input pool across aliased submissions");
@@ -100,8 +105,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias) {
                 "NR reused an input whose commands were still being recorded");
         }
         check(list->Close());
-        // ReShade notifies BEFORE ExecuteCommandLists.
-        note_dlss_nr_input_submission(queue.Get(), alias ? static_cast<ID3D12Object*>(&submitted) : list.Get());
+        // No NR accounting at the pre-Execute host notification.
         if (iteration == 1) {
             // An idle queue must not make a pre-submission notification complete.
             check(queue->Signal(done.Get(), 1));
@@ -117,6 +121,9 @@ void run_nr_recycling(ID3D12Device* device, bool alias) {
         }
         ID3D12CommandList* lists[]{list.Get()};
         queue->ExecuteCommandLists(1, lists);
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+        nr_recording_submitted(queue.Get(), alias ? static_cast<ID3D12Object*>(&submitted) : list.Get());
+#endif
         collect_dlss_nr_input_submissions();
         if (iteration == 1) {
             const bool held = prepare_dlss_nr_input(frame, settings) == nullptr;
@@ -130,8 +137,47 @@ void run_nr_recycling(ID3D12Device* device, bool alias) {
         const auto waited = WaitForSingleObject(event, 10000);
         CloseHandle(event);
         require(waited == WAIT_OBJECT_0, "NR recycling test timed out");
+        if (iteration == 1) {
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "GPU completion made an unretired input reusable");
+            ComPtr<ID3D12CommandQueue> replay_queue;
+            check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&replay_queue)));
+            check(replay_queue->Wait(gate.Get(), 2));
+            replay_queue->ExecuteCommandLists(1, lists);
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+            nr_recording_submitted(replay_queue.Get(), &submitted);
+#endif
+            // Retire while the second queue remains blocked. Use a different
+            // allocator: the old allocator still belongs to pending execution.
+            auto pending_allocator = allocator;
+            allocator.Reset();
+            check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+            check(list->Reset(allocator.Get(), nullptr));
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+            nr_recording_reset(&submitted, S_OK);
+#endif
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "Reset reused private inputs while another queue was pending");
+            release_dlss_nr_inputs(501);
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "View release bypassed the eight-input limit during replay");
+            ComPtr<ID3D12Fence> replay_done;
+            check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&replay_done)));
+            check(gate->Signal(2));
+            check(replay_queue->Signal(replay_done.Get(), 1));
+            HANDLE replay_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            check(replay_done->SetEventOnCompletion(1, replay_event));
+            const auto replay_waited = WaitForSingleObject(replay_event, 10000);
+            CloseHandle(replay_event);
+            require(replay_waited == WAIT_OBJECT_0, "NR input replay queue timed out");
+            require(prepare_dlss_nr_input(frame, settings) != nullptr,
+                "Private input pool did not recover after retirement and all queue completions");
+            check(list->Close()); // The next Reset discards this unsubmitted copy.
+        }
     }
     release_dlss_nr_inputs(501);
+    list.Reset(); // Destruction retires the final completed recording.
+    collect_dlss_nr_input_submissions();
     if (messages) {
         for (UINT64 index = 0; index < messages->GetNumStoredMessages(); ++index) {
             SIZE_T size{};
@@ -144,7 +190,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias) {
         }
     }
     std::cout << "Before NR recycled inputs across 24 submissions; aliased=" << alias
-        << "; pending GPU inputs protected\n";
+        << "; route=" << static_cast<unsigned>(route) << "; replay and pending GPU inputs protected\n";
 }
 
 ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE type) {
@@ -399,7 +445,9 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     check(list->Close());
     ID3D12CommandList* lists[]{list.Get()};
     queue->ExecuteCommandLists(1, lists);
-    note_dlss_nr_input_submission(queue.Get(), list.Get());
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+    nr_recording_submitted(queue.Get(), list.Get());
+#endif
     collect_dlss_nr_input_submissions();
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
@@ -518,8 +566,10 @@ int run_d3d12_composite_tests() {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
         ComPtr<ID3D12Device> device;
         check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-        run_nr_recycling(device.Get(), true);
-        run_nr_recycling(device.Get(), false);
+        for (auto route : {DlssNrRoute::d3d12_native, DlssNrRoute::streamline, DlssNrRoute::d3d11_transport}) {
+            run_nr_recycling(device.Get(), true, route);
+            run_nr_recycling(device.Get(), false, route);
+        }
         run_case(device.Get(), 1, 1);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, true);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, false);

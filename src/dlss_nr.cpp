@@ -1,5 +1,6 @@
 #include "dlss_nr_input.hpp"
 #include "dlss_nr_lifetime.hpp"
+#include "eye_calibration_d3d12.hpp"
 #include "dlss_nr.hpp"
 
 #include "d3d12_output_contract.hpp"
@@ -110,6 +111,7 @@ struct CachedFeature {
     FeatureKey key{};
     NgxParameters* parameters{};
     NgxHandle* handle{};
+    bool reusable{true};
 };
 
 struct ViewState {
@@ -182,6 +184,7 @@ bool view_complete(ViewState& view) noexcept {
 bool record_use(ViewState& view, ID3D12GraphicsCommandList* list) noexcept {
     return view.uses.record(list);
 }
+void evict_retired_features(ViewState& view) noexcept;
 void collect_retired_views() noexcept {
     for (auto it = views.begin(); it != views.end();) {
         const bool complete = view_complete(*it);
@@ -189,7 +192,16 @@ void collect_retired_views() noexcept {
             release_feature(*it);
             for (auto& gpu : it->gpu_resources) release_gpu(gpu);
             it = views.erase(it);
-        } else ++it;
+        } else {
+            if (complete) {
+                evict_retired_features(*it);
+                while (it->gpu_resources.size() > gpu_resource_cache_capacity) {
+                    release_gpu(it->gpu_resources.front());
+                    it->gpu_resources.pop_front();
+                }
+            }
+            ++it;
+        }
     }
 }
 
@@ -484,7 +496,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     if (view.feature_failed && view.has_key && view.key == key) return false;
     for (auto iterator = view.retired_features.begin();
          iterator != view.retired_features.end(); ++iterator) {
-        if (!(iterator->key == key)) continue;
+        if (!iterator->reusable || !(iterator->key == key)) continue;
         const CachedFeature current{view.key, view.parameters, view.handle};
         view.parameters = iterator->parameters;
         view.handle = iterator->handle;
@@ -560,8 +572,9 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     );
     diagnostics.last_result = result;
     if (!ngx_succeeded(result) || handle == nullptr) {
-        if (handle != nullptr) static_cast<void>(runtime.release_feature(handle));
-        static_cast<void>(runtime.destroy_parameters(parameters));
+        // Creation may have recorded GPU work even on failure. Retain these
+        // objects with the recording, but never reuse a failed feature.
+        view.retired_features.push_back({key, parameters, handle, false});
         diagnostics.state = DlssNrState::feature_failed;
         ++diagnostics.failed_calls;
         view.feature_failed = true;
@@ -1231,6 +1244,7 @@ bool evaluate_dlss_nr(
     const DlssNrFrame& frame,
     const Settings& settings
 ) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     collect_retired_views();
     diagnostics.skip_reason = nullptr;
@@ -1289,6 +1303,13 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
+    if (!ensure_dlss_nr_recording(frame.command_list)) {
+        device->Release();
+        diagnostics.state = DlssNrState::input_preparation_failed;
+        diagnostics.skip_reason = "NR requires compatible Execute/Reset observation and recording identity";
+        ++diagnostics.failed_calls;
+        return false;
+    }
     const bool runtime_ready = initialize_runtime(device);
     device->Release();
     if (!runtime_ready) return false;
@@ -1323,6 +1344,7 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
+    if (!record_use(view, frame.command_list)) return false;
     if (!create_feature(view, frame, settings, working_width, working_height)) {
         return false;
     }
@@ -1333,7 +1355,7 @@ bool evaluate_dlss_nr(
         working_width,
         working_height
     );
-    if (gpu == nullptr || !record_use(view, frame.command_list)) return false;
+    if (gpu == nullptr) return false;
     const auto depth_x = frame.color_is_region
         ? ScaledSubrect{frame.depth_base_x, frame.depth_width}
         : scale_subrect(
@@ -1675,7 +1697,10 @@ void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noe
     if (!settings.nr_enabled || !settings.nr_alignment_border_enabled ||
         settings.nr_processing_order != NrProcessingOrder::before_upscaling ||
         !frame.color || !frame.command_list || !frame.output_width || !frame.output_height) return;
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
+    collect_retired_views();
+    if (!ensure_dlss_nr_recording(frame.command_list)) return;
     // Compute the rounded processing region first, then map it to display pixels.
     auto region = calculate_region(settings, frame.input_width, frame.input_height,
         frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr, frame.input_width, frame.input_height,
@@ -1696,6 +1721,7 @@ void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noe
 }
 
 void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const char* reason) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     diagnostics.route = route;
     diagnostics.processing_order = settings.nr_processing_order;
@@ -1707,25 +1733,20 @@ void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const cha
     ++diagnostics.candidate_calls;
     ++diagnostics.failed_calls;
 }
-void note_dlss_nr_submission(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list,
-    bool already_submitted) noexcept {
-    if (!queue || !list) return;
-    std::lock_guard lock(nr_mutex);
-    for (auto& view : views) view.uses.submitted(queue, list, already_submitted);
-    collect_retired_views();
-}
 void collect_dlss_nr_submissions() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
-    for (auto& view : views) view.uses.signal_pending();
     collect_retired_views();
 }
 void release_dlss_nr_view(const DlssViewId view_id) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     release_dlss_nr_inputs(view_id);
     std::lock_guard lock(nr_mutex);
     for (auto& view : views) if (view.view_id == view_id) view.retired = true;
     collect_retired_views();
 }
 void release_dlss_nr_resources() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     release_dlss_nr_inputs();
     std::lock_guard lock(nr_mutex);
     for (auto& view : views) view.retired = true;
@@ -1737,6 +1758,7 @@ void release_dlss_nr_resources() noexcept {
 
 void reset_dlss_nr() noexcept {
     requested_reset_generation.fetch_add(1U, std::memory_order_acq_rel);
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     if (runtime.state == 2U) runtime.state = 0U;
     for (auto& view : views) {
@@ -1748,6 +1770,7 @@ void reset_dlss_nr() noexcept {
 }
 
 DlssNrSnapshot dlss_nr_snapshot() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     return diagnostics;
 }

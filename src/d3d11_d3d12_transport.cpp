@@ -1950,7 +1950,6 @@ bool evaluate_d3d11_via_d3d12(
     }
     ID3D12CommandList* lists[]{device->command_list12};
     device->queue12->ExecuteCommandLists(1U, lists);
-    note_dlss_nr_submission(device->queue12, device->command_list12, true);
     crop_motion12_submitted(device->queue12, 1U, lists);
     collect_crop_motion12();
     slot.done_value = device->next_fence_value++;
@@ -2120,7 +2119,6 @@ bool evaluate_d3d11_via_d3d12(
                 device->queue12->ExecuteCommandLists(1U, lists);
                 crop_motion12_submitted(device->queue12, 1U, lists);
                 collect_crop_motion12();
-                note_dlss_nr_submission(device->queue12, device->command_list12, true);
                 const auto nr_done_value = device->next_fence_value++;
                 if (SUCCEEDED(device->queue12->Signal(
                         device->fence12, nr_done_value

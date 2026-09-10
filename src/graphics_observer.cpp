@@ -2,6 +2,7 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "eye_calibration_d3d12.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include <MinHook.h>
 #include <wrl/client.h>
 #include <array>
@@ -146,8 +147,10 @@ void STDMETHODCALLTYPE execute(ID3D12CommandQueue* queue, UINT count, ID3D12Comm
         real_execute(queue, count, lists);
         for (UINT i = 0; i < count; ++i) {
             ComPtr<ID3D12GraphicsCommandList> graphics;
-            if (lists[i] && SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&graphics))))
+            if (lists[i] && SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&graphics)))) {
+                nr_recording_submitted(queue, graphics.Get());
                 calibration12_submitted(queue, graphics.Get());
+            }
         }
     }
     // This is AFTER execution is enqueued, unlike the ReShade pre-submit event.
@@ -179,8 +182,10 @@ HRESULT STDMETHODCALLTYPE reset(ID3D12GraphicsCommandList* list, ID3D12CommandAl
     {
         std::lock_guard execution_lock(calibration12_execution_mutex());
         hr = real_reset(list, allocator, state);
-        if (SUCCEEDED(hr))
+        if (SUCCEEDED(hr)) {
+            nr_recording_reset(list, hr);
             calibration12_retired(list);
+        }
     }
     if (SUCCEEDED(hr)) {
         note_d3d12_command_list_reset(list);
@@ -294,6 +299,14 @@ bool initialize_native_observer(ID3D12Device* device, ID3D12CommandQueue* queue)
     ready = true;
     log_info("Native D3D12 submission/copy observer ready");
     return true;
+}
+bool ensure_native_observer(ID3D12GraphicsCommandList* list) noexcept {
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    return list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) &&
+        SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))) &&
+        initialize_native_observer(device.Get(), queue.Get());
 }
 NativeObserverStatus native_observer_status() noexcept {
     return {ready.load(), submissions.load(), copies.load(), resets.load(), destroyed.load()};

@@ -1498,8 +1498,6 @@ void note_d3d12_command_list_submission_impl(
 ) noexcept {
     if (queue == nullptr || command_list == nullptr) return;
     note_peripheral_dlaa_submission(queue, command_list);
-    note_dlss_nr_input_submission(queue, command_list);
-    note_dlss_nr_submission(queue, command_list);
     ID3D12CommandList* motion_lists[]{command_list};
     crop_motion12_submitted(queue, 1U, motion_lists);
     std::uint64_t frequency{};

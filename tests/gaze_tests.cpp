@@ -28,6 +28,7 @@
 namespace cheeky::foveated_dlss {
 // The core GPU harness explicitly drives post-submit/reset notifications.
 NativeObserverStatus native_observer_status() noexcept { return {true}; }
+bool ensure_native_observer(ID3D12GraphicsCommandList*) noexcept { return true; }
 bool initialize_native_observer(ID3D12Device*, ID3D12CommandQueue*) noexcept { return true; }
 
 void trace_event(const char*, ...) noexcept {}

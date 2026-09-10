@@ -180,6 +180,24 @@ endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
 add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
 
+add_executable(CheekyNrObserverTests
+    tests/nr_observer_tests.cpp tests/nr_lifetime_tests.cpp tests/d3d12_composite_tests.cpp
+    src/dlss_nr_lifetime.cpp src/dlss_nr_input.cpp src/dlss_nr_contract.cpp
+    src/d3d12_output_contract.cpp src/foveation.cpp src/settings.cpp src/graphics_observer.cpp
+    third_party/reshade/deps/minhook/src/buffer.c
+    third_party/reshade/deps/minhook/src/hook.c
+    third_party/reshade/deps/minhook/src/trampoline.c
+    third_party/reshade/deps/minhook/src/hde/hde64.c)
+target_compile_features(CheekyNrObserverTests PRIVATE cxx_std_20)
+target_compile_definitions(CheekyNrObserverTests PRIVATE CHEEKY_NR_NATIVE_OBSERVER WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+target_include_directories(CheekyNrObserverTests PRIVATE src shared third_party/reshade/deps/minhook/include)
+target_link_libraries(CheekyNrObserverTests PRIVATE d3d11 d3d12 dxgi d3dcompiler)
+set_target_properties(CheekyNrObserverTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
+if(MSVC)
+    target_compile_options(CheekyNrObserverTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
+endif()
+add_test(NAME CheekyNrObserverTests COMMAND CheekyNrObserverTests)
+
 option(CHEEKY_BUILD_UEVR "Build the UEVR plugin, resident runtime and host harness" ON)
 if(CHEEKY_BUILD_UEVR)
     set(CHEEKY_RUNTIME_SOURCES ${CHEEKY_FOVEATED_DLSS_SOURCES})

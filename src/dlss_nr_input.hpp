@@ -76,9 +76,6 @@ public:
 // The source is never written. A null result means SR must use original color.
 [[nodiscard]] ID3D12Resource* prepare_dlss_nr_input(
     DlssNrFrame frame, const Settings& settings) noexcept;
-void note_dlss_nr_input_submission(ID3D12CommandQueue* queue,
-    ID3D12Object* command_list) noexcept;
-// Call at present, after notified command lists have been submitted.
 void collect_dlss_nr_input_submissions() noexcept;
 void release_dlss_nr_inputs(DlssViewId view_id = 0U) noexcept;
 // Per-view transitions invalidate both SR histories, including fallback->NR.

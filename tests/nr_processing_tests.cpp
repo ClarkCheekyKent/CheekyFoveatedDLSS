@@ -7,6 +7,7 @@
 namespace cheeky::foveated_dlss {
 // Test executable substitutes the NVIDIA evaluator; production copy/orchestration
 // still records real D3D12 commands in the WARP suite.
+void note_dlss_nr_skipped(DlssNrRoute, const Settings&, const char*) noexcept {}
 int nr_test_evaluations{};
 bool nr_test_succeeds{true};
 DlssNrFrame nr_test_frame{};
