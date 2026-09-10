@@ -27,15 +27,21 @@ struct Gpu {
     std::uint64_t value{};
     HANDLE event{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     Gpu() {
+        wchar_t no_debug_layer[2]{};
+        const bool force_no_debug_layer =
+            GetEnvironmentVariableW(L"CHEEKY_NR_TEST_NO_DEBUG_LAYER", no_debug_layer, 2) == 1 &&
+            no_debug_layer[0] == L'1';
         ComPtr<ID3D12Debug> debug;
-        check(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)));
-        debug->EnableDebugLayer();
+        const bool debug_enabled = !force_no_debug_layer && SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)));
+        if (debug_enabled) debug->EnableDebugLayer();
+        std::cout << "NR lifetime debug validation: " << (debug_enabled ? "enabled" : "unavailable")
+                  << (force_no_debug_layer ? " (CHEEKY_NR_TEST_NO_DEBUG_LAYER=1)" : "") << '\n';
         ComPtr<IDXGIFactory4> factory;
         ComPtr<IDXGIAdapter> warp;
         check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
         check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-        check(device.As(&messages));
+        if (debug_enabled) check(device.As(&messages));
         D3D12_COMMAND_QUEUE_DESC desc{};
         check(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)));
         check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
@@ -70,6 +76,7 @@ struct Gpu {
         require(WaitForSingleObject(event, 10000) == WAIT_OBJECT_0, "GPU completion timed out");
     }
     void validate() {
+        if (!messages) return;
         for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
             SIZE_T size{};
             check(messages->GetMessage(i, nullptr, &size));

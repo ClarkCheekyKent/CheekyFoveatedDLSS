@@ -179,6 +179,9 @@ if(MSVC)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
 add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
+add_test(NAME CheekyNrLifetimeTestsNoDebugLayer COMMAND CheekyTests --nr-lifetime)
+set_tests_properties(CheekyNrLifetimeTestsNoDebugLayer PROPERTIES
+    ENVIRONMENT "CHEEKY_NR_TEST_NO_DEBUG_LAYER=1")
 
 add_executable(CheekyNrObserverTests
     tests/nr_observer_tests.cpp tests/nr_lifetime_tests.cpp tests/d3d12_composite_tests.cpp
@@ -197,6 +200,9 @@ if(MSVC)
     target_compile_options(CheekyNrObserverTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
 endif()
 add_test(NAME CheekyNrObserverTests COMMAND CheekyNrObserverTests)
+add_test(NAME CheekyNrObserverTestsNoDebugLayer COMMAND CheekyNrObserverTests)
+set_tests_properties(CheekyNrObserverTestsNoDebugLayer PROPERTIES
+    ENVIRONMENT "CHEEKY_NR_TEST_NO_DEBUG_LAYER=1")
 
 option(CHEEKY_BUILD_UEVR "Build the UEVR plugin, resident runtime and host harness" ON)
 if(CHEEKY_BUILD_UEVR)

@@ -200,3 +200,31 @@ on/off, live switches, resize/dynamic resolution, stereo, and moving gaze.
 Record the displayed processing/working dimensions, NR and total pipeline GPU
 milliseconds, and image-quality observations. Test missing NR runtime and
 unsupported resources too: SR must use original color without post-SR NR.
+
+## NR GPU lifetime validation
+
+`CheekyTests.exe --nr-lifetime` and `CheekyNrObserverTests.exe` run the same
+production NR lifetime assertions on WARP. Windows Graphics Tools is optional:
+the fixture prints whether D3D12 debug validation is enabled or unavailable.
+When enabled, failure to acquire the info queue and reported errors or corruption
+still fail the test. When unavailable, only debug-message inspection is skipped.
+All lifetime assertions remain active, including 1000 two-view completed-fence
+collection cycles, replay, multiple queues, Reset, aliases, destruction, and
+failed signaling. The observer executable uses the real native hooks and also
+runs the compositor tests.
+
+The test-only environment variable `CHEEKY_NR_TEST_NO_DEBUG_LAYER=1` forces the
+lifetime fixture through the unavailable-layer path without uninstalling
+Graphics Tools. The compositor fixture also honors this override so the native
+observer executable keeps one debug mode across its lifetime and copy tests.
+CTest registers normal and forced-fallback runs of both
+executables, each in a fresh process so debug-layer state cannot carry over.
+After building with CMake, run just the fallback cases (replace `build/cmake`
+with your CMake build directory):
+
+```powershell
+ctest --test-dir build/cmake -C Release -R 'CheekyNr.*NoDebugLayer' --output-on-failure -V
+```
+
+Run all four lifetime configurations with `-R 'CheekyNr'`, or omit `-R` for the
+full suite. Each lifetime run must print the same assertion-success summary.

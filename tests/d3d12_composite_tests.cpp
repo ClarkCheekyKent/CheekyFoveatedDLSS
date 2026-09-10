@@ -553,8 +553,13 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
 
 int run_d3d12_composite_tests() {
     try {
+        // The native observer runs this after the lifetime fixture; keep one debug mode.
+        wchar_t no_debug_layer[2]{};
+        const bool force_no_debug_layer =
+            GetEnvironmentVariableW(L"CHEEKY_NR_TEST_NO_DEBUG_LAYER", no_debug_layer, 2) == 1 &&
+            no_debug_layer[0] == L'1';
         ComPtr<ID3D12Debug> debug;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+        if (!force_no_debug_layer && SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
             debug->EnableDebugLayer();
             std::cout << "D3D12 debug layer enabled\n";
         } else {
