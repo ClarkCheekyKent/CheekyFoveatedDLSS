@@ -115,6 +115,13 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     eye_calibration_enable(true);
     for (unsigned i = 0; i < 4; ++i)
         frame(false);
+    // Flush submits work but does not complete hardware readbacks. Check the
+    // resumed mapping only after these four frames have had time to finish.
+    const auto resume_deadline = GetTickCount64() + 5000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < resume_deadline) {
+        Sleep(1);
+        eye_calibration_tick();
+    }
     require(eye_calibration_stats().correction_active, "Calibration resumes after enabling");
     eye_calibration_reset_stats();
     const auto reset = eye_calibration_stats();

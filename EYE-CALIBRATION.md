@@ -25,7 +25,7 @@ two frame timelines. An OpenXR gaze runtime can therefore appear alongside an
 OpenVR calibration backend in diagnostics.
 
 This covers the project's D3D11/D3D12 paths, not Vulkan or OpenGL. Unsupported
-formats, multisampled images, non-stereo/multiple projection layers, missing
+formats, multisampled images, non-stereo/ambiguous game projection layers, missing
 markers, or unrecognized submission flags do not force an eye assignment.
 D3D11 marker/copy/readback work must use the immediate context's owning thread.
 Frame pipelines must expose both DLSS evaluations and their submissions in the
@@ -104,6 +104,12 @@ sampled on a later frame. Failed releases/end calls, stale image indices and
 ambiguous projections reject the entire pair. Swapchain/session destruction
 invalidates the associated calibration. OpenXR session generations travel with
 the mapping so crop routing cannot use a result from another session.
+
+Gaze mapping and calibration share the same projection selection. UEVR's
+Virtual Desktop workaround may add an alpha-blended 4x4 dummy swapchain with
+two side-by-side 2x4 eye regions. That specific placeholder is excluded,
+regardless of layer order. Exactly one remaining stereo projection is required;
+multiple game projections and dummy-only frames do not establish a mapping.
 
 OpenXR D3D12 copies transition from and restore `RENDER_TARGET`; OpenVR D3D12
 copies restore `PIXEL_SHADER_RESOURCE`, following their respective contracts:

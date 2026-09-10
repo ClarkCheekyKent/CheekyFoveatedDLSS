@@ -49,6 +49,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="openxr_layer\openxr_layer.cpp" />
+    <ClInclude Include="openxr_layer\projection_selection.hpp" />
     <ClCompile Include="shared\gaze_math.cpp" />
     <ClInclude Include="shared\cheeky_gaze_abi.h" />
     <ClInclude Include="shared\gaze_math.hpp" />

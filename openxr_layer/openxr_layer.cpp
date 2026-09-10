@@ -12,6 +12,7 @@
 #include "cheeky_gaze_abi.h"
 #include "gaze_math.hpp"
 #include "eye_calibration.hpp"
+#include "projection_selection.hpp"
 #include <deque>
 
 #include <algorithm>
@@ -1598,21 +1599,22 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
 
     const auto result = next(session, frame_end_info);
+    std::lock_guard lock(state_mutex);
+    const auto selected = cheeky::openxr::select_projection(frame_end_info, [session](XrSwapchain handle) {
+        const auto it = swapchains.find(handle);
+        return it != swapchains.end() && it->second.session == session &&
+            it->second.create_info.width == 4 && it->second.create_info.height == 4 &&
+            it->second.create_info.arraySize == 1;
+    });
     {
-        std::lock_guard lock(state_mutex);
         auto owner = sessions.find(session);
         if (owner != sessions.end()) {
             std::array<cheeky::openxr_calibration::Region, 2> regions{};
             std::array<std::uint32_t, 2> released{};
-            unsigned projections{};
-            bool valid = XR_SUCCEEDED(result) && frame_end_info &&
+            bool valid = XR_SUCCEEDED(result) && selected.projection &&
                 owner->second.view_configuration == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-            if (valid) for (unsigned i = 0; i < frame_end_info->layerCount; ++i) {
-                const auto* layer = frame_end_info->layers[i];
-                if (!layer || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
-                ++projections;
-                const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
-                if (projection->viewCount != 2 || !projection->views) { valid = false; continue; }
+            if (valid) {
+                const auto* projection = selected.projection;
                 for (unsigned eye = 0; eye < 2; ++eye) {
                     const auto& image = projection->views[eye].subImage;
                     regions[eye] = {reinterpret_cast<std::uint64_t>(image.swapchain), image.imageArrayIndex,
@@ -1623,33 +1625,19 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
                     else released[eye] = chain->second.released_index;
                 }
             }
-            valid = valid && projections == 1;
             owner->second.calibration.end(cheeky::openxr_calibration::bridge(), valid ? regions : decltype(regions){}, released, valid);
         }
     }
     if (XR_FAILED(result)) return result;
 
-    if (frame_end_info != nullptr) {
-        std::lock_guard lock(state_mutex);
+    {
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
             auto& state = session_it->second;
-            bool found_projection{};
-            state.ambiguous_resource = false;
-            for (std::uint32_t layer_index{};
-                 layer_index < frame_end_info->layerCount; ++layer_index) {
-                const auto* layer = frame_end_info->layers[layer_index];
-                if (layer == nullptr ||
-                    layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-                    continue;
-                }
-                const auto* projection =
-                    reinterpret_cast<const XrCompositionLayerProjection*>(layer);
-                if (projection->viewCount != CHEEKY_GAZE_MAX_VIEWS) {
-                    state.unsupported_view_configuration = true;
-                    continue;
-                }
-                found_projection = true;
+            state.ambiguous_resource = selected.ambiguous;
+            state.unsupported_view_configuration = selected.unsupported ||
+                state.view_configuration != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            if (const auto* projection = selected.projection) {
                 for (std::uint32_t view_index{};
                      view_index < CHEEKY_GAZE_MAX_VIEWS; ++view_index) {
                     const auto& sub_image =
@@ -1665,9 +1653,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
                     submitted.valid = false;
                     update_view_resource_locked(state, sub_image.swapchain);
                 }
-                break;
             }
-            if (!found_projection) {
+            if (!selected.projection) {
                 for (auto& view : state.submitted_views) view = {};
             }
             if (state.ambiguous_resource) {

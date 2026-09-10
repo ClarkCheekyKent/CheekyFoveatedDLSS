@@ -14,6 +14,8 @@
 #include "../third_party/openxr/include/openxr/openxr.h"
 #include "../third_party/openxr/include/openxr/openxr_platform.h"
 #include "../third_party/openxr/include/openxr/openxr_loader_negotiation.h"
+#include "../openxr_layer/projection_selection.hpp"
+#include "cheeky_gaze_abi.h"
 
 namespace {
 using namespace cheeky::foveated_dlss;
@@ -44,6 +46,7 @@ unsigned captures{}, accepted{};
 std::array<unsigned, 2> labels{};
 // Run the actual layer DLL against a tiny loader/runtime, without a headset.
 struct XRLayer {
+    inline static std::uintptr_t next_chain{};
     inline static void* image{};
     inline static unsigned graphics{};
     inline static XrResult wait_result{XR_SUCCESS}, release_result{XR_SUCCESS}, end_result{XR_SUCCESS};
@@ -52,6 +55,8 @@ struct XRLayer {
     XrInstance instance{};
     XrSession session{};
     XrSwapchain chain{};
+    XrSwapchain dummy_chain{};
+    unsigned projection_mode{}; // 0: normal, 1/2: dummy first/last, 3: ambiguous, 4: dummy only
     unsigned image_width{}, image_height{};
     static XrResult XRAPI_CALL create(const XrInstanceCreateInfo*, const XrApiLayerCreateInfo*,
                                       XrInstance* out) {
@@ -73,7 +78,7 @@ struct XRLayer {
         XR_FAKE("xrDestroySession", [](XrSession) { return XR_SUCCESS; });
         XR_FAKE("xrBeginSession", [](XrSession, const XrSessionBeginInfo*) { return XR_SUCCESS; });
         XR_FAKE("xrCreateSwapchain", [](XrSession, const XrSwapchainCreateInfo*, XrSwapchain* s) {
-            *s = reinterpret_cast<XrSwapchain>(77);
+            *s = reinterpret_cast<XrSwapchain>(++next_chain);
             return XR_SUCCESS;
         });
         XR_FAKE("xrDestroySwapchain", [](XrSwapchain) { return XR_SUCCESS; });
@@ -113,6 +118,7 @@ struct XRLayer {
              unsigned height = 128) : image_width(width), image_height(height) {
         image = texture;
         graphics = api;
+        next_chain = 76;
         wait_result = release_result = end_result = XR_SUCCESS;
         module = LoadLibraryW(L"CheekyOpenXRLayer.dll");
         require(module != nullptr, "Layer DLL unavailable");
@@ -166,6 +172,10 @@ struct XRLayer {
                         api == 11 ? static_cast<void*>(&image11) : static_cast<void*>(&image12))) ==
                     XR_SUCCESS,
                 "Layer image enumeration failed");
+        chain_info.width = chain_info.height = 4;
+        chain_info.arraySize = 1;
+        require(fn<PFN_xrCreateSwapchain>("xrCreateSwapchain")(session, &chain_info, &dummy_chain) == XR_SUCCESS,
+                "Dummy swapchain failed");
     }
     void begin() {
         XrFrameBeginInfo info{XR_TYPE_FRAME_BEGIN_INFO};
@@ -201,17 +211,42 @@ struct XRLayer {
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projection.viewCount = 2;
         projection.views = views.data();
-        const XrCompositionLayerBaseHeader* layers[]{
-            reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection)};
+        auto dummy_views = views;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            dummy_views[eye].subImage = {dummy_chain, {{static_cast<int>(eye * 2), 0}, {2, 4}}, 0};
+        }
+        auto dummy = projection;
+        dummy.views = dummy_views.data();
+        dummy.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        const auto* real_header = reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);
+        const auto* dummy_header = reinterpret_cast<XrCompositionLayerBaseHeader*>(&dummy);
+        const XrCompositionLayerBaseHeader* layers[]{real_header, dummy_header};
+        if (projection_mode == 1) std::swap(layers[0], layers[1]);
+        if (projection_mode == 3) layers[1] = real_header;
+        if (projection_mode == 4) layers[0] = dummy_header;
         XrFrameEndInfo info{XR_TYPE_FRAME_END_INFO};
-        info.layerCount = 1;
+        info.layerCount = projection_mode >= 1 && projection_mode <= 3 ? 2 : 1;
         info.layers = layers;
         require(fn<PFN_xrEndFrame>("xrEndFrame")(session, &info) == end_result,
                 "EndFrame result was not forwarded");
+        if (XR_SUCCEEDED(end_result)) {
+            auto get_snapshot = reinterpret_cast<CheekyOpenXRGetGazeSnapshotFn>(
+                GetProcAddress(module, "CheekyOpenXR_GetGazeSnapshot"));
+            CheekyGazeSnapshotV1 snapshot{};
+            require(get_snapshot && get_snapshot(CHEEKY_GAZE_ABI_VERSION, &snapshot, sizeof(snapshot)),
+                    "Layer snapshot unavailable");
+            require(snapshot.views[0].image_rect_width == (projection_mode >= 3 ? 0U :
+                        (array ? image_width : image_width / 2)),
+                    "Gaze must select the real projection or clear rejected geometry");
+            require(bool(snapshot.status_flags & CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE) ==
+                        (projection_mode == 3 || (array && projection_mode < 3)),
+                    "Ambiguous projection status must not persist into a valid frame");
+        }
     }
     ~XRLayer() {
         if (session) {
             fn<PFN_xrDestroySwapchain>("xrDestroySwapchain")(chain);
+            fn<PFN_xrDestroySwapchain>("xrDestroySwapchain")(dummy_chain);
             fn<PFN_xrDestroySession>("xrDestroySession")(session);
         }
         if (instance)
@@ -265,6 +300,57 @@ void layer_policy() {
             require(labels[0] == 1 && labels[1] == 0, "EndFrame must relabel swapped subimages");
     }
 }
+void projection_policy() {
+    std::array<XrCompositionLayerProjectionView, 2> real_views{}, dummy_views{};
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        real_views[eye].subImage = {reinterpret_cast<XrSwapchain>(1),
+            {{static_cast<int>(eye * 3768), 0}, {3768, 3532}}, 0};
+        dummy_views[eye].subImage = {reinterpret_cast<XrSwapchain>(2),
+            {{static_cast<int>(eye * 2), 0}, {2, 4}}, 0};
+    }
+    XrCompositionLayerProjection real{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    real.viewCount = 2;
+    real.views = real_views.data();
+    auto dummy = real;
+    dummy.views = dummy_views.data();
+    dummy.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    auto is_dummy = [](XrSwapchain s) { return s == reinterpret_cast<XrSwapchain>(2); };
+    const auto* r = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&real);
+    const auto* d = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&dummy);
+    const XrCompositionLayerBaseHeader* layers[]{d, r};
+    XrFrameEndInfo info{XR_TYPE_FRAME_END_INFO};
+    info.layers = layers;
+    info.layerCount = 2;
+    for (unsigned order = 0; order < 2; ++order) {
+        require(cheeky::openxr::select_projection(&info, is_dummy).projection == &real,
+                "Dummy ordering must not hide the game projection");
+        std::swap(layers[0], layers[1]);
+    }
+    dummy.layerFlags = 0;
+    require(cheeky::openxr::select_projection(&info, is_dummy).ambiguous,
+            "Tiny opaque projections must not be silently discarded");
+    dummy.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    require(cheeky::openxr::select_projection(&info, [](XrSwapchain) { return false; }).ambiguous,
+            "A tiny crop of a large or unknown swapchain is not a dummy");
+    dummy.viewCount = 1;
+    require(cheeky::openxr::select_projection(&info, is_dummy).unsupported &&
+                !cheeky::openxr::select_projection(&info, is_dummy).projection,
+            "Unsupported projections must not select a guessed scene");
+    dummy.viewCount = 2;
+    dummy.views = nullptr;
+    require(!cheeky::openxr::select_projection(&info, is_dummy).projection,
+            "Missing projection views must be rejected");
+    dummy.views = dummy_views.data();
+    info.layerCount = 1;
+    require(!cheeky::openxr::select_projection(&info, is_dummy).projection,
+            "A dummy-only frame must not become the game scene");
+    layers[0] = r;
+    require(cheeky::openxr::select_projection(&info, is_dummy).projection == &real,
+            "Normal stereo must remain supported");
+    info.layerCount = 0;
+    require(!cheeky::openxr::select_projection(&info, is_dummy).projection,
+            "An empty frame must clear scene selection");
+}
 void openxr11() {
     using namespace cheeky::openxr_calibration;
     roles();
@@ -303,8 +389,16 @@ void openxr11() {
         Sleep(2);
         eye_calibration_tick();
     };
-    for (unsigned i = 0; i < 16; ++i)
+    for (unsigned mode : {3U, 4U}) {
+        layer.projection_mode = mode;
+        for (unsigned i = 0; i < 16; ++i) render(false);
+    }
+    require(!eye_calibration_stats().valid && !stereo_eye_assignment(9101).calibrated,
+            "Ambiguous and dummy-only frames must never calibrate");
+    for (unsigned i = 0; i < 16; ++i) {
+        layer.projection_mode = i % 3;
         render(false);
+    }
     require(stereo_eye_assignment(9101).calibrated && stereo_eye_assignment(9101).calibration_session != 0,
             "OpenXR D3D11 array mapping must retain session provenance");
     for (unsigned i = 0; i < 16; ++i)
@@ -639,6 +733,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         check(gpu.submit_queue->Wait(gpu.fence.Get(), gpu.value));
         if (layer) {
             layer->release();
+            layer->projection_mode = frame % 3;
             layer->end(false, array);
         } else
             for (unsigned eye = 0; eye < 2; ++eye) {
@@ -709,6 +804,7 @@ int run_openxr_calibration_format_tests() {
 int run_openxr_calibration_tests() {
     try {
         layer_policy();
+        projection_policy();
         openxr11();
         recording_lifetime12();
         for (auto backend : {EyeCalibrationBackend::openvr, EyeCalibrationBackend::openxr})
