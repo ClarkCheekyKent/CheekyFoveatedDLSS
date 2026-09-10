@@ -871,6 +871,101 @@ void test_dlss_nr_independent_size_shares_sr_center() {
         "full-frame NR uses zero offsets without division by zero");
 }
 
+void test_nr_only_center(bool openvr) {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation();
+    register_stereo_view(1901); register_stereo_view(1902);
+    Settings settings{};
+    settings.enabled = false;
+    settings.nr_enabled = settings.nr_foveated = true;
+    settings.width = settings.height = 0.4F;
+    settings.nr_width = 0.6F; settings.nr_height = 0.3F;
+    settings.nr_use_sr_foveation = false;
+    settings.center_mode = FoveationCenterMode::openxr_gaze;
+    settings.gaze_smoothing_ms = 0;
+    settings.gaze_quantization_pixels = 1;
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    snapshot.structure_size = sizeof(snapshot);
+    snapshot.view_count = 2;
+    snapshot.session_generation = 765;
+    snapshot.swapchain_generation = 1;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED |
+        CHEEKY_GAZE_STATUS_GAZE_VALID;
+    if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    expect(publish_stereo_calibration(1901, 1902, stereo_view_generation(1901), stereo_view_generation(1902),
+        5000, GetTickCount64(), nullptr, openvr ? 0 : snapshot.session_generation), "NR-only eye mapping publishes");
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& v = snapshot.views[eye];
+        v.view_index = eye;
+        v.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID;
+        v.image_rect_width = 2400; v.image_rect_height = 2000;
+        v.resource_identity = 100 + eye; v.swapchain_identity = 200 + eye;
+        v.forward_u = eye ? 0.45F : 0.55F; v.forward_v = 0.5F;
+        v.center_u = eye ? 0.4F : 0.6F; v.center_v = 0.55F;
+    }
+    if (openvr) test_openvr_snapshot = &snapshot;
+    FoveationCenter centers[2];
+    const auto step = [&]() {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart;
+        ++snapshot.predicted_display_time;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            bool reset{};
+            expect(calculate_coordinated_center(settings, 1901 + eye, nullptr, 1200, 1000, 2400, 2000,
+                0, 0, centers[eye], reset, openvr ? nullptr : &snapshot), "NR-only placement resolves without SR");
+        }
+    };
+    step(); step(); step();
+    expect(gaze_diagnostics().using_gaze, "NR-only path updates live gaze diagnostics");
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        expect_near(centers[eye].u, snapshot.views[eye].center_u, 0.002F, "NR-only uses correct eye gaze");
+        const auto parameters = dlss_nr_foveation_parameters(settings, &centers[eye]);
+        FoveationGeometry nr{};
+        expect(calculate_foveation_geometry(parameters, 2400, 2000, 2400, 2000, 0, 0, nr), "NR geometry resolves");
+        expect_near((nr.input_base_x + nr.input_width * 0.5F) / 2400.F, centers[eye].u, 0.002F,
+            "Independent NR width preserves resolved center");
+        expect_near(parameters.width, settings.nr_width, 0.0001F, "Independent NR size retained");
+    }
+    const float previous = centers[0].u;
+    snapshot.views[0].center_u = 0.45F;
+    step();
+    expect(centers[0].u < previous - 0.1F, "NR-only region follows moving gaze");
+    settings.width = settings.height = 1.F;
+    step();
+    expect_near(centers[0].u, 0.45F, 0.002F, "Full-frame SR size does not pin NR gaze to the middle");
+    settings.width = settings.height = 0.4F;
+    settings.enabled = true;
+    step();
+    CropGeometry sr{}; bool reset{};
+    expect(calculate_coordinated_crop(settings, 1901, nullptr, 1200, 1000, 2400, 2000,
+        0, 0, sr, reset, openvr ? nullptr : &snapshot), "SR placement resolves when enabled");
+    expect_near(foveation_center_from_geometry(sr, 1200, 1000).u, centers[0].u, 0.002F,
+        "SR and independent NR share center");
+    settings.enabled = false;
+    step();
+    expect_near(centers[0].u, 0.45F, 0.002F, "Disabling SR does not interrupt NR gaze");
+    settings.nr_use_sr_foveation = true;
+    const auto linked = dlss_nr_foveation_parameters(settings, &centers[0]);
+    expect_near(linked.width, settings.width, 0.0001F, "Link option changes size independently of SR enable");
+    settings.center_mode = FoveationCenterMode::fixed;
+    step();
+    expect_near(centers[0].u, snapshot.views[0].forward_u, 0.002F, "NR-only fixed mode uses automatic alignment");
+    snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_GAZE_VALID;
+    settings.center_mode = FoveationCenterMode::openxr_gaze;
+    reset_gaze_foveation(); // No held sample: exercise unavailable-tracker fallback.
+    step(); step(); step();
+    expect(!gaze_diagnostics().using_gaze, "Unavailable gaze reports fallback in NR-only mode");
+    expect_near(centers[0].u, snapshot.views[0].forward_u, 0.002F, "NR-only gaze fallback preserves alignment");
+    settings.auto_stereo_alignment = false;
+    settings.center_mode = FoveationCenterMode::fixed;
+    step();
+    expect(std::isfinite(centers[0].u), "NR-only manual placement resolves with SR disabled");
+    test_openvr_snapshot = nullptr;
+    unregister_stereo_view(1901); unregister_stereo_view(1902);
+    clear_stereo_calibration(); reset_gaze_foveation();
+}
+
 void test_packed_alignment_coordinator(bool openvr = false) {
     using namespace cheeky::foveated_dlss;
     reset_gaze_foveation();
@@ -1312,6 +1407,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--motion-resample") == 0)
         return run_motion_resample_tests();
     test_center_supersampling();
+    test_nr_only_center(false);
+    test_nr_only_center(true);
     test_packed_alignment_coordinator();
     test_packed_alignment_coordinator(true);
     test_openvr_geometry();

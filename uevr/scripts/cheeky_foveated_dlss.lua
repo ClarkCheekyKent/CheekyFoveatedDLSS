@@ -302,6 +302,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
             if draft.NrEnabled then
                 check("Foveated NR", "NrFoveated")
                 if draft.NrFoveated then
+                    text("Uses Stereo and gaze settings, even with SR disabled.")
                     check("Use SR size and shape", "NrUseSrFoveation")
                     if not draft.NrUseSrFoveation then
                         slider("NR width", "NrWidth", 0.2, 1)

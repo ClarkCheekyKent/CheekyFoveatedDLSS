@@ -81,6 +81,8 @@ DLSS-view mappings for both eyes. **Eye gaze extension: Yes** alone does not mea
 the headset supplies eye tracking.
 
 Valid gaze sets both eye centers directly; it needs no manual stereo X offset.
+SR and foveated NR share gaze and automatic alignment. NR continues tracking with
+SR foveation disabled; **Use DLSS-SR size and shape** only links region settings.
 **Fallback height offset** only adjusts fixed placement when gaze is unavailable
 and does not shift valid gaze. If tracking is unavailable, a red message appears
 directly below the selector and the add-on falls back to fixed placement, using

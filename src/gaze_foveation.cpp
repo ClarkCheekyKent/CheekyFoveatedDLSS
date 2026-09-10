@@ -193,10 +193,12 @@ bool calculate_coordinated_crop(
     const std::uint32_t output_origin_y,
     CropGeometry& crop,
     bool& reset_history,
-    const CheekyGazeSnapshotV1* supplied_snapshot
+    const CheekyGazeSnapshotV1* supplied_snapshot,
+    FoveationCenter* resolved_center
 ) noexcept {
     reset_history = false;
     const auto fixed_settings = settings_for_view(settings, view_id);
+    if (resolved_center) *resolved_center = fixed_center(fixed_settings, render_width, render_height);
     const auto eye_assignment = stereo_eye_assignment(view_id);
     if (const auto module = GetModuleHandleW(L"CheekyOpenXRLayer.dll")) {
         using SetSimulationFn = void(__cdecl*)(std::uint32_t);
@@ -219,8 +221,8 @@ bool calculate_coordinated_crop(
             view.alignment_source = 0U;
             view.aligned_u = center.u; view.aligned_v = center.v;
         }
-        return calculate_crop(
-            fixed_settings, render_width, render_height,
+        return calculate_foveation_geometry(
+            foveation_parameters(fixed_settings), render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop
         );
     }
@@ -263,8 +265,9 @@ bool calculate_coordinated_crop(
     };
     const auto auto_crop = [&](const CheekyGazeViewV1* xr_view) {
         const auto center = aligned_center(xr_view);
+        if (resolved_center) *resolved_center = center;
         const bool valid = diagnostics.alignment_source == 0U && settings.aligned_height_offset == 0.F
-            ? calculate_crop(fixed_settings, render_width, render_height, output_width,
+            ? calculate_foveation_geometry(foveation_parameters(fixed_settings), render_width, render_height, output_width,
                 output_height, output_origin_x, output_origin_y, crop)
             : calculate_foveation_geometry_at_center(foveation_parameters(fixed_settings),
                 center, render_width, render_height, output_width, output_height,
@@ -303,8 +306,8 @@ bool calculate_coordinated_crop(
     if (!loaded) {
         if (automatic) return auto_crop(nullptr);
         diagnostics.using_gaze = false;
-        return calculate_crop(
-            fixed_settings, render_width, render_height,
+        return calculate_foveation_geometry(
+            foveation_parameters(fixed_settings), render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop
         );
     }
@@ -595,6 +598,8 @@ bool calculate_coordinated_crop(
         return auto_crop(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     }
 
+    if (resolved_center) *resolved_center = {temporal_result.center_u, temporal_result.center_v,
+        settings.gaze_quantization_pixels};
     if (!calculate_foveation_geometry_at_center(
             foveation_parameters(fixed_settings),
             {
@@ -655,6 +660,20 @@ bool calculate_coordinated_crop(
     }
     state.last_crop = crop;
     state.has_crop = true;
+    return true;
+}
+
+bool calculate_coordinated_center(
+    const Settings& settings, DlssViewId view_id, IUnknown* output_resource,
+    std::uint32_t render_width, std::uint32_t render_height,
+    std::uint32_t output_width, std::uint32_t output_height,
+    std::uint32_t output_origin_x, std::uint32_t output_origin_y,
+    FoveationCenter& center, bool& reset_history,
+    const CheekyGazeSnapshotV1* supplied_snapshot) noexcept {
+    CropGeometry placement{};
+    if (!calculate_coordinated_crop(settings, view_id, output_resource,
+            render_width, render_height, output_width, output_height,
+            output_origin_x, output_origin_y, placement, reset_history, supplied_snapshot, &center)) return false;
     return true;
 }
 

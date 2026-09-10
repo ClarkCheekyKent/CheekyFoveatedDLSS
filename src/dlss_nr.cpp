@@ -1054,15 +1054,13 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     const Settings& settings,
     const std::uint32_t width,
     const std::uint32_t height,
-    const FoveationGeometry* const shared_sr_crop,
-    const std::uint32_t render_width,
-    const std::uint32_t render_height
+    const FoveationCenter* const center
 ) noexcept {
     if (!settings.nr_foveated) {
         return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
     }
     const auto parameters = dlss_nr_foveation_parameters(
-        settings, shared_sr_crop, render_width, render_height
+        settings, center
     );
     FoveationGeometry geometry{};
     if (!calculate_foveation_geometry(
@@ -1267,11 +1265,12 @@ bool calculate_dlss_nr_geometry(
     const Settings& settings,
     const std::uint32_t output_width,
     const std::uint32_t output_height,
-    DlssNrGeometry& geometry
+    DlssNrGeometry& geometry,
+    const FoveationCenter* center
 ) noexcept {
     if (output_width == 0U || output_height == 0U) return false;
     const auto region = calculate_region(
-        settings, output_width, output_height, nullptr, 0U, 0U
+        settings, output_width, output_height, center
     );
     if (region.width == 0U || region.height == 0U) return false;
     geometry = {
@@ -1331,9 +1330,7 @@ bool evaluate_dlss_nr(
         settings,
         frame.output_width,
         frame.output_height,
-        frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr,
-        frame.input_width,
-        frame.input_height
+        frame.has_center ? &frame.center : nullptr
     );
     const auto working_width = scaled_extent(region.width, settings.nr_working_scale);
     const auto working_height = scaled_extent(region.height, settings.nr_working_scale);
@@ -1474,7 +1471,7 @@ bool evaluate_dlss_nr(
         trace_event("DLSS-NR inputs view=%llu flags=0x%X output=%ux%u@%u,%u "
             "mvTexture=%llux%u format=%u state=0x%X mvRect=%ux%u@%u,%u "
             "mvScale=%.6f,%.6f nrScale=%.6f,%.6f depthRect=%ux%u@%u,%u "
-            "sharedSR=%s srCrop=%ux%u@%u,%u",
+            "resolvedCenter=%s center=%.6f,%.6f",
             static_cast<unsigned long long>(frame.view_id), frame.create_flags,
             frame.output_width, frame.output_height, frame.color_base_x, frame.color_base_y,
             static_cast<unsigned long long>(motion_desc.Width), motion_desc.Height,
@@ -1484,9 +1481,7 @@ bool evaluate_dlss_nr(
             history.scale_x * working_width / region.width,
             history.scale_y * working_height / region.height,
             depth_x.extent, depth_y.extent, depth_x.base, depth_y.base,
-            frame.has_shared_sr_crop ? "yes" : "no",
-            frame.shared_sr_crop.output_width, frame.shared_sr_crop.output_height,
-            frame.shared_sr_crop.output_base_x, frame.shared_sr_crop.output_base_y);
+            frame.has_center ? "yes" : "no", frame.center.u, frame.center.v);
     }
 
     uav_barrier(frame.command_list, frame.color);

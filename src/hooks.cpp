@@ -1772,6 +1772,10 @@ std::deque<StreamlineCropHistory> streamline_crop_history;
 
 struct StreamlineEvaluation {
     StreamlineCropHistory history{};
+    FoveationCenter nr_center{};
+    bool has_nr_center{};
+    bool nr_gaze_reset{};
+    GazeProjection nr_projection{};
     std::array<SlResource, 4U> original_resources{};
     std::array<SlResourceTag, 4U> original_tags{};
     bool has_original_tags{};
@@ -2224,6 +2228,9 @@ struct StreamlineEvaluation {
 
     const auto crop = d3d12_evaluation_crop(evaluation.backend);
     const auto reconstruction = d3d12_reconstruction_crop(evaluation.backend);
+    evaluation.nr_center = d3d12_evaluation_center(evaluation.backend);
+    evaluation.has_nr_center = true;
+    evaluation.nr_gaze_reset = d3d12_evaluation_gaze_reset(evaluation.backend);
     note_stereo_view_geometry(
         streamline_view_id,
         render_width,
@@ -2535,7 +2542,7 @@ struct StreamlineEvaluation {
 }
 
 [[nodiscard]] bool prepare_streamline_nr_passthrough(
-    StreamlineEvaluation& evaluation
+    StreamlineEvaluation& evaluation, const void* frame
 ) noexcept {
     constexpr std::array<std::uint32_t, 4U> required{
         sl_tag_scaling_input,
@@ -2549,6 +2556,8 @@ struct StreamlineEvaluation {
         evaluation.viewport = cached_sl_viewport;
         evaluation.nr_constants = cached_sl_constants;
         evaluation.has_nr_constants = true;
+        evaluation.nr_projection = streamline_gaze_projections.find(evaluation.viewport.value,
+            gaze_frame_key(frame), GetTickCount64());
         for (std::size_t index{}; index < required.size(); ++index) {
             const auto& source = cached_sl_tags[required[index]];
             if (!source.present || source.resource.native == nullptr) {
@@ -2629,6 +2638,18 @@ void evaluate_streamline_nr(
     };
     frame.motion_state = static_cast<D3D12_RESOURCE_STATES>(motion.resource->state);
     frame.motion_vectors_3d = evaluation.nr_constants.motion_vectors_3d != 0;
+    frame.center = evaluation.nr_center;
+    frame.has_center = evaluation.has_nr_center;
+    frame.reset = frame.reset || evaluation.nr_gaze_reset;
+    if (!frame.has_center && evaluation.settings.nr_foveated) {
+        bool reset{};
+        const ScopedGazeProjection projection_scope(view_id, evaluation.nr_projection);
+        frame.has_center = calculate_coordinated_center(current_settings(), view_id, frame.color,
+            input_width, input_height, output_width, output_height,
+            frame.color_base_x, frame.color_base_y, frame.center, reset);
+        frame.reset = frame.reset || reset;
+        if (!frame.has_center) return;
+    }
     D3D12NrTimingScope timing{command_list, evaluation.settings.nr_foveated};
     const bool evaluated = evaluate_dlss_nr(frame, evaluation.settings);
     timing.finish(evaluated);
@@ -2942,7 +2963,7 @@ std::uint32_t hook_sl_evaluate_feature(
         diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::disabled);
         StreamlineEvaluation nr_evaluation{};
         if (live_settings.nr_enabled) {
-            static_cast<void>(prepare_streamline_nr_passthrough(nr_evaluation));
+            static_cast<void>(prepare_streamline_nr_passthrough(nr_evaluation, frame));
         }
         StreamlineEvaluationScope scope;
         D3D12PeripheralTimingScope sr_timing{
@@ -3042,7 +3063,10 @@ std::uint32_t hook_sl_evaluate_feature(
     }
     if (result == 0U && live_settings.nr_enabled) {
         StreamlineEvaluation nr_evaluation{};
-        if (prepare_streamline_nr_passthrough(nr_evaluation)) {
+        if (prepare_streamline_nr_passthrough(nr_evaluation, frame)) {
+            nr_evaluation.nr_center = evaluation.nr_center;
+            nr_evaluation.has_nr_center = evaluation.has_nr_center;
+            nr_evaluation.nr_gaze_reset = evaluation.nr_gaze_reset;
             evaluate_streamline_nr(command_list, nr_evaluation, result);
         }
     }
@@ -3869,7 +3893,8 @@ void evaluate_nr_after_native_d3d12(
     const NgxParameters* const parameters,
     const Settings& settings,
     const NgxResult result,
-    const CropGeometry* const shared_sr_crop = nullptr
+    const FoveationCenter* const resolved_center = nullptr,
+    bool center_reset = false
 ) noexcept {
     if (!settings.nr_enabled || !ngx_succeeded(result) ||
         command_list == nullptr || handle == nullptr || parameters == nullptr ||
@@ -3916,9 +3941,17 @@ void evaluate_nr_after_native_d3d12(
         get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
         false,
     };
-    if (shared_sr_crop != nullptr) {
-        frame.shared_sr_crop = *shared_sr_crop;
-        frame.has_shared_sr_crop = true;
+    frame.reset = frame.reset || center_reset;
+    if (resolved_center != nullptr) {
+        frame.center = *resolved_center;
+        frame.has_center = true;
+    } else if (settings.nr_foveated) {
+        bool reset{};
+        frame.has_center = calculate_coordinated_center(settings, view_id, frame.color,
+            input_width, input_height, output_width, output_height,
+            frame.color_base_x, frame.color_base_y, frame.center, reset);
+        frame.reset = frame.reset || reset;
+        if (!frame.has_center) return;
     }
     const auto view_settings = settings_for_view(settings, view_id);
     D3D12NrTimingScope timing{command_list, view_settings.nr_foveated};
@@ -4114,13 +4147,15 @@ void evaluate_nr_after_native_d3d12(
     );
     sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
+    const auto nr_center = d3d12_evaluation_center(evaluation);
+    const auto nr_center_reset = d3d12_evaluation_gaze_reset(evaluation);
     finish_d3d12(command_list, parameters, evaluation, result);
     if (peripheral_ready) {
         restore_peripheral_dlaa_output(command_list, peripheral);
     }
     if (!ngx_succeeded(result)) return false;
     evaluate_nr_after_native_d3d12(
-        command_list, handle, parameters, settings, result, &crop
+        command_list, handle, parameters, settings, result, &nr_center, nr_center_reset
     );
     diagnostic_note_activation(DiagnosticApi::d3d12, crop);
     return true;

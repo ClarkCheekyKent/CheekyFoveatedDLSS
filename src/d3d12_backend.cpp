@@ -741,6 +741,7 @@ struct D3D12Evaluation {
     std::uint32_t dlss_source_y{};
     std::uint32_t reset{};
     CropGeometry crop{};
+    FoveationCenter center{};
     float shape_width{};
     float shape_height{};
     float shape_offset_x{};
@@ -856,6 +857,7 @@ D3D12Evaluation* prepare_d3d12(
     auto effective_settings = settings_for_view(settings, view_id);
     CropGeometry crop{};
     bool gaze_reset{};
+    FoveationCenter center{};
     if (!calculate_coordinated_crop(
             settings,
             view_id,
@@ -867,7 +869,7 @@ D3D12Evaluation* prepare_d3d12(
             output_x,
             output_y,
             crop,
-            gaze_reset
+            gaze_reset, nullptr, &center
         )) {
         diagnostic_note_state(
             DiagnosticApi::d3d12,
@@ -1047,6 +1049,7 @@ D3D12Evaluation* prepare_d3d12(
     evaluation->dlss_source_y = 0U;
     evaluation->reset = get_ui(parameters, "Reset");
     evaluation->crop = crop;
+    evaluation->center = center;
     evaluation->shape_width = effective_settings.width;
     evaluation->shape_height = effective_settings.height;
     evaluation->shape_offset_x = effective_settings.x_offset;
@@ -1161,6 +1164,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
     auto effective_settings = settings_for_view(settings, view_id);
     CropGeometry crop{};
     bool gaze_reset{};
+    FoveationCenter center{};
     if (!calculate_coordinated_crop(
             settings,
             view_id,
@@ -1172,7 +1176,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
             output_x,
             output_y,
             crop,
-            gaze_reset
+            gaze_reset, nullptr, &center
         )) {
         return nullptr;
     }
@@ -1232,6 +1236,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
     evaluation->dlss_source_x = 0U;
     evaluation->dlss_source_y = 0U;
     evaluation->crop = crop;
+    evaluation->center = center;
     evaluation->shape_width = effective_settings.width;
     evaluation->shape_height = effective_settings.height;
     evaluation->shape_offset_x = effective_settings.x_offset;
@@ -1327,6 +1332,10 @@ CropGeometry d3d12_evaluation_crop(
     const D3D12Evaluation* const evaluation
 ) noexcept {
     return evaluation == nullptr ? CropGeometry{} : evaluation->crop;
+}
+
+FoveationCenter d3d12_evaluation_center(const D3D12Evaluation* evaluation) noexcept {
+    return evaluation ? evaluation->center : FoveationCenter{};
 }
 
 bool d3d12_evaluation_gaze_reset(

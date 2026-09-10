@@ -32,6 +32,11 @@ struct FoveationCenter {
     std::uint32_t quantization_pixels{1U};
 };
 
+// Normalize a resolved placement so effects with different region sizes can share it.
+[[nodiscard]] FoveationCenter foveation_center_from_geometry(
+    const FoveationGeometry& geometry, std::uint32_t render_width,
+    std::uint32_t render_height) noexcept;
+
 // Keep placement in final-output pixels. Only this private DLSS contract grows.
 [[nodiscard]] FoveationGeometry supersampled_crop(
     const FoveationGeometry& crop, float scale) noexcept;

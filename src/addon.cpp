@@ -1404,7 +1404,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
 
     changed |= ImGui::Checkbox("Foveated DLSS-NR", &settings.nr_foveated);
     if (settings.nr_foveated) {
-        ImGui::TextDisabled("Position follows DLSS-SR; NR size and shape can differ.");
+        ImGui::TextDisabled("Uses the shared gaze/alignment center, even with SR disabled.");
         changed |= ImGui::Checkbox(
             "Use DLSS-SR size and shape",
             &settings.nr_use_sr_foveation

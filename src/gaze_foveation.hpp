@@ -63,10 +63,20 @@ struct GazeDiagnostics {
     std::uint32_t output_origin_y,
     CropGeometry& crop,
     bool& reset_history,
-    const CheekyGazeSnapshotV1* supplied_snapshot = nullptr
+    const CheekyGazeSnapshotV1* supplied_snapshot = nullptr,
+    FoveationCenter* resolved_center = nullptr
 ) noexcept;
 
 void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
+// Placement only: does not require enabled SR or run a DLSS evaluation.
+// When SR already resolved a center, reuse it instead of advancing gaze twice.
+[[nodiscard]] bool calculate_coordinated_center(
+    const Settings& settings, DlssViewId view_id, IUnknown* output_resource,
+    std::uint32_t render_width, std::uint32_t render_height,
+    std::uint32_t output_width, std::uint32_t output_height,
+    std::uint32_t output_origin_x, std::uint32_t output_origin_y,
+    FoveationCenter& center, bool& reset_history,
+    const CheekyGazeSnapshotV1* supplied_snapshot = nullptr) noexcept;
 [[nodiscard]] GazeDiagnostics gaze_diagnostics() noexcept;
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;

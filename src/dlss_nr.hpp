@@ -56,8 +56,8 @@ struct DlssNrFrame {
     std::uint32_t color_base_y{};
     // Color, depth and motion textures already contain only the NR region.
     bool color_is_region{};
-    FoveationGeometry shared_sr_crop{};
-    bool has_shared_sr_crop{};
+    FoveationCenter center{};
+    bool has_center{};
     D3D12_RESOURCE_STATES motion_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
     bool motion_vectors_3d{};
 };
@@ -75,7 +75,8 @@ struct DlssNrGeometry {
     const Settings& settings,
     std::uint32_t output_width,
     std::uint32_t output_height,
-    DlssNrGeometry& geometry
+    DlssNrGeometry& geometry,
+    const FoveationCenter* center = nullptr
 ) noexcept;
 
 struct DlssNrSnapshot {

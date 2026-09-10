@@ -131,6 +131,8 @@ void finish_d3d12(
     const D3D12Evaluation* evaluation
 ) noexcept;
 
+[[nodiscard]] FoveationCenter d3d12_evaluation_center(const D3D12Evaluation* evaluation) noexcept;
+
 [[nodiscard]] bool d3d12_evaluation_gaze_reset(
     const D3D12Evaluation* evaluation
 ) noexcept;

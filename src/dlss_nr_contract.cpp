@@ -56,6 +56,14 @@ FoveationParameters dlss_nr_foveation_parameters(
     const std::uint32_t render_width,
     const std::uint32_t render_height
 ) noexcept {
+    const auto center = shared_sr_crop
+        ? foveation_center_from_geometry(*shared_sr_crop, render_width, render_height) : FoveationCenter{};
+    return dlss_nr_foveation_parameters(settings,
+        shared_sr_crop && render_width && render_height ? &center : nullptr);
+}
+
+FoveationParameters dlss_nr_foveation_parameters(
+    const Settings& settings, const FoveationCenter* center) noexcept {
     FoveationParameters parameters{
         settings.nr_use_sr_foveation ? settings.width : settings.nr_width,
         settings.nr_use_sr_foveation ? settings.height : settings.nr_height,
@@ -69,11 +77,9 @@ FoveationParameters dlss_nr_foveation_parameters(
     // centers. Convert through the SR center so changing NR size cannot move it.
     float center_x = settings.x_offset * (1.0F - settings.width);
     float center_y = settings.height_offset * (1.0F - settings.height);
-    if (shared_sr_crop != nullptr && render_width != 0U && render_height != 0U) {
-        center_x = (2.0F * shared_sr_crop->input_base_x +
-            shared_sr_crop->input_width) / render_width - 1.0F;
-        center_y = (2.0F * shared_sr_crop->input_base_y +
-            shared_sr_crop->input_height) / render_height - 1.0F;
+    if (center != nullptr) {
+        center_x = 2.0F * center->u - 1.0F;
+        center_y = 2.0F * center->v - 1.0F;
     }
     parameters.x_offset = parameters.width < 1.0F
         ? std::clamp(center_x / (1.0F - parameters.width), -1.0F, 1.0F) : 0.0F;

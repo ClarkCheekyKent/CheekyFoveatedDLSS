@@ -68,8 +68,8 @@ is saved separately from legacy manual placement. In gaze modes it is labeled
 **Fallback height offset** and never shifts valid gaze. **Stereo X offset** is
 shown only for manual fixed placement. An advanced **Stereo mapping override**
 retains eye-order inversion for reversed packed layouts.
-DLSS-NR inherits the SR center, including automatic alignment and gaze on
-routes that supply the live SR crop. **Use DLSS-SR size and shape** also links
+DLSS-SR and foveated DLSS-NR share the selected gaze/alignment center. NR keeps
+tracking when SR foveation is disabled. **Use DLSS-SR size and shape** also links
 width, height, roundness, and transition; otherwise those remain independent.
 
 For OpenXR, install the layer and your adapter from the same release using `CheekyOpenXRSetup.exe`.
@@ -86,7 +86,7 @@ Additional notes:
 
 - DLSS-NR is off by default.
 - Direct3D 11 games require the **DX12 Transport** processing path for DLSS-NR.
-- DLSS-NR follows the DLSS-SR center and stereo alignment. Its fovea width, height, roundness, and transition can be adjusted independently or linked to DLSS-SR, with a green alignment border for checking the region.
+- DLSS-NR uses the shared gaze and stereo alignment settings even with SR foveation disabled. Its fovea width, height, roundness, and transition can be adjusted independently or linked to DLSS-SR, with a green alignment border for checking the region.
 - A DLSS-NR failure leaves the composited DLSS-SR result intact.
 - RDR 2 currently does not work well with DLSS-NR.
 

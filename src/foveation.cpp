@@ -5,6 +5,13 @@
 
 namespace cheeky::foveated_dlss {
 
+FoveationCenter foveation_center_from_geometry(const FoveationGeometry& geometry,
+    std::uint32_t render_width, std::uint32_t render_height) noexcept {
+    if (!render_width || !render_height) return {};
+    return {(geometry.input_base_x + 0.5F * geometry.input_width) / render_width,
+            (geometry.input_base_y + 0.5F * geometry.input_height) / render_height, 1U};
+}
+
 namespace {
 
 [[nodiscard]] std::uint32_t quantized_center_start(

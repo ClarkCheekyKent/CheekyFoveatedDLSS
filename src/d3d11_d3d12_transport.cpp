@@ -1359,6 +1359,7 @@ bool evaluate_d3d11_via_d3d12(
     const auto output_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
     CropGeometry crop{};
     bool gaze_reset{};
+    FoveationCenter nr_center{};
     if (render_width == 0U || render_height == 0U || out_width == 0U ||
         out_height == 0U || color_desc.SampleDesc.Count != 1U ||
         depth_desc.SampleDesc.Count != 1U || motion_desc.SampleDesc.Count != 1U ||
@@ -1367,11 +1368,12 @@ bool evaluate_d3d11_via_d3d12(
         !in_bounds(color_y, render_height, color_desc.Height) ||
         !in_bounds(depth_x, render_width, depth_desc.Width) ||
         !in_bounds(depth_y, render_height, depth_desc.Height) ||
-        !calculate_coordinated_crop(
+        !(settings.enabled ? calculate_coordinated_crop(
             transport_settings, view_id, output,
             render_width, render_height, out_width, out_height,
-            output_x, output_y, crop, gaze_reset
-        ) ||
+            output_x, output_y, crop, gaze_reset, nullptr, &nr_center
+        ) : calculate_crop(transport_settings, render_width, render_height,
+            out_width, out_height, output_x, output_y, crop)) ||
         crop.output_width < 32U || crop.output_height < 32U) {
         const bool unsupported_samples = color_desc.SampleDesc.Count != 1U ||
             depth_desc.SampleDesc.Count != 1U ||
@@ -1383,7 +1385,7 @@ bool evaluate_d3d11_via_d3d12(
                 : D3D11TransportStatus::invalid_dimensions
         );
     }
-    if (uses_coordinated_center(transport_settings)) {
+    if (settings.enabled && uses_coordinated_center(transport_settings)) {
         const auto offsets = foveation_offsets_from_geometry(
             crop, render_width, render_height
         );
@@ -1392,16 +1394,17 @@ bool evaluate_d3d11_via_d3d12(
         apply_next_jump_preview(effective_settings, view_id);
     }
 
-    if (settings.enabled) {
-        // Both NR texture allocation and evaluation must use the same live SR
-        // center, including automatic alignment and gaze movement.
-        const auto offsets = foveation_offsets_from_geometry(
-            crop, render_width, render_height
-        );
-        nr_settings.width = static_cast<float>(crop.input_width) / render_width;
-        nr_settings.height = static_cast<float>(crop.input_height) / render_height;
-        nr_settings.x_offset = offsets.x;
-        nr_settings.height_offset = offsets.y;
+    bool has_nr_center{}, nr_gaze_reset{};
+    if (settings.nr_enabled && settings.nr_foveated) {
+        if (settings.enabled) {
+            has_nr_center = true;
+            nr_gaze_reset = gaze_reset;
+        } else {
+            has_nr_center = calculate_coordinated_center(settings, view_id, output,
+                render_width, render_height, out_width, out_height,
+                output_x, output_y, nr_center, nr_gaze_reset);
+            if (!has_nr_center) return reject_transport(D3D11TransportStatus::invalid_dimensions);
+        }
     }
 
     const auto create_flags = get_integer_bits(parameters, "DLSS.Feature.Create.Flags");
@@ -1433,7 +1436,8 @@ bool evaluate_d3d11_via_d3d12(
             nr_settings,
             out_width,
             out_height,
-            nr_geometry
+            nr_geometry,
+            has_nr_center ? &nr_center : nullptr
         )) {
         return reject_transport(D3D11TransportStatus::invalid_dimensions);
     }
@@ -1933,7 +1937,7 @@ bool evaluate_d3d11_via_d3d12(
                     nr_query_base
                 );
             }
-            const DlssNrFrame nr_frame{
+            DlssNrFrame nr_frame{
                 contract.view_id,
                 DlssNrRoute::d3d11_transport,
                 device->command_list12,
@@ -1962,6 +1966,9 @@ bool evaluate_d3d11_via_d3d12(
                 0U,
                 true,
             };
+            nr_frame.center = nr_center;
+            nr_frame.has_center = has_nr_center;
+            nr_frame.reset = nr_frame.reset || nr_gaze_reset;
             nr_succeeded = evaluate_dlss_nr(nr_frame, nr_settings);
             if (measure_dlss && nr_succeeded) {
                 device->command_list12->EndQuery(

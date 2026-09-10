@@ -40,6 +40,9 @@ struct DlssNrHistory {
 ) noexcept;
 
 [[nodiscard]] FoveationParameters dlss_nr_foveation_parameters(
+    const Settings& settings, const FoveationCenter* center) noexcept;
+
+[[nodiscard]] FoveationParameters dlss_nr_foveation_parameters(
     const Settings& settings,
     const FoveationGeometry* shared_sr_crop,
     std::uint32_t render_width,

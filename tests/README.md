@@ -1,3 +1,13 @@
+# NR-only gaze positioning regression
+
+`CheekyTests.exe` exercises NR-only placement with supplied OpenXR snapshots and
+the mocked OpenVR reader: both eye assignments, moving gaze, independent NR size,
+SR enable/disable transitions, full-frame SR size, and aligned/manual fallback.
+Placement is resolved without evaluating SR, then consumed by NR region geometry.
+For live verification, disable SR, enable foveated NR and its green alignment
+border, and use Simulated gaze before testing Runtime gaze. Check that the NR
+region moves and gaze diagnostics update; eye calibration must already be valid.
+
 # UEVR cached OpenVR compositor regression
 
 Run `CheekyUEVRTests.exe --openvr-late-027` after building. The same test supports
