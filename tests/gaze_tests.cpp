@@ -980,6 +980,28 @@ void test_packed_alignment_coordinator(bool openvr = false) {
         for (unsigned i = 0; i < 2; ++i)
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
                 snapshot.views[i].forward_u, 0.001F, "Crop follows corrected mapping after the next transition");
+        // Issue #22 has intermediate DLSS outputs and a larger array swapchain.
+        // A verified marker pair must drive gaze despite resource ambiguity.
+        settings.center_mode = FoveationCenterMode::openxr_gaze;
+        settings.gaze_smoothing_ms = 0;
+        snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_SIMULATED;
+        snapshot.status_flags |= CHEEKY_GAZE_STATUS_GAZE_VALID | CHEEKY_GAZE_STATUS_MAPPING_READY;
+        for (unsigned i = 0; i < 2; ++i) {
+            snapshot.views[i].image_rect_x = 0;
+            snapshot.views[i].image_rect_width = 4992;
+            snapshot.views[i].image_rect_height = 5024;
+            snapshot.views[i].resource_identity = 0x12345;
+            snapshot.views[i].array_index = i;
+        }
+        frame(); frame(); frame();
+        expect(gaze_diagnostics().using_gaze && gaze_diagnostics().views[0].marker_mapping &&
+                   gaze_diagnostics().views[1].marker_mapping,
+               "Verified markers must route gaze to scaled array submissions");
+        for (unsigned i = 0; i < 2; ++i)
+            expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
+                        snapshot.views[i].center_u, 0.004F, "Array gaze must use the calibrated eye's center");
+        settings.center_mode = FoveationCenterMode::fixed;
+        snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_MAPPING_READY;
         clear_stereo_calibration();
         frame(); frame();
         expect(gaze_diagnostics().alignment_source == 0U, "Ambiguous images require a live marker calibration");
@@ -1307,8 +1329,11 @@ void test_center_supersampling() {
 }
 
 int run_motion_resample_tests();
+int run_openxr_calibration_format_tests();
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--calibration-formats") == 0)
+        return run_openxr_calibration_format_tests();
     if (argc == 2 && std::strcmp(argv[1], "--motion-resample") == 0)
         return run_motion_resample_tests();
     test_center_supersampling();
@@ -1350,6 +1375,7 @@ int main(int argc, char** argv) {
     failures += run_support_summary_tests();
     failures += run_eye_calibration_tests();
     failures += run_openxr_calibration_tests();
+    failures += run_openxr_calibration_format_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

@@ -19,6 +19,7 @@ inline unsigned calibration_pixel_bytes(DXGI_FORMAT format) {
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
     case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
         return 4;
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
         return 8;
@@ -38,6 +39,15 @@ inline float calibration_half(std::uint16_t h) {
     return h & 0x8000 ? -value : value;
 }
 inline CalibrationPixel calibration_decode(const unsigned char* p, DXGI_FORMAT format) {
+    if (format == DXGI_FORMAT_R11G11B10_FLOAT) {
+        std::uint32_t n;
+        std::memcpy(&n, p, sizeof(n));
+        // Unsigned 5-bit exponents use the same bias as half-float. Align
+        // the 6/6/5-bit mantissas to half's 10 bits, retaining NaN/Inf.
+        return {calibration_half(std::uint16_t((n & 0x7ffU) << 4)),
+                calibration_half(std::uint16_t(((n >> 11) & 0x7ffU) << 4)),
+                calibration_half(std::uint16_t((n >> 22) << 5)), 1};
+    }
     if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
         CalibrationPixel result;
         std::memcpy(&result, p, sizeof(result));
@@ -61,7 +71,11 @@ inline CalibrationPixel calibration_decode(const unsigned char* p, DXGI_FORMAT f
 }
 // Markers only need exact zero/one values; no lossy float-to-half conversion.
 inline void calibration_encode_marker(unsigned char* p, DXGI_FORMAT format, unsigned candidate) {
-    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+    if (format == DXGI_FORMAT_R11G11B10_FLOAT) {
+        // Exact 1.0: exponent 15, zero mantissa; this format has no alpha.
+        const std::uint32_t value = (candidate ? 0x3c0U << 11 : 0x3c0U) | (0x1e0U << 22);
+        std::memcpy(p, &value, sizeof(value));
+    } else if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
         const CalibrationPixel value{candidate ? 0.0F : 1.0F, candidate ? 1.0F : 0.0F, 1, 1};
         std::memcpy(p, &value, 16);
     } else if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {

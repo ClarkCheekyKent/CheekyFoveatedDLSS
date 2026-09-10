@@ -130,6 +130,7 @@ struct Calibration12Frame {
     std::array<ComPtr<ID3D12CommandAllocator>, 2> allocators;
     std::array<ComPtr<ID3D12GraphicsCommandList>, 2> lists;
     bool invalid{};
+    Calibration12Failure failure{};
     std::uint64_t asynchronous_allocations{};
 };
 namespace {
@@ -164,8 +165,10 @@ void retire(std::uint64_t id) noexcept {
         for (auto& s : f->segments)
             if (s.used && s.recording == id) {
                 s.retired = true;
-                if (!s.submitted)
+                if (!s.submitted) {
                     f->invalid = true;
+                    f->failure = {"recording_retired_without_observed_submit"};
+                }
             }
     }
 }
@@ -288,6 +291,7 @@ bool calibration12_begin(Calibration12Frame& f) noexcept {
     if (!reusable(f))
         return false;
     f.invalid = false;
+    f.failure = {};
     for (auto& p : f.patches)
         p.used = false;
     for (auto& s : f.segments) {
@@ -301,36 +305,45 @@ bool calibration12_begin(Calibration12Frame& f) noexcept {
 }
 bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
                          unsigned candidate, unsigned x, unsigned y, D3D12_RESOURCE_STATES state,
-                         std::uint64_t& allocations) noexcept {
+                         std::uint64_t& allocations, Calibration12Failure* failure) noexcept {
+    if (failure) *failure = {};
+    const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
+        if (failure) *failure = {stage, hr};
+        return false;
+    };
     try {
         if (!list || !texture || candidate > 1 || list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
-            return false;
+            return reject("stamp_arguments");
         ComPtr<ID3D12Device> list_device, texture_device;
-        if (FAILED(list->GetDevice(IID_PPV_ARGS(&list_device))) ||
-            FAILED(texture->GetDevice(IID_PPV_ARGS(&texture_device))) ||
-            list_device.Get() != f.device.Get() || texture_device.Get() != f.device.Get())
-            return false;
+        auto hr = list->GetDevice(IID_PPV_ARGS(&list_device));
+        if (FAILED(hr)) return reject("stamp_list_device", hr);
+        hr = texture->GetDevice(IID_PPV_ARGS(&texture_device));
+        if (FAILED(hr)) return reject("stamp_texture_device", hr);
+        if (list_device.Get() != f.device.Get() || texture_device.Get() != f.device.Get())
+            return reject("stamp_device_mismatch");
         // Install post-Execute observation before recording any marker commands.
         if (!native_observer_status().ready) {
             D3D12_COMMAND_QUEUE_DESC q{};
             q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
             ComPtr<ID3D12CommandQueue> queue;
-            if (FAILED(f.device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue))) ||
-                !initialize_native_observer(f.device.Get(), queue.Get()))
-                return false;
+            hr = f.device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue));
+            if (FAILED(hr)) return reject("observer_queue", hr);
+            if (!initialize_native_observer(f.device.Get(), queue.Get()))
+                return reject("observer_install");
         }
         const auto recording = list_id(list, true);
         if (!recording)
-            return false;
+            return reject("recording_identity");
         std::lock_guard lock(f.mutex);
         const auto d = texture->GetDesc();
-        if (!texture_supported(d, 0) || UINT64(x) + marker_size > d.Width ||
-            UINT64(y) + marker_size > d.Height || !initialize(f, allocations))
-            return false;
+        if (!texture_supported(d, 0)) return reject("stamp_texture_format_or_layout");
+        if (UINT64(x) + marker_size > d.Width || UINT64(y) + marker_size > d.Height)
+            return reject("stamp_bounds");
+        if (!initialize(f, allocations)) return reject("stamp_query_buffers");
         const D3D12_BOX box{x, y, 0, x + marker_size, y + marker_size, 1};
         if (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
             !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations))
-            return false;
+            return reject("stamp_readback_buffers");
         if (f.marker_formats[candidate] != d.Format) {
             f.markers[candidate].Reset();
             f.marker_formats[candidate] = d.Format;
@@ -343,13 +356,14 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
             UINT64 bytes{};
             f.device->GetCopyableFootprints(&marker_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
             if (!buffer(f.device.Get(), D3D12_HEAP_TYPE_UPLOAD, bytes, f.markers[candidate]))
-                return false;
+                return reject("marker_upload_buffer");
             ++allocations;
             void* data{};
             const D3D12_RANGE empty{0, 0};
-            if (FAILED(f.markers[candidate]->Map(0, &empty, &data))) {
+            hr = f.markers[candidate]->Map(0, &empty, &data);
+            if (FAILED(hr)) {
                 f.markers[candidate].Reset();
-                return false;
+                return reject("marker_upload_map", hr);
             }
             const auto bpp = calibration_pixel_bytes(d.Format);
             for (unsigned yy = 0; yy < marker_size; ++yy)
@@ -377,39 +391,47 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         end_segment(f, list, candidate);
         return true;
     } catch (...) {
-        return false;
+        return reject("stamp_exception", E_FAIL);
     }
 }
 bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3D12Resource* texture,
                            unsigned eye, unsigned slice, D3D12_RESOURCE_STATES state,
-                           const std::array<D3D12_BOX, 2>& boxes, std::uint64_t& allocations) noexcept {
-    if (!queue || !texture || eye > 1 || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+                           const std::array<D3D12_BOX, 2>& boxes, std::uint64_t& allocations,
+                           Calibration12Failure* failure) noexcept {
+    if (failure) *failure = {};
+    const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
+        if (failure) *failure = {stage, hr};
         return false;
+    };
+    if (!queue || !texture || eye > 1 || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return reject("capture_arguments");
     std::lock_guard lock(f.mutex);
     const auto d = texture->GetDesc();
-    if (!texture_supported(d, slice) || !initialize(f, allocations))
-        return false;
+    if (!texture_supported(d, slice)) return reject("capture_texture_format_or_layout");
+    if (!initialize(f, allocations)) return reject("capture_query_buffers");
     ComPtr<ID3D12Device> device;
-    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || device.Get() != f.device.Get())
-        return false;
+    auto hr = queue->GetDevice(IID_PPV_ARGS(&device));
+    if (FAILED(hr)) return reject("capture_queue_device", hr);
+    if (device.Get() != f.device.Get()) return reject("capture_queue_device_mismatch");
     device.Reset();
-    if (FAILED(texture->GetDevice(IID_PPV_ARGS(&device))) || device.Get() != f.device.Get())
-        return false;
+    hr = texture->GetDevice(IID_PPV_ARGS(&device));
+    if (FAILED(hr)) return reject("capture_texture_device", hr);
+    if (device.Get() != f.device.Get()) return reject("capture_texture_device_mismatch");
     for (unsigned c = 0; c < 2; ++c) {
-        if (boxes[c].right > d.Width || boxes[c].bottom > d.Height ||
-            !prepare_patch(f, 4 + eye * 2 + c, d.Format, boxes[c], allocations))
-            return false;
+        if (boxes[c].right > d.Width || boxes[c].bottom > d.Height)
+            return reject("capture_bounds");
+        if (!prepare_patch(f, 4 + eye * 2 + c, d.Format, boxes[c], allocations))
+            return reject("capture_readback_buffers");
     }
     auto& allocator = f.allocators[eye];
     auto& list = f.lists[eye];
     if (!allocator) {
-        if (FAILED(
-                f.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))))
-            return false;
+        hr = f.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+        if (FAILED(hr)) return reject("capture_allocator_create", hr);
         ++allocations;
     }
-    if (FAILED(allocator->Reset()))
-        return false;
+    hr = allocator->Reset();
+    if (FAILED(hr)) return reject("capture_allocator_reset", hr);
     // Own lists are not game recordings; suppress observer callbacks while
     // submitting them under this frame lock.
     struct Scope {
@@ -421,12 +443,14 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
         }
     } scope;
     if (!list) {
-        if (FAILED(f.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                               IID_PPV_ARGS(&list))))
-            return false;
+        hr = f.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                         IID_PPV_ARGS(&list));
+        if (FAILED(hr)) return reject("capture_list_create", hr);
         ++allocations;
-    } else if (FAILED(list->Reset(allocator.Get(), nullptr)))
-        return false;
+    } else {
+        hr = list->Reset(allocator.Get(), nullptr);
+        if (FAILED(hr)) return reject("capture_list_reset", hr);
+    }
     const auto subresource = slice * d.MipLevels;
     begin_segment(f, list.Get(), 2 + eye);
     transition(list.Get(), texture, subresource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -434,10 +458,11 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
         copy_patch(f, list.Get(), 4 + eye * 2 + c, texture, subresource, boxes[c]);
     transition(list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     end_segment(f, list.Get(), 2 + eye);
-    if (FAILED(list->Close())) {
+    hr = list->Close();
+    if (FAILED(hr)) {
         f.invalid = true;
         f.segments[2 + eye].retired = true;
-        return false;
+        return reject("capture_list_close", hr);
     }
     auto& segment = f.segments[2 + eye];
     segment.retired = true;
@@ -445,7 +470,7 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     queue->ExecuteCommandLists(1, lists);
     if (!signal(f, segment, queue)) {
         f.invalid = true;
-        return false;
+        return reject("capture_fence_signal");
     }
     return true;
 }
@@ -462,8 +487,10 @@ void calibration12_submitted(ID3D12CommandQueue* queue, ID3D12GraphicsCommandLis
         std::lock_guard lock(f->mutex);
         for (auto& s : f->segments)
             if (s.used && !s.retired && s.recording == id) {
-                if (!signal(*f, s, queue))
+                if (!signal(*f, s, queue)) {
                     f->invalid = true;
+                    f->failure = {"source_fence_signal"};
+                }
             }
     }
 }
@@ -484,8 +511,10 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
     Calibration12Readback out;
     out.allocations = f.asynchronous_allocations;
     f.asynchronous_allocations = 0;
-    if (FAILED(f.device->GetDeviceRemovedReason())) {
+    const auto device_status = f.device->GetDeviceRemovedReason();
+    if (FAILED(device_status)) {
         out.ready = out.reusable = true;
+        out.failure = {"device_removed", device_status};
         return out;
     }
     out.reusable = reusable(f);
@@ -498,17 +527,21 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
             return out;
     out.ready = true;
     out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason());
+    out.failure = f.failure;
     for (unsigned i = 0; i < f.patches.size(); ++i) {
         auto& p = f.patches[i];
         if (!p.used) {
             out.valid = false;
+            if (!strcmp(out.failure.stage, "none")) out.failure = {"readback_patch_not_recorded"};
             continue;
         }
         const auto& d = p.footprint.Footprint;
         void* data{};
         const D3D12_RANGE range{0, static_cast<SIZE_T>(p.bytes)};
-        if (FAILED(p.buffer->Map(0, &range, &data))) {
+        const auto hr = p.buffer->Map(0, &range, &data);
+        if (FAILED(hr)) {
             out.valid = false;
+            out.failure = {"readback_map", hr};
             continue;
         }
         unsigned count{};

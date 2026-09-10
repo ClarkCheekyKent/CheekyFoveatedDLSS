@@ -193,6 +193,11 @@ void poll(State& s) {
                 continue;
             }
             f.invalid = f.invalid || !result.valid;
+            if (!result.valid) {
+                ++s.stats.d3d12_readback_failures;
+                s.stats.d3d12_last_readback_failure = result.failure.stage;
+                s.stats.d3d12_readback_error = result.failure.result;
+            }
             for (unsigned i = 0; i < 8; ++i) {
                 f.patches[i].used = f.patches[i].ready = true;
                 f.patches[i].score = result.scores[i];
@@ -607,6 +612,7 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
             return;
         }
         const auto d = output->GetDesc();
+        s.stats.d3d12_source_formats[c] = unsigned(d.Format);
         if (UINT64(x) + width > d.Width || UINT64(y) + height > d.Height) {
             f.invalid = true;
             return;
@@ -634,8 +640,13 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         f.views[c] = {view, width, height, assignment.assigned ? int(assignment.eye_index) : -1,
                       stereo_view_generation(view)};
         const auto px = x + (c ? width - inset - block : inset), py = y + inset;
-        if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations))
+        Calibration12Failure failure;
+        if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure)) {
             f.invalid = true;
+            ++s.stats.d3d12_stamp_failures;
+            s.stats.d3d12_last_stamp_failure = failure.stage;
+            s.stats.d3d12_stamp_error = failure.result;
+        }
     } catch (...) {
         auto& s = state();
         std::lock_guard lock(s.mutex);
@@ -670,6 +681,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         return 0;
     }
     const auto d = texture->GetDesc();
+    s.stats.d3d12_submitted_formats[eye] = unsigned(d.Format);
     if (d.Width > UINT32_MAX) {
         f.invalid = true;
         return 0;
@@ -695,9 +707,13 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     const auto expected_state = backend == EyeCalibrationBackend::openxr
                                     ? D3D12_RESOURCE_STATE_RENDER_TARGET
                                     : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    Calibration12Failure failure;
     if (!calibration12_capture(*f.gpu12, queue, texture, eye, slice, expected_state, boxes,
-                               s.stats.allocations)) {
+                               s.stats.allocations, &failure)) {
         f.invalid = true;
+        ++s.stats.d3d12_capture_failures;
+        s.stats.d3d12_last_capture_failure = failure.stage;
+        s.stats.d3d12_capture_error = failure.result;
         return 0;
     }
     return ticket_bit | (f.sequence << 1) | eye;
@@ -878,7 +894,17 @@ std::string eye_calibration_json() {
         if (i) out << ',';
         out << s.last_rejected_scores[i];
     }
-    out << "]}"
+    out << "]},\"d3d12\":{\"source_formats\":[" << s.d3d12_source_formats[0] << ',' << s.d3d12_source_formats[1]
+        << "],\"submitted_formats\":[" << s.d3d12_submitted_formats[0] << ',' << s.d3d12_submitted_formats[1]
+        << "],\"stamp_failures\":" << s.d3d12_stamp_failures
+        << ",\"capture_failures\":" << s.d3d12_capture_failures
+        << ",\"readback_failures\":" << s.d3d12_readback_failures
+        << ",\"last_stamp_failure\":\"" << s.d3d12_last_stamp_failure
+        << "\",\"stamp_hresult\":" << s.d3d12_stamp_error
+        << ",\"last_capture_failure\":\"" << s.d3d12_last_capture_failure
+        << "\",\"capture_hresult\":" << s.d3d12_capture_error
+        << ",\"last_readback_failure\":\"" << s.d3d12_last_readback_failure
+        << "\",\"readback_hresult\":" << s.d3d12_readback_error << '}'
         // View identities are pointers; strings preserve all bits through Lua.
         << ",\"left_view\":\"" << s.left_view << "\",\"right_view\":\"" << s.right_view << "\"}";
     return out.str();

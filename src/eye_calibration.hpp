@@ -27,6 +27,13 @@ struct EyeCalibrationStats {
     std::uint64_t rejected{}, publication_rejected{}, last_rejected_sequence{};
     unsigned last_rejection_mask{}, last_evaluations{}, last_submits{};
     std::array<float, 8> last_rejected_scores{};
+    // Captured on the render thread; no repeated logging or GPU waits.
+    std::array<unsigned, 2> d3d12_source_formats{}, d3d12_submitted_formats{};
+    std::uint64_t d3d12_stamp_failures{}, d3d12_capture_failures{}, d3d12_readback_failures{};
+    const char* d3d12_last_stamp_failure{"none"};
+    const char* d3d12_last_capture_failure{"none"};
+    const char* d3d12_last_readback_failure{"none"};
+    HRESULT d3d12_stamp_error{S_OK}, d3d12_capture_error{S_OK}, d3d12_readback_error{S_OK};
 };
 const char* eye_calibration_status(const EyeCalibrationStats&) noexcept;
 const char* eye_calibration_backend_name(EyeCalibrationBackend) noexcept;

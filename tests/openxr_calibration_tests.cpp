@@ -4,6 +4,7 @@
 #include "../openxr_layer/eye_calibration.hpp"
 #include <wrl/client.h>
 #include <dxgi1_4.h>
+#include <d3dcompiler.h>
 #include <iostream>
 #include <vector>
 #include <stdexcept>
@@ -51,6 +52,7 @@ struct XRLayer {
     XrInstance instance{};
     XrSession session{};
     XrSwapchain chain{};
+    unsigned image_width{}, image_height{};
     static XrResult XRAPI_CALL create(const XrInstanceCreateInfo*, const XrApiLayerCreateInfo*,
                                       XrInstance* out) {
         *out = reinterpret_cast<XrInstance>(1);
@@ -107,7 +109,8 @@ struct XRLayer {
         require(get(instance, name, &out) == XR_SUCCESS && out, "Layer dispatch missing");
         return reinterpret_cast<T>(out);
     }
-    XRLayer(void* texture, unsigned api, void* binding, unsigned width = 128, unsigned slices = 2) {
+    XRLayer(void* texture, unsigned api, void* binding, unsigned width = 128, unsigned slices = 2,
+             unsigned height = 128) : image_width(width), image_height(height) {
         image = texture;
         graphics = api;
         wait_result = release_result = end_result = XR_SUCCESS;
@@ -149,7 +152,7 @@ struct XRLayer {
         XrSwapchainCreateInfo chain_info{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         chain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
         chain_info.width = width;
-        chain_info.height = 128;
+        chain_info.height = height;
         chain_info.arraySize = slices;
         chain_info.mipCount = chain_info.faceCount = chain_info.sampleCount = 1;
         require(fn<PFN_xrCreateSwapchain>("xrCreateSwapchain")(session, &chain_info, &chain) == XR_SUCCESS,
@@ -189,7 +192,9 @@ struct XRLayer {
             v.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
             v.subImage.swapchain = chain;
             v.subImage.imageArrayIndex = array ? eye : 0;
-            v.subImage.imageRect = {{array ? 0 : static_cast<int>(eye * 128), 0}, {128, 128}};
+            const auto eye_width = static_cast<int>(array ? image_width : image_width / 2);
+            v.subImage.imageRect = {{array ? 0 : static_cast<int>(eye) * eye_width, 0},
+                                   {eye_width, static_cast<int>(image_height)}};
         }
         if (swap)
             std::swap(views[0], views[1]);
@@ -367,16 +372,17 @@ struct GPU12 {
         b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
         list->ResourceBarrier(1, &b);
     }
-    ComPtr<ID3D12Resource> texture(unsigned width, unsigned slices, D3D12_RESOURCE_STATES state) {
+    ComPtr<ID3D12Resource> texture(unsigned width, unsigned slices, D3D12_RESOURCE_STATES state,
+                                  DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, unsigned height = 128) {
         D3D12_HEAP_PROPERTIES h{};
         h.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC d{};
         d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         d.Width = width;
-        d.Height = 128;
+        d.Height = height;
         d.DepthOrArraySize = static_cast<UINT16>(slices);
         d.MipLevels = 1;
-        d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.Format = format;
         d.SampleDesc.Count = 1;
         d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         ComPtr<ID3D12Resource> r;
@@ -392,6 +398,88 @@ struct GPU12 {
         s.pResource = src;
         s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&d, x, 0, 0, &s, nullptr);
+    }
+};
+// A shader conversion/resize does not appear in the resource-copy graph.
+// Follow the markers through that path, including swapped array destinations.
+struct ScaledSubmission12 {
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    UINT increment{};
+    ScaledSubmission12(GPU12& gpu, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* target) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 3;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check(gpu.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
+        increment = gpu.device->GetDescriptorHandleIncrementSize(hd.Type);
+        auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        for (auto* source : {a, b}) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = source->GetDesc().Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2D.MipLevels = 1;
+            gpu.device->CreateShaderResourceView(source, &srv, cpu);
+            cpu.ptr += increment;
+        }
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = target->GetDesc().Format;
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        uav.Texture2DArray.ArraySize = 2;
+        gpu.device->CreateUnorderedAccessView(target, nullptr, &uav, cpu);
+        const D3D12_DESCRIPTOR_RANGE ranges[] = {
+            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
+        D3D12_ROOT_PARAMETER parameters[3]{};
+        for (unsigned i = 0; i < 2; ++i) {
+            parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            parameters[i].DescriptorTable = {1, &ranges[i]};
+        }
+        parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameters[2].Constants = {0, 0, 1};
+        D3D12_ROOT_SIGNATURE_DESC desc{};
+        desc.NumParameters = 3;
+        desc.pParameters = parameters;
+        ComPtr<ID3DBlob> signature, errors, shader;
+        check(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors));
+        check(gpu.device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                                              IID_PPV_ARGS(&root)));
+        constexpr char source[] = R"(
+Texture2D<float4> a : register(t0);
+Texture2D<float4> b : register(t1);
+RWTexture2DArray<float4> target : register(u0);
+cbuffer Options : register(b0) { uint swapped; }
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
+    uint2 p = id.xy * 128 / 192;
+    target[id] = ((id.z ^ swapped) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
+})";
+        check(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
+                          &shader, &errors));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};
+        ps.pRootSignature = root.Get();
+        ps.CS = {shader->GetBufferPointer(), shader->GetBufferSize()};
+        check(gpu.device->CreateComputePipelineState(&ps, IID_PPV_ARGS(&pipeline)));
+    }
+    void record(GPU12& gpu, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* target,
+                  D3D12_RESOURCE_STATES state, bool swapped) {
+        for (auto* r : {a, b})
+            gpu.barrier(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        gpu.barrier(target, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap* heaps[]{heap.Get()};
+        gpu.list->SetDescriptorHeaps(1, heaps);
+        gpu.list->SetComputeRootSignature(root.Get());
+        gpu.list->SetPipelineState(pipeline.Get());
+        auto handle = heap->GetGPUDescriptorHandleForHeapStart();
+        gpu.list->SetComputeRootDescriptorTable(0, handle);
+        handle.ptr += 2ULL * increment;
+        gpu.list->SetComputeRootDescriptorTable(1, handle);
+        gpu.list->SetComputeRoot32BitConstant(2, swapped ? 1U : 0U, 0);
+        gpu.list->Dispatch(24, 24, 2);
+        gpu.barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, state);
+        for (auto* r : {a, b})
+            gpu.barrier(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 };
 void recording_lifetime12() {
@@ -431,26 +519,67 @@ void recording_lifetime12() {
     check(gpu.list->Close());
     gpu.begin();
     const auto discarded = calibration12_poll(*frame);
-    require(discarded.ready && discarded.reusable && !discarded.valid,
+    require(discarded.ready && discarded.reusable && !discarded.valid &&
+                std::string(discarded.failure.stage) == "recording_retired_without_observed_submit",
             "Reset without Execute must discard safely");
     check(gpu.list->Close());
     std::cout << "D3D12 recording lifetime: resubmission, independent queue fences, discarded Reset passed\n";
 }
-void run12(EyeCalibrationBackend backend, bool array, bool hardware = false) {
+void failure_diagnostics12() {
+    roles();
+    GPU12 gpu;
+    // A single-channel texture cannot carry the two chromatic markers.
+    // Retain rejection and report its stage instead of inventing an eye role.
+    auto source = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R32_FLOAT);
+    auto target = gpu.texture(128, 2, D3D12_RESOURCE_STATE_RENDER_TARGET, DXGI_FORMAT_R32_FLOAT);
+    eye_calibration_frame(EyeCalibrationBackend::openxr, 902, 12);
+    gpu.begin();
+    eye_calibration_stamp12(gpu.list.Get(), source.Get(), 9101, 0, 0, 128, 128);
+    eye_calibration_stamp12(gpu.list.Get(), source.Get(), 9102, 0, 0, 128, 128);
+    gpu.execute();
+    for (unsigned eye = 0; eye < 2; ++eye)
+        require(eye_calibration_submit12(target.Get(), gpu.queue.Get(), eye, 0, 0, 1, 1, eye,
+                                          EyeCalibrationBackend::openxr, 902) == 0,
+                "Unsupported marker format must remain rejected");
+    gpu.wait(gpu.queue.Get());
+    calibration12_retired(gpu.list.Get());
+    eye_calibration_frame(EyeCalibrationBackend::openxr, 902, 12);
+    const auto stats = eye_calibration_stats();
+    const auto json = eye_calibration_json();
+    require(stats.valid == 0 && stats.d3d12_stamp_failures == 2 && stats.d3d12_capture_failures == 2 &&
+                stats.d3d12_readback_failures == 1 && !stereo_eye_assignment(9101).calibrated &&
+                json.find("\"source_formats\":[41,41]") != std::string::npos &&
+                json.find("\"submitted_formats\":[41,41]") != std::string::npos &&
+                json.find("stamp_texture_format_or_layout") != std::string::npos &&
+                json.find("capture_texture_format_or_layout") != std::string::npos,
+            "Rejected captures must report format/stage and never establish a mapping");
+    eye_calibration_reset_stats();
+    require(eye_calibration_stats().d3d12_stamp_failures == 0 &&
+                std::string(eye_calibration_stats().d3d12_last_stamp_failure) == "none",
+            "Resetting diagnostic counters must also reset D3D12 failure details");
+    cleanup();
+}
+void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
+           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, bool converted = false) {
     roles();
     GPU12 gpu(hardware);
     const auto state = backend == EyeCalibrationBackend::openxr ? D3D12_RESOURCE_STATE_RENDER_TARGET
                                                                 : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     const std::uint64_t generation = backend == EyeCalibrationBackend::openxr ? 901 : 0;
-    auto a = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-         b = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    auto target = gpu.texture(array ? 128 : 256, array ? 2 : 1, state);
+    auto a = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format),
+         b = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format);
+    const auto target_width = converted ? 192U : array ? 128U : 256U;
+    const auto target_height = converted ? 192U : 128U;
+    const auto target_format = converted ? DXGI_FORMAT_R16G16B16A16_FLOAT : format;
+    auto target = gpu.texture(target_width, array ? 2 : 1, state, target_format, target_height);
+    std::unique_ptr<ScaledSubmission12> scaling;
+    if (converted) scaling = std::make_unique<ScaledSubmission12>(gpu, a.Get(), b.Get(), target.Get());
     XrGraphicsBindingD3D12KHR binding{XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
     binding.device = gpu.device.Get();
     binding.queue = gpu.submit_queue.Get();
     std::unique_ptr<XRLayer> layer;
-    if (hardware)
-        layer = std::make_unique<XRLayer>(target.Get(), 12, &binding, array ? 128 : 256, array ? 2 : 1);
+    if (hardware || converted)
+        layer = std::make_unique<XRLayer>(target.Get(), 12, &binding, target_width, array ? 2 : 1, target_height);
     D3D12_HEAP_PROPERTIES h{};
     h.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC d{};
@@ -481,20 +610,24 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false) {
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             src.pResource = black.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, 512};
+            src.PlacedFootprint.Footprint = {format, 128, 128, 1, 512};
             gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             gpu.barrier(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
         eye_calibration_stamp12(gpu.list.Get(), a.Get(), 9101, 0, 0, 128, 128);
         eye_calibration_stamp12(gpu.list.Get(), b.Get(), 9102, 0, 0, 128, 128);
-        gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        gpu.barrier(target.Get(), state, D3D12_RESOURCE_STATE_COPY_DEST);
-        gpu.copy(target.Get(), 0, 0, frame < 32 ? b.Get() : a.Get());
-        gpu.copy(target.Get(), array ? 1 : 0, array ? 0 : 128, frame < 32 ? a.Get() : b.Get());
-        gpu.barrier(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, state);
-        gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (scaling) {
+            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 32);
+        } else {
+            gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            gpu.barrier(target.Get(), state, D3D12_RESOURCE_STATE_COPY_DEST);
+            gpu.copy(target.Get(), 0, 0, frame < 32 ? b.Get() : a.Get());
+            gpu.copy(target.Get(), array ? 1 : 0, array ? 0 : 128, frame < 32 ? a.Get() : b.Get());
+            gpu.barrier(target.Get(), D3D12_RESOURCE_STATE_COPY_DEST, state);
+            gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         gpu.execute();
         check(gpu.queue->Signal(gpu.fence.Get(), ++gpu.value));
         check(gpu.submit_queue->Wait(gpu.fence.Get(), gpu.value));
@@ -527,11 +660,32 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false) {
             "D3D12 transition must correct exactly once");
     require(stats.allocations == warm_allocations, "D3D12 allocations must stop after pool warmup");
     require(stats.gpu_samples > 0 && stats.gpu_us > 0, "D3D12 calibration timestamps missing");
+    require(stats.d3d12_source_formats[0] == unsigned(format) &&
+                stats.d3d12_source_formats[1] == unsigned(format) &&
+                stats.d3d12_submitted_formats[0] == unsigned(target_format) &&
+                stats.d3d12_submitted_formats[1] == unsigned(target_format) &&
+                !stats.d3d12_stamp_failures && !stats.d3d12_capture_failures,
+            "Calibration diagnostics must identify both source/submission formats without failures");
     std::cout << "D3D12 " << eye_calibration_backend_name(backend) << (array ? " array" : " packed")
-              << (hardware ? " hardware" : " WARP") << ": 64 valid, 2 corrections, stable allocations\n";
+              << (hardware ? " hardware" : " WARP") << " format=" << unsigned(format)
+              << (converted ? " -> FP16 at 1.5x via shader and layer DLL" : "")
+              << ": 64 valid, 2 corrections, stable allocations\n";
     cleanup();
 }
 } // namespace
+int run_openxr_calibration_format_tests() {
+    try {
+        failure_diagnostics12();
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT);
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT, true);
+        run12(EyeCalibrationBackend::openxr, true, true, DXGI_FORMAT_R11G11B10_FLOAT, true);
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "HDR calibration: " << e.what() << '\n' << eye_calibration_json() << '\n';
+        cleanup();
+        return 1;
+    }
+}
 int run_openxr_calibration_tests() {
     try {
         layer_policy();
