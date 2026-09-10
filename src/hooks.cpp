@@ -9,6 +9,7 @@
 #include "openvr_gaze.hpp"
 #include "crop_motion.hpp"
 #include "ngx_abi.hpp"
+#include "ngx_evaluation_extent.hpp"
 #include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
@@ -171,6 +172,7 @@ void bootstrap_streamline_options_hook() noexcept;
 struct D3D12GameView {
     const NgxHandle* handle{};
     std::uint32_t feature{1U};
+    NgxOutputExtent output{};
 };
 
 std::mutex d3d12_game_views_mutex;
@@ -3090,7 +3092,8 @@ void note_evaluation_begin(
 
 void remember_d3d12_game_view(
     const NgxHandle* const handle,
-    const std::uint32_t feature
+    const std::uint32_t feature,
+    const NgxOutputExtent output = {}
 ) {
     if (handle == nullptr || !is_dlss_feature(feature)) return;
     register_stereo_view(static_cast<DlssViewId>(
@@ -3100,10 +3103,18 @@ void remember_d3d12_game_view(
     for (auto& view : d3d12_game_views) {
         if (view.handle == handle) {
             view.feature = feature;
+            if (output.width && output.height) view.output = output;
             return;
         }
     }
-    d3d12_game_views.push_back({handle, feature});
+    d3d12_game_views.push_back({handle, feature, output});
+}
+
+[[nodiscard]] NgxOutputExtent d3d12_game_output_extent(const NgxHandle* handle) noexcept {
+    std::lock_guard lock(d3d12_game_views_mutex);
+    for (const auto& view : d3d12_game_views)
+        if (view.handle == handle) return view.output;
+    return {}; // Late attachment retains the existing evaluation dimensions.
 }
 
 [[nodiscard]] std::uint32_t d3d12_game_feature(
@@ -3798,9 +3809,10 @@ NgxResult hook_create_d3d12(
         );
         captured_d3d12_create_flags_valid.store(true, std::memory_order_release);
     }
+    const NgxOutputExtent output_extent{get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight")};
     const auto result = original(command_list, feature, parameters, handle);
     if (ngx_succeeded(result) && handle != nullptr) {
-        remember_d3d12_game_view(*handle, feature);
+        remember_d3d12_game_view(*handle, feature, output_extent);
     }
     return result;
 }
@@ -3835,9 +3847,10 @@ NgxResult hook_core_create_d3d12(
         );
         captured_d3d12_create_flags_valid.store(true, std::memory_order_release);
     }
+    const NgxOutputExtent output_extent{get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight")};
     const auto result = original(command_list, feature, parameters, handle);
     if (ngx_succeeded(result) && handle != nullptr) {
-        remember_d3d12_game_view(*handle, feature);
+        remember_d3d12_game_view(*handle, feature, output_extent);
     }
     return result;
 }
@@ -4268,6 +4281,11 @@ void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* h
 }
 NgxResult process_d3d12_evaluation(const D3D12NgxEvaluationCall& call,
     D3D12NgxEvaluateFn original, void* context) {
+    // Streamline supplies its own tagged extents. Restrict normalization to
+    // recognizable native DLSS calls, including handles adopted after attach.
+    const bool native_dlss = !inside_streamline_evaluation && recognizable_d3d12_dlss_evaluation(call);
+    const NgxEvaluationExtentScope extent_scope(native_dlss ? call.parameters : nullptr,
+        native_dlss ? d3d12_game_output_extent(call.handle) : NgxOutputExtent{});
     const auto result = process_d3d12_evaluation_impl(call, original, context);
     stamp_d3d12_game_output(call.command_list, call.handle, call.parameters, result);
     return result;

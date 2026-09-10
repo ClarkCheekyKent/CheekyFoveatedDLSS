@@ -120,7 +120,7 @@ bool texture_supported(const D3D12_RESOURCE_DESC& d, unsigned slice) {
 struct Calibration12Frame {
     std::mutex mutex;
     ComPtr<ID3D12Device> device;
-    std::array<Patch, 8> patches;
+    std::array<Patch, 12> patches;
     std::array<Segment, 4> segments;
     std::array<ComPtr<ID3D12Resource>, 2> markers;
     std::array<DXGI_FORMAT, 2> marker_formats{};
@@ -396,7 +396,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
 }
 bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3D12Resource* texture,
                            unsigned eye, unsigned slice, D3D12_RESOURCE_STATES state,
-                           const std::array<D3D12_BOX, 2>& boxes, std::uint64_t& allocations,
+                           const std::array<D3D12_BOX, 4>& boxes, std::uint64_t& allocations,
                            Calibration12Failure* failure) noexcept {
     if (failure) *failure = {};
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
@@ -417,10 +417,11 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     hr = texture->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(hr)) return reject("capture_texture_device", hr);
     if (device.Get() != f.device.Get()) return reject("capture_texture_device_mismatch");
-    for (unsigned c = 0; c < 2; ++c) {
+    for (unsigned c = 0; c < boxes.size(); ++c) {
         if (boxes[c].right > d.Width || boxes[c].bottom > d.Height)
             return reject("capture_bounds");
-        if (!prepare_patch(f, 4 + eye * 2 + c, d.Format, boxes[c], allocations))
+        const auto index = (c < 2 ? 4U : 8U) + eye * 2 + c % 2;
+        if (!prepare_patch(f, index, d.Format, boxes[c], allocations))
             return reject("capture_readback_buffers");
     }
     auto& allocator = f.allocators[eye];
@@ -454,8 +455,8 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     const auto subresource = slice * d.MipLevels;
     begin_segment(f, list.Get(), 2 + eye);
     transition(list.Get(), texture, subresource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    for (unsigned c = 0; c < 2; ++c)
-        copy_patch(f, list.Get(), 4 + eye * 2 + c, texture, subresource, boxes[c]);
+    for (unsigned c = 0; c < boxes.size(); ++c)
+        copy_patch(f, list.Get(), (c < 2 ? 4U : 8U) + eye * 2 + c % 2, texture, subresource, boxes[c]);
     transition(list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     end_segment(f, list.Get(), 2 + eye);
     hr = list->Close();

@@ -450,10 +450,12 @@ struct ScaledSubmission12 {
 Texture2D<float4> a : register(t0);
 Texture2D<float4> b : register(t1);
 RWTexture2DArray<float4> target : register(u0);
-cbuffer Options : register(b0) { uint swapped; }
+cbuffer Options : register(b0) { uint options; }
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
     uint2 p = id.xy * 128 / 192;
-    target[id] = ((id.z ^ swapped) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
+    if (options & 2) p.y = 127 - p.y;
+    if (options & 4) p.y = min(p.y, 127 - p.y);
+    target[id] = ((id.z ^ (options & 1)) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
 })";
         check(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
                           &shader, &errors));
@@ -463,7 +465,7 @@ cbuffer Options : register(b0) { uint swapped; }
         check(gpu.device->CreateComputePipelineState(&ps, IID_PPV_ARGS(&pipeline)));
     }
     void record(GPU12& gpu, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* target,
-                  D3D12_RESOURCE_STATES state, bool swapped) {
+                  D3D12_RESOURCE_STATES state, bool swapped, bool flipped = false, bool ambiguous = false) {
         for (auto* r : {a, b})
             gpu.barrier(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         gpu.barrier(target, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -475,7 +477,8 @@ cbuffer Options : register(b0) { uint swapped; }
         gpu.list->SetComputeRootDescriptorTable(0, handle);
         handle.ptr += 2ULL * increment;
         gpu.list->SetComputeRootDescriptorTable(1, handle);
-        gpu.list->SetComputeRoot32BitConstant(2, swapped ? 1U : 0U, 0);
+        gpu.list->SetComputeRoot32BitConstant(2,
+            (swapped ? 1U : 0U) | (flipped ? 2U : 0U) | (ambiguous ? 4U : 0U), 0);
         gpu.list->Dispatch(24, 24, 2);
         gpu.barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, state);
         for (auto* r : {a, b})
@@ -560,14 +563,17 @@ void failure_diagnostics12() {
     cleanup();
 }
 void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
-           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, bool converted = false) {
+           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, bool converted = false,
+           bool flipped = false, bool ambiguous = false) {
     roles();
     GPU12 gpu(hardware);
     const auto state = backend == EyeCalibrationBackend::openxr ? D3D12_RESOURCE_STATE_RENDER_TARGET
                                                                 : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     const std::uint64_t generation = backend == EyeCalibrationBackend::openxr ? 901 : 0;
-    auto a = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format),
-         b = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format);
+    // Unity can allocate a larger texture than the logical DLSS output view.
+    const auto allocation_width = converted ? 160U : 128U;
+    auto a = gpu.texture(allocation_width, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format),
+         b = gpu.texture(allocation_width, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format);
     const auto target_width = converted ? 192U : array ? 128U : 256U;
     const auto target_height = converted ? 192U : 128U;
     const auto target_format = converted ? DXGI_FORMAT_R16G16B16A16_FLOAT : format;
@@ -617,7 +623,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         eye_calibration_stamp12(gpu.list.Get(), a.Get(), 9101, 0, 0, 128, 128);
         eye_calibration_stamp12(gpu.list.Get(), b.Get(), 9102, 0, 0, 128, 128);
         if (scaling) {
-            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 32);
+            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 32, flipped, ambiguous);
         } else {
             gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -645,7 +651,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         gpu.wait(gpu.submit_queue.Get());
         calibration12_retired(gpu.list.Get());
         eye_calibration_tick();
-        if (frame == 31) {
+        if (frame == 31 && !ambiguous) {
             require(eye_calibration_stats().corrections == 1 && stereo_eye_assignment(9101).eye_index == 1,
                     "D3D12 initial eye swap was not corrected once");
             warm_allocations = eye_calibration_stats().allocations;
@@ -656,8 +662,19 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     else
         eye_calibration_frame(backend, generation, 12);
     const auto stats = eye_calibration_stats();
+    if (ambiguous) {
+        require(stats.valid == 0 && !stereo_eye_assignment(9101).calibrated &&
+                    stats.rejection_counts[7] >= 63,
+                "Conflicting orientation evidence must reject every frame and leave gaze unmapped");
+        cleanup();
+        std::cout << "D3D12 conflicting vertical orientations rejected\n";
+        return;
+    }
     require(stats.valid == 64 && stats.corrections == 2 && stereo_eye_assignment(9101).eye_index == 0,
             "D3D12 transition must correct exactly once");
+    require(stereo_eye_assignment(9101).vertical_flip == flipped &&
+                stereo_eye_assignment(9102).vertical_flip == flipped,
+            "Calibration must retain the verified image orientation for gaze projection");
     require(stats.allocations == warm_allocations, "D3D12 allocations must stop after pool warmup");
     require(stats.gpu_samples > 0 && stats.gpu_us > 0, "D3D12 calibration timestamps missing");
     require(stats.d3d12_source_formats[0] == unsigned(format) &&
@@ -676,6 +693,9 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
 int run_openxr_calibration_format_tests() {
     try {
         failure_diagnostics12();
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT, true, true);
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT, true, false, true);
+        run12(EyeCalibrationBackend::openxr, true, true, DXGI_FORMAT_R11G11B10_FLOAT, true, true);
         run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT);
         run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT, true);
         run12(EyeCalibrationBackend::openxr, true, true, DXGI_FORMAT_R11G11B10_FLOAT, true);

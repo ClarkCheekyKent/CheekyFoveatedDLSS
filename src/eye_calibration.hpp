@@ -20,6 +20,7 @@ struct EyeCalibrationStats {
     std::uint64_t left_view{}, right_view{};
     std::uint64_t corrections{}, applied{};
     bool correction_active{};
+    bool vertical_flip{};
     bool openvr_active{}, unsupported_submission{};
     std::uint64_t unsupported_submissions{};
     // A rejected capture can fail multiple checks; counters overlap.

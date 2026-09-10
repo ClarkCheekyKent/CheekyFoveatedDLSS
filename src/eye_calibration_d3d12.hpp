@@ -13,7 +13,8 @@ struct Calibration12Failure {
 };
 struct Calibration12Readback {
     bool ready{}, reusable{}, valid{}, timing_valid{};
-    std::array<float, 8> scores{};
+    // Source before/after, submitted A/B per eye, then vertically flipped A/B per eye.
+    std::array<float, 12> scores{};
     double gpu_us{};
     std::uint64_t allocations{};
     Calibration12Failure failure{};
@@ -24,7 +25,7 @@ bool calibration12_stamp(Calibration12Frame&, ID3D12GraphicsCommandList*, ID3D12
                          unsigned x, unsigned y, D3D12_RESOURCE_STATES, std::uint64_t& allocations,
                          Calibration12Failure* failure = nullptr) noexcept;
 bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resource*, unsigned eye,
-                           unsigned slice, D3D12_RESOURCE_STATES state, const std::array<D3D12_BOX, 2>& boxes,
+                           unsigned slice, D3D12_RESOURCE_STATES state, const std::array<D3D12_BOX, 4>& boxes,
                            std::uint64_t& allocations, Calibration12Failure* failure = nullptr) noexcept;
 Calibration12Readback calibration12_poll(Calibration12Frame&) noexcept;
 void calibration12_submitted(ID3D12CommandQueue*, ID3D12GraphicsCommandList*) noexcept;

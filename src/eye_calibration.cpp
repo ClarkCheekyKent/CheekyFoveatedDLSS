@@ -41,6 +41,7 @@ struct Frame {
     std::array<ComPtr<ID3D11Query>, 8> timestamp;
     // Source before/after for A and B, then A/B at each submitted eye.
     std::array<Patch, 8> patches;
+    std::array<float, 4> flipped_scores{};
     std::array<View, 2> views;
     std::array<unsigned, 2> eye_submits{};
     std::array<int, 2> result{{-1, -1}};
@@ -202,6 +203,7 @@ void poll(State& s) {
                 f.patches[i].used = f.patches[i].ready = true;
                 f.patches[i].score = result.scores[i];
             }
+            std::copy_n(result.scores.begin() + 8, 4, f.flipped_scores.begin());
             if (result.timing_valid) {
                 s.gpu.add(result.gpu_us);
                 ++s.stats.gpu_samples;
@@ -313,11 +315,20 @@ void poll(State& s) {
         const auto right_slot = 1U - left_slot;
         if (f.physical_eyes[0] >= 2 || f.physical_eyes[1] >= 2 ||
                 f.physical_eyes[0] == f.physical_eyes[1]) rejection |= 4U;
-        const int left =
+        int left =
             calibration_classify(f.patches[4 + left_slot * 2].score, f.patches[5 + left_slot * 2].score);
-        const int right =
+        int right =
             calibration_classify(f.patches[4 + right_slot * 2].score, f.patches[5 + right_slot * 2].score);
-        if (left < 0 || right < 0 || left == right) rejection |= 128U;
+        const int flipped_left = f.gpu12_used ? calibration_classify(
+            f.flipped_scores[left_slot * 2], f.flipped_scores[left_slot * 2 + 1]) : -1;
+        const int flipped_right = f.gpu12_used ? calibration_classify(
+            f.flipped_scores[right_slot * 2], f.flipped_scores[right_slot * 2 + 1]) : -1;
+        const bool normal_pair = left >= 0 && right >= 0 && left != right;
+        const bool flipped_pair = flipped_left >= 0 && flipped_right >= 0 && flipped_left != flipped_right;
+        // A post-DLSS shader may flip the image. Accept exactly one complete
+        // stereo pair; conflicting orientation evidence must never guess.
+        if (normal_pair == flipped_pair) rejection |= 128U;
+        if (flipped_pair) { left = flipped_left; right = flipped_right; }
         if (rejection) record_rejection(s, f, rejection);
         if (!rejection) {
             ++s.stats.valid;
@@ -335,7 +346,7 @@ void poll(State& s) {
                 bool corrected{};
                 if (publish_stereo_calibration(f.views[left].id, f.views[right].id, f.views[left].generation,
                                                f.views[right].generation, f.sequence, f.captured_ms,
-                                               &corrected, f.session_generation)) {
+                                               &corrected, f.session_generation, flipped_pair)) {
                     ++s.stats.applied;
                     if (corrected)
                         ++s.stats.corrections;
@@ -414,6 +425,7 @@ EyeCalibrationStats eye_calibration_stats() noexcept {
     result.unsupported_submission = s.unsupported_submission;
     result.correction_active = result.enabled && stereo_eye_assignment(result.left_view).calibrated &&
                                stereo_eye_assignment(result.right_view).calibrated;
+    result.vertical_flip = result.correction_active && stereo_eye_assignment(result.left_view).vertical_flip;
     return result;
 }
 void eye_calibration_reset_stats() noexcept {
@@ -686,20 +698,21 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         f.invalid = true;
         return 0;
     }
-    std::array<D3D12_BOX, 2> boxes;
-    for (unsigned c = 0; c < 2; ++c) {
+    std::array<D3D12_BOX, 4> boxes;
+    for (unsigned index = 0; index < boxes.size(); ++index) {
+        const auto c = index % 2;
         const auto& ref = f.views[c].width ? f.views[c] : f.views[0];
         if (!ref.width || !ref.height) {
             f.invalid = true;
             return 0;
         }
         const float nx = float(c ? ref.width - inset - block : inset) / ref.width,
-                    ny = float(inset) / ref.height;
+                    ny = float(index < 2 ? inset : ref.height - inset - block) / ref.height;
         const float ax = (u0 + nx * (u1 - u0)) * d.Width,
                     bx = (u0 + (nx + float(block) / ref.width) * (u1 - u0)) * d.Width;
         const float ay = (v0 + ny * (v1 - v0)) * d.Height,
                     by = (v0 + (ny + float(block) / ref.height) * (v1 - v0)) * d.Height;
-        boxes[c] = {unsigned(std::floor((std::min)(ax, bx))), unsigned(std::floor((std::min)(ay, by))), 0,
+        boxes[index] = {unsigned(std::floor((std::min)(ax, bx))), unsigned(std::floor((std::min)(ay, by))), 0,
                     unsigned(std::ceil((std::max)(ax, bx))),  unsigned(std::ceil((std::max)(ay, by))),  1};
         f.patches[4 + eye * 2 + c].reference_width = ref.width;
         f.patches[4 + eye * 2 + c].reference_height = ref.height;
@@ -861,6 +874,7 @@ std::string eye_calibration_json() {
         << eye_calibration_backend_name(s.backend) << "\",\"graphics_api\":" << s.graphics_api
         << ",\"enabled\":" << s.enabled << ",\"status\":\"" << eye_calibration_status(s)
         << "\",\"active\":" << s.correction_active << ",\"openvr_active\":" << s.openvr_active
+        << ",\"vertical_flip\":" << s.vertical_flip
         << ",\"unsupported_submission\":" << s.unsupported_submission
         << ",\"unsupported_submissions\":" << s.unsupported_submissions << ",\"frames\":" << s.frames
         << ",\"captures\":" << s.captures << ",\"completed\":" << s.completed << ",\"valid\":" << s.valid

@@ -12,6 +12,9 @@
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
 #include "graphics_observer.hpp"
+#include "ngx_evaluation_extent.hpp"
+#include "motion_region.hpp"
+#include "mock_ngx_parameters.hpp"
 
 #include <Windows.h>
 
@@ -1000,6 +1003,20 @@ void test_packed_alignment_coordinator(bool openvr = false) {
         for (unsigned i = 0; i < 2; ++i)
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
                         snapshot.views[i].center_u, 0.004F, "Array gaze must use the calibrated eye's center");
+        expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr,
+            calibration_session, true), "Verified vertical transform publishes with eye pair");
+        snapshot.views[0].center_v = 0.25F; snapshot.views[1].center_v = 0.7F;
+        frame(); frame(); frame();
+        for (unsigned i = 0; i < 2; ++i)
+            expect_near((crops[i].input_base_y + crops[i].input_height * 0.5F) / 1418.F,
+                1.F - snapshot.views[i].center_v, 0.004F, "Flipped submissions must invert gaze into DLSS coordinates");
+        settings.center_mode = FoveationCenterMode::fixed;
+        settings.aligned_height_offset = 0;
+        snapshot.views[0].forward_v = 0.3F; snapshot.views[1].forward_v = 0.65F;
+        frame();
+        for (unsigned i = 0; i < 2; ++i)
+            expect_near((crops[i].input_base_y + crops[i].input_height * 0.5F) / 1418.F,
+                1.F - snapshot.views[i].forward_v, 0.004F, "Flipped submissions must invert automatic forward alignment");
         settings.center_mode = FoveationCenterMode::fixed;
         snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_MAPPING_READY;
         clear_stereo_calibration();
@@ -1331,18 +1348,65 @@ void test_center_supersampling() {
 int run_motion_resample_tests();
 int run_openxr_calibration_format_tests();
 
+void test_native_dynamic_resolution_extent() {
+    using namespace cheeky::foveated_dlss;
+    MockNgxParameters parameters;
+    parameters.Set("Width", 4152U); parameters.Set("Height", 3336U);
+    // Replay DanceXR's optimal-settings query overwriting a reused bag.
+    parameters.Set("OutWidth", 2076U); parameters.Set("OutHeight", 1668U);
+    parameters.Set("DLSS.Render.Subrect.Dimensions.Width", 2076U);
+    parameters.Set("DLSS.Render.Subrect.Dimensions.Height", 1668U);
+    const auto before = parameters.values;
+    {
+        NgxEvaluationExtentScope scope(&parameters, {4152, 3336});
+        expect(get_ui(&parameters, "Width") == 2076 && get_ui(&parameters, "Height") == 1668 &&
+            get_ui(&parameters, "OutWidth") == 4152 && get_ui(&parameters, "OutHeight") == 3336,
+            "Native evaluation uses current render subrect and created output, not query scratch values");
+        Settings settings;
+        settings.width = .55F; settings.height = .45F;
+        CropGeometry crop;
+        const auto width = get_ui(&parameters, "Width"), height = get_ui(&parameters, "Height");
+        expect(calculate_foveation_geometry_at_center(foveation_parameters(settings), {.8F, .75F, 1},
+            width, height, get_ui(&parameters, "OutWidth"), get_ui(&parameters, "OutHeight"), 0, 0, crop),
+            "Dynamic-resolution gaze crop is valid");
+        expect(resolve_motion_region(true, 2, true, 2595, 2084, 0, 0, crop, width, height,
+            4152, 3336, 0, 0).valid(), "Dynamic-resolution crop fits DanceXR's allocated input motion texture");
+    }
+    expect(parameters.values == before, "Native normalization restores the application's reused parameter bag");
+    {
+        NgxEvaluationExtentScope late(&parameters, {});
+        expect(get_ui(&parameters, "OutWidth") == 2076, "Late attachment cannot guess a feature's creation size");
+    }
+    parameters.Set("Width", 2076U); parameters.Set("Height", 1668U);
+    parameters.Set("OutWidth", 4152U); parameters.Set("OutHeight", 3336U);
+    const auto compatible = parameters.values;
+    {
+        NgxEvaluationExtentScope scope(&parameters, {4152, 3336});
+        expect(parameters.values == compatible, "Compatible native contracts remain unchanged");
+    }
+    MockNgxParameters absent;
+    { NgxEvaluationExtentScope scope(&absent, {4152, 3336}); }
+    expect(absent.values.empty(), "Missing keys are not invented and cannot leak into the game");
+}
+
 int main(int argc, char** argv) {
-    if (argc == 2 && std::strcmp(argv[1], "--calibration-formats") == 0)
-        return run_openxr_calibration_format_tests();
-    if (argc == 2 && std::strcmp(argv[1], "--motion-resample") == 0)
-        return run_motion_resample_tests();
+    test_native_dynamic_resolution_extent();
+    if (argc == 2 && std::strcmp(argv[1], "--calibration-formats") == 0) {
+        failures += run_openxr_calibration_format_tests();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--motion-resample") == 0) {
+        failures += run_motion_resample_tests();
+        return failures ? 1 : 0;
+    }
     test_center_supersampling();
     test_packed_alignment_coordinator();
     test_packed_alignment_coordinator(true);
     test_openvr_geometry();
     test_auto_alignment();
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {
-        return run_d3d12_composite_tests();
+        failures += run_d3d12_composite_tests();
+        return failures ? 1 : 0;
     }
     test_simulated_gaze();
     test_gaze_copy_routes();
