@@ -78,7 +78,13 @@ public:
     DlssNrFrame frame, const Settings& settings) noexcept;
 void collect_dlss_nr_input_submissions() noexcept;
 void release_dlss_nr_inputs(DlssViewId view_id = 0U) noexcept;
-// Per-view transitions invalidate both SR histories, including fallback->NR.
+// Additional SR resets track the input actually substituted for this view.
+// First/original input needs no reset, even when order or dimensions change.
+// Entering processed Before input, changing its dimensions, or returning from
+// processed input to original (failure, disable, After) resets both SR histories
+// once. Stable processed input does not add a reset. Host resets and ordinary SR
+// crop/dimension handling remain independent. Only record an identified view;
+// failed preparation/substitution records original input, not processed input.
 [[nodiscard]] bool dlss_nr_input_history_compatible(DlssViewId view_id,
     NrProcessingOrder order, bool processed, std::uint32_t width, std::uint32_t height) noexcept;
 [[nodiscard]] bool dlss_nr_input_history_reset(DlssViewId view_id,

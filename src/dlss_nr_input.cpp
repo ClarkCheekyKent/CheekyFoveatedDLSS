@@ -19,9 +19,11 @@ struct Input {
 };
 struct History {
     DlssViewId view{};
-    NrProcessingOrder order{};
     bool processed{};
     std::uint32_t width{}, height{};
+    bool compatible(bool next_processed, std::uint32_t next_width, std::uint32_t next_height) const noexcept {
+        return processed == next_processed && (!processed || (width == next_width && height == next_height));
+    }
 };
 std::mutex mutex;
 std::deque<Input> inputs;
@@ -169,24 +171,24 @@ void release_dlss_nr_inputs(DlssViewId view_id) noexcept {
 }
 bool dlss_nr_input_history_compatible(DlssViewId view, NrProcessingOrder order,
     bool processed, std::uint32_t width, std::uint32_t height) noexcept {
+    processed = processed && order == NrProcessingOrder::before_upscaling;
     std::lock_guard lock(mutex);
     for (const auto& history : histories)
-        if (history.view == view) return history.order == order && history.processed == processed &&
-            history.width == width && history.height == height;
-    return false;
+        if (history.view == view) return history.compatible(processed, width, height);
+    return !processed;
 }
 bool dlss_nr_input_history_reset(DlssViewId view, NrProcessingOrder order,
     bool processed, std::uint32_t width, std::uint32_t height) noexcept {
+    processed = processed && order == NrProcessingOrder::before_upscaling;
     std::lock_guard lock(mutex);
-    const History next{view, order, processed, width, height};
+    const History next{view, processed, width, height};
     for (auto& history : histories) {
         if (history.view != view) continue;
-        const bool reset = history.order != order || history.processed != processed ||
-            history.width != width || history.height != height;
+        const bool reset = !history.compatible(processed, width, height);
         history = next;
         return reset;
     }
     histories.push_back(next);
-    return true;
+    return processed;
 }
 } // namespace cheeky::foveated_dlss

@@ -170,10 +170,33 @@ int run_nr_processing_tests() {
             "Second eye inherited first eye history");
         require(dlss_nr_input_history_compatible(100U, NrProcessingOrder::before_upscaling, false, 1600, 1200),
             "Second eye changed first eye history");
-        require(dlss_nr_input_history_reset(100U, NrProcessingOrder::after_upscaling, false, 1600, 1200),
-            "Order switch did not reset SR history");
+        require(!dlss_nr_input_history_reset(100U, NrProcessingOrder::after_upscaling, false, 1600, 1200),
+            "Order switch after raw fallback reset SR history");
         require(dlss_nr_input_history_reset(101U, NrProcessingOrder::before_upscaling, true, 1500, 1200),
             "Dynamic resolution did not reset SR history");
+        require(dlss_nr_input_history_reset(101U, NrProcessingOrder::after_upscaling, false, 1500, 1200),
+            "Processed Before to After did not reset SR history");
+        require(!dlss_nr_input_history_reset(101U, NrProcessingOrder::after_upscaling, false, 1500, 1200),
+            "Processed Before to After reset more than once");
+        for (const auto order : {NrProcessingOrder::after_upscaling, NrProcessingOrder::before_upscaling}) {
+            require(dlss_nr_input_history_compatible(102U, order, false, 100, 100),
+                "Unrecorded original input needs no additional reset");
+        }
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto order = i % 2 ? NrProcessingOrder::before_upscaling : NrProcessingOrder::after_upscaling;
+            require(!dlss_nr_input_history_reset(102U, order, false, 100 + i, 100 + i),
+                "Original input reset on first frame, order or dimension change");
+        }
+        require(dlss_nr_input_history_reset(102U, NrProcessingOrder::before_upscaling, true, 103, 103),
+            "Original to processed Before input did not reset");
+        require(!dlss_nr_input_history_reset(101U, NrProcessingOrder::before_upscaling, false, 200, 200),
+            "Another processed view contaminated original input history");
+        require(!dlss_nr_input_history_reset(102U, NrProcessingOrder::before_upscaling, true, 103, 103),
+            "Another raw view contaminated processed input history");
+        require(dlss_nr_input_history_reset(102U, NrProcessingOrder::before_upscaling, false, 103, 103),
+            "Disabling NR or failed substitution did not reset processed input");
+        require(!dlss_nr_input_history_reset(102U, NrProcessingOrder::before_upscaling, false, 104, 104),
+            "Repeated disabled/failed frame reset original input");
         release_dlss_nr_inputs();
         settings = Settings{};
         update_settings(settings);

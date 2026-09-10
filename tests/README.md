@@ -186,6 +186,18 @@ per-eye history changes, and restoration of NGX parameters and Streamline tags
 on success and failure. NVIDIA evaluation is stubbed in the test executable.
 Both CMake and MSBuild register the new sources.
 
+`CheekyUEVRTests.exe --late-dx12`, `--late-dx12-c`, and `--late-streamline`
+also observe Color and Reset inside fake SR evaluation through the real hooks.
+An isolated copy of the fake NGX DLL supplies feature 18, with complete current
+Streamline viewport tags/constants. Deterministic vertical region jumps check
+After NR with SR foveation disabled, then peripheral-before-center SR evaluation:
+the input scope preserves the host reset and does not consume the center reset.
+Coverage includes successful Before substitution, per-eye/viewport transitions,
+repeated After/disabled frames, failed NR or tag submission, incomplete/ambiguous
+viewport metadata, another viewport cached last, and parameter/tag restoration.
+Native private-SR failure also checks fallback with the prepared input intact.
+These fixtures do not launch a game or run NVIDIA's implementation.
+
 `CheekyTests.exe --d3d12-composite` also exercises the production private-color
 copy on WARP. A nonzero-origin render region in a mipmapped source is copied,
 then the private color is changed and passed through the production compositor.

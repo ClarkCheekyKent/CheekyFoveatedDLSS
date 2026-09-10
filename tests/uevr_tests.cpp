@@ -204,7 +204,19 @@ int main(int argc, char** argv) {
             original_wait = (*static_cast<void***>(cached_compositor))[2];
             api.vr = &vr_api; api.openvr = &openvr_api;
         }
-        const auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
+        auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
+        if (late && !dx11) {
+            // Isolate the optional fake NR runtime from ordinary host fixtures
+            // and from other concurrently running test processes.
+            const auto isolated = root / "nr-hooks";
+            const auto runtime_dir = isolated / "CheekyFoveatedDLSS";
+            std::filesystem::create_directories(runtime_dir);
+            std::filesystem::copy_file(plugin_path, isolated / plugin_path.filename());
+            std::filesystem::copy_file(bin / "CheekyFoveatedDLSS" / "CheekyFoveatedDLSSRuntime.dll",
+                runtime_dir / "CheekyFoveatedDLSSRuntime.dll");
+            std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", runtime_dir / "nvngx_dlssnr.dll");
+            plugin_path = isolated / plugin_path.filename();
+        }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));

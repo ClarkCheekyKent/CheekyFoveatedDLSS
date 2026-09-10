@@ -2795,19 +2795,34 @@ struct StreamlineNrInputScope {
         const void* const* inputs, std::uint32_t count, const Settings& settings) noexcept
         : list(command_list), token(frame), captured_settings(settings) {
         if (!list) return;
-        available = settings.nr_processing_order == NrProcessingOrder::before_upscaling
-            ? prepare_streamline_nr_current(original, frame, inputs, count)
-            : prepare_streamline_nr_passthrough(original, frame);
-        if (!available) return;
+        // Identify the evaluated viewport even when its NR metadata is missing.
+        // Never borrow the most recently tagged viewport or consume a pending
+        // transition when the evaluation's inputs cannot identify its owner.
+        SlViewportHandle viewport{};
+        AcquireSRWLockShared(&streamline_lock);
+        const bool known = has_cached_sl_options;
+        if (known) viewport = cached_sl_options_viewport;
+        ReleaseSRWLockShared(&streamline_lock);
         SlViewportHandle private_view{};
         std::array<const void*, 16U> validated{};
-        if (!prepare_streamline_sr_inputs(inputs, count, original.viewport, private_view, validated)) return;
+        if (!known || !prepare_streamline_sr_inputs(inputs, count, viewport, private_view, validated)) return;
+        const auto view_id = static_cast<DlssViewId>(viewport.value) + 1U;
+        if (settings.nr_enabled && settings.nr_processing_order == NrProcessingOrder::before_upscaling)
+            prepare(inputs, count);
+        history_reset = dlss_nr_input_history_reset(view_id, settings.nr_processing_order,
+            substituted, nr_frame.input_width, nr_frame.input_height);
+        streamline_nr_history_reset = history_reset;
+    }
+    void prepare(const void* const* inputs, std::uint32_t count) noexcept {
+        const auto& settings = captured_settings;
+        available = prepare_streamline_nr_current(original, token, inputs, count);
+        if (!available) return;
         if (!streamline_nr_frame(list, original, nr_frame)) return;
-        if (settings.nr_processing_order == NrProcessingOrder::before_upscaling) {
+        {
             GazeProjection projection{};
             AcquireSRWLockShared(&streamline_lock);
             projection = streamline_gaze_projections.find(original.viewport.value,
-                gaze_frame_key(frame), GetTickCount64());
+                gaze_frame_key(token), GetTickCount64());
             ReleaseSRWLockShared(&streamline_lock);
             const ScopedGazeProjection projection_scope(nr_frame.view_id, projection);
             auto alignment_settings = settings;
@@ -2825,7 +2840,7 @@ struct StreamlineNrInputScope {
         nr_frame.color_state = static_cast<D3D12_RESOURCE_STATES>(color.resource->state);
         nr_frame.color_base_x = color.extent.left;
         nr_frame.color_base_y = color.extent.top;
-        D3D12NrTimingScope timing{settings.nr_enabled && settings.nr_processing_order == NrProcessingOrder::before_upscaling ? list : nullptr, settings.nr_foveated, true};
+        D3D12NrTimingScope timing{list, settings.nr_foveated, true};
         if (color.resource->state != 0xFFFFFFFFU) {
             attempted = true;
             processed = prepare_dlss_nr_input(nr_frame, original.settings);
@@ -2841,9 +2856,6 @@ struct StreamlineNrInputScope {
             substituted = tag_substitution->apply(processed);
             if (!substituted) processed = nullptr;
         }
-        history_reset = dlss_nr_input_history_reset(nr_frame.view_id, settings.nr_processing_order,
-            processed != nullptr, nr_frame.input_width, nr_frame.input_height);
-        streamline_nr_history_reset = history_reset;
     }
     ~StreamlineNrInputScope() {
         if (!attempted && captured_settings.nr_enabled && captured_settings.nr_processing_order == NrProcessingOrder::before_upscaling)
@@ -4188,15 +4200,29 @@ struct NativeNrInputScope {
     NativeNrInputScope(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
         const NgxParameters* params, const Settings& settings) noexcept {
         if (!list || !handle || !params || !is_dlss_feature(d3d12_game_feature(handle))) return;
+        if (!settings.nr_enabled || settings.nr_processing_order != NrProcessingOrder::before_upscaling) {
+            const auto view_id = static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle));
+            const bool reset = dlss_nr_input_history_reset(view_id, settings.nr_processing_order, false, 0U, 0U);
+            substitution.emplace(params, nullptr, nullptr, reset);
+            return;
+        }
         frame = native_nr_frame(list, handle, params);
-        if (settings.nr_enabled && settings.nr_foveated) {
+        original_color = get_d3d12_parameter_resource(params, "Color");
+        auto* processed = prepare(list, params, settings);
+        const bool reset = dlss_nr_input_history_reset(frame.view_id, settings.nr_processing_order,
+            processed != nullptr, frame.input_width, frame.input_height);
+        substitution.emplace(params, original_color, processed, reset || gaze_reset);
+    }
+    ID3D12Resource* prepare(ID3D12GraphicsCommandList* list, const NgxParameters* params,
+        const Settings& settings) noexcept {
+        if (settings.nr_foveated) {
             frame.has_center = calculate_coordinated_center(settings, frame.view_id, frame.color,
                 frame.input_width, frame.input_height, frame.output_width, frame.output_height,
                 frame.color_base_x, frame.color_base_y, frame.center, gaze_reset);
-            if (!frame.has_center) return;
+            if (!frame.has_center) return nullptr;
             frame.reset = frame.reset || gaze_reset;
         }
-        if (settings.nr_processing_order == NrProcessingOrder::before_upscaling) {
+        {
             auto alignment_settings = settings;
             alignment_settings.enabled = true;
             crop_ready = calculate_coordinated_crop(alignment_settings, frame.view_id, frame.color,
@@ -4204,7 +4230,6 @@ struct NativeNrInputScope {
                 frame.color_base_x, frame.color_base_y, crop, gaze_reset, nullptr, &frame.center);
             frame.has_center = crop_ready;
         }
-        original_color = get_d3d12_parameter_resource(params, "Color");
         frame.color = original_color;
         frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         frame.color_base_x = get_ui(params, "DLSS.Input.Color.Subrect.Base.X");
@@ -4212,13 +4237,10 @@ struct NativeNrInputScope {
         frame.shared_sr_crop = crop;
         frame.has_shared_sr_crop = crop_ready;
         frame.reset = frame.reset || gaze_reset;
-        D3D12NrTimingScope timing{settings.nr_enabled && settings.nr_processing_order == NrProcessingOrder::before_upscaling ? list : nullptr,
-            settings.nr_foveated, true};
+        D3D12NrTimingScope timing{list, settings.nr_foveated, true};
         auto* processed = prepare_dlss_nr_input(frame, settings_for_view(settings, frame.view_id));
         timing.finish(processed != nullptr);
-        const bool reset = dlss_nr_input_history_reset(frame.view_id, settings.nr_processing_order,
-            processed != nullptr, frame.input_width, frame.input_height);
-        substitution.emplace(params, original_color, processed, reset || gaze_reset);
+        return processed;
     }
 };
 

@@ -3,6 +3,7 @@
 #include "streamline_abi.hpp"
 #include "timing_list_alias.hpp"
 #include <wrl/client.h>
+#include <array>
 #include <vector>
 #include <stdexcept>
 #include <cstdio>
@@ -24,6 +25,25 @@ using Release=NgxResult(*)(NgxHandle*);
 using Counter=unsigned(*)();
 using SlEvaluate=unsigned(*)(unsigned,const void*,const void* const*,unsigned,void*);
 using SlOptions=unsigned(*)(const void*,const SlDlssOptions*);
+struct SrInput { ID3D12Resource* color{}; unsigned reset{}; };
+std::vector<SrInput> sr_inputs;
+std::string evaluation_order;
+unsigned nr_reset{};
+void observe_sr(const NgxParameters* params) {
+    evaluation_order += 'S';
+    SrInput input;
+    params->Get("Color", &input.color);
+    params->Get("Reset", &input.reset);
+    sr_inputs.push_back(input);
+}
+void observe_nr(const NgxParameters* params) {
+    evaluation_order += 'N';
+    params->Get("DLSSNR.Reset", &nr_reset);
+}
+struct FrameToken : SlFrameToken {
+    unsigned index{};
+    operator std::uint32_t() const override { return index; }
+};
 struct Fixture {
     HMODULE ngx{},sl{}; MockNgxParameters params;
     ComPtr<ID3D11DeviceContext> context;
@@ -39,9 +59,40 @@ struct Fixture {
     Release release{}; Counter creates{},evaluates{},releases{};
     SlEvaluate sl_evaluate{}; SlOptions sl_options{};
     SlViewportHandle viewport{}; SlDlssOptions options{};
+    FrameToken frame;
+    bool complete_sl_metadata{};
+    bool missing_sl_constants{}, ambiguous_sl_inputs{}, cache_other_view{};
+    std::array<SlResource, 4> resources{};
+    std::array<SlResourceTag, 4> tags{};
+    void submit_metadata() {
+        if (!complete_sl_metadata) return;
+        const unsigned types[]{3U, 0U, 1U, 4U};
+        for (unsigned i = 0; i < 4; ++i) {
+            resources[i].native = textures12[i].Get();
+            resources[i].state = i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            tags[i].resource = &resources[i]; tags[i].type = types[i];
+            tags[i].extent.width = tags[i].extent.height = i == 3 ? 256U : 128U;
+        }
+        SlConstants constants{};
+        constants.struct_version = 1;
+        constants.motion_vector_scale = {1.F, 1.F};
+        constants.reset = static_cast<char>(get_ui(&params, "Reset"));
+        require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
+            &frame,&viewport,tags.data(),4,list.Get()) == 0, "Submit complete viewport tags");
+        if (!missing_sl_constants)
+            require(proc<unsigned(*)(const void*,const void*,const void*)>(sl,"slSetConstants")(
+                &constants,&frame,&viewport) == 0, "Submit current viewport constants");
+        if (cache_other_view) {
+            auto other = viewport; ++other.value;
+            require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
+                &frame,&other,tags.data(),4,list.Get()) == 0, "Cache another viewport last");
+            require(proc<unsigned(*)(const void*,const void*,const void*)>(sl,"slSetConstants")(
+                &constants,&frame,&other) == 0, "Cache another viewport's constants last");
+        }
+    }
     NgxHandle* handle{}; bool use_c{},use_sl{};
     NgxResult evaluate() {
-        if(use_sl) { const void* inputs[]{&viewport}; return sl_evaluate(0,nullptr,inputs,1,context ? static_cast<void*>(context.Get()) : static_cast<void*>(list.Get())); }
+        if(use_sl) { ++frame.index; submit_metadata(); const void* inputs[]{&viewport, &viewport}; return sl_evaluate(0,complete_sl_metadata ? &frame : nullptr,inputs,ambiguous_sl_inputs ? 2U : 1U,context ? static_cast<void*>(context.Get()) : static_cast<void*>(list.Get())); }
         if(context) return use_c ? evaluate11c(context.Get(),handle,&params,nullptr) : evaluate11(context.Get(),handle,&params,nullptr);
         return use_c ? evaluate12c(list.Get(),handle,&params,nullptr) : evaluate12(list.Get(),handle,&params,nullptr);
     }
@@ -58,6 +109,169 @@ struct Fixture {
 };
 Fixture& fixture() { static auto* f=new Fixture; return *f; }
 std::string snapshot(CheekyUEVRSnapshotFn get) { std::vector<char> text(32768); require(get(text.data(),32768),"Late snapshot"); return text.data(); }
+void verify_nr_reset_isolation(void (*command)(const char*)) {
+    auto& f = fixture();
+    if (f.context) return;
+    f.params.Set("Jitter.Offset.X", 0.F); f.params.Set("Jitter.Offset.Y", 0.F);
+    f.params.Set("DLSS.Hint.Render.Preset.DLAA", 0U);
+    proc<void(*)(void(*)(const NgxParameters*))>(f.ngx,"CheekyFakeObserve")(&observe_sr);
+    if (f.use_sl) {
+        f.options.struct_version = 3;
+        require(f.sl_options(&f.viewport,&f.options) == 0, "Restore supported viewport options");
+        f.complete_sl_metadata = true;
+    }
+    command("1\n90\nset\nEnabled=false\nNrEnabled=true\nNrProcessingOrder=0\nNrFoveated=true\nAutoStereoAlignment=true\nCenterMode=0\nWidth=0.5\nHeight=0.5\nXOffset=0\nHeightOffset=-1\nAlignmentBorder=false\nNrAlignmentBorder=false");
+    HMODULE nr{};
+    const auto evaluate = [&](unsigned host_reset) {
+        f.params.Set("Reset", host_reset);
+        const auto original = f.params.values;
+        sr_inputs.clear();
+        evaluation_order.clear();
+        require(ngx_succeeded(f.evaluate()), "NR isolation SR evaluation");
+        f.finish_gpu();
+        if (f.params.values != original) {
+            for (const auto& [key, value] : f.params.values) {
+                const auto found = original.find(key);
+                if (found == original.end() || found->second != value)
+                    printf("NR parameter changed: %s\n", key.c_str());
+            }
+        }
+        require(f.params.values == original, "NR scope did not restore original parameters");
+        if (f.use_sl)
+            require(proc<bool(*)(unsigned,const SlResourceTag*,unsigned)>(f.sl,"CheekyFakeTagsMatch")(
+                f.viewport.value,f.tags.data(),4), "NR scope did not restore original viewport tags");
+    };
+    evaluate(0); // Establish the coordinated region without relying on timing.
+    nr = GetModuleHandleW(L"nvngx_dlssnr.dll");
+    require(nr != nullptr, "Hook fixture loaded its local fake NR runtime");
+    proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserve")(&observe_nr);
+    command("1\n91\nset\nHeightOffset=1");
+    evaluate(7);
+    require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get(),
+        "After NR replaced original SR color");
+    require(sr_inputs[0].reset == 7, "After NR region jump changed the host SR reset");
+    require(evaluation_order == "SN" && nr_reset == 1, "After NR lost post-SR placement or history reset");
+    for (unsigned i = 0; i < 3; ++i) {
+        evaluate(0);
+        require(sr_inputs.size() == 1 && sr_inputs[0].reset == 0, "Repeated After frame reset SR");
+    }
+    command("1\n92\nset\nEnabled=true\nPeripheralDlaa=true\nHeightOffset=-1");
+    evaluate(0); evaluate(0); // Warm ordinary center/peripheral SR histories.
+    require(sr_inputs.size() == 2 && sr_inputs[0].reset == 0 && sr_inputs[1].reset == 0,
+        "Stable SR histories did not settle");
+    command("1\n93\nset\nHeightOffset=1");
+    evaluate(0);
+    require(sr_inputs.size() == 2, "Expected peripheral then center SR evaluation");
+    require(sr_inputs[0].reset == 0, "After input scope added a peripheral SR reset");
+    require(sr_inputs[1].reset == 1, "After input scope consumed the center SR gaze reset");
+    require(evaluation_order == "SSN" && nr_reset == 1, "After NR did not follow peripheral and center SR");
+    command("1\n94\nset\nEnabled=false\nNrEnabled=false\nNrProcessingOrder=1\nHeightOffset=-1");
+    for (unsigned i = 0; i < 3; ++i) {
+        evaluate(0);
+        require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get() && sr_inputs[0].reset == 0,
+            "Disabled Before NR changed raw SR input/reset");
+    }
+    command("1\n95\nset\nNrEnabled=true\nNrFoveated=false");
+    const auto fail_nr = proc<void(*)(bool)>(nr,"CheekyFakeFailEvaluations");
+    fail_nr(true);
+    evaluate(0);
+    require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get() && sr_inputs[0].reset == 0,
+        "Failed Before preparation changed original SR input/reset");
+    command("1\n96\nset\nNrProcessingOrder=0");
+    evaluate(0);
+    require(sr_inputs.size() == 1 && sr_inputs[0].reset == 0, "Raw fallback to After unnecessarily reset SR");
+    fail_nr(false);
+    command("1\n96\nset\nNrProcessingOrder=1");
+    const auto expect_input = [&](bool processed, unsigned reset, const char* why) {
+        require(sr_inputs.size() == 1 &&
+            (sr_inputs[0].color != f.textures12[0].Get()) == processed && sr_inputs[0].reset == reset, why);
+    };
+    evaluate(0);
+    expect_input(true, 1, "First successful Before substitution did not reset SR");
+    require(evaluation_order == "NS", "Before NR did not run before SR exactly once");
+    evaluate(0);
+    expect_input(true, 0, "Stable successful Before substitution reset SR");
+    if (!f.use_sl) {
+        command("1\n96\nset\nEnabled=true\nPeripheralDlaa=false");
+        proc<void(*)(unsigned)>(f.ngx,"CheekyFakeFailNextEvaluations")(1);
+        evaluate(0);
+        require(evaluation_order == "NSS" && sr_inputs.size() == 2 &&
+            sr_inputs[0].color != f.textures12[0].Get() && sr_inputs[1].color == sr_inputs[0].color,
+            "Private SR failure did not preserve prepared Before input through native fallback");
+        command("1\n96\nset\nEnabled=false");
+    }
+    // Keep another eye's processed history while this eye returns to raw input.
+    auto* first_handle = f.handle;
+    const auto first_viewport = f.viewport.value;
+    if (f.use_sl) {
+        ++f.viewport.value;
+        require(f.sl_options(&f.viewport,&f.options) == 0, "Second viewport options");
+    } else {
+        require(ngx_succeeded(f.create12(f.list.Get(),1,&f.params,&f.handle)), "Second native view");
+    }
+    evaluate(0);
+    expect_input(true, 1, "Second eye inherited first eye's processed history");
+    command("1\n96\nset\nNrProcessingOrder=0");
+    evaluate(0);
+    expect_input(false, 1, "Processed Before to After did not reset this eye");
+    evaluate(0);
+    expect_input(false, 0, "Processed Before to After reset this eye twice");
+    if (!f.use_sl) require(ngx_succeeded(f.release(f.handle)), "Release second native view");
+    f.handle = first_handle; f.viewport.value = first_viewport;
+    if (f.use_sl) {
+        require(f.sl_options(&f.viewport,&f.options) == 0, "Restore first viewport options");
+        f.ambiguous_sl_inputs = true;
+        evaluate(0);
+        expect_input(false, 0, "Ambiguous viewport consumed another view's transition");
+        f.ambiguous_sl_inputs = false;
+        f.cache_other_view = true;
+    }
+    evaluate(0);
+    expect_input(false, 1, "First eye lost its pending processed-to-After transition");
+    evaluate(0);
+    expect_input(false, 0, "First eye repeated its transition reset");
+    f.cache_other_view = false;
+    command("1\n96\nset\nNrProcessingOrder=1");
+    evaluate(0);
+    expect_input(true, 1, "Returning to successful Before did not reset");
+    fail_nr(true);
+    evaluate(0);
+    expect_input(false, 1, "Failed preparation did not reset processed history");
+    evaluate(0);
+    expect_input(false, 0, "Repeated failed preparation reset raw history");
+    fail_nr(false);
+    evaluate(0);
+    expect_input(true, 1, "Recovered preparation did not reset raw history");
+    if (f.use_sl) {
+        f.missing_sl_constants = true;
+        evaluate(0);
+        expect_input(false, 1, "Missing current metadata discarded a processed transition");
+        evaluate(0);
+        expect_input(false, 0, "Repeated missing metadata reset original input");
+        f.missing_sl_constants = false;
+        evaluate(0);
+        expect_input(true, 1, "Metadata recovery did not restore Before substitution");
+        const auto fail_tag = proc<void(*)(bool)>(f.sl,"CheekyFakeFailColorTag");
+        fail_tag(true);
+        evaluate(0);
+        expect_input(false, 1, "Rejected tag substitution was recorded as processed");
+        evaluate(0);
+        expect_input(false, 0, "Repeated rejected tag reset raw history");
+        fail_tag(false);
+        evaluate(0);
+        expect_input(true, 1, "Successful tag substitution did not reset raw history");
+    }
+    command("1\n96\nset\nNrEnabled=false");
+    evaluate(0);
+    expect_input(false, 1, "Disabling Before NR did not reset processed history");
+    evaluate(0);
+    expect_input(false, 0, "Repeated disabled frame reset raw history");
+    require(evaluation_order == "S", "Disabled NR still evaluated");
+    proc<void(*)(void(*)(const NgxParameters*))>(f.ngx,"CheekyFakeObserve")(nullptr);
+    proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserve")(nullptr);
+    command("1\n97\nset\nEnabled=true\nNrEnabled=false\nPeripheralDlaa=false\nAutoStereoAlignment=false");
+    puts("NR reset isolation: After jump, evaluation order, per-view transitions, fallback and restoration passed");
+}
 }
 void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx11,ID3D12Device* dx12,ID3D12CommandQueue* queue,bool use_c,bool use_sl) {
     auto& f=fixture(); f.use_c=use_c; f.use_sl=use_sl; f.device=dx12; f.queue=queue;
@@ -171,6 +385,7 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
         else proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
     }
     require(ngx_succeeded(f.evaluate()),"Evaluate recreated game feature"); f.finish_gpu();
+    verify_nr_reset_isolation(command);
     if (!f.context && !f.use_sl) {
         command("1\n70\nset\nEnabled=false");
         // UE can discard a recording after evaluation. Exhaust more than the
