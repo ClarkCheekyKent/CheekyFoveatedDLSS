@@ -156,6 +156,14 @@ current diagnostic interface does not expose a headset model, so users supply it
 
 ### Rendering order and working scale
 
+In UEVR DX12, enable DLSS-NR and open **Neural rendering > Rendering order**.
+The selector applies and saves through the normal acknowledged settings flow.
+`NrProcessingOrder=0` means After; `1` means Before. Older configuration files
+without the key default to After, and other values reject the settings transaction.
+If the runtime omits the setting, the menu shows it as unavailable. The configuration
+schema and UI protocol remain at version 1. UEVR's DX11 path still does not support
+NR or DX12 Transport.
+
 **Rendering order** defaults to **After upscaling**, preserving the existing
 post-SR processing. **Before upscaling** runs NR on a private copy of the active
 render-resolution color before center SR, peripheral DLAA, and composition.
