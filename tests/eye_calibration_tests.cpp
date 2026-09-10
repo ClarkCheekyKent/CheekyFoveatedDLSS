@@ -141,6 +141,42 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     unregister_stereo_view(101);
     unregister_stereo_view(202);
 }
+void pattern_tests() {
+    constexpr unsigned side = 60;
+    std::array<CalibrationPixel, side * side> pixels{};
+    auto score = [&](unsigned candidate) {
+        return calibration_pattern_score(pixels.data(), side * sizeof(CalibrationPixel), side, side,
+                                          DXGI_FORMAT_R32G32B32A32_FLOAT, candidate, true);
+    };
+    for (unsigned candidate = 0; candidate < 2; ++candidate)
+        for (int offset : {-8, -3, 0, 5, 8})
+            for (unsigned mirror = 0; mirror < 4; ++mirror) {
+                pixels.fill({.7F, .7F, .7F, 1});
+                for (unsigned y = 0; y < 40; ++y)
+                    for (unsigned x = 0; x < 40; ++x) {
+                        const bool light = calibration_pattern_bit(candidate, (mirror & 1 ? 39 - x : x) / 8,
+                                                                    (mirror & 2 ? 39 - y : y) / 8);
+                        // Strong lifted blacks and unequal channel gains resemble washed-out grading.
+                        const float v = light ? 1.F : 0.F;
+                        pixels[(10 - offset + y) * side + 10 + offset + x] =
+                            {.75F + .12F * v, .65F + .2F * v, .8F + .15F * v, 1};
+                    }
+                require(calibration_pattern_classify(score(0), score(1)) == int(candidate),
+                        "Pattern must survive grading, bounded displacement and mirrored bounds");
+            }
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        for (unsigned y = 0; y < side; ++y)
+            for (unsigned x = 0; x < side; ++x) {
+                const float v = mode == 0 ? 1.F : mode == 1 ? x / 60.F :
+                                mode == 2 ? float((x / 8 + y / 8) % 2) : .75F;
+                pixels[y * side + x] = {v, v, v, 1};
+            }
+        require(calibration_pattern_classify(score(0), score(1)) == -1,
+                "Uniform, clipped, gradient and checkerboard patches must remain unmapped");
+    }
+    pixels[0].r = std::numeric_limits<float>::quiet_NaN();
+    require(score(0) == 0, "Nonfinite readback must not match a pattern");
+}
 void run_calibration_policy() {
     clear_stereo_calibration();
     register_stereo_view(8001);
@@ -183,18 +219,6 @@ void run_calibration_policy() {
 int run_eye_calibration_tests() {
     try {
         run_calibration_policy();
-        require(calibration_classify(0.1F, 0.05F) == -1, "Weak relative winner must remain unknown");
-        require(calibration_classify(0.9F, 0.85F) == -1, "Both markers must remain ambiguous");
-        require(calibration_classify(0.7F, 0.1F) == 0, "Clear marker should be recognized");
-        require(calibration_classify(0.4F, 0.2F) == 0 && calibration_classify(0.2F, 0.4F) == 1,
-                "Accept either marker at the score and separation boundaries");
-        require(calibration_classify(0.399F, 0.F) == -1,
-                "Reject scores below the relaxed minimum");
-        require(calibration_classify(0.4F, 0.201F) == -1,
-                "Reject insufficient separation even when the winning score passes");
-        require(calibration_similarity({0.4F, 0.05F, 0.4F, 1}, 0) > 0.8F,
-                "Intensity changes should be tolerated");
-        require(calibration_similarity({1, 1, 1, 1}, 0) == 0, "White HUD must not count as magenta");
         require(calibration_half(0x3c00) == 1 && calibration_half(0x3800) == 0.5F,
                 "Half-float decoding failed");
         // Independent packed values exercise channel layout, non-unit HDR
@@ -208,20 +232,26 @@ int run_eye_calibration_tests() {
         const auto subnormal_pixel = packed_pixel(1U | (1U << 11) | (1U << 22));
         require(subnormal_pixel.r == std::ldexp(1.0F, -20) && subnormal_pixel.g == subnormal_pixel.r &&
                     subnormal_pixel.b == std::ldexp(1.0F, -19), "R11G11B10 subnormal decoding failed");
-        require(calibration_similarity(packed_pixel(0x7c0U), 0) == 0 &&
-                    calibration_similarity(packed_pixel(0x7c1U << 11), 1) == 0,
-                "R11G11B10 Inf/NaN must never identify an eye");
-        for (unsigned c = 0; c < 2; ++c) {
-            std::uint32_t marker{};
-            calibration_encode_marker(reinterpret_cast<unsigned char*>(&marker), DXGI_FORMAT_R11G11B10_FLOAT, c);
-            require(marker == ((c ? 0x3c0U << 11 : 0x3c0U) | (0x1e0U << 22)) &&
-                        calibration_similarity(packed_pixel(marker), c) == 1.0F &&
-                        calibration_similarity(packed_pixel(marker), 1U - c) == 0.0F,
-                    "R11G11B10 markers must identify only their own candidate");
-        }
-        require(calibration_similarity({1, calibration_half(0x7c00), 1, 1}, 0) == 0 &&
-                    calibration_classify(calibration_half(0x7e00), 1) == -1,
-                "Non-finite HDR pixels and scores must not create a false eye match");
+        require(std::isinf(packed_pixel(0x7c0U).r) && std::isnan(packed_pixel(0x7c1U << 11).g),
+                "R11G11B10 invalid channels must remain detectable");
+        for (unsigned c = 0; c < 2; ++c)
+            for (unsigned y = 0; y < 5; ++y)
+                for (unsigned x = 0; x < 5; ++x) {
+                    std::uint32_t marker{};
+                    calibration_encode_pattern(reinterpret_cast<unsigned char*>(&marker),
+                                               DXGI_FORMAT_R11G11B10_FLOAT, c, x * 8, y * 8);
+                    const auto pixel = packed_pixel(marker);
+                    const float expected = calibration_pattern_bit(c, x, y) ? 1.F : 0.F;
+                    require(pixel.r == expected && pixel.g == expected && pixel.b == expected,
+                            "Packed HDR pattern must encode exact neutral light/dark cells");
+                }
+        require(calibration_pattern_classify(.89F, 0.F) == -1 &&
+                    calibration_pattern_classify(.95F, .85F) == -1 &&
+                    calibration_pattern_classify(1.F, .5F) == 0 &&
+                    calibration_pattern_classify(.5F, 1.F) == 1 &&
+                    calibration_pattern_classify(calibration_half(0x7e00), 1.F) == -1,
+                "Pattern classification must reject weak, ambiguous and nonfinite scores");
+        pattern_tests();
         run_calibration();
         for (auto format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
                             DXGI_FORMAT_R11G11B10_FLOAT,

@@ -18,7 +18,8 @@ namespace cheeky::foveated_dlss {
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr unsigned ring_size = 8, block = calibration_marker_size, inset = 12;
-constexpr unsigned sample = calibration_sample_size, margin = calibration_sample_margin;
+constexpr unsigned sample = calibration_sample_size;
+constexpr int margin = calibration_sample_margin;
 constexpr std::uint64_t ticket_bit = 1ULL << 63;
 struct Patch {
     ComPtr<ID3D11Texture2D> staging;
@@ -254,20 +255,10 @@ void poll(State& s) {
                     p.ready = true;
                     continue;
                 }
-                float score{};
-                unsigned count{};
                 const unsigned candidate = i < 4 ? i / 2 : (i - 4) % 2;
-                const unsigned bytes = calibration_pixel_bytes(p.format);
-                for (unsigned y = p.height / 5; y < p.height - p.height / 5; ++y)
-                    for (unsigned x = p.width / 5; x < p.width - p.width / 5; ++x) {
-                        const auto pixel = calibration_decode(
-                            static_cast<const unsigned char*>(mapped.pData) + y * mapped.RowPitch + x * bytes,
-                            p.format);
-                        score += calibration_similarity(pixel, candidate);
-                        ++count;
-                    }
+                p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
+                                                    p.format, candidate, i >= 4);
                 f.context->Unmap(p.staging.Get(), 0);
-                p.score = count ? score / count : 0;
                 p.ready = true;
             }
             if (waiting)
@@ -318,12 +309,12 @@ void poll(State& s) {
         if (f.physical_eyes[0] >= 2 || f.physical_eyes[1] >= 2 ||
                 f.physical_eyes[0] == f.physical_eyes[1]) rejection |= 4U;
         int left =
-            calibration_classify(f.patches[4 + left_slot * 2].score, f.patches[5 + left_slot * 2].score);
+            calibration_pattern_classify(f.patches[4 + left_slot * 2].score, f.patches[5 + left_slot * 2].score);
         int right =
-            calibration_classify(f.patches[4 + right_slot * 2].score, f.patches[5 + right_slot * 2].score);
-        const int flipped_left = f.gpu12_used ? calibration_classify(
+            calibration_pattern_classify(f.patches[4 + right_slot * 2].score, f.patches[5 + right_slot * 2].score);
+        const int flipped_left = f.gpu12_used ? calibration_pattern_classify(
             f.flipped_scores[left_slot * 2], f.flipped_scores[left_slot * 2 + 1]) : -1;
-        const int flipped_right = f.gpu12_used ? calibration_classify(
+        const int flipped_right = f.gpu12_used ? calibration_pattern_classify(
             f.flipped_scores[right_slot * 2], f.flipped_scores[right_slot * 2 + 1]) : -1;
         const bool normal_pair = left >= 0 && right >= 0 && left != right;
         const bool flipped_pair = flipped_left >= 0 && flipped_right >= 0 && flipped_left != flipped_right;
@@ -583,7 +574,7 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         if (!s.markers[c]) {
             std::vector<unsigned char> data(block * block * bytes);
             for (unsigned i = 0; i < block * block; ++i)
-                calibration_encode_marker(data.data() + i * bytes, desc.Format, c);
+                calibration_encode_pattern(data.data() + i * bytes, desc.Format, c, i % block, i / block);
             desc.Width = desc.Height = block;
             desc.MipLevels = 1;
             desc.Usage = D3D11_USAGE_DEFAULT;
@@ -600,10 +591,10 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
                       stereo_view_generation(view)};
         const unsigned px = x + (c ? width - inset - block : inset), py = y + inset;
         context->End(f.timestamp[c * 2].Get());
-        if (!copy_patch(s, f, c * 2, texture.Get(), px + margin, py + margin, sample, sample))
+        if (!copy_patch(s, f, c * 2, texture.Get(), px, py, block, block))
             f.invalid = true;
         context->CopySubresourceRegion(texture.Get(), 0, px, py, 0, s.markers[c].Get(), 0, nullptr);
-        if (!copy_patch(s, f, c * 2 + 1, texture.Get(), px + margin, py + margin, sample, sample))
+        if (!copy_patch(s, f, c * 2 + 1, texture.Get(), px, py, block, block))
             f.invalid = true;
         context->End(f.timestamp[c * 2 + 1].Get());
         f.segments[c] = true;
@@ -716,8 +707,8 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
             f.invalid = true;
             return 0;
         }
-        const float nx = float((c ? ref.width - inset - block : inset) + margin) / ref.width,
-                    ny = float((index < 2 ? inset : ref.height - inset - block) + margin) / ref.height;
+        const float nx = (float(c ? ref.width - inset - block : inset) + margin) / ref.width,
+                    ny = (float(index < 2 ? inset : ref.height - inset - block) + margin) / ref.height;
         const float ax = (u0 + nx * (u1 - u0)) * d.Width,
                     bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * d.Width;
         const float ay = (v0 + ny * (v1 - v0)) * d.Height,
@@ -787,8 +778,8 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
             f.invalid = true;
             continue;
         }
-        const float nx = float((c ? ref.width - inset - block : inset) + margin) / ref.width,
-                    ny = float(inset + margin) / ref.height;
+        const float nx = (float(c ? ref.width - inset - block : inset) + margin) / ref.width,
+                    ny = (float(inset) + margin) / ref.height;
         const float ax = (u0 + nx * (u1 - u0)) * desc.Width,
                     bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * desc.Width;
         const float ay = (v0 + ny * (v1 - v0)) * desc.Height,
@@ -928,7 +919,9 @@ std::string eye_calibration_json() {
         << ",\"last_capture_failure\":\"" << s.d3d12_last_capture_failure
         << "\",\"capture_hresult\":" << s.d3d12_capture_error
         << ",\"last_readback_failure\":\"" << s.d3d12_last_readback_failure
-        << "\",\"readback_hresult\":" << s.d3d12_readback_error << '}'
+        << "\",\"readback_hresult\":" << s.d3d12_readback_error << '}';
+    out << ",\"marker_mode\":\"pattern5x5\",\"pattern_min_score\":0.90,\"pattern_min_gap\":0.15";
+    out
         // View identities are pointers; strings preserve all bits through Lua.
         << ",\"left_view\":\"" << s.left_view << "\",\"right_view\":\"" << s.right_view << "\"}";
     return out.str();

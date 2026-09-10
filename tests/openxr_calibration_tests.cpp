@@ -550,7 +550,9 @@ cbuffer Options : register(b0) { uint options; }
     if (options & 2) p.y = 127 - p.y;
     if (options & 4) p.y = min(p.y, 127 - p.y);
     if (options & 8) p = uint2(clamp(int2(p) + int2(8, 8), int2(0, 0), int2(127, 127)));
-    target[id] = ((id.z ^ (options & 1)) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
+    float4 color = ((id.z ^ (options & 1)) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
+    if (options & 8) color.rgb = float3(.75, .65, .8) + color.rgb * float3(.12, .2, .15);
+    target[id] = color;
 })";
         check(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
                           &shader, &errors));

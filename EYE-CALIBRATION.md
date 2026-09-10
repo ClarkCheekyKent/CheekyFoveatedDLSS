@@ -66,17 +66,22 @@ Calibration does not automatically write images, ZIPs or logs.
 
 ## Markers and asynchronous readback
 
-After a successful outer DLSS evaluation and final composition, candidate A gets
-a 40x40 magenta block near its top-left corner; B gets cyan near its top-right.
-Readback targets the centered 20x20 region, leaving a 10-pixel source-space
-margin on each side. Submitted sampling applies the same inset through scaling
-and vertical-flip coordinates. Recognition requires a winning score of at least
-0.40 and separation of at least 0.20 from the competing marker.
-Both markers are inset 12 pixels and remain in the output. Before/after source patches
-verify that the marker was written. Two small patches from each submitted eye
-are compared using normalized color contrast, absolute confidence and separation
-thresholds. Each physical eye must confidently identify a different candidate.
-This remains a heuristic under postprocessing that can obscure or alter markers.
+After a successful outer DLSS evaluation and final composition, candidates A/B
+get distinct 40x40 light/dark patterns near their top-left/top-right corners.
+Each pattern has 5x5 cells of 8x8 pixels. Both remain inset 12 pixels.
+Source before/after readbacks cover the full 40x40 stamp. Submitted readbacks
+cover 60x60 source pixels, including a 10-pixel border around the expected stamp;
+these bounds scale with the submitted image and its vertical-flip alternatives.
+
+Recognition searches offsets of +/-8 source pixels in 2-pixel steps. It samples
+four points near each cell center and uses brightness-normalized correlation,
+requiring a score of 0.90, separation of 0.15 from the other candidate, at least
+24 of 25 correctly ordered cells, and light/dark mean contrast of at least 0.04.
+Mirrored templates handle reversed bounds; top/bottom marker locations still
+resolve image orientation. Both eyes must identify different candidates.
+Uniform, clipped and ambiguous patches remain rejected. Grading that destroys
+the light/dark structure can still prevent recognition. Scores in diagnostic
+exports now measure pattern correlation, not the previous color contrast.
 
 `src/eye_calibration.cpp` owns an eight-slot reusable readback ring. Busy slots
 are skipped, never waited on or overwritten. The D3D11 implementation uses

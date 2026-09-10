@@ -340,8 +340,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (UINT64(x) + marker_size > d.Width || UINT64(y) + marker_size > d.Height)
             return reject("stamp_bounds");
         if (!initialize(f, allocations)) return reject("stamp_query_buffers");
-        const auto sx = x + calibration_sample_margin, sy = y + calibration_sample_margin;
-        const D3D12_BOX box{sx, sy, 0, sx + calibration_sample_size, sy + calibration_sample_size, 1};
+        const D3D12_BOX box{x, y, 0, x + marker_size, y + marker_size, 1};
         if (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
             !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations))
             return reject("stamp_readback_buffers");
@@ -369,9 +368,9 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
             const auto bpp = calibration_pixel_bytes(d.Format);
             for (unsigned yy = 0; yy < marker_size; ++yy)
                 for (unsigned xx = 0; xx < marker_size; ++xx)
-                    calibration_encode_marker(static_cast<unsigned char*>(data) +
+                    calibration_encode_pattern(static_cast<unsigned char*>(data) +
                                                   yy * footprint.Footprint.RowPitch + xx * bpp,
-                                              d.Format, candidate);
+                                              d.Format, candidate, xx, yy);
             f.markers[candidate]->Unmap(0, nullptr);
         }
         begin_segment(f, list, candidate);
@@ -546,21 +545,10 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
             out.failure = {"readback_map", hr};
             continue;
         }
-        unsigned count{};
-        float score{};
-        const auto bpp = calibration_pixel_bytes(d.Format);
         const auto candidate = i < 4 ? i / 2 : (i - 4) % 2;
-        for (unsigned y = d.Height / 5; y < d.Height - d.Height / 5; ++y)
-            for (unsigned x = d.Width / 5; x < d.Width - d.Width / 5; ++x) {
-                score += calibration_similarity(
-                    calibration_decode(static_cast<const unsigned char*>(data) + y * d.RowPitch + x * bpp,
-                                       d.Format),
-                    candidate);
-                ++count;
-            }
+        out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4);
         const D3D12_RANGE empty{0, 0};
         p.buffer->Unmap(0, &empty);
-        out.scores[i] = count ? score / count : 0;
     }
     out.timing_valid = true;
     for (const auto& s : f.segments)

@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -8,9 +9,13 @@
 
 namespace cheeky::foveated_dlss {
 inline constexpr unsigned calibration_marker_size = 40;
-inline constexpr unsigned calibration_sample_size = 20;
-inline constexpr unsigned calibration_sample_margin =
-    (calibration_marker_size - calibration_sample_size) / 2;
+inline constexpr unsigned calibration_sample_size = 60;
+inline constexpr int calibration_sample_margin =
+    (int(calibration_marker_size) - int(calibration_sample_size)) / 2;
+inline constexpr float calibration_pattern_min_score = .90F;
+inline constexpr float calibration_pattern_min_gap = .15F;
+static_assert(calibration_marker_size == 40 && calibration_sample_size == 60,
+              "The 5x5 pattern and bounded search use source-pixel coordinates");
 struct CalibrationPixel {
     float r{}, g{}, b{}, a{1};
 };
@@ -73,45 +78,91 @@ inline CalibrationPixel calibration_decode(const unsigned char* p, DXGI_FORMAT f
                       format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
     return {p[bgra ? 2 : 0] / 255.0F, p[1] / 255.0F, p[bgra ? 0 : 2] / 255.0F, p[3] / 255.0F};
 }
-// Markers only need exact zero/one values; no lossy float-to-half conversion.
-inline void calibration_encode_marker(unsigned char* p, DXGI_FORMAT format, unsigned candidate) {
-    if (format == DXGI_FORMAT_R11G11B10_FLOAT) {
-        // Exact 1.0: exponent 15, zero mantissa; this format has no alpha.
-        const std::uint32_t value = (candidate ? 0x3c0U << 11 : 0x3c0U) | (0x1e0U << 22);
-        std::memcpy(p, &value, sizeof(value));
+// Balanced, asymmetric 5x5 codes. Each cell is 8x8 source pixels.
+inline bool calibration_pattern_bit(unsigned candidate, unsigned x, unsigned y) {
+    constexpr const char* codes[]{
+        "11010" "00101" "11000" "10101" "00110",
+        "10111" "00100" "00110" "11001" "01001"};
+    return codes[candidate][y * 5 + x] == '1';
+}
+inline void calibration_encode_pattern(unsigned char* p, DXGI_FORMAT format, unsigned candidate,
+                                       unsigned x, unsigned y) {
+    const bool light = calibration_pattern_bit(candidate, x / 8, y / 8);
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        const auto v = std::uint16_t(light ? 0x3c00 : 0);
+        const std::uint16_t values[]{v, v, v, 0x3c00};
+        std::memcpy(p, values, 8);
     } else if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
-        const CalibrationPixel value{candidate ? 0.0F : 1.0F, candidate ? 1.0F : 0.0F, 1, 1};
+        const float v = light ? 1.F : 0.F;
+        const CalibrationPixel value{v, v, v, 1};
         std::memcpy(p, &value, 16);
-    } else if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        const std::uint16_t value[]{std::uint16_t(candidate ? 0 : 0x3c00),
-                                    std::uint16_t(candidate ? 0x3c00 : 0), 0x3c00, 0x3c00};
-        std::memcpy(p, value, 8);
+    } else if (format == DXGI_FORMAT_R11G11B10_FLOAT) {
+        const std::uint32_t v = light ? 0x3c0U | (0x3c0U << 11) | (0x1e0U << 22) : 0;
+        std::memcpy(p, &v, 4);
     } else if (format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-        const std::uint32_t value = (candidate ? 1023U << 10 : 1023U) | (1023U << 20) | (3U << 30);
-        std::memcpy(p, &value, 4);
+        const std::uint32_t v = (light ? 0x3fffffffU : 0) | (3U << 30);
+        std::memcpy(p, &v, 4);
     } else {
-        const bool bgra = format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
-                          format == DXGI_FORMAT_B8G8R8A8_TYPELESS;
-        p[bgra ? 2 : 0] = candidate ? 0 : 255;
-        p[1] = candidate ? 255 : 0;
-        p[bgra ? 0 : 2] = 255;
+        p[0] = p[1] = p[2] = light ? 255 : 0;
         p[3] = 255;
     }
 }
-inline float calibration_similarity(CalibrationPixel p, unsigned candidate) {
-    if (!std::isfinite(p.r) || !std::isfinite(p.g) || !std::isfinite(p.b))
-        return 0;
-    const float peak = (std::max)({p.r, p.g, p.b});
-    if (peak < 0.05F)
-        return 0;
-    const float contrast = candidate ? (std::min)(p.g, p.b) - p.r : (std::min)(p.r, p.b) - p.g;
-    return std::clamp(contrast / peak, 0.0F, 1.0F);
+// Normalize only the tiny readback, then search +/-8 source pixels in 2px steps.
+// Mirrored templates tolerate reversed bounds; the marker's corner determines
+// the submitted image orientation using the existing top/bottom checks.
+inline float calibration_pattern_score(const void* data, unsigned pitch, unsigned width,
+                                        unsigned height, DXGI_FORMAT format, unsigned candidate,
+                                        bool submitted) {
+    if (!data || !width || !height || candidate > 1 || !calibration_pixel_bytes(format)) return 0;
+    const unsigned side = submitted ? calibration_sample_size : calibration_marker_size;
+    std::array<float, calibration_sample_size * calibration_sample_size> luma{};
+    const auto bytes = calibration_pixel_bytes(format);
+    for (unsigned y = 0; y < side; ++y)
+        for (unsigned x = 0; x < side; ++x) {
+            const auto px = (std::min)(width - 1, unsigned((x + .5F) * width / side));
+            const auto py = (std::min)(height - 1, unsigned((y + .5F) * height / side));
+            const auto p = calibration_decode(static_cast<const unsigned char*>(data) + py * pitch + px * bytes, format);
+            if (!std::isfinite(p.r) || !std::isfinite(p.g) || !std::isfinite(p.b)) return 0;
+            luma[y * side + x] = (p.r + p.g + p.b) / 3.F;
+        }
+    float best{};
+    const int origin = submitted ? 10 : 0, radius = submitted ? 8 : 0;
+    for (unsigned mirror = 0; mirror < (submitted ? 4U : 1U); ++mirror)
+        for (int dy = -radius; dy <= radius; dy += 2)
+            for (int dx = -radius; dx <= radius; dx += 2) {
+                std::array<float, 25> values{}, signs{};
+                float sum{}, square{}, dot{}, sign_sum{}, high{}, low{};
+                unsigned highs{}, lows{};
+                for (unsigned y = 0; y < 5; ++y)
+                    for (unsigned x = 0; x < 5; ++x) {
+                        const int cx = origin + dx + int(x * 8) + 4;
+                        const int cy = origin + dy + int(y * 8) + 4;
+                        const float v = (luma[(cy - 1) * side + cx - 1] + luma[(cy - 1) * side + cx + 1] +
+                                         luma[(cy + 1) * side + cx - 1] + luma[(cy + 1) * side + cx + 1]) * .25F;
+                        const bool light = calibration_pattern_bit(candidate, mirror & 1 ? 4 - x : x,
+                                                                    mirror & 2 ? 4 - y : y);
+                        const float sign = light ? 1.F : -1.F;
+                        values[y * 5 + x] = v; signs[y * 5 + x] = sign;
+                        sum += v; square += v * v; dot += v * sign; sign_sum += sign;
+                        if (light) { high += v; ++highs; } else { low += v; ++lows; }
+                    }
+                high /= highs; low /= lows;
+                if (high - low < .04F) continue; // Flat/clipped patches carry no usable code.
+                const float variance = square - sum * sum / 25.F;
+                if (variance <= 1e-6F) continue;
+                unsigned correct{};
+                for (unsigned i = 0; i < 25; ++i)
+                    correct += (values[i] - (high + low) * .5F) * signs[i] > 0;
+                if (correct < 24) continue;
+                const float score = (dot - sum * sign_sum / 25.F) /
+                    std::sqrt(variance * (25.F - sign_sum * sign_sum / 25.F));
+                best = (std::max)(best, std::clamp(score, 0.F, 1.F));
+            }
+    return best;
 }
-inline int calibration_classify(float a, float b) {
-    if (!std::isfinite(a) || !std::isfinite(b))
-        return -1;
-    if ((std::max)(a, b) < 0.40F || std::abs(a - b) < 0.20F)
-        return -1;
+inline int calibration_pattern_classify(float a, float b) {
+    if (!std::isfinite(a) || !std::isfinite(b) || (std::max)(a, b) < calibration_pattern_min_score ||
+        std::abs(a - b) < calibration_pattern_min_gap) return -1;
     return a > b ? 0 : 1;
 }
 } // namespace cheeky::foveated_dlss
