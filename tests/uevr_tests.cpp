@@ -32,6 +32,10 @@ std::string received;
 UEVR_OnPresentCb present{};
 UEVR_OnDeviceResetCb reset{};
 UEVR_OnCustomEventCb custom{};
+void* cached_compositor{};
+bool openvr_active{};
+bool is_openvr() { return openvr_active; }
+UEVR_IVRCompositor get_compositor() { return reinterpret_cast<UEVR_IVRCompositor>(cached_compositor); }
 bool add_present(UEVR_OnPresentCb f) { present = f; return true; }
 bool add_reset(UEVR_OnDeviceResetCb f) { reset = f; return true; }
 bool add_custom(UEVR_OnCustomEventCb f) { custom = f; return true; }
@@ -136,6 +140,7 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--hardware") hardware = true;
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
+        const bool openvr_late = mode.starts_with("--openvr-late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
         require(!conflict_mode || conflict, "Create conflicting owner");
@@ -158,6 +163,23 @@ int main(int argc, char** argv) {
             renderer = {UEVR_RENDERER_D3D11, device11.Get(), nullptr, nullptr};
         }
         UEVR_PluginInitializeParam api{}; api.version = &version; api.functions = &functions; api.callbacks = &callbacks; api.renderer = &renderer;
+        UEVR_VRData vr_api{}; vr_api.is_openvr = is_openvr;
+        UEVR_OpenVRData openvr_api{}; openvr_api.get_vr_compositor = get_compositor;
+        void* original_wait{};
+        if (openvr_late) {
+            auto fixture = LoadLibraryW((bin / "test-fixtures" / "openvr_api.dll").c_str());
+            require(fixture != nullptr, "Load mock OpenVR before Cheeky");
+            auto configure = reinterpret_cast<void (*)(unsigned)>(GetProcAddress(fixture, "CheekyFakeOpenVR_SetVersion"));
+            auto get_interface = reinterpret_cast<void* (*)(const char*, int*)>(GetProcAddress(fixture, "VR_GetGenericInterface"));
+            require(configure && get_interface, "OpenVR fixture exports");
+            const auto abi = static_cast<unsigned>(std::stoul(mode.substr(mode.size() - 3)));
+            configure(abi);
+            int error{};
+            cached_compositor = get_interface(("IVRCompositor_" + mode.substr(mode.size() - 3)).c_str(), &error);
+            require(cached_compositor && !error, "Host caches compositor before Cheeky loads");
+            original_wait = (*static_cast<void***>(cached_compositor))[2];
+            api.vr = &vr_api; api.openvr = &openvr_api;
+        }
         const auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
@@ -171,6 +193,36 @@ int main(int argc, char** argv) {
         const auto runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"); require(runtime != nullptr, "Runtime dependency loaded");
         auto get = reinterpret_cast<CheekyUEVRSnapshotFn>(GetProcAddress(runtime, "CheekyUEVR_Snapshot"));
         auto start = reinterpret_cast<CheekyUEVRStartFn>(GetProcAddress(runtime, "CheekyUEVR_Start"));
+        if (openvr_late) {
+            auto attach = reinterpret_cast<CheekyUEVRAttachOpenVRFn>(GetProcAddress(runtime, "CheekyUEVR_AttachOpenVR"));
+            require(attach && !attach(0, cached_compositor), "Reject unowned compositor attachment");
+            // Host reports no active OpenVR session first. Do not touch its
+            // cached interface until it becomes active, then attach without a
+            // second host VR_GetGenericInterface request.
+            present();
+            require((*static_cast<void***>(cached_compositor))[2] == original_wait, "Inactive OpenVR stays untouched");
+            openvr_active = true;
+            for (unsigned i = 0; i < 20 && (*static_cast<void***>(cached_compositor))[2] == original_wait; ++i) {
+                present(); Sleep(25);
+            }
+            auto hooked_wait = (*static_cast<void***>(cached_compositor))[2];
+            require(hooked_wait != original_wait, "Late attachment hooks cached compositor without a new host request");
+            using Wait = int (*)(void*, void*, unsigned, void*, unsigned);
+            require(reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0) == 0, "Original WaitGetPoses return preserved");
+            auto observed = snapshot(get);
+            require(observed.find("\"backend\":\"OpenVR\"") != observed.npos && field(observed, "frames") == 1,
+                "Cached WaitGetPoses activates OpenVR calibration exactly once");
+            for (unsigned i = 0; i < 5; ++i) present();
+            require((*static_cast<void***>(cached_compositor))[2] == hooked_wait, "Repeated host ticks do not stack hooks");
+            reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0);
+            require(field(snapshot(get), "frames") == 2, "No duplicate observation after repeated ticks");
+            reset(); present();
+            require((*static_cast<void***>(cached_compositor))[2] == hooked_wait, "Device reset can reattach without stacking hooks");
+            reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0);
+            require(field(snapshot(get), "frames") == 3, "Observation continues after device reset");
+            puts("PASS: cached OpenVR compositor late attachment");
+            return 0;
+        }
         CheekyUEVRStart bad; bad.abi=999; require(!start(&bad), "Runtime ABI rejection");
         command("1\n1\nget");
         require(!received.empty(), "Native-to-Lua event bridge");

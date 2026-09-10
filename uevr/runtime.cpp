@@ -10,6 +10,7 @@
 #include "diagnostics.hpp"
 #include "eye_calibration.hpp"
 #include "gaze_foveation.hpp"
+#include "openvr_gaze.hpp"
 #include "dlss_nr.hpp"
 #include "version.h"
 #include <atomic>
@@ -307,6 +308,12 @@ extern "C" __declspec(dllexport) void CheekyUEVR_Detach(std::uint64_t attachment
     adapter_attached.store(false, std::memory_order_release);
     eye_calibration_suspend();
     set_processing_allowed(false);
+}
+extern "C" __declspec(dllexport) bool CheekyUEVR_AttachOpenVR(std::uint64_t attachment, void* compositor) {
+    try {
+        if (!attachment || !adapter_attached.load() || attachment != active_attachment.load()) return false;
+        return attach_openvr_compositor(compositor);
+    } catch (...) { return false; }
 }
 extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, std::uint32_t renderer, void* device, void* queue) {
     try {

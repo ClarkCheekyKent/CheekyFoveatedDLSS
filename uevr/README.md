@@ -17,7 +17,7 @@ scripts/
   cheeky_foveated_dlss.lua
 ```
 
-4. **If UEVR uses OpenXR, run the matching `CheekyOpenXRSetup.exe`. This is required for automatic stereo alignment and eye calibration, even without eye tracking.** Native OpenVR mode uses the built-in adapter instead.
+4. **If UEVR uses OpenXR, run the matching `CheekyOpenXRSetup.exe`. This is required for automatic stereo alignment and eye calibration, even without eye tracking.** Native OpenVR mode uses the built-in adapter instead. It also attaches to UEVR's cached compositor when OpenVR initialized before the plugin.
 5. Start the game with DLSS enabled, inject UEVR and open **LuaLoader → Cheeky Foveated DLSS**.
 
 The OpenXR installation is shared across games. Install all plugin files and the layer from the same release when updating.

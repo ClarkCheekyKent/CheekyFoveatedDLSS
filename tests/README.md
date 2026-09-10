@@ -1,3 +1,19 @@
+# UEVR cached OpenVR compositor regression
+
+Run `CheekyUEVRTests.exe --openvr-late-027` after building. The same test supports
+`022`, `028`, and `029`. A fixture DLL supplies an OpenVR compositor that the
+host obtains before loading the actual Cheeky plugin/runtime. The host never
+requests the interface again. The test checks that an inactive OpenVR session
+is untouched, then activates the host and verifies cached `WaitGetPoses` calls
+reach calibration exactly once, including after repeated presents/device reset.
+The original implementation fails at the late-attachment assertion.
+
+This is an offline hook/ABI regression, not a headset or gaze accuracy test.
+For live verification, restart the game with both updated UEVR DLLs. The log
+should report `OpenVR cached host compositor attached interface=...`, and the
+calibration backend should become OpenVR with increasing frame counts. Then
+verify simulated gaze and runtime gaze separately.
+
 # D3D12 SR array-output regression
 
 After `scripts/build.ps1 -Configuration Release`, run:

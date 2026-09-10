@@ -272,34 +272,41 @@ bool install_slot(void** slot,void* detour,void** original) {
     if (!hook.install(slot,detour,original)) { FreeLibrary(module); return false; }
     retained_modules.push_back(module); vtable_hooks.push_back(hook); return true;
 }
-template<unsigned N> void arm(const char* version,void* object) {
+template<unsigned N> bool arm(const char* version,void* object) {
     auto** vtable=*static_cast<void***>(object);
     const auto slot=openvr_submit_slot(version);
     const auto before=vtable_hooks.size();
     using H=CompositorHooks<N>;
-    install_slot(&vtable[2],reinterpret_cast<void*>(&H::wait_hook),reinterpret_cast<void**>(&H::wait));
-    install_slot(&vtable[slot],reinterpret_cast<void*>(&H::submit_hook),reinterpret_cast<void**>(&H::submit));
-    if constexpr (N<2) install_slot(&vtable[slot+1],reinterpret_cast<void*>(&H::array_hook),reinterpret_cast<void**>(&H::array));
+    const bool wait_ok=install_slot(&vtable[2],reinterpret_cast<void*>(&H::wait_hook),reinterpret_cast<void**>(&H::wait));
+    const bool submit_ok=install_slot(&vtable[slot],reinterpret_cast<void*>(&H::submit_hook),reinterpret_cast<void**>(&H::submit));
+    bool array_ok=true;
+    if constexpr (N<2) array_ok=install_slot(&vtable[slot+1],reinterpret_cast<void*>(&H::array_hook),reinterpret_cast<void**>(&H::array));
     if (vtable_hooks.size()!=before) trace_event("OpenVR compositor table hooks armed interface=%s",version);
+    return wait_ok && submit_ok && array_ok;
+}
+bool arm_compositor(const char* version,void* object) {
+    if (!std::strcmp(version,"IVRCompositor_029")) return arm<0>(version,object);
+    if (!std::strcmp(version,"IVRCompositor_028")) return arm<1>(version,object);
+    if (!std::strcmp(version,"IVRCompositor_027")) return arm<2>(version,object);
+    if (!std::strcmp(version,"IVRCompositor_022")) return arm<3>(version,object);
+    return false;
 }
 void* interface_hook(const char* version,vr::EVRInitError* error) {
     auto* object=get_interface(version,error);
     if (!object || stopping.load() || !openvr_submit_slot(version)) return object;
     std::lock_guard lock(hook_mutex);
     if (stopping.load()) return object;
-    if (!std::strcmp(version,"IVRCompositor_029")) arm<0>(version,object);
-    else if (!std::strcmp(version,"IVRCompositor_028")) arm<1>(version,object);
-    else if (!std::strcmp(version,"IVRCompositor_027")) arm<2>(version,object);
-    else if (!std::strcmp(version,"IVRCompositor_022")) arm<3>(version,object);
+    arm_compositor(version,object);
     return object;
 }
 }
 void poll_openvr_hooks() noexcept {
     if (stopping.load()) return;
+    std::lock_guard lock(hook_mutex);
+    if (stopping.load()) return;
     if (!api_module) {
         if (!GetModuleHandleExW(0,L"openvr_api.dll",&api_module)) return;
     }
-    std::lock_guard lock(hook_mutex);
     if (!original_shutdown) {
         auto* target=reinterpret_cast<void*>(GetProcAddress(api_module,"VR_ShutdownInternal"));
         if (!target || !install(target,reinterpret_cast<void*>(&shutdown_hook),reinterpret_cast<void**>(&original_shutdown))) return;
@@ -310,6 +317,26 @@ void poll_openvr_hooks() noexcept {
     }
     // Observe the interfaces requested by the application. Proactively querying
     // every version can also force ReShade to select the wrong first interface.
+}
+bool attach_openvr_compositor(void* compositor) noexcept {
+    if (!compositor || stopping.load()) return false;
+    poll_openvr_hooks();
+    std::lock_guard hooks_lock(hook_mutex);
+    if (stopping.load() || !get_interface) return false;
+    std::lock_guard state_lock(state_mutex);
+    if (runtime_stopping) return false;
+    // UEVR has already requested/cached its compositor, so ReShade's first-ABI
+    // selection has already happened. Use our original export and arm only the
+    // object the host actually uses, not the compatibility wrappers we probe.
+    for (const auto* version : {"IVRCompositor_027", "IVRCompositor_029", "IVRCompositor_028", "IVRCompositor_022"}) {
+        vr::EVRInitError error{};
+        if (get_interface(version,&error)==compositor && error==vr::VRInitError_None) {
+            const bool armed=arm_compositor(version,compositor);
+            if (armed) trace_event("OpenVR cached host compositor attached interface=%s",version);
+            return armed;
+        }
+    }
+    return false;
 }
 void stop_openvr_hooks() noexcept {
     stopping.store(true);

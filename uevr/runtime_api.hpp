@@ -19,6 +19,7 @@ struct CheekyUEVRStart {
 using CheekyUEVRStartFn = bool (*)(const CheekyUEVRStart*);
 using CheekyUEVRDetachFn = void (*)(std::uint64_t);
 using CheekyUEVRTickFn = void (*)(std::uint64_t, std::uint32_t, void*, void*);
+using CheekyUEVRAttachOpenVRFn = bool (*)(std::uint64_t, void*);
 using CheekyUEVRCommandFn = bool (*)(std::uint64_t, const char*);
 using CheekyUEVRSnapshotFn = bool (*)(char*, std::uint32_t);
 // Every export contains exceptions. Detach is a loader-lock-safe atomic store.

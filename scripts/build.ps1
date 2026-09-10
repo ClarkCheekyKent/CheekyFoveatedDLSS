@@ -73,6 +73,10 @@ foreach ($mode in @("dx11", "dx11-c", "dx12", "dx12-c", "streamline", "streamlin
     & $uevrTest "--late-$mode"
     if ($LASTEXITCODE -ne 0) { throw "UEVR late attachment ($mode) failed with exit code $LASTEXITCODE." }
 }
+foreach ($abi in @("022", "027", "028", "029")) {
+    & $uevrTest "--openvr-late-$abi"
+    if ($LASTEXITCODE -ne 0) { throw "UEVR cached OpenVR compositor ($abi) test failed." }
+}
 
 Write-Host "Built and tested:"
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.dll")

@@ -14,10 +14,13 @@ const UEVR_PluginInitializeParam* api{};
 CheekyUEVRStartFn runtime_start{};
 CheekyUEVRDetachFn runtime_detach{};
 CheekyUEVRTickFn runtime_tick{};
+CheekyUEVRAttachOpenVRFn runtime_attach_openvr{};
 CheekyUEVRCommandFn runtime_command{};
 CheekyUEVRSnapshotFn runtime_snapshot{};
 std::atomic<bool> initialized{};
 std::uint64_t attachment{};
+std::atomic<void*> attached_compositor{};
+std::atomic<ULONGLONG> next_openvr_attach{};
 std::mutex commands_mutex;
 std::deque<std::string> commands;
 constexpr char command_event[] = "cheeky.foveated_dlss.command.v1";
@@ -39,6 +42,18 @@ void publish_snapshot() {
 void on_present() {
     if (!initialized || !api) return;
     try {
+        if (api->vr && api->vr->is_openvr && api->vr->is_openvr() && api->openvr && api->openvr->get_vr_compositor) {
+            auto* compositor = reinterpret_cast<void*>(api->openvr->get_vr_compositor());
+            const auto now = GetTickCount64();
+            if (compositor && compositor != attached_compositor && now >= next_openvr_attach && runtime_attach_openvr && attachment) {
+                next_openvr_attach = now + 250;
+                if (runtime_attach_openvr(attachment, compositor)) attached_compositor = compositor;
+            }
+            if (!compositor) attached_compositor = nullptr;
+        } else {
+            attached_compositor = nullptr;
+            next_openvr_attach = 0;
+        }
         const auto* r = api->renderer;
         if (runtime_tick && r && attachment) runtime_tick(attachment, r->renderer_type, r->device, r->command_queue);
         std::deque<std::string> pending;
@@ -57,6 +72,8 @@ void on_present() {
     } catch (...) { if (api->functions->log_error) api->functions->log_error("Cheeky UEVR callback failed"); }
 }
 void on_device_reset() {
+    attached_compositor = nullptr;
+    next_openvr_attach = 0;
     if (runtime_tick && attachment) runtime_tick(attachment, 0, nullptr, nullptr);
 }
 template<class T> bool load_export(HMODULE dll, const char* name, T& out) {
@@ -85,7 +102,8 @@ extern "C" __declspec(dllexport) bool uevr_plugin_initialize(const UEVR_PluginIn
         }
         if (!load_export(dll, "CheekyUEVR_Start", runtime_start) || !load_export(dll, "CheekyUEVR_Detach", runtime_detach) ||
             !load_export(dll, "CheekyUEVR_Tick", runtime_tick) || !load_export(dll, "CheekyUEVR_Command", runtime_command) ||
-            !load_export(dll, "CheekyUEVR_Snapshot", runtime_snapshot)) {
+            !load_export(dll, "CheekyUEVR_Snapshot", runtime_snapshot) ||
+            !load_export(dll, "CheekyUEVR_AttachOpenVR", runtime_attach_openvr)) {
             runtime_detach = nullptr; FreeLibrary(dll); return false;
         }
         HMODULE pinned{};

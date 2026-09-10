@@ -97,6 +97,7 @@
   <ItemGroup><ProjectReference Include="CheekyFoveatedDLSSUEVR.vcxproj"><Project>{D761875E-230B-43C6-9F49-83B097A4E577}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
   <ItemGroup><ProjectReference Include="CheekyFakeNGX.vcxproj"><Project>{A73087E1-1CD8-4313-AE49-8C0000000001}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
   <ItemGroup><ProjectReference Include="CheekyFakeStreamline.vcxproj"><Project>{A73087E1-1CD8-4313-AE49-8C0000000002}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <ItemGroup><ProjectReference Include="CheekyFakeOpenVR.vcxproj"><Project>{A73087E1-1CD8-4313-AE49-8C0000000003}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
