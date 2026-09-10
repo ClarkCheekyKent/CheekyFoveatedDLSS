@@ -7,6 +7,10 @@
 #include <dxgiformat.h>
 
 namespace cheeky::foveated_dlss {
+inline constexpr unsigned calibration_marker_size = 40;
+inline constexpr unsigned calibration_sample_size = 20;
+inline constexpr unsigned calibration_sample_margin =
+    (calibration_marker_size - calibration_sample_size) / 2;
 struct CalibrationPixel {
     float r{}, g{}, b{}, a{1};
 };
@@ -106,7 +110,7 @@ inline float calibration_similarity(CalibrationPixel p, unsigned candidate) {
 inline int calibration_classify(float a, float b) {
     if (!std::isfinite(a) || !std::isfinite(b))
         return -1;
-    if ((std::max)(a, b) < 0.55F || std::abs(a - b) < 0.25F)
+    if ((std::max)(a, b) < 0.40F || std::abs(a - b) < 0.20F)
         return -1;
     return a > b ? 0 : 1;
 }

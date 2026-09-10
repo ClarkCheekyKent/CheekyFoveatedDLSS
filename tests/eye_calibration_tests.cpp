@@ -186,6 +186,12 @@ int run_eye_calibration_tests() {
         require(calibration_classify(0.1F, 0.05F) == -1, "Weak relative winner must remain unknown");
         require(calibration_classify(0.9F, 0.85F) == -1, "Both markers must remain ambiguous");
         require(calibration_classify(0.7F, 0.1F) == 0, "Clear marker should be recognized");
+        require(calibration_classify(0.4F, 0.2F) == 0 && calibration_classify(0.2F, 0.4F) == 1,
+                "Accept either marker at the score and separation boundaries");
+        require(calibration_classify(0.399F, 0.F) == -1,
+                "Reject scores below the relaxed minimum");
+        require(calibration_classify(0.4F, 0.201F) == -1,
+                "Reject insufficient separation even when the winning score passes");
         require(calibration_similarity({0.4F, 0.05F, 0.4F, 1}, 0) > 0.8F,
                 "Intensity changes should be tolerated");
         require(calibration_similarity({1, 1, 1, 1}, 0) == 0, "White HUD must not count as magenta");

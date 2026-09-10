@@ -549,6 +549,7 @@ cbuffer Options : register(b0) { uint options; }
     uint2 p = id.xy * 128 / 192;
     if (options & 2) p.y = 127 - p.y;
     if (options & 4) p.y = min(p.y, 127 - p.y);
+    if (options & 8) p = uint2(clamp(int2(p) + int2(8, 8), int2(0, 0), int2(127, 127)));
     target[id] = ((id.z ^ (options & 1)) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
 })";
         check(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
@@ -559,7 +560,8 @@ cbuffer Options : register(b0) { uint options; }
         check(gpu.device->CreateComputePipelineState(&ps, IID_PPV_ARGS(&pipeline)));
     }
     void record(GPU12& gpu, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* target,
-                  D3D12_RESOURCE_STATES state, bool swapped, bool flipped = false, bool ambiguous = false) {
+                  D3D12_RESOURCE_STATES state, bool swapped, bool flipped = false, bool ambiguous = false,
+                  bool shifted = false) {
         for (auto* r : {a, b})
             gpu.barrier(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         gpu.barrier(target, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -572,7 +574,7 @@ cbuffer Options : register(b0) { uint options; }
         handle.ptr += 2ULL * increment;
         gpu.list->SetComputeRootDescriptorTable(1, handle);
         gpu.list->SetComputeRoot32BitConstant(2,
-            (swapped ? 1U : 0U) | (flipped ? 2U : 0U) | (ambiguous ? 4U : 0U), 0);
+            (swapped ? 1U : 0U) | (flipped ? 2U : 0U) | (ambiguous ? 4U : 0U) | (shifted ? 8U : 0U), 0);
         gpu.list->Dispatch(24, 24, 2);
         gpu.barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, state);
         for (auto* r : {a, b})
@@ -658,7 +660,7 @@ void failure_diagnostics12() {
 }
 void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
            DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, bool converted = false,
-           bool flipped = false, bool ambiguous = false) {
+           bool flipped = false, bool ambiguous = false, bool shifted = false) {
     roles();
     GPU12 gpu(hardware);
     const auto state = backend == EyeCalibrationBackend::openxr ? D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -717,7 +719,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         eye_calibration_stamp12(gpu.list.Get(), a.Get(), 9101, 0, 0, 128, 128);
         eye_calibration_stamp12(gpu.list.Get(), b.Get(), 9102, 0, 0, 128, 128);
         if (scaling) {
-            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 32, flipped, ambiguous);
+            scaling->record(gpu, a.Get(), b.Get(), target.Get(), state, frame < 32, flipped, ambiguous, shifted);
         } else {
             gpu.barrier(a.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
             gpu.barrier(b.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -787,6 +789,9 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
 } // namespace
 int run_openxr_calibration_format_tests() {
     try {
+        for (bool flipped : {false, true})
+            run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT,
+                  true, flipped, false, true);
         failure_diagnostics12();
         run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT, true, true);
         run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT, true, false, true);

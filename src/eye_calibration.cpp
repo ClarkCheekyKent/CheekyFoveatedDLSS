@@ -17,7 +17,8 @@
 namespace cheeky::foveated_dlss {
 namespace {
 using Microsoft::WRL::ComPtr;
-constexpr unsigned ring_size = 8, block = 20, inset = 12;
+constexpr unsigned ring_size = 8, block = calibration_marker_size, inset = 12;
+constexpr unsigned sample = calibration_sample_size, margin = calibration_sample_margin;
 constexpr std::uint64_t ticket_bit = 1ULL << 63;
 struct Patch {
     ComPtr<ID3D11Texture2D> staging;
@@ -590,10 +591,10 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
                       stereo_view_generation(view)};
         const unsigned px = x + (c ? width - inset - block : inset), py = y + inset;
         context->End(f.timestamp[c * 2].Get());
-        if (!copy_patch(s, f, c * 2, texture.Get(), px, py, block, block))
+        if (!copy_patch(s, f, c * 2, texture.Get(), px + margin, py + margin, sample, sample))
             f.invalid = true;
         context->CopySubresourceRegion(texture.Get(), 0, px, py, 0, s.markers[c].Get(), 0, nullptr);
-        if (!copy_patch(s, f, c * 2 + 1, texture.Get(), px, py, block, block))
+        if (!copy_patch(s, f, c * 2 + 1, texture.Get(), px + margin, py + margin, sample, sample))
             f.invalid = true;
         context->End(f.timestamp[c * 2 + 1].Get());
         f.segments[c] = true;
@@ -706,12 +707,12 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
             f.invalid = true;
             return 0;
         }
-        const float nx = float(c ? ref.width - inset - block : inset) / ref.width,
-                    ny = float(index < 2 ? inset : ref.height - inset - block) / ref.height;
+        const float nx = float((c ? ref.width - inset - block : inset) + margin) / ref.width,
+                    ny = float((index < 2 ? inset : ref.height - inset - block) + margin) / ref.height;
         const float ax = (u0 + nx * (u1 - u0)) * d.Width,
-                    bx = (u0 + (nx + float(block) / ref.width) * (u1 - u0)) * d.Width;
+                    bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * d.Width;
         const float ay = (v0 + ny * (v1 - v0)) * d.Height,
-                    by = (v0 + (ny + float(block) / ref.height) * (v1 - v0)) * d.Height;
+                    by = (v0 + (ny + float(sample) / ref.height) * (v1 - v0)) * d.Height;
         boxes[index] = {unsigned(std::floor((std::min)(ax, bx))), unsigned(std::floor((std::min)(ay, by))), 0,
                     unsigned(std::ceil((std::max)(ax, bx))),  unsigned(std::ceil((std::max)(ay, by))),  1};
         f.patches[4 + eye * 2 + c].reference_width = ref.width;
@@ -777,12 +778,12 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
             f.invalid = true;
             continue;
         }
-        const float nx = float(c ? ref.width - inset - block : inset) / ref.width,
-                    ny = float(inset) / ref.height;
+        const float nx = float((c ? ref.width - inset - block : inset) + margin) / ref.width,
+                    ny = float(inset + margin) / ref.height;
         const float ax = (u0 + nx * (u1 - u0)) * desc.Width,
-                    bx = (u0 + (nx + float(block) / ref.width) * (u1 - u0)) * desc.Width;
+                    bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * desc.Width;
         const float ay = (v0 + ny * (v1 - v0)) * desc.Height,
-                    by = (v0 + (ny + float(block) / ref.height) * (v1 - v0)) * desc.Height;
+                    by = (v0 + (ny + float(sample) / ref.height) * (v1 - v0)) * desc.Height;
         const unsigned x = unsigned(std::floor((std::min)(ax, bx))),
                        y = unsigned(std::floor((std::min)(ay, by)));
         const unsigned w = unsigned(std::ceil((std::max)(ax, bx))) - x,

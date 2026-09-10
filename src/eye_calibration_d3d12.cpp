@@ -9,7 +9,7 @@
 namespace cheeky::foveated_dlss {
 using Microsoft::WRL::ComPtr;
 namespace {
-constexpr unsigned marker_size = 20;
+constexpr unsigned marker_size = calibration_marker_size;
 constexpr GUID list_key{0x4f637a10, 0x6e74, 0x4a72, {0x81, 0x9a, 0x39, 0xd5, 0x21, 0x36, 0x8b, 0xf1}};
 std::atomic<std::uint64_t> next_list_id{1};
 thread_local bool internal_work{};
@@ -340,7 +340,8 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (UINT64(x) + marker_size > d.Width || UINT64(y) + marker_size > d.Height)
             return reject("stamp_bounds");
         if (!initialize(f, allocations)) return reject("stamp_query_buffers");
-        const D3D12_BOX box{x, y, 0, x + marker_size, y + marker_size, 1};
+        const auto sx = x + calibration_sample_margin, sy = y + calibration_sample_margin;
+        const D3D12_BOX box{sx, sy, 0, sx + calibration_sample_size, sy + calibration_sample_size, 1};
         if (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
             !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations))
             return reject("stamp_readback_buffers");

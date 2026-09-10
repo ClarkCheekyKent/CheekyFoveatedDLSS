@@ -65,8 +65,12 @@ Calibration does not automatically write images, ZIPs or logs.
 ## Markers and asynchronous readback
 
 After a successful outer DLSS evaluation and final composition, candidate A gets
-a 20x20 magenta block near its top-left corner; B gets cyan near its top-right.
-Both are inset 12 pixels and remain in the output. Before/after source patches
+a 40x40 magenta block near its top-left corner; B gets cyan near its top-right.
+Readback targets the centered 20x20 region, leaving a 10-pixel source-space
+margin on each side. Submitted sampling applies the same inset through scaling
+and vertical-flip coordinates. Recognition requires a winning score of at least
+0.40 and separation of at least 0.20 from the competing marker.
+Both markers are inset 12 pixels and remain in the output. Before/after source patches
 verify that the marker was written. Two small patches from each submitted eye
 are compared using normalized color contrast, absolute confidence and separation
 thresholds. Each physical eye must confidently identify a different candidate.
