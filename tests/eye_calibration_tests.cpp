@@ -184,15 +184,40 @@ int run_eye_calibration_tests() {
         require(calibration_similarity({1, 1, 1, 1}, 0) == 0, "White HUD must not count as magenta");
         require(calibration_half(0x3c00) == 1 && calibration_half(0x3800) == 0.5F,
                 "Half-float decoding failed");
+        // Independent packed values exercise channel layout, non-unit HDR
+        // values, subnormals, and invalid signals rather than only round trips.
+        const auto packed_pixel = [](std::uint32_t bits) {
+            return calibration_decode(reinterpret_cast<const unsigned char*>(&bits), DXGI_FORMAT_R11G11B10_FLOAT);
+        };
+        const auto hdr = packed_pixel(0x380U | (0x400U << 11) | (0x230U << 22));
+        require(hdr.r == 0.5F && hdr.g == 2.0F && hdr.b == 6.0F && hdr.a == 1.0F,
+                "R11G11B10 HDR channels must retain their different mantissa widths");
+        const auto subnormal_pixel = packed_pixel(1U | (1U << 11) | (1U << 22));
+        require(subnormal_pixel.r == std::ldexp(1.0F, -20) && subnormal_pixel.g == subnormal_pixel.r &&
+                    subnormal_pixel.b == std::ldexp(1.0F, -19), "R11G11B10 subnormal decoding failed");
+        require(calibration_similarity(packed_pixel(0x7c0U), 0) == 0 &&
+                    calibration_similarity(packed_pixel(0x7c1U << 11), 1) == 0,
+                "R11G11B10 Inf/NaN must never identify an eye");
+        for (unsigned c = 0; c < 2; ++c) {
+            std::uint32_t marker{};
+            calibration_encode_marker(reinterpret_cast<unsigned char*>(&marker), DXGI_FORMAT_R11G11B10_FLOAT, c);
+            require(marker == ((c ? 0x3c0U << 11 : 0x3c0U) | (0x1e0U << 22)) &&
+                        calibration_similarity(packed_pixel(marker), c) == 1.0F &&
+                        calibration_similarity(packed_pixel(marker), 1U - c) == 0.0F,
+                    "R11G11B10 markers must identify only their own candidate");
+        }
         require(calibration_similarity({1, calibration_half(0x7c00), 1, 1}, 0) == 0 &&
                     calibration_classify(calibration_half(0x7e00), 1) == -1,
                 "Non-finite HDR pixels and scores must not create a false eye match");
         run_calibration();
         for (auto format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+                            DXGI_FORMAT_R11G11B10_FLOAT,
                             DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT})
             run_calibration(false, format);
         run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, true);
         run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, false, true);
+        run_calibration(false, DXGI_FORMAT_R11G11B10_FLOAT, true);
+        run_calibration(false, DXGI_FORMAT_R11G11B10_FLOAT, false, true);
         run_calibration(true);
         eye_calibration_enable(true);
         eye_calibration_frame();

@@ -89,6 +89,7 @@ std::uint64_t stereo_evaluation_sequence{};
 std::uint64_t registration_generation{};
 struct Calibration {
     std::uint64_t left{}, right{}, sequence{}, session_generation{};
+    bool vertical_flip{};
 } calibration;
 bool calibration_live() {
     // Verified identity survives missing markers. View destruction, session
@@ -97,8 +98,8 @@ bool calibration_live() {
 }
 StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
-    if (view == calibration.left) return {0, true, true, calibration.session_generation};
-    if (view == calibration.right) return {1, true, true, calibration.session_generation};
+    if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip};
+    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip};
     return {};
 }
 
@@ -415,7 +416,7 @@ std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept {
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected,
-    std::uint64_t session_generation) noexcept {
+    std::uint64_t session_generation, bool vertical_flip) noexcept {
     if (corrected) *corrected = false;
     if (!left || !right || left == right || !left_generation || !right_generation) return false;
     std::lock_guard lock(stereo_views_mutex);
@@ -442,7 +443,7 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     if (corrected) {
         *corrected = (previous_left >= 0 && previous_left != 0) || (previous_right >= 0 && previous_right != 1);
     }
-    calibration = {left, right, sequence, session_generation};
+    calibration = {left, right, sequence, session_generation, vertical_flip};
     return true;
 }
 void clear_stereo_calibration() noexcept {

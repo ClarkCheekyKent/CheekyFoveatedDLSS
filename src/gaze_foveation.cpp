@@ -26,6 +26,7 @@ struct ViewState {
     std::int64_t last_snapshot_display_time{};
     std::uint64_t last_snapshot_qpc{};
     bool has_crop{};
+    bool calibrated_vertical_flip{};
     bool next_jump_visible{};
     FoveationOffsets next_jump_offsets{};
     unsigned mapping_log_count{};
@@ -235,13 +236,15 @@ bool calculate_coordinated_crop(
     // A projection belongs to the current DLSS view, so this route does not
     // depend on guessed left/right evaluation order. Require stereo and a
     // full local view; packed subrect projections need explicit XR mapping.
+    bool calibrated_vertical_flip{};
     const auto aligned_center = [&](const CheekyGazeViewV1* xr_view) {
         auto center = fixed_center(fixed_settings, render_width, render_height);
         float u{}, v{};
         unsigned source{};
         if (automatic && xr_view && (xr_view->flags & CHEEKY_GAZE_VIEW_FORWARD_VALID) != 0U &&
             std::isfinite(xr_view->forward_u) && std::isfinite(xr_view->forward_v)) {
-            u = xr_view->forward_u; v = xr_view->forward_v;
+            u = xr_view->forward_u;
+            v = calibrated_vertical_flip ? 1.F - xr_view->forward_v : xr_view->forward_v;
             source = (diagnostics.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U ? 3U : 2U;
         } else if (automatic && has_multiple_stereo_views() && output_origin_x == 0U && output_origin_y == 0U &&
             projection_forward_center(camera, u, v)) {
@@ -329,6 +332,7 @@ bool calculate_coordinated_crop(
     const bool marker_match = eye_assignment.calibrated && snapshot.view_count == 2U &&
         (openvr_snapshot ? eye_assignment.calibration_session == 0 :
             eye_assignment.calibration_session != 0 && eye_assignment.calibration_session == snapshot.session_generation);
+    calibrated_vertical_flip = marker_match && eye_assignment.vertical_flip;
     if (marker_match) { matched_index = eye_assignment.eye_index; match_count = 1U; }
     std::array<GazeProjection, 2> xr_projections{};
     for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
@@ -416,6 +420,10 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
+    if (state.calibrated_vertical_flip != calibrated_vertical_flip) {
+        state.calibrated_vertical_flip = calibrated_vertical_flip;
+        state.temporal = {};
+    }
     const bool mapping_ready = (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U;
     if (mapping_ready != state.logged_mapping_ready) {
         state.logged_mapping_ready = mapping_ready;
@@ -563,7 +571,8 @@ bool calculate_coordinated_crop(
         CropGeometry next_crop{};
         if ((target.flags & CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID) != 0U &&
             calculate_foveation_geometry_at_center(foveation_parameters(fixed_settings),
-                {target.next_jump_u, target.next_jump_v, settings.gaze_quantization_pixels},
+                {target.next_jump_u, calibrated_vertical_flip ? 1.F - target.next_jump_v : target.next_jump_v,
+                    settings.gaze_quantization_pixels},
                 render_width, render_height, output_width, output_height,
                 output_origin_x, output_origin_y, next_crop)) {
             state.next_jump_visible = true;
@@ -576,7 +585,7 @@ bool calculate_coordinated_crop(
     if (use_sample) {
         const auto& source = snapshot.views[state.mapping.view_index];
         raw_u = source.center_u;
-        raw_v = source.center_v;
+        raw_v = calibrated_vertical_flip ? 1.F - source.center_v : source.center_v;
     }
     const auto temporal_result = update_gaze_temporal_policy(
         state.temporal,
