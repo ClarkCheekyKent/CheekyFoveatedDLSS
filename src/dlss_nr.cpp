@@ -1,5 +1,5 @@
 #include "dlss_nr_input.hpp"
-#include "d3d12_submission_identity.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include "dlss_nr.hpp"
 
 #include "d3d12_output_contract.hpp"
@@ -112,14 +112,8 @@ struct CachedFeature {
     NgxHandle* handle{};
 };
 
-struct NrUse {
-    ID3D12GraphicsCommandList* list{};
-    ID3D12Fence* fence{};
-    std::uint64_t identity{};
-    ID3D12CommandQueue* queue{};
-};
 struct ViewState {
-    std::deque<NrUse> uses;
+    NrLifetime uses;
     bool retired{};
     DlssViewId view_id{};
     NgxParameters* parameters{};
@@ -182,29 +176,16 @@ void release_feature(ViewState& view) noexcept {
 }
 
 bool view_complete(ViewState& view) noexcept {
-    for (auto it = view.uses.begin(); it != view.uses.end();) {
-        if (!it->list && !it->queue && it->fence->GetCompletedValue() >= 1U) {
-            it->fence->Release();
-            it = view.uses.erase(it);
-        } else ++it;
-    }
+    view.uses.collect();
     return view.uses.empty();
 }
 bool record_use(ViewState& view, ID3D12GraphicsCommandList* list) noexcept {
-    for (const auto& use : view.uses) if (use.list == list) return true;
-    ID3D12Device* device{};
-    ID3D12Fence* fence{};
-    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return false;
-    const auto result = device->CreateFence(0U, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-    device->Release();
-    if (FAILED(result)) return false;
-    list->AddRef();
-    view.uses.push_back({list, fence, d3d12_submission_identity(list, true)});
-    return true;
+    return view.uses.record(list);
 }
 void collect_retired_views() noexcept {
     for (auto it = views.begin(); it != views.end();) {
-        if (it->retired && view_complete(*it)) {
+        const bool complete = view_complete(*it);
+        if (it->retired && complete) {
             release_feature(*it);
             for (auto& gpu : it->gpu_resources) release_gpu(gpu);
             it = views.erase(it);
@@ -1251,6 +1232,7 @@ bool evaluate_dlss_nr(
     const Settings& settings
 ) noexcept {
     std::lock_guard lock(nr_mutex);
+    collect_retired_views();
     diagnostics.skip_reason = nullptr;
     diagnostics.route = frame.route;
     diagnostics.processing_order = settings.nr_processing_order;
@@ -1728,30 +1710,13 @@ void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const cha
 void note_dlss_nr_submission(ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* list,
     bool already_submitted) noexcept {
     if (!queue || !list) return;
-    const auto identity = d3d12_submission_identity(list);
     std::lock_guard lock(nr_mutex);
-    for (auto& view : views) for (auto& use : view.uses) {
-        if (use.list && (use.list == list || (identity && use.identity == identity))) {
-            queue->AddRef();
-            use.queue = queue;
-            use.list->Release();
-            use.list = nullptr;
-            if (already_submitted && SUCCEEDED(queue->Signal(use.fence, 1U))) {
-                use.queue->Release();
-                use.queue = nullptr;
-            }
-        }
-    }
+    for (auto& view : views) view.uses.submitted(queue, list, already_submitted);
     collect_retired_views();
 }
 void collect_dlss_nr_submissions() noexcept {
     std::lock_guard lock(nr_mutex);
-    for (auto& view : views) for (auto& use : view.uses) {
-        if (use.queue && SUCCEEDED(use.queue->Signal(use.fence, 1U))) {
-            use.queue->Release();
-            use.queue = nullptr;
-        }
-    }
+    for (auto& view : views) view.uses.signal_pending();
     collect_retired_views();
 }
 void release_dlss_nr_view(const DlssViewId view_id) noexcept {

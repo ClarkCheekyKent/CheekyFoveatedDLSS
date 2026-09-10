@@ -1485,7 +1485,10 @@ void test_native_dynamic_resolution_extent() {
     expect(absent.values.empty(), "Missing keys are not invented and cannot leak into the game");
 }
 
+int run_nr_lifetime_tests();
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--nr-lifetime") == 0) return run_nr_lifetime_tests();
     if (argc == 2 && std::strcmp(argv[1], "--nr-processing") == 0) {
         return run_nr_processing_tests();
     }

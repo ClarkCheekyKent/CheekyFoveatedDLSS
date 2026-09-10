@@ -1,5 +1,14 @@
 # Before-mode input recycling
 
+NR feature/resource use records are collected independently of view retirement,
+including on stable feature/resource cache hits. A completed record releases its
+fence once; an unsubmitted use, pending queue signal, or incomplete fence stays
+retained. The internal `src/dlss_nr_lifetime.cpp` implementation is shared with
+the native tests and registered through the production source globs in MSBuild
+and CMake. Run `bin/Release/CheekyTests.exe --nr-lifetime` for 1,000 two-view
+submit/complete/collect cycles plus blocked-GPU and failed-signal checks. These
+tests use WARP and do not substitute the NVIDIA evaluator for lifetime coverage.
+
 Before mode owns up to eight private inputs per view. A recorded input must stay
 unavailable until the command list has been submitted and its GPU work has finished.
 

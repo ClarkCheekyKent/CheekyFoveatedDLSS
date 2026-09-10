@@ -147,6 +147,8 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/crop_motion.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/support_summary_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/nr_processing_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/nr_lifetime_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_nr_lifetime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_nr_input.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/shared/gaze_math.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/foveation.cpp"
@@ -176,6 +178,7 @@ if(MSVC)
     target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
+add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
 
 option(CHEEKY_BUILD_UEVR "Build the UEVR plugin, resident runtime and host harness" ON)
 if(CHEEKY_BUILD_UEVR)
