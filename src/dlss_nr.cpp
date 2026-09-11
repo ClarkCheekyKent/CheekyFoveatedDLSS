@@ -91,6 +91,8 @@ struct FeatureKey {
 }
 
 struct GpuResources {
+    NrLifetime uses;
+    std::uint64_t last_use{};
     ID3D12Resource* game_output{};
     ID3D12Resource* original_output{};
     ID3D12Resource* color_proxy{};
@@ -112,6 +114,7 @@ struct CachedFeature {
     NgxParameters* parameters{};
     NgxHandle* handle{};
     bool reusable{true};
+    NrLifetime uses;
 };
 
 struct ViewState {
@@ -132,6 +135,7 @@ struct ViewState {
     std::uint64_t history_corrections{}, history_compensation_failures{};
     std::deque<CachedFeature> retired_features;
     std::deque<GpuResources> gpu_resources;
+    std::uint64_t gpu_use_sequence{};
 };
 
 std::mutex nr_mutex;
@@ -139,8 +143,11 @@ RuntimeState runtime;
 std::deque<ViewState> views;
 std::atomic<std::uint64_t> requested_reset_generation{};
 DlssNrSnapshot diagnostics;
-constexpr std::size_t retired_feature_capacity = 8U;
-constexpr std::size_t gpu_resource_cache_capacity = 8U;
+// One active feature plus one alternate for full/foveated toggling. Pending
+// recordings count against this budget too; exhausted caches fall back to SR.
+constexpr std::size_t retired_feature_capacity = 1U;
+// Two configurations across three rotating private input textures per eye.
+constexpr std::size_t gpu_resource_cache_capacity = 6U;
 
 void release_gpu(GpuResources& gpu) noexcept {
     release(gpu.border_pipeline);
@@ -193,23 +200,23 @@ void collect_retired_views() noexcept {
             for (auto& gpu : it->gpu_resources) release_gpu(gpu);
             it = views.erase(it);
         } else {
-            if (complete) {
-                evict_retired_features(*it);
-                while (it->gpu_resources.size() > gpu_resource_cache_capacity) {
-                    release_gpu(it->gpu_resources.front());
-                    it->gpu_resources.pop_front();
-                }
-            }
+            evict_retired_features(*it);
+            for (auto& gpu : it->gpu_resources) gpu.uses.collect();
             ++it;
         }
     }
 }
 
 void evict_retired_features(ViewState& view) noexcept {
-    if (!view_complete(view)) return;
-    while (view.retired_features.size() > retired_feature_capacity) {
-        const auto retired = view.retired_features.front();
-        view.retired_features.pop_front();
+    for (auto it = view.retired_features.begin(); it != view.retired_features.end();) {
+        it->uses.collect();
+        if (!it->uses.empty() || (it->reusable &&
+                view.retired_features.size() <= retired_feature_capacity)) {
+            ++it;
+            continue;
+        }
+        const auto retired = std::move(*it);
+        it = view.retired_features.erase(it);
         if (retired.handle != nullptr && runtime.release_feature != nullptr) {
             static_cast<void>(runtime.release_feature(retired.handle));
         }
@@ -497,7 +504,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     for (auto iterator = view.retired_features.begin();
          iterator != view.retired_features.end(); ++iterator) {
         if (!iterator->reusable || !(iterator->key == key)) continue;
-        const CachedFeature current{view.key, view.parameters, view.handle};
+        const CachedFeature current{view.key, view.parameters, view.handle, true, view.uses};
         view.parameters = iterator->parameters;
         view.handle = iterator->handle;
         view.retired_features.erase(iterator);
@@ -515,10 +522,19 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     if (view.handle != nullptr || view.parameters != nullptr) {
         // Retain a bounded set of replaced features. This both avoids releasing
         // work still in flight and makes common on/off foveation sizes reusable.
-        view.retired_features.push_back({view.key, view.parameters, view.handle});
+        view.retired_features.push_back({view.key, view.parameters, view.handle, true, view.uses});
         view.parameters = nullptr;
         view.handle = nullptr;
         evict_retired_features(view);
+    }
+    // Reserve the second slot for the new active feature. Never accumulate
+    // additional feature instances while the old recordings are still live.
+    evict_retired_features(view);
+    if (view.retired_features.size() > retired_feature_capacity) {
+        diagnostics.state = DlssNrState::input_preparation_failed;
+        diagnostics.skip_reason = "NR feature cache busy; using original color";
+        ++diagnostics.failed_calls;
+        return false;
     }
     view.feature_failed = false;
     view.key = key;
@@ -574,7 +590,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     if (!ngx_succeeded(result) || handle == nullptr) {
         // Creation may have recorded GPU work even on failure. Retain these
         // objects with the recording, but never reuse a failed feature.
-        view.retired_features.push_back({key, parameters, handle, false});
+        view.retired_features.push_back({key, parameters, handle, false, view.uses});
         diagnostics.state = DlssNrState::feature_failed;
         ++diagnostics.failed_calls;
         view.feature_failed = true;
@@ -1085,11 +1101,31 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     for (auto& gpu : view.gpu_resources) {
         if (gpu.game_output == frame.color && gpu.width == region.width &&
             gpu.height == region.height && gpu.working_width == working_width &&
-            gpu.working_height == working_height) return &gpu;
+            gpu.working_height == working_height) {
+            if (!gpu.uses.record(frame.command_list)) return nullptr;
+            gpu.last_use = ++view.gpu_use_sequence;
+            return &gpu;
+        }
+    }
+    if (view.gpu_resources.size() >= gpu_resource_cache_capacity) {
+        auto oldest = view.gpu_resources.end();
+        for (auto it = view.gpu_resources.begin(); it != view.gpu_resources.end(); ++it) {
+            it->uses.collect();
+            if (it->uses.empty() && (oldest == view.gpu_resources.end() ||
+                    it->last_use < oldest->last_use)) oldest = it;
+        }
+        if (oldest == view.gpu_resources.end()) {
+            diagnostics.state = DlssNrState::input_preparation_failed;
+            diagnostics.skip_reason = "NR texture cache busy; using original color";
+            ++diagnostics.failed_calls;
+            return nullptr;
+        }
+        release_gpu(*oldest);
+        view.gpu_resources.erase(oldest);
     }
     view.gpu_resources.push_back(GpuResources{});
     auto& gpu = view.gpu_resources.back();
-    if (!initialize_gpu_resources(
+    if (!gpu.uses.record(frame.command_list) || !initialize_gpu_resources(
             frame.command_list,
             frame.color,
             region,
@@ -1100,10 +1136,7 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         view.gpu_resources.pop_back();
         return nullptr;
     }
-    while (view.gpu_resources.size() > gpu_resource_cache_capacity && view_complete(view)) {
-        release_gpu(view.gpu_resources.front());
-        view.gpu_resources.pop_front();
-    }
+    gpu.last_use = ++view.gpu_use_sequence;
     return &gpu;
 }
 

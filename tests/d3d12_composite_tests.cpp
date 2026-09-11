@@ -99,7 +99,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
         require(prepare_dlss_nr_input(frame, settings) != nullptr,
             "Before NR exhausted its input pool across aliased submissions");
         if (iteration == 1) {
-            for (unsigned slot = 1; slot < 8; ++slot)
+            for (unsigned slot = 1; slot < 3; ++slot)
                 require(prepare_dlss_nr_input(frame, settings) != nullptr, "Could not fill NR pool");
             require(prepare_dlss_nr_input(frame, settings) == nullptr,
                 "NR reused an input whose commands were still being recorded");
@@ -160,7 +160,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
                 "Reset reused private inputs while another queue was pending");
             release_dlss_nr_inputs(501);
             require(prepare_dlss_nr_input(frame, settings) == nullptr,
-                "View release bypassed the eight-input limit during replay");
+                "View release bypassed the three-input limit during replay");
             ComPtr<ID3D12Fence> replay_done;
             check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&replay_done)));
             check(gate->Signal(2));

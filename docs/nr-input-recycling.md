@@ -25,11 +25,20 @@ cannot satisfy it. Completed execution records and their fences are collected
 once, including on active views and stable feature/resource cache hits. The
 recording remains live for replay after those completed records are gone.
 
-The eight-input limit includes retired inputs that still have pending work. Inputs
+The three-input per-view limit includes retired inputs that still have pending work. Inputs
 are reusable, and retained NR resources releasable, only after **both** recording
 retirement and completion on every executing queue. Pool exhaustion falls back to
 SR until reclamation is safe. No guessed submission or presentation queue is used.
-Collection also trims completed views' feature/resource caches before new uses.
+Each view keeps at most two NR feature instances (active plus one alternate),
+including instances still pending retirement. This covers toggling full/foveated
+NR without retaining a history of slider choices. Retired features snapshot their
+recording dependencies so later work on the same view cannot prevent collection.
+Intermediate textures track their own recordings and use a six-entry per-view
+cache: two configurations across three rotating input copies. On a cache miss,
+the least recently used safe texture set is released before allocating another.
+If all slots are still live, NR falls back to SR until safe reclamation instead
+of growing either cache. Limits are entry counts, not a total VRAM byte budget;
+NVIDIA's internal memory usage is not measured here.
 
 The observer's recursive execution mutex serializes recording, Execute, Reset,
 and collection, and is acquired before NR owner mutexes. The private-data
@@ -48,7 +57,7 @@ subsequent collection drains retired owners as completion becomes observable.
   Execute/Reset hooks, plus the private-input/compositor suite. The ordinary
   gaze/calibration/timing consumers are inert so they cannot supply NR notifications.
   Private-input scenarios cover native DX12, Streamline, and DX11-transport frame
-  routes, aliases, view release during blocked replay, eight-slot backpressure,
+  routes, aliases, view release during blocked replay, three-slot backpressure,
   sustained recycling after Reset, and source-texture readback preservation.
 - `scripts/build.ps1 -Configuration Release`: builds both integrations and runs
   the native/UEVR suites, including native DX12, Streamline, and DX11 late attachment.

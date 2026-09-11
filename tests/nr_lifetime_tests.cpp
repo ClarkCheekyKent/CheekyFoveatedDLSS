@@ -121,6 +121,21 @@ int run_nr_lifetime_tests() {
                 require(view.fences_released() == cycle + 1, "Completed fence released twice");
             }
         }
+        // A cached feature owns a snapshot of past recordings. New work for
+        // the same eye must not prevent the old feature from being reclaimed.
+        NrLifetime active_cache;
+        require(active_cache.record(gpu.list.Get()), "Could not record cached feature");
+        NrLifetime old_cache = active_cache;
+        gpu.execute(); gpu.wait();
+        old_cache.collect();
+        require(!old_cache.empty(), "Cache released a replayable recording");
+        gpu.reset();
+        require(active_cache.record(gpu.list.Get()), "Could not record new feature work");
+        old_cache.collect(); active_cache.collect();
+        require(old_cache.empty() && !active_cache.empty(),
+            "Active view prevented independent cached-feature reclamation");
+        gpu.reset(); active_cache.collect();
+        require(active_cache.empty(), "New cached-feature recording did not drain");
         NrLifetime retired;
         require(retired.record(gpu.list.Get()), "Could not record retiring view");
         retired.collect();

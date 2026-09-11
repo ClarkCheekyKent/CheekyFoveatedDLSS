@@ -101,7 +101,8 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
             }
             if (complete(input)) { selected = &input; break; }
         }
-        if (!selected && count < 8U) {
+        // Accommodate overlapping frames, not a history of settings choices.
+        if (!selected && count < 3U) {
             ID3D12Device* device{};
             if (SUCCEEDED(frame.command_list->GetDevice(IID_PPV_ARGS(&device)))) {
                 Input created{};

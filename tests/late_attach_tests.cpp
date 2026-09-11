@@ -261,6 +261,31 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         evaluate(0);
         expect_input(true, 1, "Successful tag substitution did not reset raw history");
     }
+    // Exercise the production feature cache through the fake NVIDIA runtime:
+    // warm two toggle states, then churn dimensions without growing live features.
+    const auto nr_creates = proc<Counter>(nr, "CheekyFakeCreates");
+    const auto nr_releases = proc<Counter>(nr, "CheekyFakeReleases");
+    const auto set_foveated = [&](bool enabled) {
+        command(enabled
+            ? "1\n96\nset\nNrFoveated=true\nNrWidth=0.5\nNrHeight=0.5\nNrWorkingScale=1"
+            : "1\n96\nset\nNrFoveated=false\nNrWorkingScale=1");
+        evaluate(0);
+        require(evaluation_order == "NS", "Cache toggle failed to run Before NR");
+    };
+    set_foveated(false); set_foveated(true);
+    const auto warm_creates = nr_creates();
+    const auto warm_live = nr_creates() - nr_releases();
+    for (unsigned i = 0; i < 12; ++i) set_foveated(i % 2 != 0);
+    require(nr_creates() == warm_creates, "Two-state NR toggle recreated warmed features");
+    for (unsigned i = 0; i < 24; ++i) {
+        const auto setting = std::string("1\n96\nset\nNrFoveated=false\nNrWorkingScale=") +
+            std::to_string(0.5 + 0.01 * i);
+        command(setting.c_str());
+        evaluate(0);
+        require(evaluation_order == "NS", "Settings churn failed to run Before NR");
+        require(nr_creates() - nr_releases() <= warm_live,
+            "Settings churn accumulated retired NVIDIA features");
+    }
     command("1\n96\nset\nNrEnabled=false");
     evaluate(0);
     expect_input(false, 1, "Disabling Before NR did not reset processed history");
