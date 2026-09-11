@@ -38,6 +38,7 @@ std::atomic<std::uint32_t> gaze_smoothing_ms_bits{0x41A00000U};
 std::atomic<std::uint32_t> gaze_quantization_pixels{8U};
 std::atomic<std::uint32_t> gaze_jump_reset_ratio_bits{0x3E000000U};
 std::atomic<bool> nr_enabled{false};
+std::atomic<NrProcessingOrder> nr_order{NrProcessingOrder::after_upscaling};
 std::atomic<bool> nr_foveated{true};
 std::atomic<bool> nr_use_sr_foveation{false};
 std::atomic<bool> nr_alignment_border_enabled{false};
@@ -158,6 +159,7 @@ Settings configured_settings() noexcept {
     settings.gaze_jump_reset_ratio = load_float(
         gaze_jump_reset_ratio_bits
     );
+    settings.nr_processing_order = nr_order.load(std::memory_order_acquire);
     settings.nr_enabled = nr_enabled.load(std::memory_order_acquire);
     settings.nr_foveated = nr_foveated.load(std::memory_order_acquire);
     settings.nr_use_sr_foveation =
@@ -269,6 +271,7 @@ void update_settings(const Settings& settings) noexcept {
         gaze_jump_reset_ratio_bits,
         std::clamp(settings.gaze_jump_reset_ratio, 0.01F, 1.0F)
     );
+    nr_order.store(nr_processing_order(static_cast<std::uint32_t>(settings.nr_processing_order)), std::memory_order_release);
     nr_enabled.store(settings.nr_enabled, std::memory_order_release);
     nr_foveated.store(settings.nr_foveated, std::memory_order_release);
     nr_use_sr_foveation.store(

@@ -17,7 +17,8 @@ template<class T> bool parse(std::string_view s, T& value) {
         return false;
     } else if constexpr (std::is_enum_v<T>) {
         std::uint32_t n{};
-        if (!parse(s, n) || n > 2) return false;
+        constexpr auto maximum = std::is_same_v<T, NrProcessingOrder> ? 1U : 2U;
+        if (!parse(s, n) || n > maximum) return false;
         value = static_cast<T>(n); return true;
     } else {
         T n{};
@@ -94,7 +95,11 @@ std::string json_escape(std::string_view s) {
 bool read_settings_file(const std::filesystem::path& path, Settings& s, std::string& error) {
     std::ifstream in(path);
     if (!in) { error = "Cannot read settings file"; return false; }
-    auto candidate = s; std::string line; bool section = false;
+    auto candidate = s;
+    // Older files predate this additive key and use After, even when loaded
+    // over a currently configured Before setting. Commit only after validation.
+    candidate.nr_processing_order = NrProcessingOrder::after_upscaling;
+    std::string line; bool section = false;
     while (std::getline(in, line)) {
         const auto text = trim(line);
         if (text.empty() || text.front() == ';' || text.front() == '#') continue;

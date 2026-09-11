@@ -81,6 +81,30 @@ void settings_tests(const std::filesystem::path& root) {
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
     require(serialize_settings(r) == serialize_settings(s), "Roundtrip all persisted fields");
+    for (const auto order : {"0", "1"}) {
+        require(set_named_setting(s, "NrProcessingOrder", order), "Parse NR rendering order");
+        s.nr_working_scale = 0.37f;
+        require(write_settings_file(path, s, error) && read_settings_file(path, r, error), "Persist NR order");
+        require(r.nr_processing_order == s.nr_processing_order && r.nr_working_scale == 0.37f,
+            "Rendering order roundtrip changed working scale");
+        require(settings_json(r).find(std::string("\"NrProcessingOrder\":") + order) != std::string::npos,
+            "Runtime/support settings omit rendering order");
+        require(serialize_settings(r).find("SchemaVersion=1\n") != std::string::npos, "Additive key changed schema");
+    }
+    for (const auto value : {"-1", "2", "3", "1.5", "nan", "invalid"}) {
+        const auto before = serialize_settings(r);
+        require(!set_named_setting(r, "NrProcessingOrder", value) && serialize_settings(r) == before,
+            "Invalid rendering order changed settings");
+        { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nWidth=0.2\nNrProcessingOrder=" << value << '\n'; }
+        require(!read_settings_file(path, r, error) && serialize_settings(r) == before,
+            "Invalid NR order file was not rejected atomically");
+    }
+    { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nNrWorkingScale=0.37\n"; }
+    require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
+        r.nr_working_scale == 0.37f, "Missing NR order must default to After");
+    require(setting_groups_json().find("\"NrProcessingOrder\":\"nr\"") != std::string::npos,
+        "Rendering order is missing from NR group metadata");
+    r = s;
     { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nWidth=0.4\nHeight=nan\n"; }
     require(!read_settings_file(path, r, error) && r.width == s.width, "Atomic malformed file rejection");
     { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=99\n"; }
@@ -180,7 +204,19 @@ int main(int argc, char** argv) {
             original_wait = (*static_cast<void***>(cached_compositor))[2];
             api.vr = &vr_api; api.openvr = &openvr_api;
         }
-        const auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
+        auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
+        if (late && !dx11) {
+            // Isolate the optional fake NR runtime from ordinary host fixtures
+            // and from other concurrently running test processes.
+            const auto isolated = root / "nr-hooks";
+            const auto runtime_dir = isolated / "CheekyFoveatedDLSS";
+            std::filesystem::create_directories(runtime_dir);
+            std::filesystem::copy_file(plugin_path, isolated / plugin_path.filename());
+            std::filesystem::copy_file(bin / "CheekyFoveatedDLSS" / "CheekyFoveatedDLSSRuntime.dll",
+                runtime_dir / "CheekyFoveatedDLSSRuntime.dll");
+            std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", runtime_dir / "nvngx_dlssnr.dll");
+            plugin_path = isolated / plugin_path.filename();
+        }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
@@ -267,21 +303,38 @@ int main(int argc, char** argv) {
         command("1\n3\nset\nWidth=0.4\nHeight=nan");
         require(field(received,"revision")==revision && std::abs(field(received,"Width")-0.65)<0.0001, "Invalid transaction is atomic");
         command("1\n4\nset\nEnabled=true");
-        command("1\n40\nset\nNrIntensity=0.4\nGazeSmoothingMs=60");
+        command("1\n83\nset\nNrProcessingOrder=1\nNrWorkingScale=0.37");
+        require(field(received,"NrProcessingOrder") == 1 && std::abs(field(received,"NrWorkingScale")-0.37)<0.0001,
+            "Before rendering order command/acknowledgement");
+        command("1\n84\nset\nNrProcessingOrder=0");
+        require(field(received,"NrProcessingOrder") == 0 && std::abs(field(received,"NrWorkingScale")-0.37)<0.0001,
+            "After rendering order changed working scale");
+        const auto order_revision = field(received,"revision");
+        const auto order_ack = field(received,"applied_request");
+        for (const auto value : {"-1", "2", "3", "1.5", "nan"}) {
+            const auto invalid = std::string("1\n85\nset\nNrWorkingScale=0.5\nNrProcessingOrder=") + value;
+            command(invalid.c_str());
+            require(field(received,"revision") == order_revision && field(received,"applied_request") == order_ack &&
+                field(received,"NrProcessingOrder") == 0 && std::abs(field(received,"NrWorkingScale")-0.37)<0.0001,
+                "Invalid order command must reject the whole transaction");
+        }
+        command("1\n40\nset\nNrProcessingOrder=1\nNrIntensity=0.4\nGazeSmoothingMs=60");
         command("1\n41\ndefaults_nr");
-        require(std::abs(field(received,"Width")-0.65)<0.0001 && field(received,"NrIntensity")==1 && field(received,"GazeSmoothingMs")==60,
+        require(std::abs(field(received,"Width")-0.65)<0.0001 && field(received,"NrIntensity")==1 && field(received,"NrProcessingOrder")==0 && field(received,"GazeSmoothingMs")==60,
             "NR reset preserves SR and gaze");
-        command("1\n42\nset\nNrIntensity=0.4");
+        command("1\n42\nset\nNrIntensity=0.4\nNrProcessingOrder=1");
         command("1\n43\ndefaults_gaze");
         require(std::abs(field(received,"Width")-0.65)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001 && field(received,"GazeSmoothingMs")==20,
             "Gaze reset preserves SR and NR");
+        require(field(received,"NrProcessingOrder")==1, "Gaze reset changed NR order");
         command("1\n44\ndefaults_sr");
         require(std::abs(field(received,"Width")-0.55)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001,
             "SR reset preserves NR");
+        require(field(received,"NrProcessingOrder")==1, "SR reset changed NR order");
         const auto reset_revision = field(received,"revision");
         command("1\n45\ndefaults_typo");
         require(field(received,"revision") == reset_revision, "Unknown reset group is atomic");
-        command("1\n46\nset\nWidth=0.65\nNrIntensity=1");
+        command("1\n46\nset\nWidth=0.65\nNrIntensity=1\nNrWorkingScale=0.37");
         require(received.find("\"setting_groups\":{") != received.npos && received.find("\"nr_details\":{") != received.npos &&
             received.find("\"frame\":{") != received.npos, "Expanded diagnostic snapshot bridge");
         for (unsigned i = 0; i < 35; ++i) { Sleep(10); present(); }
@@ -332,6 +385,8 @@ int main(int argc, char** argv) {
         for (int i=0;i<500 && field(snapshot(get),"saved_revision")<field(snapshot(get),"revision");++i) Sleep(10);
         Settings saved; std::string error; require(read_settings_file(root/"CheekyFoveatedDLSS.ini",saved,error),"Persisted runtime config");
         require(std::abs(saved.width-0.65f)<0.0001f && saved.enabled,"Persisted configured state");
+        require(saved.nr_processing_order == NrProcessingOrder::before_upscaling && saved.nr_working_scale == 0.37f,
+            "Asynchronous persistence lost NR rendering order or scale");
         // Reproduce UEVR clearing callbacks before FreeLibrary.
         present=nullptr; custom=nullptr; reset=nullptr;
         FreeLibrary(plugin);
@@ -343,6 +398,8 @@ int main(int argc, char** argv) {
         init=reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin,"uevr_plugin_initialize"));
         require(init(&api),"Reconnect existing runtime"); command("1\n6\nget");
         require(received.find("\"attached\":true")!=received.npos && std::abs(field(received,"Width")-0.65)<0.0001,"Reload retains settings");
+        require(field(received,"NrProcessingOrder")==1 && std::abs(field(received,"NrWorkingScale")-0.37)<0.0001,
+            "Reconnect lost rendering order or scale");
         detach(1);
         require(snapshot(get).find("\"attached\":true")!=std::string::npos,"Stale attachment cannot detach reloaded plugin");
         puts("UEVR settings, ABI, bridge, native observation, persistence, unload/reload tests passed");

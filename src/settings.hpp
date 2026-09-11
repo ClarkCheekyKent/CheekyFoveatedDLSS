@@ -13,6 +13,21 @@ enum class FoveationCenterMode : std::uint32_t {
     simulated_gaze = 2U,
 };
 
+enum class NrProcessingOrder : std::uint32_t {
+    after_upscaling = 0U,
+    before_upscaling = 1U,
+};
+
+inline NrProcessingOrder nr_processing_order(std::uint32_t value) noexcept {
+    return value == 1U ? NrProcessingOrder::before_upscaling
+                       : NrProcessingOrder::after_upscaling;
+}
+
+inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
+    return order == NrProcessingOrder::before_upscaling
+        ? "Before upscaling" : "After upscaling";
+}
+
 struct Settings {
     bool enabled{true};
     bool d3d11_use_d3d12_transport{false};
@@ -42,9 +57,12 @@ struct Settings {
     float gaze_jump_reset_ratio{0.125F};
 
     bool nr_enabled{false};
+    NrProcessingOrder nr_processing_order{NrProcessingOrder::after_upscaling};
     bool nr_foveated{true};
     bool nr_use_sr_foveation{false};
     bool nr_alignment_border_enabled{false};
+    // Transient final-resolution border for DX11 transport composition.
+    std::uint32_t nr_border_x{}, nr_border_y{}, nr_border_width{}, nr_border_height{};
     float nr_width{0.56F};
     float nr_height{0.56F};
     float nr_roundness{0.0F};

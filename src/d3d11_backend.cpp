@@ -27,7 +27,7 @@ using D3D11ReleaseFeatureFn = NgxResult (*)(NgxHandle*);
 
 namespace {
 
-constexpr UINT constant_buffer_size = 96U;
+constexpr UINT constant_buffer_size = 128U;
 constexpr std::uint32_t dlss_feature_flag_mv_low_res = 1U << 1U;
 
 struct FoveatedConstants {
@@ -48,9 +48,13 @@ struct FoveatedConstants {
     float next_jump_offset_x;
     float next_jump_offset_y;
     std::uint32_t show_next_jump;
+    std::uint32_t nr_base[2], nr_size[2];
+    float nr_roundness;
+    std::uint32_t show_nr_border;
+    std::uint32_t nr_padding[2];
 };
 
-static_assert(sizeof(FoveatedConstants) == 24U * sizeof(std::uint32_t));
+static_assert(sizeof(FoveatedConstants) == 32U * sizeof(std::uint32_t));
 
 struct ResourceSet {
     ID3D11DeviceContext* context{};
@@ -1394,6 +1398,11 @@ bool composite_d3d11_crop(
         settings.alignment_border_enabled ? 1U : 0U,
         settings.next_jump_offset_x, settings.next_jump_offset_y,
         settings.next_jump_visible ? 1U : 0U,
+        {settings.nr_border_x, settings.nr_border_y},
+        {settings.nr_border_width, settings.nr_border_height},
+        settings.nr_use_sr_foveation ? settings.roundness : settings.nr_roundness,
+        settings.nr_border_width && settings.nr_alignment_border_enabled ? 1U : 0U,
+        {},
     };
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context->Map(resources->constant_buffer, 0U,

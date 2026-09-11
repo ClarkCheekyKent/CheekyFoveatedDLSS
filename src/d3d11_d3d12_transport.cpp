@@ -1,3 +1,4 @@
+#include "dlss_nr_input.hpp"
 #include "d3d11_d3d12_transport.hpp"
 
 #include "diagnostics.hpp"
@@ -139,6 +140,7 @@ struct TransportSlot {
     SharedTexture peripheral_depth;
     SharedTexture peripheral_motion_vectors;
     SharedTexture peripheral_output;
+    bool nr_before{};
     SharedTexture nr_color;
     SharedTexture nr_depth;
     SharedTexture nr_motion_vectors;
@@ -717,9 +719,10 @@ void trace_format_support(
     const bool peripheral_enabled,
     const DXGI_FORMAT color_format,
     const DXGI_FORMAT motion_format,
-    const DXGI_FORMAT output_format
+    const DXGI_FORMAT output_format,
+    const bool nr_before
 ) noexcept {
-    return slot.color.resource12 != nullptr &&
+    return slot.nr_before == nr_before && slot.color.resource12 != nullptr &&
         slot.input_width == crop.input_width &&
         slot.input_height == crop.input_height &&
         slot.output_width == crop.output_width &&
@@ -774,7 +777,8 @@ void trace_format_support(
     const bool peripheral_enabled,
     const DXGI_FORMAT color_format,
     const DXGI_FORMAT motion_format,
-    const DXGI_FORMAT output_format
+    const DXGI_FORMAT output_format,
+    const bool nr_before
 ) noexcept {
     release_slot(slot);
     if (!device.format_support_logged) {
@@ -881,7 +885,7 @@ void trace_format_support(
         )) ||
         (nr_enabled && (
             !create_shared_texture(device, "NR composited color",
-                output_width, output_height, output_format,
+                output_width, output_height, nr_before ? color_format : output_format,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.nr_color) ||
             !create_shared_texture(device, "NR depth",
                 render_width, render_height, DXGI_FORMAT_R32_FLOAT,
@@ -905,6 +909,7 @@ void trace_format_support(
     slot.peripheral_motion_width = peripheral_motion_width;
     slot.peripheral_motion_height = peripheral_motion_height;
     slot.peripheral_enabled = peripheral_enabled;
+    slot.nr_before = nr_before;
     slot.nr_input_width = render_width;
     slot.nr_input_height = render_height;
     slot.nr_output_width = output_width;
@@ -1046,6 +1051,7 @@ void resolve_timing(
             static_cast<double>(disjoint.Frequency)
         );
         diagnostic_note_transport_gpu_time(milliseconds);
+        diagnostic_note_pipeline_gpu_time(DiagnosticApi::d3d11, milliseconds, slot.nr_before);
     }
 }
 
@@ -1074,7 +1080,7 @@ void resolve_dlss_timing(
         query_count >= 4U;
     const auto peripheral_begin = has_peripheral ? timestamps[2U] : 0U;
     const auto peripheral_end = has_peripheral ? timestamps[3U] : 0U;
-    const auto nr_query_base = has_peripheral ? 4U : 2U;
+    const auto nr_query_base = slot.nr_before || has_peripheral ? 4U : 2U;
     const bool has_nr = query_count >= nr_query_base + 2U;
     const auto nr_begin = has_nr ? timestamps[nr_query_base] : 0U;
     const auto nr_end = has_nr ? timestamps[nr_query_base + 1U] : 0U;
@@ -1106,7 +1112,7 @@ void resolve_dlss_timing(
             static_cast<double>(device.timestamp_frequency)
         );
         diagnostic_note_dlss_nr_gpu_time(
-            DiagnosticApi::d3d11, milliseconds, nr_foveated
+            DiagnosticApi::d3d11, milliseconds, nr_foveated, slot.nr_before
         );
     }
 }
@@ -1262,10 +1268,20 @@ bool evaluate_d3d11_via_d3d12(
     const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(game_handle)
     );
+    struct NrTransportAttempt {
+        const Settings& settings;
+        bool attempted{};
+        ~NrTransportAttempt() {
+            if (!attempted && settings.nr_enabled &&
+                settings.nr_processing_order == NrProcessingOrder::before_upscaling)
+                note_dlss_nr_skipped(DlssNrRoute::d3d11_transport, settings,
+                    "DX12 Transport preparation rejected; see transport status");
+        }
+    } nr_attempt{settings};
     auto transport_settings = settings;
     if (!transport_settings.enabled && transport_settings.nr_enabled) {
-        // NR-only mode still needs the transport to run the game's SR feature
-        // first. Use a full-frame SR crop, then apply the independent NR crop.
+        // NR-only mode still runs the game's SR feature through transport.
+        // Use a full-frame SR crop; NR follows its selected processing order.
         transport_settings.enabled = true;
         transport_settings.width = 1.0F;
         transport_settings.height = 1.0F;
@@ -1431,28 +1447,34 @@ bool evaluate_d3d11_via_d3d12(
     const auto mv_height = mv_low_res ? crop.input_height : crop.output_height;
     const auto nr_motion_width = mv_low_res ? render_width : out_width;
     const auto nr_motion_height = mv_low_res ? render_height : out_height;
+    const bool nr_before = settings.nr_enabled &&
+        settings.nr_processing_order == NrProcessingOrder::before_upscaling;
+    const auto nr_processing_width = nr_before ? render_width : out_width;
+    const auto nr_processing_height = nr_before ? render_height : out_height;
     DlssNrGeometry nr_geometry{};
     if (settings.nr_enabled && !calculate_dlss_nr_geometry(
             nr_settings,
-            out_width,
-            out_height,
+            nr_processing_width,
+            nr_processing_height,
             nr_geometry,
             has_nr_center ? &nr_center : nullptr
         )) {
         return reject_transport(D3D11TransportStatus::invalid_dimensions);
     }
+    // Transport the complete render color and matching guides before SR.
+    if (nr_before) nr_geometry = {0U, 0U, render_width, render_height, 0U, 0U};
     const auto nr_depth_x = settings.nr_enabled
-        ? scale_range(nr_geometry.base_x, nr_geometry.width, render_width, out_width)
+        ? scale_range(nr_geometry.base_x, nr_geometry.width, render_width, nr_processing_width)
         : ScaledRange{};
     const auto nr_depth_y = settings.nr_enabled
-        ? scale_range(nr_geometry.base_y, nr_geometry.height, render_height, out_height)
+        ? scale_range(nr_geometry.base_y, nr_geometry.height, render_height, nr_processing_height)
         : ScaledRange{};
     const auto nr_mv_region_x = settings.nr_enabled
         ? scale_range(
             nr_geometry.base_x,
             nr_geometry.width,
             nr_motion_width,
-            out_width
+            nr_processing_width
         )
         : ScaledRange{};
     const auto nr_mv_region_y = settings.nr_enabled
@@ -1460,7 +1482,7 @@ bool evaluate_d3d11_via_d3d12(
             nr_geometry.base_y,
             nr_geometry.height,
             nr_motion_height,
-            out_height
+            nr_processing_height
         )
         : ScaledRange{};
     if (!in_bounds(mv_x + mv_crop_x, mv_width, motion_desc.Width) ||
@@ -1570,7 +1592,7 @@ bool evaluate_d3d11_via_d3d12(
             peripheral_dimensions.width, peripheral_dimensions.height,
             nr_motion_width, nr_motion_height,
             settings.peripheral_dlaa_enabled,
-            color_desc.Format, motion_desc.Format, output_desc.Format
+            color_desc.Format, motion_desc.Format, output_desc.Format, nr_before
         ) && !initialize_slot(
             *device, slot, reconstruction, mv_width, mv_height, nr_depth_x.extent, nr_depth_y.extent,
             nr_geometry.width, nr_geometry.height,
@@ -1580,7 +1602,7 @@ bool evaluate_d3d11_via_d3d12(
             peripheral_dimensions.width, peripheral_dimensions.height,
             nr_motion_width, nr_motion_height,
             settings.peripheral_dlaa_enabled,
-            color_desc.Format, motion_desc.Format, output_desc.Format
+            color_desc.Format, motion_desc.Format, output_desc.Format, nr_before
         )) {
         release(context4);
         return reject_transport(
@@ -1671,6 +1693,12 @@ bool evaluate_d3d11_via_d3d12(
         );
     }
 
+    if (nr_before) {
+        const D3D11_BOX nr_box{color_x, color_y, 0U,
+            color_x + render_width, color_y + render_height, 1U};
+        context->CopySubresourceRegion(slot.nr_color.texture11, 0U, 0U, 0U, 0U, color, 0U, &nr_box);
+    }
+
     const auto ready_value = device->next_fence_value++;
     if (FAILED(context4->Signal(device->fence11, ready_value)) ||
         FAILED(device->queue12->Wait(device->fence12, ready_value)) ||
@@ -1699,6 +1727,73 @@ bool evaluate_d3d11_via_d3d12(
         slot.dlss_peripheral_timing_recorded = false;
     }
 
+    bool nr_before_succeeded{};
+    if (nr_before) {
+        if (measure_dlss) device->command_list12->EndQuery(slot.dlss_timing_heap, D3D12_QUERY_TYPE_TIMESTAMP, 4U);
+        slot.dlss_nr_timing_foveated = settings.nr_foveated;
+        transition(device->command_list12, slot.nr_color.resource12,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        transition(device->command_list12, slot.nr_depth.resource12,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(device->command_list12, slot.nr_motion_vectors.resource12,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        DlssNrFrame nr_frame{contract.view_id, DlssNrRoute::d3d11_transport,
+            device->command_list12, slot.nr_color.resource12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            slot.nr_depth.resource12, slot.nr_motion_vectors.resource12,
+            render_width, render_height, out_width, out_height,
+            0U, 0U, render_width, render_height, 0U, 0U, nr_motion_width, nr_motion_height,
+            contract.motion_vector_scale_x, contract.motion_vector_scale_y,
+            contract.depth_inverted, contract.reset, contract.create_flags};
+        nr_frame.reset = nr_frame.reset || !dlss_nr_input_history_compatible(contract.view_id,
+            settings.nr_processing_order, true, render_width, render_height);
+        nr_frame.processing_width = render_width;
+        nr_frame.processing_height = render_height;
+        nr_frame.center = nr_center;
+        nr_frame.has_center = has_nr_center;
+        nr_frame.reset = nr_frame.reset || nr_gaze_reset;
+        auto processing_settings = nr_settings;
+        processing_settings.nr_alignment_border_enabled = false;
+        nr_attempt.attempted = true;
+        nr_before_succeeded = evaluate_dlss_nr(nr_frame, processing_settings);
+        transition(device->command_list12, slot.nr_depth.resource12,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        transition(device->command_list12, slot.nr_motion_vectors.resource12,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        transition(device->command_list12, slot.nr_color.resource12,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if (nr_before_succeeded) {
+            transition(device->command_list12, slot.color.resource12,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+            source.pResource = slot.nr_color.resource12;
+            destination.pResource = slot.color.resource12;
+            source.Type = destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX box{crop.input_base_x, crop.input_base_y, 0U,
+                crop.input_base_x + crop.input_width, crop.input_base_y + crop.input_height, 1U};
+            device->command_list12->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, &box);
+            transition(device->command_list12, slot.color.resource12,
+                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        transition(device->command_list12, slot.nr_color.resource12,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    if (nr_before && measure_dlss) {
+        device->command_list12->EndQuery(slot.dlss_timing_heap, D3D12_QUERY_TYPE_TIMESTAMP, 5U);
+        device->command_list12->ResolveQueryData(slot.dlss_timing_heap, D3D12_QUERY_TYPE_TIMESTAMP,
+            4U, 2U, slot.dlss_timing_readback, 4U * sizeof(std::uint64_t));
+    }
+    struct InputHistoryCompletion {
+        DlssViewId view;
+        NrProcessingOrder order;
+        std::uint32_t width, height;
+        bool complete{};
+        ~InputHistoryCompletion() {
+            if (!complete) static_cast<void>(dlss_nr_input_history_reset(view, order, false, width, height));
+        }
+    } input_completion{contract.view_id, settings.nr_processing_order, render_width, render_height};
+    contract.reset = dlss_nr_input_history_reset(contract.view_id, settings.nr_processing_order,
+        nr_before_succeeded, render_width, render_height) || contract.reset;
+
     PeripheralDlaaResources peripheral{};
     bool peripheral_ready{};
     if (settings.peripheral_dlaa_enabled) {
@@ -1726,7 +1821,7 @@ bool evaluate_d3d11_via_d3d12(
         PeripheralDlaaRequest peripheral_request{};
         peripheral_request.view_id = contract.view_id;
         peripheral_request.command_list = device->command_list12;
-        peripheral_request.color = slot.peripheral_color.resource12;
+        peripheral_request.color = nr_before_succeeded ? slot.nr_color.resource12 : slot.peripheral_color.resource12;
         peripheral_request.depth = slot.peripheral_depth.resource12;
         peripheral_request.motion_vectors =
             slot.peripheral_motion_vectors.resource12;
@@ -1836,7 +1931,7 @@ bool evaluate_d3d11_via_d3d12(
             0U
         );
         slot.dlss_timing_query_count =
-            slot.dlss_peripheral_timing_recorded ? 4U : 2U;
+            nr_before ? 6U : slot.dlss_peripheral_timing_recorded ? 4U : 2U;
     }
 
     transition(device->command_list12, slot.output.resource12,
@@ -1846,6 +1941,8 @@ bool evaluate_d3d11_via_d3d12(
     transition(device->command_list12, slot.depth.resource12,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     transition(device->command_list12, slot.color.resource12,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (nr_before) transition(device->command_list12, slot.nr_color.resource12,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (FAILED(device->command_list12->Close())) {
         release(context4);
@@ -1867,13 +1964,29 @@ bool evaluate_d3d11_via_d3d12(
         return reject_transport(D3D11TransportStatus::ngx_evaluation_failed);
     }
     auto composite_contract = contract;
-    ID3D11Resource* composite_base = color;
+    ID3D11Resource* composite_base = nr_before_succeeded ? slot.nr_color.texture11 : color;
+    if (nr_before_succeeded) {
+        composite_contract.color_base_x = 0U;
+        composite_contract.color_base_y = 0U;
+    }
     if (peripheral_ready) {
         composite_base = slot.peripheral_output.texture11;
         composite_contract.color_base_x = 0U;
         composite_contract.color_base_y = 0U;
         composite_contract.render_width = peripheral.working_width;
         composite_contract.render_height = peripheral.working_height;
+    }
+    auto composite_settings = effective_settings;
+    if (nr_before && settings.nr_alignment_border_enabled) {
+        DlssNrGeometry border{};
+        if (calculate_dlss_nr_geometry(nr_settings, render_width, render_height, border, has_nr_center ? &nr_center : nullptr)) {
+            const auto x = scale_range(border.base_x, border.width, out_width, render_width);
+            const auto y = scale_range(border.base_y, border.height, out_height, render_height);
+            composite_settings.nr_border_x = x.base;
+            composite_settings.nr_border_y = y.base;
+            composite_settings.nr_border_width = x.extent;
+            composite_settings.nr_border_height = y.extent;
+        }
     }
     if (!composite_d3d11_crop(
             context,
@@ -1882,7 +1995,7 @@ bool evaluate_d3d11_via_d3d12(
             slot.output.texture11,
             composite_contract,
             crop,
-            effective_settings
+            composite_settings
         )) {
         slot.dlss_timing_pending = measure_dlss;
         release(context4);
@@ -1890,7 +2003,7 @@ bool evaluate_d3d11_via_d3d12(
     }
 
     bool nr_succeeded{};
-    if (settings.nr_enabled) {
+    if (settings.nr_enabled && !nr_before) {
         D3D11_BOX output_box{
             output_x + nr_geometry.base_x,
             output_y + nr_geometry.base_y,
@@ -1929,7 +2042,7 @@ bool evaluate_d3d11_via_d3d12(
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             );
             const auto nr_query_base =
-                slot.dlss_peripheral_timing_recorded ? 4U : 2U;
+                nr_before ? 6U : slot.dlss_peripheral_timing_recorded ? 4U : 2U;
             if (measure_dlss) {
                 device->command_list12->EndQuery(
                     slot.dlss_timing_heap,
@@ -2040,6 +2153,7 @@ bool evaluate_d3d11_via_d3d12(
     timing.finish();
     diagnostic_note_d3d11_transport_status(D3D11TransportStatus::active);
     diagnostic_note_activation(DiagnosticApi::d3d11, crop);
+    input_completion.complete = true;
     return true;
 }
 

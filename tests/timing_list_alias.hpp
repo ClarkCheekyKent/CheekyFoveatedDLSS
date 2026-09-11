@@ -23,6 +23,7 @@ struct TimingListAlias {
     }
     static HRESULT STDMETHODCALLTYPE get_private(TimingListAlias* self, REFGUID key, UINT* size, void* data) { return self->target->GetPrivateData(key, size, data); }
     static HRESULT STDMETHODCALLTYPE set(TimingListAlias* self, REFGUID key, UINT size, const void* data) { return self->target->SetPrivateData(key, size, data); }
+    static HRESULT STDMETHODCALLTYPE set_interface(TimingListAlias* self, REFGUID key, const IUnknown* value) { return self->target->SetPrivateDataInterface(key, value); }
     static HRESULT STDMETHODCALLTYPE device(TimingListAlias* self, REFIID iid, void** out) { return self->target->GetDevice(iid, out); }
     static void STDMETHODCALLTYPE end(TimingListAlias* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) { self->target->EndQuery(heap, type, index); }
     static void STDMETHODCALLTYPE resolve(TimingListAlias* self, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT first, UINT count, ID3D12Resource* out, UINT64 offset) {
@@ -31,7 +32,7 @@ struct TimingListAlias {
     explicit TimingListAlias(ID3D12GraphicsCommandList* list) : vtable(methods.data()), target(list) {
         methods.fill(reinterpret_cast<void*>(&unexpected));
         methods[0] = reinterpret_cast<void*>(&query); methods[1] = reinterpret_cast<void*>(&addref); methods[2] = reinterpret_cast<void*>(&release);
-        methods[3] = reinterpret_cast<void*>(&get_private); methods[4] = reinterpret_cast<void*>(&set); methods[7] = reinterpret_cast<void*>(&device);
+        methods[3] = reinterpret_cast<void*>(&get_private); methods[4] = reinterpret_cast<void*>(&set); methods[5] = reinterpret_cast<void*>(&set_interface); methods[7] = reinterpret_cast<void*>(&device);
         methods[53] = reinterpret_cast<void*>(&end); methods[54] = reinterpret_cast<void*>(&resolve);
     }
     ID3D12GraphicsCommandList* get() { return reinterpret_cast<ID3D12GraphicsCommandList*>(this); }

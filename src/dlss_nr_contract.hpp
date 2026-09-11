@@ -6,6 +6,54 @@
 
 namespace cheeky::foveated_dlss {
 
+struct NrRegion {
+    std::uint32_t base_x{};
+    std::uint32_t base_y{};
+    std::uint32_t width{};
+    std::uint32_t height{};
+    float shape_width{1.0F};
+    float shape_height{1.0F};
+    float roundness{};
+    float transition{};
+};
+
+struct ScaledSubrect {
+    std::uint32_t base{};
+    std::uint32_t extent{};
+};
+
+struct DlssNrGeometry {
+    std::uint32_t base_x{};
+    std::uint32_t base_y{};
+    std::uint32_t width{};
+    std::uint32_t height{};
+    std::uint32_t working_width{};
+    std::uint32_t working_height{};
+};
+
+[[nodiscard]] bool calculate_dlss_nr_geometry(
+    const Settings& settings,
+    std::uint32_t output_width,
+    std::uint32_t output_height,
+    DlssNrGeometry& geometry,
+    const FoveationCenter* center = nullptr
+) noexcept;
+
+struct DlssNrResolution { std::uint32_t width{}, height{}; };
+[[nodiscard]] inline DlssNrResolution dlss_nr_processing_resolution(NrProcessingOrder order,
+    std::uint32_t render_width, std::uint32_t render_height,
+    std::uint32_t output_width, std::uint32_t output_height) noexcept {
+    return order == NrProcessingOrder::before_upscaling
+        ? DlssNrResolution{render_width, render_height} : DlssNrResolution{output_width, output_height};
+}
+[[nodiscard]] NrRegion calculate_region(const Settings& settings, std::uint32_t width,
+    std::uint32_t height, const FoveationGeometry* shared_sr_crop,
+    std::uint32_t render_width, std::uint32_t render_height,
+    const FoveationCenter* center = nullptr) noexcept;
+[[nodiscard]] std::uint32_t scaled_extent(std::uint32_t extent, float scale) noexcept;
+[[nodiscard]] ScaledSubrect scale_subrect(std::uint32_t region_base, std::uint32_t region_extent,
+    std::uint32_t source_base, std::uint32_t source_extent, std::uint32_t output_extent) noexcept;
+
 struct DlssNrResourceBase {
     std::uint32_t x{};
     std::uint32_t y{};

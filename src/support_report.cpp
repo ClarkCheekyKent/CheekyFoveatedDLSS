@@ -119,6 +119,7 @@ std::string settings_text(const Settings& s) {
     out << "nr_height=" << s.nr_height << '\n';
     out << "nr_roundness=" << s.nr_roundness << '\n';
     out << "nr_transition_width=" << s.nr_transition_width << '\n';
+    out << "nr_processing_order=" << nr_processing_order_name(s.nr_processing_order) << '\n';
     out << "nr_working_scale=" << s.nr_working_scale << '\n';
     out << "nr_preset=" << s.nr_preset << '\n';
     out << "nr_intensity=" << s.nr_intensity << '\n';
@@ -160,6 +161,10 @@ std::string diagnostics_text() {
         out << "transport_gpu_ms=" << d.transport_gpu_ms << '\n';
         out << "foveated_dlss_gpu_ms=" << d.foveated_dlss_gpu_ms << '\n';
         out << "peripheral_dlaa_gpu_ms=" << d.peripheral_dlaa_gpu_ms << '\n';
+        out << "before_full_nr_gpu_ms=" << d.before_full_nr_gpu_ms << '\n';
+        out << "before_foveated_nr_gpu_ms=" << d.before_foveated_nr_gpu_ms << '\n';
+        out << "before_pipeline_gpu_ms=" << d.before_pipeline_gpu_ms << '\n';
+        out << "after_pipeline_gpu_ms=" << d.after_pipeline_gpu_ms << '\n';
         out << "full_dlss_nr_gpu_ms=" << d.full_dlss_nr_gpu_ms << '\n';
         out << "foveated_dlss_nr_gpu_ms=" << d.foveated_dlss_nr_gpu_ms << '\n';
         out << "native_dlss_gpu_ms=" << d.native_dlss_gpu_ms << '\n';
@@ -239,6 +244,10 @@ std::string diagnostics_text() {
     out << "region_base_y=" << nr.region_base_y << '\n';
     out << "region_width=" << nr.region_width << '\n';
     out << "region_height=" << nr.region_height << '\n';
+    if (nr.skip_reason) out << "skip_reason=" << nr.skip_reason << '\n';
+    out << "processing_order=" << nr_processing_order_name(nr.processing_order) << '\n';
+    out << "processing_width=" << nr.processing_width << '\n';
+    out << "processing_height=" << nr.processing_height << '\n';
     out << "working_width=" << nr.working_width << '\n';
     out << "working_height=" << nr.working_height << '\n';
     out << "intermediate_vram_bytes=" << nr.intermediate_vram_bytes << '\n';

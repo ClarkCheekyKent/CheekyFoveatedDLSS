@@ -56,6 +56,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."
 }
 
+& (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe")
+if ($LASTEXITCODE -ne 0) { throw "NR native observer tests failed with exit code $LASTEXITCODE." }
+
 $testExecutable = Join-Path $projectRoot "bin\$Configuration\CheekyTests.exe"
 & $testExecutable
 if ($LASTEXITCODE -ne 0) {

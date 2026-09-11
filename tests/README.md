@@ -176,3 +176,67 @@ ACC DX11 reported heavy head-motion blur away from 1x with unscaled output vecto
 The correction scales displacement with the resized output grid and restores
 output-space gaze offsets. GPU readback verifies this numerical behavior; an
 ACC moving-head A/B comparison against 1x is still required.
+## NR rendering order
+
+Run `bin/Release/CheekyTests.exe --nr-processing` to run the NR contracts independently.
+
+The standard suite tests processing-resolution selection, Working scale, crop
+centers, independent resource origins, render/output-resolution motion fields,
+per-eye history changes, and restoration of NGX parameters and Streamline tags
+on success and failure. NVIDIA evaluation is stubbed in the test executable.
+Both CMake and MSBuild register the new sources.
+
+`CheekyUEVRTests.exe --late-dx12`, `--late-dx12-c`, and `--late-streamline`
+also observe Color and Reset inside fake SR evaluation through the real hooks.
+An isolated copy of the fake NGX DLL supplies feature 18, with complete current
+Streamline viewport tags/constants. Deterministic vertical region jumps check
+After NR with SR foveation disabled, then peripheral-before-center SR evaluation:
+the input scope preserves the host reset and does not consume the center reset.
+Coverage includes successful Before substitution, per-eye/viewport transitions,
+repeated After/disabled frames, failed NR or tag submission, incomplete/ambiguous
+viewport metadata, another viewport cached last, and parameter/tag restoration.
+Native private-SR failure also checks fallback with the prepared input intact.
+These fixtures do not launch a game or run NVIDIA's implementation.
+
+`CheekyTests.exe --d3d12-composite` also exercises the production private-color
+copy on WARP. A nonzero-origin render region in a mipmapped source is copied,
+then the private color is changed and passed through the production compositor.
+Readback checks the original source and every unrelated mip/slice, plus both
+successful private-input propagation and failed-NR fallback. This does not
+execute the full game/Streamline/transport hooks or NVIDIA feature 18.
+
+NVIDIA acceptance is still pending for native DX12, Streamline, and DX11
+Transport. On each route compare the same scene/settings in both orders across
+NR full/foveated, linked/independent shapes, SR foveation on/off, peripheral DLAA
+on/off, live switches, resize/dynamic resolution, stereo, and moving gaze.
+Record the displayed processing/working dimensions, NR and total pipeline GPU
+milliseconds, and image-quality observations. Test missing NR runtime and
+unsupported resources too: SR must use original color without post-SR NR.
+
+## NR GPU lifetime validation
+
+`CheekyTests.exe --nr-lifetime` and `CheekyNrObserverTests.exe` run the same
+production NR lifetime assertions on WARP. Windows Graphics Tools is optional:
+the fixture prints whether D3D12 debug validation is enabled or unavailable.
+When enabled, failure to acquire the info queue and reported errors or corruption
+still fail the test. When unavailable, only debug-message inspection is skipped.
+All lifetime assertions remain active, including 1000 two-view completed-fence
+collection cycles, replay, multiple queues, Reset, aliases, destruction, and
+failed signaling. The observer executable uses the real native hooks and also
+runs the compositor tests.
+
+The test-only environment variable `CHEEKY_NR_TEST_NO_DEBUG_LAYER=1` forces the
+lifetime fixture through the unavailable-layer path without uninstalling
+Graphics Tools. The compositor fixture also honors this override so the native
+observer executable keeps one debug mode across its lifetime and copy tests.
+CTest registers normal and forced-fallback runs of both
+executables, each in a fresh process so debug-layer state cannot carry over.
+After building with CMake, run just the fallback cases (replace `build/cmake`
+with your CMake build directory):
+
+```powershell
+ctest --test-dir build/cmake -C Release -R 'CheekyNr.*NoDebugLayer' --output-on-failure -V
+```
+
+Run all four lifetime configurations with `-R 'CheekyNr'`, or omit `-R` for the
+full suite. Each lifetime run must print the same assertion-success summary.

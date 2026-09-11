@@ -28,6 +28,7 @@
 namespace cheeky::foveated_dlss {
 // The core GPU harness explicitly drives post-submit/reset notifications.
 NativeObserverStatus native_observer_status() noexcept { return {true}; }
+bool ensure_native_observer(ID3D12GraphicsCommandList*) noexcept { return true; }
 bool initialize_native_observer(ID3D12Device*, ID3D12CommandQueue*) noexcept { return true; }
 
 void trace_event(const char*, ...) noexcept {}
@@ -1366,6 +1367,7 @@ int run_d3d12_composite_tests();
 int run_eye_calibration_tests();
 int run_openxr_calibration_tests();
 int run_support_summary_tests();
+int run_nr_processing_tests();
 
 void test_openvr_geometry() {
     using namespace cheeky::foveated_dlss;
@@ -1484,7 +1486,13 @@ void test_native_dynamic_resolution_extent() {
     expect(absent.values.empty(), "Missing keys are not invented and cannot leak into the game");
 }
 
+int run_nr_lifetime_tests();
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--nr-lifetime") == 0) return run_nr_lifetime_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--nr-processing") == 0) {
+        return run_nr_processing_tests();
+    }
     test_native_dynamic_resolution_extent();
     if (argc == 2 && std::strcmp(argv[1], "--calibration-formats") == 0) {
         failures += run_openxr_calibration_format_tests();
@@ -1537,6 +1545,7 @@ int main(int argc, char** argv) {
     failures += run_eye_calibration_tests();
     failures += run_openxr_calibration_tests();
     failures += run_openxr_calibration_format_tests();
+    failures += run_nr_processing_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

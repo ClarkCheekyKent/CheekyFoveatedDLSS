@@ -36,6 +36,8 @@ struct RuntimeDiagnostics {
     std::atomic<std::uint32_t> transport_gpu_ms_bits{};
     std::atomic<std::uint32_t> foveated_dlss_gpu_ms_bits{};
     std::atomic<std::uint32_t> peripheral_dlaa_gpu_ms_bits{};
+    std::atomic<std::uint32_t> before_full_nr_gpu_ms_bits{}, before_foveated_nr_gpu_ms_bits{};
+    std::atomic<std::uint32_t> before_pipeline_gpu_ms_bits{}, after_pipeline_gpu_ms_bits{};
     std::atomic<std::uint32_t> full_dlss_nr_gpu_ms_bits{};
     std::atomic<std::uint32_t> foveated_dlss_nr_gpu_ms_bits{};
     std::atomic<std::uint32_t> native_dlss_gpu_ms_bits{};
@@ -280,8 +282,17 @@ void diagnostic_note_peripheral_dlaa_gpu_time(
 void diagnostic_note_dlss_nr_gpu_time(
     const DiagnosticApi api,
     const float milliseconds,
-    const bool foveated
+    const bool foveated,
+    const bool before_upscaling
 ) noexcept {
+    if (before_upscaling) {
+        note_averaged_gpu_time(api == DiagnosticApi::d3d12
+            ? (foveated ? DiagnosticGpuTiming::d3d12_before_foveated_nr : DiagnosticGpuTiming::d3d12_before_full_nr)
+            : (foveated ? DiagnosticGpuTiming::d3d11_before_foveated_nr : DiagnosticGpuTiming::d3d11_before_full_nr),
+            foveated ? for_api(api).before_foveated_nr_gpu_ms_bits : for_api(api).before_full_nr_gpu_ms_bits,
+            milliseconds);
+        return;
+    }
     note_averaged_gpu_time(
         api == DiagnosticApi::d3d12
             ? (foveated
@@ -295,6 +306,14 @@ void diagnostic_note_dlss_nr_gpu_time(
             : for_api(api).full_dlss_nr_gpu_ms_bits,
         milliseconds
     );
+}
+
+void diagnostic_note_pipeline_gpu_time(DiagnosticApi api, float milliseconds, bool before) noexcept {
+    note_averaged_gpu_time(api == DiagnosticApi::d3d12
+        ? (before ? DiagnosticGpuTiming::d3d12_before_pipeline : DiagnosticGpuTiming::d3d12_after_pipeline)
+        : (before ? DiagnosticGpuTiming::d3d11_before_pipeline : DiagnosticGpuTiming::d3d11_after_pipeline),
+        before ? for_api(api).before_pipeline_gpu_ms_bits : for_api(api).after_pipeline_gpu_ms_bits,
+        milliseconds);
 }
 
 void diagnostic_note_native_dlss_gpu_time(
@@ -456,6 +475,10 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         transport_gpu_ms,
         foveated_dlss_gpu_ms,
         peripheral_dlaa_gpu_ms,
+        load_gpu_time(data.before_full_nr_gpu_ms_bits),
+        load_gpu_time(data.before_foveated_nr_gpu_ms_bits),
+        load_gpu_time(data.before_pipeline_gpu_ms_bits),
+        load_gpu_time(data.after_pipeline_gpu_ms_bits),
         full_dlss_nr_gpu_ms,
         foveated_dlss_nr_gpu_ms,
         native_dlss_gpu_ms,

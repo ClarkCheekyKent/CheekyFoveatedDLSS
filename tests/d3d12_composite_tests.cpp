@@ -1,3 +1,5 @@
+#include "dlss_nr_input.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include "d3d12_composite_shader.hpp"
 #include "d3d11_composite_shader.hpp"
 #include "d3d12_output_contract.hpp"
@@ -14,6 +16,12 @@
 #include <stdexcept>
 #include <vector>
 
+namespace cheeky::foveated_dlss {
+extern int nr_test_evaluations;
+extern bool nr_test_succeeds;
+extern DlssNrFrame nr_test_frame;
+}
+
 namespace {
 using Microsoft::WRL::ComPtr;
 using namespace cheeky::foveated_dlss;
@@ -26,6 +34,163 @@ void check(HRESULT hr) {
 }
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
+}
+
+// Interposers may expose a different COM pointer while forwarding object data.
+// Only the object interface is used by the submission bookkeeping.
+class ObjectAlias final : public ID3D12Object {
+    ID3D12Object* object_;
+public:
+    explicit ObjectAlias(ID3D12Object* object) : object_(object) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override { return object_->QueryInterface(id, out); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return object_->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override { return object_->Release(); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID id, UINT* size, void* data) override { return object_->GetPrivateData(id, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID id, UINT size, const void* data) override { return object_->SetPrivateData(id, size, data); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID id, const IUnknown* data) override { return object_->SetPrivateDataInterface(id, data); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR name) override { return object_->SetName(name); }
+};
+
+void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
+    ComPtr<ID3D12InfoQueue> messages;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) messages->ClearStoredMessages();
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC q{};
+    check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 32;
+    desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    ComPtr<ID3D12Resource> color;
+    check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&color)));
+    ComPtr<ID3D12Fence> done;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)));
+    ComPtr<ID3D12Fence> gate;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+    Settings settings{};
+    settings.nr_enabled = true;
+    settings.nr_processing_order = NrProcessingOrder::before_upscaling;
+    DlssNrFrame frame{};
+    frame.view_id = 501;
+    frame.route = route;
+    frame.command_list = list.Get();
+    frame.color = color.Get();
+    frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    frame.input_width = frame.input_height = 32;
+    frame.output_width = frame.output_height = 64;
+    ObjectAlias submitted(list.Get());
+    for (UINT64 iteration = 1; iteration <= 24; ++iteration) {
+        if (iteration != 1) {
+            check(allocator->Reset());
+            check(list->Reset(allocator.Get(), nullptr));
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+            nr_recording_reset(alias ? static_cast<ID3D12Object*>(&submitted) : list.Get(), S_OK);
+#endif
+        }
+        require(prepare_dlss_nr_input(frame, settings) != nullptr,
+            "Before NR exhausted its input pool across aliased submissions");
+        if (iteration == 1) {
+            for (unsigned slot = 1; slot < 8; ++slot)
+                require(prepare_dlss_nr_input(frame, settings) != nullptr, "Could not fill NR pool");
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "NR reused an input whose commands were still being recorded");
+        }
+        check(list->Close());
+        // No NR accounting at the pre-Execute host notification.
+        if (iteration == 1) {
+            // An idle queue must not make a pre-submission notification complete.
+            check(queue->Signal(done.Get(), 1));
+            HANDLE idle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            require(idle != nullptr, "CreateEvent failed");
+            check(done->SetEventOnCompletion(1, idle));
+            const auto waited = WaitForSingleObject(idle, 10000);
+            CloseHandle(idle);
+            require(waited == WAIT_OBJECT_0, "Idle queue timed out");
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "NR recycled an input before ExecuteCommandLists");
+            check(queue->Wait(gate.Get(), 1));
+        }
+        ID3D12CommandList* lists[]{list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+        nr_recording_submitted(queue.Get(), alias ? static_cast<ID3D12Object*>(&submitted) : list.Get());
+#endif
+        collect_dlss_nr_input_submissions();
+        if (iteration == 1) {
+            const bool held = prepare_dlss_nr_input(frame, settings) == nullptr;
+            check(gate->Signal(1));
+            require(held, "NR recycled an input before GPU completion");
+        }
+        check(queue->Signal(done.Get(), iteration + 1));
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        require(event != nullptr, "CreateEvent failed");
+        check(done->SetEventOnCompletion(iteration + 1, event));
+        const auto waited = WaitForSingleObject(event, 10000);
+        CloseHandle(event);
+        require(waited == WAIT_OBJECT_0, "NR recycling test timed out");
+        if (iteration == 1) {
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "GPU completion made an unretired input reusable");
+            ComPtr<ID3D12CommandQueue> replay_queue;
+            check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&replay_queue)));
+            check(replay_queue->Wait(gate.Get(), 2));
+            replay_queue->ExecuteCommandLists(1, lists);
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+            nr_recording_submitted(replay_queue.Get(), &submitted);
+#endif
+            // Retire while the second queue remains blocked. Use a different
+            // allocator: the old allocator still belongs to pending execution.
+            auto pending_allocator = allocator;
+            allocator.Reset();
+            check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+            check(list->Reset(allocator.Get(), nullptr));
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+            nr_recording_reset(&submitted, S_OK);
+#endif
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "Reset reused private inputs while another queue was pending");
+            release_dlss_nr_inputs(501);
+            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+                "View release bypassed the eight-input limit during replay");
+            ComPtr<ID3D12Fence> replay_done;
+            check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&replay_done)));
+            check(gate->Signal(2));
+            check(replay_queue->Signal(replay_done.Get(), 1));
+            HANDLE replay_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            check(replay_done->SetEventOnCompletion(1, replay_event));
+            const auto replay_waited = WaitForSingleObject(replay_event, 10000);
+            CloseHandle(replay_event);
+            require(replay_waited == WAIT_OBJECT_0, "NR input replay queue timed out");
+            require(prepare_dlss_nr_input(frame, settings) != nullptr,
+                "Private input pool did not recover after retirement and all queue completions");
+            check(list->Close()); // The next Reset discards this unsubmitted copy.
+        }
+    }
+    release_dlss_nr_inputs(501);
+    list.Reset(); // Destruction retires the final completed recording.
+    collect_dlss_nr_input_submissions();
+    if (messages) {
+        for (UINT64 index = 0; index < messages->GetNumStoredMessages(); ++index) {
+            SIZE_T size{};
+            check(messages->GetMessage(index, nullptr, &size));
+            std::vector<unsigned char> storage(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            check(messages->GetMessage(index, message, &size));
+            require(message->Severity > D3D12_MESSAGE_SEVERITY_ERROR,
+                "D3D12 debug layer reported an NR recycling error");
+        }
+    }
+    std::cout << "Before NR recycled inputs across 24 submissions; aliased=" << alias
+        << "; route=" << static_cast<unsigned>(route) << "; replay and pending GPU inputs protected\n";
 }
 
 ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE type) {
@@ -104,7 +269,7 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
-    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false) {
+    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false, bool before_nr = false, bool nr_success = true) {
     ComPtr<ID3D12InfoQueue> messages;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) {
         messages->ClearStoredMessages();
@@ -127,6 +292,64 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     transition(list.Get(), dlss.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
+    ID3D12Resource* composite_color = color.resource.Get();
+    ComPtr<ID3D12Resource> copy_probe;
+    ComPtr<ID3D12DescriptorHeap> clear_heap, clear_cpu_heap;
+    if (before_nr) {
+        Settings settings{};
+        settings.nr_enabled = true;
+        settings.nr_processing_order = NrProcessingOrder::before_upscaling;
+        DlssNrFrame frame{};
+        frame.view_id = 500U;
+        frame.command_list = list.Get();
+        frame.color = color.resource.Get();
+        frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        frame.input_width = 24U; frame.input_height = 20U;
+        frame.output_width = 48U; frame.output_height = 40U;
+        frame.color_base_x = 4U; frame.color_base_y = 2U;
+        nr_test_succeeds = nr_success;
+        const auto calls = nr_test_evaluations;
+        auto* processed = prepare_dlss_nr_input(frame, settings);
+        require(nr_test_evaluations == calls + 1, "Before NR was not evaluated exactly once");
+        require(nr_test_frame.processing_width == 24U && nr_test_frame.processing_height == 20U,
+            "Before NR received display dimensions");
+        require(nr_test_frame.color != color.resource.Get(), "NR received game-owned color");
+        if (!nr_success) require(processed == nullptr, "Failed NR propagated private color");
+        if (processed) {
+            require((processed->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0U,
+                "Private NR color lacks UAV capability");
+            composite_color = processed;
+            copy_probe = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
+            transition(list.Get(), processed, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+            source.pResource = processed;
+            source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.pResource = copy_probe.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            destination.PlacedFootprint = color.footprints[0];
+            list->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
+            transition(list.Get(), processed, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            D3D12_DESCRIPTOR_HEAP_DESC clear_desc{};
+            clear_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            clear_desc.NumDescriptors = 1U;
+            clear_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            check(device->CreateDescriptorHeap(&clear_desc, IID_PPV_ARGS(&clear_heap)));
+            clear_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            check(device->CreateDescriptorHeap(&clear_desc, IID_PPV_ARGS(&clear_cpu_heap)));
+            D3D12_UNORDERED_ACCESS_VIEW_DESC clear_view{};
+            clear_view.Format = format;
+            clear_view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            device->CreateUnorderedAccessView(processed, nullptr, &clear_view, clear_heap->GetCPUDescriptorHandleForHeapStart());
+            device->CreateUnorderedAccessView(processed, nullptr, &clear_view, clear_cpu_heap->GetCPUDescriptorHandleForHeapStart());
+            ID3D12DescriptorHeap* clear_heaps[]{clear_heap.Get()};
+            list->SetDescriptorHeaps(1U, clear_heaps);
+            const float green_color[]{0.0F, 1.0F, 0.0F, 1.0F};
+            list->ClearUnorderedAccessViewFloat(clear_heap->GetGPUDescriptorHandleForHeapStart(),
+                clear_cpu_heap->GetCPUDescriptorHandleForHeapStart(), processed, green_color, 0U, nullptr);
+            transition(list.Get(), processed, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+    }
+
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.NumDescriptors = 3;
@@ -143,7 +366,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Texture2D.MipLevels = 1;
     }
-    device->CreateShaderResourceView(color.resource.Get(), &srv, cpu);
+    device->CreateShaderResourceView(composite_color, &srv, cpu);
     cpu.ptr += increment;
     device->CreateShaderResourceView(dlss.resource.Get(), &srv, cpu);
     cpu.ptr += increment;
@@ -164,7 +387,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         params[i].DescriptorTable = {1, &ranges[i]};
     }
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[2].Constants = {0, 0, 24};
+    params[2].Constants = {0, 0, 32};
     D3D12_ROOT_SIGNATURE_DESC rd{};
     rd.NumParameters = 3;
     rd.pParameters = params;
@@ -190,11 +413,12 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     list->SetComputeRootDescriptorTable(0, gpu);
     gpu.ptr += 2ULL * increment;
     list->SetComputeRootDescriptorTable(1, gpu);
-    std::array<UINT32, 24> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
+    std::array<UINT32, 32> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
+    if (before_nr) { constants[4] = 4U; constants[5] = 2U; constants[6] = 24U; constants[7] = 20U; }
     const float one = 1.0F;
     std::memcpy(&constants[12], &one, sizeof(one));
     std::memcpy(&constants[13], &one, sizeof(one));
-    list->SetComputeRoot32BitConstants(2, 24, constants.data(), 0);
+    list->SetComputeRoot32BitConstants(2, 32, constants.data(), 0);
     list->Dispatch(2, 2, 1);
     transition(list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     auto readback = buffer(device, output.bytes, D3D12_HEAP_TYPE_READBACK);
@@ -208,9 +432,23 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         dst.PlacedFootprint = output.footprints[i];
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     }
+    auto original_readback = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
+    transition(list.Get(), color.resource.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT i = 0; i < color.footprints.size(); ++i) {
+        D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+        source.pResource = color.resource.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source.SubresourceIndex = i;
+        destination.pResource = original_readback.Get(); destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        destination.PlacedFootprint = color.footprints[i];
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
     check(list->Close());
     ID3D12CommandList* lists[]{list.Get()};
     queue->ExecuteCommandLists(1, lists);
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+    nr_recording_submitted(queue.Get(), list.Get());
+#endif
+    collect_dlss_nr_input_submissions();
     ComPtr<ID3D12Fence> fence;
     check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
     check(queue->Signal(fence.Get(), 1));
@@ -230,7 +468,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
             for (UINT x = 0; x < f.Footprint.Width; ++x) {
                 UINT32 expected = sentinel;
                 if (i == 0 && x >= 4 && x < 28 && y >= 2 && y < 22) {
-                    expected = x >= 12 && x < 20 && y >= 8 && y < 16 ? green : blue;
+                    expected = (before_nr && nr_success) || (x >= 12 && x < 20 && y >= 8 && y < 16) ? green : blue;
                 }
                 if (checker && i == 0 && x >= 12 && x < 20 && y >= 8 && y < 16) {
                     // Independent CPU reference: integrate every source cell's
@@ -272,6 +510,28 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     }
     readback->Unmap(0, nullptr);
     require(correct, "Composite pixels incorrect or another slice/mip was modified");
+    check(original_readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
+    bool source_unchanged = true;
+    for (const auto& footprint : color.footprints)
+        for (UINT y = 0; y < footprint.Footprint.Height; ++y) {
+            const auto* row = reinterpret_cast<const UINT32*>(mapped + footprint.Offset + y * footprint.Footprint.RowPitch);
+            for (UINT x = 0; x < footprint.Footprint.Width; ++x) source_unchanged &= row[x] == blue;
+        }
+    original_readback->Unmap(0, nullptr);
+    require(source_unchanged, "NR modified original color or unrelated source subresources");
+    if (copy_probe) {
+        check(copy_probe->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
+        bool copied = true;
+        const auto& footprint = color.footprints[0];
+        for (UINT y = 2; y < 22; ++y) {
+            const auto* row = reinterpret_cast<const UINT32*>(mapped + footprint.Offset + y * footprint.Footprint.RowPitch);
+            for (UINT x = 4; x < 28; ++x) copied &= row[x] == blue;
+        }
+        copy_probe->Unmap(0, nullptr);
+        require(copied, "Private color copy lost the active region or origin");
+    }
+    release_dlss_nr_inputs(500U);
+    nr_test_succeeds = true;
     if (messages) {
         for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
             SIZE_T size{};
@@ -293,8 +553,13 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
 
 int run_d3d12_composite_tests() {
     try {
+        // The native observer runs this after the lifetime fixture; keep one debug mode.
+        wchar_t no_debug_layer[2]{};
+        const bool force_no_debug_layer =
+            GetEnvironmentVariableW(L"CHEEKY_NR_TEST_NO_DEBUG_LAYER", no_debug_layer, 2) == 1 &&
+            no_debug_layer[0] == L'1';
         ComPtr<ID3D12Debug> debug;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+        if (!force_no_debug_layer && SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
             debug->EnableDebugLayer();
             std::cout << "D3D12 debug layer enabled\n";
         } else {
@@ -306,7 +571,13 @@ int run_d3d12_composite_tests() {
         check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
         ComPtr<ID3D12Device> device;
         check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+        for (auto route : {DlssNrRoute::d3d12_native, DlssNrRoute::streamline, DlssNrRoute::d3d11_transport}) {
+            run_nr_recycling(device.Get(), true, route);
+            run_nr_recycling(device.Get(), false, route);
+        }
         run_case(device.Get(), 1, 1);
+        run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, true);
+        run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, false);
         run_case(device.Get(), 2, 5);
         run_case(device.Get(), 4, 5);
         run_case(device.Get(), 2, 5, DXGI_FORMAT_R11G11B10_FLOAT);

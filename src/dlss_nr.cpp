@@ -1,3 +1,6 @@
+#include "dlss_nr_input.hpp"
+#include "dlss_nr_lifetime.hpp"
+#include "eye_calibration_d3d12.hpp"
 #include "dlss_nr.hpp"
 
 #include "d3d12_output_contract.hpp"
@@ -76,17 +79,8 @@ struct FeatureKey {
     std::uint32_t output_width{};
     std::uint32_t output_height{};
     std::uint32_t create_flags{};
-};
-
-struct NrRegion {
-    std::uint32_t base_x{};
-    std::uint32_t base_y{};
-    std::uint32_t width{};
-    std::uint32_t height{};
-    float shape_width{1.0F};
-    float shape_height{1.0F};
-    float roundness{};
-    float transition{};
+    NrProcessingOrder order{};
+    std::uint32_t processing_width{}, processing_height{};
 };
 
 [[nodiscard]] bool operator==(
@@ -105,6 +99,7 @@ struct GpuResources {
     ID3D12RootSignature* root_signature{};
     ID3D12PipelineState* encode_pipeline{};
     ID3D12PipelineState* decode_pipeline{};
+    ID3D12PipelineState* border_pipeline{};
     std::uint32_t width{};
     std::uint32_t height{};
     std::uint32_t working_width{};
@@ -116,9 +111,12 @@ struct CachedFeature {
     FeatureKey key{};
     NgxParameters* parameters{};
     NgxHandle* handle{};
+    bool reusable{true};
 };
 
 struct ViewState {
+    NrLifetime uses;
+    bool retired{};
     DlssViewId view_id{};
     NgxParameters* parameters{};
     NgxHandle* handle{};
@@ -145,6 +143,7 @@ constexpr std::size_t retired_feature_capacity = 8U;
 constexpr std::size_t gpu_resource_cache_capacity = 8U;
 
 void release_gpu(GpuResources& gpu) noexcept {
+    release(gpu.border_pipeline);
     release(gpu.decode_pipeline);
     release(gpu.encode_pipeline);
     release(gpu.root_signature);
@@ -178,7 +177,36 @@ void release_feature(ViewState& view) noexcept {
     view.retired_features.clear();
 }
 
+bool view_complete(ViewState& view) noexcept {
+    view.uses.collect();
+    return view.uses.empty();
+}
+bool record_use(ViewState& view, ID3D12GraphicsCommandList* list) noexcept {
+    return view.uses.record(list);
+}
+void evict_retired_features(ViewState& view) noexcept;
+void collect_retired_views() noexcept {
+    for (auto it = views.begin(); it != views.end();) {
+        const bool complete = view_complete(*it);
+        if (it->retired && complete) {
+            release_feature(*it);
+            for (auto& gpu : it->gpu_resources) release_gpu(gpu);
+            it = views.erase(it);
+        } else {
+            if (complete) {
+                evict_retired_features(*it);
+                while (it->gpu_resources.size() > gpu_resource_cache_capacity) {
+                    release_gpu(it->gpu_resources.front());
+                    it->gpu_resources.pop_front();
+                }
+            }
+            ++it;
+        }
+    }
+}
+
 void evict_retired_features(ViewState& view) noexcept {
+    if (!view_complete(view)) return;
     while (view.retired_features.size() > retired_feature_capacity) {
         const auto retired = view.retired_features.front();
         view.retired_features.pop_front();
@@ -310,7 +338,13 @@ DWORD WINAPI hook_nr_get_module_file_name(
 }
 
 [[nodiscard]] bool initialize_runtime(ID3D12Device* const device) noexcept {
-    if (runtime.state == 1U) return runtime.device == device;
+    if (runtime.state == 1U) {
+        if (runtime.device == device) return true;
+        diagnostics.state = DlssNrState::runtime_failed;
+        diagnostics.skip_reason = "NR runtime belongs to a different device";
+        ++diagnostics.failed_calls;
+        return false;
+    }
     if (runtime.state == 2U || runtime.state == 3U || device == nullptr) {
         return false;
     }
@@ -434,7 +468,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
 
 [[nodiscard]] ViewState& find_or_create_view(const DlssViewId view_id) {
     for (auto& view : views) {
-        if (view.view_id == view_id) return view;
+        if (view.view_id == view_id && !view.retired) return view;
     }
     views.push_back(ViewState{});
     views.back().view_id = view_id;
@@ -454,12 +488,15 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
         working_width,
         working_height,
         frame.create_flags,
+        settings.nr_processing_order,
+        frame.processing_width ? frame.processing_width : frame.output_width,
+        frame.processing_height ? frame.processing_height : frame.output_height,
     };
     if (view.handle != nullptr && view.has_key && view.key == key) return true;
     if (view.feature_failed && view.has_key && view.key == key) return false;
     for (auto iterator = view.retired_features.begin();
          iterator != view.retired_features.end(); ++iterator) {
-        if (!(iterator->key == key)) continue;
+        if (!iterator->reusable || !(iterator->key == key)) continue;
         const CachedFeature current{view.key, view.parameters, view.handle};
         view.parameters = iterator->parameters;
         view.handle = iterator->handle;
@@ -535,8 +572,9 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     );
     diagnostics.last_result = result;
     if (!ngx_succeeded(result) || handle == nullptr) {
-        if (handle != nullptr) static_cast<void>(runtime.release_feature(handle));
-        static_cast<void>(runtime.destroy_parameters(parameters));
+        // Creation may have recorded GPU work even on failure. Retain these
+        // objects with the recording, but never reuse a failed feature.
+        view.retired_features.push_back({key, parameters, handle, false});
         diagnostics.state = DlssNrState::feature_failed;
         ++diagnostics.failed_calls;
         view.feature_failed = true;
@@ -907,6 +945,17 @@ void EncodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
 }
 
 [numthreads(16, 16, 1)]
+void BorderMain(uint3 dispatch_id : SV_DispatchThreadID) {
+    if (any(dispatch_id.xy >= Size)) return;
+    const float distance = FoveationShapeDistance(dispatch_id.xy);
+    const float step = max(
+        abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(1, 0)) - distance),
+        abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(0, 1)) - distance));
+    if (distance <= 1.0 && distance >= 1.0 - 5.0 * step)
+        Output0[SourceBase + dispatch_id.xy] = float4(0, 1, 0, 1);
+}
+
+[numthreads(16, 16, 1)]
 void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     if (any(dispatch_id.xy >= Size)) return;
     const float4 original_sample = Source0.Load(int3(dispatch_id.xy, 0));
@@ -1005,6 +1054,14 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         IID_PPV_ARGS(&gpu.decode_pipeline)
     );
     if (FAILED(result)) return fail("CreateComputePipelineState(decode)", result);
+    release(decoded);
+    release(shader_errors);
+    result = D3DCompile(shader, sizeof(shader), nullptr, nullptr, nullptr,
+        "BorderMain", "cs_5_0", 0U, 0U, &decoded, &shader_errors);
+    if (FAILED(result)) return fail("D3DCompile(border)", result);
+    pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
+    result = device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&gpu.border_pipeline));
+    if (FAILED(result)) return fail("CreateComputePipelineState(border)", result);
     cleanup();
     trace_event(
         "DLSS-NR region codec created region=%ux%u working=%ux%u source=%u,%u",
@@ -1043,90 +1100,11 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         view.gpu_resources.pop_back();
         return nullptr;
     }
-    while (view.gpu_resources.size() > gpu_resource_cache_capacity) {
+    while (view.gpu_resources.size() > gpu_resource_cache_capacity && view_complete(view)) {
         release_gpu(view.gpu_resources.front());
         view.gpu_resources.pop_front();
     }
     return &gpu;
-}
-
-[[nodiscard]] NrRegion calculate_region(
-    const Settings& settings,
-    const std::uint32_t width,
-    const std::uint32_t height,
-    const FoveationCenter* const center
-) noexcept {
-    if (!settings.nr_foveated) {
-        return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
-    }
-    const auto parameters = dlss_nr_foveation_parameters(
-        settings, center
-    );
-    FoveationGeometry geometry{};
-    if (!calculate_foveation_geometry(
-            parameters,
-            width,
-            height,
-            width,
-            height,
-            0U,
-            0U,
-            geometry
-        )) {
-        return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
-    }
-    const auto x = dlss_nr_aligned_axis(
-        geometry.output_base_x, geometry.output_width, width);
-    const auto y = dlss_nr_aligned_axis(
-        geometry.output_base_y, geometry.output_height, height);
-    return {
-        x.base,
-        y.base,
-        x.extent,
-        y.extent,
-        parameters.width,
-        parameters.height,
-        parameters.roundness,
-        parameters.transition_width,
-    };
-}
-
-[[nodiscard]] std::uint32_t scaled_extent(
-    const std::uint32_t extent,
-    const float scale
-) noexcept {
-    const auto requested = (std::max)(
-        32U,
-        static_cast<std::uint32_t>(
-            static_cast<float>(extent) * std::clamp(scale, 0.1F, 1.0F) + 0.5F
-        )
-    );
-    return (requested + 7U) / 8U * 8U;
-}
-
-struct ScaledSubrect {
-    std::uint32_t base{};
-    std::uint32_t extent{};
-};
-
-[[nodiscard]] ScaledSubrect scale_subrect(
-    const std::uint32_t region_base,
-    const std::uint32_t region_extent,
-    const std::uint32_t source_base,
-    const std::uint32_t source_extent,
-    const std::uint32_t output_extent
-) noexcept {
-    const auto base = static_cast<std::uint32_t>(std::floor(
-        static_cast<double>(region_base) * source_extent / output_extent
-    ));
-    const auto end = (std::min)(
-        source_extent,
-        static_cast<std::uint32_t>(std::ceil(
-            static_cast<double>(region_base + region_extent) * source_extent /
-                output_extent
-        ))
-    );
-    return {source_base + base, (std::max)(1U, end - base)};
 }
 
 [[nodiscard]] std::uint64_t settings_signature(
@@ -1138,6 +1116,7 @@ struct ScaledSubrect {
         signature ^= value;
         signature *= 1099511628211ULL;
     };
+    append(static_cast<std::uint32_t>(settings.nr_processing_order));
     for (const auto value : {
             settings.nr_working_scale,
             settings.nr_intensity,
@@ -1261,40 +1240,29 @@ void dispatch_codec(
 
 }  // namespace
 
-bool calculate_dlss_nr_geometry(
-    const Settings& settings,
-    const std::uint32_t output_width,
-    const std::uint32_t output_height,
-    DlssNrGeometry& geometry,
-    const FoveationCenter* center
-) noexcept {
-    if (output_width == 0U || output_height == 0U) return false;
-    const auto region = calculate_region(
-        settings, output_width, output_height, center
-    );
-    if (region.width == 0U || region.height == 0U) return false;
-    geometry = {
-        region.base_x,
-        region.base_y,
-        region.width,
-        region.height,
-        scaled_extent(region.width, settings.nr_working_scale),
-        scaled_extent(region.height, settings.nr_working_scale),
-    };
-    return true;
-}
-
 bool evaluate_dlss_nr(
     const DlssNrFrame& frame,
     const Settings& settings
 ) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
+    collect_retired_views();
+    diagnostics.skip_reason = nullptr;
     diagnostics.route = frame.route;
+    diagnostics.processing_order = settings.nr_processing_order;
+    diagnostics.processing_width = frame.processing_width ? frame.processing_width : frame.output_width;
+    diagnostics.processing_height = frame.processing_height ? frame.processing_height : frame.output_height;
     if (!settings.nr_enabled) {
         diagnostics.state = DlssNrState::disabled;
         for (auto& view : views) view.was_enabled = false;
         return false;
     }
+    diagnostics.output_width = frame.output_width;
+    diagnostics.output_height = frame.output_height;
+    diagnostics.region_base_x = diagnostics.region_base_y = 0U;
+    diagnostics.region_width = diagnostics.region_height = 0U;
+    diagnostics.working_width = diagnostics.working_height = 0U;
+    diagnostics.last_result = 0U;
     ++diagnostics.candidate_calls;
     auto& view = find_or_create_view(frame.view_id);
     // Any rejected/failed NR evaluation breaks consecutive temporal history.
@@ -1314,6 +1282,19 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
+    const auto guide_valid = [](ID3D12Resource* resource, std::uint32_t x, std::uint32_t y,
+        std::uint32_t width, std::uint32_t height) noexcept {
+        const auto desc = resource->GetDesc();
+        return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1U &&
+            desc.SampleDesc.Count == 1U && x <= desc.Width && width <= desc.Width - x &&
+            y <= desc.Height && height <= desc.Height - y;
+    };
+    if (!guide_valid(frame.depth, frame.depth_base_x, frame.depth_base_y, frame.depth_width, frame.depth_height) ||
+        !guide_valid(frame.motion_vectors, frame.motion_base_x, frame.motion_base_y, frame.motion_width, frame.motion_height)) {
+        diagnostics.state = DlssNrState::unsupported_resources;
+        ++diagnostics.failed_calls;
+        return false;
+    }
     ID3D12Device* device{};
     const auto device_result = frame.command_list->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(device_result) || device == nullptr) {
@@ -1322,14 +1303,26 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
+    if (!ensure_dlss_nr_recording(frame.command_list)) {
+        device->Release();
+        diagnostics.state = DlssNrState::input_preparation_failed;
+        diagnostics.skip_reason = "NR requires compatible Execute/Reset observation and recording identity";
+        ++diagnostics.failed_calls;
+        return false;
+    }
     const bool runtime_ready = initialize_runtime(device);
     device->Release();
     if (!runtime_ready) return false;
 
+    const auto processing_width = frame.processing_width != 0U ? frame.processing_width : frame.output_width;
+    const auto processing_height = frame.processing_height != 0U ? frame.processing_height : frame.output_height;
     const auto region = calculate_region(
         settings,
-        frame.output_width,
-        frame.output_height,
+        processing_width,
+        processing_height,
+        frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr,
+        frame.input_width,
+        frame.input_height,
         frame.has_center ? &frame.center : nullptr
     );
     const auto working_width = scaled_extent(region.width, settings.nr_working_scale);
@@ -1351,6 +1344,7 @@ bool evaluate_dlss_nr(
         ++diagnostics.failed_calls;
         return false;
     }
+    if (!record_use(view, frame.command_list)) return false;
     if (!create_feature(view, frame, settings, working_width, working_height)) {
         return false;
     }
@@ -1369,7 +1363,7 @@ bool evaluate_dlss_nr(
             region.width,
             frame.depth_base_x,
             frame.depth_width,
-            frame.output_width
+            processing_width
         );
     const auto depth_y = frame.color_is_region
         ? ScaledSubrect{frame.depth_base_y, frame.depth_height}
@@ -1378,7 +1372,7 @@ bool evaluate_dlss_nr(
             region.height,
             frame.depth_base_y,
             frame.depth_height,
-            frame.output_height
+            processing_height
         );
     const auto motion_x = frame.color_is_region
         ? ScaledSubrect{frame.motion_base_x, frame.motion_width}
@@ -1387,7 +1381,7 @@ bool evaluate_dlss_nr(
             region.width,
             frame.motion_base_x,
             frame.motion_width,
-            frame.output_width
+            processing_width
         );
     const auto motion_y = frame.color_is_region
         ? ScaledSubrect{frame.motion_base_y, frame.motion_height}
@@ -1396,11 +1390,21 @@ bool evaluate_dlss_nr(
             region.height,
             frame.motion_base_y,
             frame.motion_height,
-            frame.output_height
+            processing_height
         );
 
     auto* const parameters = view.parameters;
-    const auto signature = settings_signature(settings, region);
+    auto signature = settings_signature(settings, region);
+    // Guides can change resolution/origin while the working texture stays the
+    // same size (e.g. output-resolution motion with dynamic display sizing).
+    for (const auto dimension : {frame.input_width, frame.input_height,
+            frame.output_width, frame.output_height, processing_width, processing_height,
+            frame.depth_width, frame.depth_height, frame.motion_width, frame.motion_height,
+            frame.color_base_x, frame.color_base_y, frame.depth_base_x, frame.depth_base_y,
+            frame.motion_base_x, frame.motion_base_y}) {
+        signature ^= dimension;
+        signature *= 1099511628211ULL;
+    }
     const auto reset_generation = requested_reset_generation.load(
         std::memory_order_acquire
     );
@@ -1605,6 +1609,7 @@ bool evaluate_dlss_nr(
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             frame.color_state
         );
+        view.was_enabled = false;
         diagnostics.state = DlssNrState::evaluation_failed;
         ++diagnostics.failed_calls;
         trace_event(
@@ -1688,33 +1693,72 @@ bool evaluate_dlss_nr(
     return true;
 }
 
-void release_dlss_nr_view(const DlssViewId view_id) noexcept {
+void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noexcept {
+    if (!settings.nr_enabled || !settings.nr_alignment_border_enabled ||
+        settings.nr_processing_order != NrProcessingOrder::before_upscaling ||
+        !frame.color || !frame.command_list || !frame.output_width || !frame.output_height) return;
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
-    for (auto iterator = views.begin(); iterator != views.end(); ++iterator) {
-        if (iterator->view_id != view_id) continue;
-        release_feature(*iterator);
-        for (auto& gpu : iterator->gpu_resources) release_gpu(gpu);
-        views.erase(iterator);
-        return;
-    }
+    collect_retired_views();
+    if (!ensure_dlss_nr_recording(frame.command_list)) return;
+    // Compute the rounded processing region first, then map it to display pixels.
+    auto region = calculate_region(settings, frame.input_width, frame.input_height,
+        frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr, frame.input_width, frame.input_height,
+        frame.has_center ? &frame.center : nullptr);
+    const auto x = scale_subrect(region.base_x, region.width, frame.color_base_x,
+        frame.output_width, frame.input_width);
+    const auto y = scale_subrect(region.base_y, region.height, frame.color_base_y,
+        frame.output_height, frame.input_height);
+    region.base_x = x.base; region.base_y = y.base;
+    region.width = x.extent; region.height = y.extent;
+    auto& view = find_or_create_view(frame.view_id);
+    auto* gpu = find_or_create_gpu(view, frame, region, 8U, 8U);
+    if (!gpu || !record_use(view, frame.command_list)) return;
+    transition(frame.command_list, frame.color, frame.color_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch_codec(frame, *gpu, gpu->border_pipeline, 1U, 6U, settings, region);
+    uav_barrier(frame.command_list, frame.color);
+    transition(frame.command_list, frame.color, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, frame.color_state);
 }
 
-void release_dlss_nr_resources() noexcept {
+void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const char* reason) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
-    for (auto& view : views) {
-        release_feature(view);
-        for (auto& gpu : view.gpu_resources) release_gpu(gpu);
-    }
-    views.clear();
-    release(runtime.device);
-    // Keep the signed module loaded: its shutdown export is not part of the
-    // known-good feature-18 contract and unloading it can race queued work.
-    runtime = {};
+    diagnostics.route = route;
+    diagnostics.processing_order = settings.nr_processing_order;
+    diagnostics.skip_reason = reason;
+    diagnostics.state = DlssNrState::input_preparation_failed;
+    diagnostics.processing_width = diagnostics.processing_height = 0U;
+    diagnostics.region_width = diagnostics.region_height = 0U;
+    diagnostics.working_width = diagnostics.working_height = 0U;
+    ++diagnostics.candidate_calls;
+    ++diagnostics.failed_calls;
+}
+void collect_dlss_nr_submissions() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    std::lock_guard lock(nr_mutex);
+    collect_retired_views();
+}
+void release_dlss_nr_view(const DlssViewId view_id) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    release_dlss_nr_inputs(view_id);
+    std::lock_guard lock(nr_mutex);
+    for (auto& view : views) if (view.view_id == view_id) view.retired = true;
+    collect_retired_views();
+}
+void release_dlss_nr_resources() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    release_dlss_nr_inputs();
+    std::lock_guard lock(nr_mutex);
+    for (auto& view : views) view.retired = true;
+    collect_retired_views();
+    // Keep runtime callbacks alive while submitted or recorded work owns features.
+    if (views.empty()) { release(runtime.device); runtime = {}; }
     diagnostics = {};
 }
 
 void reset_dlss_nr() noexcept {
     requested_reset_generation.fetch_add(1U, std::memory_order_acq_rel);
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     if (runtime.state == 2U) runtime.state = 0U;
     for (auto& view : views) {
@@ -1726,6 +1770,7 @@ void reset_dlss_nr() noexcept {
 }
 
 DlssNrSnapshot dlss_nr_snapshot() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     return diagnostics;
 }
@@ -1740,6 +1785,7 @@ const char* dlss_nr_state_name(const DlssNrState state) noexcept {
     case DlssNrState::feature_failed: return "DLSS-NR feature 18 creation failed";
     case DlssNrState::evaluation_failed: return "DLSS-NR feature 18 evaluation failed";
     case DlssNrState::active: return "Active";
+    case DlssNrState::input_preparation_failed: return "NR input preparation failed; using original color";
     }
     return "Unknown";
 }

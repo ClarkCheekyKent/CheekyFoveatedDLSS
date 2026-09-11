@@ -153,3 +153,45 @@ The description and reproduction prompts prefill the game executable and VR mode
 when compatible OpenXR session/mapping activity is detected. Otherwise the user
 is asked to confirm desktop or VR. The runtime name is shown separately; the
 current diagnostic interface does not expose a headset model, so users supply it.
+
+### Rendering order and working scale
+
+In UEVR DX12, enable DLSS-NR and open **Neural rendering > Rendering order**.
+The selector applies and saves through the normal acknowledged settings flow.
+`NrProcessingOrder=0` means After; `1` means Before. Older configuration files
+without the key default to After, and other values reject the settings transaction.
+If the runtime omits the setting, the menu shows it as unavailable. The configuration
+schema and UI protocol remain at version 1. UEVR's DX11 path still does not support
+NR or DX12 Transport.
+
+**Rendering order** defaults to **After upscaling**, preserving the existing
+post-SR processing. **Before upscaling** runs NR on a private copy of the active
+render-resolution color before center SR, peripheral DLAA, and composition.
+The option is implemented for native DX12, Streamline, and DX11 with **DX12
+Transport**, including when SR foveation is disabled. Game-owned color remains
+unchanged. Existing array-slice restrictions still apply.
+
+**Working scale** remains adjustable from **0.10–1.00**, defaults to **1.00**,
+and retains its saved value when changing order. It scales the NR region's width
+and height in the selected processing resolution. For example, full-frame NR
+with a 1600×1200 render size and 3200×2400 display size works at 1280×960 before
+SR, or 2560×1920 after SR, at scale 0.80. At 1.00 Before mode uses render-resolution
+pixels. Dimensions retain the runtime's eight-pixel alignment and 32-pixel minimum.
+Independent and linked NR shapes follow the coordinated SR center; the green
+border is drawn after SR at display resolution with its five-pixel width.
+
+Before mode trades potential image quality for fewer NR working pixels. **No
+NVIDIA quality or performance improvement has been measured for this change.**
+The Release tests and WARP GPU readbacks verify contracts, private copying,
+composition, and input/subresource preservation; they cannot establish NVIDIA
+runtime or game compatibility. Compare identical scenes and settings on each
+route using the separate Before/After NR and total intercepted-pipeline GPU
+measurements in diagnostics. Native/Streamline totals include preparation,
+NR, SR, peripheral work, and composition; DX11 totals include transport and its
+queue waits. These totals do not represent the entire game's GPU frame.
+
+In-game acceptance remains pending: test NR full/foveated, SR foveation on/off,
+peripheral DLAA on/off, live order switching, dynamic resolution/resizing, both
+eyes, and gaze movement. Record image quality, actual NR working dimensions,
+NR GPU time, and total pipeline GPU time for both orders. Support reports include
+the selected order, dimensions, skip state, and separate timing samples.

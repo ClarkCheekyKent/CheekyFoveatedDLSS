@@ -3,6 +3,7 @@
 #include "frame_contract.hpp"
 #include "ngx_abi.hpp"
 #include "settings.hpp"
+#include "dlss_nr_contract.hpp"
 
 #include <cstdint>
 
@@ -24,6 +25,7 @@ enum class DlssNrState : std::uint32_t {
     feature_failed,
     evaluation_failed,
     active,
+    input_preparation_failed,
 };
 
 struct DlssNrFrame {
@@ -60,26 +62,17 @@ struct DlssNrFrame {
     bool has_center{};
     D3D12_RESOURCE_STATES motion_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
     bool motion_vectors_3d{};
+    FoveationGeometry shared_sr_crop{};
+    bool has_shared_sr_crop{};
+    // Zero preserves the legacy display-resolution contract.
+    std::uint32_t processing_width{};
+    std::uint32_t processing_height{};
 };
-
-struct DlssNrGeometry {
-    std::uint32_t base_x{};
-    std::uint32_t base_y{};
-    std::uint32_t width{};
-    std::uint32_t height{};
-    std::uint32_t working_width{};
-    std::uint32_t working_height{};
-};
-
-[[nodiscard]] bool calculate_dlss_nr_geometry(
-    const Settings& settings,
-    std::uint32_t output_width,
-    std::uint32_t output_height,
-    DlssNrGeometry& geometry,
-    const FoveationCenter* center = nullptr
-) noexcept;
 
 struct DlssNrSnapshot {
+    NrProcessingOrder processing_order{NrProcessingOrder::after_upscaling};
+    std::uint32_t processing_width{}, processing_height{};
+    const char* skip_reason{};
     DlssNrState state{DlssNrState::waiting};
     DlssNrRoute route{DlssNrRoute::none};
     std::uint64_t candidate_calls{};
@@ -101,6 +94,10 @@ struct DlssNrSnapshot {
     const DlssNrFrame& frame,
     const Settings& settings
 ) noexcept;
+
+void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const char* reason) noexcept;
+void collect_dlss_nr_submissions() noexcept;
+void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noexcept;
 
 void release_dlss_nr_view(DlssViewId view_id) noexcept;
 void release_dlss_nr_resources() noexcept;

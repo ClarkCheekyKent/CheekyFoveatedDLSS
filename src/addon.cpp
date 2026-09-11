@@ -505,6 +505,9 @@ void draw_nr_performance() {
     ImGui::SeparatorText("Status");
     if (DiagnosticTable table{"nr_status"}) {
         diagnostic_row("State", "%s", dlss_nr_state_name(data.state));
+        if (data.skip_reason) diagnostic_row("Skipped", "%s", data.skip_reason);
+        diagnostic_row("Rendering order", "%s", nr_processing_order_name(data.processing_order));
+        diagnostic_row("Processing resolution", "%u x %u", data.processing_width, data.processing_height);
         diagnostic_row("Current route", "%s", dlss_nr_route_name(data.route));
         diagnostic_row(
             "Calls", "Candidate %llu | Evaluated %llu | Failed %llu",
@@ -533,8 +536,8 @@ void draw_nr_performance() {
                 pixel_percentage(
                     data.region_width,
                     data.region_height,
-                    data.output_width,
-                    data.output_height
+                    data.processing_width,
+                    data.processing_height
                 ),
                 data.region_base_x,
                 data.region_base_y
@@ -560,9 +563,13 @@ void draw_nr_performance() {
         "Measured with D3D12 timestamps on the active processing path."
     );
     if (DiagnosticTable table{"nr_gpu_timing"}) {
-        timing_row("Full DLSS-NR call", timing.full_dlss_nr_gpu_ms);
+        timing_row("Before: full NR + preparation", timing.before_full_nr_gpu_ms);
+        timing_row("Before: foveated NR + preparation", timing.before_foveated_nr_gpu_ms);
+        timing_row("Before: total intercepted pipeline", timing.before_pipeline_gpu_ms);
+        timing_row("After: total intercepted pipeline", timing.after_pipeline_gpu_ms);
+        timing_row("After: full DLSS-NR call", timing.full_dlss_nr_gpu_ms);
         timing_row(
-            "Foveated DLSS-NR call", timing.foveated_dlss_nr_gpu_ms
+            "After: foveated DLSS-NR call", timing.foveated_dlss_nr_gpu_ms
         );
         if (timing.full_dlss_nr_gpu_ms > 0.0F &&
             timing.foveated_dlss_nr_gpu_ms > 0.0F) {
@@ -813,6 +820,9 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "GazeJumpResetRatio",
         settings.gaze_jump_reset_ratio
     ));
+    std::uint32_t nr_order{};
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "NrProcessingOrder", nr_order));
+    settings.nr_processing_order = nr_processing_order(nr_order);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrEnabled", settings.nr_enabled
     ));
@@ -971,6 +981,8 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "GazeJumpResetRatio",
         settings.gaze_jump_reset_ratio
     );
+    reshade::set_config_value(nullptr, config_section, "NrProcessingOrder",
+        static_cast<std::uint32_t>(settings.nr_processing_order));
     reshade::set_config_value(
         nullptr, config_section, "NrEnabled", settings.nr_enabled
     );
@@ -1448,6 +1460,12 @@ void draw_nr_controls(Settings& settings, bool& changed) {
     );
 
     ImGui::SeparatorText("Neural rendering");
+    int order = static_cast<int>(settings.nr_processing_order);
+    if (ImGui::Combo("Rendering order", &order, "After upscaling\0Before upscaling\0")) {
+        settings.nr_processing_order = nr_processing_order(static_cast<std::uint32_t>(order));
+        changed = true;
+    }
+    ImGui::TextWrapped("Before upscaling is experimental: it trades potential image quality for reduced NR workload. Working scale applies to the selected region at the chosen processing resolution.");
     deferred_slider(
         "Working scale",
         settings.nr_working_scale,
@@ -1534,6 +1552,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         settings.nr_height = defaults.nr_height;
         settings.nr_roundness = defaults.nr_roundness;
         settings.nr_transition_width = defaults.nr_transition_width;
+        settings.nr_processing_order = defaults.nr_processing_order;
         settings.nr_working_scale = defaults.nr_working_scale;
         settings.nr_preset = defaults.nr_preset;
         settings.nr_intensity = defaults.nr_intensity;

@@ -36,6 +36,16 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
         return
     end
     status = value
+    -- A reconnect can reach an older runtime. Drop unsupported order drafts
+    -- before automatic flush or Apply can resend them to that runtime.
+    if value.settings.NrProcessingOrder == nil then
+        draft.NrProcessingOrder, dirty.NrProcessingOrder = nil, nil
+        ready_edits.NrProcessingOrder, slider_edits.NrProcessingOrder = nil, nil
+        if pending_apply and pending_apply.values.NrProcessingOrder ~= nil then
+            pending_apply.values.NrProcessingOrder = nil
+            if not next(pending_apply.values) and not pending_apply.reset_group then pending_apply = nil end
+        end
+    end
     last_snapshot_frame = frame
     error_text = nil
     if pending_apply and value.request == pending_apply.id then
@@ -313,6 +323,11 @@ uevr.sdk.callbacks.on_draw_ui(function()
                     check("Show NR alignment border", "NrAlignmentBorder")
                 end
                 section("Neural rendering")
+                if status.settings.NrProcessingOrder ~= nil then
+                    combo("Rendering order", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
+                else
+                    text("Rendering order: Unavailable in this runtime")
+                end
                 slider("NR working scale", "NrWorkingScale", 0.1, 1)
                 combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A",[2]="Preset B",[3]="Preset C",
                     [4]="Preset D",[5]="Preset E",[6]="Preset F",[7]="Preset G"})

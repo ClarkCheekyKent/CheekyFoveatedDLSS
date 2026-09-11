@@ -51,6 +51,20 @@ struct GazeDiagnostics {
     std::array<GazeViewDiagnostics, 2U> views{};
 };
 
+// Pin a crop for one interception so NR and SR consume the same gaze sample.
+struct ScopedCoordinatedCrop {
+    DlssViewId view_id{};
+    CropGeometry crop{};
+    bool reset{};
+    FoveationCenter center{};
+    bool has_center{};
+    const ScopedCoordinatedCrop* previous{};
+    ScopedCoordinatedCrop(DlssViewId view, const CropGeometry& value, bool reset_history,
+        const FoveationCenter* resolved_center = nullptr) noexcept;
+    ~ScopedCoordinatedCrop();
+    ScopedCoordinatedCrop(const ScopedCoordinatedCrop&) = delete;
+};
+
 [[nodiscard]] bool calculate_coordinated_crop(
     const Settings& settings,
     DlssViewId view_id,

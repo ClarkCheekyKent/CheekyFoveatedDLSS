@@ -182,6 +182,13 @@ void update_diagnostics_view(
 
 }  // namespace
 
+thread_local const ScopedCoordinatedCrop* coordinated_crop_override{};
+ScopedCoordinatedCrop::ScopedCoordinatedCrop(DlssViewId view, const CropGeometry& value,
+    bool reset_history, const FoveationCenter* resolved_center) noexcept : view_id(view), crop(value), reset(reset_history),
+    center(resolved_center ? *resolved_center : FoveationCenter{}), has_center(resolved_center != nullptr),
+    previous(coordinated_crop_override) { coordinated_crop_override = this; }
+ScopedCoordinatedCrop::~ScopedCoordinatedCrop() { coordinated_crop_override = previous; }
+
 bool calculate_coordinated_crop(
     const Settings& settings,
     const DlssViewId view_id,
@@ -197,6 +204,14 @@ bool calculate_coordinated_crop(
     const CheekyGazeSnapshotV1* supplied_snapshot,
     FoveationCenter* resolved_center
 ) noexcept {
+    if (coordinated_crop_override && coordinated_crop_override->view_id == view_id && view_id != 0U) {
+        crop = coordinated_crop_override->crop;
+        reset_history = coordinated_crop_override->reset;
+        if (resolved_center) *resolved_center = coordinated_crop_override->has_center
+            ? coordinated_crop_override->center
+            : foveation_center_from_geometry(crop, render_width, render_height);
+        return true;
+    }
     reset_history = false;
     const auto fixed_settings = settings_for_view(settings, view_id);
     if (resolved_center) *resolved_center = fixed_center(fixed_settings, render_width, render_height);

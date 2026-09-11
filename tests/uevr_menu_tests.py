@@ -21,12 +21,17 @@ baseline = json.loads(baseline_path.read_text())
 assert baseline['eye_calibration']['backend'] == 'Waiting for VR'
 assert not baseline['eye_calibration']['active']
 assert 'corrections' in baseline['eye_calibration']
+assert baseline['settings']['NrProcessingOrder'] in (0, 1)
+assert baseline['setting_groups']['NrProcessingOrder'] == 'nr'
 bundles = list((baseline_path.parent / "support").glob("*.zip"))
 assert bundles, "Native host test must produce a support ZIP"
 with zipfile.ZipFile(max(bundles, key=lambda p: p.stat().st_mtime)) as bundle:
     assert bundle.testzip() is None, "Corrupt support ZIP"
     assert {"diagnostics.json", "settings.ini", "issue-report.md", "README.txt", "CheekyFoveatedDLSS-UEVR.log"} <= set(bundle.namelist())
     assert json.loads(bundle.read("diagnostics.json")) == baseline
+    saved_settings = bundle.read("settings.ini").decode()
+    assert "NrProcessingOrder=" + str(baseline["settings"]["NrProcessingOrder"]) in saved_settings
+    assert "SchemaVersion=1" in saved_settings
     assert all("/" not in name and "\\" not in name for name in bundle.namelist())
 
 
@@ -224,6 +229,40 @@ def run(engine):
     assert g.combos["Simulation pattern"][0] == "Figure eight (8 s)"
     assert g.combos["Simulation pattern"][5] == "Hold center"
     assert g.combos["DLSS-NR preset"][7] == "Preset G"
+    # Rendering order follows the same immediate apply and acknowledgement
+    # flow as the existing selectors, while preserving working scale.
+    state["settings"].update(NrProcessingOrder=0, NrWorkingScale=0.37)
+    receive(state)
+    draw()
+    assert g.combos["Rendering order"][0] == "After upscaling"
+    assert g.combos["Rendering order"][1] == "Before upscaling"
+    assert g["values"]["Rendering order"] == 0
+    count = len(g.sent)
+    draw(changes={"Rendering order": 1})
+    assert len(g.sent) == count + 1 and "NrProcessingOrder=1" in last()
+    assert "NrWorkingScale=" not in last()
+    order_request = int(last().splitlines()[1])
+    draw(changes={"Rendering order": 0})  # New edit while the first is in flight.
+    assert len(g.sent) == count + 1
+    state["request"] = state["applied_request"] = order_request
+    state["settings"]["NrProcessingOrder"] = 1
+    receive(state)
+    draw()
+    assert len(g.sent) == count + 2 and "NrProcessingOrder=0" in last()
+    assert g["values"]["Rendering order"] == 0, "Older ack overwrote a newer order draft"
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["NrProcessingOrder"] = 0
+    receive(state)
+    draw()
+    assert len(g.sent) == count + 2 and abs(g["values"]["NR working scale"] - 0.37) < 0.0001
+    draw(changes={"Rendering order": 1})
+    state["request"] = int(last().splitlines()[1])  # Rejected: applied_request stays old.
+    receive(state)
+    draw("Apply changes##bottom")
+    assert "NrProcessingOrder=1" in last(), "Rejected order draft could not be retried"
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["NrProcessingOrder"] = 1
+    receive(state)
     # A reset clears only its group's held edits; unrelated drafts survive its acknowledgement.
     g.active_label = "Gaze smoothing (ms)"
     draw(changes={"Gaze smoothing (ms)": 35})
@@ -232,10 +271,12 @@ def run(engine):
     assert len(g.sent) == count + 1 and last().endswith("\ndefaults_nr")
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["NrEnabled"] = False
+    state["settings"]["NrProcessingOrder"] = 0
     receive(state)
     g.active_label = None
     draw()
     assert "GazeSmoothingMs=35" in last(), "Unrelated held edit was lost by group reset"
+    assert "NrProcessingOrder=" not in last(), "NR reset resurrected the rendering order draft"
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["GazeSmoothingMs"] = 35
     receive(state)
@@ -268,6 +309,29 @@ def run(engine):
     state["settings"]["AutoStereoAlignment"] = False
     receive(state)
     draw()  # Simulation and manual alignment branches.
+    # Reaching an older runtime must remove unsupported queued edits, including
+    # a newer draft waiting for an outstanding selector acknowledgement.
+    state["renderer"] = 1
+    state["settings"].update(NrEnabled=True, NrProcessingOrder=0)
+    receive(state)
+    draw()
+    assert g["values"]["Rendering order"] == 0, "NR defaults did not reset the selector"
+    draw(changes={"Rendering order": 1})
+    order_request = int(last().splitlines()[1])
+    draw(changes={"Rendering order": 0})
+    older = copy.deepcopy(state)
+    older["settings"].pop("NrProcessingOrder")
+    older["setting_groups"].pop("NrProcessingOrder")
+    older["request"] = older["applied_request"] = 0  # A freshly connected older runtime.
+    receive(older)
+    count = len(g.sent)
+    draw("Apply changes##bottom", changes={"Rendering order": 1})
+    g.changes["Rendering order"] = None  # No such widget existed in this draw.
+    g.callbacks.on_frame()
+    assert len(g.sent) == count, "Older runtime received an unsupported rendering-order setting"
+    assert g["values"]["Rendering order"] is None
+    assert not any("Waiting for settings acknowledgement" in t for t in g.drawn.values()), "Unsupported in-flight order blocked reconnect"
+    assert any("Rendering order: Unavailable in this runtime" in t for t in g.drawn.values())
     receive({"protocol": 999, "settings": {}})
     draw()
     assert any("version mismatch" in t for t in g.drawn.values())
@@ -278,6 +342,12 @@ def run(engine):
         g.callbacks.on_frame()
     draw()
     assert any("Waiting" in t for t in g.drawn.values()), "Stale host must show disconnected"
+    state["settings"].update(NrProcessingOrder=1, NrWorkingScale=0.37)
+    receive(state)
+    count = len(g.sent)
+    draw()
+    assert g["values"]["Rendering order"] == 1 and g["values"]["NR working scale"] == 0.37
+    assert len(g.sent) == count, "Reconnect resent a discarded rendering-order edit"
     print(engine + ": menu, protocol, drafts, acknowledgements, slider release and reconnect passed")
 
 
