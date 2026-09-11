@@ -201,14 +201,24 @@ local function nr_diagnostics(d)
         {"State", status.nr}, {"Route", n.route or "Unknown"},
         {"Candidate / evaluated / failed", string.format("%d / %d / %d", n.candidates or 0, n.evaluations or 0, n.failures or 0)},
         {"Last result", result(n.result)}, {"SR output", size(n.output_width, n.output_height)},
+        {"NR processing size", size(n.processing_width, n.processing_height)},
+        {"Skip reason", n.skip_reason or ""},
         {"NR region", size(n.region_width, n.region_height)},
         {"Region origin", string.format("%d,%d", n.region_x or 0, n.region_y or 0)},
         {"NR working size", size(n.working_width, n.working_height)},
         {"Intermediate VRAM", string.format("%.1f MiB", (n.vram_bytes or 0) / 1048576)}
     })
     section("DLSS-NR GPU timing (250 ms average)")
-    rows("nr_timing", {{"Full NR call", timing(d.nr_full_ms)}, {"Foveated NR call", timing(d.nr_foveated_ms)},
-        {"Foveated savings", saving(d.nr_full_ms, d.nr_foveated_ms)}})
+    rows("nr_timing", {
+        {"Before: full NR + preparation", timing(d.before_nr_full_ms)},
+        {"Before: foveated NR + preparation", timing(d.before_nr_foveated_ms)},
+        {"Before: total intercepted pipeline", timing(d.before_pipeline_ms)},
+        {"After: full NR call", timing(d.nr_full_ms)},
+        {"After: foveated NR call", timing(d.nr_foveated_ms)},
+        {"After: foveated savings", saving(d.nr_full_ms, d.nr_foveated_ms)},
+        {"After: total intercepted pipeline", timing(d.after_pipeline_ms)}
+    })
+    text("Samples are retained when a mode is disabled; compare timings from the same processing order.")
 end
 
 uevr.sdk.callbacks.on_draw_ui(function()

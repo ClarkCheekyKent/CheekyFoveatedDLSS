@@ -23,6 +23,10 @@ assert not baseline['eye_calibration']['active']
 assert 'corrections' in baseline['eye_calibration']
 assert baseline['settings']['NrProcessingOrder'] in (0, 1)
 assert baseline['setting_groups']['NrProcessingOrder'] == 'nr'
+assert {'processing_order', 'processing_width', 'processing_height', 'skip_reason'} <= baseline['nr_details'].keys()
+for api in baseline['apis']:
+    assert {'before_nr_full_ms', 'before_nr_foveated_ms', 'before_pipeline_ms',
+            'after_pipeline_ms', 'nr_full_ms', 'nr_foveated_ms'} <= api.keys()
 bundles = list((baseline_path.parent / "support").glob("*.zip"))
 assert bundles, "Native host test must produce a support ZIP"
 with zipfile.ZipFile(max(bundles, key=lambda p: p.stat().st_mtime)) as bundle:

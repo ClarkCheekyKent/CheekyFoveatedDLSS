@@ -107,6 +107,9 @@ std::string snapshot_locked(State& s) {
         << "\"route\":\"" << json_escape(dlss_nr_route_name(nr.route)) << "\",\"candidates\":" << nr.candidate_calls
         << ",\"evaluations\":" << nr.evaluation_calls << ",\"failures\":" << nr.failed_calls << ",\"result\":" << nr.last_result
         << ",\"output_width\":" << nr.output_width << ",\"output_height\":" << nr.output_height
+        << ",\"processing_order\":" << static_cast<unsigned>(nr.processing_order)
+        << ",\"processing_width\":" << nr.processing_width << ",\"processing_height\":" << nr.processing_height
+        << ",\"skip_reason\":\"" << json_escape(nr.skip_reason ? nr.skip_reason : "") << "\""
         << ",\"region_width\":" << nr.region_width << ",\"region_height\":" << nr.region_height
         << ",\"region_x\":" << nr.region_base_x << ",\"region_y\":" << nr.region_base_y
         << ",\"working_width\":" << nr.working_width << ",\"working_height\":" << nr.working_height
@@ -124,6 +127,10 @@ std::string snapshot_locked(State& s) {
             << ",\"direct_detour\":" << d.direct_detour_installed << ",\"has_private_result\":" << d.has_private_result
             << ",\"private_result\":" << d.last_private_result << ",\"nr_full_ms\":" << d.full_dlss_nr_gpu_ms
             << ",\"nr_foveated_ms\":" << d.foveated_dlss_nr_gpu_ms
+            << ",\"before_nr_full_ms\":" << d.before_full_nr_gpu_ms
+            << ",\"before_nr_foveated_ms\":" << d.before_foveated_nr_gpu_ms
+            << ",\"before_pipeline_ms\":" << d.before_pipeline_gpu_ms
+            << ",\"after_pipeline_ms\":" << d.after_pipeline_gpu_ms
             << ",\"motion_width\":" << d.motion_vector_width << ",\"motion_height\":" << d.motion_vector_height
             << ",\"motion_space\":\"" << motion_vector_space_name(d.motion_vector_space)
             << "\",\"execution_path\":\"" << json_escape(d3d11_execution_path_name(d.d3d11_execution_path))
