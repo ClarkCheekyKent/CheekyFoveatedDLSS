@@ -3,6 +3,7 @@
 #include "mock_ngx_parameters.hpp"
 #include <iostream>
 #include <stdexcept>
+#include <cmath>
 
 namespace cheeky::foveated_dlss {
 // Test executable substitutes the NVIDIA evaluator; production copy/orchestration
@@ -60,6 +61,39 @@ int run_nr_processing_tests() {
         const auto require = [](bool value, const char* why) {
             if (!value) throw std::runtime_error(why);
         };
+        // A stored vector representing 12 render pixels must reproject the
+        // same scene displacement for either guide resolution and NR order.
+        for (auto processing : {1815U, 3024U}) {
+            for (auto guide : {1815U, 3024U}) {
+                for (auto region : {processing, 960U}) {
+                    const auto rect = scale_subrect(0U, region, 0U, guide, processing);
+                    for (float working_scale : {1.0F, 0.5F}) {
+                        const auto working = scaled_extent(region, working_scale);
+                        const auto axis = dlss_nr_motion_axis(
+                            dlss_nr_ngx_motion_uv_scale(1.0F, 1815U),
+                            processing, region, rect.extent);
+                        const float actual_working_motion = 12.0F * axis.runtime_scale /
+                            rect.extent * working;
+                        const float expected = 12.0F / 1815.0F * processing / region * working;
+                        require(std::abs(actual_working_motion - expected) < 0.0001F,
+                            "NR motion changed with processing order, guide size or working scale");
+                    }
+                }
+            }
+        }
+        const auto sl = dlss_nr_motion_axis(-1.0F, 3024U, 960U, 1601U);
+        require(std::abs(0.01F * sl.runtime_scale / 1601.0F - (-0.0315F)) < 0.000001F,
+            "Streamline normalized motion lost sign or crop normalization");
+        const auto native = dlss_nr_motion_axis(dlss_nr_ngx_motion_uv_scale(1.0F, 1815U),
+            1815U, 960U, 1601U);
+        DlssNrHistory previous{80U, 160U, 960U, 904U, 3024U, 2836U, 480U, 452U,
+            native.processing_pixel_scale, -1.0F};
+        auto current = previous;
+        current.x += 8U;
+        float dx{}, dy{};
+        require(dlss_nr_motion_offset(previous, current, dx, dy) &&
+            std::abs(dx * native.runtime_scale / 1601.0F - 8.0F / 960.0F) < 0.000001F,
+            "Moving NR crop does not reproject a stationary scene point");
         {
             MockNgxParameters missing;
             { NgxNrInputSubstitution unchanged(&missing, nullptr, nullptr, true); }

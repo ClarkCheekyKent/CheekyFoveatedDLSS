@@ -7,6 +7,7 @@
 #include <vector>
 #include <stdexcept>
 #include <cstdio>
+#include <cmath>
 using namespace cheeky::foveated_dlss;
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -29,6 +30,8 @@ struct SrInput { ID3D12Resource* color{}; unsigned reset{}; };
 std::vector<SrInput> sr_inputs;
 std::string evaluation_order;
 unsigned nr_reset{};
+float nr_motion_x{};
+unsigned nr_motion_width{};
 void observe_sr(const NgxParameters* params) {
     evaluation_order += 'S';
     SrInput input;
@@ -39,6 +42,8 @@ void observe_sr(const NgxParameters* params) {
 void observe_nr(const NgxParameters* params) {
     evaluation_order += 'N';
     params->Get("DLSSNR.Reset", &nr_reset);
+    params->Get("DLSSNR.MVecScaleX", &nr_motion_x);
+    params->Get("DLSSNR.MVecSubrectWidth", &nr_motion_width);
 }
 struct FrameToken : SlFrameToken {
     unsigned index{};
@@ -151,6 +156,8 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         "After NR replaced original SR color");
     require(sr_inputs[0].reset == 7, "After NR region jump changed the host SR reset");
     require(evaluation_order == "SN" && nr_reset == 1, "After NR lost post-SR placement or history reset");
+    require(std::abs(nr_motion_x - (f.use_sl ? 128.F : 1.F)) < 0.00001F,
+        "After foveated NR used incorrect guide-pixel motion units");
     for (unsigned i = 0; i < 3; ++i) {
         evaluate(0);
         require(sr_inputs.size() == 1 && sr_inputs[0].reset == 0, "Repeated After frame reset SR");
@@ -189,6 +196,8 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     evaluate(0);
     expect_input(true, 1, "First successful Before substitution did not reset SR");
     require(evaluation_order == "NS", "Before NR did not run before SR exactly once");
+    require(std::abs(nr_motion_x / nr_motion_width - (f.use_sl ? 1.F : 1.F / 128.F)) < 0.000001F,
+        "NR hook did not convert original motion units to the runtime convention");
     evaluate(0);
     expect_input(true, 0, "Stable successful Before substitution reset SR");
     if (!f.use_sl) {
@@ -283,6 +292,8 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         command(setting.c_str());
         evaluate(0);
         require(evaluation_order == "NS", "Settings churn failed to run Before NR");
+        require(std::abs(nr_motion_x - (f.use_sl ? 128.F : 1.F)) < 0.00001F,
+            "Changing NR working resolution changed motion displacement");
         require(nr_creates() - nr_releases() <= warm_live,
             "Settings churn accumulated retired NVIDIA features");
     }

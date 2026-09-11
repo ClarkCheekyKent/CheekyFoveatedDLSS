@@ -1742,7 +1742,8 @@ bool evaluate_d3d11_via_d3d12(
             slot.nr_depth.resource12, slot.nr_motion_vectors.resource12,
             render_width, render_height, out_width, out_height,
             0U, 0U, render_width, render_height, 0U, 0U, nr_motion_width, nr_motion_height,
-            contract.motion_vector_scale_x, contract.motion_vector_scale_y,
+            dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_x, render_width),
+            dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_y, render_height),
             contract.depth_inverted, contract.reset, contract.create_flags};
         nr_frame.reset = nr_frame.reset || !dlss_nr_input_history_compatible(contract.view_id,
             settings.nr_processing_order, true, render_width, render_height);
@@ -2070,8 +2071,8 @@ bool evaluate_d3d11_via_d3d12(
                 0U,
                 nr_mv_region_x.extent,
                 nr_mv_region_y.extent,
-                contract.motion_vector_scale_x,
-                contract.motion_vector_scale_y,
+                dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_x, render_width),
+                dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_y, render_height),
                 contract.depth_inverted,
                 contract.reset,
                 contract.create_flags,

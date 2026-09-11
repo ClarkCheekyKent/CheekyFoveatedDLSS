@@ -48,9 +48,9 @@ struct DlssNrFrame {
     std::uint32_t motion_base_y{};
     std::uint32_t motion_width{};
     std::uint32_t motion_height{};
-    // Stored motion vectors to full-output pixels (before NR working scaling).
-    float motion_scale_x{1.0F};
-    float motion_scale_y{1.0F};
+    // Stored vectors to current-to-previous UV displacement over the full view.
+    float motion_uv_scale_x{1.0F};
+    float motion_uv_scale_y{1.0F};
     bool depth_inverted{};
     bool reset{};
     std::uint32_t create_flags{};

@@ -72,7 +72,29 @@ struct DlssNrHistory {
     float scale_x{}, scale_y{};
 };
 
-// Scales convert stored vectors to output pixels before NR working scaling.
+// NGX scales convert stored vectors to render pixels, independently of the
+// resolution of the motion texture. Streamline scales already produce UVs.
+[[nodiscard]] inline float dlss_nr_ngx_motion_uv_scale(float scale,
+    std::uint32_t render_extent) noexcept {
+    return render_extent ? scale / static_cast<float>(render_extent) : 0.0F;
+}
+
+struct DlssNrMotionAxis {
+    float processing_pixel_scale{};
+    float runtime_scale{};
+};
+
+// NR divides MVecScale by the declared motion subrect extent. Color working
+// resolution must not affect the resulting normalized history displacement.
+[[nodiscard]] inline DlssNrMotionAxis dlss_nr_motion_axis(float uv_scale,
+    std::uint32_t processing_extent, std::uint32_t region_extent,
+    std::uint32_t motion_extent) noexcept {
+    const float pixels = uv_scale * static_cast<float>(processing_extent);
+    return {pixels, region_extent ? pixels * static_cast<float>(motion_extent) /
+        static_cast<float>(region_extent) : 0.0F};
+}
+
+// Scales convert stored vectors to processing pixels (the crop-origin units).
 // Returns false when history cannot be reprojected safely.
 [[nodiscard]] bool dlss_nr_motion_offset(const DlssNrHistory& previous,
     const DlssNrHistory& current, float& x, float& y) noexcept;

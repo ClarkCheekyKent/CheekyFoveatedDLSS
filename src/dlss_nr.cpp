@@ -1447,11 +1447,17 @@ bool evaluate_dlss_nr(
         view.reset_generation != reset_generation ? "requested" :
         view.history_route != frame.route ? "route" : nullptr;
     bool reset = reset_reason != nullptr;
+    const auto motion_scale_x = dlss_nr_motion_axis(
+        frame.motion_uv_scale_x * settings.nr_motion_scale_x_multiplier,
+        processing_width, region.width, motion_x.extent);
+    const auto motion_scale_y = dlss_nr_motion_axis(
+        frame.motion_uv_scale_y * settings.nr_motion_scale_y_multiplier,
+        processing_height, region.height, motion_y.extent);
     const DlssNrHistory history{
         region.base_x, region.base_y, region.width, region.height,
         frame.output_width, frame.output_height, working_width, working_height,
-        frame.motion_scale_x * settings.nr_motion_scale_x_multiplier,
-        frame.motion_scale_y * settings.nr_motion_scale_y_multiplier,
+        motion_scale_x.processing_pixel_scale,
+        motion_scale_y.processing_pixel_scale,
     };
     auto* motion_vectors = frame.motion_vectors;
     auto motion_base_x = motion_x.base;
@@ -1461,8 +1467,8 @@ bool evaluate_dlss_nr(
         reset = !dlss_nr_motion_offset(view.history, history, offset.x, offset.y);
         if (reset) reset_reason = "incompatible-geometry-or-scale";
         if (!reset && (offset.x != 0.0F || offset.y != 0.0F)) {
-            // Working scaling multiplies both the origin displacement and MV
-            // scale, so it cancels when computing the stored-vector offset.
+            // Crop origins and history scales use processing pixels. The
+            // correction remains in stored-vector units at every working size.
             auto* corrected = !frame.motion_vectors_3d &&
                 frame.motion_state != static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU)
                 ? prepare_crop_motion12(frame.command_list, frame.motion_vectors,
@@ -1507,16 +1513,16 @@ bool evaluate_dlss_nr(
             static_cast<unsigned long long>(view.history_compensation_failures));
         trace_event("DLSS-NR inputs view=%llu flags=0x%X output=%ux%u@%u,%u "
             "mvTexture=%llux%u format=%u state=0x%X mvRect=%ux%u@%u,%u "
-            "mvScale=%.6f,%.6f nrScale=%.6f,%.6f depthRect=%ux%u@%u,%u "
+            "mvUvScale=%.9f,%.9f nrScale=%.6f,%.6f depthRect=%ux%u@%u,%u "
             "resolvedCenter=%s center=%.6f,%.6f",
             static_cast<unsigned long long>(frame.view_id), frame.create_flags,
             frame.output_width, frame.output_height, frame.color_base_x, frame.color_base_y,
             static_cast<unsigned long long>(motion_desc.Width), motion_desc.Height,
             static_cast<unsigned>(motion_desc.Format), static_cast<unsigned>(frame.motion_state),
             motion_x.extent, motion_y.extent, motion_x.base, motion_y.base,
-            frame.motion_scale_x, frame.motion_scale_y,
-            history.scale_x * working_width / region.width,
-            history.scale_y * working_height / region.height,
+            frame.motion_uv_scale_x, frame.motion_uv_scale_y,
+            motion_scale_x.runtime_scale,
+            motion_scale_y.runtime_scale,
             depth_x.extent, depth_y.extent, depth_x.base, depth_y.base,
             frame.has_center ? "yes" : "no", frame.center.u, frame.center.v);
     }
@@ -1574,13 +1580,11 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.MVecSubrectHeight", motion_y.extent);
     parameters->Set(
         "DLSSNR.MVecScaleX",
-        frame.motion_scale_x * settings.nr_motion_scale_x_multiplier *
-            static_cast<float>(working_width) / region.width
+        motion_scale_x.runtime_scale
     );
     parameters->Set(
         "DLSSNR.MVecScaleY",
-        frame.motion_scale_y * settings.nr_motion_scale_y_multiplier *
-            static_cast<float>(working_height) / region.height
+        motion_scale_y.runtime_scale
     );
     const bool depth_inverted = settings.nr_depth_convention == 1U
         ? false
