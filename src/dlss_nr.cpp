@@ -6,6 +6,7 @@
 #include "d3d12_output_contract.hpp"
 #include "dlss_nr_contract.hpp"
 #include "crop_motion.hpp"
+#include "nr_guides.hpp"
 #include "runtime.hpp"
 #include "runtime_search.hpp"
 
@@ -91,6 +92,7 @@ struct FeatureKey {
 }
 
 struct GpuResources {
+    NrGuidePass guides;
     NrLifetime uses;
     std::uint64_t last_use{};
     ID3D12Resource* game_output{};
@@ -130,6 +132,7 @@ struct ViewState {
     std::uint64_t settings_signature{};
     std::uint64_t reset_generation{};
     DlssNrHistory history{};
+    float jitter_uv_x{}, jitter_uv_y{};
     DlssNrRoute history_route{};
     std::uint64_t history_calls{}, history_moves{}, history_resets{};
     std::uint64_t history_corrections{}, history_compensation_failures{};
@@ -1101,7 +1104,9 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     for (auto& gpu : view.gpu_resources) {
         if (gpu.game_output == frame.color && gpu.width == region.width &&
             gpu.height == region.height && gpu.working_width == working_width &&
-            gpu.working_height == working_height) {
+            gpu.working_height == working_height &&
+            gpu.guides.source_motion.Get() == frame.motion_vectors &&
+            gpu.guides.source_depth.Get() == frame.depth) {
             if (!gpu.uses.record(frame.command_list)) return nullptr;
             gpu.last_use = ++view.gpu_use_sequence;
             return &gpu;
@@ -1132,7 +1137,8 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             working_width,
             working_height,
             gpu
-        )) {
+        ) || !gpu.guides.initialize(frame.motion_vectors, frame.depth, working_width, working_height)) {
+        release_gpu(gpu);
         view.gpu_resources.pop_back();
         return nullptr;
     }
@@ -1310,7 +1316,11 @@ bool evaluate_dlss_nr(
         frame.input_height == 0U || frame.output_width == 0U ||
         frame.output_height == 0U || frame.depth_width == 0U ||
         frame.depth_height == 0U || frame.motion_width == 0U ||
-        frame.motion_height == 0U) {
+        frame.motion_height == 0U || !std::isfinite(frame.jitter_uv_x) ||
+        !std::isfinite(frame.jitter_uv_y) || !std::isfinite(frame.motion_uv_scale_x) ||
+        !std::isfinite(frame.motion_uv_scale_y) || frame.motion_vectors_3d ||
+        frame.motion_state == static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU) ||
+        frame.depth_state == static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU)) {
         diagnostics.state = DlssNrState::unsupported_resources;
         ++diagnostics.failed_calls;
         return false;
@@ -1318,7 +1328,8 @@ bool evaluate_dlss_nr(
     const auto guide_valid = [](ID3D12Resource* resource, std::uint32_t x, std::uint32_t y,
         std::uint32_t width, std::uint32_t height) noexcept {
         const auto desc = resource->GetDesc();
-        return desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1U &&
+        return !(desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) &&
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1U &&
             desc.SampleDesc.Count == 1U && x <= desc.Width && width <= desc.Width - x &&
             y <= desc.Height && height <= desc.Height - y;
     };
@@ -1438,6 +1449,13 @@ bool evaluate_dlss_nr(
         signature ^= dimension;
         signature *= 1099511628211ULL;
     }
+    signature ^= frame.motion_vectors_jittered ? 1U : 0U;
+    for (const auto dimension : {frame.motion_full_width, frame.motion_full_height,
+            frame.depth_full_width, frame.depth_full_height, frame.motion_copy_x,
+            frame.motion_copy_y, frame.depth_copy_x, frame.depth_copy_y}) {
+        signature *= 1099511628211ULL;
+        signature ^= dimension;
+    }
     const auto reset_generation = requested_reset_generation.load(
         std::memory_order_acquire
     );
@@ -1459,36 +1477,43 @@ bool evaluate_dlss_nr(
         motion_scale_x.processing_pixel_scale,
         motion_scale_y.processing_pixel_scale,
     };
-    auto* motion_vectors = frame.motion_vectors;
-    auto motion_base_x = motion_x.base;
-    auto motion_base_y = motion_y.base;
     CropMotionOffset offset{};
     if (!reset) {
+        // Validate overlap and geometry before using any previous-frame data.
         reset = !dlss_nr_motion_offset(view.history, history, offset.x, offset.y);
         if (reset) reset_reason = "incompatible-geometry-or-scale";
-        if (!reset && (offset.x != 0.0F || offset.y != 0.0F)) {
-            // Crop origins and history scales use processing pixels. The
-            // correction remains in stored-vector units at every working size.
-            auto* corrected = !frame.motion_vectors_3d &&
-                frame.motion_state != static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU)
-                ? prepare_crop_motion12(frame.command_list, frame.motion_vectors,
-                    motion_x.base, motion_y.base, motion_x.extent, motion_y.extent,
-                    offset, frame.motion_state) : nullptr;
-            if (corrected) {
-                motion_vectors = corrected;
-                motion_base_x = motion_base_y = 0U;
-            } else {
-                reset = true;
-                reset_reason = "compensation-unavailable";
-            }
-        }
     }
+    const bool before = settings.nr_processing_order == NrProcessingOrder::before_upscaling;
+    const float jitter_x = dlss_nr_jitter_delta(view.jitter_uv_x, frame.jitter_uv_x,
+        before, frame.motion_vectors_jittered, reset);
+    const float jitter_y = dlss_nr_jitter_delta(view.jitter_uv_y, frame.jitter_uv_y,
+        before, frame.motion_vectors_jittered, reset);
+    offset.x = reset ? 0.0F : (static_cast<float>(region.base_x) - view.history.x + jitter_x * processing_width) / region.width;
+    offset.y = reset ? 0.0F : (static_cast<float>(region.base_y) - view.history.y + jitter_y * processing_height) / region.height;
+    const NrGuideConstants guide_constants{
+        {working_width, working_height}, {region.base_x, region.base_y},
+        {region.width, region.height}, {processing_width, processing_height},
+        {frame.motion_full_width ? frame.motion_full_width : frame.motion_width,
+         frame.motion_full_height ? frame.motion_full_height : frame.motion_height},
+        {frame.depth_full_width ? frame.depth_full_width : frame.depth_width,
+         frame.depth_full_height ? frame.depth_full_height : frame.depth_height},
+        {static_cast<float>(frame.motion_base_x) - frame.motion_copy_x,
+         static_cast<float>(frame.motion_base_y) - frame.motion_copy_y},
+        {static_cast<float>(frame.depth_base_x) - frame.depth_copy_x,
+         static_cast<float>(frame.depth_base_y) - frame.depth_copy_y},
+        {motion_scale_x.processing_pixel_scale / region.width,
+         motion_scale_y.processing_pixel_scale / region.height},
+        {offset.x, offset.y}
+    };
+    gpu->guides.dispatch(frame.command_list, guide_constants, frame.motion_state, frame.depth_state);
+    auto* motion_vectors = gpu->guides.motion.Get();
     const bool moved = view.was_enabled &&
         (view.history.x != history.x || view.history.y != history.y);
     ++view.history_calls;
     if (moved) ++view.history_moves;
     if (reset) ++view.history_resets;
-    if (motion_vectors != frame.motion_vectors) ++view.history_corrections;
+    const bool corrected = offset.x != 0.0F || offset.y != 0.0F;
+    if (corrected) ++view.history_corrections;
     const bool compensation_failed = reset_reason != nullptr &&
         std::strcmp(reset_reason, "compensation-unavailable") == 0;
     if (compensation_failed) ++view.history_compensation_failures;
@@ -1504,15 +1529,19 @@ bool evaluate_dlss_nr(
             static_cast<unsigned long long>(frame.view_id), region.width, region.height,
             region.base_x, region.base_y, view.history.x, view.history.y,
             working_width, working_height, offset.x, offset.y,
-            motion_vectors != frame.motion_vectors ? "yes" : "no", reset ? "yes" : "no",
+            corrected ? "yes" : "no", reset ? "yes" : "no",
             reset_reason != nullptr ? reset_reason : "none",
             static_cast<unsigned long long>(view.history_calls),
             static_cast<unsigned long long>(view.history_moves),
             static_cast<unsigned long long>(view.history_resets),
             static_cast<unsigned long long>(view.history_corrections),
             static_cast<unsigned long long>(view.history_compensation_failures));
+        trace_event("DLSS-NR guides view=%llu size=%ux%u before=%s mvJittered=%s jitterUV=%.9f,%.9f jitterDeltaUV=%.9f,%.9f",
+            static_cast<unsigned long long>(frame.view_id), working_width, working_height,
+            before ? "yes" : "no", frame.motion_vectors_jittered ? "yes" : "no",
+            frame.jitter_uv_x, frame.jitter_uv_y, jitter_x, jitter_y);
         trace_event("DLSS-NR inputs view=%llu flags=0x%X output=%ux%u@%u,%u "
-            "mvTexture=%llux%u format=%u state=0x%X mvRect=%ux%u@%u,%u "
+            "mvTexture=%llux%u format=%u state=0x%X sourceMvRect=%ux%u@%u,%u "
             "mvUvScale=%.9f,%.9f nrScale=%.6f,%.6f depthRect=%ux%u@%u,%u "
             "resolvedCenter=%s center=%.6f,%.6f",
             static_cast<unsigned long long>(frame.view_id), frame.create_flags,
@@ -1521,8 +1550,8 @@ bool evaluate_dlss_nr(
             static_cast<unsigned>(motion_desc.Format), static_cast<unsigned>(frame.motion_state),
             motion_x.extent, motion_y.extent, motion_x.base, motion_y.base,
             frame.motion_uv_scale_x, frame.motion_uv_scale_y,
-            motion_scale_x.runtime_scale,
-            motion_scale_y.runtime_scale,
+            static_cast<float>(working_width),
+            static_cast<float>(working_height),
             depth_x.extent, depth_y.extent, depth_x.base, depth_y.base,
             frame.has_center ? "yes" : "no", frame.center.u, frame.center.v);
     }
@@ -1561,7 +1590,7 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.Color", gpu->color_proxy);
     parameters->Set("DLSSNR.Output", gpu->neural_output);
     parameters->Set("DLSSNR.MVec", motion_vectors);
-    parameters->Set("DLSSNR.Depth", frame.depth);
+    parameters->Set("DLSSNR.Depth", gpu->guides.depth.Get());
     parameters->Set("DLSSNR.ColorSubrectBaseX", 0U);
     parameters->Set("DLSSNR.ColorSubrectBaseY", 0U);
     parameters->Set("DLSSNR.ColorSubrectWidth", working_width);
@@ -1570,21 +1599,21 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.OutputSubrectBaseY", 0U);
     parameters->Set("DLSSNR.OutputSubrectWidth", working_width);
     parameters->Set("DLSSNR.OutputSubrectHeight", working_height);
-    parameters->Set("DLSSNR.DepthSubrectBaseX", depth_x.base);
-    parameters->Set("DLSSNR.DepthSubrectBaseY", depth_y.base);
-    parameters->Set("DLSSNR.DepthSubrectWidth", depth_x.extent);
-    parameters->Set("DLSSNR.DepthSubrectHeight", depth_y.extent);
-    parameters->Set("DLSSNR.MVecSubrectBaseX", motion_base_x);
-    parameters->Set("DLSSNR.MVecSubrectBaseY", motion_base_y);
-    parameters->Set("DLSSNR.MVecSubrectWidth", motion_x.extent);
-    parameters->Set("DLSSNR.MVecSubrectHeight", motion_y.extent);
+    parameters->Set("DLSSNR.DepthSubrectBaseX", 0U);
+    parameters->Set("DLSSNR.DepthSubrectBaseY", 0U);
+    parameters->Set("DLSSNR.DepthSubrectWidth", working_width);
+    parameters->Set("DLSSNR.DepthSubrectHeight", working_height);
+    parameters->Set("DLSSNR.MVecSubrectBaseX", 0U);
+    parameters->Set("DLSSNR.MVecSubrectBaseY", 0U);
+    parameters->Set("DLSSNR.MVecSubrectWidth", working_width);
+    parameters->Set("DLSSNR.MVecSubrectHeight", working_height);
     parameters->Set(
         "DLSSNR.MVecScaleX",
-        motion_scale_x.runtime_scale
+        static_cast<float>(working_width)
     );
     parameters->Set(
         "DLSSNR.MVecScaleY",
-        motion_scale_y.runtime_scale
+        static_cast<float>(working_height)
     );
     const bool depth_inverted = settings.nr_depth_convention == 1U
         ? false
@@ -1626,7 +1655,7 @@ bool evaluate_dlss_nr(
     diagnostics.working_height = working_height;
     diagnostics.intermediate_vram_bytes =
         static_cast<std::uint64_t>(region.width) * region.height * 8U +
-        static_cast<std::uint64_t>(working_width) * working_height * 16U;
+        static_cast<std::uint64_t>(working_width) * working_height * 28U;
     if (!ngx_succeeded(result)) {
         transition(
             frame.command_list,
@@ -1705,6 +1734,8 @@ bool evaluate_dlss_nr(
     );
     ++diagnostics.evaluation_calls;
     view.history = history;
+    view.jitter_uv_x = frame.jitter_uv_x;
+    view.jitter_uv_y = frame.jitter_uv_y;
     view.history_route = frame.route;
     view.settings_signature = signature;
     view.reset_generation = reset_generation;

@@ -1,4 +1,5 @@
 #include "crop_motion.hpp"
+#include "nr_guides.hpp"
 #include <d3d11.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -113,14 +114,15 @@ void run12() {
     ComPtr<ID3D12Device> device; check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC q{}; check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
-    const unsigned sizes[][2]{{4,3},{6,5},{8,6},{10,9},{12,7},{16,12}};
-    for (auto& size : sizes) for (const CropMotionOffset offset : {CropMotionOffset{}, CropMotionOffset{-4,-8}}) {
+    const unsigned sizes[][2]{{4,3},{6,5},{8,6},{10,9},{12,7},{16,12},{16384,3}};
+    for (bool nr : {false, true}) for (bool logged : {false,true}) for (auto& size : sizes) for (const CropMotionOffset offset : {CropMotionOffset{}, CropMotionOffset{-4,-8}}) {
+        if(!nr && (logged || size[0]>16)) continue;
         ComPtr<ID3D12CommandAllocator> allocator;
         check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
         ComPtr<ID3D12GraphicsCommandList> list;
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
         D3D12_RESOURCE_DESC desc{}; desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 2; desc.MipLevels = 1;
+        desc.Width = width; desc.Height = height; desc.DepthOrArraySize = nr ? 1 : 2; desc.MipLevels = 1;
         desc.SampleDesc.Count = 1; desc.Format = DXGI_FORMAT_R32G32_FLOAT;
         D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
         ComPtr<ID3D12Resource> source;
@@ -142,6 +144,21 @@ void run12() {
         auto* result = prepare_crop_motion12(list.Get(), source.Get(), base_x, base_y,
             crop_width, crop_height, offset, D3D12_RESOURCE_STATE_COPY_DEST, size[0], size[1]);
         require(result != nullptr, "DX12 vector pass creation failed");
+        NrGuidePass guides;
+        NrGuideConstants gc{{size[0],size[1]}, {2,1}, {4,3}, {7,5},
+            {width,height}, {width,height}, {0,0}, {0,0}, {-0.25F,0.125F}, {offset.x,offset.y}};
+        if(logged) {
+            gc.region_base[0]=392; gc.region_base[1]=24;
+            gc.processing[0]=1815; gc.processing[1]=1702;
+            gc.motion_full[0]=gc.depth_full[0]=3024; gc.motion_full[1]=gc.depth_full[1]=2836;
+            gc.motion_origin[0]=gc.depth_origin[0]=-653; gc.motion_origin[1]=gc.depth_origin[1]=-39;
+        }
+        if(nr) {
+            require(guides.initialize(source.Get(),source.Get(),size[0],size[1]), "NR guide setup failed");
+            guides.dispatch(list.Get(),gc,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_DEST);
+            result=guides.motion.Get();
+        }
+
         const auto output_desc = result->GetDesc();
         device->GetCopyableFootprints(&output_desc, 0, 1, 0, &fp, nullptr, nullptr, &bytes);
         auto readback = buffer(device.Get(), bytes, D3D12_HEAP_TYPE_READBACK);
@@ -165,7 +182,23 @@ void run12() {
         const auto waited = WaitForSingleObject(event, 10000); CloseHandle(event);
         require(waited == WAIT_OBJECT_0, "motion GPU test timed out");
         check(readback->Map(0, nullptr, reinterpret_cast<void**>(&mapped)));
-        verify(mapped + fp.Offset, fp.Footprint.RowPitch, size[0], size[1], offset);
+        if(!nr) verify(mapped + fp.Offset, fp.Footprint.RowPitch, size[0], size[1], offset);
+        else {
+            for(unsigned y=0;y<size[1];++y) for(unsigned x=0;x<size[0];++x) {
+                const auto sx=unsigned(int((2ULL*gc.region_base[0]*size[0]+(2ULL*x+1)*gc.region_size[0])*gc.motion_full[0]/(2ULL*size[0]*gc.processing[0]))+int(gc.motion_origin[0]));
+                const auto sy=unsigned(int((2ULL*gc.region_base[1]*size[1]+(2ULL*y+1)*gc.region_size[1])*gc.motion_full[1]/(2ULL*size[1]*gc.processing[1]))+int(gc.motion_origin[1]));
+                auto expected=data[sy*width+sx];
+                if(std::isfinite(expected.x) && std::isfinite(expected.y) && std::abs(expected.x)<1e15F && std::abs(expected.y)<1e15F) {
+                    expected.x=expected.x*gc.motion_scale[0]+offset.x;
+                    expected.y=expected.y*gc.motion_scale[1]+offset.y;
+                }
+                const auto actual=reinterpret_cast<Vector*>(mapped+fp.Offset+y*fp.Footprint.RowPitch)[x];
+                const auto same=[](float a,float b){return (std::isnan(a)&&std::isnan(b)) || a==b || std::abs(a-b)<0.00001F;};
+                if(!(same(actual.x,expected.x)&&same(actual.y,expected.y)))
+                    std::cerr << "guide " << size[0] << "x" << size[1] << " pixel " << x << "," << y << " source " << sx << "," << sy << " got " << actual.x << "," << actual.y << " expected " << expected.x << "," << expected.y << "\n";
+                require(same(actual.x,expected.x)&&same(actual.y,expected.y), "NR full-view guide sampling or normalized jitter/crop offset mismatch");
+            }
+        }
         readback->Unmap(0, nullptr);
         collect_crop_motion12();
     }

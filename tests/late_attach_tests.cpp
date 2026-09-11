@@ -32,6 +32,7 @@ std::string evaluation_order;
 unsigned nr_reset{};
 float nr_motion_x{};
 unsigned nr_motion_width{};
+ComPtr<ID3D12Resource> nr_motion_resource;
 void observe_sr(const NgxParameters* params) {
     evaluation_order += 'S';
     SrInput input;
@@ -44,6 +45,7 @@ void observe_nr(const NgxParameters* params) {
     params->Get("DLSSNR.Reset", &nr_reset);
     params->Get("DLSSNR.MVecScaleX", &nr_motion_x);
     params->Get("DLSSNR.MVecSubrectWidth", &nr_motion_width);
+    ID3D12Resource* mv{}; params->Get("DLSSNR.MVec", &mv); nr_motion_resource=mv;
 }
 struct FrameToken : SlFrameToken {
     unsigned index{};
@@ -81,6 +83,9 @@ struct Fixture {
         SlConstants constants{};
         constants.struct_version = 1;
         constants.motion_vector_scale = {1.F, 1.F};
+        params.Get("Jitter.Offset.X", &constants.jitter_offset.x);
+        params.Get("Jitter.Offset.Y", &constants.jitter_offset.y);
+        constants.motion_vectors_jittered = (get_ui(&params,"DLSS.Feature.Create.Flags") & 4U) != 0;
         constants.reset = static_cast<char>(get_ui(&params, "Reset"));
         require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
             &frame,&viewport,tags.data(),4,list.Get()) == 0, "Submit complete viewport tags");
@@ -156,7 +161,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         "After NR replaced original SR color");
     require(sr_inputs[0].reset == 7, "After NR region jump changed the host SR reset");
     require(evaluation_order == "SN" && nr_reset == 1, "After NR lost post-SR placement or history reset");
-    require(std::abs(nr_motion_x - (f.use_sl ? 128.F : 1.F)) < 0.00001F,
+    require(std::abs(nr_motion_x - static_cast<float>(nr_motion_width)) < 0.00001F,
         "After foveated NR used incorrect guide-pixel motion units");
     for (unsigned i = 0; i < 3; ++i) {
         evaluate(0);
@@ -196,7 +201,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     evaluate(0);
     expect_input(true, 1, "First successful Before substitution did not reset SR");
     require(evaluation_order == "NS", "Before NR did not run before SR exactly once");
-    require(std::abs(nr_motion_x / nr_motion_width - (f.use_sl ? 1.F : 1.F / 128.F)) < 0.000001F,
+    require(std::abs(nr_motion_x / nr_motion_width - 1.F) < 0.000001F,
         "NR hook did not convert original motion units to the runtime convention");
     evaluate(0);
     expect_input(true, 0, "Stable successful Before substitution reset SR");
@@ -270,6 +275,58 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         evaluate(0);
         expect_input(true, 1, "Successful tag substitution did not reset raw history");
     }
+    // Observe actual GPU-written jitter compensation through both host adapters.
+    const auto make_buffer = [&](UINT64 bytes, D3D12_HEAP_TYPE type) {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type=type;
+        D3D12_RESOURCE_DESC d{}; d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; d.Width=bytes;
+        d.Height=d.DepthOrArraySize=d.MipLevels=1; d.SampleDesc.Count=1; d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> r;
+        check(f.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,
+            type==D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,IID_PPV_ARGS(&r)), "NR jitter buffer"); return r;
+    };
+    const auto transition_resource = [&](ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
+        D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        v.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b}; f.list->ResourceBarrier(1,&v);
+    };
+    const auto motion_desc=f.textures12[2]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes{};
+    f.device->GetCopyableFootprints(&motion_desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+    auto upload=make_buffer(bytes,D3D12_HEAP_TYPE_UPLOAD);
+    void* mapped{};check(upload->Map(0,nullptr,&mapped),"Map zero motion");std::memset(mapped,0,static_cast<size_t>(bytes));upload->Unmap(0,nullptr);
+    D3D12_TEXTURE_COPY_LOCATION source{},destination{};
+    source.pResource=upload.Get();source.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;source.PlacedFootprint=fp;
+    destination.pResource=f.textures12[2].Get();destination.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    transition_resource(destination.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+    f.list->CopyTextureRegion(&destination,0,0,0,&source,nullptr);
+    transition_resource(destination.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    f.finish_gpu();
+    const auto read_motion = [&]() {
+        auto readback=make_buffer(256,D3D12_HEAP_TYPE_READBACK);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};
+        src.pResource=nr_motion_resource.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=readback.Get();dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint={DXGI_FORMAT_R32G32_FLOAT,1,1,1,256};
+        const D3D12_BOX box{0,0,0,1,1,1};
+        transition_resource(src.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        f.list->CopyTextureRegion(&dst,0,0,0,&src,&box);
+        transition_resource(src.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.finish_gpu();float* data{};check(readback->Map(0,nullptr,reinterpret_cast<void**>(&data)),"NR jitter readback");
+        const std::array<float,2> value{data[0],data[1]};readback->Unmap(0,nullptr);return value;
+    };
+    command("1\n96\nset\nEnabled=false\nNrEnabled=true\nNrFoveated=false\nNrWorkingScale=1\nNrProcessingOrder=1\nNrMotionScaleXMultiplier=-2");
+    f.params.Set("Jitter.Offset.X",0.F);f.params.Set("Jitter.Offset.Y",0.F);evaluate(1);
+    f.params.Set("Jitter.Offset.X",0.25F);f.params.Set("Jitter.Offset.Y",-0.375F);evaluate(0);
+    auto jitter_motion=read_motion();
+    require(std::abs(jitter_motion[0]+0.25F/128.F)<1e-7F && std::abs(jitter_motion[1]-0.375F/128.F)<1e-7F,
+        "Before NR lost per-view jitter or applied the user multiplier to jitter");
+    evaluate(1);jitter_motion=read_motion();
+    require(jitter_motion[0]==0.F && jitter_motion[1]==0.F,"Reset retained previous jitter");
+    command("1\n96\nset\nNrProcessingOrder=0");evaluate(0);
+    f.params.Set("Jitter.Offset.X",-0.25F);evaluate(0);jitter_motion=read_motion();
+    require(jitter_motion[0]==0.F && jitter_motion[1]==0.F,"After NR added render jitter to stabilized color");
+    f.params.Set("Jitter.Offset.X",0.F);f.params.Set("Jitter.Offset.Y",0.F);
+    command("1\n96\nset\nNrProcessingOrder=1\nNrMotionScaleXMultiplier=1");evaluate(1);
     // Exercise the production feature cache through the fake NVIDIA runtime:
     // warm two toggle states, then churn dimensions without growing live features.
     const auto nr_creates = proc<Counter>(nr, "CheekyFakeCreates");
@@ -292,7 +349,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         command(setting.c_str());
         evaluate(0);
         require(evaluation_order == "NS", "Settings churn failed to run Before NR");
-        require(std::abs(nr_motion_x - (f.use_sl ? 128.F : 1.F)) < 0.00001F,
+        require(std::abs(nr_motion_x - static_cast<float>(nr_motion_width)) < 0.00001F,
             "Changing NR working resolution changed motion displacement");
         require(nr_creates() - nr_releases() <= warm_live,
             "Settings churn accumulated retired NVIDIA features");
@@ -306,6 +363,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     proc<void(*)(void(*)(const NgxParameters*))>(f.ngx,"CheekyFakeObserve")(nullptr);
     proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserve")(nullptr);
     command("1\n97\nset\nEnabled=true\nNrEnabled=false\nPeripheralDlaa=false\nAutoStereoAlignment=false");
+    nr_motion_resource.Reset();
     puts("NR reset isolation: After jump, evaluation order, per-view transitions, fallback and restoration passed");
 }
 }

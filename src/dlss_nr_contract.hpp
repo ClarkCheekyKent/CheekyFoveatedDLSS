@@ -84,6 +84,15 @@ struct DlssNrMotionAxis {
     float runtime_scale{};
 };
 
+// Match the temporal coordinate domain of the color supplied to NR. Before
+// uses jittered render color; After uses the stabilized SR output. Jitter is
+// already a displacement, so do not apply the user's motion multiplier to it.
+[[nodiscard]] inline float dlss_nr_jitter_delta(float previous, float current,
+    bool before, bool vectors_jittered, bool reset) noexcept {
+    return reset ? 0.0F : (static_cast<int>(before) - static_cast<int>(vectors_jittered)) *
+        (previous - current);
+}
+
 // NR divides MVecScale by the declared motion subrect extent. Color working
 // resolution must not affect the resulting normalized history displacement.
 [[nodiscard]] inline DlssNrMotionAxis dlss_nr_motion_axis(float uv_scale,

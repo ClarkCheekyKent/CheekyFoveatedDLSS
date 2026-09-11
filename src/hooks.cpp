@@ -2763,6 +2763,10 @@ bool streamline_nr_frame(ID3D12GraphicsCommandList* command_list,
         false,
     };
     frame.motion_state = static_cast<D3D12_RESOURCE_STATES>(motion.resource->state);
+    frame.depth_state = static_cast<D3D12_RESOURCE_STATES>(depth.resource->state);
+    frame.jitter_uv_x = dlss_nr_ngx_motion_uv_scale(evaluation.nr_constants.jitter_offset.x, input_width);
+    frame.jitter_uv_y = dlss_nr_ngx_motion_uv_scale(evaluation.nr_constants.jitter_offset.y, input_height);
+    frame.motion_vectors_jittered = evaluation.nr_constants.motion_vectors_jittered != 0;
     frame.motion_vectors_3d = evaluation.nr_constants.motion_vectors_3d != 0;
     frame.center = evaluation.nr_center;
     frame.has_center = evaluation.has_nr_center;
@@ -4188,6 +4192,9 @@ NgxResult hook_core_create_d3d12(
         get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
         false,
     };
+    frame.jitter_uv_x = dlss_nr_ngx_motion_uv_scale(get_d3d12_parameter_float(parameters, "Jitter.Offset.X", 0.0F), input_width);
+    frame.jitter_uv_y = dlss_nr_ngx_motion_uv_scale(get_d3d12_parameter_float(parameters, "Jitter.Offset.Y", 0.0F), input_height);
+    frame.motion_vectors_jittered = (flags & (1U << 2U)) != 0U;
     return frame;
 }
 

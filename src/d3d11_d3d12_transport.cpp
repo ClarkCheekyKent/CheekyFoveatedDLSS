@@ -1745,6 +1745,9 @@ bool evaluate_d3d11_via_d3d12(
             dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_x, render_width),
             dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_y, render_height),
             contract.depth_inverted, contract.reset, contract.create_flags};
+        nr_frame.jitter_uv_x = dlss_nr_ngx_motion_uv_scale(contract.jitter_x, render_width);
+        nr_frame.jitter_uv_y = dlss_nr_ngx_motion_uv_scale(contract.jitter_y, render_height);
+        nr_frame.motion_vectors_jittered = (contract.create_flags & (1U << 2U)) != 0U;
         nr_frame.reset = nr_frame.reset || !dlss_nr_input_history_compatible(contract.view_id,
             settings.nr_processing_order, true, render_width, render_height);
         nr_frame.processing_width = render_width;
@@ -2080,6 +2083,17 @@ bool evaluate_d3d11_via_d3d12(
                 0U,
                 true,
             };
+            nr_frame.jitter_uv_x = dlss_nr_ngx_motion_uv_scale(contract.jitter_x, render_width);
+            nr_frame.jitter_uv_y = dlss_nr_ngx_motion_uv_scale(contract.jitter_y, render_height);
+            nr_frame.motion_vectors_jittered = (contract.create_flags & (1U << 2U)) != 0U;
+            nr_frame.motion_full_width = nr_motion_width;
+            nr_frame.motion_full_height = nr_motion_height;
+            nr_frame.depth_full_width = render_width;
+            nr_frame.depth_full_height = render_height;
+            nr_frame.motion_copy_x = nr_mv_region_x.base;
+            nr_frame.motion_copy_y = nr_mv_region_y.base;
+            nr_frame.depth_copy_x = nr_depth_x.base;
+            nr_frame.depth_copy_y = nr_depth_y.base;
             nr_frame.center = nr_center;
             nr_frame.has_center = has_nr_center;
             nr_frame.reset = nr_frame.reset || nr_gaze_reset;

@@ -67,6 +67,14 @@ struct DlssNrFrame {
     // Zero preserves the legacy display-resolution contract.
     std::uint32_t processing_width{};
     std::uint32_t processing_height{};
+    // Jitter in full-view UV units, with the NGX/Streamline screen-axis signs.
+    float jitter_uv_x{}, jitter_uv_y{};
+    bool motion_vectors_jittered{};
+    D3D12_RESOURCE_STATES depth_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    // A transport may copy an enclosing guide subrect into a private texture.
+    // Preserve the original full-view mapping independently of that copy.
+    std::uint32_t motion_full_width{}, motion_full_height{}, depth_full_width{}, depth_full_height{};
+    std::uint32_t motion_copy_x{}, motion_copy_y{}, depth_copy_x{}, depth_copy_y{};
 };
 
 struct DlssNrSnapshot {

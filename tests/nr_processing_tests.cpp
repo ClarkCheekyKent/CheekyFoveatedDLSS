@@ -61,6 +61,20 @@ int run_nr_processing_tests() {
         const auto require = [](bool value, const char* why) {
             if (!value) throw std::runtime_error(why);
         };
+        // A static point moves only by its raster jitter in Before color.
+        // Verify all four color/MV domain combinations, including signed axes.
+        for (bool before : {false, true}) for (bool jittered : {false, true}) {
+            const float previous_jitter = -0.25F / 1815.0F;
+            const float current_jitter = 0.375F / 1815.0F;
+            const float delta = previous_jitter - current_jitter;
+            const float supplied = jittered ? delta : 0.0F;
+            const float corrected = supplied + dlss_nr_jitter_delta(previous_jitter,
+                current_jitter, before, jittered, false);
+            require(std::abs(corrected - (before ? delta : 0.0F)) < 1e-8F,
+                "Jitter was applied twice, omitted, or retained in stabilized After color");
+            require(dlss_nr_jitter_delta(previous_jitter,current_jitter,before,jittered,true) == 0.0F,
+                "Reset reused stale jitter history");
+        }
         // A stored vector representing 12 render pixels must reproject the
         // same scene displacement for either guide resolution and NR order.
         for (auto processing : {1815U, 3024U}) {

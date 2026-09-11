@@ -50,3 +50,32 @@ Contract tests check scene displacement across processing orders, guide sizes,
 crops, working scales, signed normalized vectors, and moving crop origins.
 Native/Streamline integration tests observe the actual NR parameter calls.
 These checks do not replace an in-game visual comparison of temporal quality.
+
+## Exact guide preparation and jitter
+
+NR now receives private motion and depth textures at its working size. The
+sampling position is calculated from the full-view crop origin and pixel
+center, not by stretching an enclosing integer guide subrect. A transport copy
+retains the original full guide extent and subtracts its copied origin. Integer
+wide-product comparisons avoid floating-point floor errors at texel boundaries.
+Motion is point sampled; invalid vector sentinels are preserved.
+
+Private motion values are already normalized to the NR crop. The runtime
+MVecScale is therefore the working extent; NR divides by the identical private
+motion extent. The earlier formula above describes the original guide-domain
+conversion; it is not the scale written for the new normalized private texture.
+
+Per-view history retains the jitter of the last successful NR evaluation.
+For current-to-previous screen-axis jitter, the added UV displacement is
+`(before - motion_vectors_jittered) * (previous_jitter - current_jitter)`.
+It adds jitter for unjittered vectors with Before color, leaves already-jittered
+Before vectors alone, and removes jitter from jittered vectors with After color.
+Crop-origin displacement and jitter are independent of user motion multipliers.
+Reset/failure breaks history, and non-finite jitter is rejected rather than sent
+to the runtime. Native NGX, DX11 transport and Streamline all carry these fields.
+
+Both private guides live in the existing six-entry NR resource cache and use
+its recording/replay/fence lifetime. Source identities are included in cache
+matching so descriptors referenced by pending recordings are never rewritten.
+The guides cost 12 bytes per working pixel (RG32F motion plus R32F depth); active
+intermediate VRAM diagnostics include that cost. No new unbounded pool is used.
