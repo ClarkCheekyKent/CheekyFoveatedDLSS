@@ -1037,6 +1037,39 @@ void test_packed_alignment_coordinator(bool openvr = false) {
     frame();
     expect(gaze_diagnostics().alignment_source == (openvr ? 3U : 2U) && !gaze_diagnostics().using_gaze,
         "gaze mode uses automatic fixed fallback when tracker is unavailable");
+    // NR can push a frame beyond the gaze freshness budget. Fixed optical
+    // alignment must survive that delay and menu focus transitions, even when
+    // the stale publication still claims a valid gaze sample.
+    const auto stable_left = crops[0], stable_right = crops[1];
+    settings.x_offset = 0.6F;
+    settings.height_offset = -0.45F;
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+    for (const auto mode : {FoveationCenterMode::fixed, FoveationCenterMode::openxr_gaze}) {
+        settings.center_mode = mode;
+        for (unsigned cycle = 0; cycle < 12; ++cycle) {
+            const auto saved_flags = snapshot.status_flags;
+            snapshot.status_flags |= CHEEKY_GAZE_STATUS_GAZE_VALID;
+            if (cycle % 2) snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+            LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+            snapshot.publication_qpc = now.QuadPart - frequency.QuadPart;
+            for (unsigned i = 0; i < 2; ++i) {
+                bool reset{};
+                FoveationCenter center{};
+                expect(calculate_coordinated_crop(settings, 951U + i, nullptr,
+                    1512U, 1418U, 3024U, 2836U, 0U, 0U, crops[i], reset,
+                    openvr ? nullptr : &snapshot, &center), "delayed NR frame resolves a center");
+                const auto& stable = i ? stable_right : stable_left;
+                expect(crops[i].input_base_x == stable.input_base_x &&
+                    crops[i].input_base_y == stable.input_base_y && !reset,
+                    "delayed or unfocused frame must not jump to manual offsets or reset history");
+                expect_near(center.u, snapshot.views[i].forward_u, 0.001F,
+                    "NR receives stable optical alignment on delayed frames");
+            }
+            expect(!gaze_diagnostics().using_gaze, "stale publication cannot activate live gaze");
+            snapshot.status_flags = saved_flags;
+            frame();
+        }
+    }
     expect_near((crops[0].input_base_y + crops[0].input_height * 0.5F) / 1418.F, 0.4F, 0.004F,
         "gaze fallback retains fixed height preference");
     snapshot.status_flags |= CHEEKY_GAZE_STATUS_GAZE_VALID;

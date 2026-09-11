@@ -559,21 +559,26 @@ bool calculate_coordinated_crop(
         state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS;
     // Alignment is independent of gaze availability. The packed bridge route
     // uses the existing eye roles (and manual inversion override).
-    const bool usable = mapping_stable && snapshot.view_count == 2U &&
+    // Forward alignment describes the stereo optics, not a live gaze sample.
+    // Slow NR frames and menu focus changes must not alternate between this
+    // center and the manual offsets. Keep validating the mapping and view
+    // configuration; only gaze requires a fresh, focused publication.
+    const bool alignment_usable = mapping_stable && snapshot.view_count == 2U &&
             ((snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U || marker_match) &&
-            (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
             (snapshot.status_flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) == 0U &&
-            ((snapshot.status_flags & CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE) == 0U || marker_match) &&
+            ((snapshot.status_flags & CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE) == 0U || marker_match);
+    const bool usable = alignment_usable &&
+            (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
             snapshot.predicted_display_time != 0 && snapshot.publication_qpc != 0U &&
             now >= snapshot.publication_qpc &&
             seconds_between(now, snapshot.publication_qpc) <= gaze_stale_seconds &&
             sample_age_seconds <= gaze_stale_seconds;
     if (settings.center_mode == FoveationCenterMode::fixed)
-        return auto_crop(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
+        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     const bool source_matches =
         ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U) ==
         (settings.center_mode == FoveationCenterMode::simulated_gaze);
-    const bool snapshot_valid = source_matches &&
+    const bool snapshot_valid = usable && source_matches &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
@@ -594,7 +599,7 @@ bool calculate_coordinated_crop(
             state.next_jump_offsets = foveation_offsets_from_geometry(next_crop, render_width, render_height);
         }
     }
-    const auto fallback = aligned_center(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
+    const auto fallback = aligned_center(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     float raw_u = fallback.u;
     float raw_v = fallback.v;
     if (use_sample) {
@@ -619,7 +624,7 @@ bool calculate_coordinated_crop(
     );
     diagnostics.using_gaze = temporal_result.using_gaze;
     if (!state.temporal.has_filtered) {
-        return auto_crop(usable ? &snapshot.views[state.mapping.view_index] : nullptr);
+        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr);
     }
 
     if (resolved_center) *resolved_center = {temporal_result.center_u, temporal_result.center_v,
