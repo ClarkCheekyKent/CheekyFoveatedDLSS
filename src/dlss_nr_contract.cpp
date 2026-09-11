@@ -136,7 +136,8 @@ FoveationParameters dlss_nr_foveation_parameters(
             static_cast<float>(extent) * std::clamp(scale, 0.1F, 1.0F) + 0.5F
         )
     );
-    return (requested + 7U) / 8U * 8U;
+    // Preserve the pixel grid at scale 1 instead of stretching to an aligned size.
+    return requested;
 }
 
 [[nodiscard]] ScaledSubrect scale_subrect(

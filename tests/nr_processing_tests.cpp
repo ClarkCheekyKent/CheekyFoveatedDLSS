@@ -143,6 +143,17 @@ int run_nr_processing_tests() {
                     "Working scale uses wrong resolution");
             }
         }
+        settings.nr_foveated = false;
+        settings.nr_working_scale = 1.0F;
+        DlssNrGeometry unaligned;
+        require(calculate_dlss_nr_geometry(settings, 1815U, 1702U, unaligned) &&
+            unaligned.working_width == 1815U && unaligned.working_height == 1702U,
+            "Full-frame NR at scale 1 must preserve unaligned input pixels");
+        settings.nr_working_scale = 0.5F;
+        require(calculate_dlss_nr_geometry(settings, 1815U, 1702U, unaligned) &&
+            unaligned.working_width == 908U && unaligned.working_height == 851U,
+            "NR working dimensions must round to the nearest pixel without alignment");
+        require(scaled_extent(100U, 0.1F) == 32U, "NR minimum working dimension changed");
         const auto depth = scale_subrect(400U, 800U, 19U, 1600U, 1600U);
         const auto low_mv = scale_subrect(400U, 800U, 31U, 1600U, 1600U);
         const auto output_mv = scale_subrect(400U, 800U, 37U, 3200U, 1600U);

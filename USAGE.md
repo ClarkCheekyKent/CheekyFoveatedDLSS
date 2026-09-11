@@ -176,7 +176,8 @@ and retains its saved value when changing order. It scales the NR region's width
 and height in the selected processing resolution. For example, full-frame NR
 with a 1600×1200 render size and 3200×2400 display size works at 1280×960 before
 SR, or 2560×1920 after SR, at scale 0.80. At 1.00 Before mode uses render-resolution
-pixels. Dimensions retain the runtime's eight-pixel alignment and 32-pixel minimum.
+pixels without rounding working dimensions to multiples of eight. Scaled dimensions
+are rounded to the nearest pixel and retain a 32-pixel minimum.
 Independent and linked NR shapes follow the coordinated SR center; the green
 border is drawn after SR at display resolution with its five-pixel width.
 
