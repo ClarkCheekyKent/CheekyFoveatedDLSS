@@ -49,7 +49,7 @@ unchanged. Unsupported vector resources or 3D Streamline vectors fall back to
 the game's DLSS if resampling is required. Extremely large centers are capped
 at the GPU's 16,384-pixel texture dimension limit.
 
-Press **Alt+Shift+/** to toggle foveated DLSS-SR. Settings save automatically through the selected integration.
+Press **Alt+Shift+/** to toggle foveated DLSS-SR. Press **Alt+Shift+>** (hold Alt and Shift, then press the period key) to toggle the entire DLSS-NR feature, preserving its foveation setting. Both shortcuts toggle once per press and save automatically through the selected integration.
 
 **Automatic stereo alignment** is enabled by default and needs no eye tracker.
 It aligns fixed placement and the fallback center when gaze is unavailable;

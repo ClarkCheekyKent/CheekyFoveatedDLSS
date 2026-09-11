@@ -37,6 +37,7 @@ SRWLOCK trace_log_lock = SRWLOCK_INIT;
 
 constexpr char config_section[] = "CheekyFoveatedDLSS";
 std::atomic<bool> toggle_hotkey_down{};
+std::atomic<bool> nr_toggle_hotkey_down{};
 HANDLE processing_owner{};
 
 struct DiagnosticDisplayCache {
@@ -1633,6 +1634,8 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         changed |= ImGui::Checkbox(
             "Enable DLSS-NR (DLSS 5)", &settings.nr_enabled
         );
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Alt+Shift+>)");
         ImGui::TextDisabled(
             "Requires nvngx_dlssnr.dll beside this add-on and a DX12 processing path."
         );
@@ -1700,7 +1703,7 @@ void on_present(
             reinterpret_cast<ID3D12CommandQueue*>(queue->get_native())
         );
     }
-    auto settings = current_settings();
+    auto settings = configured_settings();
     const bool down =
         (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
         (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
@@ -1716,6 +1719,21 @@ void on_present(
             "Foveated DLSS hotkey Alt+Shift+/ toggled enabled=%s",
             settings.enabled ? "yes" : "no"
         );
+    }
+    // '>' is Shift+period on the same keyboard layout as the existing shortcut.
+    const bool nr_down =
+        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) != 0;
+    const bool nr_was_down = nr_toggle_hotkey_down.exchange(
+        nr_down, std::memory_order_acq_rel
+    );
+    if (nr_down && !nr_was_down) {
+        settings.nr_enabled = !settings.nr_enabled;
+        update_settings(settings);
+        save_settings_to_reshade(settings);
+        trace_event("DLSS-NR hotkey Alt+Shift+> toggled enabled=%s",
+            settings.nr_enabled ? "yes" : "no");
     }
 }
 

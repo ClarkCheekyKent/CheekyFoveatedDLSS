@@ -30,6 +30,10 @@ Manual stereo offsets are a troubleshooting fallback, not a replacement for cali
 
 Sliders apply once on release; checkboxes and dropdowns apply immediately. Settings save automatically. Start with **DLSS-NR off**.
 
+Press **Alt+Shift+>** (the period key with Alt and Shift held) to toggle the
+entire DLSS-NR feature. Its foveation setting is preserved, and the change saves
+automatically. Holding the shortcut toggles only once.
+
 NR **Style** offers Standard, Natural and Cinematic. **Intensity** runs from 0
 (no model edit) to 1 (full edit). **Skin structure** appears with Automatic mask
 enabled; **Paper white** appears for HDR NR input. The old preset hints and

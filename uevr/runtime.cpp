@@ -350,6 +350,19 @@ extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, 
             auto settings = configured_settings(); settings.enabled = !settings.enabled; update_settings(settings); ++s.revision; request_save(s);
         }
         was_down = down;
+        static bool nr_was_down{};
+        const bool nr_down = (GetAsyncKeyState(VK_MENU) & 0x8000) &&
+            (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000);
+        if (nr_down && !nr_was_down) {
+            auto settings = configured_settings();
+            settings.nr_enabled = !settings.nr_enabled;
+            update_settings(settings);
+            ++s.revision;
+            request_save(s);
+            trace_event("DLSS-NR hotkey Alt+Shift+> toggled enabled=%s",
+                settings.nr_enabled ? "yes" : "no");
+        }
+        nr_was_down = nr_down;
     } catch (...) { set_processing_allowed(false); }
 }
 extern "C" __declspec(dllexport) bool CheekyUEVR_Command(std::uint64_t attachment, const char* command) {

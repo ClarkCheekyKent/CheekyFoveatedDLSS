@@ -319,6 +319,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
             text("DLSS-NR / DX12 transport is unavailable on the DX11 path in the UEVR plugin.")
         else
             check("Enable DLSS-NR", "NrEnabled")
+            text("Alt+Shift+> (period key): toggle DLSS-NR")
             if draft.NrEnabled then
                 check("Foveated NR", "NrFoveated")
                 if draft.NrFoveated then
