@@ -662,7 +662,8 @@ void failure_diagnostics12() {
 }
 void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
            DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, bool converted = false,
-           bool flipped = false, bool ambiguous = false, bool shifted = false) {
+           bool flipped = false, bool ambiguous = false, bool shifted = false,
+           bool late_begin = false, bool fail_end = false) {
     roles();
     GPU12 gpu(hardware);
     const auto state = backend == EyeCalibrationBackend::openxr ? D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -682,7 +683,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     binding.device = gpu.device.Get();
     binding.queue = gpu.submit_queue.Get();
     std::unique_ptr<XRLayer> layer;
-    if (hardware || converted)
+    if (hardware || converted || late_begin)
         layer = std::make_unique<XRLayer>(target.Get(), 12, &binding, target_width, array ? 2 : 1, target_height);
     D3D12_HEAP_PROPERTIES h{};
     h.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -703,9 +704,9 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     std::uint64_t warm_allocations{};
     for (unsigned frame = 0; frame < (layer ? 641U : 640U); ++frame) {
         bool sampling{};
-        if (layer)
-            layer->begin();
-        else
+        if (layer) {
+            if (!late_begin) layer->begin();
+        } else
             sampling = eye_calibration_frame(backend, generation, 12);
         gpu.begin();
         for (auto* r : {a.Get(), b.Get()}) {
@@ -737,8 +738,12 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         check(gpu.queue->Signal(gpu.fence.Get(), ++gpu.value));
         check(gpu.submit_queue->Wait(gpu.fence.Get(), gpu.value));
         if (layer) {
+            // Reproduce Mortal Shell 2: both DLSS evaluations have already
+            // happened when the host opens the OpenXR frame for submission.
+            if (late_begin) layer->begin();
             layer->release();
             layer->projection_mode = frame % 3;
+            XRLayer::end_result = fail_end && frame == 11 ? XR_ERROR_TIME_INVALID : XR_SUCCESS;
             layer->end(false, array);
         } else
             for (unsigned eye = 0; eye < 2; ++eye) {
@@ -770,8 +775,10 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         std::cout << "D3D12 conflicting vertical orientations rejected\n";
         return;
     }
-    require(stats.valid == 64 && stats.corrections == 2 && stereo_eye_assignment(9101).eye_index == 0,
+    require(stats.valid == (fail_end ? 63U : 64U) && stats.corrections == 2 && stereo_eye_assignment(9101).eye_index == 0,
             "D3D12 transition must correct exactly once");
+    if (fail_end) require(stats.rejection_counts[3] >= 1,
+                         "Failed EndFrame must reject its capture and allow later samples to recover");
     require(stereo_eye_assignment(9101).vertical_flip == flipped &&
                 stereo_eye_assignment(9102).vertical_flip == flipped,
             "Calibration must retain the verified image orientation for gaze projection");
@@ -786,7 +793,8 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     std::cout << "D3D12 " << eye_calibration_backend_name(backend) << (array ? " array" : " packed")
               << (hardware ? " hardware" : " WARP") << " format=" << unsigned(format)
               << (converted ? " -> FP16 at 1.5x via shader and layer DLL" : "")
-              << ": 64 valid, 2 corrections, stable allocations\n";
+              << (late_begin ? " late BeginFrame" : "")
+              << ": " << stats.valid << " valid, 2 corrections, stable allocations\n";
     cleanup();
 }
 } // namespace
@@ -815,6 +823,11 @@ int run_openxr_calibration_tests() {
         projection_policy();
         openxr11();
         recording_lifetime12();
+        for (bool array : {false, true})
+            run12(EyeCalibrationBackend::openxr, array, false, DXGI_FORMAT_R8G8B8A8_UNORM,
+                  false, false, false, false, true);
+        run12(EyeCalibrationBackend::openxr, false, false, DXGI_FORMAT_R8G8B8A8_UNORM,
+              false, false, false, false, true, true);
         for (auto backend : {EyeCalibrationBackend::openvr, EyeCalibrationBackend::openxr})
             for (bool array : {false, true})
                 run12(backend, array);

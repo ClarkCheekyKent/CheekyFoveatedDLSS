@@ -1575,14 +1575,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
       if (!instance) return XR_ERROR_HANDLE_INVALID;
       next = instance->dispatch.begin_frame; }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
-    const auto result = next(session, info);
-    if (XR_SUCCEEDED(result)) {
-        std::lock_guard lock(state_mutex);
-        auto it = sessions.find(session);
-        if (it != sessions.end()) it->second.calibration.begin(cheeky::openxr_calibration::bridge(),
-            it->second.generation, it->second.graphics_api);
-    }
-    return result;
+    // Some hosts render DLSS before BeginFrame and call it just before submitting.
+    // Preserve the source markers collected since the previous EndFrame.
+    return next(session, info);
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
@@ -1626,6 +1621,11 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
                 }
             }
             owner->second.calibration.end(cheeky::openxr_calibration::bridge(), valid ? regions : decltype(regions){}, released, valid);
+            // Validate the submitted pair before closing its core record and
+            // arming the next sample. End-to-end intervals cover both early and
+            // late BeginFrame hosts; the first interval is an unstamped warm-up.
+            owner->second.calibration.begin(cheeky::openxr_calibration::bridge(),
+                owner->second.generation, owner->second.graphics_api);
         }
     }
     if (XR_FAILED(result)) return result;

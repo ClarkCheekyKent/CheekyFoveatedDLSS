@@ -33,6 +33,12 @@ D3D11 marker/copy/readback work must use the immediate context's owning thread.
 Frame pipelines must expose both DLSS evaluations and their submissions in the
 same observed VR frame; extra or mismatched evaluations are rejected.
 
+OpenXR calibration records span one `xrEndFrame` to the next. `xrBeginFrame`
+does not reset the source markers: hosts may render DLSS before calling it.
+The first submitted frame supplies the eye rectangles and arms calibration;
+subsequent samples retain the existing ten-frame cadence. Failed submissions
+reject their pair and clear the learned rectangles before the next interval.
+
 ## Diagnostics
 
 Open **Diagnostics > Eye calibration** in ReShade or **Diagnostics and support
