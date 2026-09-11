@@ -82,13 +82,54 @@ struct FeatureKey {
     std::uint32_t create_flags{};
     NrProcessingOrder order{};
     std::uint32_t processing_width{}, processing_height{};
+    std::uint32_t preset{};
+    std::uint32_t style{};
+    float intensity{}, local_tone{}, local_structure{}, skin_structure{};
+    bool automatic_mask{}, ui_correction{};
+
+    bool operator==(const FeatureKey&) const = default;
 };
 
-[[nodiscard]] bool operator==(
-    const FeatureKey& left,
-    const FeatureKey& right
-) noexcept {
-    return std::memcmp(&left, &right, sizeof(left)) == 0;
+void set_model_tuning(NgxParameters* parameters, const Settings& settings) noexcept {
+    // Match the reference forwarder's creation-time tuning contract. Keep these
+    // in FeatureKey as well, without depending on live retuning support.
+    parameters->Set("DLSSNR.Hint.Render.Preset", settings.nr_preset);
+    parameters->Set("DLSSNR.Intensity", settings.nr_intensity);
+    parameters->Set("DLSSNR.LocalToneStrength", settings.nr_local_tone_strength);
+    parameters->Set("DLSSNR.LocalStructureStrength", settings.nr_local_structure_strength);
+    parameters->Set("DLSSNR.SkinStructureStrength", settings.nr_skin_structure_strength);
+    // The driver distinguishes integer values from pointer values even on x64.
+    parameters->Set("DLSSNR.ControlMask", static_cast<void*>(nullptr));
+    parameters->Set("DLSSNR.UseAutoMask", settings.nr_automatic_mask ? 1U : 0U);
+    parameters->Set("DLSSNR.Style", settings.nr_style);
+    parameters->Set("DLSSNR.UICorrection", settings.nr_ui_correction ? 1U : 0U);
+}
+
+bool verify_model_tuning(NgxParameters* parameters, const Settings& settings,
+    DlssViewId view_id) noexcept {
+    const char* names[]{"DLSSNR.Intensity", "DLSSNR.LocalToneStrength",
+        "DLSSNR.LocalStructureStrength", "DLSSNR.SkinStructureStrength"};
+    const float expected[]{settings.nr_intensity, settings.nr_local_tone_strength,
+        settings.nr_local_structure_strength, settings.nr_skin_structure_strength};
+    float readback[4]{};
+    bool valid = true;
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto result = parameters->Get(names[i], &readback[i]);
+        if (!ngx_succeeded(result) || readback[i] != expected[i]) {
+            valid = false;
+            trace_event("DLSS-NR parameter mismatch view=%llu key=%s requested=%.6f read=%.6f result=0x%08X",
+                view_id, names[i], expected[i], readback[i], result);
+        }
+    }
+    void* mask{};
+    valid = ngx_succeeded(parameters->Get("DLSSNR.ControlMask", &mask)) && !mask && valid;
+    unsigned style{}, auto_mask{};
+    valid = ngx_succeeded(parameters->Get("DLSSNR.Style", &style)) && style == settings.nr_style && valid;
+    valid = ngx_succeeded(parameters->Get("DLSSNR.UseAutoMask", &auto_mask)) && auto_mask == (settings.nr_automatic_mask ? 1U : 0U) && valid;
+    trace_event("DLSS-NR parameter readback view=%llu valid=%s style=%u intensity=%.6f tone=%.6f structure=%.6f skin=%.6f autoMask=%u skinEnabled=%s",
+        view_id, valid ? "yes" : "no", style, readback[0], readback[1], readback[2], readback[3],
+        auto_mask, auto_mask ? "yes" : "no");
+    return valid;
 }
 
 struct GpuResources {
@@ -501,6 +542,11 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
         settings.nr_processing_order,
         frame.processing_width ? frame.processing_width : frame.output_width,
         frame.processing_height ? frame.processing_height : frame.output_height,
+        settings.nr_preset,
+        settings.nr_style,
+        settings.nr_intensity, settings.nr_local_tone_strength,
+        settings.nr_local_structure_strength, settings.nr_skin_structure_strength,
+        settings.nr_automatic_mask, settings.nr_ui_correction,
     };
     if (view.handle != nullptr && view.has_key && view.key == key) return true;
     if (view.feature_failed && view.has_key && view.key == key) return false;
@@ -552,7 +598,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
         view.feature_failed = true;
         return false;
     }
-    const auto preset = settings.nr_preset == 0U ? 1U : settings.nr_preset;
+    const auto preset = settings.nr_preset;
     parameters->Set("Width", working_width);
     parameters->Set("Height", working_height);
     parameters->Set("OutWidth", working_width);
@@ -569,7 +615,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     parameters->Set("DLSSNR.Scale", 1.0F);
     parameters->Set("DLSSNR.Upscaling", 0U);
     parameters->Set("DLSSNR.Enabled", 1U);
-    parameters->Set("DLSSNR.Hint.Render.Preset", preset);
+    set_model_tuning(parameters, settings);
     parameters->Set(
         "DLSSNRComputeScalingRatioCallback",
         reinterpret_cast<void*>(
@@ -580,6 +626,15 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     parameters->Set("DLSS.Feature.Create.Flags", frame.create_flags);
     parameters->Set("CreationNodeMask", 1U);
     parameters->Set("VisibilityNodeMask", 1U);
+
+    if (!verify_model_tuning(parameters, settings, frame.view_id)) {
+        static_cast<void>(runtime.destroy_parameters(parameters));
+        view.feature_failed = true;
+        diagnostics.state = DlssNrState::feature_failed;
+        diagnostics.skip_reason = "NR parameter readback failed; model tuning was not applied";
+        ++diagnostics.failed_calls;
+        return false;
+    }
 
     NgxHandle* handle{};
     constexpr std::uint32_t neural_feature_id = 18U;
@@ -885,9 +940,9 @@ float4 LoadSource0Bilinear(float2 position, uint2 origin, uint2 dimensions) {
     const int2 minimum = int2(origin);
     const int2 maximum = minimum + int2(dimensions) - 1;
     const int2 p00 = clamp(int2(base), minimum, maximum);
-    const int2 p10 = clamp(p00 + int2(1, 0), minimum, maximum);
-    const int2 p01 = clamp(p00 + int2(0, 1), minimum, maximum);
-    const int2 p11 = clamp(p00 + int2(1, 1), minimum, maximum);
+    const int2 p10 = clamp(int2(base) + int2(1, 0), minimum, maximum);
+    const int2 p01 = clamp(int2(base) + int2(0, 1), minimum, maximum);
+    const int2 p11 = clamp(int2(base) + int2(1, 1), minimum, maximum);
     return lerp(
         lerp(Source0.Load(int3(p00, 0)), Source0.Load(int3(p10, 0)), fraction.x),
         lerp(Source0.Load(int3(p01, 0)), Source0.Load(int3(p11, 0)), fraction.x),
@@ -900,9 +955,9 @@ float4 LoadSource1Bilinear(float2 position, uint2 dimensions) {
     const float2 fraction = position - base;
     const int2 maximum = int2(dimensions) - 1;
     const int2 p00 = clamp(int2(base), int2(0, 0), maximum);
-    const int2 p10 = clamp(p00 + int2(1, 0), int2(0, 0), maximum);
-    const int2 p01 = clamp(p00 + int2(0, 1), int2(0, 0), maximum);
-    const int2 p11 = clamp(p00 + int2(1, 1), int2(0, 0), maximum);
+    const int2 p10 = clamp(int2(base) + int2(1, 0), int2(0, 0), maximum);
+    const int2 p01 = clamp(int2(base) + int2(0, 1), int2(0, 0), maximum);
+    const int2 p11 = clamp(int2(base) + int2(1, 1), int2(0, 0), maximum);
     return lerp(
         lerp(Source1.Load(int3(p00, 0)), Source1.Load(int3(p10, 0)), fraction.x),
         lerp(Source1.Load(int3(p01, 0)), Source1.Load(int3(p11, 0)), fraction.x),
@@ -915,9 +970,9 @@ float4 LoadSource2Bilinear(float2 position, uint2 dimensions) {
     const float2 fraction = position - base;
     const int2 maximum = int2(dimensions) - 1;
     const int2 p00 = clamp(int2(base), int2(0, 0), maximum);
-    const int2 p10 = clamp(p00 + int2(1, 0), int2(0, 0), maximum);
-    const int2 p01 = clamp(p00 + int2(0, 1), int2(0, 0), maximum);
-    const int2 p11 = clamp(p00 + int2(1, 1), int2(0, 0), maximum);
+    const int2 p10 = clamp(int2(base) + int2(1, 0), int2(0, 0), maximum);
+    const int2 p01 = clamp(int2(base) + int2(0, 1), int2(0, 0), maximum);
+    const int2 p11 = clamp(int2(base) + int2(1, 1), int2(0, 0), maximum);
     return lerp(
         lerp(Source2.Load(int3(p00, 0)), Source2.Load(int3(p10, 0)), fraction.x),
         lerp(Source2.Load(int3(p01, 0)), Source2.Load(int3(p11, 0)), fraction.x),
@@ -958,7 +1013,7 @@ void EncodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             proxy_source.rgb / max(PaperWhiteScale, 0.0001),
             0.0
         );
-        const float3 encoded = HdrMode != 0 ? SrgbEncode(linear_color) : linear_color;
+        const float3 encoded = HdrMode != 0 ? SrgbEncode(linear_color) : proxy_source.rgb;
         Output1[dispatch_id.xy] = float4(encoded, proxy_source.a);
     }
 }
@@ -1013,7 +1068,8 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     const float4 proxy_sample = LoadSource1Bilinear(proxy_position, ProxySize);
     const float4 neural_sample = LoadSource2Bilinear(proxy_position, ProxySize);
     if (HdrMode == 0) {
-        const float4 processed = lerp(original_sample, neural_sample, ColorStrength);
+        const float4 processed = float4(lerp(original_sample.rgb, neural_sample.rgb,
+            TransferStrength * ColorStrength), original_sample.a);
         Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
         return;
     }
@@ -1156,6 +1212,7 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         signature *= 1099511628211ULL;
     };
     append(static_cast<std::uint32_t>(settings.nr_processing_order));
+    append(settings.nr_style);
     for (const auto value : {
             settings.nr_working_scale,
             settings.nr_intensity,
@@ -1258,7 +1315,7 @@ void dispatch_codec(
         settings.nr_paper_white_scale,
         settings.nr_hdr_transfer_strength,
         settings.nr_color_strength,
-        1U,
+        (frame.create_flags & 1U) != 0U ? 1U : 0U,
         {0U, 0U},
         {gpu.width, gpu.height},
         region.shape_width,
@@ -1288,6 +1345,7 @@ bool evaluate_dlss_nr(
     collect_retired_views();
     diagnostics.skip_reason = nullptr;
     diagnostics.route = frame.route;
+    diagnostics.hdr_input = (frame.create_flags & 1U) != 0U;
     diagnostics.processing_order = settings.nr_processing_order;
     diagnostics.processing_width = frame.processing_width ? frame.processing_width : frame.output_width;
     diagnostics.processing_height = frame.processing_height ? frame.processing_height : frame.output_height;
@@ -1485,11 +1543,11 @@ bool evaluate_dlss_nr(
     }
     const bool before = settings.nr_processing_order == NrProcessingOrder::before_upscaling;
     const float jitter_x = dlss_nr_jitter_delta(view.jitter_uv_x, frame.jitter_uv_x,
-        before, frame.motion_vectors_jittered, reset);
+        before, frame.motion_vectors_jittered, reset, settings.nr_motion_scale_x_multiplier);
     const float jitter_y = dlss_nr_jitter_delta(view.jitter_uv_y, frame.jitter_uv_y,
-        before, frame.motion_vectors_jittered, reset);
-    offset.x = reset ? 0.0F : (static_cast<float>(region.base_x) - view.history.x + jitter_x * processing_width) / region.width;
-    offset.y = reset ? 0.0F : (static_cast<float>(region.base_y) - view.history.y + jitter_y * processing_height) / region.height;
+        before, frame.motion_vectors_jittered, reset, settings.nr_motion_scale_y_multiplier);
+    offset.x = reset ? 0.0F : offset.x + jitter_x * processing_width / region.width;
+    offset.y = reset ? 0.0F : offset.y + jitter_y * processing_height / region.height;
     const NrGuideConstants guide_constants{
         {working_width, working_height}, {region.base_x, region.base_y},
         {region.width, region.height}, {processing_width, processing_height},
@@ -1624,19 +1682,7 @@ bool evaluate_dlss_nr(
     parameters->Set("DLSSNR.ScalingRatio", 1.0F);
     parameters->Set("DLSSNR.Scale", 1.0F);
     parameters->Set("DLSSNR.Upscaling", 0U);
-    parameters->Set("DLSSNR.Intensity", settings.nr_intensity);
-    parameters->Set("DLSSNR.LocalToneStrength", settings.nr_local_tone_strength);
-    parameters->Set(
-        "DLSSNR.LocalStructureStrength",
-        settings.nr_local_structure_strength
-    );
-    parameters->Set(
-        "DLSSNR.SkinStructureStrength",
-        settings.nr_skin_structure_strength
-    );
-    parameters->Set("DLSSNR.UseAutoMask", settings.nr_automatic_mask ? 1U : 0U);
-    parameters->Set("DLSSNR.Style", 0U);
-    parameters->Set("DLSSNR.UICorrection", settings.nr_ui_correction ? 1U : 0U);
+    set_model_tuning(parameters, settings);
 
     const auto result = runtime.evaluate_feature(
         frame.command_list,
@@ -1792,6 +1838,7 @@ void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const cha
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     diagnostics.route = route;
+    diagnostics.hdr_input = false;
     diagnostics.processing_order = settings.nr_processing_order;
     diagnostics.skip_reason = reason;
     diagnostics.state = DlssNrState::input_preparation_failed;

@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cmath>
+#include <DirectXPackedVector.h>
 using namespace cheeky::foveated_dlss;
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -33,6 +34,10 @@ unsigned nr_reset{};
 float nr_motion_x{};
 unsigned nr_motion_width{};
 ComPtr<ID3D12Resource> nr_motion_resource;
+MockNgxParameters nr_created;
+void observe_nr_created(const NgxParameters* params) {
+    nr_created.values = static_cast<const MockNgxParameters*>(params)->values;
+}
 void observe_sr(const NgxParameters* params) {
     evaluation_order += 'S';
     SrInput input;
@@ -155,6 +160,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     nr = GetModuleHandleW(L"nvngx_dlssnr.dll");
     require(nr != nullptr, "Hook fixture loaded its local fake NR runtime");
     proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserve")(&observe_nr);
+    proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserveCreated")(&observe_nr_created);
     command("1\n91\nset\nHeightOffset=1");
     evaluate(7);
     require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get(),
@@ -327,10 +333,141 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     require(jitter_motion[0]==0.F && jitter_motion[1]==0.F,"After NR added render jitter to stabilized color");
     f.params.Set("Jitter.Offset.X",0.F);f.params.Set("Jitter.Offset.Y",0.F);
     command("1\n96\nset\nNrProcessingOrder=1\nNrMotionScaleXMultiplier=1");evaluate(1);
+    // Jittered source vectors contain both scene motion and raster jitter.
+    // Scale only scene motion, then restore the selected color domain's jitter.
+    for (bool before : {true, false}) for (float multiplier : {-2.F, 0.F, 0.5F}) {
+        command((std::string("1\n96\nset\nNrProcessingOrder=") + (before ? "1" : "0") +
+            "\nNrMotionScaleXMultiplier=" + std::to_string(multiplier)).c_str());
+        f.params.Set("DLSS.Feature.Create.Flags", 6U);
+        f.params.Set("Jitter.Offset.X",0.F); f.params.Set("Jitter.Offset.Y",0.F); evaluate(1);
+        check(upload->Map(0,nullptr,&mapped), "Map jittered motion");
+        for (unsigned y = 0; y < motion_desc.Height; ++y) {
+            auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + fp.Offset + y * fp.Footprint.RowPitch);
+            for (unsigned x = 0; x < motion_desc.Width; ++x) {
+                row[2*x] = DirectX::PackedVector::XMConvertFloatToHalf(1.75F / (f.use_sl ? 128.F : 1.F));
+                row[2*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(0.375F / (f.use_sl ? 128.F : 1.F));
+            }
+        }
+        upload->Unmap(0,nullptr);
+        transition_resource(destination.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+        f.list->CopyTextureRegion(&destination,0,0,0,&source,nullptr);
+        transition_resource(destination.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.params.Set("Jitter.Offset.X",0.25F); f.params.Set("Jitter.Offset.Y",-0.375F); evaluate(0);
+        const auto actual = read_motion();
+        require(nr_reset == 0 && std::abs(actual[0] - (2.F*multiplier - (before ? 0.25F : 0.F))/128.F) < 1e-7F &&
+            std::abs(actual[1] - (before ? 0.375F/128.F : 0.F)) < 1e-7F,
+            "NR multiplier scaled embedded jitter instead of only scene motion");
+    }
+    f.params.Set("DLSS.Feature.Create.Flags", 2U);
+    f.params.Set("Jitter.Offset.X",0.F); f.params.Set("Jitter.Offset.Y",0.F);
+    command("1\n96\nset\nNrProcessingOrder=1\nNrMotionScaleXMultiplier=1"); evaluate(1);
+
+    // Identity-model round trip: SDR is already encoded. Paper white must not
+    // dim it, and alpha belongs to the original color, not the model.
+    const auto copy_nr_color = proc<void(*)(bool)>(nr, "CheekyFakeCopyNrColor");
+    copy_nr_color(true);
+    const auto color_desc = f.textures12[0]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT color_fp{}; UINT64 color_bytes{};
+    f.device->GetCopyableFootprints(&color_desc,0,1,0,&color_fp,nullptr,nullptr,&color_bytes);
+    auto color_upload = make_buffer(color_bytes,D3D12_HEAP_TYPE_UPLOAD);
+    check(color_upload->Map(0,nullptr,&mapped), "Map NR color");
+    for (unsigned y = 0; y < color_desc.Height; ++y) {
+        auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + color_fp.Offset + y*color_fp.Footprint.RowPitch);
+        for (unsigned x = 0; x < color_desc.Width; ++x) {
+            row[4*x] = DirectX::PackedVector::XMConvertFloatToHalf(static_cast<float>(x)/128.F);
+            row[4*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(static_cast<float>(y)/128.F);
+            row[4*x+2] = DirectX::PackedVector::XMConvertFloatToHalf(0.75F);
+            row[4*x+3] = DirectX::PackedVector::XMConvertFloatToHalf(0.25F);
+        }
+    }
+    color_upload->Unmap(0,nullptr);
+    D3D12_TEXTURE_COPY_LOCATION color_src{}, color_dst{};
+    color_src.pResource=color_upload.Get(); color_src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; color_src.PlacedFootprint=color_fp;
+    color_dst.pResource=f.textures12[0].Get(); color_dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+    f.list->CopyTextureRegion(&color_dst,0,0,0,&color_src,nullptr);
+    transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    for (float white : {0.25F, 1.F, 4.F}) for (float scale : {1.F, 0.5F})
+    for (float transfer : {0.F, 0.5F, 1.F, 2.F}) {
+        command((std::string("1\n96\nset\nNrPaperWhiteScale=") + std::to_string(white) +
+            "\nNrWorkingScale=" + std::to_string(scale) +
+            "\nNrHdrTransferStrength=" + std::to_string(transfer)).c_str()); evaluate(0);
+        require(sr_inputs.size() == 1 && sr_inputs[0].color != f.textures12[0].Get(), "Color round trip did not execute NR");
+        auto readback=make_buffer(256,D3D12_HEAP_TYPE_READBACK);
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource=sr_inputs[0].color; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16B16A16_FLOAT,1,1,1,256};
+        // The first reconstructed pixel clamps to the first proxy pixel. Clamp
+        // every bilinear tap independently, not relative to an already-clamped tap.
+        const D3D12_BOX pixel{0,0,0,1,1,1};
+        transition_resource(from.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        f.list->CopyTextureRegion(&to,0,0,0,&from,&pixel);
+        transition_resource(from.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.finish_gpu(); check(readback->Map(0,nullptr,&mapped), "Map NR color result");
+        const auto* result = static_cast<const DirectX::PackedVector::HALF*>(mapped);
+        const float expected_edge = scale == 1.F ? 0.F : transfer*0.5F/128.F;
+        const bool unchanged = DirectX::PackedVector::XMConvertHalfToFloat(result[0]) == expected_edge &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[1]) == expected_edge &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[2]) == 0.75F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[3]) == 0.25F;
+        readback->Unmap(0,nullptr);
+        require(unchanged, "SDR NR round trip changed paper white, alpha, or working-scale edge sampling");
+    }
+    command("1\n96\nset\nNrPaperWhiteScale=1\nNrWorkingScale=1\nNrHdrTransferStrength=1"); evaluate(0);
+    copy_nr_color(false);
     // Exercise the production feature cache through the fake NVIDIA runtime:
     // warm two toggle states, then churn dimensions without growing live features.
     const auto nr_creates = proc<Counter>(nr, "CheekyFakeCreates");
     const auto nr_releases = proc<Counter>(nr, "CheekyFakeReleases");
+    // The fixture observes the immutable creation snapshot of the actual handle
+    // being evaluated, including cached handles. Evaluate-only writes cannot pass.
+    const auto check_model = [&]() {
+        unsigned preset{}, mask{}, ui{};
+        void* control_mask = reinterpret_cast<void*>(123);
+        require(ngx_succeeded(nr_created.Get("DLSSNR.Hint.Render.Preset", &preset)) && preset == 0,
+            "Default NR preset must be passed as zero");
+        require(ngx_succeeded(nr_created.Get("DLSSNR.ControlMask", &control_mask)) && control_mask == nullptr,
+            "Explicit control mask overrides automatic NR mask");
+        require(ngx_succeeded(nr_created.Get("DLSSNR.UseAutoMask", &mask)) && mask == 0 &&
+            ngx_succeeded(nr_created.Get("DLSSNR.UICorrection", &ui)) && ui == 0,
+            "Default NR mask/UI tuning missing at creation");
+    };
+    evaluate(0); check_model();
+    const auto model_live_limit = nr_creates() - nr_releases() + 1;
+    struct ModelSetting { const char* setting; const char* parameter; float original; float changed; };
+    for (const auto& item : {
+        ModelSetting{"NrIntensity", "DLSSNR.Intensity", 1.F, 0.25F},
+        ModelSetting{"NrLocalToneStrength", "DLSSNR.LocalToneStrength", 1.F, 0.5F},
+        ModelSetting{"NrLocalStructureStrength", "DLSSNR.LocalStructureStrength", 1.F, 1.5F},
+        ModelSetting{"NrSkinStructureStrength", "DLSSNR.SkinStructureStrength", 1.F, 0.75F},
+        ModelSetting{"NrAutomaticMask", "DLSSNR.UseAutoMask", 0.F, 1.F},
+        ModelSetting{"NrUiCorrection", "DLSSNR.UICorrection", 0.F, 1.F},
+        ModelSetting{"NrPreset", "DLSSNR.Hint.Render.Preset", 0.F, 3.F},
+        ModelSetting{"NrStyle", "DLSSNR.Style", 0.F, 2.F}}) {
+        const auto set_value = [&](float value) {
+            const bool boolean = std::string(item.setting) == "NrAutomaticMask" || std::string(item.setting) == "NrUiCorrection";
+            const auto text = std::string("1\n96\nset\n") + item.setting + "=" +
+                (boolean ? (value != 0 ? "true" : "false") :
+                    (std::string(item.setting) == "NrPreset" || std::string(item.setting) == "NrStyle") ? std::to_string(static_cast<unsigned>(value)) : std::to_string(value));
+            command(text.c_str()); evaluate(0);
+            float actual = -100.F;
+            require(evaluation_order == "NS" && ngx_succeeded(nr_created.Get(item.parameter, &actual)) && actual == value,
+                "NR control did not reach the feature's immutable creation parameters");
+        };
+        const auto previous_creates = nr_creates();
+        set_value(item.changed);
+        require(nr_creates() == previous_creates + 1 && nr_reset == 1,
+            "NR model tuning did not recreate and reset the feature");
+        evaluate(0);
+        require(nr_creates() == previous_creates + 1 && nr_reset == 0,
+            "Unchanged NR tuning recreated the feature or reset history");
+        set_value(item.original);
+        require(nr_creates() == previous_creates + 1 && nr_reset == 1,
+            "Returning to cached NR tuning used the wrong feature or history");
+        require(nr_creates() - nr_releases() <= model_live_limit, "NR tuning grew the feature cache");
+    }
+    check_model();
     const auto set_foveated = [&](bool enabled) {
         command(enabled
             ? "1\n96\nset\nNrFoveated=true\nNrWidth=0.5\nNrHeight=0.5\nNrWorkingScale=1"
@@ -362,9 +499,10 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     require(evaluation_order == "S", "Disabled NR still evaluated");
     proc<void(*)(void(*)(const NgxParameters*))>(f.ngx,"CheekyFakeObserve")(nullptr);
     proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserve")(nullptr);
+    proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserveCreated")(nullptr);
     command("1\n97\nset\nEnabled=true\nNrEnabled=false\nPeripheralDlaa=false\nAutoStereoAlignment=false");
     nr_motion_resource.Reset();
-    puts("NR reset isolation: After jump, evaluation order, per-view transitions, fallback and restoration passed");
+    puts("NR controls, cached creation tuning, jittered vectors, SDR codec/edge sampling and reset isolation passed");
 }
 }
 void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx11,ID3D12Device* dx12,ID3D12CommandQueue* queue,bool use_c,bool use_sl) {

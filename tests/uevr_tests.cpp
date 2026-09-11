@@ -77,6 +77,7 @@ void settings_tests(const std::filesystem::path& root) {
     require(!set_named_setting(s, "CenterMode", "99"), "Reject enum");
     require(!set_named_setting(s, "GazeQuantizationPixels", "-1"), "Reject negative unsigned");
     s.enabled = false; s.nr_motion_scale_x_multiplier = -1.25f;
+    require(set_named_setting(s, "NrStyle", "2"), "Parse Cinematic style");
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
@@ -102,6 +103,7 @@ void settings_tests(const std::filesystem::path& root) {
     { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nNrWorkingScale=0.37\n"; }
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
+    require(r.nr_style == 0U, "Legacy settings must restore Standard style");
     require(setting_groups_json().find("\"NrProcessingOrder\":\"nr\"") != std::string::npos,
         "Rendering order is missing from NR group metadata");
     r = s;

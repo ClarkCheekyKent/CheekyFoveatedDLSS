@@ -29,9 +29,9 @@ bool dlss_nr_motion_offset(const DlssNrHistory& previous,
     if (std::abs(dx) >= current.width || std::abs(dy) >= current.height) return false;
     if (dx == 0.0 && dy == 0.0) return true;
     if (!std::isfinite(current.scale_x) || !std::isfinite(current.scale_y) ||
-        current.scale_x == 0.0F || current.scale_y == 0.0F) return false;
-    x = static_cast<float>(dx / current.scale_x);
-    y = static_cast<float>(dy / current.scale_y);
+        !std::isfinite(previous.scale_x) || !std::isfinite(previous.scale_y)) return false;
+    x = static_cast<float>(dx / current.width);
+    y = static_cast<float>(dy / current.height);
     return std::isfinite(x) && std::isfinite(y);
 }
 

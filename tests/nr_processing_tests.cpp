@@ -61,15 +61,27 @@ int run_nr_processing_tests() {
         const auto require = [](bool value, const char* why) {
             if (!value) throw std::runtime_error(why);
         };
+        // Old INIs exposed intensity up to 2, although the model saturates at 1.
+        const auto saved_settings = current_settings();
+        for (const auto [requested, expected] : {std::pair{2.0F, 1.0F},
+                 std::pair{-1.0F, 0.0F}, std::pair{0.375F, 0.375F}}) {
+            auto settings = saved_settings;
+            settings.nr_intensity = requested;
+            update_settings(settings);
+            const auto actual = current_settings().nr_intensity;
+            update_settings(saved_settings);
+            require(actual == expected, "NR intensity normalization changed its effective range");
+        }
         // A static point moves only by its raster jitter in Before color.
         // Verify all four color/MV domain combinations, including signed axes.
-        for (bool before : {false, true}) for (bool jittered : {false, true}) {
+        for (bool before : {false, true}) for (bool jittered : {false, true})
+        for (float multiplier : {-2.0F, 0.0F, 0.5F, 1.0F, 3.0F}) {
             const float previous_jitter = -0.25F / 1815.0F;
             const float current_jitter = 0.375F / 1815.0F;
             const float delta = previous_jitter - current_jitter;
             const float supplied = jittered ? delta : 0.0F;
-            const float corrected = supplied + dlss_nr_jitter_delta(previous_jitter,
-                current_jitter, before, jittered, false);
+            const float corrected = supplied * multiplier + dlss_nr_jitter_delta(previous_jitter,
+                current_jitter, before, jittered, false, multiplier);
             require(std::abs(corrected - (before ? delta : 0.0F)) < 1e-8F,
                 "Jitter was applied twice, omitted, or retained in stabilized After color");
             require(dlss_nr_jitter_delta(previous_jitter,current_jitter,before,jittered,true) == 0.0F,
@@ -106,7 +118,7 @@ int run_nr_processing_tests() {
         current.x += 8U;
         float dx{}, dy{};
         require(dlss_nr_motion_offset(previous, current, dx, dy) &&
-            std::abs(dx * native.runtime_scale / 1601.0F - 8.0F / 960.0F) < 0.000001F,
+            std::abs(dx - 8.0F / 960.0F) < 0.000001F,
             "Moving NR crop does not reproject a stationary scene point");
         {
             MockNgxParameters missing;

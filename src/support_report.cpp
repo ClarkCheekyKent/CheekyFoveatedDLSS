@@ -122,6 +122,7 @@ std::string settings_text(const Settings& s) {
     out << "nr_processing_order=" << nr_processing_order_name(s.nr_processing_order) << '\n';
     out << "nr_working_scale=" << s.nr_working_scale << '\n';
     out << "nr_preset=" << s.nr_preset << '\n';
+    out << "nr_style=" << s.nr_style << '\n';
     out << "nr_intensity=" << s.nr_intensity << '\n';
     out << "nr_local_tone_strength=" << s.nr_local_tone_strength << '\n';
     out << "nr_local_structure_strength=" << s.nr_local_structure_strength << '\n';

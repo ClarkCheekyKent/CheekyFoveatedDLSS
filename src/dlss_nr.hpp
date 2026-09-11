@@ -80,6 +80,7 @@ struct DlssNrFrame {
 struct DlssNrSnapshot {
     NrProcessingOrder processing_order{NrProcessingOrder::after_upscaling};
     std::uint32_t processing_width{}, processing_height{};
+    bool hdr_input{};
     const char* skip_reason{};
     DlssNrState state{DlssNrState::waiting};
     DlssNrRoute route{DlssNrRoute::none};

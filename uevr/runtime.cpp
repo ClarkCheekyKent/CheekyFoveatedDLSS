@@ -109,6 +109,7 @@ std::string snapshot_locked(State& s) {
         << ",\"output_width\":" << nr.output_width << ",\"output_height\":" << nr.output_height
         << ",\"processing_order\":" << static_cast<unsigned>(nr.processing_order)
         << ",\"processing_width\":" << nr.processing_width << ",\"processing_height\":" << nr.processing_height
+        << ",\"hdr_input\":" << (nr.hdr_input ? "true" : "false")
         << ",\"skip_reason\":\"" << json_escape(nr.skip_reason ? nr.skip_reason : "") << "\""
         << ",\"region_width\":" << nr.region_width << ",\"region_height\":" << nr.region_height
         << ",\"region_x\":" << nr.region_base_x << ",\"region_y\":" << nr.region_base_y

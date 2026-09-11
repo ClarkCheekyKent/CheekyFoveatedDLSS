@@ -85,6 +85,9 @@ The required NVIDIA and Streamline runtimes are **not distributed with this proj
 Additional notes:
 
 - DLSS-NR is off by default.
+- **Style** selects Standard, Natural or Cinematic. This changes a different model parameter from the old preset hints, which have been removed from the menus along with the unverified UI correction toggle.
+- **Intensity** controls the model edit from 0 (none) to 1 (full). Values above 1 from older settings files normalize to 1. **Local tone** and **Local structure** remain 0–2; compare their endpoints in a stationary scene to judge the effect.
+- **Skin structure** appears when **Automatic mask** is enabled. **Paper white** appears only when NR receives HDR input. These controls do not affect the picture outside those conditions.
 - Direct3D 11 games require the **DX12 Transport** processing path for DLSS-NR.
 - DLSS-NR uses the shared gaze and stereo alignment settings even with SR foveation disabled. Its fovea width, height, roundness, and transition can be adjusted independently or linked to DLSS-SR, with a green alignment border for checking the region.
 - A DLSS-NR failure leaves the composited DLSS-SR result intact.

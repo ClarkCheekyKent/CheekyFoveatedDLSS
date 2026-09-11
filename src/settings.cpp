@@ -48,6 +48,7 @@ std::atomic<std::uint32_t> nr_roundness_bits{};
 std::atomic<std::uint32_t> nr_transition_bits{0x3DA3D70AU};
 std::atomic<std::uint32_t> nr_working_scale_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_preset{};
+std::atomic<std::uint32_t> nr_style{};
 std::atomic<std::uint32_t> nr_intensity_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_local_tone_bits{0x3F800000U};
 std::atomic<std::uint32_t> nr_local_structure_bits{0x3F800000U};
@@ -172,6 +173,7 @@ Settings configured_settings() noexcept {
     settings.nr_transition_width = load_float(nr_transition_bits);
     settings.nr_working_scale = load_float(nr_working_scale_bits);
     settings.nr_preset = nr_preset.load(std::memory_order_acquire);
+    settings.nr_style = nr_style.load(std::memory_order_acquire);
     settings.nr_intensity = load_float(nr_intensity_bits);
     settings.nr_local_tone_strength = load_float(nr_local_tone_bits);
     settings.nr_local_structure_strength = load_float(nr_local_structure_bits);
@@ -297,7 +299,10 @@ void update_settings(const Settings& settings) noexcept {
         std::clamp(settings.nr_working_scale, 0.10F, 1.0F)
     );
     nr_preset.store((std::min)(settings.nr_preset, 7U), std::memory_order_release);
-    store_float(nr_intensity_bits, std::clamp(settings.nr_intensity, 0.0F, 2.0F));
+    nr_style.store((std::min)(settings.nr_style, 2U), std::memory_order_release);
+    // NR 310.8 saturates the final model blend at one. Accept legacy saved
+    // values above one, but expose the effective value to both integrations.
+    store_float(nr_intensity_bits, std::clamp(settings.nr_intensity, 0.0F, 1.0F));
     store_float(
         nr_local_tone_bits,
         std::clamp(settings.nr_local_tone_strength, 0.0F, 2.0F)

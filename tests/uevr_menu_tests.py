@@ -44,6 +44,7 @@ def run(engine):
     lua.execute("""
         callbacks, sent, clicked, changes, drawn, values, combos, trees = {}, {}, {}, {}, {}, {}, {}, {}
         disabled = {false}
+        slider_ranges = {}
         tree_stack, tree_order, tree_parents = {}, {}, {}
         uevr = {api = {}, sdk = {callbacks = {}}}
         for _, name in ipairs({'on_lua_event', 'on_frame', 'on_draw_ui'}) do
@@ -74,7 +75,11 @@ def run(engine):
             begin_table = function() return true end, end_table = function() end,
             table_next_row = function() end, table_next_column = function() end,
             same_line = function() end,
-            checkbox = widget, slider_int = widget, slider_float = widget,
+            checkbox = widget, slider_int = widget,
+            slider_float = function(label, current, minimum, maximum)
+                slider_ranges[label] = {minimum, maximum}
+                return widget(label, current)
+            end,
             is_item_active = function() return last_item == active_label end,
             combo = function(label, value, items)
                 combos[label] = items
@@ -217,11 +222,26 @@ def run(engine):
     draw()
     assert g.trees["DLSS-SR"] and g.trees["SR resolution and GPU timing"]
     assert g["values"]["Fovea width"] is None and g["values"]["NR intensity"] is None
-    state["settings"].update(Enabled=True, NrEnabled=True, NrFoveated=False)
+    state["settings"].update(Enabled=True, NrEnabled=True, NrFoveated=False, NrAutomaticMask=False)
     receive(state)
     draw()
     assert g["values"]["NR width"] is None and g["values"]["Use SR size and shape"] is None
     assert g["values"]["NR intensity"] is not None
+    assert g.slider_ranges["NR intensity"][1] == 0 and g.slider_ranges["NR intensity"][2] == 1
+    assert g["values"]["Skin structure"] is None, "Hide skin tuning without automatic masking"
+    assert g["values"]["DLSS-NR preset"] is None and g["values"]["UI correction"] is None
+    state["nr_details"]["hdr_input"] = False
+    receive(state)
+    draw()
+    assert g["values"]["Paper white"] is None, "SDR has no paper-white conversion"
+    state["nr_details"]["hdr_input"] = True
+    receive(state)
+    draw()
+    assert g["values"]["Paper white"] is not None, "HDR must expose paper-white conversion"
+    state["settings"]["NrAutomaticMask"] = True
+    receive(state)
+    draw()
+    assert g["values"]["Skin structure"] is not None, "Automatic masking must expose skin tuning"
     state["settings"].update(NrFoveated=True, NrUseSrFoveation=True)
     receive(state)
     draw()
@@ -232,7 +252,15 @@ def run(engine):
     assert g["values"]["NR width"] is not None
     assert g.combos["Simulation pattern"][0] == "Figure eight (8 s)"
     assert g.combos["Simulation pattern"][5] == "Hold center"
-    assert g.combos["DLSS-NR preset"][7] == "Preset G"
+    assert g.combos["DLSS-NR style"][2] == "Cinematic"
+    count = len(g.sent)
+    draw(changes={"DLSS-NR style": 2})
+    assert len(g.sent) == count + 1 and "NrStyle=2" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["NrStyle"] = 2
+    receive(state)
+    draw()
+    assert g["values"]["DLSS-NR style"] == 2, "Style acknowledgement was not retained"
     # Rendering order follows the same immediate apply and acknowledgement
     # flow as the existing selectors, while preserving working scale.
     state["settings"].update(NrProcessingOrder=0, NrWorkingScale=0.37)

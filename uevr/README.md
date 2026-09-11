@@ -30,6 +30,11 @@ Manual stereo offsets are a troubleshooting fallback, not a replacement for cali
 
 Sliders apply once on release; checkboxes and dropdowns apply immediately. Settings save automatically. Start with **DLSS-NR off**.
 
+NR **Style** offers Standard, Natural and Cinematic. **Intensity** runs from 0
+(no model edit) to 1 (full edit). **Skin structure** appears with Automatic mask
+enabled; **Paper white** appears for HDR NR input. The old preset hints and
+unverified UI correction checkbox have been removed from the menu.
+
 ## Reports and details
 
 **Report an issue...** creates a support ZIP and opens a GitHub issue. Add your description and attach the ZIP; nothing is uploaded automatically. ZIPs are saved in `support/` under the game's UEVR configuration directory.

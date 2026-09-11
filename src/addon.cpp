@@ -857,6 +857,9 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "NrPreset", settings.nr_preset
     ));
     static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrStyle", settings.nr_style
+    ));
+    static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrIntensity", settings.nr_intensity
     ));
     static_cast<void>(reshade::get_config_value(
@@ -1010,6 +1013,7 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "NrWorkingScale", settings.nr_working_scale
     );
     reshade::set_config_value(nullptr, config_section, "NrPreset", settings.nr_preset);
+    reshade::set_config_value(nullptr, config_section, "NrStyle", settings.nr_style);
     reshade::set_config_value(
         nullptr, config_section, "NrIntensity", settings.nr_intensity
     );
@@ -1379,6 +1383,8 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         float width{};
         float height{};
         float working_scale{};
+        float intensity{}, local_tone{}, local_structure{}, skin_structure{};
+        bool editing_intensity{}, editing_local_tone{}, editing_local_structure{}, editing_skin_structure{};
     };
     static GeometryDrafts drafts;
     if (!drafts.initialized) {
@@ -1475,44 +1481,44 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         1.0F,
         "%.2f"
     );
-    int preset = static_cast<int>(settings.nr_preset);
+    int style = static_cast<int>(settings.nr_style);
     if (ImGui::Combo(
-            "DLSS-NR preset",
-            &preset,
-            "Default\0Preset A\0Preset B\0Preset C\0Preset D\0Preset E\0Preset F\0Preset G\0"
+            "DLSS-NR style",
+            &style,
+            "Standard\0Natural\0Cinematic\0"
         )) {
-        settings.nr_preset = static_cast<std::uint32_t>(preset);
+        settings.nr_style = static_cast<std::uint32_t>(style);
         changed = true;
     }
-    changed |= ImGui::SliderFloat(
-        "Intensity", &settings.nr_intensity,
-        0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+    deferred_slider(
+        "Intensity", settings.nr_intensity, drafts.intensity, drafts.editing_intensity,
+        0.0F, 1.0F, "%.2f"
     );
+    ImGui::TextDisabled("0 = no model edit, 1 = full model edit.");
     if (ImGui::TreeNode("Advanced DLSS-NR tuning")) {
-        changed |= ImGui::SliderFloat(
-            "Local tone strength", &settings.nr_local_tone_strength,
-            0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+        deferred_slider(
+            "Local tone strength", settings.nr_local_tone_strength, drafts.local_tone, drafts.editing_local_tone,
+            0.0F, 2.0F, "%.2f"
         );
-        changed |= ImGui::SliderFloat(
-            "Local structure strength", &settings.nr_local_structure_strength,
-            0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
-        );
-        changed |= ImGui::SliderFloat(
-            "Skin structure strength", &settings.nr_skin_structure_strength,
-            0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+        deferred_slider(
+            "Local structure strength", settings.nr_local_structure_strength, drafts.local_structure, drafts.editing_local_structure,
+            0.0F, 2.0F, "%.2f"
         );
         changed |= ImGui::Checkbox(
             "Automatic mask", &settings.nr_automatic_mask
         );
-        changed |= ImGui::Checkbox(
-            "UI correction", &settings.nr_ui_correction
+        if (settings.nr_automatic_mask) deferred_slider(
+            "Skin structure strength", settings.nr_skin_structure_strength, drafts.skin_structure, drafts.editing_skin_structure,
+            0.0F, 2.0F, "%.2f"
         );
+        if (dlss_nr_snapshot().hdr_input) {
+            changed |= ImGui::SliderFloat(
+                "Paper white scale", &settings.nr_paper_white_scale,
+                0.01F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
+            );
+        }
         changed |= ImGui::SliderFloat(
-            "Paper white scale", &settings.nr_paper_white_scale,
-            0.01F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
-        );
-        changed |= ImGui::SliderFloat(
-            "HDR transfer strength", &settings.nr_hdr_transfer_strength,
+            "Transfer strength", &settings.nr_hdr_transfer_strength,
             0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
         );
         changed |= ImGui::SliderFloat(
@@ -1555,6 +1561,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         settings.nr_processing_order = defaults.nr_processing_order;
         settings.nr_working_scale = defaults.nr_working_scale;
         settings.nr_preset = defaults.nr_preset;
+        settings.nr_style = defaults.nr_style;
         settings.nr_intensity = defaults.nr_intensity;
         settings.nr_local_tone_strength = defaults.nr_local_tone_strength;
         settings.nr_local_structure_strength = defaults.nr_local_structure_strength;

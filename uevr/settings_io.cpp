@@ -99,6 +99,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     // Older files predate this additive key and use After, even when loaded
     // over a currently configured Before setting. Commit only after validation.
     candidate.nr_processing_order = NrProcessingOrder::after_upscaling;
+    candidate.nr_style = 0U; // Older files used the hardcoded Standard style.
     std::string line; bool section = false;
     while (std::getline(in, line)) {
         const auto text = trim(line);

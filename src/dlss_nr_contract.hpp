@@ -88,8 +88,11 @@ struct DlssNrMotionAxis {
 // uses jittered render color; After uses the stabilized SR output. Jitter is
 // already a displacement, so do not apply the user's motion multiplier to it.
 [[nodiscard]] inline float dlss_nr_jitter_delta(float previous, float current,
-    bool before, bool vectors_jittered, bool reset) noexcept {
-    return reset ? 0.0F : (static_cast<int>(before) - static_cast<int>(vectors_jittered)) *
+    bool before, bool vectors_jittered, bool reset, float motion_multiplier = 1.0F) noexcept {
+    // Remove the jitter carried inside the scaled source field before adding
+    // the color's jitter. Only scene motion should receive the user multiplier.
+    return reset ? 0.0F : (static_cast<int>(before) -
+        static_cast<int>(vectors_jittered) * motion_multiplier) *
         (previous - current);
 }
 
@@ -103,7 +106,8 @@ struct DlssNrMotionAxis {
         static_cast<float>(region_extent) : 0.0F};
 }
 
-// Scales convert stored vectors to processing pixels (the crop-origin units).
+// Returns crop motion in region UVs, independent of the stored-vector scale.
+// A zero scene-motion multiplier must still allow crop-origin compensation.
 // Returns false when history cannot be reprojected safely.
 [[nodiscard]] bool dlss_nr_motion_offset(const DlssNrHistory& previous,
     const DlssNrHistory& current, float& x, float& y) noexcept;

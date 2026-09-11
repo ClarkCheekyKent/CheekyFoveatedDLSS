@@ -339,17 +339,20 @@ uevr.sdk.callbacks.on_draw_ui(function()
                     text("Rendering order: Unavailable in this runtime")
                 end
                 slider("NR working scale", "NrWorkingScale", 0.1, 1)
-                combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A",[2]="Preset B",[3]="Preset C",
-                    [4]="Preset D",[5]="Preset E",[6]="Preset F",[7]="Preset G"})
-                slider("NR intensity", "NrIntensity", 0, 2)
+                combo("DLSS-NR style", "NrStyle", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
+                slider("NR intensity", "NrIntensity", 0, 1)
+                text("Intensity: 0 = no model edit, 1 = full model edit.")
                 if imgui.tree_node("Advanced NR") then
                     slider("Local tone", "NrLocalToneStrength", 0, 2)
                     slider("Local structure", "NrLocalStructureStrength", 0, 2)
-                    slider("Skin structure", "NrSkinStructureStrength", 0, 2)
                     check("Automatic mask", "NrAutomaticMask")
-                    check("UI correction", "NrUiCorrection")
-                    slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
-                    slider("HDR transfer", "NrHdrTransferStrength", 0, 2)
+                    if draft.NrAutomaticMask == true then
+                        slider("Skin structure", "NrSkinStructureStrength", 0, 2)
+                    end
+                    if (status.nr_details or {}).hdr_input == true then
+                        slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
+                    end
+                    slider("Transfer strength", "NrHdrTransferStrength", 0, 2)
                     slider("Color strength", "NrColorStrength", 0, 2)
                     combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
                     slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)

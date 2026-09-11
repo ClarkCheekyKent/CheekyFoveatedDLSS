@@ -760,11 +760,11 @@ void test_dlss_nr_stable_crop_and_history() {
     current.y -= 8U;
     float x{}, y{};
     expect(dlss_nr_motion_offset(previous, current, x, y), "small NR crop move preserves history");
-    expect_near(x, 4.0F, 0.0001F, "NR origin motion uses output-pixel MV scale");
-    expect_near(y, 2.0F, 0.0001F, "NR origin motion respects negative vertical scale");
+    expect_near(x, 8.0F / 400.0F, 0.0001F, "NR origin motion uses region UVs");
+    expect_near(y, -8.0F / 240.0F, 0.0001F, "NR origin motion is independent of signed vector scale");
     // Static scene point: current-local + corrected MV = previous-local,
     // including a half-resolution NR working texture.
-    expect_near((100.0F - 8.0F) * 0.5F + x * current.scale_x * 0.5F,
+    expect_near((100.0F - 8.0F) * 0.5F + x * current.working_width,
         100.0F * 0.5F, 0.0001F, "NR reprojects overlapping static pixels at working scale");
     expect(dlss_nr_motion_offset(current, current, x, y) && x == 0.0F && y == 0.0F,
         "stationary NR region needs no correction");
@@ -786,7 +786,8 @@ void test_dlss_nr_stable_crop_and_history() {
     previous.scale_x = 0.0F;
     current = previous;
     current.x += 8U;
-    expect(!dlss_nr_motion_offset(previous, current, x, y), "invalid NR motion scale rejects crop correction");
+    expect(dlss_nr_motion_offset(previous, current, x, y), "zero NR motion scale still corrects crop motion");
+    expect_near(x, 8.0F / 400.0F, 0.0001F, "zero scene motion does not suppress gaze displacement");
 }
 
 void test_dlss_nr_maps_right_eye_region_into_packed_output() {
