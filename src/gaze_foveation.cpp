@@ -16,7 +16,12 @@ namespace cheeky::foveated_dlss {
 namespace {
 
 constexpr double gaze_stale_seconds = 0.050;
-constexpr double gaze_hold_seconds = 0.100;
+// A blink lasts 100-400 ms. The previous 100 ms hold plus the 50 ms staleness
+// limit gave 150 ms before the crop began drifting back to the fixed centre,
+// so an ordinary blink entered the return phase and snapped back on reopen.
+// Hold long enough to cover a blink; when tracking is genuinely lost the last
+// gaze point is still a better guess than screen centre for that extra time.
+constexpr double gaze_hold_seconds = 0.400;
 constexpr double gaze_return_seconds = 0.150;
 
 struct ViewState {
