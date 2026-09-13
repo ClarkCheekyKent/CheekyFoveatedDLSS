@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
             api.vr = &vr_api; api.openvr = &openvr_api;
         }
         auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
-        if (late && !dx11) {
+        if ((late && !dx11) || afw) {
             // Isolate the optional fake NR runtime from ordinary host fixtures
             // and from other concurrently running test processes.
             const auto isolated = root / "nr-hooks";

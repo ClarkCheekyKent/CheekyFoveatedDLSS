@@ -239,8 +239,8 @@ uevr.sdk.callbacks.on_draw_ui(function()
     local afw = status.afw_experiment or {}
     if afw.enabled then
         text("AFW compatibility detected. Check warp activity and SR status separately.")
-        text("Gaze covers both eye projections. NR and marker calibration are bypassed; saved preferences are retained.")
-        text(string.format("Coverage selected at last DLSS call: %.1f%% x %.1f%%; center scale %.2fx (%s).",
+        text("SR and NR support bilateral fixed/gaze coverage. Marker calibration is bypassed.")
+        text(string.format("SR coverage selected at last DLSS call: %.1f%% x %.1f%%; center scale %.2fx (%s).",
             100 * (afw.effective_width or 0.7), 100 * (afw.effective_height or 0.7),
             afw.effective_center_scale or 1, afw.coverage_mode == 3 and "bilateral gaze coverage" or afw.coverage_mode == 2 and "automatic stereo coverage" or afw.manual_coverage and "manual stereo coverage" or "centered minimum 70%"))
         rows("afw_routing", {{"Lower SR runtime selected", yes(afw.runtime_selected)},
@@ -265,7 +265,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
             text("Automatic coverage is awaiting fresh matching projections; the centered fallback is selected.")
         end
         if (afw.lower_calls or 0) == 0 then text("Waiting for a usable nested DLSS route; ordinary DLSS passes through.") end
-        if (afw.rejected_core_reentry or 0) > 0 then text("This hook chain reenters the core runtime. Disable Cheeky SR and include a support ZIP when reporting it.") end
+        if (afw.rejected_core_reentry or 0) > 0 then text("This hook chain reenters the core runtime. Disable Cheeky SR and NR and include a support ZIP when reporting it.") end
     end
     if not status.ready then text("Processing is paused. See the status and log before testing.") end
     text("Sliders apply on release. Other controls apply immediately and save automatically.")
@@ -382,12 +382,11 @@ uevr.sdk.callbacks.on_draw_ui(function()
     end
 
     if imgui.tree_node("DLSS-NR (experimental)") then
-        if afw.enabled then
-            text("DLSS-NR is bypassed while AFW compatibility is latched. Its saved settings are retained.")
-        elseif status.renderer == 0 then
+        if status.renderer == 0 then
             text("DLSS-NR / DX12 transport is unavailable on the DX11 path in the UEVR plugin.")
         else
             check("Enable DLSS-NR", "NrEnabled")
+            if afw.enabled then text("NR runs inside the nested DLSS route, after AFW motion preparation. Both rendering orders are supported; foveated NR covers both eyes with warp padding.") end
             text("Alt+Shift+> (period key): toggle DLSS-NR")
             if draft.NrEnabled then
                 check("Foveated NR", "NrFoveated")
@@ -397,7 +396,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
                     if not draft.NrUseSrFoveation then
                         slider("NR width", "NrWidth", 0.2, 1)
                         slider("NR height", "NrHeight", 0.2, 1)
-                        slider("NR roundness", "NrRoundness", 0, 1)
+                        if not afw.enabled then slider("NR roundness", "NrRoundness", 0, 1) end
                         slider("NR transition", "NrTransitionWidth", 0, 0.3)
                     end
                     check("Show NR alignment border", "NrAlignmentBorder")

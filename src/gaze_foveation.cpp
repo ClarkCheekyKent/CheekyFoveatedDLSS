@@ -217,8 +217,9 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
         selected.height = static_cast<float>(crop.input_height) / rh;
         const auto offsets = foveation_offsets_from_geometry(crop, rw, rh);
         selected.x_offset = offsets.x; selected.height_offset = offsets.y;
-        note_afw_coverage(selected, settings.afw_automatic_coverage && afw_projection_matches_output(afw_stereo_projection(), ow, oh, ox, oy),
-            diagnostics.using_gaze);
+        if (!settings.afw_nr_coverage)
+            note_afw_coverage(selected, settings.afw_automatic_coverage && afw_projection_matches_output(afw_stereo_projection(), ow, oh, ox, oy),
+                diagnostics.using_gaze);
         if (resolved) *resolved = foveation_center_from_geometry(crop, rw, rh);
         return true;
     };
@@ -858,7 +859,7 @@ void forget_gaze_view(const DlssViewId view_id) noexcept {
     view_states.erase(
         std::remove_if(
             view_states.begin(), view_states.end(), [&](const auto& state) {
-                return state.view_id == view_id;
+                return state.view_id == view_id || state.view_id == afw_nr_gaze_view(view_id);
             }
         ),
         view_states.end()

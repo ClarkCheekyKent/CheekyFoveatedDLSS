@@ -248,7 +248,7 @@ void detect_afw_runtime() noexcept {
         !GetProcAddress(module, "InitDevice") || !GetProcAddress(module, "InitFrameWarp")) return;
     // Latch for this process. AFW's hooks also run during warmup and fallback.
     enable_afw_compatibility();
-    log_info("AFW compatibility: full-frame core passthrough, nested public DLSS only; eye-independent coverage, NR/gaze/marker calibration bypassed. Warp activity is reported separately from DLL detection.");
+    log_info("AFW compatibility: full-frame core passthrough, nested SR/NR processing with bilateral fixed/gaze coverage; marker calibration bypassed. Warp activity is reported separately from DLL detection.");
 }
 
 void afw_private_succeeded(const NgxHandle* handle) {
@@ -4268,6 +4268,7 @@ NgxResult hook_core_create_d3d12(
     frame.jitter_uv_x = dlss_nr_ngx_motion_uv_scale(get_d3d12_parameter_float(parameters, "Jitter.Offset.X", 0.0F), input_width);
     frame.jitter_uv_y = dlss_nr_ngx_motion_uv_scale(get_d3d12_parameter_float(parameters, "Jitter.Offset.Y", 0.0F), input_height);
     frame.motion_vectors_jittered = (flags & (1U << 2U)) != 0U;
+    frame.view_output_base_x = frame.color_base_x; frame.view_output_base_y = frame.color_base_y;
     return frame;
 }
 
@@ -4280,6 +4281,8 @@ struct NativeNrInputScope {
     NativeNrInputScope(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
         const NgxParameters* params, const Settings& settings) noexcept {
         if (!list || !handle || !params || !is_dlss_feature(d3d12_game_feature(handle))) return;
+        if (settings.eye_independent_coverage && !settings.nr_enabled)
+            skip_dlss_nr_history(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle)));
         if (!settings.nr_enabled || settings.nr_processing_order != NrProcessingOrder::before_upscaling) {
             const auto view_id = static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle));
             const bool reset = dlss_nr_input_history_reset(view_id, settings.nr_processing_order, false, 0U, 0U);
@@ -4289,13 +4292,14 @@ struct NativeNrInputScope {
         frame = native_nr_frame(list, handle, params);
         original_color = get_d3d12_parameter_resource(params, "Color");
         auto* processed = prepare(list, params, settings);
+        if (!processed && settings.eye_independent_coverage) skip_dlss_nr_history(frame.view_id);
         const bool reset = dlss_nr_input_history_reset(frame.view_id, settings.nr_processing_order,
             processed != nullptr, frame.input_width, frame.input_height);
         substitution.emplace(params, original_color, processed, reset || gaze_reset);
     }
     ID3D12Resource* prepare(ID3D12GraphicsCommandList* list, const NgxParameters* params,
         const Settings& settings) noexcept {
-        if (settings.nr_foveated) {
+        if (settings.nr_foveated && !settings.eye_independent_coverage) {
             frame.has_center = calculate_coordinated_center(settings, frame.view_id, frame.color,
                 frame.input_width, frame.input_height, frame.output_width, frame.output_height,
                 frame.color_base_x, frame.color_base_y, frame.center, gaze_reset);
@@ -4332,7 +4336,8 @@ void evaluate_nr_after_native_d3d12(
     const Settings& settings,
     const NgxResult result,
     const FoveationCenter* const resolved_center = nullptr,
-    bool center_reset = false
+    bool center_reset = false,
+    const CropGeometry* const resolved_crop = nullptr
 ) noexcept {
     if (settings.nr_processing_order == NrProcessingOrder::before_upscaling) {
         if (ngx_succeeded(result) && parameters && command_list && handle) {
@@ -4349,15 +4354,18 @@ void evaluate_nr_after_native_d3d12(
         }
         return;
     }
+    if (settings.eye_independent_coverage && !ngx_succeeded(result))
+        skip_dlss_nr_history(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle)));
     if (!settings.nr_enabled || !ngx_succeeded(result) ||
         command_list == nullptr || handle == nullptr || parameters == nullptr ||
         !is_dlss_feature(d3d12_game_feature(handle))) return;
     auto frame = native_nr_frame(command_list, handle, parameters);
+    if (resolved_crop) { frame.shared_sr_crop = *resolved_crop; frame.has_shared_sr_crop = true; }
     frame.reset = frame.reset || center_reset;
     if (resolved_center != nullptr) {
         frame.center = *resolved_center;
         frame.has_center = true;
-    } else if (settings.nr_foveated) {
+    } else if (settings.nr_foveated && !settings.eye_independent_coverage) {
         bool reset{};
         frame.has_center = calculate_coordinated_center(settings, frame.view_id, frame.color,
             frame.input_width, frame.input_height, frame.output_width, frame.output_height,
@@ -4572,7 +4580,7 @@ void evaluate_nr_after_native_d3d12(
     }
     if (!ngx_succeeded(result)) return false;
     evaluate_nr_after_native_d3d12(
-        command_list, handle, parameters, settings, result, &nr_center, nr_center_reset
+        command_list, handle, parameters, settings, result, &nr_center, nr_center_reset, &crop
     );
     diagnostic_note_activation(DiagnosticApi::d3d12, crop);
     return true;

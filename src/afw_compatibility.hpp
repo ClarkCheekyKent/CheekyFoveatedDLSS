@@ -56,7 +56,7 @@ inline bool afw_projection_matches_output(const AfwStereoProjection& projection,
 // uncertainty envelope, not a claim that opposite-eye UVs correspond in 3D.
 // Padding is a user-controlled heuristic for warp donors/disocclusion, not a
 // reprojection guarantee. No DLSS-handle or evaluation-parity eye guesses.
-inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjection* projection = nullptr) noexcept {
+inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjection* projection = nullptr) noexcept {
     const auto finite = [](float value, float fallback, float lo, float hi) {
         return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
     };
@@ -106,7 +106,18 @@ inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjec
     settings.auto_stereo_alignment = settings.invert_stereo_x_offset = false;
     settings.center_supersampling = finite(settings.center_supersampling, 1.F, 1.F, 2.F);
     settings.next_jump_visible = false;
-    settings.nr_enabled = false;
     return settings;
+}
+inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjection* projection = nullptr) noexcept {
+    auto nr = settings;
+    if (!settings.nr_use_sr_foveation) { nr.width = settings.nr_width; nr.height = settings.nr_height; }
+    nr = afw_coverage_settings(nr, projection);
+    settings = afw_coverage_settings(settings, projection);
+    settings.afw_nr = {nr.width, nr.height, nr.x_offset, nr.height_offset, nr.afw_gaze_width, nr.afw_gaze_height};
+    return settings;
+}
+inline std::uint64_t afw_nr_gaze_view(std::uint64_t view) noexcept {
+    // Windows native NGX handles do not occupy this private coordinator namespace.
+    return view ^ 0x4000000000000000ULL;
 }
 }

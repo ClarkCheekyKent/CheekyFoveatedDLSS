@@ -43,6 +43,10 @@ struct Settings {
     float afw_warp_margin{0.05F};
     bool eye_independent_coverage{}; // Transient: never mirror a resolved AFW envelope by guessed view role.
     float afw_gaze_width{}, afw_gaze_height{}; // Requested size before the fixed fallback envelope expands it.
+    struct AfwNrCoverage {
+        float width{}, height{}, x{}, y{}, gaze_width{}, gaze_height{};
+    } afw_nr; // Evaluation-local NR envelope; never persisted.
+    bool afw_nr_coverage{}; // NR uses its own gaze allocation without replacing SR coverage diagnostics.
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};

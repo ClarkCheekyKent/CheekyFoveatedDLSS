@@ -115,8 +115,15 @@ FoveationParameters dlss_nr_foveation_parameters(
         )) {
         return {0U, 0U, width, height, 1.0F, 1.0F, 0.0F, 0.0F};
     }
-    const auto x = dlss_nr_aligned_axis(geometry.output_base_x, geometry.output_width, width);
-    const auto y = dlss_nr_aligned_axis(geometry.output_base_y, geometry.output_height, height);
+    const auto aligned = [&](unsigned base, unsigned extent, unsigned capacity) {
+        if (!settings.eye_independent_coverage) return dlss_nr_aligned_axis(base, extent, capacity);
+        // Reserve the worst-case alignment pad so moving an unchanged gaze
+        // envelope neither clips its far edge nor toggles NR feature dimensions.
+        const auto size = (std::min)(capacity, (extent + 14U) / 8U * 8U);
+        return DlssNrAxis{(std::min)(base - base % 8U, capacity - size), size};
+    };
+    const auto x = aligned(geometry.output_base_x, geometry.output_width, width);
+    const auto y = aligned(geometry.output_base_y, geometry.output_height, height);
     return {
         x.base, y.base, x.extent, y.extent,
         parameters.width,

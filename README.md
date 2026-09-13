@@ -76,7 +76,7 @@ Start with defaults, then compare native and foveated DLSS timings in the perfor
 1. Use latest DLSS files using DLSS Swapper
 2. Make sure no overrides are set in NVidia Profile Inspector, NVidia App, or DLSS Swapper
 3. I found games don't like some presets (Example Mortal Shell 2 causes smearing if center region is set to Preset K). Try other Presets.
-4. UEVR AFW has an experimental DX12 routing path with fixed or gaze-driven coverage of both eyes, center supersampling, separate center/peripheral histories, and warp eye/mode diagnostics on verified builds. It uses the public AFW UEVR build without a custom executable. Marker calibration and NR remain bypassed. The original centered mode kept AFW enabled in a Hogwarts Legacy user test; the completed SR integration still needs in-game validation. [AFW test instructions](uevr/README.md#afw-routing-experiment)
+4. UEVR AFW has an experimental DX12 routing path for SR and NR, with fixed or gaze-driven coverage of both eyes, center supersampling, and warp eye/mode diagnostics on verified builds. NR supports before/after upscaling, full-frame or foveated processing, and independent or linked SR coverage. It uses the public AFW UEVR build without a custom executable. Marker calibration remains bypassed. The original centered SR mode kept AFW enabled in a Hogwarts Legacy user test; the completed integration still needs in-game validation. [AFW test instructions](uevr/README.md#afw-routing-experiment)
 5. Eye Tracking: You can use https://github.com/maluoi/openxr-explorer to verify eye tracking works
 
 ## Eye tracking (experimental)

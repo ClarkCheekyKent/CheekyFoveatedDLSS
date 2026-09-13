@@ -130,6 +130,7 @@ def run(engine):
     state = copy.deepcopy(baseline)
     state["settings"]["Enabled"] = True
     afw = copy.deepcopy(state)
+    afw["renderer"] = 1  # AFW supports DX12; the newest ordinary host report may be DX11.
     afw["afw_experiment"] = {"enabled": True, "core_calls": 100, "lower_calls": 0,
                              "missing_lower_calls": 100, "rejected_core_reentry": 0}
     receive(afw)
@@ -138,10 +139,16 @@ def run(engine):
     assert any("AFW compatibility detected" in t for t in g.drawn.values())
     assert any("ordinary DLSS passes through" in t for t in g.drawn.values())
     assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
-    assert "Foveation center" in g["values"] and "Enable DLSS-NR" not in g["values"]
+    assert "Foveation center" in g["values"] and "Enable DLSS-NR" in g["values"]
     assert "Automatic stereo alignment" not in g["values"] and "Invert stereo eye order" not in g["values"]
     assert "Automatic eye calibration (this session)" not in g["values"]
     assert "Center supersampling" in g["values"]
+    afw["settings"].update(NrEnabled=True, NrFoveated=True, NrUseSrFoveation=False)
+    receive(afw)
+    draw()
+    assert "Rendering order" in g["values"] and "NR width" in g["values"]
+    assert "NR roundness" not in g["values"] and "NR working scale" in g["values"]
+    assert any("after AFW motion preparation" in t for t in g.drawn.values())
     afw["afw_experiment"].update(lower_calls=100, missing_lower_calls=0)
     afw["afw_experiment"].update(runtime_candidates=1, runtime_selected=True)
     receive(afw)

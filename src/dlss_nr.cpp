@@ -9,6 +9,9 @@
 #include "nr_guides.hpp"
 #include "runtime.hpp"
 #include "runtime_search.hpp"
+#include "afw_compatibility.hpp"
+#include "gaze_foveation.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 
 #include <Windows.h>
 #include <d3dcompiler.h>
@@ -173,6 +176,8 @@ struct ViewState {
     std::uint64_t settings_signature{};
     std::uint64_t reset_generation{};
     DlssNrHistory history{};
+    NrRegion last_region{};
+    NrProcessingOrder last_order{};
     float jitter_uv_x{}, jitter_uv_y{};
     DlssNrRoute history_route{};
     std::uint64_t history_calls{}, history_moves{}, history_resets{};
@@ -1334,12 +1339,42 @@ void dispatch_codec(
     );
 }
 
+// Resolve NR independently of SR: changing NR dimensions must not resize the
+// SR history, and NR must keep tracking when foveated SR is disabled.
+bool resolve_afw_nr_coverage(DlssNrFrame& frame, Settings& settings) noexcept {
+    if (!settings.eye_independent_coverage || !settings.nr_enabled || !settings.nr_foveated) return true;
+    auto coverage = settings;
+    coverage.enabled = true;
+    coverage.width = settings.afw_nr.width; coverage.height = settings.afw_nr.height;
+    coverage.x_offset = settings.afw_nr.x; coverage.height_offset = settings.afw_nr.y;
+    coverage.afw_gaze_width = settings.afw_nr.gaze_width; coverage.afw_gaze_height = settings.afw_nr.gaze_height;
+    coverage.afw_nr_coverage = true;
+    CropGeometry crop{}; bool reset{};
+    if (settings.nr_use_sr_foveation && frame.has_shared_sr_crop) {
+        crop = frame.shared_sr_crop;
+        if (!frame.input_width || !frame.input_height) return false;
+        frame.center = foveation_center_from_geometry(crop, frame.input_width, frame.input_height);
+    } else if (!calculate_coordinated_crop(coverage, afw_nr_gaze_view(frame.view_id), frame.color,
+            frame.input_width, frame.input_height, frame.output_width, frame.output_height,
+            frame.view_output_base_x, frame.view_output_base_y, crop, reset, nullptr, &frame.center)) return false;
+    frame.has_center = true; frame.reset |= reset;
+    settings.nr_width = static_cast<float>(crop.input_width) / frame.input_width;
+    settings.nr_height = static_cast<float>(crop.input_height) / frame.input_height;
+    settings.nr_roundness = settings.nr_use_sr_foveation ? settings.roundness : 0.F;
+    if (settings.nr_use_sr_foveation) settings.nr_transition_width = settings.transition_width;
+    settings.nr_use_sr_foveation = false;
+    return true;
+}
 }  // namespace
 
 bool evaluate_dlss_nr(
-    const DlssNrFrame& frame,
-    const Settings& settings
+    const DlssNrFrame& input_frame,
+    const Settings& input_settings
 ) noexcept {
+    auto frame = input_frame;
+    auto settings = input_settings;
+    if (!resolve_afw_nr_coverage(frame, settings)) { skip_dlss_nr_history(frame.view_id); return false; }
+    AfwPrivateWorkScope private_work;
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     collect_retired_views();
@@ -1780,6 +1815,7 @@ bool evaluate_dlss_nr(
     );
     ++diagnostics.evaluation_calls;
     view.history = history;
+    view.last_region = region; view.last_order = settings.nr_processing_order;
     view.jitter_uv_x = frame.jitter_uv_x;
     view.jitter_uv_y = frame.jitter_uv_y;
     view.history_route = frame.route;
@@ -1807,7 +1843,9 @@ bool evaluate_dlss_nr(
     return true;
 }
 
-void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noexcept {
+void draw_dlss_nr_border(const DlssNrFrame& input_frame, const Settings& input_settings) noexcept {
+    auto frame = input_frame;
+    auto settings = input_settings;
     if (!settings.nr_enabled || !settings.nr_alignment_border_enabled ||
         settings.nr_processing_order != NrProcessingOrder::before_upscaling ||
         !frame.color || !frame.command_list || !frame.output_width || !frame.output_height) return;
@@ -1819,6 +1857,13 @@ void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noe
     auto region = calculate_region(settings, frame.input_width, frame.input_height,
         frame.has_shared_sr_crop ? &frame.shared_sr_crop : nullptr, frame.input_width, frame.input_height,
         frame.has_center ? &frame.center : nullptr);
+    if (settings.eye_independent_coverage) {
+        // Before NR already sampled gaze. Draw the region actually processed,
+        // even if inference took long enough for the gaze publication to age.
+        const auto found = std::find_if(views.begin(), views.end(), [&](const auto& v) { return v.view_id == frame.view_id; });
+        if (found == views.end() || !found->was_enabled || found->last_order != NrProcessingOrder::before_upscaling) return;
+        region = found->last_region;
+    }
     const auto x = scale_subrect(region.base_x, region.width, frame.color_base_x,
         frame.output_width, frame.input_width);
     const auto y = scale_subrect(region.base_y, region.height, frame.color_base_y,
@@ -1853,6 +1898,11 @@ void collect_dlss_nr_submissions() noexcept {
     std::lock_guard lock(nr_mutex);
     collect_retired_views();
 }
+void skip_dlss_nr_history(const DlssViewId view_id) noexcept {
+    std::lock_guard lock(nr_mutex);
+    for (auto& view : views) if (view.view_id == view_id) view.was_enabled = false;
+}
+
 void release_dlss_nr_view(const DlssViewId view_id) noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     release_dlss_nr_inputs(view_id);

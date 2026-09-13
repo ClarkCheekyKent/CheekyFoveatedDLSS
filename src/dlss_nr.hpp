@@ -75,6 +75,7 @@ struct DlssNrFrame {
     // Preserve the original full-view mapping independently of that copy.
     std::uint32_t motion_full_width{}, motion_full_height{}, depth_full_width{}, depth_full_height{};
     std::uint32_t motion_copy_x{}, motion_copy_y{}, depth_copy_x{}, depth_copy_y{};
+    std::uint32_t view_output_base_x{}, view_output_base_y{}; // Retained when Before NR switches color to input space.
 };
 
 struct DlssNrSnapshot {
@@ -109,6 +110,7 @@ void collect_dlss_nr_submissions() noexcept;
 void draw_dlss_nr_border(const DlssNrFrame& frame, const Settings& settings) noexcept;
 
 void release_dlss_nr_view(DlssViewId view_id) noexcept;
+void skip_dlss_nr_history(DlssViewId view_id) noexcept;
 void release_dlss_nr_resources() noexcept;
 void reset_dlss_nr() noexcept;
 

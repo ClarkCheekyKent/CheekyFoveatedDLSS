@@ -1542,9 +1542,20 @@ void test_afw_dispatch_and_settings() {
     saved.center_supersampling = 2.F; saved.center_mode = FoveationCenterMode::simulated_gaze;
     const auto effective = afw_experiment_settings(saved);
     expect(effective.width == .7F && effective.height == .9F && effective.x_offset == 0.F && effective.height_offset == 0.F &&
-        !effective.auto_stereo_alignment && !effective.nr_enabled && effective.center_supersampling == 2.F &&
+        !effective.auto_stereo_alignment && effective.nr_enabled && effective.center_supersampling == 2.F &&
         effective.center_mode == FoveationCenterMode::simulated_gaze, "AFW preserves the requested gaze source with a generous fixed fallback");
     expect(saved.width == .4F && saved.nr_enabled && saved.center_supersampling == 2.F, "AFW overrides leave saved settings intact");
+    auto independent = saved;
+    independent.afw_manual_coverage = true; independent.nr_use_sr_foveation = false;
+    independent.nr_width = .3F; independent.nr_height = .4F;
+    const auto nr_envelope = afw_experiment_settings(independent);
+    independent.width = .9F;
+    expect(afw_experiment_settings(independent).afw_nr.width == nr_envelope.afw_nr.width,
+        "Independent AFW NR coverage is unaffected by SR size changes");
+    independent.nr_use_sr_foveation = true;
+    const auto linked = afw_experiment_settings(independent);
+    expect(linked.afw_nr.width == linked.width && linked.afw_nr.height == linked.height,
+        "Linked AFW NR includes the same fixed stereo envelope as SR");
     for (const auto width : {.2F, .55F, .7F, 1.F})
     for (const auto height : {.2F, .45F, .7F, 1.F})
     for (const auto x : {-1.F, -.6F, 0.F, .6F, 1.F})
@@ -1787,6 +1798,21 @@ void test_afw_gaze_integration() {
 void test_afw_gaze_pixel_coverage() {
     using namespace cheeky::foveated_dlss;
     for (unsigned extent : {33U, 128U, 999U, 2259U, 4096U}) {
+        Settings nr;
+        nr.eye_independent_coverage = nr.nr_foveated = true; nr.nr_use_sr_foveation = false;
+        nr.nr_width = .217F; nr.nr_height = .3F;
+        unsigned previous_width{};
+        for (unsigned step = 0; step <= 100; ++step) {
+            const FoveationCenter center{step / 100.F, .5F, 1};
+            const auto parameters = dlss_nr_foveation_parameters(nr, &center);
+            CropGeometry wanted{};
+            expect(calculate_foveation_geometry(parameters, extent, extent, extent, extent, 0, 0, wanted), "NR target geometry resolves");
+            const auto region = calculate_region(nr, extent, extent, nullptr, extent, extent, &center);
+            expect(region.base_x <= wanted.input_base_x && region.base_x + region.width >= wanted.input_base_x + wanted.input_width &&
+                region.base_x + region.width <= extent, "Aligned AFW NR retains its complete gaze envelope");
+            expect(!previous_width || previous_width == region.width, "Gaze translation keeps NR allocation dimensions stable");
+            previous_width = region.width;
+        }
         for (unsigned quantum : {1U, 8U, 64U}) {
             unsigned retained{};
             for (unsigned step = 0; step <= 100; ++step) {

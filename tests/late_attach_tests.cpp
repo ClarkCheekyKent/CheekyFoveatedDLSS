@@ -33,6 +33,8 @@ struct SrInput { ID3D12Resource* color{}; unsigned reset{}; };
 std::vector<SrInput> sr_inputs;
 std::string evaluation_order;
 unsigned nr_reset{};
+const NgxHandle* nr_last_handle{};
+void observe_nr_handle(const NgxHandle* handle, const NgxParameters*) { nr_last_handle = handle; }
 float nr_motion_x{};
 unsigned nr_motion_width{};
 ComPtr<ID3D12Resource> nr_motion_resource;
@@ -141,6 +143,7 @@ void observe_afw_history(const NgxHandle* handle, const NgxParameters* params) {
 }
 bool afw_contract_ok{true}, afw_order_ok{true};
 void observe_afw_core(const NgxParameters* params) {
+    evaluation_order += 'A';
     ++afw_full_calls;
     auto& f = fixture();
     const char* names[]{"Color", "Depth", "MotionVectors", "Output"};
@@ -154,6 +157,7 @@ void observe_afw_core(const NgxParameters* params) {
     const_cast<NgxParameters*>(params)->Set("CheekyFake.AfwCorrected", afw_full_calls);
 }
 void observe_afw_lower(const NgxParameters* params) {
+    observe_sr(params);
     ++afw_lower_calls;
     afw_order_ok &= get_ui(params, "CheekyFake.AfwCorrected") == afw_full_calls;
     ID3D12Resource* depth{}; params->Get("Depth", &depth);
@@ -715,15 +719,109 @@ void verify_afw_gaze_history(CheekyUEVRSnapshotFn get, void (*command)(const cha
     command("1\n235\nset\nEnabled=true"); evaluate();
     require(afw_history.size() == 2 && afw_history[0].reset && afw_history[1].reset, "Native fallback invalidates both skipped private histories");
     evaluate(); require(!afw_history[0].reset && !afw_history[1].reset, "Native-to-private transition resets only once");
+    command("1\n237\nset\nNrEnabled=true\nNrProcessingOrder=0\nNrFoveated=true\nNrUseSrFoveation=false\nNrWidth=0.2\nNrHeight=0.3\nNrWorkingScale=0.5");
+    evaluate(); evaluate();
+    require(snapshot(get).find("\"afw_fresh_sample\":true") != std::string::npos &&
+        snapshot(get).find("\"nr\":\"Active\"") != std::string::npos, "Independent foveated NR consumes bilateral gaze through the real hook");
+    const auto gaze_sr_creates = f.creates();
+    command("1\n238\nset\nNrWidth=0.45"); evaluate();
+    require(f.creates() == gaze_sr_creates, "NR gaze size changes do not recreate SR histories");
+    command("1\n239\nset\nNrUseSrFoveation=true\nNrProcessingOrder=1"); evaluate(); evaluate();
+    require(snapshot(get).find("\"afw_fresh_sample\":true") != std::string::npos &&
+        snapshot(get).find("\"processing_width\":128") != std::string::npos, "Before NR supports gaze and linked SR coverage");
+    command("1\n250\nset\nNrEnabled=false"); evaluate();
     command("1\n236\nset\nCenterMode=0");
     proc<void(*)(void(*)(const NgxHandle*, const NgxParameters*))>(f.ngx, "CheekyFakeObserveHandle")(nullptr);
     FreeLibrary(layer);
     puts("PASS: AFW bilateral gaze, shared/separate game histories, reset propagation and skipped periphery");
 }
 
+void verify_afw_nr(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
+    auto& f = fixture();
+    wchar_t runtime_path[32768]{};
+    require(GetModuleFileNameW(GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"), runtime_path, 32768), "Locate isolated AFW NR fixture");
+    const auto nr = LoadLibraryW((std::filesystem::path(runtime_path).parent_path() / "nvngx_dlssnr.dll").c_str());
+    require(nr != nullptr, "Load isolated NR snippet");
+    proc<void(*)(void(*)(const NgxParameters*))>(nr, "CheekyFakeObserve")(observe_nr);
+    proc<void(*)(void(*)(const NgxParameters*))>(nr, "CheekyFakeObserveCreated")(observe_nr_created);
+    proc<void(*)(void(*)(const NgxHandle*, const NgxParameters*))>(nr, "CheekyFakeObserveHandle")(observe_nr_handle);
+    proc<void(*)(bool)>(nr, "CheekyFakeCopyNrColor")(true);
+    const auto fail = proc<void(*)(bool)>(nr, "CheekyFakeFailEvaluations");
+    const auto creates = proc<Counter>(nr, "CheekyFakeCreates");
+    const auto evaluate = [&] {
+        command("1\n240\nget");
+        evaluation_order.clear(); sr_inputs.clear(); nr_reset = ~0U;
+        auto original = f.params.values;
+        require(ngx_succeeded(f.evaluate()), "AFW NR frame succeeds"); f.finish_gpu();
+        original["CheekyFake.AfwCorrected"] = f.params.values.at("CheekyFake.AfwCorrected");
+        require(f.params.values == original, "NR restores all game parameters after AFW processing");
+        require(afw_contract_ok && afw_order_ok, "NR never changes the contract visible to the AFW core");
+    };
+    command("1\n241\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=true\nNrProcessingOrder=0\nNrFoveated=true\nNrUseSrFoveation=false\nNrWidth=0.3\nNrHeight=0.4\nNrWorkingScale=1\nAfwAutomaticCoverage=true\nCenterMode=0");
+    evaluate();
+    require(evaluation_order == "ASSN" && nr_reset == 1, "After NR follows AFW preparation, periphery and center exactly once");
+    const auto first_nr_creates = creates();
+    evaluate();
+    require(evaluation_order == "ASSN" && nr_reset == 0 && creates() == first_nr_creates,
+        "Stable AFW NR retains its private feature and temporal history");
+    require(snapshot(get).find("\"processing_width\":256") != std::string::npos, "After NR processes output-space pixels");
+    proc<void(*)(unsigned)>(f.ngx, "CheekyFakeFailNextEvaluations")(2); evaluate();
+    require(evaluation_order == "ASSSN", "After NR runs once after private SR failure and successful native fallback");
+    evaluate(); evaluate();
+    const auto first_nr_handle = nr_last_handle;
+    const auto first_game_handle = f.handle;
+    NgxHandle* second_game_handle{};
+    require(ngx_succeeded(f.create12(f.list.Get(), 1, &f.params, &second_game_handle)), "Create second AFW NR history");
+    const auto select = [&](NgxHandle* handle) {
+        f.handle = handle;
+        if (f.use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, handle, &f.params);
+    };
+    select(second_game_handle); evaluate();
+    require(nr_last_handle != first_nr_handle && nr_reset == 1, "Separate AFW game handles own separate NR features");
+    select(first_game_handle); evaluate();
+    require(nr_last_handle == first_nr_handle && nr_reset == 0, "Returning to a game handle preserves its NR history");
+    require(ngx_succeeded(f.release(second_game_handle)), "Release second AFW NR history");
+    const auto sr_creates = f.creates();
+    command("1\n242\nset\nNrWidth=0.6\nNrHeight=0.5"); evaluate();
+    require(nr_reset == 1 && f.creates() == sr_creates, "Independent NR coverage change leaves SR feature allocations intact");
+    command("1\n243\nset\nNrProcessingOrder=1\nNrAlignmentBorder=true"); evaluate();
+    require(evaluation_order == "ANSS" && nr_reset == 1 && sr_inputs.size() == 2 &&
+        sr_inputs.back().color != f.textures12[0].Get(), "Before NR substitutes a private full-size color only below AFW");
+    require(snapshot(get).find("\"processing_width\":128") != std::string::npos, "Before NR processes input-space pixels");
+    evaluate(); require(nr_reset == 0 && !sr_inputs[0].reset && !sr_inputs[1].reset, "Stable Before NR preserves all three histories");
+    proc<void(*)(unsigned)>(f.ngx, "CheekyFakeFailNextEvaluations")(2); evaluate();
+    require(evaluation_order == "ANSSS" && sr_inputs.back().color != f.textures12[0].Get(),
+        "Before NR is evaluated once and its processed input survives native SR fallback");
+    evaluate(); evaluate();
+    fail(true); evaluate();
+    require(evaluation_order == "ANSS" && sr_inputs.back().color == f.textures12[0].Get() &&
+        sr_inputs[0].reset && sr_inputs[1].reset, "NR failure restores raw SR input and resets both processed-input histories");
+    fail(false); evaluate();
+    require(nr_reset == 1 && sr_inputs[0].reset && sr_inputs[1].reset, "NR recovery resets raw-to-processed histories once");
+    command("1\n244\nset\nNrProcessingOrder=0\nNrAlignmentBorder=false\nEnabled=false"); evaluate();
+    if (evaluation_order != "ASN") { printf("Unexpected NR order: %s\n", evaluation_order.c_str()); puts(snapshot(get).c_str()); }
+    require(evaluation_order == "ASN", "After NR also works with ordinary SR beneath AFW");
+    command("1\n245\nset\nNrEnabled=false"); evaluate();
+    require(evaluation_order == "AS", "NR disabled performs no private neural work");
+    command("1\n246\nset\nNrEnabled=true"); evaluate();
+    require(evaluation_order == "ASN" && nr_reset == 1, "Re-enabled After NR resets skipped temporal history");
+    evaluate(); require(nr_reset == 0, "Re-enabled NR reset is not repeated");
+    command("1\n247\nset\nNrFoveated=false\nNrWorkingScale=0.5"); evaluate();
+    require(snapshot(get).find("\"region_width\":256") != std::string::npos && snapshot(get).find("\"working_width\":128") != std::string::npos,
+        "Full-frame AFW NR supports its working scale without resizing game output");
+    afw_expected_reset = 1; f.params.Set("Reset", 1U); evaluate();
+    require(nr_reset == 1 && get_ui(&f.params, "Reset") == 1, "AFW game reset propagates to NR without changing original parameters");
+    afw_expected_reset = 0; f.params.Set("Reset", 0U);
+    command("1\n248\nset\nNrEnabled=false\nEnabled=true\nNrFoveated=true");
+    evaluate();
+    FreeLibrary(nr);
+    puts("PASS: AFW NR Before/After order, independent coverage, full-frame scaling, failure recovery and original contract");
+}
+
 void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     auto& f = fixture();
-    command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=2\nAutoStereoAlignment=true\nCenterMode=2\nNrEnabled=true\nAlignmentBorder=false");
+    command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=2\nAutoStereoAlignment=true\nCenterMode=2\nNrEnabled=false\nAlignmentBorder=false");
+    if (afw_missing_lower) command("1\n249\nset\nNrEnabled=true");
     require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos, "AFW experiment visible in exported status");
     if (afw_ota) {
         const auto discovery = snapshot(get);
@@ -744,6 +842,11 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
         "AFW core receives game work only, no private creates/evaluations");
     require(afw_contract_ok && afw_order_ok, "AFW sees full resources and precedes private DLSS work");
     const auto status = snapshot(get);
+    if (afw_missing_lower) {
+        const auto nr_begin = status.find("\"nr_details\":{");
+        require(nr_begin != std::string::npos && status.substr(nr_begin, status.find('}', nr_begin) - nr_begin).find("\"evaluations\":0") != std::string::npos,
+            "Unavailable or ambiguous nested route does not run enabled NR outside AFW");
+    }
     require(status.find("\"rejected_core_reentry\":0") != std::string::npos, "Supported route never reenters core");
     require(status.find("\"warp_observer_ready\":true") != std::string::npos &&
         status.find("\"warp_calls\":0") != std::string::npos && status.find("\"last_warp_age_ms\":-1") != std::string::npos,
@@ -771,7 +874,7 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
             "One nested game DLSS route per full-frame core call");
         const auto nr_begin = status.find("\"nr_details\":{");
         require(nr_begin != std::string::npos && status.substr(nr_begin, status.find('}', nr_begin) - nr_begin).find("\"evaluations\":0") != std::string::npos,
-            "Experimental path does not evaluate NR");
+            "Disabled NR does not evaluate");
         // Change coverage and quality while AFW continues to see the same full
         // game textures. Stable manual placement must retain private handles.
         command("1\n210\nset\nAfwManualCoverage=true\nAfwWarpMargin=0.05\nXOffset=0.5\nHeightOffset=-0.25\nCenterSupersampling=1.25");
@@ -824,6 +927,7 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
         require(ngx_succeeded(f.evaluate()), "Toggle off resumes native history"); f.finish_gpu();
         require(afw_full_resets == 2, "Toggle transition resets native history once");
         verify_afw_gaze_history(get, command);
+        verify_afw_nr(get, command);
     }
     require(ngx_succeeded(f.release(f.handle)), "Wrapped core release cleans lower game and private handles");
     require(f.creates() == f.releases(), "No leaked lower private features after core release");
