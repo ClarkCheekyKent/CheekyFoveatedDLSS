@@ -552,13 +552,25 @@ LONG CALLBACK hook_debug_exception_handler(
 
     static thread_local bool reporting{};
     if (reporting) return EXCEPTION_CONTINUE_SEARCH;
-    static std::atomic<unsigned> exceptions{};
-    const unsigned exception_number = exceptions.fetch_add(1, std::memory_order_relaxed)+1;
-    if (exception_number > 1024 || (exception_number > 16 && (exception_number & (exception_number-1)) != 0)) return EXCEPTION_CONTINUE_SEARCH;
     reporting = true;
     struct ReportingReset { bool& flag; ~ReportingReset() { flag = false; } } reset{reporting};
-    hook_debug_emergency_logf("HOOKDBG EXCEPTION sampled_event=%u pid=%lu tick_ms=%llu (first16 then powers-of-two; capped)",
-        exception_number, GetCurrentProcessId(), GetTickCount64());
+
+    // First-chance exceptions may be handled by the application's SEH probes.
+    // UEVR's guarded UObject candidate checks can generate these continuously.
+    // Never turn those probes into unbounded synchronous log/stack-walk work,
+    // even when the addon's rendering is disabled. Saturate rather than wrap.
+    static std::atomic<unsigned int> reports{0U};
+    constexpr unsigned int report_limit = 8U;
+    auto report_count = reports.load(std::memory_order_relaxed);
+    do {
+        if (report_count >= report_limit) return EXCEPTION_CONTINUE_SEARCH;
+    } while (!reports.compare_exchange_weak(
+        report_count, report_count + 1U, std::memory_order_relaxed));
+    if (report_count + 1U == report_limit) {
+        hook_debug_emergency_logf(
+            "HOOKDBG first-chance report limit reached; subsequent exceptions pass through without logging");
+    }
+
     const auto* const context = pointers->ContextRecord;
     void* instruction{};
     std::uintptr_t stack_pointer{};
