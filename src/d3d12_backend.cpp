@@ -41,6 +41,7 @@ struct CanonicalViewState {
     NgxHandle* private_handle{};
     D3D12ReleaseFeatureFn release_feature{};
     CropGeometry last_crop{};
+    std::uint64_t evaluations{}, resets{}, motion_corrections{};
     bool has_key{};
     bool has_crop{};
 };
@@ -279,13 +280,6 @@ SRWLOCK resources_lock = SRWLOCK_INIT;
 D3D12Resources* resource_list{};
 std::uint64_t resource_use_sequence{};
 constexpr std::size_t resource_cache_capacity = 8U;
-
-SRWLOCK settings_lock = SRWLOCK_INIT;
-bool last_enabled{};
-std::uint32_t last_width_bits{};
-std::uint32_t last_height_bits{};
-std::uint32_t last_height_offset_bits{};
-std::uint32_t last_roundness_bits{};
 
 
 
@@ -686,34 +680,6 @@ void insert_uav_barrier(
     command_list->ResourceBarrier(1U, &barrier);
 }
 
-[[nodiscard]] bool consume_reset(const Settings& settings) noexcept {
-    std::uint32_t width_bits{};
-    std::uint32_t height_bits{};
-    std::uint32_t height_offset_bits{};
-    std::uint32_t roundness_bits{};
-    std::memcpy(&width_bits, &settings.width, sizeof(width_bits));
-    std::memcpy(&height_bits, &settings.height, sizeof(height_bits));
-    std::memcpy(
-        &height_offset_bits,
-        &settings.height_offset,
-        sizeof(height_offset_bits)
-    );
-    std::memcpy(&roundness_bits, &settings.roundness, sizeof(roundness_bits));
-
-    AcquireSRWLockExclusive(&settings_lock);
-    const bool reset = !last_enabled || width_bits != last_width_bits ||
-        height_bits != last_height_bits ||
-        height_offset_bits != last_height_offset_bits ||
-        roundness_bits != last_roundness_bits;
-    last_enabled = true;
-    last_width_bits = width_bits;
-    last_height_bits = height_bits;
-    last_height_offset_bits = height_offset_bits;
-    last_roundness_bits = roundness_bits;
-    ReleaseSRWLockExclusive(&settings_lock);
-    return reset;
-}
-
 }  // namespace
 
 struct D3D12Evaluation {
@@ -775,9 +741,7 @@ D3D12Evaluation* prepare_d3d12(
     const Settings& settings
 ) noexcept {
     if (!settings.enabled) {
-        AcquireSRWLockExclusive(&settings_lock);
-        last_enabled = false;
-        ReleaseSRWLockExclusive(&settings_lock);
+        skip_d3d12_history(view_id);
         diagnostic_note_state(
             DiagnosticApi::d3d12,
             DiagnosticState::disabled
@@ -1143,7 +1107,12 @@ D3D12Evaluation* prepare_d3d12(
     mutable_parameters->Set("DLSS.Output.Subrect.Base.X", 0U);
     mutable_parameters->Set("DLSS.Output.Subrect.Base.Y", 0U);
     mutable_parameters->Set("DLSS.Enable.Output.Subrects", 0);
-    if (consume_reset(settings) || gaze_reset) {
+    // The canonical backend owns history per NGX view and compares integer
+    // crop geometry. Projected AFW widths can differ by a few float ULPs on
+    // every eye switch while producing identical pixel dimensions. Comparing
+    // those settings here discarded the entire center history every frame.
+    // Shape-only changes affect compositing, not the reconstructed rectangle.
+    if (gaze_reset) {
         mutable_parameters->Set("Reset", 1U);
     }
     diagnostic_note_crop(DiagnosticApi::d3d12, crop);
@@ -1703,6 +1672,7 @@ NgxResult evaluate_d3d12_backend(
                 (source_crop.output_width != crop.output_width || source_crop.output_height != crop.output_height);
             CropMotionOffset offset{};
             bool correct_motion{};
+            bool motion_corrected{};
             bool motion_ready = true;
             if (!contract.reset && !key_changed && view->has_crop && crop_changed &&
                 contract.preserve_history_on_crop_move) {
@@ -1719,6 +1689,7 @@ NgxResult evaluate_d3d12_backend(
                     contract.motion_vectors_low_res ? crop.input_width : crop.output_width,
                     contract.motion_vectors_low_res ? crop.input_height : crop.output_height);
                 if (corrected) {
+                    motion_corrected = true;
                     parameters->Set("MotionVectors", corrected);
                     parameters->Set("DLSS.Input.MV.Subrect.Base.X", 0U);
                     parameters->Set("DLSS.Input.MV.Subrect.Base.Y", 0U);
@@ -1731,6 +1702,23 @@ NgxResult evaluate_d3d12_backend(
                 (crop_changed && !contract.preserve_history_on_crop_move)) {
                 parameters->Set("Reset", 1);
             }
+            // Record the actual NGX reset after every source of invalidation.
+            // The coordinator's gaze reset alone cannot describe SR history.
+            const bool actual_reset = read_int(parameters, "Reset") != 0;
+            ++view->evaluations;
+            view->resets += actual_reset;
+            view->motion_corrections += motion_corrected;
+            if (view->evaluations <= 8 || view->evaluations % 300 <= 1)
+                trace_event("D3D12 canonical history view=%llu calls=%llu resets=%llu corrections=%llu "
+                    "reset=%u requested=%u keyChanged=%u motionReset=%u cropChanged=%u corrected=%u "
+                    "crop=%ux%u@%u,%u offset=%.6f,%.6f mvScale=%.6f,%.6f",
+                    static_cast<unsigned long long>(contract.view_id),
+                    static_cast<unsigned long long>(view->evaluations),
+                    static_cast<unsigned long long>(view->resets),
+                    static_cast<unsigned long long>(view->motion_corrections),
+                    actual_reset, contract.reset, key_changed, motion_reset, crop_changed, motion_corrected,
+                    crop.output_width, crop.output_height, crop.output_base_x, crop.output_base_y,
+                    offset.x, offset.y, contract.motion_vector_scale_x, contract.motion_vector_scale_y);
             result = motion_ready ? callbacks.evaluate_feature(
                 command_list,
                 view->private_handle,
@@ -1830,13 +1818,6 @@ void release_d3d12_resources() noexcept {
     resource_use_sequence = 0U;
     ReleaseSRWLockExclusive(&resources_lock);
 
-    AcquireSRWLockExclusive(&settings_lock);
-    last_enabled = false;
-    last_width_bits = 0U;
-    last_height_bits = 0U;
-    last_height_offset_bits = 0U;
-    last_roundness_bits = 0U;
-    ReleaseSRWLockExclusive(&settings_lock);
 }
 
 }  // namespace cheeky::foveated_dlss
