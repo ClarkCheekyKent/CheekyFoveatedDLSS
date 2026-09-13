@@ -166,6 +166,7 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--hardware") hardware = true;
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
+        const bool afw = mode.starts_with("--afw-");
         const bool openvr_late = mode.starts_with("--openvr-late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
@@ -220,6 +221,7 @@ int main(int argc, char** argv) {
             plugin_path = isolated / plugin_path.filename();
         }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
+        if (afw) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
         require(init != nullptr, "Plugin entry export");
@@ -283,6 +285,7 @@ int main(int argc, char** argv) {
             verify_late_attach_test(get, command);
             return 0;
         }
+        if (afw) { verify_afw_test(get, command); return 0; }
         if (dx11) {
             command("1\n10\nset\nD3D11D3D12Transport=true");
             require(received.find("transport is unavailable")!=received.npos,"DX11 transport rejected explicitly");

@@ -7,7 +7,15 @@ std::atomic<unsigned> creates{}, evaluates{}, releases{};
 using Observe = void(*)(const NgxParameters*);
 Observe observe{};
 Observe observe_created{};
-struct Feature { unsigned id; MockNgxParameters created; };
+struct Feature { unsigned id; MockNgxParameters created; NgxHandle* lower{}; };
+using Create12 = NgxResult(*)(ID3D12GraphicsCommandList*, unsigned, NgxParameters*, NgxHandle**);
+using Evaluate12 = NgxResult(*)(ID3D12GraphicsCommandList*, const NgxHandle*, const NgxParameters*, NgxProgressCallback);
+using Evaluate12C = NgxResult(*)(ID3D12GraphicsCommandList*, const NgxHandle*, const NgxParameters*, NgxProgressCallbackC);
+using Release12 = NgxResult(*)(NgxHandle*);
+Create12 forward_create{};
+Evaluate12 forward_evaluate{};
+Evaluate12C forward_evaluate_c{};
+Release12 forward_release{};
 bool fail_evaluation{};
 bool copy_nr_color{};
 unsigned fail_next{};
@@ -21,6 +29,7 @@ NgxResult evaluate(const NgxHandle* handle, const NgxParameters* params) {
 }
 #define EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
 EXPORT unsigned CheekyFakeCreates() { return creates.load(); }
+EXPORT unsigned NVSDK_NGX_GetSnippetVersion() { return 0x01360900U; }
 EXPORT unsigned CheekyFakeEvaluates() { return evaluates.load(); }
 EXPORT unsigned CheekyFakeReleases() { return releases.load(); }
 EXPORT void CheekyFakeObserve(Observe callback) { observe = callback; }
@@ -28,6 +37,18 @@ EXPORT void CheekyFakeObserveCreated(Observe callback) { observe_created = callb
 EXPORT void CheekyFakeFailEvaluations(bool fail) { fail_evaluation = fail; }
 EXPORT void CheekyFakeCopyNrColor(bool enabled) { copy_nr_color = enabled; }
 EXPORT void CheekyFakeFailNextEvaluations(unsigned count) { fail_next = count; }
+// A separately loaded copy acts as the core runtime and deliberately wraps the
+// lower handle. Cache these addresses before Cheeky installs its real detours.
+EXPORT void CheekyFakeForwardTo(HMODULE lower, bool use_c) {
+    forward_create = reinterpret_cast<Create12>(GetProcAddress(lower, "NVSDK_NGX_D3D12_CreateFeature"));
+    forward_release = reinterpret_cast<Release12>(GetProcAddress(lower, "NVSDK_NGX_D3D12_ReleaseFeature"));
+    forward_evaluate = use_c ? nullptr : reinterpret_cast<Evaluate12>(GetProcAddress(lower, "NVSDK_NGX_D3D12_EvaluateFeature"));
+    forward_evaluate_c = use_c ? reinterpret_cast<Evaluate12C>(GetProcAddress(lower, "NVSDK_NGX_D3D12_EvaluateFeature_C")) : nullptr;
+}
+// Only the test fixture exports these stubs. No real AFW binary is executed.
+EXPORT void InitDevice() {}
+EXPORT void InitFrameWarp() {}
+EXPORT void EvaluateFrameWarp() {}
 // The hook harness loads a second copy as its optional feature-18 runtime.
 EXPORT NgxResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID3D12Device*, unsigned, const NgxParameters*) {
     wchar_t path[MAX_PATH]{};
@@ -40,8 +61,13 @@ EXPORT NgxResult NVSDK_NGX_D3D12_Init(unsigned long long, const wchar_t*, ID3D12
 EXPORT NgxResult NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle** out) {
     *out=reinterpret_cast<NgxHandle*>(new Feature{++creates, {}}); return 1U;
 }
-EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList*, unsigned, NgxParameters* params, NgxHandle** out) {
-    *out=reinterpret_cast<NgxHandle*>(new Feature{++creates, *static_cast<MockNgxParameters*>(params)}); return 1U;
+EXPORT NgxResult NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList* list, unsigned feature, NgxParameters* params, NgxHandle** out) {
+    NgxHandle* lower{};
+    if (forward_create) {
+        const auto result = forward_create(list, feature, params, &lower);
+        if (!ngx_succeeded(result)) return result;
+    }
+    *out=reinterpret_cast<NgxHandle*>(new Feature{++creates, *static_cast<MockNgxParameters*>(params), lower}); return 1U;
 }
 EXPORT NgxResult NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*, const NgxHandle*, const NgxParameters*, NgxProgressCallback) {
     ++evaluates; return 1U;
@@ -49,8 +75,12 @@ EXPORT NgxResult NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext*, const Ngx
 EXPORT NgxResult NVSDK_NGX_D3D11_EvaluateFeature_C(ID3D11DeviceContext*, const NgxHandle*, const NgxParameters*, NgxProgressCallbackC) {
     ++evaluates; return 1U;
 }
-EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, const NgxHandle* handle, const NgxParameters* params, NgxProgressCallback) {
+EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list, const NgxHandle* handle, const NgxParameters* params, NgxProgressCallback callback) {
     const auto result = evaluate(handle, params);
+    if (ngx_succeeded(result) && forward_evaluate)
+        return forward_evaluate(list, reinterpret_cast<const Feature*>(handle)->lower, params, callback);
+    if (ngx_succeeded(result) && forward_evaluate_c)
+        return forward_evaluate_c(list, reinterpret_cast<const Feature*>(handle)->lower, params, nullptr);
     if (ngx_succeeded(result) && copy_nr_color) {
         ID3D12Resource* color{}; ID3D12Resource* output{};
         params->Get("DLSSNR.Color", &color); params->Get("DLSSNR.Output", &output);
@@ -66,8 +96,17 @@ EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* list
     }
     return result;
 }
-EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList*, const NgxHandle* handle, const NgxParameters* params, NgxProgressCallbackC) {
-    return evaluate(handle, params);
+EXPORT NgxResult NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList* list, const NgxHandle* handle, const NgxParameters* params, NgxProgressCallbackC callback) {
+    const auto result = evaluate(handle, params);
+    if (ngx_succeeded(result) && forward_evaluate)
+        return forward_evaluate(list, reinterpret_cast<const Feature*>(handle)->lower, params, nullptr);
+    if (ngx_succeeded(result) && forward_evaluate_c)
+        return forward_evaluate_c(list, reinterpret_cast<const Feature*>(handle)->lower, params, callback);
+    return result;
 }
 EXPORT NgxResult NVSDK_NGX_D3D11_ReleaseFeature(NgxHandle* handle) { ++releases; delete reinterpret_cast<Feature*>(handle); return 1U; }
-EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle) { ++releases; delete reinterpret_cast<Feature*>(handle); return 1U; }
+EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle) {
+    auto* feature = reinterpret_cast<Feature*>(handle);
+    if (forward_release && feature->lower) forward_release(feature->lower);
+    ++releases; delete feature; return 1U;
+}

@@ -234,6 +234,18 @@ uevr.sdk.callbacks.on_draw_ui(function()
     end
     text("Cheeky " .. tostring(status.version))
     text(status.message)
+    local afw = status.afw_experiment or {}
+    if afw.enabled then
+        text("AFW routing experiment detected. In-game warp quality is not yet verified.")
+        text("Effective settings: fixed centered region at least 70% x 70%, center scale 1x. NR, gaze and marker calibration are bypassed. Saved preferences are retained.")
+        rows("afw_routing", {{"Lower SR runtime selected", yes(afw.runtime_selected)},
+            {"SR runtime candidates at selection", tostring(afw.runtime_candidates or 0)},
+            {"Full-frame core / nested DLSS calls", tostring(afw.core_calls or 0) .. " / " .. tostring(afw.lower_calls or 0)},
+            {"Core calls without nested DLSS", tostring(afw.missing_lower_calls or 0)},
+            {"Rejected core reentry", tostring(afw.rejected_core_reentry or 0)}})
+        if (afw.lower_calls or 0) == 0 then text("Waiting for a usable nested DLSS route; ordinary DLSS passes through.") end
+        if (afw.rejected_core_reentry or 0) > 0 then text("This hook chain reenters the core runtime. Disable Cheeky SR and include a support ZIP when reporting it.") end
+    end
     if not status.ready then text("Processing is paused. See the status and log before testing.") end
     text("Sliders apply on release. Other controls apply immediately and save automatically.")
     text("Alt+Shift+/ toggles SR.")

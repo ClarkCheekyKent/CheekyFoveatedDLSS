@@ -142,6 +142,12 @@ std::string diagnostics_text() {
     std::ostringstream out;
     out << std::boolalpha << "Report schema: 1\nAdd-on: " << CHEEKY_VERSION
         << "\nBuild: " << __DATE__ << ' ' << __TIME__ << '\n';
+    const auto afw = afw_compatibility_status();
+    out << "afw_experiment=" << afw.enabled << "\nafw_core_calls=" << afw.core_calls
+        << "\nafw_lower_calls=" << afw.lower_calls << "\nafw_missing_lower_calls=" << afw.missing_lower_calls
+        << "\nafw_standalone_lower_calls=" << afw.standalone_lower_calls
+        << "\nafw_rejected_core_reentry=" << afw.rejected_core_reentry
+        << "\nafw_runtime_candidates=" << afw.runtime_candidates << "\nafw_runtime_selected=" << afw.runtime_selected << '\n';
     for (const auto api : {DiagnosticApi::d3d11, DiagnosticApi::d3d12}) {
         const auto d = diagnostic_snapshot(api);
         out << "\n[" << (api == DiagnosticApi::d3d11 ? "DX11" : "DX12") << "]\n";

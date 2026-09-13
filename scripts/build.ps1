@@ -80,6 +80,10 @@ foreach ($abi in @("022", "027", "028", "029")) {
     & $uevrTest "--openvr-late-$abi"
     if ($LASTEXITCODE -ne 0) { throw "UEVR cached OpenVR compositor ($abi) test failed." }
 }
+foreach ($mode in @("native", "native-c", "streamline", "missing-lower", "public-first", "public-first-c", "ota", "ota-c", "ota-streamline", "ota-ambiguous")) {
+    & $uevrTest "--afw-$mode"
+    if ($LASTEXITCODE -ne 0) { throw "UEVR AFW routing ($mode) failed with exit code $LASTEXITCODE." }
+}
 
 Write-Host "Built and tested:"
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.dll")

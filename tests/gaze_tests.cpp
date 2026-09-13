@@ -1,5 +1,7 @@
 #include "cheeky_gaze_abi.h"
 #include "d3d12_ngx_dispatch.hpp"
+#include "afw_compatibility.hpp"
+#include "ngx_runtime_discovery.hpp"
 #include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr_contract.hpp"
@@ -80,6 +82,7 @@ cheeky::foveated_dlss::NgxResult fake_d3d12_processor(
     harness.active_during_processor = d3d12_ngx_interception_active();
     harness.observed_route = call.route;
     if (harness.nest_core_evaluation) {
+        AfwPrivateWorkScope private_work;
         const D3D12NgxEvaluationCall nested{
             D3D12NgxRoute::core_runtime,
             call.command_list,
@@ -1520,6 +1523,59 @@ void test_native_dynamic_resolution_extent() {
     expect(absent.values.empty(), "Missing keys are not invented and cannot leak into the game");
 }
 
+void test_afw_dispatch_and_settings() {
+    using namespace cheeky::foveated_dlss;
+    expect(is_dlss_sr_runtime_path(L"C:/game/NVNGX_DLSS.DLL") &&
+        is_dlss_sr_runtime_path(L"C:/ProgramData/NVIDIA/NGX/models//DLSS/versions/20318464/files/160_E658700.BIN"),
+        "SR discovery accepts normal DLLs and generated OTA names with mixed separators and case");
+    expect(!is_dlss_sr_runtime_path(L"C:/NGX/models/dlssnr/versions/1/files/160.bin") &&
+        !is_dlss_sr_runtime_path(L"C:/NGX/models/dlssd/versions/1/files/160.bin") &&
+        !is_dlss_sr_runtime_path(L"C:/NGX/models/sl_dlss_0/versions/1/files/160.bin") &&
+        !is_dlss_sr_runtime_path(L"C:/game/160.bin") && !is_dlss_sr_runtime_path(L"C:/game/nvngx_dlssg.dll"),
+        "SR discovery rejects NR, RR, Streamline, FG and unrelated generated names");
+    Settings saved;
+    saved.width = .4F; saved.height = .9F; saved.nr_enabled = true;
+    saved.center_supersampling = 2.F; saved.center_mode = FoveationCenterMode::simulated_gaze;
+    const auto effective = afw_experiment_settings(saved);
+    expect(effective.width == .7F && effective.height == .9F && effective.x_offset == 0.F && effective.height_offset == 0.F &&
+        !effective.auto_stereo_alignment && !effective.nr_enabled && effective.center_supersampling == 1.F &&
+        effective.center_mode == FoveationCenterMode::fixed, "AFW experiment uses symmetric generous fixed settings");
+    expect(saved.width == .4F && saved.nr_enabled && saved.center_supersampling == 2.F, "AFW overrides leave saved settings intact");
+    // The process-wide latch is intentional, so this runs after normal dispatch tests.
+    enable_afw_compatibility();
+    D3D12DispatchHarness harness{}; dispatch_harness = &harness;
+    D3D12NgxEvaluationCall call{D3D12NgxRoute::core_runtime};
+    const auto lower_from_core = +[](ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+        const NgxParameters* params, NgxProgressCallback callback) -> NgxResult {
+        ++dispatch_harness->original_calls;
+        const D3D12NgxEvaluationCall lower{D3D12NgxRoute::public_runtime, list, handle, params, callback};
+        return dispatch_d3d12_ngx_evaluation(lower, &fake_d3d12_original, &fake_d3d12_processor, dispatch_harness);
+    };
+    expect(dispatch_d3d12_ngx_evaluation(call, lower_from_core, &fake_d3d12_processor, &harness) == 0x200U &&
+        harness.processor_calls == 1 && harness.observed_route == D3D12NgxRoute::public_runtime,
+        "AFW core forwards unchanged and processing belongs to its nested lower route");
+    harness.nest_core_evaluation = true;
+    expect(dispatch_d3d12_ngx_evaluation(call, lower_from_core, &fake_d3d12_processor, &harness) == 0xBAD00007U &&
+        harness.original_calls == 2, "Private core reentry is rejected before reaching core original");
+    expect(dispatch_d3d12_ngx_evaluation(call, &fake_d3d12_original, &fake_d3d12_processor, &harness) == 0x100U,
+        "AFW core without visible lower route is passthrough");
+    call.route = D3D12NgxRoute::public_runtime;
+    expect(dispatch_d3d12_ngx_evaluation(call, &fake_d3d12_original, &fake_d3d12_processor, &harness) == 0x100U &&
+        harness.processor_calls == 2, "Independent lower call cannot bypass the full-frame AFW boundary");
+    const auto core_from_public = +[](ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+        const NgxParameters* params, NgxProgressCallback callback) -> NgxResult {
+        const D3D12NgxEvaluationCall core{D3D12NgxRoute::core_runtime, list, handle, params, callback};
+        return dispatch_d3d12_ngx_evaluation(core, &fake_d3d12_original, &fake_d3d12_processor, dispatch_harness);
+    };
+    expect(dispatch_d3d12_ngx_evaluation(call, core_from_public, &fake_d3d12_processor, &harness) == 0x100U &&
+        harness.processor_calls == 2, "Public-to-core passthrough must not be mistaken for private reentry");
+    const auto status = afw_compatibility_status();
+    expect(status.core_calls == 4 && status.lower_calls == 2 && status.missing_lower_calls == 2 &&
+        status.rejected_core_reentry == 1 && status.standalone_lower_calls == 2 && !d3d12_ngx_interception_active(),
+        "AFW routing diagnostics and thread scope survive failure and fallback");
+    dispatch_harness = nullptr;
+}
+
 int run_nr_lifetime_tests();
 
 int main(int argc, char** argv) {
@@ -1580,6 +1636,7 @@ int main(int argc, char** argv) {
     failures += run_openxr_calibration_tests();
     failures += run_openxr_calibration_format_tests();
     failures += run_nr_processing_tests();
+    test_afw_dispatch_and_settings();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

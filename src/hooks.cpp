@@ -6,6 +6,8 @@
 #include "d3d11_d3d12_transport.hpp"
 #include "d3d11_peripheral_dlaa.hpp"
 #include "d3d12_ngx_dispatch.hpp"
+#include "afw_compatibility.hpp"
+#include "ngx_runtime_discovery.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
 #include "openvr_gaze.hpp"
@@ -175,6 +177,7 @@ struct D3D12GameView {
     const NgxHandle* handle{};
     std::uint32_t feature{1U};
     NgxOutputExtent output{};
+    bool afw_native_history_stale{};
 };
 
 std::mutex d3d12_game_views_mutex;
@@ -221,6 +224,47 @@ std::atomic<bool> captured_d3d12_create_flags_valid{};
 thread_local bool inside_streamline_evaluation{};
 thread_local unsigned streamline_create_width{}, streamline_create_height{};
 thread_local bool streamline_nr_history_reset{};
+
+void detect_afw_runtime() noexcept {
+    if (afw_compatibility_enabled()) return;
+    const auto module = GetModuleHandleW(L"PDAFWPlugin.dll");
+    if (!module || !GetProcAddress(module, "EvaluateFrameWarp") ||
+        !GetProcAddress(module, "InitDevice") || !GetProcAddress(module, "InitFrameWarp")) return;
+    // Latch for this process. AFW's hooks also run during warmup and fallback.
+    enable_afw_compatibility();
+    log_info("AFW experiment: full-frame core passthrough, nested public DLSS only; fixed region at least 70% x 70%, center scale 1x, NR and marker calibration bypassed.");
+}
+
+void afw_private_succeeded(const NgxHandle* handle) {
+    if (!afw_compatibility_enabled()) return;
+    std::lock_guard lock(d3d12_game_views_mutex);
+    for (auto& view : d3d12_game_views)
+        if (view.handle == handle) view.afw_native_history_stale = true;
+}
+
+struct AfwNativeResetScope {
+    const NgxHandle* handle{};
+    NgxParameters* parameters{};
+    unsigned saved{};
+    AfwNativeResetScope(const NgxHandle* h, const NgxParameters* p) : handle(h) {
+        if (!afw_compatibility_enabled() || !p) return;
+        std::lock_guard lock(d3d12_game_views_mutex);
+        for (const auto& view : d3d12_game_views) {
+            if (view.handle == h && view.afw_native_history_stale && ngx_succeeded(p->Get("Reset", &saved))) {
+                parameters = const_cast<NgxParameters*>(p);
+                parameters->Set("Reset", 1U);
+                break;
+            }
+        }
+    }
+    void complete(NgxResult result) {
+        if (!parameters || !ngx_succeeded(result)) return;
+        std::lock_guard lock(d3d12_game_views_mutex);
+        for (auto& view : d3d12_game_views)
+            if (view.handle == handle) view.afw_native_history_stale = false;
+    }
+    ~AfwNativeResetScope() { if (parameters) parameters->Set("Reset", saved); }
+};
 struct NrResetOverride {
     NgxParameters* parameters{};
     unsigned original{};
@@ -3134,6 +3178,12 @@ std::uint32_t hook_sl_evaluate_feature(
         );
     }
     if (original == nullptr) return 0x18U;
+    detect_afw_runtime();
+    if (afw_compatibility_enabled() && feature == 0U) {
+        // Keep the game's viewport/tags/options intact through AFW. The nested
+        // native path owns SR; do not set inside_streamline_evaluation here.
+        return original(feature, frame, inputs, input_count, command_buffer);
+    }
     if (feature != 0U) {
         StreamlineEvaluationScope scope;
         const auto passthrough = original(feature, frame, inputs, input_count, command_buffer);
@@ -4059,6 +4109,7 @@ NgxResult hook_create_d3d12(
 ) {
     const auto original = real_create_d3d12.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
+    detect_afw_runtime();
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
         return original(command_list, feature, parameters, handle);
@@ -4097,6 +4148,12 @@ NgxResult hook_core_create_d3d12(
 ) {
     const auto original = real_core_create_d3d12.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
+    detect_afw_runtime();
+    if (afw_compatibility_enabled()) {
+        if (afw_reject_core_reentry()) return 0xBAD00007U;
+        // Let the lower create hook track its own handle and output contract.
+        return original(command_list, feature, parameters, handle);
+    }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
         return original(command_list, feature, parameters, handle);
@@ -4316,6 +4373,7 @@ void evaluate_nr_after_native_d3d12(
         callbacks.evaluate_feature == nullptr ||
         callbacks.release_feature == nullptr) return false;
 
+    AfwPrivateWorkScope afw_private_work;
     DlssFrameContract contract{};
     contract.view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
@@ -4583,7 +4641,11 @@ NgxResult process_d3d12_evaluation_impl(
         diagnostic_note_result(DiagnosticApi::d3d12, result);
         return result;
     }
-    const auto settings = current_settings();
+    auto settings = current_settings();
+    if (afw_compatibility_enabled()) {
+        settings = afw_experiment_settings(settings);
+        if (d3d12_game_feature(call.handle) != 1U) settings.enabled = false;
+    }
     NrPipelineTimingScope pipeline_timing{call.command_list, settings};
     NativeNrInputScope nr_input{call.command_list, call.handle, call.parameters, settings};
     ScopedCoordinatedCrop nr_crop{nr_input.crop_ready ? nr_input.frame.view_id : 0U,
@@ -4599,6 +4661,7 @@ NgxResult process_d3d12_evaluation_impl(
             callbacks,
             result,
             private_attempted)) {
+        afw_private_succeeded(call.handle);
         diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::active);
         diagnostic_note_result(DiagnosticApi::d3d12, result);
         return result;
@@ -4616,12 +4679,14 @@ NgxResult process_d3d12_evaluation_impl(
         call.command_list, D3D12TimingKind::native_dlss
     };
     sr_timing.begin();
+    AfwNativeResetScope native_reset{call.handle, call.parameters};
     result = original(
         call.command_list,
         call.handle,
         call.parameters,
         call.callback
     );
+    native_reset.complete(result);
     sr_timing.finish(ngx_succeeded(result));
     evaluate_nr_after_native_d3d12(
         call.command_list, call.handle, call.parameters, settings, result
@@ -4638,6 +4703,7 @@ NgxResult process_d3d12_evaluation_impl(
 
 void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxResult result) {
+    if (afw_compatibility_enabled()) return;
     if (!eye_calibration_enabled() || calibration_evaluation_depth || inside_streamline_evaluation || !ngx_succeeded(result)) return;
     const D3D12NgxEvaluationCall call{D3D12NgxRoute::public_runtime, list, handle, parameters, nullptr};
     if (!recognizable_d3d12_dlss_evaluation(call) || !has_d3d12_game_view(handle)) return;
@@ -4664,6 +4730,7 @@ NgxResult hook_evaluate_d3d12(
     const NgxProgressCallback callback
 ) {
     const auto original = real_evaluate_d3d12.load(std::memory_order_acquire);
+    detect_afw_runtime();
     return dispatch_d3d12_ngx_evaluation(
         {
             D3D12NgxRoute::public_runtime,
@@ -4683,6 +4750,7 @@ NgxResult hook_core_evaluate_d3d12(
     const NgxParameters* const parameters,
     const NgxProgressCallback callback
 ) {
+    detect_afw_runtime();
     const auto original = real_core_evaluate_d3d12.load(
         std::memory_order_acquire
     );
@@ -4707,6 +4775,9 @@ NgxResult evaluate_d3d12_c_impl(
 ) {
     const auto original = real_evaluate_d3d12_c.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
+    detect_afw_runtime();
+    if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation())
+        return original(command_list, handle, parameters, callback);
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
         return original(command_list, handle, parameters, callback);
@@ -4735,7 +4806,11 @@ NgxResult evaluate_d3d12_c_impl(
         diagnostic_note_result(DiagnosticApi::d3d12, result);
         return result;
     }
-    const auto settings = current_settings();
+    auto settings = current_settings();
+    if (afw_compatibility_enabled()) {
+        settings = afw_experiment_settings(settings);
+        if (d3d12_game_feature(handle) != 1U) settings.enabled = false;
+    }
     NrPipelineTimingScope pipeline_timing{command_list, settings};
     NativeNrInputScope nr_input{command_list, handle, parameters, settings};
     ScopedCoordinatedCrop nr_crop{nr_input.crop_ready ? nr_input.frame.view_id : 0U,
@@ -4748,10 +4823,12 @@ NgxResult evaluate_d3d12_c_impl(
     if (evaluate_native_d3d12_canonical(
             command_list, handle, parameters, settings,
             callbacks, result, private_attempted)) {
+        afw_private_succeeded(handle);
         diagnostic_note_state(DiagnosticApi::d3d12, DiagnosticState::active);
         diagnostic_note_result(DiagnosticApi::d3d12, result);
         return result;
     }
+    skip_d3d12_history(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle)));
     diagnostic_note_state(
         DiagnosticApi::d3d12,
         !settings.enabled ? DiagnosticState::disabled
@@ -4762,7 +4839,9 @@ NgxResult evaluate_d3d12_c_impl(
         command_list, D3D12TimingKind::native_dlss
     };
     sr_timing.begin();
+    AfwNativeResetScope native_reset{handle, parameters};
     result = original(command_list, handle, parameters, callback);
+    native_reset.complete(result);
     sr_timing.finish(ngx_succeeded(result));
     evaluate_nr_after_native_d3d12(
         command_list, handle, parameters, settings, result
@@ -4799,6 +4878,11 @@ NgxResult hook_core_release_d3d12(NgxHandle* const handle) {
         std::memory_order_acquire
     );
     if (original == nullptr) return 0xBAD00007U;
+    detect_afw_runtime();
+    if (afw_compatibility_enabled()) {
+        if (afw_reject_core_reentry()) return 0xBAD00007U;
+        return original(handle);
+    }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) return original(handle);
     if (has_d3d12_game_view(handle)) forget_d3d12_game_view(handle);
@@ -5185,19 +5269,62 @@ template <typename T>
     return true;
 }
 
+[[nodiscard]] HMODULE find_afw_sr_runtime() noexcept {
+    // One callback set owns one snippet for this process. Retain the selected
+    // image so a later unload/reload cannot leave its detours or private feature
+    // callbacks pointing into freed memory. Never switch them to another DLL.
+    static HMODULE selected{};
+    if (selected) return selected;
+    std::array<HMODULE, 2048> modules{};
+    DWORD required{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &required) || required > sizeof(modules)) {
+        afw_note_runtime_discovery(0U, false);
+        return nullptr;
+    }
+    HMODULE candidate{};
+    unsigned count{};
+    std::array<wchar_t, 2048> candidate_path{};
+    for (std::size_t i = 0; i < required / sizeof(HMODULE); ++i) {
+        std::array<wchar_t, 2048> path{};
+        const auto length = GetModuleFileNameW(modules[i], path.data(), static_cast<DWORD>(path.size()));
+        if (!length || length >= path.size() || !is_dlss_sr_runtime_path({path.data(), length})) continue;
+        if (!GetProcAddress(modules[i], "NVSDK_NGX_GetSnippetVersion") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_CreateFeature") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_EvaluateFeature") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_ReleaseFeature")) continue;
+        candidate = modules[i]; candidate_path = path; ++count;
+    }
+    static unsigned previous_count = ~0U;
+    if (count != previous_count) {
+        trace_event("AFW lower-runtime discovery candidates=%u; %s", count,
+            count == 1 ? "one SR snippet found" : count ? "ambiguous SR snippets; passing through" : "waiting for an SR snippet");
+        previous_count = count;
+    }
+    if (count == 1 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(candidate), &selected)) {
+        trace_event("AFW lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
+    }
+    afw_note_runtime_discovery(count, selected != nullptr);
+    return selected;
+}
+
 [[nodiscard]] bool install_direct_export_hooks(
     const bool require_runtime_stability = false
 ) noexcept {
     if (!minhook_initialized.load(std::memory_order_acquire)) return false;
     bool installed{};
 
-    const auto observed_public_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto observed_public_runtime = afw_compatibility_enabled()
+        ? find_afw_sr_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
     const auto public_runtime = runtime_ready_for_direct_hooks(
         observed_public_runtime,
         public_runtime_stability,
         L"nvngx_dlss.dll",
         require_runtime_stability
     ) ? observed_public_runtime : nullptr;
+    // Older snippets alias DX11 and DX12 exports to the same address. AFW's
+    // experiment is DX12-only; installing a DX11 detour first would steal it.
+    const auto public_d3d11_runtime = afw_compatibility_enabled() ? nullptr : public_runtime;
 
     if (public_runtime != nullptr) {
         diagnostic_note_runtime_loaded(DiagnosticApi::d3d11);
@@ -5205,7 +5332,7 @@ template <typename T>
     }
     {
         installed |= install_direct_hook(
-            public_runtime,
+            public_d3d11_runtime,
             "NVSDK_NGX_D3D11_Init",
             reinterpret_cast<void*>(&hook_init_d3d11),
             real_init_d3d11,
@@ -5226,28 +5353,28 @@ template <typename T>
             DiagnosticApi::d3d12
         );
         installed |= install_direct_hook(
-            public_runtime,
+            public_d3d11_runtime,
             "NVSDK_NGX_D3D11_CreateFeature",
             reinterpret_cast<void*>(&hook_create_d3d11),
             real_create_d3d11,
             DiagnosticApi::d3d11
         );
         installed |= install_direct_hook(
-            public_runtime,
+            public_d3d11_runtime,
             "NVSDK_NGX_D3D11_EvaluateFeature",
             reinterpret_cast<void*>(&hook_evaluate_d3d11),
             real_evaluate_d3d11,
             DiagnosticApi::d3d11
         );
         installed |= install_direct_hook(
-            public_runtime,
+            public_d3d11_runtime,
             "NVSDK_NGX_D3D11_EvaluateFeature_C",
             reinterpret_cast<void*>(&hook_evaluate_d3d11_c),
             real_evaluate_d3d11_c,
             DiagnosticApi::d3d11
         );
         installed |= install_direct_hook(
-            public_runtime,
+            public_d3d11_runtime,
             "NVSDK_NGX_D3D11_ReleaseFeature",
             reinterpret_cast<void*>(&hook_release_d3d11),
             real_release_d3d11,
@@ -5894,6 +6021,7 @@ LateAttachStatus late_attach_status() noexcept {
 
 bool start_interception() noexcept {
     if (started.exchange(true, std::memory_order_acq_rel)) return true;
+    detect_afw_runtime();
     real_get_proc_address.store(&GetProcAddress, std::memory_order_release);
     trace_event("Interception startup begin");
     install_hook_debug_diagnostics();

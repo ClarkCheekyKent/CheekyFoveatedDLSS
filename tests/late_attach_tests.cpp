@@ -123,6 +123,33 @@ struct Fixture {
     }
 };
 Fixture& fixture() { static auto* f=new Fixture; return *f; }
+HMODULE afw_core{};
+bool afw_missing_lower{};
+bool afw_public_first{};
+bool afw_ota{}, afw_ambiguous{};
+unsigned afw_full_calls{}, afw_lower_calls{}, afw_reduced_depth_calls{}, afw_full_resets{};
+bool afw_contract_ok{true}, afw_order_ok{true};
+void observe_afw_core(const NgxParameters* params) {
+    ++afw_full_calls;
+    auto& f = fixture();
+    const char* names[]{"Color", "Depth", "MotionVectors", "Output"};
+    for (unsigned i = 0; i < 4; ++i) {
+        ID3D12Resource* resource{}; params->Get(names[i], &resource);
+        afw_contract_ok &= resource == f.textures12[i].Get();
+        if (resource) afw_contract_ok &= resource->GetDesc().Width == (i == 3 ? 256U : 128U) && resource->GetDesc().Height == (i == 3 ? 256U : 128U);
+    }
+    afw_contract_ok &= get_ui(params, "Width") == 128 && get_ui(params, "OutWidth") == 256 && get_ui(params, "Reset") == 0;
+    // Model AFW's pre-DLSS work. The lower observer must run after this update.
+    const_cast<NgxParameters*>(params)->Set("CheekyFake.AfwCorrected", afw_full_calls);
+}
+void observe_afw_lower(const NgxParameters* params) {
+    ++afw_lower_calls;
+    afw_order_ok &= get_ui(params, "CheekyFake.AfwCorrected") == afw_full_calls;
+    ID3D12Resource* depth{}; params->Get("Depth", &depth);
+    if (depth && depth->GetDesc().Width < 128) ++afw_reduced_depth_calls;
+    ID3D12Resource* output{}; params->Get("Output", &output);
+    if (output == fixture().textures12[3].Get()) afw_full_resets += get_ui(params, "Reset") != 0;
+}
 std::string snapshot(CheekyUEVRSnapshotFn get) { std::vector<char> text(32768); require(get(text.data(),32768),"Late snapshot"); return text.data(); }
 void verify_nr_reset_isolation(void (*command)(const char*)) {
     auto& f = fixture();
@@ -505,9 +532,9 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     puts("NR controls, cached creation tuning, jittered vectors, SDR codec/edge sampling and reset isolation passed");
 }
 }
-void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx11,ID3D12Device* dx12,ID3D12CommandQueue* queue,bool use_c,bool use_sl) {
+void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx11,ID3D12Device* dx12,ID3D12CommandQueue* queue,bool use_c,bool use_sl,const std::filesystem::path& ngx_path) {
     auto& f=fixture(); f.use_c=use_c; f.use_sl=use_sl; f.device=dx12; f.queue=queue;
-    f.ngx=LoadLibraryW((bin/L"test-fixtures"/L"nvngx_dlss.dll").c_str()); require(f.ngx!=nullptr,"Load fake NGX before plugin");
+    f.ngx=LoadLibraryW((ngx_path.empty() ? bin/L"test-fixtures"/L"nvngx_dlss.dll" : ngx_path).c_str()); require(f.ngx!=nullptr,"Load fake NGX before plugin");
     f.creates=proc<Counter>(f.ngx,"CheekyFakeCreates"); f.evaluates=proc<Counter>(f.ngx,"CheekyFakeEvaluates"); f.releases=proc<Counter>(f.ngx,"CheekyFakeReleases");
     f.params.Set("Width",128U); f.params.Set("Height",128U); f.params.Set("OutWidth",256U); f.params.Set("OutHeight",256U);
     f.params.Set("DLSS.Feature.Create.Flags",2U); f.params.Set("PerfQualityValue",2U);
@@ -559,6 +586,119 @@ void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx1
     require(ngx_succeeded(f.evaluate()),"Evaluate before injection");
     require(f.creates()==1 && f.evaluates()==1,"Fixture initialized before hook installation");
 }
+void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::path& root, ID3D12Device* device,
+    ID3D12CommandQueue* queue, std::string_view mode) {
+    const bool use_c = mode.ends_with("-c"), use_sl = mode.find("streamline") != mode.npos;
+    const bool missing_lower = mode == "--afw-missing-lower", public_first = mode.starts_with("--afw-public-first");
+    afw_ota = mode.starts_with("--afw-ota"); afw_ambiguous = mode == "--afw-ota-ambiguous";
+    std::filesystem::path ngx_path;
+    if (afw_ota) {
+        ngx_path = root / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
+        std::filesystem::create_directories(ngx_path.parent_path());
+        std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", ngx_path);
+        // Identical export names are insufficient: an RR or NR snippet must
+        // never be selected as SR, even with the same generated basename.
+        for (const auto* model : {"dlssd", "dlssnr", "sl_dlss_0"}) {
+            const auto decoy = root / "NVIDIA/NGX/models" / model / "versions/20318464/files/160_E658700.bin";
+            std::filesystem::create_directories(decoy.parent_path());
+            std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", decoy);
+            require(LoadLibraryW(decoy.c_str()) != nullptr, "Load non-SR OTA decoy");
+        }
+        if (afw_ambiguous) require(LoadLibraryW((bin / "test-fixtures/nvngx_dlss.dll").c_str()) != nullptr, "Load a second SR runtime");
+    }
+    prepare_late_attach_test(bin, nullptr, device, queue, false, use_sl, ngx_path);
+    auto& f = fixture();
+    require(ngx_succeeded(f.release(f.handle)), "Release initial public fixture handle");
+    const auto dir = root / "afw-fixtures";
+    std::filesystem::create_directories(dir);
+    for (const auto* name : {L"_nvngx.dll", L"PDAFWPlugin.dll"})
+        std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", dir / name);
+    afw_core = LoadLibraryW((dir / "_nvngx.dll").c_str());
+    require(afw_core && LoadLibraryW((dir / "PDAFWPlugin.dll").c_str()), "Load simulated AFW core before Cheeky");
+    afw_missing_lower = missing_lower || public_first || afw_ambiguous;
+    afw_public_first = public_first;
+    if (public_first) {
+        proc<void(*)(HMODULE, bool)>(f.ngx, "CheekyFakeForwardTo")(afw_core, false);
+        f.use_c = use_c;
+    } else {
+        if (!missing_lower) proc<void(*)(HMODULE, bool)>(afw_core, "CheekyFakeForwardTo")(f.ngx, use_c);
+        f.create12 = proc<Create12>(afw_core, "NVSDK_NGX_D3D12_CreateFeature");
+        f.evaluate12 = proc<Evaluate12>(afw_core, "NVSDK_NGX_D3D12_EvaluateFeature");
+        f.release = proc<Release>(afw_core, "NVSDK_NGX_D3D12_ReleaseFeature");
+    }
+    f.params.Set("Reset", 0U);
+    require(ngx_succeeded(f.create12(f.list.Get(), 1U, &f.params, &f.handle)), "Create wrapped game feature before injection");
+    if (use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, f.handle, &f.params);
+    proc<void(*)(void(*)(const NgxParameters*))>(afw_core, "CheekyFakeObserve")(&observe_afw_core);
+    if (!public_first) proc<void(*)(void(*)(const NgxParameters*))>(f.ngx, "CheekyFakeObserve")(&observe_afw_lower);
+}
+
+void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
+    auto& f = fixture();
+    command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=2\nAutoStereoAlignment=true\nCenterMode=2\nNrEnabled=true\nAlignmentBorder=false");
+    require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos, "AFW experiment visible in exported status");
+    if (afw_ota) {
+        const auto discovery = snapshot(get);
+        require(discovery.find(afw_ambiguous ? "\"runtime_candidates\":2,\"runtime_selected\":false" : "\"runtime_candidates\":1,\"runtime_selected\":true") != std::string::npos,
+            "OTA SR discovery excludes decoys and rejects ambiguous runtimes");
+        if (!afw_ambiguous) require(GetModuleHandleW(L"nvngx_dlss.dll") == nullptr, "OTA test has no conventionally named SR module");
+    }
+    const auto creates_before = f.creates();
+    // Exceed AFW's 90-frame suspension window. It must see one stable, full-size
+    // input per game evaluation, while the private periphery really is smaller.
+    for (unsigned i = 0; i < 100; ++i) {
+        require(ngx_succeeded(f.evaluate()), "AFW game evaluation succeeds");
+        f.finish_gpu();
+        require(get_ui(&f.params, "Width") == 128 && get_ui(&f.params, "OutWidth") == 256 && get_ui(&f.params, "Reset") == 0,
+            "AFW game dimensions and reset restored");
+    }
+    require(afw_full_calls == 100 && proc<Counter>(afw_core, "CheekyFakeCreates")() == 1,
+        "AFW core receives game work only, no private creates/evaluations");
+    require(afw_contract_ok && afw_order_ok, "AFW sees full resources and precedes private DLSS work");
+    const auto status = snapshot(get);
+    require(status.find("\"rejected_core_reentry\":0") != std::string::npos, "Supported route never reenters core");
+    if (afw_missing_lower) {
+        require(f.creates() == creates_before && afw_lower_calls == (afw_ambiguous ? 100U : 0U), "Absent lower route stays ordinary DLSS");
+        require(status.find("\"missing_lower_calls\":100") != std::string::npos, "Absent route explicitly reported");
+        if (afw_public_first) require(status.find("\"standalone_lower_calls\":100") != std::string::npos,
+            "Reversed hook topology remains full-frame public-to-core passthrough");
+    } else {
+        if (f.creates() != creates_before + 2 || afw_lower_calls != 200) puts(status.c_str());
+        require(f.creates() == creates_before + 2 && afw_lower_calls == 200 && afw_reduced_depth_calls == 100,
+            "Center and reduced periphery run below AFW with stable private handles");
+        require(status.find("\"missing_lower_calls\":0") != std::string::npos && status.find("\"lower_calls\":100") != std::string::npos,
+            "One nested game DLSS route per full-frame core call");
+        const auto nr_begin = status.find("\"nr_details\":{");
+        require(nr_begin != std::string::npos && status.substr(nr_begin, status.find('}', nr_begin) - nr_begin).find("\"evaluations\":0") != std::string::npos,
+            "Experimental path does not evaluate NR");
+        // A private failure must restore the original contract and reset the
+        // game feature's starved history exactly on the fallback transition.
+        proc<void(*)(unsigned)>(f.ngx, "CheekyFakeFailNextEvaluations")(2);
+        require(ngx_succeeded(f.evaluate()), "Private failure falls back to game DLSS"); f.finish_gpu();
+        require(afw_full_resets == 1 && afw_contract_ok && get_ui(&f.params, "Reset") == 0,
+            "Fallback resets native history below AFW and restores game Reset");
+        command("1\n201\nset\nEnabled=false");
+        require(ngx_succeeded(f.evaluate()), "Disabled SR uses ordinary nested DLSS"); f.finish_gpu();
+        require(afw_full_resets == 1, "Consecutive native frame does not repeat reset");
+        command("1\n202\nset\nEnabled=true");
+        require(ngx_succeeded(f.evaluate()), "SR resumes after native fallback"); f.finish_gpu();
+        command("1\n203\nset\nEnabled=false");
+        require(ngx_succeeded(f.evaluate()), "Toggle off resumes native history"); f.finish_gpu();
+        require(afw_full_resets == 2, "Toggle transition resets native history once");
+    }
+    require(ngx_succeeded(f.release(f.handle)), "Wrapped core release cleans lower game and private handles");
+    require(f.creates() == f.releases(), "No leaked lower private features after core release");
+    // A post-injection create must also reach the lower lifecycle hook with its
+    // own handle; the core and public wrappers deliberately have different IDs.
+    require(ngx_succeeded(f.create12(f.list.Get(), 1U, &f.params, &f.handle)), "Create wrapped feature after injection");
+    if (f.use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, f.handle, &f.params);
+    command("1\n204\nset\nEnabled=true");
+    require(ngx_succeeded(f.evaluate()), "Evaluate post-injection wrapped feature"); f.finish_gpu();
+    require(ngx_succeeded(f.release(f.handle)) && f.creates() == f.releases(), "Post-injection lower lifecycle cleans all features");
+    require(afw_contract_ok && afw_order_ok, "Full-frame contract survives lifecycle and fallback transitions");
+    puts("PASS: AFW full-frame routing, private resolution isolation, fallback, and lifecycle");
+}
+
 void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     auto& f=fixture();
     // Missing metadata must forward unchanged and must not create a feature.

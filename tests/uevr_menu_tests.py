@@ -129,6 +129,21 @@ def run(engine):
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
     state["settings"]["Enabled"] = True
+    afw = copy.deepcopy(state)
+    afw["afw_experiment"] = {"enabled": True, "core_calls": 100, "lower_calls": 0,
+                             "missing_lower_calls": 100, "rejected_core_reentry": 0}
+    receive(afw)
+    count = len(g.sent)
+    draw()
+    assert any("AFW routing experiment detected" in t for t in g.drawn.values())
+    assert any("ordinary DLSS passes through" in t for t in g.drawn.values())
+    assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
+    afw["afw_experiment"].update(lower_calls=100, missing_lower_calls=0)
+    afw["afw_experiment"].update(runtime_candidates=1, runtime_selected=True)
+    receive(afw)
+    draw()
+    assert not any("ordinary DLSS passes through" in t for t in g.drawn.values())
+    assert any("Lower SR runtime selected" in t for t in g.drawn.values())
     receive(state)
     draw()  # Open every tree, validate all widget types and enum keys.
     order = list(g.tree_order.values())

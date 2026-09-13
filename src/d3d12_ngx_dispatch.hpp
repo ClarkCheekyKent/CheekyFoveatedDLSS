@@ -12,6 +12,33 @@ enum class D3D12NgxRoute : std::uint32_t {
     core_runtime,
 };
 
+// Experimental AFW routing: the core observes the original game evaluation;
+// only a feature-runtime evaluation nested inside it may own reconstruction.
+struct AfwCompatibilityStatus {
+    bool enabled{};
+    std::uint64_t core_calls{}, lower_calls{}, missing_lower_calls{};
+    std::uint64_t standalone_lower_calls{}, rejected_core_reentry{};
+    unsigned runtime_candidates{};
+    bool runtime_selected{};
+};
+void enable_afw_compatibility() noexcept;
+[[nodiscard]] bool afw_compatibility_enabled() noexcept;
+[[nodiscard]] AfwCompatibilityStatus afw_compatibility_status() noexcept;
+void afw_note_runtime_discovery(unsigned candidates, bool selected) noexcept;
+// Called only by an outermost public/_C evaluation, never private recursion.
+[[nodiscard]] bool afw_claim_lower_evaluation() noexcept;
+[[nodiscard]] bool afw_reject_core_reentry() noexcept;
+
+// Separate private reconstruction from full-frame passthrough and lifecycle
+// hooks: an ordinary public call is allowed to forward to a core runtime.
+class AfwPrivateWorkScope final {
+public:
+    AfwPrivateWorkScope() noexcept;
+    ~AfwPrivateWorkScope();
+    AfwPrivateWorkScope(const AfwPrivateWorkScope&) = delete;
+    AfwPrivateWorkScope& operator=(const AfwPrivateWorkScope&) = delete;
+};
+
 using D3D12NgxEvaluateFn = NgxResult (*)(
     ID3D12GraphicsCommandList*,
     const NgxHandle*,

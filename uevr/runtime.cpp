@@ -12,6 +12,7 @@
 #include "gaze_foveation.hpp"
 #include "openvr_gaze.hpp"
 #include "dlss_nr.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 #include "version.h"
 #include <atomic>
 #include <array>
@@ -60,6 +61,7 @@ std::string snapshot_locked(State& s) {
     const auto views = stereo_view_statistics();
     const auto nr = dlss_nr_snapshot();
     const auto attach = late_attach_status();
+    const auto afw = afw_compatibility_status();
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
     out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr\",\"request\":" << s.request
@@ -70,6 +72,12 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"afw_experiment\":{\"enabled\":" << afw.enabled
+        << ",\"core_calls\":" << afw.core_calls << ",\"lower_calls\":" << afw.lower_calls
+        << ",\"missing_lower_calls\":" << afw.missing_lower_calls
+        << ",\"standalone_lower_calls\":" << afw.standalone_lower_calls
+        << ",\"rejected_core_reentry\":" << afw.rejected_core_reentry
+        << ",\"runtime_candidates\":" << afw.runtime_candidates << ",\"runtime_selected\":" << afw.runtime_selected << '}'
         << ",\"eye_calibration\":" << eye_calibration_json()
         << ",\"support\":{\"busy\":" << s.report_busy.load() << ",\"zip\":\"" << json_escape(path_utf8(s.report_zip)) << "\"}"
         << ",\"gpu_timing\":{\"recorded\":" << gpu.recorded << ",\"submitted\":" << gpu.submitted
