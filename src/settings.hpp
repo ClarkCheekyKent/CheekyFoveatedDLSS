@@ -35,6 +35,11 @@ struct Settings {
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
     float center_supersampling{1.0F};
+    // AFW has no authoritative source-eye identity before DLSS. Manual mode
+    // covers both possible eye offsets in one rectangle; default keeps the
+    // original centered 70% compatibility region.
+    bool afw_manual_coverage{false};
+    float afw_warp_margin{0.05F};
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};

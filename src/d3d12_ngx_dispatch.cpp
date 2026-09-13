@@ -1,5 +1,6 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include <atomic>
+#include <Windows.h>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -11,6 +12,8 @@ std::atomic<std::uint64_t> core_calls{}, lower_calls{}, missing_lower_calls{};
 std::atomic<std::uint64_t> standalone_lower_calls{}, rejected_core_reentry{};
 std::atomic<unsigned> runtime_candidates{};
 std::atomic<bool> runtime_selected{};
+std::atomic<bool> warp_observer_ready{};
+std::atomic<std::uint64_t> warp_calls{}, last_warp_ms{};
 thread_local bool* afw_core_lower_seen{};
 
 struct AfwCoreScope {
@@ -28,9 +31,17 @@ struct AfwCoreScope {
 void enable_afw_compatibility() noexcept { afw_enabled.store(true, std::memory_order_release); }
 bool afw_compatibility_enabled() noexcept { return afw_enabled.load(std::memory_order_acquire); }
 AfwCompatibilityStatus afw_compatibility_status() noexcept {
+    const auto last_warp = last_warp_ms.load(std::memory_order_acquire);
+    const auto now = GetTickCount64();
     return {afw_compatibility_enabled(), core_calls.load(), lower_calls.load(),
         missing_lower_calls.load(), standalone_lower_calls.load(), rejected_core_reentry.load(),
-        runtime_candidates.load(), runtime_selected.load()};
+        runtime_candidates.load(), runtime_selected.load(), warp_observer_ready.load(),
+        warp_calls.load(), last_warp ? (now >= last_warp ? now - last_warp : 0U) : UINT64_MAX};
+}
+void afw_note_warp_observer(bool ready) noexcept { warp_observer_ready.store(ready); }
+void afw_note_warp_call() noexcept {
+    ++warp_calls;
+    last_warp_ms.store(GetTickCount64(), std::memory_order_release);
 }
 void afw_note_runtime_discovery(unsigned candidates, bool selected) noexcept {
     runtime_candidates.store(candidates, std::memory_order_relaxed);

@@ -1538,9 +1538,50 @@ void test_afw_dispatch_and_settings() {
     saved.center_supersampling = 2.F; saved.center_mode = FoveationCenterMode::simulated_gaze;
     const auto effective = afw_experiment_settings(saved);
     expect(effective.width == .7F && effective.height == .9F && effective.x_offset == 0.F && effective.height_offset == 0.F &&
-        !effective.auto_stereo_alignment && !effective.nr_enabled && effective.center_supersampling == 1.F &&
+        !effective.auto_stereo_alignment && !effective.nr_enabled && effective.center_supersampling == 2.F &&
         effective.center_mode == FoveationCenterMode::fixed, "AFW experiment uses symmetric generous fixed settings");
     expect(saved.width == .4F && saved.nr_enabled && saved.center_supersampling == 2.F, "AFW overrides leave saved settings intact");
+    for (const auto width : {.2F, .55F, .7F, 1.F})
+    for (const auto height : {.2F, .45F, .7F, 1.F})
+    for (const auto x : {-1.F, -.6F, 0.F, .6F, 1.F})
+    for (const auto y : {-1.F, -.45F, 0.F, .45F, 1.F})
+    for (const auto margin : {0.F, .05F, .25F}) {
+        Settings manual;
+        manual.afw_manual_coverage = true; manual.afw_warp_margin = margin;
+        manual.width = width; manual.height = height;
+        manual.x_offset = x; manual.height_offset = y; manual.roundness = 1.F;
+        const auto envelope = afw_experiment_settings(manual);
+        expect(envelope.roundness == 0.F && !uses_coordinated_center(envelope),
+            "Manual envelope does not remove corners or require an eye assignment");
+        const float left = (1.F - envelope.width) * .5F;
+        const float top = (1.F - envelope.height) * (1.F + envelope.height_offset) * .5F;
+        for (const auto eye_sign : {-1.F, 1.F}) {
+            const float eye_left = (1.F - width) * (1.F + x * eye_sign) * .5F;
+            const float eye_top = (1.F - height) * (1.F + y) * .5F;
+            expect(left <= eye_left + 1e-6F && left + envelope.width + 1e-6F >= eye_left + width &&
+                top <= eye_top + 1e-6F && top + envelope.height + 1e-6F >= eye_top + height,
+                "AFW envelope contains both possible eye rectangles, including image edges");
+        }
+        auto inverted = manual; inverted.invert_stereo_x_offset = true;
+        const auto other = afw_experiment_settings(inverted);
+        expect(other.width == envelope.width && other.height_offset == envelope.height_offset,
+            "AFW coverage is invariant under an eye-order swap");
+    }
+    auto invalid = saved;
+    invalid.afw_manual_coverage = true;
+    invalid.afw_warp_margin = invalid.width = invalid.height = invalid.x_offset =
+        invalid.height_offset = invalid.center_supersampling = std::numeric_limits<float>::quiet_NaN();
+    const auto sanitized = afw_experiment_settings(invalid);
+    expect(std::isfinite(sanitized.width) && std::isfinite(sanitized.height_offset) && sanitized.center_supersampling == 1.F,
+        "Invalid AFW coverage inputs fail to finite defaults");
+    const auto previous_settings = configured_settings();
+    invalid = previous_settings; invalid.afw_manual_coverage = true; invalid.afw_warp_margin = .15F;
+    update_settings(invalid);
+    expect(configured_settings().afw_manual_coverage && configured_settings().afw_warp_margin == .15F,
+        "AFW settings survive the render settings snapshot");
+    invalid.afw_warp_margin = 5.F; update_settings(invalid);
+    expect(configured_settings().afw_warp_margin == .25F, "AFW warp margin is bounded");
+    update_settings(previous_settings);
     // The process-wide latch is intentional, so this runs after normal dispatch tests.
     enable_afw_compatibility();
     D3D12DispatchHarness harness{}; dispatch_harness = &harness;

@@ -4,6 +4,8 @@
 using namespace cheeky::foveated_dlss;
 namespace {
 std::atomic<unsigned> creates{}, evaluates{}, releases{};
+void* last_warp_parameters{};
+unsigned warp_calls{};
 using Observe = void(*)(const NgxParameters*);
 Observe observe{};
 Observe observe_created{};
@@ -48,7 +50,9 @@ EXPORT void CheekyFakeForwardTo(HMODULE lower, bool use_c) {
 // Only the test fixture exports these stubs. No real AFW binary is executed.
 EXPORT void InitDevice() {}
 EXPORT void InitFrameWarp() {}
-EXPORT void EvaluateFrameWarp() {}
+EXPORT void __stdcall EvaluateFrameWarp(void* parameters) { last_warp_parameters = parameters; ++warp_calls; }
+EXPORT void* CheekyFakeLastWarpParameters() { return last_warp_parameters; }
+EXPORT unsigned CheekyFakeWarpCalls() { return warp_calls; }
 // The hook harness loads a second copy as its optional feature-18 runtime.
 EXPORT NgxResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID3D12Device*, unsigned, const NgxParameters*) {
     wchar_t path[MAX_PATH]{};

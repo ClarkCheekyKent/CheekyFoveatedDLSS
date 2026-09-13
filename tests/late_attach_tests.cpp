@@ -124,6 +124,9 @@ struct Fixture {
 };
 Fixture& fixture() { static auto* f=new Fixture; return *f; }
 HMODULE afw_core{};
+HMODULE afw_warp_module{};
+void (__stdcall* afw_cached_warp)(void*){};
+unsigned afw_largest_output_width{};
 bool afw_missing_lower{};
 bool afw_public_first{};
 bool afw_ota{}, afw_ambiguous{};
@@ -148,6 +151,7 @@ void observe_afw_lower(const NgxParameters* params) {
     ID3D12Resource* depth{}; params->Get("Depth", &depth);
     if (depth && depth->GetDesc().Width < 128) ++afw_reduced_depth_calls;
     ID3D12Resource* output{}; params->Get("Output", &output);
+    if (output) afw_largest_output_width = (std::max)(afw_largest_output_width, static_cast<unsigned>(output->GetDesc().Width));
     if (output == fixture().textures12[3].Get()) afw_full_resets += get_ui(params, "Reset") != 0;
 }
 std::string snapshot(CheekyUEVRSnapshotFn get) { std::vector<char> text(32768); require(get(text.data(),32768),"Late snapshot"); return text.data(); }
@@ -614,7 +618,9 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
     for (const auto* name : {L"_nvngx.dll", L"PDAFWPlugin.dll"})
         std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", dir / name);
     afw_core = LoadLibraryW((dir / "_nvngx.dll").c_str());
-    require(afw_core && LoadLibraryW((dir / "PDAFWPlugin.dll").c_str()), "Load simulated AFW core before Cheeky");
+    afw_warp_module = LoadLibraryW((dir / "PDAFWPlugin.dll").c_str());
+    require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
+    afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
     afw_missing_lower = missing_lower || public_first || afw_ambiguous;
     afw_public_first = public_first;
     if (public_first) {
@@ -657,6 +663,18 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     require(afw_contract_ok && afw_order_ok, "AFW sees full resources and precedes private DLSS work");
     const auto status = snapshot(get);
     require(status.find("\"rejected_core_reentry\":0") != std::string::npos, "Supported route never reenters core");
+    require(status.find("\"warp_observer_ready\":true") != std::string::npos &&
+        status.find("\"warp_calls\":0") != std::string::npos && status.find("\"last_warp_age_ms\":-1") != std::string::npos,
+        "Module detection and SR evaluations do not claim warp activity");
+    std::array<unsigned char, 256> opaque_warp_parameters{};
+    for (unsigned i = 0; i < opaque_warp_parameters.size(); ++i) opaque_warp_parameters[i] = static_cast<unsigned char>(i);
+    const auto unchanged_warp_parameters = opaque_warp_parameters;
+    for (unsigned i = 0; i < 3; ++i) afw_cached_warp(opaque_warp_parameters.data());
+    require(opaque_warp_parameters == unchanged_warp_parameters &&
+        proc<void*(*)()>(afw_warp_module, "CheekyFakeLastWarpParameters")() == opaque_warp_parameters.data() &&
+        proc<Counter>(afw_warp_module, "CheekyFakeWarpCalls")() == 3 &&
+        snapshot(get).find("\"warp_calls\":3") != std::string::npos,
+        "Warp observer forwards cached calls and opaque parameters exactly once without mutation");
     if (afw_missing_lower) {
         require(f.creates() == creates_before && afw_lower_calls == (afw_ambiguous ? 100U : 0U), "Absent lower route stays ordinary DLSS");
         require(status.find("\"missing_lower_calls\":100") != std::string::npos, "Absent route explicitly reported");
@@ -666,11 +684,26 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
         if (f.creates() != creates_before + 2 || afw_lower_calls != 200) puts(status.c_str());
         require(f.creates() == creates_before + 2 && afw_lower_calls == 200 && afw_reduced_depth_calls == 100,
             "Center and reduced periphery run below AFW with stable private handles");
+        require(afw_largest_output_width > 256, "AFW center supersampling enlarges only the private output");
         require(status.find("\"missing_lower_calls\":0") != std::string::npos && status.find("\"lower_calls\":100") != std::string::npos,
             "One nested game DLSS route per full-frame core call");
         const auto nr_begin = status.find("\"nr_details\":{");
         require(nr_begin != std::string::npos && status.substr(nr_begin, status.find('}', nr_begin) - nr_begin).find("\"evaluations\":0") != std::string::npos,
             "Experimental path does not evaluate NR");
+        // Change coverage and quality while AFW continues to see the same full
+        // game textures. Stable manual placement must retain private handles.
+        command("1\n210\nset\nAfwManualCoverage=true\nAfwWarpMargin=0.05\nXOffset=0.5\nHeightOffset=-0.25\nCenterSupersampling=1.25");
+        require(ngx_succeeded(f.evaluate()), "Manual AFW coverage evaluates"); f.finish_gpu();
+        const auto manual_creates = f.creates();
+        for (unsigned i = 0; i < 4; ++i) {
+            require(ngx_succeeded(f.evaluate()), "Manual AFW coverage stays active"); f.finish_gpu();
+        }
+        require(f.creates() == manual_creates && afw_contract_ok && afw_order_ok,
+            "Manual envelope retains private history and isolates resolution changes from AFW");
+        require(snapshot(get).find("\"manual_coverage\":true") != std::string::npos,
+            "Report includes effective AFW coverage mode");
+        command("1\n211\nset\nAfwManualCoverage=false\nCenterSupersampling=2");
+        require(ngx_succeeded(f.evaluate()), "Tested centered AFW mode can be restored"); f.finish_gpu();
         // A private failure must restore the original contract and reset the
         // game feature's starved history exactly on the fallback transition.
         proc<void(*)(unsigned)>(f.ngx, "CheekyFakeFailNextEvaluations")(2);

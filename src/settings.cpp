@@ -20,6 +20,8 @@ std::atomic<bool> peripheral_dlaa_enabled{true};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
 std::atomic<std::uint32_t> center_supersampling_bits{0x3F800000U};
+std::atomic<bool> afw_manual_coverage{false};
+std::atomic<std::uint32_t> afw_warp_margin_bits{0x3D4CCCCDU};
 std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
 std::atomic<std::uint32_t> width_bits{0x3F0CCCCDU};
 std::atomic<std::uint32_t> height_bits{0x3EE66666U};
@@ -132,6 +134,8 @@ Settings configured_settings() noexcept {
         peripheral_dlaa_enabled.load(std::memory_order_acquire);
     settings.peripheral_dlaa_scale = load_float(peripheral_dlaa_scale_bits);
     settings.center_supersampling = load_float(center_supersampling_bits);
+    settings.afw_manual_coverage = afw_manual_coverage.load(std::memory_order_acquire);
+    settings.afw_warp_margin = load_float(afw_warp_margin_bits);
     settings.center_preset =
         center_preset.load(std::memory_order_acquire);
     settings.peripheral_dlaa_preset =
@@ -219,6 +223,9 @@ void update_settings(const Settings& settings) noexcept {
     };
     store_float(center_supersampling_bits, std::isfinite(settings.center_supersampling)
         ? std::clamp(settings.center_supersampling, 1.0F, 2.0F) : 1.0F);
+    afw_manual_coverage.store(settings.afw_manual_coverage, std::memory_order_release);
+    store_float(afw_warp_margin_bits, std::isfinite(settings.afw_warp_margin)
+        ? std::clamp(settings.afw_warp_margin, 0.F, 0.25F) : 0.05F);
     center_preset.store(
         settings.center_preset == 0U || valid_preset(settings.center_preset)
             ? settings.center_preset

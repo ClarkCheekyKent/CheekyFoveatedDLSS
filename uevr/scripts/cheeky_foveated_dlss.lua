@@ -36,14 +36,16 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
         return
     end
     status = value
-    -- A reconnect can reach an older runtime. Drop unsupported order drafts
+    -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    if value.settings.NrProcessingOrder == nil then
-        draft.NrProcessingOrder, dirty.NrProcessingOrder = nil, nil
-        ready_edits.NrProcessingOrder, slider_edits.NrProcessingOrder = nil, nil
-        if pending_apply and pending_apply.values.NrProcessingOrder ~= nil then
-            pending_apply.values.NrProcessingOrder = nil
-            if not next(pending_apply.values) and not pending_apply.reset_group then pending_apply = nil end
+    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwWarpMargin"}) do
+        if value.settings[key] == nil then
+            draft[key], dirty[key] = nil, nil
+            ready_edits[key], slider_edits[key] = nil, nil
+            if pending_apply and pending_apply.values[key] ~= nil then
+                pending_apply.values[key] = nil
+                if not next(pending_apply.values) and not pending_apply.reset_group then pending_apply = nil end
+            end
         end
     end
     last_snapshot_frame = frame
@@ -236,13 +238,23 @@ uevr.sdk.callbacks.on_draw_ui(function()
     text(status.message)
     local afw = status.afw_experiment or {}
     if afw.enabled then
-        text("AFW routing experiment detected. In-game warp quality is not yet verified.")
-        text("Effective settings: fixed centered region at least 70% x 70%, center scale 1x. NR, gaze and marker calibration are bypassed. Saved preferences are retained.")
+        text("AFW compatibility detected. Check warp activity and SR status separately.")
+        text("NR, gaze and marker calibration are bypassed. Saved preferences are retained.")
+        text(string.format("Effective coverage: %.1f%% x %.1f%%; center scale %.2fx (%s).",
+            100 * (afw.effective_width or 0.7), 100 * (afw.effective_height or 0.7),
+            afw.effective_center_scale or 1, afw.manual_coverage and "manual stereo coverage" or "centered minimum 70%"))
         rows("afw_routing", {{"Lower SR runtime selected", yes(afw.runtime_selected)},
             {"SR runtime candidates at selection", tostring(afw.runtime_candidates or 0)},
             {"Full-frame core / nested DLSS calls", tostring(afw.core_calls or 0) .. " / " .. tostring(afw.lower_calls or 0)},
             {"Core calls without nested DLSS", tostring(afw.missing_lower_calls or 0)},
-            {"Rejected core reentry", tostring(afw.rejected_core_reentry or 0)}})
+            {"Rejected core reentry", tostring(afw.rejected_core_reentry or 0)},
+            {"Warp observer ready", yes(afw.warp_observer_ready)},
+            {"Completed warp calls", tostring(afw.warp_calls or 0)},
+            {"Last warp call", (afw.last_warp_age_ms or -1) >= 0 and tostring(afw.last_warp_age_ms) .. " ms ago" or "Not observed"}})
+        if not afw.warp_observer_ready then text("Warp observation unavailable; check AFW's own status.")
+        elseif (afw.warp_calls or 0) == 0 then text("No warp calls observed yet; AFW may be off or suspended.")
+        elseif (afw.last_warp_age_ms or 0) > 1000 then text("No recent warp calls. Check AFW's status after loading or resolution changes.") end
+        text("Warp calls confirm CPU activity, not GPU completion or visual quality.")
         if (afw.lower_calls or 0) == 0 then text("Waiting for a usable nested DLSS route; ordinary DLSS passes through.") end
         if (afw.rejected_core_reentry or 0) > 0 then text("This hook chain reenters the core runtime. Disable Cheeky SR and include a support ZIP when reporting it.") end
     end
@@ -258,6 +270,10 @@ uevr.sdk.callbacks.on_draw_ui(function()
     apply_buttons("top")
 
     if imgui.tree_node("Stereo and gaze") then
+        if afw.enabled then
+            text("AFW's source eye is unknown before DLSS. Coverage does not use evaluation order or guessed eye labels.")
+            text("Use the AFW coverage controls under DLSS-SR. Eye-specific alignment and gaze remain unavailable.")
+        else
         combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
         check("Automatic stereo alignment", "AutoStereoAlignment")
         if draft.AutoStereoAlignment then slider("Height offset / gaze fallback", "AlignedHeightOffset", -1, 1)
@@ -287,18 +303,32 @@ uevr.sdk.callbacks.on_draw_ui(function()
         end
         text("OpenXR alignment/gaze uses the matching Cheeky layer. Fixed alignment needs no eye tracker.")
         reset_group("Reset Stereo / gaze defaults", "gaze")
+        end
         imgui.tree_pop()
     end
 
     if imgui.tree_node("DLSS-SR") then
         check("Enable foveated DLSS-SR", "Enabled")
         if draft.Enabled then
+            if afw.enabled and draft.AfwManualCoverage ~= nil then
+                section("AFW coverage")
+                check("Manual stereo coverage", "AfwManualCoverage")
+                if draft.AfwManualCoverage then
+                    slider("Stereo coverage X offset", "XOffset", -1, 1)
+                    slider("Coverage height offset", "HeightOffset", -1, 1)
+                    slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25)
+                    text("Covers both mirrored X offsets in a rectangle. Width and height below describe each requested region before padding.")
+                    text("Padding is a fraction of the full image; larger values cost more. Inspect moving objects and region edges in both eyes.")
+                else
+                    text("Centered coverage with a minimum of 70% width and height. Larger sizes apply; manual offsets are bypassed.")
+                end
+            end
             section("Center")
             combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
             slider("Center supersampling", "CenterSupersampling", 1, 2)
             slider("Fovea width", "Width", 0.2, 1)
             slider("Fovea height", "Height", 0.2, 1)
-            slider("Roundness", "Roundness", 0, 1)
+            if not afw.enabled or not draft.AfwManualCoverage then slider("Roundness", "Roundness", 0, 1) end
             slider("Transition width", "TransitionWidth", 0, 0.3)
             check("Show red alignment border", "AlignmentBorder")
             section("Periphery")
@@ -327,7 +357,9 @@ uevr.sdk.callbacks.on_draw_ui(function()
     end
 
     if imgui.tree_node("DLSS-NR (experimental)") then
-        if status.renderer == 0 then
+        if afw.enabled then
+            text("DLSS-NR is bypassed while AFW compatibility is latched. Its saved settings are retained.")
+        elseif status.renderer == 0 then
             text("DLSS-NR / DX12 transport is unavailable on the DX11 path in the UEVR plugin.")
         else
             check("Enable DLSS-NR", "NrEnabled")
@@ -386,6 +418,9 @@ uevr.sdk.callbacks.on_draw_ui(function()
 
     if imgui.tree_node("Diagnostics and support") then
         if imgui.tree_node("Eye calibration") then
+            if afw.enabled then
+                text("Marker calibration is bypassed for AFW. Ordinary two-eye marker matching cannot identify its rendered source eye.")
+            else
             local c = status.eye_calibration or {}
             local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
             if changed then send(enabled and "calibration_enable" or "calibration_disable") end
@@ -402,6 +437,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
             text("Samples every 10 VR frames. Corrections count changes to an existing eye assignment; confirmations do not increment it.")
             text("GPU time covers marker and copy commands; CPU time excludes lock waiting.")
             if imgui.button("Reset eye calibration counters") then send("calibration_reset") end
+            end
             imgui.tree_pop()
         end
         local a, o, g = status.late_attach or {}, status.observer or {}, status.gaze or {}

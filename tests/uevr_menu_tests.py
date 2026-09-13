@@ -135,15 +135,41 @@ def run(engine):
     receive(afw)
     count = len(g.sent)
     draw()
-    assert any("AFW routing experiment detected" in t for t in g.drawn.values())
+    assert any("AFW compatibility detected" in t for t in g.drawn.values())
     assert any("ordinary DLSS passes through" in t for t in g.drawn.values())
     assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
+    assert "Foveation center" not in g["values"] and "Enable DLSS-NR" not in g["values"]
+    assert "Automatic eye calibration (this session)" not in g["values"]
+    assert "Center supersampling" in g["values"]
     afw["afw_experiment"].update(lower_calls=100, missing_lower_calls=0)
     afw["afw_experiment"].update(runtime_candidates=1, runtime_selected=True)
     receive(afw)
     draw()
     assert not any("ordinary DLSS passes through" in t for t in g.drawn.values())
     assert any("Lower SR runtime selected" in t for t in g.drawn.values())
+    afw["afw_experiment"].update(warp_observer_ready=True, warp_calls=0, last_warp_age_ms=-1)
+    receive(afw)
+    draw()
+    assert any("No warp calls observed yet" in t for t in g.drawn.values())
+    afw["settings"]["AfwManualCoverage"] = True
+    afw["afw_experiment"].update(manual_coverage=True, warp_calls=3, last_warp_age_ms=20,
+                                  effective_width=0.8, effective_height=0.6, effective_center_scale=1.25)
+    receive(afw)
+    draw()
+    assert "Stereo coverage X offset" in g["values"] and "Warp padding per edge" in g["values"]
+    assert "Roundness" not in g["values"]
+    assert any("80.0% x 60.0%" in t and "1.25x" in t for t in g.drawn.values())
+    afw["afw_experiment"]["last_warp_age_ms"] = 1500
+    receive(afw)
+    draw()
+    assert any("No recent warp calls" in t for t in g.drawn.values())
+    assert len(g.sent) == count, "Drawing AFW status and overrides must not write settings"
+    legacy_afw = copy.deepcopy(afw)
+    del legacy_afw["settings"]["AfwManualCoverage"]
+    del legacy_afw["settings"]["AfwWarpMargin"]
+    receive(legacy_afw)
+    draw()
+    assert "Manual stereo coverage" not in g["values"] and "Warp padding per edge" not in g["values"]
     receive(state)
     draw()  # Open every tree, validate all widget types and enum keys.
     order = list(g.tree_order.values())

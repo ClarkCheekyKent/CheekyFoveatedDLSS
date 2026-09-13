@@ -78,6 +78,8 @@ void settings_tests(const std::filesystem::path& root) {
     require(!set_named_setting(s, "GazeQuantizationPixels", "-1"), "Reject negative unsigned");
     s.enabled = false; s.nr_motion_scale_x_multiplier = -1.25f;
     require(set_named_setting(s, "NrStyle", "2"), "Parse Cinematic style");
+    require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
+        "Parse AFW manual coverage settings");
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
@@ -104,6 +106,10 @@ void settings_tests(const std::filesystem::path& root) {
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
     require(r.nr_style == 0U, "Legacy settings must restore Standard style");
+    require(!r.afw_manual_coverage && r.afw_warp_margin == .05F,
+        "Legacy settings restore centered AFW mode even over existing manual settings");
+    require(setting_group("AfwManualCoverage") == "sr" && setting_group("AfwWarpMargin") == "sr",
+        "AFW coverage belongs to the SR reset group");
     require(setting_groups_json().find("\"NrProcessingOrder\":\"nr\"") != std::string::npos,
         "Rendering order is missing from NR group metadata");
     r = s;

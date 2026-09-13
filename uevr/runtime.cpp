@@ -13,6 +13,7 @@
 #include "openvr_gaze.hpp"
 #include "dlss_nr.hpp"
 #include "d3d12_ngx_dispatch.hpp"
+#include "afw_compatibility.hpp"
 #include "version.h"
 #include <atomic>
 #include <array>
@@ -62,6 +63,7 @@ std::string snapshot_locked(State& s) {
     const auto nr = dlss_nr_snapshot();
     const auto attach = late_attach_status();
     const auto afw = afw_compatibility_status();
+    const auto afw_settings = afw_experiment_settings(configured_settings());
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
     out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr\",\"request\":" << s.request
@@ -77,7 +79,13 @@ std::string snapshot_locked(State& s) {
         << ",\"missing_lower_calls\":" << afw.missing_lower_calls
         << ",\"standalone_lower_calls\":" << afw.standalone_lower_calls
         << ",\"rejected_core_reentry\":" << afw.rejected_core_reentry
-        << ",\"runtime_candidates\":" << afw.runtime_candidates << ",\"runtime_selected\":" << afw.runtime_selected << '}'
+        << ",\"runtime_candidates\":" << afw.runtime_candidates << ",\"runtime_selected\":" << afw.runtime_selected
+        << ",\"warp_observer_ready\":" << afw.warp_observer_ready << ",\"warp_calls\":" << afw.warp_calls
+        << ",\"last_warp_age_ms\":" << (afw.last_warp_age_ms == UINT64_MAX ? -1LL : static_cast<long long>(afw.last_warp_age_ms))
+        << ",\"manual_coverage\":" << afw_settings.afw_manual_coverage
+        << ",\"effective_width\":" << afw_settings.width << ",\"effective_height\":" << afw_settings.height
+        << ",\"effective_height_offset\":" << afw_settings.height_offset
+        << ",\"effective_center_scale\":" << afw_settings.center_supersampling << '}'
         << ",\"eye_calibration\":" << eye_calibration_json()
         << ",\"support\":{\"busy\":" << s.report_busy.load() << ",\"zip\":\"" << json_escape(path_utf8(s.report_zip)) << "\"}"
         << ",\"gpu_timing\":{\"recorded\":" << gpu.recorded << ",\"submitted\":" << gpu.submitted
@@ -156,7 +164,7 @@ std::string snapshot_locked(State& s) {
         const auto& v = details[i];
         if (i) out << ',';
         out << "{\"id\":\"" << v.view_id << "\",\"eye\":\""
-            << (v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : "Unassigned")
+            << (afw.enabled ? "Unknown (AFW source eye)" : v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : "Unassigned")
             << "\",\"evaluations\":" << v.evaluations
             << ",\"input_width\":" << v.render_width << ",\"input_height\":" << v.render_height
             << ",\"output_width\":" << v.output_width << ",\"output_height\":" << v.output_height

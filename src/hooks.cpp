@@ -225,6 +225,18 @@ thread_local bool inside_streamline_evaluation{};
 thread_local unsigned streamline_create_width{}, streamline_create_height{};
 thread_local bool streamline_nr_history_reset{};
 
+// Public AFW ABI: void __stdcall EvaluateFrameWarp(FrameWarpEvaluateParams&).
+// A Win64 reference is passed as a pointer. Forward it opaquely: observing
+// activity must not depend on a private parameter layout or assign an early eye.
+using AfwEvaluateWarpFn = void(__stdcall*)(void*);
+std::atomic<AfwEvaluateWarpFn> real_afw_evaluate_warp{};
+void __stdcall hook_afw_evaluate_warp(void* parameters) {
+    const auto original = real_afw_evaluate_warp.load(std::memory_order_acquire);
+    if (!original) return;
+    original(parameters);
+    afw_note_warp_call(); // A returned CPU call, not proof of GPU/visual correctness.
+}
+
 void detect_afw_runtime() noexcept {
     if (afw_compatibility_enabled()) return;
     const auto module = GetModuleHandleW(L"PDAFWPlugin.dll");
@@ -232,7 +244,7 @@ void detect_afw_runtime() noexcept {
         !GetProcAddress(module, "InitDevice") || !GetProcAddress(module, "InitFrameWarp")) return;
     // Latch for this process. AFW's hooks also run during warmup and fallback.
     enable_afw_compatibility();
-    log_info("AFW experiment: full-frame core passthrough, nested public DLSS only; fixed region at least 70% x 70%, center scale 1x, NR and marker calibration bypassed.");
+    log_info("AFW compatibility: full-frame core passthrough, nested public DLSS only; eye-independent coverage, NR/gaze/marker calibration bypassed. Warp activity is reported separately from DLL detection.");
 }
 
 void afw_private_succeeded(const NgxHandle* handle) {
@@ -5181,7 +5193,8 @@ template <typename T>
     const char* const export_name,
     void* const detour,
     std::atomic<T>& original_storage,
-    const DiagnosticApi api
+    const DiagnosticApi api,
+    const bool report_ngx_detour = true
 ) noexcept {
     if (module == nullptr || export_name == nullptr || detour == nullptr) {
         return false;
@@ -5264,7 +5277,7 @@ template <typename T>
 
     direct_hook_targets[direct_hook_count++] = target;
     ReleaseSRWLockExclusive(&direct_hook_lock);
-    diagnostic_note_direct_detour(api);
+    if (report_ngx_detour) diagnostic_note_direct_detour(api);
     trace_event("Direct detour installed export=%s target=%p detour=%p", export_name, target, detour);
     return true;
 }
@@ -5313,6 +5326,27 @@ template <typename T>
 ) noexcept {
     if (!minhook_initialized.load(std::memory_order_acquire)) return false;
     bool installed{};
+
+    detect_afw_runtime();
+    if (afw_compatibility_enabled() && !afw_compatibility_status().warp_observer_ready) {
+        static RuntimeStability warp_stability{};
+        static HMODULE attempted_module{};
+        const auto observed = GetModuleHandleW(L"PDAFWPlugin.dll");
+        HMODULE module{};
+        // Keep the observer's module alive with its trampoline. A failed
+        // observer is optional and never prevents ordinary SR routing.
+        if (observed != attempted_module && runtime_ready_for_direct_hooks(observed,
+                warp_stability, L"PDAFWPlugin.dll", require_runtime_stability) &&
+                GetModuleHandleExW(0, L"PDAFWPlugin.dll", &module)) {
+            attempted_module = module;
+            if (install_direct_hook(module, "EvaluateFrameWarp",
+                    reinterpret_cast<void*>(&hook_afw_evaluate_warp), real_afw_evaluate_warp,
+                    DiagnosticApi::d3d12, false)) {
+                afw_note_warp_observer(true);
+                installed = true;
+            } else FreeLibrary(module);
+        }
+    }
 
     const auto observed_public_runtime = afw_compatibility_enabled()
         ? find_afw_sr_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
@@ -5483,6 +5517,7 @@ template <typename T>
 }
 
 void shutdown_direct_export_hooks() noexcept {
+    afw_note_warp_observer(false);
     if (!minhook_initialized.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
