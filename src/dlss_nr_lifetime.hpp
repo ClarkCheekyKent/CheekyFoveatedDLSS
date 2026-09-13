@@ -22,6 +22,7 @@ public:
     void collect(NrSignal = nullptr) noexcept;
     [[nodiscard]] bool empty() const noexcept { return uses_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return uses_.size(); }
+    [[nodiscard]] bool has_submissions() const noexcept;
     [[nodiscard]] std::uint64_t fences_created() const noexcept;
     [[nodiscard]] std::uint64_t fences_released() const noexcept;
 private:

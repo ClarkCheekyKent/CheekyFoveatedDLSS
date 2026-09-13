@@ -849,7 +849,7 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     root_parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
     root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[2].Constants.ShaderRegister = 0U;
-    root_parameters[2].Constants.Num32BitValues = 21U;
+    root_parameters[2].Constants.Num32BitValues = 40U;
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
     root_desc.NumParameters = 3U;
     root_desc.pParameters = root_parameters;
@@ -891,9 +891,22 @@ cbuffer CodecConstants : register(b0) {
     float FoveationRoundness;
     float FoveationFeather;
     uint ShowAlignmentBorder;
+    uint MaskCount;
+    uint2 MaskPadding;
+    float4 MaskBounds[4];
 };
 
 float FoveationShapeDistance(float2 pixel) {
+    if (MaskCount != 0 && FoveationRoundness > 0) {
+        const float2 uv = (pixel - float2(RegionBase) + 0.5) / max(float2(RegionSize), 1.0);
+        float distance = 1e10;
+        [unroll] for (uint i = 0; i < 4; ++i) if (i < MaskCount) {
+            const float4 b = MaskBounds[i];
+            const float2 p = abs(2.0 * uv - b.xy - b.zw) / max(b.zw - b.xy, 0.0001);
+            distance = min(distance, lerp(max(p.x, p.y), length(p), saturate(FoveationRoundness)));
+        }
+        return distance;
+    }
     const float2 centered =
         (pixel - float2(RegionBase) + 0.5) /
         (0.5 * max(float2(RegionSize), 1.0)) - 1.0;
@@ -1310,9 +1323,11 @@ void dispatch_codec(
         float foveation_roundness;
         float foveation_feather;
         std::uint32_t show_alignment_border;
+        std::uint32_t mask_count, padding[2];
+        float mask_bounds[4][4];
     };
-    static_assert(sizeof(CodecConstants) == 21U * sizeof(std::uint32_t));
-    const CodecConstants constants{
+    static_assert(sizeof(CodecConstants) == 40U * sizeof(std::uint32_t));
+    CodecConstants constants{
         {gpu.width, gpu.height},
         {gpu.width, gpu.height},
         {region.base_x, region.base_y},
@@ -1328,8 +1343,10 @@ void dispatch_codec(
         region.roundness,
         region.transition,
         settings.nr_alignment_border_enabled ? 1U : 0U,
+        region.mask.count, {}, {},
     };
-    frame.command_list->SetComputeRoot32BitConstants(2U, 21U, &constants, 0U);
+    std::memcpy(constants.mask_bounds, region.mask.bounds, sizeof(constants.mask_bounds));
+    frame.command_list->SetComputeRoot32BitConstants(2U, 40U, &constants, 0U);
     const auto dispatch_width = (std::max)(gpu.width, gpu.working_width);
     const auto dispatch_height = (std::max)(gpu.height, gpu.working_height);
     frame.command_list->Dispatch(
@@ -1349,18 +1366,23 @@ bool resolve_afw_nr_coverage(DlssNrFrame& frame, Settings& settings) noexcept {
     coverage.x_offset = settings.afw_nr.x; coverage.height_offset = settings.afw_nr.y;
     coverage.afw_gaze_width = settings.afw_nr.gaze_width; coverage.afw_gaze_height = settings.afw_nr.gaze_height;
     coverage.afw_nr_coverage = true;
+    coverage.afw_mask = settings.afw_nr_mask;
     CropGeometry crop{}; bool reset{};
     if (settings.nr_use_sr_foveation && frame.has_shared_sr_crop) {
         crop = frame.shared_sr_crop;
         if (!frame.input_width || !frame.input_height) return false;
         frame.center = foveation_center_from_geometry(crop, frame.input_width, frame.input_height);
+        coverage.afw_mask = settings.afw_mask;
+        apply_next_jump_preview(coverage, frame.view_id);
     } else if (!calculate_coordinated_crop(coverage, afw_nr_gaze_view(frame.view_id), frame.color,
             frame.input_width, frame.input_height, frame.output_width, frame.output_height,
             frame.view_output_base_x, frame.view_output_base_y, crop, reset, nullptr, &frame.center)) return false;
+    else apply_next_jump_preview(coverage, afw_nr_gaze_view(frame.view_id));
     frame.has_center = true; frame.reset |= reset;
     settings.nr_width = static_cast<float>(crop.input_width) / frame.input_width;
     settings.nr_height = static_cast<float>(crop.input_height) / frame.input_height;
-    settings.nr_roundness = settings.nr_use_sr_foveation ? settings.roundness : 0.F;
+    settings.nr_roundness = settings.nr_use_sr_foveation ? settings.roundness : settings.nr_roundness;
+    settings.afw_nr_mask = coverage.afw_mask;
     if (settings.nr_use_sr_foveation) settings.nr_transition_width = settings.transition_width;
     settings.nr_use_sr_foveation = false;
     return true;

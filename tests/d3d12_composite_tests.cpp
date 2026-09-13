@@ -3,6 +3,11 @@
 #include "d3d12_composite_shader.hpp"
 #include "d3d11_composite_shader.hpp"
 #include "d3d12_output_contract.hpp"
+#include "d3d12_ngx_dispatch.hpp"
+#include "graphics_observer.hpp"
+#include "mock_ngx_parameters.hpp"
+#include "afw_depth_coverage.hpp"
+#include "afw_compatibility.hpp"
 
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
@@ -269,7 +274,8 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 
 void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
-    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false, bool before_nr = false, bool nr_success = true) {
+    UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false, bool before_nr = false, bool nr_success = true,
+    bool afw_rounded = false) {
     ComPtr<ID3D12InfoQueue> messages;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) {
         messages->ClearStoredMessages();
@@ -387,7 +393,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         params[i].DescriptorTable = {1, &ranges[i]};
     }
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[2].Constants = {0, 0, 32};
+    params[2].Constants = {0, 0, 44};
     D3D12_ROOT_SIGNATURE_DESC rd{};
     rd.NumParameters = 3;
     rd.pParameters = params;
@@ -413,12 +419,19 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     list->SetComputeRootDescriptorTable(0, gpu);
     gpu.ptr += 2ULL * increment;
     list->SetComputeRootDescriptorTable(1, gpu);
-    std::array<UINT32, 32> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
+    std::array<UINT32, 44> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
     if (before_nr) { constants[4] = 4U; constants[5] = 2U; constants[6] = 24U; constants[7] = 20U; }
     const float one = 1.0F;
     std::memcpy(&constants[12], &one, sizeof(one));
     std::memcpy(&constants[13], &one, sizeof(one));
-    list->SetComputeRoot32BitConstants(2, 32, constants.data(), 0);
+    if (afw_rounded) {
+        std::memcpy(&constants[16], &one, sizeof(one));
+        constants[26] = 2;
+        const float bounds[8]{7.4F / 24, 6.4F / 20, 12.6F / 24, 11.6F / 20,
+            11.4F / 24, 8.4F / 20, 16.6F / 24, 13.6F / 20};
+        std::memcpy(&constants[28], bounds, sizeof(bounds));
+    }
+    list->SetComputeRoot32BitConstants(2, 44, constants.data(), 0);
     list->Dispatch(2, 2, 1);
     transition(list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     auto readback = buffer(device, output.bytes, D3D12_HEAP_TYPE_READBACK);
@@ -469,6 +482,13 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
                 UINT32 expected = sentinel;
                 if (i == 0 && x >= 4 && x < 28 && y >= 2 && y < 22) {
                     expected = (before_nr && nr_success) || (x >= 12 && x < 20 && y >= 8 && y < 16) ? green : blue;
+                    if (afw_rounded && expected == green) {
+                        // Independent circle-union reference, in full-eye pixels.
+                        const double px = x - 4 + .5, py = y - 2 + .5;
+                        const double a = (px - 10) * (px - 10) + (py - 9) * (py - 9);
+                        const double b = (px - 14) * (px - 14) + (py - 11) * (py - 11);
+                        if ((std::min)(a, b) > 2.6 * 2.6) expected = blue;
+                    }
                 }
                 if (checker && i == 0 && x >= 12 && x < 20 && y >= 8 && y < 16) {
                     // Independent CPU reference: integrate every source cell's
@@ -549,6 +569,103 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         << " format=" << format << " source=" << source_width << "x" << source_height
         << " shader=" << (direct11 ? "DX11" : "DX12") << '\n';
 }
+
+#ifdef CHEEKY_NR_NATIVE_OBSERVER
+void run_afw_copy_identity(ID3D12Device* device) {
+    ComPtr<ID3D12InfoQueue> messages;
+    device->QueryInterface(IID_PPV_ARGS(&messages));
+    if (messages) messages->ClearStoredMessages();
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC q{};
+    check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
+    require(initialize_native_observer(device, queue.Get()), "AFW depth-copy observer initialization");
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    auto source = texture(device, list.Get(), 32, 24, 1, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto target = texture(device, list.Get(), 32, 24, 1, 1, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+    transition(list.Get(), source.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    enable_afw_compatibility();
+    afw_bind_depth_eye(1, observe_native_resource(target.resource.Get()));
+    MockNgxParameters parameters;
+    parameters.Set("Depth", source.resource.Get()); parameters.Set("Output", target.resource.Get());
+    const auto core = +[](ID3D12GraphicsCommandList* cmd, const NgxHandle* h, const NgxParameters* p, NgxProgressCallback cb) -> NgxResult {
+        ID3D12Resource* src{}; ID3D12Resource* dst{}; unsigned mode{};
+        p->Get("Depth", &src); p->Get("Output", &dst); p->Get("CopyMode", &mode);
+        if (mode == 0) cmd->CopyResource(dst, src);
+        else {
+            D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+            from.pResource = src; to.pResource = dst;
+            from.Type = to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_BOX box{mode == 2 ? 1U : 0U, 0, 0, 32, 24, 1};
+            cmd->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+        }
+        const auto original = +[](ID3D12GraphicsCommandList*, const NgxHandle*, const NgxParameters*, NgxProgressCallback) -> NgxResult { return 0x100; };
+        const auto lower = +[](const D3D12NgxEvaluationCall&, D3D12NgxEvaluateFn, void*) -> NgxResult {
+            return afw_current_source_eye() == 1 ? 0x101 : 0x200;
+        };
+        return dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime, cmd, h, p, cb}, original, lower);
+    };
+    for (unsigned mode : {0U, 1U, 2U}) {
+        parameters.Set("CopyMode", mode);
+        const auto result = dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime, list.Get(), nullptr, &parameters}, core, nullptr);
+        require(result == (mode == 2 ? 0x200U : 0x101U), "Native depth-copy hook must identify complete copies and reject partial ones");
+        require(afw_current_source_eye() == UINT32_MAX, "Native source-eye observation escaped its core evaluation");
+    }
+    float projections[2][16]{};
+    for (auto& p : projections) { p[0] = p[5] = p[11] = 1.F; p[14] = .1F; }
+    allow_afw_stereo_projection(true);
+    publish_afw_stereo_projection(projections, 256, 256, true);
+    auto depth = texture(device, list.Get(), 128, 64, 1, 1, 0x3F000000U, DXGI_FORMAT_R32_FLOAT); // Uniform 0.5 depth.
+    transition(list.Get(), depth.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    AfwMatrix transform{}; transform[0] = transform[5] = transform[10] = transform[15] = 1.F; transform[8] = .4F;
+    capture_afw_depth_coverage(list.Get(), depth.resource.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, transform, 1);
+    require(afw_depth_coverage_status().pending == 1 && !afw_depth_coverage_status().valid,
+        "Recorded depth cannot be consumed before submission and retirement");
+    check(list->Close());
+    ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1, lists);
+    ComPtr<ID3D12Fence> fence;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+    check(queue->Signal(fence.Get(), 1));
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    require(done != nullptr, "AFW copy test event");
+    const auto signal = fence->SetEventOnCompletion(1, done);
+    const auto waited = SUCCEEDED(signal) ? WaitForSingleObject(done, 10000) : WAIT_FAILED;
+    CloseHandle(done); require(waited == WAIT_OBJECT_0, "AFW copy test GPU timeout");
+    poll_afw_depth_coverage();
+    require(!afw_depth_coverage_status().valid, "A replayable depth readback must remain protected after first execution");
+    check(allocator->Reset()); check(list->Reset(allocator.Get(), nullptr));
+    poll_afw_depth_coverage();
+    const auto measured = afw_depth_coverage_status(1);
+    require(measured.valid && measured.margin >= .124F && measured.margin <= .126F && measured.completed == 1,
+        "GPU depth readback must measure 10% displacement plus its quantized sample guard");
+    require(!afw_depth_coverage_status(0).valid, "Another source eye cannot inherit depth estimates");
+    capture_afw_depth_coverage(list.Get(), depth.resource.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, transform, 0);
+    check(list->Close()); check(allocator->Reset()); check(list->Reset(allocator.Get(), nullptr));
+    poll_afw_depth_coverage();
+    require(!afw_depth_coverage_status(0).valid && afw_depth_coverage_status().pending == 0 && afw_depth_coverage_status().completed == 1,
+        "An unsubmitted Reset must discard depth work without accepting undefined readback bytes");
+    allow_afw_stereo_projection(false);
+    require(!afw_depth_coverage_status().valid, "Host detach invalidates depth feedback immediately");
+    check(list->Close());
+    if (messages) {
+        for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
+            SIZE_T size{};
+            check(messages->GetMessage(i, nullptr, &size));
+            std::vector<unsigned char> storage(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            check(messages->GetMessage(i, message, &size));
+            if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
+                std::cerr << message->pDescription << '\n';
+                throw std::runtime_error("D3D12 debug layer rejected AFW depth capture/copy work");
+            }
+        }
+    }
+    std::cout << "AFW source eye: real CopyResource/CopyTextureRegion hooks, partial-copy rejection and scoped identity passed\n";
+    std::cout << "AFW depth padding: GPU readback, measured reprojection, replay protection, unsubmitted Reset and detach passed\n";
+}
+#endif
 } // namespace
 
 int run_d3d12_composite_tests() {
@@ -576,6 +693,7 @@ int run_d3d12_composite_tests() {
             run_nr_recycling(device.Get(), false, route);
         }
         run_case(device.Get(), 1, 1);
+        run_case(device.Get(), 2, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, false, true, true);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, true);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, false);
         run_case(device.Get(), 2, 5);
@@ -591,6 +709,9 @@ int run_d3d12_composite_tests() {
             run_case(device.Get(), direct11 ? 1 : 2, direct11 ? 1 : 5,
                 DXGI_FORMAT_R11G11B10_FLOAT, 12, 12, direct11);
         }
+#ifdef CHEEKY_NR_NATIVE_OBSERVER
+        run_afw_copy_identity(device.Get());
+#endif
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

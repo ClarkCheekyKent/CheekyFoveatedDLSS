@@ -54,4 +54,29 @@ inline void afw_gaze_axis(float lower, float upper, unsigned extent, unsigned qu
     const auto aligned = ((desired + quantum / 2) / quantum) * quantum;
     start = std::clamp(aligned, minimum, maximum); // Coverage takes precedence over quantization at an edge.
 }
+
+// Grow immediately; shrink only after one second continuously below a useful
+// reduction threshold. Retain the largest request in that interval and a
+// quantum of headroom, so jitter cannot churn DLSS features every frame.
+struct AfwGazeAllocation {
+    unsigned candidate{};
+    double since{-1.};
+    void update(float lower, float upper, unsigned extent, unsigned quantum,
+        double now, unsigned& retained) noexcept {
+        quantum = std::clamp(quantum, 1U, 64U);
+        const unsigned lo = static_cast<unsigned>(std::floor(std::clamp(lower, 0.F, 1.F) * extent));
+        const unsigned hi = static_cast<unsigned>(std::ceil(std::clamp(upper, 0.F, 1.F) * extent));
+        const unsigned needed = (std::min)(extent, ((hi - lo + quantum - 1) / quantum) * quantum);
+        const unsigned headroom = (std::min)(extent, needed + quantum);
+        const unsigned threshold = (std::max)(2U * quantum, retained / 8U);
+        if (headroom >= retained || retained - headroom < threshold || !std::isfinite(now)) {
+            candidate = 0; since = -1.; return;
+        }
+        if (since < 0. || now < since) { since = now; candidate = headroom; }
+        candidate = (std::max)(candidate, headroom);
+        if (now - since >= 1.) {
+            retained = candidate; candidate = 0; since = -1.;
+        }
+    }
+};
 }

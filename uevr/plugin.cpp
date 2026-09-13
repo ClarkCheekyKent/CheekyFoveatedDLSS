@@ -16,6 +16,7 @@ CheekyUEVRDetachFn runtime_detach{};
 CheekyUEVRTickFn runtime_tick{};
 CheekyUEVRAttachOpenVRFn runtime_attach_openvr{};
 CheekyUEVRPublishStereoFn runtime_publish_stereo{};
+CheekyUEVRPublishRenderingModeFn runtime_publish_mode{};
 CheekyUEVRCommandFn runtime_command{};
 CheekyUEVRSnapshotFn runtime_snapshot{};
 std::atomic<bool> initialized{};
@@ -57,6 +58,13 @@ void on_present() {
         }
         const auto* r = api->renderer;
         if (runtime_tick && r && attachment) runtime_tick(attachment, r->renderer_type, r->device, r->command_queue);
+        if (runtime_publish_mode && attachment) {
+            char value[32]{};
+            if (api->vr && api->vr->get_mod_value) api->vr->get_mod_value("VR_RenderingMethod", value, sizeof(value));
+            const auto mode = value[0] >= '0' && value[0] <= '3' && value[1] == '\0'
+                ? static_cast<unsigned>(value[0] - '0') : UINT32_MAX;
+            runtime_publish_mode(attachment, mode);
+        }
         if (runtime_publish_stereo && attachment) {
             CheekyUEVRStereoProjection projection;
             if (r && r->renderer_type == UEVR_RENDERER_D3D12 && r->device && r->command_queue &&
@@ -129,6 +137,7 @@ extern "C" __declspec(dllexport) bool uevr_plugin_initialize(const UEVR_PluginIn
             runtime_detach = nullptr; FreeLibrary(dll); return false;
         }
         load_export(dll, "CheekyUEVR_PublishStereo", runtime_publish_stereo); // Additive, optional for older resident runtimes.
+        load_export(dll, "CheekyUEVR_PublishRenderingMode", runtime_publish_mode);
         HMODULE pinned{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(runtime_start), &pinned)) {

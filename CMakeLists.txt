@@ -187,6 +187,7 @@ add_executable(CheekyNrObserverTests
     tests/nr_observer_tests.cpp tests/nr_lifetime_tests.cpp tests/d3d12_composite_tests.cpp
     src/dlss_nr_lifetime.cpp src/dlss_nr_input.cpp src/dlss_nr_contract.cpp
     src/d3d12_output_contract.cpp src/foveation.cpp src/settings.cpp src/graphics_observer.cpp
+    src/d3d12_ngx_dispatch.cpp src/afw_depth_coverage.cpp
     third_party/reshade/deps/minhook/src/buffer.c
     third_party/reshade/deps/minhook/src/hook.c
     third_party/reshade/deps/minhook/src/trampoline.c

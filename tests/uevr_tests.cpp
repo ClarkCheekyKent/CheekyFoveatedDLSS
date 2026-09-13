@@ -35,6 +35,10 @@ UEVR_OnCustomEventCb custom{};
 void* cached_compositor{};
 bool openvr_active{};
 bool hmd_active{true};
+std::string rendering_mode{"3"};
+void get_mod_value(const char* key, char* value, unsigned size) {
+    if (std::string(key) == "VR_RenderingMethod") strncpy_s(value, size, rendering_mode.c_str(), _TRUNCATE);
+}
 bool is_hmd_active() { return hmd_active; }
 unsigned hmd_extent() { return 256; }
 void get_projection(UEVR_Eye eye, UEVR_Matrix4x4f* out) {
@@ -89,6 +93,7 @@ void settings_tests(const std::filesystem::path& root) {
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
         "Parse AFW manual coverage settings");
     require(set_named_setting(s, "AfwAutomaticCoverage", "true"), "Parse AFW automatic coverage setting");
+    require(set_named_setting(s, "AfwDepthCoverage", "false"), "Parse AFW depth coverage setting");
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
@@ -115,10 +120,16 @@ void settings_tests(const std::filesystem::path& root) {
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
     require(r.nr_style == 0U, "Legacy settings must restore Standard style");
-    require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_warp_margin == .05F,
+    require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_depth_coverage && r.afw_warp_margin == .05F,
         "Legacy settings restore centered AFW mode even over existing manual settings");
-    require(setting_group("AfwManualCoverage") == "sr" && setting_group("AfwWarpMargin") == "sr",
-        "AFW coverage belongs to the SR reset group");
+    for (const auto key : {"AfwManualCoverage", "AfwAutomaticCoverage", "AfwDepthCoverage", "AfwWarpMargin"})
+        require(setting_group(key) == "gaze", "Shared AFW coverage belongs to the Stereo/gaze reset group");
+    auto reset_afw = s;
+    require(reset_settings_group(reset_afw, "sr") && reset_afw.afw_manual_coverage && !reset_afw.afw_depth_coverage,
+        "SR reset must preserve shared AFW coverage used by NR");
+    require(reset_settings_group(reset_afw, "gaze") && !reset_afw.afw_manual_coverage &&
+        !reset_afw.afw_automatic_coverage && reset_afw.afw_depth_coverage && reset_afw.afw_warp_margin == .05F,
+        "Stereo/gaze reset restores all shared AFW controls");
     require(setting_groups_json().find("\"NrProcessingOrder\":\"nr\"") != std::string::npos,
         "Rendering order is missing from NR group metadata");
     r = s;
@@ -207,6 +218,7 @@ int main(int argc, char** argv) {
         UEVR_PluginInitializeParam api{}; api.version = &version; api.functions = &functions; api.callbacks = &callbacks; api.renderer = &renderer;
         UEVR_VRData vr_api{}; vr_api.is_openvr = is_openvr;
         vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
+        vr_api.get_mod_value = get_mod_value;
         vr_api.get_hmd_width = vr_api.get_hmd_height = hmd_extent;
         if (afw) api.vr = &vr_api;
         UEVR_OpenVRData openvr_api{}; openvr_api.get_vr_compositor = get_compositor;
@@ -304,6 +316,15 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (afw) {
+            const auto publish_mode = reinterpret_cast<CheekyUEVRPublishRenderingModeFn>(GetProcAddress(runtime, "CheekyUEVR_PublishRenderingMode"));
+            require(publish_mode && !publish_mode(0, 0) && !publish_mode(999, 0), "Unowned AFW mode publication rejected");
+            rendering_mode = "0"; present();
+            require(snapshot(get).find("\"coverage_enabled\":false") != std::string::npos &&
+                snapshot(get).find("\"rendering_mode\":0") != std::string::npos, "Native Stereo restores ordinary coverage without removing hooks");
+            rendering_mode = "garbage"; present();
+            require(snapshot(get).find("\"coverage_enabled\":true") != std::string::npos &&
+                snapshot(get).find("\"rendering_mode_known\":false") != std::string::npos, "Malformed mode retains conservative AFW coverage");
+            rendering_mode = "3"; present();
             auto publish = reinterpret_cast<CheekyUEVRPublishStereoFn>(GetProcAddress(runtime, "CheekyUEVR_PublishStereo"));
             CheekyUEVRStereoProjection invalid;
             require(publish && !publish(0, &invalid) && !publish(999, &invalid), "Unowned projection publication rejected");
@@ -326,6 +347,7 @@ int main(int argc, char** argv) {
                 "Reattachment does not inherit another adapter generation's projections");
             invalid.abi = 1;
             require(!publish(1, &invalid), "Old adapter generation cannot publish after reconnect");
+            require(!publish_mode(1, 0), "Old adapter cannot disable new attachment's AFW coverage");
             present();
             require(snapshot(get).find("\"projection_valid\":true") != std::string::npos,
                 "Reconnected AFW adapter publishes fresh projections");

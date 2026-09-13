@@ -15,6 +15,7 @@ struct NrRegion {
     float shape_height{1.0F};
     float roundness{};
     float transition{};
+    FoveationMask mask{}; // Bounds normalized to this processing rectangle.
 };
 
 struct ScaledSubrect {

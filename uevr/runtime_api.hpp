@@ -26,6 +26,7 @@ struct CheekyUEVRStereoProjection {
     float matrices[2][16]{};
 };
 using CheekyUEVRPublishStereoFn = bool (*)(std::uint64_t, const CheekyUEVRStereoProjection*);
+using CheekyUEVRPublishRenderingModeFn = bool (*)(std::uint64_t, std::uint32_t);
 using CheekyUEVRCommandFn = bool (*)(std::uint64_t, const char*);
 using CheekyUEVRSnapshotFn = bool (*)(char*, std::uint32_t);
 // Every export contains exceptions. Detach is a loader-lock-safe atomic store.

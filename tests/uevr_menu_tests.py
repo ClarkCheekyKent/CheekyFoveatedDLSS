@@ -147,7 +147,7 @@ def run(engine):
     receive(afw)
     draw()
     assert "Rendering order" in g["values"] and "NR width" in g["values"]
-    assert "NR roundness" not in g["values"] and "NR working scale" in g["values"]
+    assert "NR roundness" in g["values"] and "NR working scale" in g["values"]
     assert any("after AFW motion preparation" in t for t in g.drawn.values())
     afw["afw_experiment"].update(lower_calls=100, missing_lower_calls=0)
     afw["afw_experiment"].update(runtime_candidates=1, runtime_selected=True)
@@ -165,7 +165,8 @@ def run(engine):
     receive(afw)
     draw()
     assert "Stereo coverage X offset" in g["values"] and "Warp padding per edge" in g["values"]
-    assert "Roundness" not in g["values"]
+    assert "Roundness" in g["values"]
+    assert "Depth-adaptive warp padding" in g["values"]
     assert any("80.0% x 60.0%" in t and "1.25x" in t for t in g.drawn.values())
     afw["afw_experiment"]["last_warp_age_ms"] = 1500
     receive(afw)
@@ -195,10 +196,24 @@ def run(engine):
     receive(afw)
     draw()
     assert "Simulation pattern" in g["values"] and "Gaze smoothing (ms)" in g["values"]
-    assert "Show next jump target" not in g["values"] and "Roundness" not in g["values"]
+    assert "Show next jump target" in g["values"] and "Roundness" in g["values"]
     assert any("bilateral gaze coverage" in t for t in g.drawn.values())
     assert not any("awaiting fresh matching projections" in t for t in g.drawn.values())
     assert len(g.sent) == count, "Gaze diagnostics must not rewrite preferences"
+    afw["settings"]["Enabled"] = False
+    receive(afw)
+    draw()
+    assert "Depth-adaptive warp padding" in g["values"] and "Warp padding per edge" in g["values"]
+    assert "Enable DLSS-NR" in g["values"] and "Fovea width" not in g["values"]
+    afw["settings"]["Enabled"] = True
+    afw["afw_experiment"]["coverage_enabled"] = False
+    receive(afw)
+    draw()
+    assert "Automatic stereo alignment" in g["values"] and "Invert stereo eye order" in g["values"]
+    assert "Automatic eye calibration (this session)" in g["values"]
+    assert "Manual stereo coverage" not in g["values"]
+    assert len(g.sent) == count, "Live AFW off/on must not rewrite preferences"
+    afw["afw_experiment"]["coverage_enabled"] = True
     afw["settings"]["CenterMode"] = 0
     legacy_afw = copy.deepcopy(afw)
     del legacy_afw["settings"]["AfwManualCoverage"]

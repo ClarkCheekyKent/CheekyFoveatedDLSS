@@ -48,7 +48,8 @@ std::string_view setting_group(std::string_view key) {
     if (key.starts_with("Nr")) return "nr";
     for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
             "AutoStereoAlignment", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
-            "GazeSmoothingMs", "GazeQuantizationPixels", "GazeJumpResetRatio"})
+            "GazeSmoothingMs", "GazeQuantizationPixels", "GazeJumpResetRatio",
+            "AfwManualCoverage", "AfwAutomaticCoverage", "AfwDepthCoverage", "AfwWarpMargin"})
         if (key == gaze) return "gaze";
     return "sr";
 }
@@ -102,6 +103,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     candidate.nr_style = 0U; // Older files used the hardcoded Standard style.
     candidate.afw_manual_coverage = false; // Older AFW builds used the centered safety region.
     candidate.afw_automatic_coverage = false;
+    candidate.afw_depth_coverage = true;
     candidate.afw_warp_margin = Settings{}.afw_warp_margin;
     std::string line; bool section = false;
     while (std::getline(in, line)) {

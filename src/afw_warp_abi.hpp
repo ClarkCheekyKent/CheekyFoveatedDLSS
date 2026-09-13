@@ -4,8 +4,9 @@
 #include <cstring>
 
 namespace cheeky::foveated_dlss {
-// Public beta 6 PDAFWPlugin.h, through EyeIndex only. Never dereference its
-// resources or cameras. Decode only after verifying the loaded runtime's ABI.
+// Public beta 6 PDAFWPlugin.h. Decode only after verifying the loaded runtime's
+// ABI. Resource references are consumed only during its live callback; no
+// framebuffer or camera pointers are retained.
 struct AfwWarpPrefix {
     void* command_list{};
     void* input_framebuffer{};
@@ -15,6 +16,17 @@ struct AfwWarpPrefix {
     std::uint32_t mode{}, source_eye{};
 };
 static_assert(offsetof(AfwWarpPrefix, mode) == 60 && offsetof(AfwWarpPrefix, source_eye) == 64);
+struct AfwWarpCameraPrefix { AfwWarpPrefix warp{}; void* cameras{}; };
+static_assert(offsetof(AfwWarpCameraPrefix, cameras) == 72);
+struct AfwTexturePrefix {
+    std::uint32_t type{};
+    void* resource{};
+    std::int32_t srv{}, uav{};
+    std::uint64_t srv_handle{}, uav_handle{}, target_handle{};
+    std::uint32_t initial_state{};
+};
+struct AfwFramebuffer { AfwTexturePrefix color{}, depth{}, motion{}; };
+static_assert(sizeof(AfwTexturePrefix) == 56 && offsetof(AfwTexturePrefix, resource) == 8);
 struct AfwWarpMetadata { unsigned eye{UINT32_MAX}, mode{UINT32_MAX}; };
 inline AfwWarpMetadata afw_warp_metadata(const void* parameters, bool known_abi) noexcept {
     if (!parameters || !known_abi) return {};

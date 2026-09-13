@@ -3,6 +3,7 @@
 #include "runtime.hpp"
 #include "eye_calibration_d3d12.hpp"
 #include "dlss_nr_lifetime.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 #include <MinHook.h>
 #include <wrl/client.h>
 #include <array>
@@ -78,8 +79,10 @@ class Lifetime final : public IUnknown {
             // after the UEVR adapter has been unloaded.
             if (list)
                 reset_gaze_copies(identity);
-            else
+            else {
+                afw_forget_depth_resource(identity);
                 forget_gaze_resource(identity);
+            }
             ++destroyed;
             delete this;
         }
@@ -198,6 +201,8 @@ void STDMETHODCALLTYPE copy_resource(ID3D12GraphicsCommandList* list, ID3D12Reso
                                      ID3D12Resource* source) {
     ObservationScope scope;
     real_copy(list, destination, source);
+    if (scope.outer && ready && afw_pending_depth_copy(list, source))
+        afw_observe_depth_copy(list, source, track(destination));
     if (!scope.outer || !ready || !uses_coordinated_center(current_settings()))
         return;
     try {
@@ -212,6 +217,13 @@ void STDMETHODCALLTYPE copy_texture(ID3D12GraphicsCommandList* list, const D3D12
                                     const D3D12_BOX* box) {
     ObservationScope scope;
     real_copy_texture(list, dst, x, y, z, src, box);
+    if (scope.outer && ready && dst && src && !x && !y && !z &&
+            src->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && dst->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+            !src->SubresourceIndex && !dst->SubresourceIndex && afw_pending_depth_copy(list, src->pResource)) {
+        const auto desc = src->pResource->GetDesc();
+        if (!box || (!box->left && !box->top && !box->front && box->right == desc.Width && box->bottom == desc.Height && box->back == 1))
+            afw_observe_depth_copy(list, src->pResource, track(dst->pResource));
+    }
     if (!scope.outer || !ready || !dst || !src || z != 0 || !uses_coordinated_center(current_settings()))
         return;
     if (src->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ||
@@ -242,6 +254,9 @@ void STDMETHODCALLTYPE resolve(ID3D12GraphicsCommandList* list, ID3D12Resource* 
     }
 }
 } // namespace
+std::uint64_t observe_native_resource(ID3D12Resource* resource) noexcept {
+    try { return track(resource); } catch (...) { return 0; }
+}
 bool initialize_native_observer(ID3D12Device* device, ID3D12CommandQueue* queue) noexcept {
     if (!device || !queue)
         return false;

@@ -49,7 +49,19 @@ void note_afw_coverage(const Settings& settings, bool automatic_applied, bool ga
 
 inline bool afw_projection_matches_output(const AfwStereoProjection& projection,
     unsigned width, unsigned height, unsigned x = 0, unsigned y = 0) noexcept {
-    return projection.valid && !x && !y && width == projection.output_width && height == projection.output_height;
+    // Offsets locate a complete eye in a larger allocation. They do not change
+    // its projection; the backend independently validates the resource bounds.
+    return projection.valid && width == projection.output_width && height == projection.output_height &&
+        static_cast<std::uint64_t>(x) + width <= 16384 && static_cast<std::uint64_t>(y) + height <= 16384;
+}
+inline void afw_mask_include(FoveationMask& mask, FoveationCenter center, float width, float height, float margin) noexcept {
+    if (mask.count >= 4) return;
+    const float x = std::clamp(center.u - width * .5F, 0.F, 1.F - width);
+    const float y = std::clamp(center.v - height * .5F, 0.F, 1.F - height);
+    auto& bounds = mask.bounds[mask.count++];
+    // Retain the un-clipped shape at screen edges, avoiding squeezed ellipses.
+    bounds[0] = x - margin; bounds[1] = y - margin;
+    bounds[2] = x + width + margin; bounds[3] = y + height + margin;
 }
 // Apply only to evaluation-local copies; never rewrite saved preferences.
 // Manual coverage bounds BOTH possible mirrored horizontal crops. This is an
@@ -64,13 +76,17 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
     const float height = finite(settings.height, .7F, .2F, 1.F);
     settings.afw_gaze_width = width; settings.afw_gaze_height = height;
     settings.afw_warp_margin = finite(settings.afw_warp_margin, .05F, 0.F, .25F);
+    const float depth_margin = settings.afw_depth_coverage ? finite(settings.afw_depth_margin, 0.F, 0.F, 1.F) : 0.F;
+    settings.afw_warp_margin = (std::min)(1.F, settings.afw_warp_margin + depth_margin);
     const float manual_x = settings.x_offset;
+    settings.afw_mask = {};
     settings.x_offset = 0.F;
     if (settings.afw_automatic_coverage && projection && projection->valid) {
-        const float margin = finite(settings.afw_warp_margin, .05F, 0.F, .25F);
+        const float margin = settings.afw_warp_margin;
         const float bias = .5F * finite(settings.aligned_height_offset, 0.F, -1.F, 1.F);
         float left = 1.F, top = 1.F, right = 0.F, bottom = 0.F;
         for (const auto& center : projection->centers) {
+            afw_mask_include(settings.afw_mask, {center.u, center.v + bias, 1}, width, height, margin);
             const float x = std::clamp(center.u - width * .5F, 0.F, 1.F - width);
             const float y = std::clamp(center.v + bias - height * .5F, 0.F, 1.F - height);
             left = (std::min)(left, x); top = (std::min)(top, y);
@@ -81,11 +97,13 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
         settings.width = right - left; settings.height = bottom - top;
         settings.x_offset = settings.width < 1.F ? std::clamp(2.F * left / (1.F - settings.width) - 1.F, -1.F, 1.F) : 0.F;
         settings.height_offset = settings.height < 1.F ? std::clamp(2.F * top / (1.F - settings.height) - 1.F, -1.F, 1.F) : 0.F;
-        settings.roundness = 0.F;
     } else if (!settings.afw_automatic_coverage && settings.afw_manual_coverage) {
-        const float margin = finite(settings.afw_warp_margin, .05F, 0.F, .25F);
+        const float margin = settings.afw_warp_margin;
         const float x = finite(manual_x, 0.F, -1.F, 1.F);
         const float y = finite(settings.height_offset, 0.F, -1.F, 1.F);
+        for (const float sign : {-1.F, 1.F})
+            afw_mask_include(settings.afw_mask, {.5F + sign * x * (1.F - width) * .5F,
+                .5F + y * (1.F - height) * .5F, 1}, width, height, margin);
         settings.width = (std::min)(1.F, width + std::abs(x) * (1.F - width) + 2.F * margin);
         // Clip padding at the image boundary; retain the union's true center.
         const float top = (std::max)(0.F, (1.F - height) * (y + 1.F) * .5F - margin);
@@ -93,16 +111,13 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
         settings.height = bottom - top;
         settings.height_offset = settings.height < 1.F
             ? std::clamp(2.F * top / (1.F - settings.height) - 1.F, -1.F, 1.F) : 0.F;
-        // Rounding the bounding rectangle would remove covered corner pixels.
-        settings.roundness = 0.F;
     } else {
-        settings.width = (std::max)(width, .70F);
-        settings.height = (std::max)(height, .70F);
+        settings.width = (std::min)(1.F, (std::max)(width, .70F) + 2.F * depth_margin);
+        settings.height = (std::min)(1.F, (std::max)(height, .70F) + 2.F * depth_margin);
         settings.height_offset = 0.F;
     }
     settings.aligned_height_offset = 0.F;
     settings.eye_independent_coverage = true;
-    if (settings.center_mode != FoveationCenterMode::fixed) settings.roundness = 0.F;
     settings.auto_stereo_alignment = settings.invert_stereo_x_offset = false;
     settings.center_supersampling = finite(settings.center_supersampling, 1.F, 1.F, 2.F);
     settings.next_jump_visible = false;
@@ -114,6 +129,7 @@ inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjec
     nr = afw_coverage_settings(nr, projection);
     settings = afw_coverage_settings(settings, projection);
     settings.afw_nr = {nr.width, nr.height, nr.x_offset, nr.height_offset, nr.afw_gaze_width, nr.afw_gaze_height};
+    settings.afw_nr_mask = nr.afw_mask;
     return settings;
 }
 inline std::uint64_t afw_nr_gaze_view(std::uint64_t view) noexcept {

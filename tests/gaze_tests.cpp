@@ -2,6 +2,8 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include "afw_compatibility.hpp"
 #include "afw_gaze.hpp"
+#include "afw_eye_identity.hpp"
+#include "afw_depth_coverage.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
@@ -35,6 +37,7 @@ namespace cheeky::foveated_dlss {
 // The core GPU harness explicitly drives post-submit/reset notifications.
 NativeObserverStatus native_observer_status() noexcept { return {true}; }
 bool ensure_native_observer(ID3D12GraphicsCommandList*) noexcept { return true; }
+std::uint64_t observe_native_resource(ID3D12Resource* resource) noexcept { return reinterpret_cast<std::uint64_t>(resource); }
 bool initialize_native_observer(ID3D12Device*, ID3D12CommandQueue*) noexcept { return true; }
 
 void trace_event(const char*, ...) noexcept {}
@@ -1566,8 +1569,8 @@ void test_afw_dispatch_and_settings() {
         manual.width = width; manual.height = height;
         manual.x_offset = x; manual.height_offset = y; manual.roundness = 1.F;
         const auto envelope = afw_experiment_settings(manual);
-        expect(envelope.roundness == 0.F && !uses_coordinated_center(envelope),
-            "Manual envelope does not remove corners or require an eye assignment");
+        expect(envelope.roundness == 1.F && envelope.afw_mask.count == 2 && !uses_coordinated_center(envelope),
+            "Manual rounded coverage retains two independent eye masks without an eye assignment");
         const float left = (1.F - envelope.width) * .5F;
         const float top = (1.F - envelope.height) * (1.F + envelope.height_offset) * .5F;
         for (const auto eye_sign : {-1.F, 1.F}) {
@@ -1629,6 +1632,36 @@ void test_afw_dispatch_and_settings() {
     expect(status.core_calls == 4 && status.lower_calls == 2 && status.missing_lower_calls == 2 &&
         status.rejected_core_reentry == 1 && status.standalone_lower_calls == 2 && !d3d12_ngx_interception_active(),
         "AFW routing diagnostics and thread scope survive failure and fallback");
+    MockNgxParameters depth_parameters;
+    const auto source = reinterpret_cast<ID3D12Resource*>(0x1000);
+    const auto list = reinterpret_cast<ID3D12GraphicsCommandList*>(0x2000);
+    depth_parameters.Set("Depth", source);
+    depth_parameters.Set("Output", reinterpret_cast<ID3D12Resource*>(0x3000));
+    afw_bind_depth_eye(1, 0x3000);
+    const auto copied_core = +[](ID3D12GraphicsCommandList* cmd, const NgxHandle* h,
+        const NgxParameters* p, NgxProgressCallback cb) -> NgxResult {
+        ID3D12Resource* src{}; ID3D12Resource* dst{};
+        p->Get("Depth", &src); p->Get("Output", &dst);
+        afw_observe_depth_copy(cmd, reinterpret_cast<ID3D12Resource*>(0x9999), reinterpret_cast<std::uint64_t>(dst));
+        if (afw_current_source_eye() != UINT32_MAX) return 0;
+        afw_observe_depth_copy(cmd, src, reinterpret_cast<std::uint64_t>(dst));
+        const auto lower = +[](const D3D12NgxEvaluationCall&, D3D12NgxEvaluateFn, void*) -> NgxResult {
+            return afw_current_source_eye() == 1 ? 0x100U : 0U;
+        };
+        return dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime, cmd, h, p, cb}, fake_d3d12_original, lower);
+    };
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime, list, nullptr, &depth_parameters}, copied_core, nullptr) == 0x100 &&
+        afw_compatibility_status().last_evaluation_eye == 1 && afw_current_source_eye() == UINT32_MAX,
+        "Only the current core call's own depth copy identifies the nested evaluation; scope cannot leak into the next frame");
+    afw_forget_depth_resource(0x3000);
+    allow_afw_stereo_projection(true);
+    publish_afw_rendering_mode(0);
+    expect(afw_compatibility_enabled() && !afw_coverage_enabled(), "AFW off restores normal geometry while routing stays protected");
+    publish_afw_rendering_mode(3);
+    expect(afw_coverage_enabled(), "AFW can be re-enabled without restarting the process");
+    publish_afw_rendering_mode(UINT32_MAX);
+    expect(afw_coverage_enabled(), "Unknown host mode cannot disable compatibility coverage");
+    allow_afw_stereo_projection(false);
     dispatch_harness = nullptr;
 }
 
@@ -1645,7 +1678,7 @@ void test_afw_projection_and_metadata() {
         "Public UE projection memory order resolves asymmetric optical centers");
     expect(!cache.snapshot(999).valid && !cache.snapshot(1251).valid, "Projection clock reversal and staleness reject automatic placement");
     expect(afw_projection_matches_output(projection, 256, 256) && !afw_projection_matches_output(projection, 512, 256) &&
-        !afw_projection_matches_output(projection, 256, 256, 1, 0), "Projection coverage requires matching full-eye output extent");
+        afw_projection_matches_output(projection, 256, 256, 1, 0) && !afw_projection_matches_output(projection, 256, 256, UINT32_MAX, 0), "Projection accepts a complete eye inside a padded allocation, with bounded origins");
     Settings settings;
     settings.afw_automatic_coverage = settings.afw_manual_coverage = true;
     settings.width = .4F; settings.height = .3F; settings.afw_warp_margin = .05F;
@@ -1715,7 +1748,7 @@ void test_afw_gaze_integration() {
     requested.gaze_smoothing_ms = 0.F; requested.roundness = 1.F;
     const auto projection = afw_stereo_projection();
     auto settings = afw_experiment_settings(requested, &projection);
-    expect(settings.roundness == 0.F, "AFW gaze union retains covered corner pixels");
+    expect(settings.roundness == 1.F, "AFW retains requested roundness for per-eye masks");
     CheekyGazeSnapshotV1 sample{};
     sample.abi_version = CHEEKY_GAZE_ABI_VERSION; sample.structure_size = sizeof(sample);
     sample.view_count = 2; sample.session_generation = 41; sample.swapchain_generation = 42;
@@ -1753,7 +1786,7 @@ void test_afw_gaze_integration() {
     expect(crop.input_base_x + crop.input_width == 1000, "Fresh edge gaze remains covered while smoothing trails behind");
     const auto grown = crop.input_width;
     for (auto& v : sample.views) v.center_u = .5F;
-    fresh(); expect(evaluate() && crop.input_width == grown, "Coverage does not shrink and recreate DLSS as gaze returns");
+    fresh(); expect(evaluate() && crop.input_width == grown, "Coverage does not shrink immediately as gaze returns");
     expect(evaluate(701) && reset, "A separate native DLSS handle starts an independent gaze history");
     fresh(); expect(evaluate(700) && !reset, "Returning to the first handle retains its own temporal state");
     sample.status_flags &= ~CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
@@ -1786,6 +1819,25 @@ void test_afw_gaze_integration() {
     settings = afw_experiment_settings(requested, &projection);
     fresh(); expect(evaluate(), "Simulation source change uses a safe transition");
     fresh(); expect(evaluate() && gaze_diagnostics().afw_fresh_sample, "AFW simulated gaze uses the same production coverage path");
+    settings.simulation_pattern = 2;
+    for (auto& v : sample.views) {
+        v.flags |= CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID; v.next_jump_u = .1F; v.next_jump_v = .2F;
+    }
+    fresh(); evaluate(); fresh(); expect(evaluate(), "Jump-preview mode acquires a fresh simulation sample");
+    auto preview = settings;
+    apply_next_jump_preview(preview, 700);
+    expect(preview.next_jump_visible && preview.next_jump_width > 0 && preview.next_jump_height > 0 &&
+        preview.afw_mask.count == 4, "AFW publishes an independently sized jump preview and both raw/filtered eye masks");
+    const auto preview_crop = crop;
+    settings.show_next_jump_target = false;
+    fresh(); expect(evaluate() && crop.input_width == preview_crop.input_width && crop.input_height == preview_crop.input_height,
+        "Turning off the preview cannot resize current DLSS coverage");
+    apply_next_jump_preview(preview = settings, 700);
+    expect(!preview.next_jump_visible, "Disabled preview is cleared without disabling rounded coverage");
+    settings.show_next_jump_target = true;
+    sample.views[1].flags &= ~CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID;
+    fresh(); evaluate(); apply_next_jump_preview(preview = settings, 700);
+    expect(!preview.next_jump_visible, "One missing future eye suppresses an incomplete preview");
     sample.status_flags &= ~CHEEKY_GAZE_STATUS_GAZE_VALID;
     Sleep(110); publish(); expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Tracking loss enters hold/return policy");
     Sleep(160); publish(); expect(evaluate() && !gaze_diagnostics().using_gaze && crop.input_width >= 700,
@@ -1797,6 +1849,49 @@ void test_afw_gaze_integration() {
 
 void test_afw_gaze_pixel_coverage() {
     using namespace cheeky::foveated_dlss;
+    AfwMatrix matrix{}; matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.F; matrix[8] = .4F;
+    float px{}, py{};
+    expect(afw_project_depth(matrix, .5F, .5F, .5F, px, py) && std::abs(px - .6F) < 1e-6F && py == .5F,
+        "Depth participates in homogeneous source-to-warp projection");
+    expect(afw_project_depth(matrix, .5F, .5F, 0.F, px, py) && px == .5F,
+        "Far-plane depth removes a depth-dependent disparity");
+    expect(!afw_project_depth(matrix, .5F, .5F, NAN, px, py), "Malformed depth is rejected");
+    AfwDepthMarginPolicy padding;
+    expect(padding.update(.2F, 100) >= .2F && padding.update(.05F, 200) >= .2F &&
+        padding.update(.05F, 1200) < .1F, "Depth padding grows immediately and shrinks only after sustained lower demand");
+    Settings padded;
+    padded.afw_manual_coverage = true; padded.width = padded.height = .2F; padded.x_offset = padded.height_offset = 0;
+    padded.afw_warp_margin = .05F; padded.afw_depth_margin = .1F;
+    expect(std::abs(afw_experiment_settings(padded).width - .5F) < 1e-6F,
+        "Observed depth displacement adds to manual padding for both SR and NR");
+    padded.afw_depth_coverage = false;
+    expect(std::abs(afw_experiment_settings(padded).width - .3F) < 1e-6F,
+        "Disabling adaptive depth coverage restores the requested manual padding");
+    AfwGazeAllocation shrink;
+    unsigned allocated = 800, allocation_start{};
+    shrink.update(.3F, .7F, 1000, 8, 10., allocated);
+    shrink.update(.3F, .7F, 1000, 8, 10.99, allocated);
+    expect(allocated == 800, "Transient smaller coverage cannot churn DLSS allocations");
+    shrink.update(.3F, .7F, 1000, 8, 11., allocated);
+    expect(allocated >= 400 && allocated <= 416, "Sustained smaller coverage releases excess allocation with headroom");
+    afw_gaze_axis(.1F, .9F, 1000, 8, allocated, allocation_start);
+    expect(allocated >= 800, "Coverage grows immediately after shrinking");
+    shrink.update(.3F, .7F, 1000, 8, 12., allocated);
+    shrink.update(.1F, .9F, 1000, 8, 12.9, allocated);
+    shrink.update(.3F, .7F, 1000, 8, 13., allocated);
+    expect(allocated >= 800, "A larger intervening request restarts the shrink delay");
+    AfwDepthEyes identity;
+    identity.record(1, 20, 100, 4); identity.record(0, 10, 101, 4);
+    expect(identity.lookup(10, 102, 4) == 0 && identity.lookup(20, 102, 4) == 1,
+        "Explicit depth resources identify eyes independently of observation order");
+    expect(identity.lookup(10, 352, 4) == UINT32_MAX && identity.lookup(10, 102, 5) == UINT32_MAX,
+        "Stale and previous-session depth bindings are rejected");
+    identity.forget(10);
+    expect(identity.lookup(10, 102, 4) == UINT32_MAX, "Destroyed depth resources cannot identify reused addresses");
+    identity.record(0, 20, 102, 4);
+    expect(identity.lookup(20, 103, 4) == UINT32_MAX, "A depth buffer shared by both eyes is ambiguous");
+    identity.record(1, 20, 104, 4);
+    expect(identity.lookup(20, 105, 4) == UINT32_MAX, "Shared-resource ambiguity cannot clear on the next eye's observation");
     for (unsigned extent : {33U, 128U, 999U, 2259U, 4096U}) {
         Settings nr;
         nr.eye_independent_coverage = nr.nr_foveated = true; nr.nr_use_sr_foveation = false;

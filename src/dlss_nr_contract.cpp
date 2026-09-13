@@ -124,12 +124,19 @@ FoveationParameters dlss_nr_foveation_parameters(
     };
     const auto x = aligned(geometry.output_base_x, geometry.output_width, width);
     const auto y = aligned(geometry.output_base_y, geometry.output_height, height);
+    auto mask = settings.afw_nr_mask;
+    for (unsigned i = 0; i < mask.count; ++i) {
+        auto& b = mask.bounds[i];
+        b[0] = (b[0] * width - x.base) / x.extent; b[2] = (b[2] * width - x.base) / x.extent;
+        b[1] = (b[1] * height - y.base) / y.extent; b[3] = (b[3] * height - y.base) / y.extent;
+    }
     return {
         x.base, y.base, x.extent, y.extent,
         parameters.width,
         parameters.height,
         parameters.roundness,
         parameters.transition_width,
+        mask,
     };
 }
 

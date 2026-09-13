@@ -268,9 +268,12 @@ struct CompositeConstants {
     float next_jump_offset_x;
     float next_jump_offset_y;
     std::uint32_t show_next_jump;
+    float next_jump_width, next_jump_height;
+    std::uint32_t mask_count, padding;
+    float mask_bounds[4][4];
 };
 
-static_assert(sizeof(CompositeConstants) == 24U * sizeof(std::uint32_t));
+static_assert(sizeof(CompositeConstants) == 44U * sizeof(std::uint32_t));
 
 SRWLOCK resources_lock = SRWLOCK_INIT;
 D3D12Resources* resource_list{};
@@ -462,7 +465,7 @@ void release_resources(D3D12Resources* const resources) noexcept {
     root_parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
     root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[2].Constants.ShaderRegister = 0U;
-    root_parameters[2].Constants.Num32BitValues = 24U;
+    root_parameters[2].Constants.Num32BitValues = 44U;
 
     D3D12_ROOT_SIGNATURE_DESC root_description{};
     root_description.NumParameters = 3U;
@@ -751,6 +754,8 @@ struct D3D12Evaluation {
     bool alignment_border{};
     bool next_jump_visible{};
     float next_jump_offset_x{}, next_jump_offset_y{};
+    float next_jump_width{}, next_jump_height{};
+    FoveationMask mask{};
     bool gaze_reset{};
     bool low_res_motion{};
     std::uint64_t descriptor_offset{};
@@ -1064,6 +1069,9 @@ D3D12Evaluation* prepare_d3d12(
     evaluation->next_jump_visible = effective_settings.next_jump_visible;
     evaluation->next_jump_offset_x = effective_settings.next_jump_offset_x;
     evaluation->next_jump_offset_y = effective_settings.next_jump_offset_y;
+    evaluation->next_jump_width = effective_settings.next_jump_width;
+    evaluation->next_jump_height = effective_settings.next_jump_height;
+    evaluation->mask = effective_settings.afw_mask;
     evaluation->gaze_reset = gaze_reset;
 
     const auto descriptor_set = resources->next_descriptor_set.fetch_add(
@@ -1255,6 +1263,9 @@ D3D12Evaluation* prepare_d3d12_streamline(
     evaluation->next_jump_visible = effective_settings.next_jump_visible;
     evaluation->next_jump_offset_x = effective_settings.next_jump_offset_x;
     evaluation->next_jump_offset_y = effective_settings.next_jump_offset_y;
+    evaluation->next_jump_width = effective_settings.next_jump_width;
+    evaluation->next_jump_height = effective_settings.next_jump_height;
+    evaluation->mask = effective_settings.afw_mask;
     evaluation->gaze_reset = gaze_reset;
     evaluation->diagnostic_trace = diagnostic_trace;
     evaluation->diagnostic_sequence = diagnostic_sequence;
@@ -1454,7 +1465,7 @@ void finish_d3d12(
             );
         }
 
-        const CompositeConstants constants{
+        CompositeConstants constants{
             {evaluation->output_width, evaluation->output_height},
             {evaluation->output_x, evaluation->output_y},
             {evaluation->color_x, evaluation->color_y},
@@ -1480,7 +1491,10 @@ void finish_d3d12(
             evaluation->alignment_border ? 1U : 0U,
             evaluation->next_jump_offset_x, evaluation->next_jump_offset_y,
             evaluation->next_jump_visible ? 1U : 0U,
+            evaluation->next_jump_width, evaluation->next_jump_height,
+            evaluation->mask.count, 0U, {},
         };
+        std::memcpy(constants.mask_bounds, evaluation->mask.bounds, sizeof(constants.mask_bounds));
 
         ID3D12DescriptorHeap* heaps[] = {resources->descriptors};
         command_list->SetDescriptorHeaps(1U, heaps);
@@ -1493,7 +1507,7 @@ void finish_d3d12(
         command_list->SetComputeRootDescriptorTable(1U, gpu);
         command_list->SetComputeRoot32BitConstants(
             2U,
-            24U,
+            44U,
             &constants,
             0U
         );
