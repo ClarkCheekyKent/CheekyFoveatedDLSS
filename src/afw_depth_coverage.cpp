@@ -18,6 +18,7 @@ struct Readback {
     AfwMatrix matrix{}, projection_only{};
     std::uint64_t captured{}, generation{}, bytes{};
     unsigned eye{};
+    DXGI_FORMAT format{};
     bool pending{}, submitted{};
 };
 struct Sample { float margin{}; std::uint64_t captured{}, generation{}; bool valid{}; AfwDepthMarginPolicy policy{}; };
@@ -27,6 +28,7 @@ struct State {
     std::array<Sample, 2> samples{};
     std::array<std::uint64_t, 2> next_capture{};
     std::uint64_t captures{}, completed{}, skipped{};
+    unsigned format{}, initial_state{}, skip_reason{};
 };
 State& state() { static auto* value = new State; return *value; } // Recording references can outlive adapter unload.
 constexpr std::uint64_t freshness_ms = 500;
@@ -60,8 +62,8 @@ void collect(State& s) {
                     unsigned valid{}; bool malformed{};
                     float displacement{};
                     for (unsigned y = 0; y < h; y += step_y) for (unsigned x = 0; x < w; x += step_x) {
-                        float depth{};
-                        std::memcpy(&depth, data + slot.footprint.Offset + static_cast<std::size_t>(y) * slot.footprint.Footprint.RowPitch + x * sizeof(float), sizeof(depth));
+                        const float depth = afw_decode_depth(data + slot.footprint.Offset + static_cast<std::size_t>(y) * slot.footprint.Footprint.RowPitch +
+                            x * afw_depth_sample_bytes(slot.format), slot.format);
                         if (!std::isfinite(depth) || depth < 0 || depth > 1) { malformed = true; continue; }
                         const float u = (x + .5F) / w, v = (y + .5F) / h;
                         float dx{}, dy{}, bx{}, by{};
@@ -88,7 +90,7 @@ void collect(State& s) {
 }
 void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
     D3D12_RESOURCE_BARRIER b{}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to}; list->ResourceBarrier(1, &b);
+    b.Transition = {resource, 0, from, to}; list->ResourceBarrier(1, &b); // Depth plane only; leave stencil untouched.
 }
 }
 void poll_afw_depth_coverage() noexcept {
@@ -102,6 +104,7 @@ AfwDepthCoverageStatus afw_depth_coverage_status(unsigned eye) noexcept {
     const auto now = GetTickCount64(); const auto projection = afw_stereo_projection();
     AfwDepthCoverageStatus result;
     result.captures = s.captures; result.completed = s.completed; result.skipped = s.skipped;
+    result.format = s.format; result.initial_state = s.initial_state; result.skip_reason = s.skip_reason;
     for (const auto& slot : s.slots) result.pending += slot.pending;
     for (unsigned i = 0; i < 2; ++i) {
         if (eye < 2 && i != eye) continue;
@@ -123,23 +126,25 @@ void capture_afw_depth_coverage(ID3D12GraphicsCommandList* list, ID3D12Resource*
         const auto now = GetTickCount64();
         if (now < s.next_capture[eye]) return;
         s.next_capture[eye] = now + 100; // At most ten copies/second/eye; no render-thread waits.
-        for (float value : matrix) if (!std::isfinite(value)) { ++s.skipped; return; }
-        for (float value : projection_only) if (!std::isfinite(value)) { ++s.skipped; return; }
+        const auto skip = [&](unsigned reason) { ++s.skipped; s.skip_reason = reason; };
+        for (float value : matrix) if (!std::isfinite(value)) { skip(1); return; }
+        for (float value : projection_only) if (!std::isfinite(value)) { skip(1); return; }
         const auto projection = afw_stereo_projection();
         const auto desc = depth->GetDesc();
-        if (!projection.valid || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 ||
-                desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 ||
-                (desc.Format != DXGI_FORMAT_R32_FLOAT && desc.Format != DXGI_FORMAT_R32_TYPELESS && desc.Format != DXGI_FORMAT_D32_FLOAT) ||
-                (initial != D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE && initial != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE && initial != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) {
-            ++s.skipped; return;
-        }
+        s.format = desc.Format; s.initial_state = initial;
+        if (!projection.valid) { skip(2); return; }
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 ||
+                desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1) { skip(3); return; }
+        if (!afw_depth_sample_bytes(desc.Format)) { skip(4); return; }
+        if (!(initial & D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE) ||
+                (initial & ~(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_DEPTH_READ))) { skip(5); return; }
         auto slot = std::find_if(s.slots.begin(), s.slots.end(), [](const auto& r) { return !r.pending; });
-        if (slot == s.slots.end()) { ++s.skipped; return; }
+        if (slot == s.slots.end()) { skip(6); return; }
         ComPtr<ID3D12Device> device;
-        if (FAILED(depth->GetDevice(IID_PPV_ARGS(&device)))) { ++s.skipped; return; }
+        if (FAILED(depth->GetDevice(IID_PPV_ARGS(&device)))) { skip(7); return; }
         UINT64 bytes{}; D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
         device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
-        if (!bytes || bytes > 64ULL * 1024 * 1024) { ++s.skipped; return; }
+        if (!bytes || bytes > 64ULL * 1024 * 1024 || footprint.Footprint.RowPitch < desc.Width * afw_depth_sample_bytes(desc.Format)) { skip(8); return; }
         ComPtr<ID3D12Device> previous_device;
         if (slot->buffer) slot->buffer->GetDevice(IID_PPV_ARGS(&previous_device));
         if (!slot->buffer || slot->bytes != bytes || previous_device.Get() != device.Get()) {
@@ -148,12 +153,13 @@ void capture_afw_depth_coverage(ID3D12GraphicsCommandList* list, ID3D12Resource*
             D3D12_RESOURCE_DESC buffer{}; buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
             buffer.Width = bytes; buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
             buffer.SampleDesc.Count = 1; buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slot->buffer)))) { ++s.skipped; return; }
+            if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&slot->buffer)))) { skip(9); return; }
         }
-        if (!slot->lifetime.record(list)) { ++s.skipped; return; }
+        if (!slot->lifetime.record(list)) { skip(10); return; }
         slot->depth = depth; slot->matrix = matrix; slot->eye = eye; slot->captured = now; slot->generation = projection.generation;
         slot->projection_only = projection_only;
         slot->footprint = footprint; slot->bytes = bytes; slot->pending = true; slot->submitted = false;
+        slot->format = desc.Format; s.skip_reason = 0;
         D3D12_TEXTURE_COPY_LOCATION from{}, to{};
         from.pResource = depth; from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         to.pResource = slot->buffer.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint = footprint;

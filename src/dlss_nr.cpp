@@ -897,7 +897,7 @@ cbuffer CodecConstants : register(b0) {
 };
 
 float FoveationShapeDistance(float2 pixel) {
-    if (MaskCount != 0 && FoveationRoundness > 0) {
+    if (MaskCount != 0) {
         const float2 uv = (pixel - float2(RegionBase) + 0.5) / max(float2(RegionSize), 1.0);
         float distance = 1e10;
         [unroll] for (uint i = 0; i < 4; ++i) if (i < MaskCount) {

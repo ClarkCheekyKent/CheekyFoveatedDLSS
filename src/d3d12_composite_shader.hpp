@@ -33,7 +33,7 @@ cbuffer Constants : register(b0) {
 };
 
 float ShapeDistance(float2 centered) {
-    if (MaskCount != 0 && ShapeRoundness > 0) {
+    if (MaskCount != 0) {
         const float2 uv = (centered + float2(ShapeOffsetX * (1.0 - ShapeWidth),
             ShapeOffsetY * (1.0 - ShapeHeight)) + 1.0) * 0.5;
         float distance = 1e10;

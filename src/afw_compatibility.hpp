@@ -54,7 +54,15 @@ inline bool afw_projection_matches_output(const AfwStereoProjection& projection,
     return projection.valid && width == projection.output_width && height == projection.output_height &&
         static_cast<std::uint64_t>(x) + width <= 16384 && static_cast<std::uint64_t>(y) + height <= 16384;
 }
-inline void afw_mask_include(FoveationMask& mask, FoveationCenter center, float width, float height, float margin) noexcept {
+inline FoveationCenter afw_project_between_eyes(FoveationCenter p, const GazeProjection& from, const GazeProjection& to) noexcept {
+    return {(from.left + p.u * (from.right - from.left) - to.left) / (to.right - to.left),
+        (to.up - from.up + p.v * (from.up - from.down)) / (to.up - to.down), 1};
+}
+inline bool afw_has_source_projection(const Settings& settings, const AfwStereoProjection* projection) noexcept {
+    return settings.afw_source_eye < 2 && projection && projection->valid;
+}
+inline void afw_mask_include(FoveationMask& mask, FoveationCenter center, float width, float height, float margin,
+    const AfwStereoProjection* projection = nullptr, unsigned owner = UINT32_MAX, unsigned source = UINT32_MAX) noexcept {
     if (mask.count >= 4) return;
     const float x = std::clamp(center.u - width * .5F, 0.F, 1.F - width);
     const float y = std::clamp(center.v - height * .5F, 0.F, 1.F - height);
@@ -62,10 +70,46 @@ inline void afw_mask_include(FoveationMask& mask, FoveationCenter center, float 
     // Retain the un-clipped shape at screen edges, avoiding squeezed ellipses.
     bounds[0] = x - margin; bounds[1] = y - margin;
     bounds[2] = x + width + margin; bounds[3] = y + height + margin;
+    if (projection && projection->valid && owner < 2 && source < 2) {
+        const auto lo = afw_project_between_eyes({bounds[0], bounds[1], 1}, projection->projections[owner], projection->projections[source]);
+        const auto hi = afw_project_between_eyes({bounds[2], bounds[3], 1}, projection->projections[owner], projection->projections[source]);
+        bounds[0] = lo.u; bounds[1] = lo.v; bounds[2] = hi.u; bounds[3] = hi.v;
+    }
+}
+struct AfwMaskExtent {
+    float left{1.F}, top{1.F}, right{}, bottom{}, width{}, height{};
+};
+inline AfwMaskExtent afw_mask_extent(const FoveationMask& mask, const AfwStereoProjection* projection = nullptr,
+    unsigned source = UINT32_MAX) noexcept {
+    AfwMaskExtent result;
+    for (unsigned i = 0; i < mask.count; ++i) {
+        const auto& b = mask.bounds[i];
+        result.left = (std::min)(result.left, b[0]); result.top = (std::min)(result.top, b[1]);
+        result.right = (std::max)(result.right, b[2]); result.bottom = (std::max)(result.bottom, b[3]);
+    }
+    result.width = result.right - result.left; result.height = result.bottom - result.top;
+    if (projection && projection->valid && source < 2) {
+        const auto& from = projection->projections[source]; const auto& to = projection->projections[source ^ 1];
+        // Reserve the same pixel extent for either source eye. Optical offsets
+        // move the allocation; they must not recreate DLSS on every alternation.
+        result.width *= (std::max)(1.F, (from.right - from.left) / (to.right - to.left));
+        result.height *= (std::max)(1.F, (from.up - from.down) / (to.up - to.down));
+    }
+    result.width = std::clamp(result.width, .001F, 1.F); result.height = std::clamp(result.height, .001F, 1.F);
+    return result;
+}
+inline void afw_settings_from_mask(Settings& settings, const AfwStereoProjection& projection) noexcept {
+    const auto b = afw_mask_extent(settings.afw_mask, &projection, settings.afw_source_eye);
+    settings.width = b.width; settings.height = b.height;
+    const float left = std::clamp((b.left + b.right - b.width) * .5F, 0.F, 1.F - b.width);
+    const float top = std::clamp((b.top + b.bottom - b.height) * .5F, 0.F, 1.F - b.height);
+    settings.x_offset = b.width < 1.F ? 2.F * left / (1.F - b.width) - 1.F : 0.F;
+    settings.height_offset = b.height < 1.F ? 2.F * top / (1.F - b.height) - 1.F : 0.F;
 }
 // Apply only to evaluation-local copies; never rewrite saved preferences.
-// Manual coverage bounds BOTH possible mirrored horizontal crops. This is an
-// uncertainty envelope, not a claim that opposite-eye UVs correspond in 3D.
+// With a verified source eye, map both requested regions into that projection
+// before taking their union. Opposite-eye UVs are not interchangeable.
+// Without source identity the older uncertainty envelope remains a fallback.
 // Padding is a user-controlled heuristic for warp donors/disocclusion, not a
 // reprojection guarantee. No DLSS-handle or evaluation-parity eye guesses.
 inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjection* projection = nullptr) noexcept {
@@ -85,8 +129,9 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
         const float margin = settings.afw_warp_margin;
         const float bias = .5F * finite(settings.aligned_height_offset, 0.F, -1.F, 1.F);
         float left = 1.F, top = 1.F, right = 0.F, bottom = 0.F;
-        for (const auto& center : projection->centers) {
-            afw_mask_include(settings.afw_mask, {center.u, center.v + bias, 1}, width, height, margin);
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto& center = projection->centers[eye];
+            afw_mask_include(settings.afw_mask, {center.u, center.v + bias, 1}, width, height, margin, projection, eye, settings.afw_source_eye);
             const float x = std::clamp(center.u - width * .5F, 0.F, 1.F - width);
             const float y = std::clamp(center.v + bias - height * .5F, 0.F, 1.F - height);
             left = (std::min)(left, x); top = (std::min)(top, y);
@@ -101,9 +146,11 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
         const float margin = settings.afw_warp_margin;
         const float x = finite(manual_x, 0.F, -1.F, 1.F);
         const float y = finite(settings.height_offset, 0.F, -1.F, 1.F);
-        for (const float sign : {-1.F, 1.F})
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const float sign = eye == 0 ? -1.F : 1.F;
             afw_mask_include(settings.afw_mask, {.5F + sign * x * (1.F - width) * .5F,
-                .5F + y * (1.F - height) * .5F, 1}, width, height, margin);
+                .5F + y * (1.F - height) * .5F, 1}, width, height, margin, projection, eye, settings.afw_source_eye);
+        }
         settings.width = (std::min)(1.F, width + std::abs(x) * (1.F - width) + 2.F * margin);
         // Clip padding at the image boundary; retain the union's true center.
         const float top = (std::max)(0.F, (1.F - height) * (y + 1.F) * .5F - margin);
@@ -115,7 +162,12 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
         settings.width = (std::min)(1.F, (std::max)(width, .70F) + 2.F * depth_margin);
         settings.height = (std::min)(1.F, (std::max)(height, .70F) + 2.F * depth_margin);
         settings.height_offset = 0.F;
+        if (afw_has_source_projection(settings, projection))
+            for (unsigned eye = 0; eye < 2; ++eye)
+                afw_mask_include(settings.afw_mask, projection->centers[eye], settings.width, settings.height, 0.F,
+                    projection, eye, settings.afw_source_eye);
     }
+    if (afw_has_source_projection(settings, projection)) afw_settings_from_mask(settings, *projection);
     settings.aligned_height_offset = 0.F;
     settings.eye_independent_coverage = true;
     settings.auto_stereo_alignment = settings.invert_stereo_x_offset = false;

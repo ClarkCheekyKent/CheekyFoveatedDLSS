@@ -59,7 +59,9 @@ Updating either DLL requires a full game restart. Reloading the adapter does not
 
 This integration runs with the **public, unmodified AFW UEVR release on DX12**. No separate Cheeky build of UEVR is required. It does not add AFW to mainline UEVR. Compatibility was confirmed in the user's Hogwarts Legacy test; this candidate adds the remaining controls and recovery behavior for a final headset test.
 
-Install the complete `afw-rc-1` ZIP with the game closed. Replace both Cheeky DLLs and the Lua script. The optional matching OpenXR installer is in `OpenXR/`; run it for OpenXR gaze. NVIDIA binaries are not included. For NR, provide a compatible `nvngx_dlssnr.dll` beside the nested Cheeky runtime or the running game executable.
+Install the complete `afw-rc-2` ZIP with the game closed. Replace both Cheeky DLLs and the Lua script. The optional matching OpenXR installer is in `OpenXR/`; run it for OpenXR gaze. NVIDIA binaries are not included. For NR, provide a compatible `nvngx_dlssnr.dll` beside the nested Cheeky runtime or the running game executable.
+
+RC2 corrects the source-eye projection mismatch reported as three red boxes and shimmering in the side regions while the middle and outer periphery remained stable. RC1 applied the same union of left/right image coordinates to alternating source eyes. That could leave the side regions without corresponding center-history donors. RC2 maps both requested regions into the verified source eye's projection, keeps allocations stable across eye changes, and preserves crop-motion compensation. The headset result still needs validation; passing geometry and GPU tests does not prove the visual symptom is gone.
 
 ### Coverage and eye identity
 
@@ -69,13 +71,13 @@ The **Stereo and gaze** section contains the shared AFW controls, including when
 
 - **Automatic stereo coverage** uses both optical centers from UEVR's public projections, the requested region sizes and height bias. It takes precedence over manual coverage. Fresh matching full-eye dimensions are required; a complete eye may occupy a subrectangle in a larger output allocation.
 - **Manual stereo coverage** contains both mirrored X-offset regions, with a shared vertical offset.
-- With both options off, the fixed fallback is centered and at least 70% wide/high. Larger requested sizes apply.
+- With both options off, the fixed fallback is at least 70% wide/high. With verified source identity it follows the optical center; otherwise it stays image-centered. Larger requested sizes apply.
 - **Warp padding per edge** supplies a manual safety allowance, measured as a fraction of the full image. Automatic and manual modes add it around the requested regions. **Depth-adaptive warp padding** adds measured geometric displacement, including to the centered fallback, when valid depth feedback is available.
-- **Roundness** applies independently to the covered eye regions. In gaze mode it includes both fresh and filtered positions. The private DLSS allocation remains their bounding rectangle; rounded masking changes the composite, not the rectangular DLSS inference cost. With roundness zero the entire bounding rectangle is used.
+- **Roundness** applies independently to the covered eye regions. In gaze mode it includes both fresh and filtered positions. The private DLSS allocation remains their bounding rectangle; masking changes the composite, not the rectangular DLSS inference cost. Rectangle and rounded modes both use the actual projected region masks, so retained allocation headroom does not change the visible center/periphery boundary.
 
 On the verified AFW beta 6 warp DLL, each warp callback explicitly identifies its source eye and depth buffer. A later core evaluation can identify its source eye **before its nested DLSS call** by copying its original depth into that exact buffer. This works without frame parity or permanently assigning an eye to an NGX handle. Partial copies, conflicting bindings, expired observations, resource destruction and session changes invalidate the match. The diagnostics distinguish **Source eye at last DLSS call** from the later warp callback's own eye/mode.
 
-Knowing the source eye does not eliminate the other eye's warp donors. Coverage therefore still accounts for both requested eye regions. Verified eye identity selects that eye's depth estimate; an unknown eye uses the larger valid estimate. Marker-based two-eye calibration is bypassed while AFW is selected because AFW's synthesized views are not ordinary stereo submissions. Automatic coverage provides alignment through the public projection API instead.
+Knowing the source eye does not eliminate the other eye's warp donors. Coverage therefore accounts for both requested eye regions after converting their viewing directions into the actual source projection. It reserves a common allocation size for either eye while moving the crop origin with that eye's projection. Gaze-jump detection compares successive observations of the same eye; private DLSS still receives the game's temporal motion convention with crop-origin compensation. Both eyes use the larger valid depth estimate, avoiding alternating padding sizes. Marker-based two-eye calibration is bypassed while AFW is selected because AFW's synthesized views are not ordinary stereo submissions. Automatic coverage provides alignment through the public projection API instead.
 
 ### Depth-adaptive padding
 
@@ -83,7 +85,7 @@ This option is enabled by default. The verified warp callback supplies the curre
 
 A grid of at most 64 by 64 depth samples estimates the maximum geometric reprojection displacement beyond the static optical projection map. A sample-cell guard and upward quantization accompany the estimate. Padding grows immediately and shrinks after one second of sustained lower demand. The user's manual padding remains additional. Capture is limited to ten copies per second per eye, with four bounded readback slots. There are no render-thread GPU waits.
 
-Feedback expires after 500 ms and is invalidated by host/projection changes. The readback path supports single-sample, single-mip, single-layer R32 float/typeless and D32 float depth textures up to 64 MiB, with a declared shader-readable state. Unsupported layouts, camera data, unknown warp DLLs or unavailable readbacks use manual padding. **Fresh depth estimate**, capture/completion/pending counters and estimated extra padding explain whether it is active.
+Feedback expires after 500 ms and is invalidated by host/projection changes. The readback path supports single-sample, single-mip, single-layer R32/D32 float, R16/D16 UNORM, D24S8 and D32S8 depth families, including their typeless resource formats, up to 64 MiB per depth-plane copy with a declared shader-readable state. Stencil is left untouched; planar readbacks follow [Microsoft's D3D12 depth/stencil layout](https://microsoft.github.io/DirectX-Specs/d3d/PlanarDepthStencilDDISpec.html). Unsupported layouts, camera data, unknown warp DLLs or unavailable readbacks use manual padding. **Fresh depth estimate**, capture/completion/pending counters, depth format/state and an explicit capture status explain whether it is active and why captures were rejected.
 
 This is recent sampled feedback, not a per-pixel prediction of a future warp. Thin foreground objects between samples, abrupt scene changes, object motion and disocclusion can need more manual padding. It can also expand coverage to the full image and reduce or remove the performance benefit. Turn the option off to reproduce the previous fixed-padding baseline.
 
@@ -109,7 +111,7 @@ Changing UEVR's rendering method away from AFW restores ordinary Cheeky stereo c
 
 An unambiguous nested DLSS route is required. Missing, ambiguous or reversed hook topologies remain ordinary-DLSS passthrough. Other NGX proxies may change that topology. Unknown warp DLLs retain SR/NR routing, bilateral coverage, public projection/gaze support and opaque warp activity reporting; resource/camera interpretation requires the verified ABI. These are explicit compatibility boundaries, not inferred eye assignments or unchecked memory layouts.
 
-The automated suite exercises real D3D12 copy hooks, GPU composite/depth readbacks, lifetime/replay protection, NR ordering and fallback, native/OTA/Streamline routes, projection/adapter resets, live mode publication, gaze allocation policy, and both supported Lua runtimes. It substitutes NVIDIA inference and does not establish final headset image quality or performance.
+The automated suite exercises real D3D12 copy hooks, rectangular and rounded GPU composites, float/UNORM/depth-stencil GPU readbacks, lifetime/replay protection, NR ordering and fallback, native/OTA/Streamline routes, projection/adapter resets, live mode publication, gaze allocation policy, and both supported Lua runtimes. Projection tests reproduce the reported 24% eye offset and check matching viewing directions, side-region history donors and crop-motion compensation across alternating eyes. It substitutes NVIDIA inference and does not establish final headset image quality or performance.
 
 For the final headset pass:
 

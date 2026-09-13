@@ -97,6 +97,8 @@ std::string snapshot_locked(State& s) {
         << ",\"depth_valid\":" << afw_depth.valid << ",\"depth_margin\":" << afw_depth.margin
         << ",\"depth_captures\":" << afw_depth.captures << ",\"depth_completed\":" << afw_depth.completed
         << ",\"depth_pending\":" << afw_depth.pending << ",\"depth_skipped\":" << afw_depth.skipped
+        << ",\"depth_format\":" << afw_depth.format << ",\"depth_initial_state\":" << afw_depth.initial_state
+        << ",\"depth_skip_reason\":" << afw_depth.skip_reason
         << ",\"depth_age_ms\":" << (afw_depth.valid ? static_cast<long long>(afw_depth.age_ms) : -1)
         << ",\"projection_valid\":" << afw_projection.valid
         << ",\"projection_width\":" << afw_projection.output_width << ",\"projection_height\":" << afw_projection.output_height

@@ -4552,7 +4552,7 @@ void evaluate_nr_after_native_d3d12(
     contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
     contract.motion_vectors_low_res = d3d12_evaluation_low_res_motion(evaluation);
     contract.preserve_history_on_crop_move =
-        uses_coordinated_center(settings);
+        uses_coordinated_center(settings) || settings.eye_independent_coverage;
     private_attempted = true;
 
     if (peripheral_ready && !d3d12_set_composite_base(
@@ -4696,11 +4696,12 @@ NgxResult process_d3d12_evaluation_impl(
     }
     auto settings = current_settings();
     if (afw_coverage_enabled()) {
+        settings.afw_source_eye = afw_current_source_eye();
         auto projection = afw_stereo_projection();
         projection.valid = afw_projection_matches_output(projection, get_ui(call.parameters, "OutWidth"), get_ui(call.parameters, "OutHeight"),
             get_ui(call.parameters, "DLSS.Output.Subrect.Base.X"), get_ui(call.parameters, "DLSS.Output.Subrect.Base.Y"));
         if (settings.afw_depth_coverage && projection.valid) {
-            const auto depth = afw_depth_coverage_status(afw_current_source_eye());
+            const auto depth = afw_depth_coverage_status(); // One shared padding floor prevents alternate-eye size/quality oscillation.
             settings.afw_depth_margin = depth.valid ? depth.margin : 0.F;
         }
         settings = afw_experiment_settings(settings, &projection);
@@ -4870,11 +4871,12 @@ NgxResult evaluate_d3d12_c_impl(
     }
     auto settings = current_settings();
     if (afw_coverage_enabled()) {
+        settings.afw_source_eye = afw_current_source_eye();
         auto projection = afw_stereo_projection();
         projection.valid = afw_projection_matches_output(projection, get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
             get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"));
         if (settings.afw_depth_coverage && projection.valid) {
-            const auto depth = afw_depth_coverage_status(afw_current_source_eye());
+            const auto depth = afw_depth_coverage_status();
             settings.afw_depth_margin = depth.valid ? depth.margin : 0.F;
         }
         settings = afw_experiment_settings(settings, &projection);

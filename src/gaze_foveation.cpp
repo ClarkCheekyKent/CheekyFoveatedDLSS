@@ -48,6 +48,8 @@ struct ViewState {
     bool logged_mapping_ready{};
     std::uint64_t last_mapping_log_qpc{};
     CropGeometry last_crop{};
+    CropGeometry afw_last_crop[2]{};
+    bool afw_has_crop[2]{};
     AfwGazeState afw{};
 };
 
@@ -209,13 +211,21 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
     state.afw_mask = settings.afw_mask;
     const auto finish = [&](bool valid, bool sample = false, bool reacquired = false, bool epoch = false) {
         if (!valid) return false;
+        if (epoch) state.afw_has_crop[0] = state.afw_has_crop[1] = false;
+        const auto source = settings.afw_source_eye;
+        const auto previous = source < 2 ? state.afw_last_crop[source] : state.last_crop;
+        const bool previous_valid = source < 2 ? state.afw_has_crop[source] : state.has_crop;
         const auto decision = evaluate_gaze_reset(
-            {state.last_crop.input_base_x, state.last_crop.input_base_y, state.last_crop.input_width, state.last_crop.input_height, state.has_crop},
+            {previous.input_base_x, previous.input_base_y, previous.input_width, previous.input_height, previous_valid},
             {crop.input_base_x, crop.input_base_y, crop.input_width, crop.input_height, true},
             sample, reacquired, epoch, settings.gaze_jump_reset_ratio);
         reset = decision.reason != GazeResetReason::none;
         diagnostics.last_reset_reason = decision.reason;
         state.last_crop = crop; state.has_crop = true;
+        // Compare gaze movement with the previous observation of this eye.
+        // Alternating optical offsets are not gaze jumps. DLSS itself retains
+        // the game's shared temporal convention and crop-motion compensation.
+        if (source < 2) { state.afw_last_crop[source] = crop; state.afw_has_crop[source] = true; }
         auto selected = settings;
         selected.width = static_cast<float>(crop.input_width) / rw;
         selected.height = static_cast<float>(crop.input_height) / rh;
@@ -229,6 +239,7 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
     };
     const auto fallback = [&] { return finish(calculate_crop(settings, rw, rh, ow, oh, ox, oy, crop)); };
     const auto projection = afw_stereo_projection();
+    const bool source_known = afw_has_source_projection(settings, &projection);
     if (!rw || !rh || !ow || !oh) return false;
     if (settings.center_mode == FoveationCenterMode::fixed || !afw_projection_matches_output(projection, ow, oh, ox, oy)) {
         afw = {};
@@ -289,25 +300,40 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
     const bool focus_lost = loaded && !(snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED);
     for (unsigned eye = 0; eye < 2; ++eye) {
         if (focus_lost) afw.temporal[eye] = {};
+        const auto eye_fallback = source_known ? afw_project_between_eyes(fixed_center,
+            projection.projections[settings.afw_source_eye], projection.projections[eye]) : fixed_center;
         const auto filtered = update_gaze_temporal_policy(afw.temporal[eye],
             {seconds_between(now, 0), snapshot.predicted_display_time, raw[eye].u, raw[eye].v,
-                fixed_center.u, fixed_center.v, settings.gaze_smoothing_ms, gaze_hold_seconds, gaze_return_seconds, valid});
+                eye_fallback.u, eye_fallback.v, settings.gaze_smoothing_ms, gaze_hold_seconds, gaze_return_seconds, valid});
         reacquired |= filtered.reacquired; tracking |= filtered.using_gaze;
         bounds.include({filtered.center_u, filtered.center_v, 1}, settings.afw_gaze_width, settings.afw_gaze_height);
-        afw_mask_include(mask, {filtered.center_u, filtered.center_v, 1}, settings.afw_gaze_width, settings.afw_gaze_height, settings.afw_warp_margin);
+        afw_mask_include(mask, {filtered.center_u, filtered.center_v, 1}, settings.afw_gaze_width, settings.afw_gaze_height,
+            settings.afw_warp_margin, &projection, eye, settings.afw_source_eye);
         // Filtering never cuts the actual fresh gaze out of the sharp region.
         if (valid) {
             bounds.include(raw[eye], settings.afw_gaze_width, settings.afw_gaze_height);
-            afw_mask_include(mask, raw[eye], settings.afw_gaze_width, settings.afw_gaze_height, settings.afw_warp_margin);
+            afw_mask_include(mask, raw[eye], settings.afw_gaze_width, settings.afw_gaze_height, settings.afw_warp_margin,
+                &projection, eye, settings.afw_source_eye);
         }
         diagnostics.views[eye].center_u = filtered.center_u; diagnostics.views[eye].center_v = filtered.center_v;
     }
     bounds.pad(settings.afw_warp_margin);
     if (!tracking) bounds.include(fixed_center, static_cast<float>(fixed.input_width) / rw, static_cast<float>(fixed.input_height) / rh);
     state.afw_mask = tracking ? mask : settings.afw_mask;
+    if (source_known && state.afw_mask.count) {
+        const auto b = afw_mask_extent(state.afw_mask, &projection, settings.afw_source_eye);
+        bounds = {std::clamp(b.left, 0.F, 1.F), std::clamp(b.top, 0.F, 1.F),
+            std::clamp(b.right, 0.F, 1.F), std::clamp(b.bottom, 0.F, 1.F)};
+        unsigned unused{};
+        afw.shrink_x.update(0, b.width, rw, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_width);
+        afw.shrink_y.update(0, b.height, rh, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_height);
+        afw_gaze_axis(0, b.width, rw, settings.gaze_quantization_pixels, afw.allocated_width, unused);
+        afw_gaze_axis(0, b.height, rh, settings.gaze_quantization_pixels, afw.allocated_height, unused);
+    } else {
+        afw.shrink_x.update(bounds.left, bounds.right, rw, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_width);
+        afw.shrink_y.update(bounds.top, bounds.bottom, rh, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_height);
+    }
     unsigned x{}, y{};
-    afw.shrink_x.update(bounds.left, bounds.right, rw, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_width);
-    afw.shrink_y.update(bounds.top, bounds.bottom, rh, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_height);
     afw_gaze_axis(bounds.left, bounds.right, rw, settings.gaze_quantization_pixels, afw.allocated_width, x);
     afw_gaze_axis(bounds.top, bounds.bottom, rh, settings.gaze_quantization_pixels, afw.allocated_height, y);
     auto parameters = foveation_parameters(settings);
@@ -316,6 +342,7 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
     if (valid && settings.show_next_jump_target && settings.center_mode == FoveationCenterMode::simulated_gaze &&
             (settings.simulation_pattern == 2U || settings.simulation_pattern == 3U)) {
         AfwGazeBounds next;
+        FoveationMask next_mask{};
         bool next_valid = true;
         for (unsigned eye = 0; eye < 2; ++eye) {
             FoveationCenter target;
@@ -323,11 +350,22 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
             const bool projected = (source.flags & CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID) &&
                 afw_project_gaze(source, projection.projections[eye], source.next_jump_u, source.next_jump_v, target);
             next_valid &= projected;
-            if (projected) next.include(target, settings.afw_gaze_width, settings.afw_gaze_height);
+            if (projected) {
+                next.include(target, settings.afw_gaze_width, settings.afw_gaze_height);
+                afw_mask_include(next_mask, target, settings.afw_gaze_width, settings.afw_gaze_height, settings.afw_warp_margin,
+                    &projection, eye, settings.afw_source_eye);
+            }
         }
         if (next_valid) {
             next.pad(settings.afw_warp_margin);
             unsigned nw = afw.allocated_width, nh = afw.allocated_height, nx{}, ny{};
+            if (source_known) {
+                const auto b = afw_mask_extent(next_mask, &projection, settings.afw_source_eye);
+                next = {std::clamp(b.left, 0.F, 1.F), std::clamp(b.top, 0.F, 1.F),
+                    std::clamp(b.right, 0.F, 1.F), std::clamp(b.bottom, 0.F, 1.F)};
+                afw_gaze_axis(0, b.width, rw, settings.gaze_quantization_pixels, nw, nx);
+                afw_gaze_axis(0, b.height, rh, settings.gaze_quantization_pixels, nh, ny);
+            }
             afw_gaze_axis(next.left, next.right, rw, settings.gaze_quantization_pixels, nw, nx);
             afw_gaze_axis(next.top, next.bottom, rh, settings.gaze_quantization_pixels, nh, ny);
             CropGeometry preview{nx, ny, nw, nh};

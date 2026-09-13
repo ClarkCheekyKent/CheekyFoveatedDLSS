@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace cheeky::foveated_dlss {
 using AfwMatrix = std::array<float, 16>;
@@ -31,7 +32,28 @@ struct AfwDepthCoverageStatus {
     float margin{};
     std::uint64_t captures{}, completed{}, skipped{}, age_ms{UINT64_MAX};
     unsigned pending{}, source_eye{UINT32_MAX};
+    unsigned format{}, initial_state{}, skip_reason{};
 };
+// D3D12 stages depth/stencil plane 0 separately: D32S8 uses four bytes,
+// and D24S8 uses the low 24 bits of a four-byte element (not a float).
+inline unsigned afw_depth_sample_bytes(DXGI_FORMAT format) noexcept {
+    switch (format) {
+    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_D16_UNORM: return 2;
+    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R24G8_TYPELESS: case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS: case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return 4;
+    default: return 0;
+    }
+}
+inline float afw_decode_depth(const void* data, DXGI_FORMAT format) noexcept {
+    if (afw_depth_sample_bytes(format) == 2) {
+        std::uint16_t bits{}; std::memcpy(&bits, data, sizeof(bits)); return bits / 65535.F;
+    }
+    if (format == DXGI_FORMAT_R24G8_TYPELESS || format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
+        std::uint32_t bits{}; std::memcpy(&bits, data, sizeof(bits)); return (bits & 0xFFFFFFU) / 16777215.F;
+    }
+    float value{}; std::memcpy(&value, data, sizeof(value)); return value;
+}
 struct AfwDepthMarginPolicy {
     float value{}, candidate{};
     std::uint64_t since{};

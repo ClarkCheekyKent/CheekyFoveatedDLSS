@@ -263,6 +263,11 @@ uevr.sdk.callbacks.on_draw_ui(function()
             {"Estimated extra padding", string.format("%.1f%%", 100 * (afw.depth_margin or 0))},
             {"Depth captures / completed / pending", tostring(afw.depth_captures or 0) .. " / " .. tostring(afw.depth_completed or 0) .. " / " .. tostring(afw.depth_pending or 0)},
             {"Unsupported or busy depth captures", tostring(afw.depth_skipped or 0)},
+            {"Depth capture status", ({[0]="Ready / no rejection",[1]="Invalid camera transform",[2]="No fresh projections",
+                [3]="Unsupported texture layout",[4]="Unsupported depth format",[5]="Unsupported declared resource state",
+                [6]="Readback slots busy",[7]="Device unavailable",[8]="Readback footprint exceeds limit",
+                [9]="Readback allocation failed",[10]="Command recording cannot be observed"})[afw.depth_skip_reason or -1] or "Unavailable"},
+            {"Depth format / state", tostring(afw.depth_format or 0) .. " / " .. tostring(afw.depth_initial_state or 0)},
             {"Last warp call", (afw.last_warp_age_ms or -1) >= 0 and tostring(afw.last_warp_age_ms) .. " ms ago" or "Not observed"}})
         if not afw.warp_observer_ready then text("Warp observation unavailable; check AFW's own status.")
         elseif (afw.warp_calls or 0) == 0 then text("No warp calls observed yet; AFW may be off or suspended.")
@@ -317,7 +322,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
         end
         if afw_active then
             text("Source-eye identification uses AFW depth-buffer copies when verified. Coverage never uses evaluation order or guessed eye labels.")
-            text("Gaze covers both eyes in one rectangle. Fresh gaze and UEVR projections are required; otherwise the selected fixed coverage is used.")
+            text("Both gaze regions are projected into the verified source eye. Fresh gaze and UEVR projections are required; otherwise the selected fixed coverage is used.")
         else
         check("Automatic stereo alignment", "AutoStereoAlignment")
         if draft.AutoStereoAlignment then slider("Height offset / gaze fallback", "AlignedHeightOffset", -1, 1)

@@ -4,6 +4,7 @@
 #include "afw_gaze.hpp"
 #include "afw_eye_identity.hpp"
 #include "afw_depth_coverage.hpp"
+#include "crop_motion.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
@@ -1847,6 +1848,87 @@ void test_afw_gaze_integration() {
     reset_gaze_foveation();
 }
 
+void test_afw_source_projection_coverage() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation(); allow_afw_stereo_projection(true);
+    float matrices[2][16]{};
+    for (auto& m : matrices) { m[0] = m[5] = m[11] = 1.F; m[14] = .1F; }
+    matrices[0][8] = .242513F; matrices[1][8] = -.242513F;
+    publish_afw_stereo_projection(matrices, 2000, 1600, true);
+    const auto projection = afw_stereo_projection();
+    Settings requested;
+    requested.center_mode = FoveationCenterMode::openxr_gaze;
+    requested.width = requested.height = .2F; requested.afw_warp_margin = .13F;
+    requested.gaze_smoothing_ms = 0; requested.roundness = 0;
+    CheekyGazeSnapshotV1 sample{};
+    sample.abi_version = CHEEKY_GAZE_ABI_VERSION; sample.structure_size = sizeof(sample);
+    sample.view_count = 2; sample.session_generation = 71; sample.swapchain_generation = 72;
+    sample.status_flags = CHEEKY_GAZE_STATUS_LAYER_ACTIVE | CHEEKY_GAZE_STATUS_SESSION_FOCUSED | CHEEKY_GAZE_STATUS_GAZE_VALID;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& v = sample.views[eye]; v.structure_size = sizeof(v); v.view_index = eye;
+        v.flags = CHEEKY_GAZE_VIEW_ORIENTATION_VALID | CHEEKY_GAZE_VIEW_FOV_VALID;
+        v.fov_left = v.fov_down = -std::atan(1.F); v.fov_right = v.fov_up = std::atan(1.F);
+        v.center_u = v.center_v = .5F;
+    }
+    CropGeometry crops[2]{}; FoveationMask masks[2]{};
+    for (unsigned frame = 0; frame < 12; ++frame) {
+        const auto eye = frame % 2; requested.afw_source_eye = eye;
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now); sample.publication_qpc = now.QuadPart; ++sample.predicted_display_time;
+        publish_afw_stereo_projection(matrices, 2000, 1600, true);
+        auto settings = afw_experiment_settings(requested, &projection); bool reset{};
+        expect(calculate_coordinated_crop(settings, 771, nullptr, 1000, 800, 2000, 1600, 0, 0, crops[eye], reset, &sample),
+            "Verified source-eye gaze resolves without an NGX-handle eye assignment");
+        if (frame >= 2) expect(!reset, "Alternating optical offsets must not reset DLSS temporal history");
+        apply_next_jump_preview(settings, 771); masks[eye] = settings.afw_mask;
+        expect(crops[eye].input_width < 500, "Same gaze ray must not become a 70% raw-UV stereo union");
+    }
+    expect(crops[0].input_width == crops[1].input_width && crops[0].input_height == crops[1].input_height,
+        "Alternating source eyes retain the same private reconstruction allocation");
+    expect(std::abs(static_cast<float>(crops[0].input_base_x) - crops[1].input_base_x - 242.513F) <= 8.F,
+        "The crop translates by the actual eye projection offset");
+    for (unsigned i = 0; i < 4; ++i) for (unsigned corner = 0; corner < 4; corner += 2) {
+        // Independently compare viewing rays, rather than comparing pixel UVs.
+        const float left_ray = projection.projections[0].left + masks[0].bounds[i][corner] * 2.F;
+        const float right_ray = projection.projections[1].left + masks[1].bounds[i][corner] * 2.F;
+        expect_near(left_ray, right_ray, 1e-5F, "Left/right sharp-region boundaries represent the same viewing directions");
+    }
+    for (unsigned i = 0; i <= 20; ++i) {
+        const float ray = -.40F + i * .04F;
+        const float u0 = (ray - projection.projections[0].left) / 2.F;
+        const float u1 = (ray - projection.projections[1].left) / 2.F;
+        const float previous_pixel = u0 * 1000.F - crops[0].input_base_x;
+        const float current_pixel = u1 * 1000.F - crops[1].input_base_x;
+        expect(previous_pixel >= 0 && previous_pixel < crops[0].input_width && current_pixel >= 0 && current_pixel < crops[1].input_width,
+            "Side regions must have center-history donors in both alternating source images");
+        CropMotionOffset correction{};
+        expect(crop_motion_offset(crops[0], crops[1], true, 1000, 800, correction), "AFW crop-motion compensation is available");
+        expect_near(current_pixel + ((u0 - u1) + correction.x) * 1000.F, previous_pixel, .001F,
+            "Optical motion plus crop-origin correction lands on the same center-history pixel");
+    }
+    // Fixed automatic and independent NR use the same source-space mapping.
+    requested.center_mode = FoveationCenterMode::fixed; requested.afw_automatic_coverage = true;
+    requested.nr_use_sr_foveation = false; requested.nr_width = .3F; requested.nr_height = .25F;
+    Settings fixed[2];
+    for (unsigned eye = 0; eye < 2; ++eye) { requested.afw_source_eye = eye; fixed[eye] = afw_experiment_settings(requested, &projection); }
+    expect_near(fixed[0].afw_nr_mask.bounds[0][0] - fixed[1].afw_nr_mask.bounds[0][0], .242513F, 1e-5F,
+        "Independent NR aligns its own shape to the source eye");
+    expect_near(fixed[0].width, fixed[1].width, 1e-5F, "Fixed optical coverage keeps stable dimensions");
+    for (const float scale : {.7F, 1.F, 1.4F}) for (const float width : {.2F, .4F, .55F, .7F}) {
+        matrices[1][0] = scale;
+        publish_afw_stereo_projection(matrices, 2000, 1600, true);
+        const auto asymmetric = afw_stereo_projection(); requested.width = width;
+        CropGeometry pair[2]{};
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            requested.afw_source_eye = eye;
+            const auto shaped = afw_experiment_settings(requested, &asymmetric);
+            expect(calculate_crop(shaped, 2259, 2118, 2000, 1600, 0, 0, pair[eye]), "Asymmetric source-eye crop resolves");
+        }
+        expect(pair[0].input_width == pair[1].input_width && pair[0].output_width == pair[1].output_width,
+            "Unequal eye FOV spans cannot resize private DLSS every other frame");
+    }
+    allow_afw_stereo_projection(false); reset_gaze_foveation();
+}
+
 void test_afw_gaze_pixel_coverage() {
     using namespace cheeky::foveated_dlss;
     AfwMatrix matrix{}; matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.F; matrix[8] = .4F;
@@ -1995,6 +2077,7 @@ int main(int argc, char** argv) {
     test_afw_dispatch_and_settings();
     test_afw_projection_and_metadata();
     test_afw_gaze_integration();
+    test_afw_source_projection_coverage();
     test_afw_gaze_pixel_coverage();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
