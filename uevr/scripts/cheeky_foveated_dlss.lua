@@ -38,7 +38,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwWarpMargin"}) do
+    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -240,9 +240,9 @@ uevr.sdk.callbacks.on_draw_ui(function()
     if afw.enabled then
         text("AFW compatibility detected. Check warp activity and SR status separately.")
         text("NR, gaze and marker calibration are bypassed. Saved preferences are retained.")
-        text(string.format("Effective coverage: %.1f%% x %.1f%%; center scale %.2fx (%s).",
+        text(string.format("Coverage selected at last DLSS call: %.1f%% x %.1f%%; center scale %.2fx (%s).",
             100 * (afw.effective_width or 0.7), 100 * (afw.effective_height or 0.7),
-            afw.effective_center_scale or 1, afw.manual_coverage and "manual stereo coverage" or "centered minimum 70%"))
+            afw.effective_center_scale or 1, afw.coverage_mode == 2 and "automatic stereo coverage" or afw.manual_coverage and "manual stereo coverage" or "centered minimum 70%"))
         rows("afw_routing", {{"Lower SR runtime selected", yes(afw.runtime_selected)},
             {"SR runtime candidates at selection", tostring(afw.runtime_candidates or 0)},
             {"Full-frame core / nested DLSS calls", tostring(afw.core_calls or 0) .. " / " .. tostring(afw.lower_calls or 0)},
@@ -250,11 +250,20 @@ uevr.sdk.callbacks.on_draw_ui(function()
             {"Rejected core reentry", tostring(afw.rejected_core_reentry or 0)},
             {"Warp observer ready", yes(afw.warp_observer_ready)},
             {"Completed warp calls", tostring(afw.warp_calls or 0)},
+            {"Warp metadata ABI verified", yes(afw.warp_metadata_supported)},
+            {"Last reported source eye", ({[0]="Left",[1]="Right"})[afw.last_warp_source_eye or -1] or "Unknown"},
+            {"Last reported warp mode", ({[0]="None",[1]="Alternate eye",[2]="Previous frame",[3]="Combined"})[afw.last_warp_mode or -1] or "Unknown"},
+            {"Source left / right warp calls", tostring(afw.source_left_calls or 0) .. " / " .. tostring(afw.source_right_calls or 0)},
+            {"Fresh UEVR stereo projections", yes(afw.projection_valid)},
             {"Last warp call", (afw.last_warp_age_ms or -1) >= 0 and tostring(afw.last_warp_age_ms) .. " ms ago" or "Not observed"}})
         if not afw.warp_observer_ready then text("Warp observation unavailable; check AFW's own status.")
         elseif (afw.warp_calls or 0) == 0 then text("No warp calls observed yet; AFW may be off or suspended.")
         elseif (afw.last_warp_age_ms or 0) > 1000 then text("No recent warp calls. Check AFW's status after loading or resolution changes.") end
         text("Warp calls confirm CPU activity, not GPU completion or visual quality.")
+        text("Reported eye/mode describe the last warp call, after DLSS. They do not predict the next source eye.")
+        if (status.settings or {}).AfwAutomaticCoverage and afw.coverage_mode ~= 2 then
+            text("Automatic coverage is awaiting fresh matching projections; the centered fallback is selected.")
+        end
         if (afw.lower_calls or 0) == 0 then text("Waiting for a usable nested DLSS route; ordinary DLSS passes through.") end
         if (afw.rejected_core_reentry or 0) > 0 then text("This hook chain reenters the core runtime. Disable Cheeky SR and include a support ZIP when reporting it.") end
     end
@@ -312,6 +321,12 @@ uevr.sdk.callbacks.on_draw_ui(function()
         if draft.Enabled then
             if afw.enabled and draft.AfwManualCoverage ~= nil then
                 section("AFW coverage")
+                if draft.AfwAutomaticCoverage ~= nil then check("Automatic stereo coverage", "AfwAutomaticCoverage") end
+                if draft.AfwAutomaticCoverage then
+                    slider("Automatic coverage height bias", "AlignedHeightOffset", -1, 1)
+                    slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25)
+                    text("Covers both UEVR projection centers. No eye-calibration layer is needed. Missing, stale or mismatched projections use the centered fallback.")
+                else
                 check("Manual stereo coverage", "AfwManualCoverage")
                 if draft.AfwManualCoverage then
                     slider("Stereo coverage X offset", "XOffset", -1, 1)
@@ -322,13 +337,14 @@ uevr.sdk.callbacks.on_draw_ui(function()
                 else
                     text("Centered coverage with a minimum of 70% width and height. Larger sizes apply; manual offsets are bypassed.")
                 end
+                end
             end
             section("Center")
             combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
             slider("Center supersampling", "CenterSupersampling", 1, 2)
             slider("Fovea width", "Width", 0.2, 1)
             slider("Fovea height", "Height", 0.2, 1)
-            if not afw.enabled or not draft.AfwManualCoverage then slider("Roundness", "Roundness", 0, 1) end
+            if not afw.enabled or (not draft.AfwManualCoverage and not draft.AfwAutomaticCoverage) then slider("Roundness", "Roundness", 0, 1) end
             slider("Transition width", "TransitionWidth", 0, 0.3)
             check("Show red alignment border", "AlignmentBorder")
             section("Periphery")

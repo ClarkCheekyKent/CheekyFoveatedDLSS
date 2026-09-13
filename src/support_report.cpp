@@ -149,6 +149,9 @@ std::string diagnostics_text() {
         << "\nafw_rejected_core_reentry=" << afw.rejected_core_reentry
         << "\nafw_runtime_candidates=" << afw.runtime_candidates << "\nafw_runtime_selected=" << afw.runtime_selected
         << "\nafw_warp_observer_ready=" << afw.warp_observer_ready << "\nafw_warp_calls=" << afw.warp_calls
+        << "\nafw_warp_metadata_supported=" << afw.warp_metadata_supported
+        << "\nafw_last_warp_source_eye=" << afw.last_warp_source_eye << "\nafw_last_warp_mode=" << afw.last_warp_mode
+        << "\nafw_source_left_calls=" << afw.source_left_calls << "\nafw_source_right_calls=" << afw.source_right_calls
         << "\nafw_last_warp_age_ms=" << (afw.last_warp_age_ms == UINT64_MAX ? -1LL : static_cast<long long>(afw.last_warp_age_ms)) << '\n';
     for (const auto api : {DiagnosticApi::d3d11, DiagnosticApi::d3d12}) {
         const auto d = diagnostic_snapshot(api);

@@ -1,6 +1,8 @@
 #include "cheeky_gaze_abi.h"
 #include "d3d12_ngx_dispatch.hpp"
 #include "afw_compatibility.hpp"
+#include "afw_warp_abi.hpp"
+#include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
 #include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
@@ -26,6 +28,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <filesystem>
 
 namespace cheeky::foveated_dlss {
 // The core GPU harness explicitly drives post-submit/reset notifications.
@@ -1617,9 +1620,81 @@ void test_afw_dispatch_and_settings() {
     dispatch_harness = nullptr;
 }
 
+void test_afw_projection_and_metadata() {
+    using namespace cheeky::foveated_dlss;
+    float matrices[2][16]{};
+    for (auto& m : matrices) { m[0] = m[5] = m[11] = 1.F; m[14] = 10.F; }
+    matrices[0][8] = .4F; matrices[1][8] = -.2F; matrices[0][9] = .2F;
+    AfwProjectionCache cache;
+    cache.publish(matrices, 256, 256, true, 1000);
+    auto projection = cache.snapshot(1100);
+    expect(projection.valid && std::abs(projection.centers[0].u - .7F) < 1e-6F &&
+        std::abs(projection.centers[1].u - .4F) < 1e-6F && std::abs(projection.centers[0].v - .4F) < 1e-6F,
+        "Public UE projection memory order resolves asymmetric optical centers");
+    expect(!cache.snapshot(999).valid && !cache.snapshot(1251).valid, "Projection clock reversal and staleness reject automatic placement");
+    expect(afw_projection_matches_output(projection, 256, 256) && !afw_projection_matches_output(projection, 512, 256) &&
+        !afw_projection_matches_output(projection, 256, 256, 1, 0), "Projection coverage requires matching full-eye output extent");
+    Settings settings;
+    settings.afw_automatic_coverage = settings.afw_manual_coverage = true;
+    settings.width = .4F; settings.height = .3F; settings.afw_warp_margin = .05F;
+    auto resolved = afw_experiment_settings(settings, &projection);
+    expect(std::abs(resolved.width - .8F) < 1e-6F && std::abs(resolved.height - .5F) < 1e-6F &&
+        std::abs(resolved.x_offset - .5F) < 1e-5F && std::abs(resolved.height_offset + .2F) < 1e-5F,
+        "Automatic envelope contains both off-center projections and edge padding");
+    expect(settings_for_view(resolved, 0xFFFFFFFFULL).x_offset == resolved.x_offset,
+        "Unassigned DLSS handle cannot recenter or mirror an AFW envelope");
+    std::swap(projection.centers[0], projection.centers[1]);
+    const auto swapped = afw_experiment_settings(settings, &projection);
+    expect(swapped.x_offset == resolved.x_offset && swapped.width == resolved.width, "Eye-order changes leave automatic coverage unchanged");
+    projection.valid = false;
+    const auto fallback = afw_experiment_settings(settings, &projection);
+    expect(fallback.width == .7F && fallback.height == .7F && fallback.x_offset == 0.F,
+        "Unavailable automatic projection uses centered fallback, not saved manual offsets");
+    matrices[1][0] = std::numeric_limits<float>::quiet_NaN();
+    cache.publish(matrices, 256, 256, true, 1300);
+    expect(!cache.snapshot(1301).valid, "A malformed eye invalidates the whole stereo pair");
+    matrices[1][0] = 1.F;
+    cache.publish(matrices, 256, 256, false, 1400);
+    expect(!cache.snapshot(1400).valid, "Inactive HMD invalidates projection placement immediately");
+    allow_afw_stereo_projection(true);
+    publish_afw_stereo_projection(matrices, 256, 256, true);
+    expect(afw_stereo_projection().valid, "Resident runtime accepts copied projection data");
+    matrices[0][8] = 99.F;
+    expect(afw_stereo_projection().valid, "Resident projection does not retain host matrix pointers");
+    allow_afw_stereo_projection(false);
+    expect(!afw_stereo_projection().valid, "Loader-safe detach suppresses stale host projections");
+    allow_afw_stereo_projection(true);
+    expect(!afw_stereo_projection().valid, "Reattachment requires fresh projection data");
+    allow_afw_stereo_projection(false);
+
+    AfwWarpPrefix prefix;
+    prefix.source_eye = 1; prefix.mode = 3;
+    expect(afw_warp_metadata(&prefix, true).eye == 1 && afw_warp_metadata(&prefix, true).mode == 3,
+        "Verified AFW ABI reads explicit source eye and warp mode");
+    expect(afw_warp_metadata(reinterpret_cast<void*>(1), false).eye == UINT32_MAX,
+        "Unknown runtime ABI never reads opaque parameter memory");
+    prefix.mode = 4;
+    expect(afw_warp_metadata(&prefix, true).eye == UINT32_MAX, "Unknown warp mode invalidates metadata");
+    prefix.mode = 1; prefix.source_eye = 2;
+    expect(afw_warp_metadata(&prefix, true).eye == UINT32_MAX, "Invalid eye is never guessed");
+    afw_note_warp_abi(true);
+    afw_note_warp_call(1, 3); afw_note_warp_call(0, 2); afw_note_warp_call(1, 0);
+    auto status = afw_compatibility_status();
+    expect(status.source_left_calls == 1 && status.source_right_calls == 1 && status.last_warp_mode == 0,
+        "Warp source counters count explicit active modes without inventing alternation");
+    afw_note_warp_abi(false); afw_note_warp_call(0, 3);
+    expect(afw_compatibility_status().last_warp_source_eye == UINT32_MAX,
+        "Unsupported ABI clears last eye rather than retaining stale metadata");
+}
+
 int run_nr_lifetime_tests();
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--afw-runtime-file") == 0) {
+        const bool supported = cheeky::foveated_dlss::known_afw_warp_file(std::filesystem::path(argv[2]).c_str());
+        std::cout << (supported ? "Verified AFW warp ABI file\n" : "Unknown AFW warp ABI file\n");
+        return supported ? 0 : 1;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--nr-lifetime") == 0) return run_nr_lifetime_tests();
     if (argc == 2 && std::strcmp(argv[1], "--nr-processing") == 0) {
         return run_nr_processing_tests();
@@ -1678,6 +1753,7 @@ int main(int argc, char** argv) {
     failures += run_openxr_calibration_format_tests();
     failures += run_nr_processing_tests();
     test_afw_dispatch_and_settings();
+    test_afw_projection_and_metadata();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

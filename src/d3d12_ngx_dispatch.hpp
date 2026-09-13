@@ -23,13 +23,17 @@ struct AfwCompatibilityStatus {
     bool warp_observer_ready{};
     std::uint64_t warp_calls{};
     std::uint64_t last_warp_age_ms{UINT64_MAX};
+    bool warp_metadata_supported{};
+    unsigned last_warp_source_eye{UINT32_MAX}, last_warp_mode{UINT32_MAX};
+    std::uint64_t source_left_calls{}, source_right_calls{};
 };
 void enable_afw_compatibility() noexcept;
 [[nodiscard]] bool afw_compatibility_enabled() noexcept;
 [[nodiscard]] AfwCompatibilityStatus afw_compatibility_status() noexcept;
 void afw_note_runtime_discovery(unsigned candidates, bool selected) noexcept;
 void afw_note_warp_observer(bool ready) noexcept;
-void afw_note_warp_call() noexcept;
+void afw_note_warp_abi(bool supported) noexcept;
+void afw_note_warp_call(unsigned source_eye = UINT32_MAX, unsigned mode = UINT32_MAX) noexcept;
 // Called only by an outermost public/_C evaluation, never private recursion.
 [[nodiscard]] bool afw_claim_lower_evaluation() noexcept;
 [[nodiscard]] bool afw_reject_core_reentry() noexcept;

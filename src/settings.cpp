@@ -21,6 +21,7 @@ std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
 std::atomic<std::uint32_t> center_supersampling_bits{0x3F800000U};
 std::atomic<bool> afw_manual_coverage{false};
+std::atomic<bool> afw_automatic_coverage{false};
 std::atomic<std::uint32_t> afw_warp_margin_bits{0x3D4CCCCDU};
 std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
 std::atomic<std::uint32_t> width_bits{0x3F0CCCCDU};
@@ -135,6 +136,7 @@ Settings configured_settings() noexcept {
     settings.peripheral_dlaa_scale = load_float(peripheral_dlaa_scale_bits);
     settings.center_supersampling = load_float(center_supersampling_bits);
     settings.afw_manual_coverage = afw_manual_coverage.load(std::memory_order_acquire);
+    settings.afw_automatic_coverage = afw_automatic_coverage.load(std::memory_order_acquire);
     settings.afw_warp_margin = load_float(afw_warp_margin_bits);
     settings.center_preset =
         center_preset.load(std::memory_order_acquire);
@@ -224,6 +226,7 @@ void update_settings(const Settings& settings) noexcept {
     store_float(center_supersampling_bits, std::isfinite(settings.center_supersampling)
         ? std::clamp(settings.center_supersampling, 1.0F, 2.0F) : 1.0F);
     afw_manual_coverage.store(settings.afw_manual_coverage, std::memory_order_release);
+    afw_automatic_coverage.store(settings.afw_automatic_coverage, std::memory_order_release);
     store_float(afw_warp_margin_bits, std::isfinite(settings.afw_warp_margin)
         ? std::clamp(settings.afw_warp_margin, 0.F, 0.25F) : 0.05F);
     center_preset.store(
@@ -514,6 +517,7 @@ Settings settings_for_view(
     const Settings& settings,
     const std::uint64_t view_id
 ) noexcept {
+    if (settings.eye_independent_coverage) return settings;
     auto result = settings;
     std::lock_guard lock(stereo_views_mutex);
     StereoView* matched_view{};

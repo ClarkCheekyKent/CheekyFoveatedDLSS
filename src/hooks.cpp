@@ -7,6 +7,8 @@
 #include "d3d11_peripheral_dlaa.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "afw_compatibility.hpp"
+#include "afw_warp_abi.hpp"
+#include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
@@ -230,11 +232,13 @@ thread_local bool streamline_nr_history_reset{};
 // activity must not depend on a private parameter layout or assign an early eye.
 using AfwEvaluateWarpFn = void(__stdcall*)(void*);
 std::atomic<AfwEvaluateWarpFn> real_afw_evaluate_warp{};
+std::atomic<bool> afw_known_warp_abi{};
 void __stdcall hook_afw_evaluate_warp(void* parameters) {
     const auto original = real_afw_evaluate_warp.load(std::memory_order_acquire);
     if (!original) return;
+    const auto metadata = afw_warp_metadata(parameters, afw_known_warp_abi.load(std::memory_order_acquire));
     original(parameters);
-    afw_note_warp_call(); // A returned CPU call, not proof of GPU/visual correctness.
+    afw_note_warp_call(metadata.eye, metadata.mode); // Late observation only; never predict a future eye.
 }
 
 void detect_afw_runtime() noexcept {
@@ -4655,7 +4659,11 @@ NgxResult process_d3d12_evaluation_impl(
     }
     auto settings = current_settings();
     if (afw_compatibility_enabled()) {
-        settings = afw_experiment_settings(settings);
+        auto projection = afw_stereo_projection();
+        projection.valid = afw_projection_matches_output(projection, get_ui(call.parameters, "OutWidth"), get_ui(call.parameters, "OutHeight"),
+            get_ui(call.parameters, "DLSS.Output.Subrect.Base.X"), get_ui(call.parameters, "DLSS.Output.Subrect.Base.Y"));
+        settings = afw_experiment_settings(settings, &projection);
+        note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
         if (d3d12_game_feature(call.handle) != 1U) settings.enabled = false;
     }
     NrPipelineTimingScope pipeline_timing{call.command_list, settings};
@@ -4820,7 +4828,11 @@ NgxResult evaluate_d3d12_c_impl(
     }
     auto settings = current_settings();
     if (afw_compatibility_enabled()) {
-        settings = afw_experiment_settings(settings);
+        auto projection = afw_stereo_projection();
+        projection.valid = afw_projection_matches_output(projection, get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
+            get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"));
+        settings = afw_experiment_settings(settings, &projection);
+        note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
         if (d3d12_game_feature(handle) != 1U) settings.enabled = false;
     }
     NrPipelineTimingScope pipeline_timing{command_list, settings};
@@ -5339,6 +5351,10 @@ template <typename T>
                 warp_stability, L"PDAFWPlugin.dll", require_runtime_stability) &&
                 GetModuleHandleExW(0, L"PDAFWPlugin.dll", &module)) {
             attempted_module = module;
+            const auto known_abi = known_afw_warp_runtime(module);
+            afw_known_warp_abi.store(known_abi, std::memory_order_release);
+            afw_note_warp_abi(known_abi);
+            trace_event("AFW warp metadata ABI verified=%s; unknown builds use opaque call observation", known_abi ? "yes" : "no");
             if (install_direct_hook(module, "EvaluateFrameWarp",
                     reinterpret_cast<void*>(&hook_afw_evaluate_warp), real_afw_evaluate_warp,
                     DiagnosticApi::d3d12, false)) {

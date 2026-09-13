@@ -1,6 +1,8 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include <atomic>
 #include <Windows.h>
+#include "afw_compatibility.hpp"
+#include <mutex>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -14,6 +16,12 @@ std::atomic<unsigned> runtime_candidates{};
 std::atomic<bool> runtime_selected{};
 std::atomic<bool> warp_observer_ready{};
 std::atomic<std::uint64_t> warp_calls{}, last_warp_ms{};
+std::atomic<bool> warp_metadata_supported{};
+std::atomic<std::uint64_t> last_warp_metadata{UINT64_MAX}, source_left_calls{}, source_right_calls{};
+std::mutex afw_projection_mutex;
+AfwProjectionCache afw_projection_cache;
+AfwCoverageStatus afw_coverage;
+std::atomic<bool> afw_projection_allowed{};
 thread_local bool* afw_core_lower_seen{};
 
 struct AfwCoreScope {
@@ -33,13 +41,48 @@ bool afw_compatibility_enabled() noexcept { return afw_enabled.load(std::memory_
 AfwCompatibilityStatus afw_compatibility_status() noexcept {
     const auto last_warp = last_warp_ms.load(std::memory_order_acquire);
     const auto now = GetTickCount64();
+    const auto metadata = last_warp_metadata.load();
     return {afw_compatibility_enabled(), core_calls.load(), lower_calls.load(),
         missing_lower_calls.load(), standalone_lower_calls.load(), rejected_core_reentry.load(),
         runtime_candidates.load(), runtime_selected.load(), warp_observer_ready.load(),
-        warp_calls.load(), last_warp ? (now >= last_warp ? now - last_warp : 0U) : UINT64_MAX};
+        warp_calls.load(), last_warp ? (now >= last_warp ? now - last_warp : 0U) : UINT64_MAX,
+        warp_metadata_supported.load(), static_cast<unsigned>(metadata >> 32), static_cast<unsigned>(metadata),
+        source_left_calls.load(), source_right_calls.load()};
 }
 void afw_note_warp_observer(bool ready) noexcept { warp_observer_ready.store(ready); }
-void afw_note_warp_call() noexcept {
+void publish_afw_stereo_projection(const float (&matrices)[2][16], unsigned width, unsigned height, bool active) noexcept {
+    std::lock_guard lock(afw_projection_mutex);
+    afw_projection_cache.publish(matrices, width, height, active, GetTickCount64());
+}
+void allow_afw_stereo_projection(bool allowed) noexcept {
+    if (allowed) {
+        std::lock_guard lock(afw_projection_mutex);
+        afw_projection_cache = {};
+    }
+    afw_projection_allowed.store(allowed, std::memory_order_release);
+}
+AfwStereoProjection afw_stereo_projection() noexcept {
+    std::lock_guard lock(afw_projection_mutex);
+    auto result = afw_projection_cache.snapshot(GetTickCount64());
+    result.valid &= afw_projection_allowed.load(std::memory_order_acquire);
+    return result;
+}
+void note_afw_coverage(const Settings& settings, bool automatic_applied) noexcept {
+    std::lock_guard lock(afw_projection_mutex);
+    afw_coverage = {true, automatic_applied ? 2U : !settings.afw_automatic_coverage && settings.afw_manual_coverage ? 1U : 0U,
+        settings.width, settings.height, settings.x_offset, settings.height_offset, settings.center_supersampling};
+}
+AfwCoverageStatus afw_coverage_status() noexcept {
+    std::lock_guard lock(afw_projection_mutex);
+    return afw_coverage;
+}
+void afw_note_warp_abi(bool supported) noexcept { warp_metadata_supported.store(supported); }
+void afw_note_warp_call(unsigned source_eye, unsigned mode) noexcept {
+    const bool valid = warp_metadata_supported.load() && source_eye < 2 && mode <= 3;
+    last_warp_metadata.store(valid ? (static_cast<std::uint64_t>(source_eye) << 32) | mode : UINT64_MAX);
+    if (valid && mode != 0) {
+        if (source_eye == 0) ++source_left_calls; else ++source_right_calls;
+    }
     ++warp_calls;
     last_warp_ms.store(GetTickCount64(), std::memory_order_release);
 }

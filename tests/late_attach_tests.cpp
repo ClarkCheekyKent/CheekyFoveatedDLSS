@@ -702,6 +702,29 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
             "Manual envelope retains private history and isolates resolution changes from AFW");
         require(snapshot(get).find("\"manual_coverage\":true") != std::string::npos,
             "Report includes effective AFW coverage mode");
+        command("1\n212\nset\nAfwAutomaticCoverage=true\nAlignedHeightOffset=0.1");
+        require(ngx_succeeded(f.evaluate()), "Automatic stereo envelope evaluates below AFW"); f.finish_gpu();
+        require(snapshot(get).find("\"coverage_mode\":2") != std::string::npos && afw_contract_ok,
+            "Automatic placement uses matching public host projections without resizing AFW inputs");
+        const auto automatic_creates = f.creates();
+        for (unsigned i = 0; i < 3; ++i) { require(ngx_succeeded(f.evaluate()), "Stable automatic evaluation"); f.finish_gpu(); }
+        require(f.creates() == automatic_creates, "Stable automatic geometry retains private handles");
+        Sleep(300);
+        require(ngx_succeeded(f.evaluate()), "Stale host projection falls back safely"); f.finish_gpu();
+        require(snapshot(get).find("\"coverage_mode\":0") != std::string::npos,
+            "Stale public projections select the centered fallback in the real hook");
+        CheekyUEVRStereoProjection mismatched;
+        mismatched.active = 1; mismatched.output_width = 512; mismatched.output_height = 256;
+        for (auto& m : mismatched.matrices) { m[0] = m[5] = m[11] = 1.F; m[14] = 10.F; }
+        const auto publish = proc<CheekyUEVRPublishStereoFn>(GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"), "CheekyUEVR_PublishStereo");
+        require(publish(1, &mismatched), "Publish a valid projection for a different output size");
+        require(ngx_succeeded(f.evaluate()), "Mismatched projection cannot displace current DLSS view"); f.finish_gpu();
+        require(snapshot(get).find("\"coverage_mode\":0") != std::string::npos, "Extra output view retains centered coverage");
+        command("1\n214\nget");
+        require(ngx_succeeded(f.evaluate()), "Fresh matching projection resumes automatic coverage"); f.finish_gpu();
+        require(snapshot(get).find("\"coverage_mode\":2") != std::string::npos && afw_contract_ok,
+            "Projection reacquisition preserves AFW's full-frame contract");
+        command("1\n213\nset\nAfwAutomaticCoverage=false");
         command("1\n211\nset\nAfwManualCoverage=false\nCenterSupersampling=2");
         require(ngx_succeeded(f.evaluate()), "Tested centered AFW mode can be restored"); f.finish_gpu();
         // A private failure must restore the original contract and reset the

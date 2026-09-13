@@ -164,8 +164,25 @@ def run(engine):
     draw()
     assert any("No recent warp calls" in t for t in g.drawn.values())
     assert len(g.sent) == count, "Drawing AFW status and overrides must not write settings"
+    afw["settings"]["AfwAutomaticCoverage"] = True
+    afw["afw_experiment"].update(coverage_mode=2, projection_valid=True, warp_metadata_supported=True,
+                                  last_warp_source_eye=1, last_warp_mode=3, source_left_calls=10, source_right_calls=12)
+    receive(afw)
+    draw()
+    assert "Automatic coverage height bias" in g["values"] and "Stereo coverage X offset" not in g["values"]
+    assert any("automatic stereo coverage" in t for t in g.drawn.values())
+    assert any(t == "Right" for t in g.drawn.values()) and any(t == "Combined" for t in g.drawn.values())
+    afw["afw_experiment"]["last_warp_mode"] = 2
+    receive(afw)
+    draw()
+    assert any(t == "Previous frame" for t in g.drawn.values())
+    afw["afw_experiment"].update(coverage_mode=0, projection_valid=False)
+    receive(afw)
+    draw()
+    assert any("awaiting fresh matching projections" in t for t in g.drawn.values())
     legacy_afw = copy.deepcopy(afw)
     del legacy_afw["settings"]["AfwManualCoverage"]
+    del legacy_afw["settings"]["AfwAutomaticCoverage"]
     del legacy_afw["settings"]["AfwWarpMargin"]
     receive(legacy_afw)
     draw()
