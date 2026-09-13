@@ -138,7 +138,8 @@ def run(engine):
     assert any("AFW compatibility detected" in t for t in g.drawn.values())
     assert any("ordinary DLSS passes through" in t for t in g.drawn.values())
     assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
-    assert "Foveation center" not in g["values"] and "Enable DLSS-NR" not in g["values"]
+    assert "Foveation center" in g["values"] and "Enable DLSS-NR" not in g["values"]
+    assert "Automatic stereo alignment" not in g["values"] and "Invert stereo eye order" not in g["values"]
     assert "Automatic eye calibration (this session)" not in g["values"]
     assert "Center supersampling" in g["values"]
     afw["afw_experiment"].update(lower_calls=100, missing_lower_calls=0)
@@ -180,6 +181,18 @@ def run(engine):
     receive(afw)
     draw()
     assert any("awaiting fresh matching projections" in t for t in g.drawn.values())
+    afw["settings"]["CenterMode"] = 2
+    afw["settings"]["SimulationPattern"] = 2
+    afw["gaze"].update(using_gaze=True, afw_bilateral=True, afw_fresh_sample=True)
+    afw["afw_experiment"].update(coverage_mode=3, projection_valid=True)
+    receive(afw)
+    draw()
+    assert "Simulation pattern" in g["values"] and "Gaze smoothing (ms)" in g["values"]
+    assert "Show next jump target" not in g["values"] and "Roundness" not in g["values"]
+    assert any("bilateral gaze coverage" in t for t in g.drawn.values())
+    assert not any("awaiting fresh matching projections" in t for t in g.drawn.values())
+    assert len(g.sent) == count, "Gaze diagnostics must not rewrite preferences"
+    afw["settings"]["CenterMode"] = 0
     legacy_afw = copy.deepcopy(afw)
     del legacy_afw["settings"]["AfwManualCoverage"]
     del legacy_afw["settings"]["AfwAutomaticCoverage"]

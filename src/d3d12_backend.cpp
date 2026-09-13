@@ -909,6 +909,10 @@ D3D12Evaluation* prepare_d3d12(
         );
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
+        if (settings.eye_independent_coverage) {
+            effective_settings.width = static_cast<float>(crop.input_width) / render_width;
+            effective_settings.height = static_cast<float>(crop.input_height) / render_height;
+        }
         apply_next_jump_preview(effective_settings, view_id);
     }
 
@@ -1186,6 +1190,10 @@ D3D12Evaluation* prepare_d3d12_streamline(
         );
         effective_settings.x_offset = offsets.x;
         effective_settings.height_offset = offsets.y;
+        if (settings.eye_independent_coverage) {
+            effective_settings.width = static_cast<float>(crop.input_width) / render_width;
+            effective_settings.height = static_cast<float>(crop.input_height) / render_height;
+        }
         apply_next_jump_preview(effective_settings, view_id);
     }
 

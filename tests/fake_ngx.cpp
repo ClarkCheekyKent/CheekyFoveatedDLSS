@@ -1,11 +1,15 @@
 #include "ngx_abi.hpp"
 #include "mock_ngx_parameters.hpp"
+#include "../shared/cheeky_gaze_abi.h"
 #include <atomic>
 using namespace cheeky::foveated_dlss;
 namespace {
 std::atomic<unsigned> creates{}, evaluates{}, releases{};
 void* last_warp_parameters{};
 unsigned warp_calls{};
+CheekyGazeSnapshotV1 fake_gaze{};
+using ObserveHandle = void(*)(const NgxHandle*, const NgxParameters*);
+ObserveHandle observe_handle{};
 using Observe = void(*)(const NgxParameters*);
 Observe observe{};
 Observe observe_created{};
@@ -25,6 +29,7 @@ NgxResult evaluate(const NgxHandle* handle, const NgxParameters* params) {
     ++evaluates;
     if (observe_created) observe_created(&reinterpret_cast<const Feature*>(handle)->created);
     if (observe) observe(params);
+    if (observe_handle) observe_handle(handle, params);
     if (fail_next) { --fail_next; return 0xBAD00007U; }
     return fail_evaluation ? 0xBAD00007U : 1U;
 }
@@ -35,6 +40,14 @@ EXPORT unsigned NVSDK_NGX_GetSnippetVersion() { return 0x01360900U; }
 EXPORT unsigned CheekyFakeEvaluates() { return evaluates.load(); }
 EXPORT unsigned CheekyFakeReleases() { return releases.load(); }
 EXPORT void CheekyFakeObserve(Observe callback) { observe = callback; }
+EXPORT void CheekyFakeObserveHandle(ObserveHandle callback) { observe_handle = callback; }
+EXPORT void CheekyFakeGazeSnapshot(const CheekyGazeSnapshotV1* value) { fake_gaze = *value; }
+EXPORT unsigned __cdecl CheekyOpenXR_GetGazeSnapshot(unsigned abi, void* output, unsigned size) {
+    if (abi != CHEEKY_GAZE_ABI_VERSION || size < sizeof(fake_gaze) || !output) return 0;
+    memcpy(output, &fake_gaze, sizeof(fake_gaze)); return 1;
+}
+EXPORT void __cdecl CheekyOpenXR_SetSimulatedGaze(unsigned) {}
+EXPORT void __cdecl CheekyOpenXR_SetSimulationPattern(unsigned) {}
 EXPORT void CheekyFakeObserveCreated(Observe callback) { observe_created = callback; }
 EXPORT void CheekyFakeFailEvaluations(bool fail) { fail_evaluation = fail; }
 EXPORT void CheekyFakeCopyNrColor(bool enabled) { copy_nr_color = enabled; }

@@ -4497,6 +4497,10 @@ void evaluate_nr_after_native_d3d12(
         peripheral_timing.finish(peripheral_ready);
     }
 
+    // The periphery owns a separate temporal feature. Skipping it invalidates
+    // that history even when the center continues to evaluate successfully.
+    if (!peripheral_ready) skip_d3d12_history(peripheral_dlaa_view_id(contract.view_id));
+
     NgxPresetOverrideScope center_preset{
         parameters, effective_settings.center_preset
     };
@@ -4689,6 +4693,7 @@ NgxResult process_d3d12_evaluation_impl(
     // A native fallback skips this private feature's history. Its next use
     // cannot reproject across the missing evaluation with single-frame vectors.
     skip_d3d12_history(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(call.handle)));
+    skip_d3d12_history(peripheral_dlaa_view_id(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(call.handle))));
     diagnostic_note_state(
         DiagnosticApi::d3d12,
         !settings.enabled ? DiagnosticState::disabled
@@ -4853,6 +4858,7 @@ NgxResult evaluate_d3d12_c_impl(
         return result;
     }
     skip_d3d12_history(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle)));
+    skip_d3d12_history(peripheral_dlaa_view_id(static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle))));
     diagnostic_note_state(
         DiagnosticApi::d3d12,
         !settings.enabled ? DiagnosticState::disabled

@@ -2,6 +2,8 @@
 
 Start with the [installation guide](README.md#installation). This page contains the detailed control reference.
 
+For **UEVR AFW**, use the [AFW setup and validation guide](uevr/README.md#afw-routing-experiment). That DX12 path covers both possible source eyes in one fixed or gaze-driven region and bypasses ordinary eye calibration. Its effective coverage can be larger than the stored fovea dimensions; the AFW banner reports the actual size. Cheeky NR remains bypassed on that path.
+
 ## Controls
 
 Start with the defaults, then tune the region while looking at a representative scene:

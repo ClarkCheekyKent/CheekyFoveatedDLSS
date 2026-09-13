@@ -2,6 +2,8 @@
 #include "mock_ngx_parameters.hpp"
 #include "streamline_abi.hpp"
 #include "timing_list_alias.hpp"
+#include "../shared/cheeky_gaze_abi.h"
+#include <filesystem>
 #include <wrl/client.h>
 #include <array>
 #include <vector>
@@ -131,6 +133,12 @@ bool afw_missing_lower{};
 bool afw_public_first{};
 bool afw_ota{}, afw_ambiguous{};
 unsigned afw_full_calls{}, afw_lower_calls{}, afw_reduced_depth_calls{}, afw_full_resets{};
+unsigned afw_expected_reset{};
+struct AfwHistorySample { const NgxHandle* handle{}; unsigned reset{}; };
+std::vector<AfwHistorySample> afw_history;
+void observe_afw_history(const NgxHandle* handle, const NgxParameters* params) {
+    afw_history.push_back({handle, get_ui(params, "Reset")});
+}
 bool afw_contract_ok{true}, afw_order_ok{true};
 void observe_afw_core(const NgxParameters* params) {
     ++afw_full_calls;
@@ -141,7 +149,7 @@ void observe_afw_core(const NgxParameters* params) {
         afw_contract_ok &= resource == f.textures12[i].Get();
         if (resource) afw_contract_ok &= resource->GetDesc().Width == (i == 3 ? 256U : 128U) && resource->GetDesc().Height == (i == 3 ? 256U : 128U);
     }
-    afw_contract_ok &= get_ui(params, "Width") == 128 && get_ui(params, "OutWidth") == 256 && get_ui(params, "Reset") == 0;
+    afw_contract_ok &= get_ui(params, "Width") == 128 && get_ui(params, "OutWidth") == 256 && get_ui(params, "Reset") == afw_expected_reset;
     // Model AFW's pre-DLSS work. The lower observer must run after this update.
     const_cast<NgxParameters*>(params)->Set("CheekyFake.AfwCorrected", afw_full_calls);
 }
@@ -639,6 +647,80 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
     if (!public_first) proc<void(*)(void(*)(const NgxParameters*))>(f.ngx, "CheekyFakeObserve")(&observe_afw_lower);
 }
 
+void verify_afw_gaze_history(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
+    auto& f = fixture();
+    wchar_t filename[32768]{};
+    require(GetModuleFileNameW(afw_warp_module, filename, 32768) != 0, "Find fake gaze runtime source");
+    const auto gaze_path = std::filesystem::path(filename).parent_path() / L"CheekyOpenXRLayer.dll";
+    std::filesystem::copy_file(filename, gaze_path, std::filesystem::copy_options::overwrite_existing);
+    const auto layer = LoadLibraryW(gaze_path.c_str()); require(layer != nullptr, "Load fake gaze publication runtime");
+    const auto publish = proc<void(*)(const CheekyGazeSnapshotV1*)>(layer, "CheekyFakeGazeSnapshot");
+    proc<void(*)(void(*)(const NgxHandle*, const NgxParameters*))>(f.ngx, "CheekyFakeObserveHandle")(observe_afw_history);
+    CheekyGazeSnapshotV1 gaze{};
+    gaze.structure_size = sizeof(gaze); gaze.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    gaze.view_count = 2; gaze.session_generation = 1; gaze.swapchain_generation = 1;
+    gaze.status_flags = CHEEKY_GAZE_STATUS_LAYER_ACTIVE | CHEEKY_GAZE_STATUS_SESSION_FOCUSED | CHEEKY_GAZE_STATUS_GAZE_VALID;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& v = gaze.views[eye]; v.structure_size = sizeof(v); v.view_index = eye;
+        v.flags = CHEEKY_GAZE_VIEW_FOV_VALID | CHEEKY_GAZE_VIEW_ORIENTATION_VALID;
+        v.fov_left = v.fov_down = -std::atan(1.F); v.fov_right = v.fov_up = std::atan(1.F);
+        v.center_u = v.center_v = .5F;
+    }
+    const auto evaluate = [&] {
+        command("1\n230\nget"); // Publish the current UEVR projection pair.
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now); gaze.publication_qpc = now.QuadPart;
+        ++gaze.predicted_display_time; publish(&gaze); afw_history.clear();
+        require(ngx_succeeded(f.evaluate()), "AFW gaze evaluation succeeds"); f.finish_gpu();
+        require(afw_contract_ok && afw_order_ok, "Gaze preserves full AFW inputs and corrected motion order");
+    };
+    command("1\n231\nset\nEnabled=true\nCenterMode=1\nAfwAutomaticCoverage=true\nWidth=0.25\nHeight=0.3\nAfwWarpMargin=0.03\nGazeSmoothingMs=0\nCenterSupersampling=1\nPeripheralDlaa=true");
+    evaluate(); // Changing source rejects the publication preceding that change.
+    evaluate();
+    if (snapshot(get).find("\"afw_fresh_sample\":true") == std::string::npos || snapshot(get).find("\"coverage_mode\":3") == std::string::npos)
+        puts(snapshot(get).c_str());
+    require(snapshot(get).find("\"afw_fresh_sample\":true") != std::string::npos &&
+        snapshot(get).find("\"coverage_mode\":3") != std::string::npos, "Real hook consumes bilateral gaze without eye mapping");
+    require(afw_history.size() == 2 && afw_history.back().reset, "Gaze acquisition resets center history");
+    const auto first = afw_history;
+    const auto creates = f.creates();
+    evaluate();
+    require(afw_history.size() == 2 && !afw_history[0].reset && !afw_history[1].reset && f.creates() == creates,
+        "Stable shared game handle preserves both private histories");
+    afw_expected_reset = 1; f.params.Set("Reset", 1U); evaluate();
+    require(afw_history.size() == 2 && afw_history[0].reset && afw_history[1].reset && get_ui(&f.params, "Reset") == 1,
+        "Game reset reaches both private histories and original Reset is restored");
+    afw_expected_reset = 0; f.params.Set("Reset", 0U); evaluate();
+    require(!afw_history[0].reset && !afw_history[1].reset, "Game reset is not repeated");
+    command("1\n232\nset\nPeripheralDlaa=false"); evaluate();
+    require(afw_history.size() == 1 && afw_history[0].handle == first[1].handle, "Center keeps its history while periphery is off");
+    command("1\n233\nset\nPeripheralDlaa=true"); evaluate();
+    require(afw_history.size() == 2 && afw_history[0].reset && !afw_history[1].reset,
+        "Resuming starved periphery resets only its history");
+    evaluate(); require(!afw_history[0].reset && !afw_history[1].reset, "Resumed private histories stabilize");
+    const auto first_game = f.handle;
+    NgxHandle* second_game{};
+    require(ngx_succeeded(f.create12(f.list.Get(), 1, &f.params, &second_game)), "Create second game history");
+    const auto select = [&](NgxHandle* handle) {
+        f.handle = handle;
+        if (f.use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, handle, &f.params);
+    };
+    select(second_game); evaluate();
+    require(afw_history.size() == 2 && afw_history[0].handle != first[0].handle && afw_history[1].handle != first[1].handle &&
+        afw_history[0].reset && afw_history[1].reset, "Distinct game handles have distinct center and peripheral histories");
+    select(first_game); evaluate();
+    require(afw_history.size() == 2 && afw_history[0].handle == first[0].handle && afw_history[1].handle == first[1].handle &&
+        !afw_history[0].reset && !afw_history[1].reset, "Returning to first game handle preserves its own histories");
+    require(ngx_succeeded(f.release(second_game)), "Release second history independently");
+    command("1\n234\nset\nEnabled=false"); evaluate();
+    command("1\n235\nset\nEnabled=true"); evaluate();
+    require(afw_history.size() == 2 && afw_history[0].reset && afw_history[1].reset, "Native fallback invalidates both skipped private histories");
+    evaluate(); require(!afw_history[0].reset && !afw_history[1].reset, "Native-to-private transition resets only once");
+    command("1\n236\nset\nCenterMode=0");
+    proc<void(*)(void(*)(const NgxHandle*, const NgxParameters*))>(f.ngx, "CheekyFakeObserveHandle")(nullptr);
+    FreeLibrary(layer);
+    puts("PASS: AFW bilateral gaze, shared/separate game histories, reset propagation and skipped periphery");
+}
+
 void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     auto& f = fixture();
     command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=2\nAutoStereoAlignment=true\nCenterMode=2\nNrEnabled=true\nAlignmentBorder=false");
@@ -741,6 +823,7 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
         command("1\n203\nset\nEnabled=false");
         require(ngx_succeeded(f.evaluate()), "Toggle off resumes native history"); f.finish_gpu();
         require(afw_full_resets == 2, "Toggle transition resets native history once");
+        verify_afw_gaze_history(get, command);
     }
     require(ngx_succeeded(f.release(f.handle)), "Wrapped core release cleans lower game and private handles");
     require(f.creates() == f.releases(), "No leaked lower private features after core release");

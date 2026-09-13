@@ -239,10 +239,10 @@ uevr.sdk.callbacks.on_draw_ui(function()
     local afw = status.afw_experiment or {}
     if afw.enabled then
         text("AFW compatibility detected. Check warp activity and SR status separately.")
-        text("NR, gaze and marker calibration are bypassed. Saved preferences are retained.")
+        text("Gaze covers both eye projections. NR and marker calibration are bypassed; saved preferences are retained.")
         text(string.format("Coverage selected at last DLSS call: %.1f%% x %.1f%%; center scale %.2fx (%s).",
             100 * (afw.effective_width or 0.7), 100 * (afw.effective_height or 0.7),
-            afw.effective_center_scale or 1, afw.coverage_mode == 2 and "automatic stereo coverage" or afw.manual_coverage and "manual stereo coverage" or "centered minimum 70%"))
+            afw.effective_center_scale or 1, afw.coverage_mode == 3 and "bilateral gaze coverage" or afw.coverage_mode == 2 and "automatic stereo coverage" or afw.manual_coverage and "manual stereo coverage" or "centered minimum 70%"))
         rows("afw_routing", {{"Lower SR runtime selected", yes(afw.runtime_selected)},
             {"SR runtime candidates at selection", tostring(afw.runtime_candidates or 0)},
             {"Full-frame core / nested DLSS calls", tostring(afw.core_calls or 0) .. " / " .. tostring(afw.lower_calls or 0)},
@@ -261,7 +261,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
         elseif (afw.last_warp_age_ms or 0) > 1000 then text("No recent warp calls. Check AFW's status after loading or resolution changes.") end
         text("Warp calls confirm CPU activity, not GPU completion or visual quality.")
         text("Reported eye/mode describe the last warp call, after DLSS. They do not predict the next source eye.")
-        if (status.settings or {}).AfwAutomaticCoverage and afw.coverage_mode ~= 2 then
+        if (status.settings or {}).AfwAutomaticCoverage and afw.coverage_mode ~= 2 and afw.coverage_mode ~= 3 then
             text("Automatic coverage is awaiting fresh matching projections; the centered fallback is selected.")
         end
         if (afw.lower_calls or 0) == 0 then text("Waiting for a usable nested DLSS route; ordinary DLSS passes through.") end
@@ -281,9 +281,8 @@ uevr.sdk.callbacks.on_draw_ui(function()
     if imgui.tree_node("Stereo and gaze") then
         if afw.enabled then
             text("AFW's source eye is unknown before DLSS. Coverage does not use evaluation order or guessed eye labels.")
-            text("Use the AFW coverage controls under DLSS-SR. Eye-specific alignment and gaze remain unavailable.")
+            text("Gaze covers both eyes in one rectangle. Fresh gaze and UEVR projections are required; otherwise the selected fixed coverage is used.")
         else
-        combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
         check("Automatic stereo alignment", "AutoStereoAlignment")
         if draft.AutoStereoAlignment then slider("Height offset / gaze fallback", "AlignedHeightOffset", -1, 1)
         else
@@ -291,11 +290,13 @@ uevr.sdk.callbacks.on_draw_ui(function()
             slider("Manual height offset", "HeightOffset", -1, 1)
         end
         check("Invert stereo eye order", "InvertStereoXOffset")
+        end
+        combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
         if draft.CenterMode == 2 then
             combo("Simulation pattern", "SimulationPattern", {[0]="Figure eight (8 s)",[1]="Slow sweep (20 s)",
                 [2]="Jump every 2 s",[3]="Jump every 8 s",[4]="Tracking loss",[5]="Hold center"})
             text("Patterns restart when changed. Enable the red border to inspect motion.")
-            if draft.SimulationPattern == 2 or draft.SimulationPattern == 3 then check("Show next jump target", "ShowNextJumpTarget") end
+            if not afw.enabled and (draft.SimulationPattern == 2 or draft.SimulationPattern == 3) then check("Show next jump target", "ShowNextJumpTarget") end
             if draft.SimulationPattern == 4 then text("Moves for 4 s, loses tracking for 1 s, then recovers.") end
         end
         if imgui.tree_node("Advanced eye tracking") then
@@ -305,14 +306,18 @@ uevr.sdk.callbacks.on_draw_ui(function()
             imgui.tree_pop()
         end
         local g = status.gaze or {}
+        if afw.enabled then
+        rows("afw_gaze_summary", {{"Gaze driving foveation", yes(g.using_gaze)}, {"Fresh bilateral gaze", yes(g.afw_fresh_sample)}})
+        text("The rectangle covers fresh and smoothed gaze together. Its allocation can grow with eye separation or smoothing; change fovea size or switch Fixed then gaze to start smaller again.")
+        else
         rows("gaze_summary", {{"Alignment", alignment[g.alignment] or "Unknown"}, {"Gaze driving foveation", yes(g.using_gaze)},
             {"Mapped left / right", yes(g.left_mapped) .. " / " .. yes(g.right_mapped)}})
+        end
         if draft.CenterMode == 1 and not g.using_gaze then
-            imgui.text_colored("Eye tracking unavailable or awaiting mapping; using fixed fallback.", 0xFFFFBC70)
+            imgui.text_colored(afw.enabled and "Fresh bilateral gaze or matching projections unavailable; using fixed fallback." or "Eye tracking unavailable or awaiting mapping; using fixed fallback.", 0xFFFFBC70)
         end
         text("OpenXR alignment/gaze uses the matching Cheeky layer. Fixed alignment needs no eye tracker.")
         reset_group("Reset Stereo / gaze defaults", "gaze")
-        end
         imgui.tree_pop()
     end
 
@@ -321,17 +326,21 @@ uevr.sdk.callbacks.on_draw_ui(function()
         if draft.Enabled then
             if afw.enabled and draft.AfwManualCoverage ~= nil then
                 section("AFW coverage")
+                if draft.CenterMode ~= 0 then
+                    slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25)
+                    text("Width and height describe each eye's gaze region. The fixed coverage options below control the tracking-loss fallback.")
+                end
                 if draft.AfwAutomaticCoverage ~= nil then check("Automatic stereo coverage", "AfwAutomaticCoverage") end
                 if draft.AfwAutomaticCoverage then
                     slider("Automatic coverage height bias", "AlignedHeightOffset", -1, 1)
-                    slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25)
+                    if draft.CenterMode == 0 then slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25) end
                     text("Covers both UEVR projection centers. No eye-calibration layer is needed. Missing, stale or mismatched projections use the centered fallback.")
                 else
                 check("Manual stereo coverage", "AfwManualCoverage")
                 if draft.AfwManualCoverage then
                     slider("Stereo coverage X offset", "XOffset", -1, 1)
                     slider("Coverage height offset", "HeightOffset", -1, 1)
-                    slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25)
+                    if draft.CenterMode == 0 then slider("Warp padding per edge", "AfwWarpMargin", 0, 0.25) end
                     text("Covers both mirrored X offsets in a rectangle. Width and height below describe each requested region before padding.")
                     text("Padding is a fraction of the full image; larger values cost more. Inspect moving objects and region edges in both eyes.")
                 else
@@ -344,7 +353,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
             slider("Center supersampling", "CenterSupersampling", 1, 2)
             slider("Fovea width", "Width", 0.2, 1)
             slider("Fovea height", "Height", 0.2, 1)
-            if not afw.enabled or (not draft.AfwManualCoverage and not draft.AfwAutomaticCoverage) then slider("Roundness", "Roundness", 0, 1) end
+            if not afw.enabled or (draft.CenterMode == 0 and not draft.AfwManualCoverage and not draft.AfwAutomaticCoverage) then slider("Roundness", "Roundness", 0, 1) end
             slider("Transition width", "TransitionWidth", 0, 0.3)
             check("Show red alignment border", "AlignmentBorder")
             section("Periphery")

@@ -3,6 +3,7 @@
 #include "cheeky_gaze_abi.h"
 #include "runtime.hpp"
 #include "openvr_gaze.hpp"
+#include "afw_gaze.hpp"
 
 #include <Windows.h>
 
@@ -19,6 +20,17 @@ constexpr double gaze_stale_seconds = 0.050;
 constexpr double gaze_hold_seconds = 0.100;
 constexpr double gaze_return_seconds = 0.150;
 
+struct AfwGazeState {
+    std::array<GazeTemporalPolicyState, 2> temporal{};
+    std::array<GazeProjection, 2> projections{};
+    std::uint64_t host_generation{}, session{}, swapchain{}, last_display_qpc{}, minimum_publication{};
+    std::int64_t display_time{};
+    unsigned render_width{}, render_height{}, output_width{}, output_height{}, allocated_width{}, allocated_height{};
+    unsigned pattern{}, mode{}, quantum{};
+    float width{}, height{}, margin{};
+    bool configured{}, openvr{};
+};
+
 struct ViewState {
     DlssViewId view_id{};
     GazeMappingPolicyState mapping{};
@@ -33,6 +45,7 @@ struct ViewState {
     bool logged_mapping_ready{};
     std::uint64_t last_mapping_log_qpc{};
     CropGeometry last_crop{};
+    AfwGazeState afw{};
 };
 
 std::mutex coordinator_mutex;
@@ -180,6 +193,119 @@ void update_diagnostics_view(
     target.xr_array = source.array_index;
 }
 
+bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* output,
+    unsigned rw, unsigned rh, unsigned ow, unsigned oh, unsigned ox, unsigned oy,
+    CropGeometry& crop, bool& reset, const CheekyGazeSnapshotV1* supplied, FoveationCenter* resolved) noexcept {
+    std::lock_guard lock(coordinator_mutex);
+    auto& state = state_for_view(view_id);
+    auto& afw = state.afw;
+    diagnostics.afw_bilateral = true; diagnostics.afw_fresh_sample = false;
+    diagnostics.using_gaze = false; diagnostics.alignment_source = 0;
+    for (auto& eye : diagnostics.views) eye = {};
+    state.next_jump_visible = false;
+    const auto finish = [&](bool valid, bool sample = false, bool reacquired = false, bool epoch = false) {
+        if (!valid) return false;
+        const auto decision = evaluate_gaze_reset(
+            {state.last_crop.input_base_x, state.last_crop.input_base_y, state.last_crop.input_width, state.last_crop.input_height, state.has_crop},
+            {crop.input_base_x, crop.input_base_y, crop.input_width, crop.input_height, true},
+            sample, reacquired, epoch, settings.gaze_jump_reset_ratio);
+        reset = decision.reason != GazeResetReason::none;
+        diagnostics.last_reset_reason = decision.reason;
+        state.last_crop = crop; state.has_crop = true;
+        auto selected = settings;
+        selected.width = static_cast<float>(crop.input_width) / rw;
+        selected.height = static_cast<float>(crop.input_height) / rh;
+        const auto offsets = foveation_offsets_from_geometry(crop, rw, rh);
+        selected.x_offset = offsets.x; selected.height_offset = offsets.y;
+        note_afw_coverage(selected, settings.afw_automatic_coverage && afw_projection_matches_output(afw_stereo_projection(), ow, oh, ox, oy),
+            diagnostics.using_gaze);
+        if (resolved) *resolved = foveation_center_from_geometry(crop, rw, rh);
+        return true;
+    };
+    const auto fallback = [&] { return finish(calculate_crop(settings, rw, rh, ow, oh, ox, oy, crop)); };
+    const auto projection = afw_stereo_projection();
+    if (!rw || !rh || !ow || !oh) return false;
+    if (settings.center_mode == FoveationCenterMode::fixed || !afw_projection_matches_output(projection, ow, oh, ox, oy)) {
+        afw = {};
+        return fallback();
+    }
+    if (!qpc_frequency) { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); qpc_frequency = f.QuadPart; }
+    const auto now = qpc_now();
+    CheekyGazeSnapshotV1 snapshot{};
+    bool loaded = supplied ? (snapshot = *supplied, snapshot.abi_version == CHEEKY_GAZE_ABI_VERSION && snapshot.structure_size >= sizeof(snapshot))
+        : load_snapshot(snapshot);
+    if (!supplied && (!loaded || !snapshot.session_generation)) loaded = read_openvr_gaze(settings, output, snapshot);
+    bool projection_changed{};
+    for (unsigned eye = 0; eye < 2; ++eye) projection_changed |= !gaze_projection_matches(afw.projections[eye], projection.projections[eye]);
+    const bool mode_changed = afw.configured && (afw.mode != static_cast<unsigned>(settings.center_mode) || afw.pattern != settings.simulation_pattern);
+    const bool epoch = !afw.configured || mode_changed || projection_changed || afw.host_generation != projection.generation ||
+        afw.render_width != rw || afw.render_height != rh || afw.output_width != ow || afw.output_height != oh ||
+        afw.width != settings.afw_gaze_width || afw.height != settings.afw_gaze_height || afw.margin != settings.afw_warp_margin ||
+        afw.quantum != settings.gaze_quantization_pixels ||
+        (loaded && (afw.session != snapshot.session_generation || afw.swapchain != snapshot.swapchain_generation ||
+            afw.openvr != ((snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0)));
+    if (epoch) {
+        afw = {};
+        afw.configured = true; afw.projections = projection.projections; afw.host_generation = projection.generation;
+        afw.render_width = rw; afw.render_height = rh; afw.output_width = ow; afw.output_height = oh;
+        afw.width = settings.afw_gaze_width; afw.height = settings.afw_gaze_height; afw.margin = settings.afw_warp_margin;
+        afw.quantum = settings.gaze_quantization_pixels; afw.mode = static_cast<unsigned>(settings.center_mode); afw.pattern = settings.simulation_pattern;
+        afw.session = snapshot.session_generation; afw.swapchain = snapshot.swapchain_generation;
+        afw.openvr = (snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0;
+        afw.minimum_publication = mode_changed ? now : 0;
+    }
+    if (loaded && afw.display_time != snapshot.predicted_display_time) {
+        afw.display_time = snapshot.predicted_display_time; afw.last_display_qpc = now;
+    }
+    constexpr auto required = CHEEKY_GAZE_STATUS_LAYER_ACTIVE | CHEEKY_GAZE_STATUS_SESSION_FOCUSED | CHEEKY_GAZE_STATUS_GAZE_VALID;
+    bool valid = loaded && snapshot.view_count == 2 && snapshot.session_generation && snapshot.predicted_display_time &&
+        (snapshot.status_flags & required) == required && !(snapshot.status_flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) &&
+        ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0) == (settings.center_mode == FoveationCenterMode::simulated_gaze) &&
+        snapshot.publication_qpc && now >= snapshot.publication_qpc && snapshot.publication_qpc >= afw.minimum_publication &&
+        seconds_between(now, snapshot.publication_qpc) <= gaze_stale_seconds && seconds_between(now, afw.last_display_qpc) <= gaze_stale_seconds;
+    std::array<FoveationCenter, 2> raw{};
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        const auto& source = snapshot.views[eye];
+        valid &= source.structure_size >= sizeof(source) && source.view_index == eye && (source.flags & CHEEKY_GAZE_VIEW_ORIENTATION_VALID) &&
+            afw_project_gaze(source, projection.projections[eye], source.center_u, source.center_v, raw[eye]);
+    }
+    diagnostics.status_flags = loaded ? snapshot.status_flags : 0;
+    diagnostics.sample_age_ms = loaded && snapshot.publication_qpc && now >= snapshot.publication_qpc
+        ? static_cast<float>(seconds_between(now, snapshot.publication_qpc) * 1000.) : -1.F;
+    diagnostics.afw_fresh_sample = valid;
+    if (loaded) strncpy_s(diagnostics.runtime_name, snapshot.runtime_name, _TRUNCATE);
+    if (!valid && !afw.temporal[0].has_filtered && !afw.temporal[1].has_filtered) return fallback();
+    CropGeometry fixed{};
+    if (!calculate_crop(settings, rw, rh, ow, oh, ox, oy, fixed)) return false;
+    const auto fixed_center = foveation_center_from_geometry(fixed, rw, rh);
+    AfwGazeBounds bounds;
+    bool reacquired{}, tracking{};
+    const bool focus_lost = loaded && !(snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED);
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        if (focus_lost) afw.temporal[eye] = {};
+        const auto filtered = update_gaze_temporal_policy(afw.temporal[eye],
+            {seconds_between(now, 0), snapshot.predicted_display_time, raw[eye].u, raw[eye].v,
+                fixed_center.u, fixed_center.v, settings.gaze_smoothing_ms, gaze_hold_seconds, gaze_return_seconds, valid});
+        reacquired |= filtered.reacquired; tracking |= filtered.using_gaze;
+        bounds.include({filtered.center_u, filtered.center_v, 1}, settings.afw_gaze_width, settings.afw_gaze_height);
+        // Filtering never cuts the actual fresh gaze out of the sharp region.
+        if (valid) bounds.include(raw[eye], settings.afw_gaze_width, settings.afw_gaze_height);
+        diagnostics.views[eye].center_u = filtered.center_u; diagnostics.views[eye].center_v = filtered.center_v;
+    }
+    bounds.pad(settings.afw_warp_margin);
+    if (!tracking) bounds.include(fixed_center, static_cast<float>(fixed.input_width) / rw, static_cast<float>(fixed.input_height) / rh);
+    unsigned x{}, y{};
+    afw_gaze_axis(bounds.left, bounds.right, rw, settings.gaze_quantization_pixels, afw.allocated_width, x);
+    afw_gaze_axis(bounds.top, bounds.bottom, rh, settings.gaze_quantization_pixels, afw.allocated_height, y);
+    auto parameters = foveation_parameters(settings);
+    parameters.width = static_cast<float>(afw.allocated_width) / rw;
+    parameters.height = static_cast<float>(afw.allocated_height) / rh;
+    diagnostics.using_gaze = tracking;
+    return finish(calculate_foveation_geometry_at_center(parameters,
+        {(x + afw.allocated_width * .5F) / rw, (y + afw.allocated_height * .5F) / rh, 1},
+        rw, rh, ow, oh, ox, oy, crop), valid, reacquired, epoch);
+}
+
 }  // namespace
 
 thread_local const ScopedCoordinatedCrop* coordinated_crop_override{};
@@ -226,6 +352,10 @@ bool calculate_coordinated_crop(
         if (set_simulation != nullptr) {
             set_simulation(settings.center_mode == FoveationCenterMode::simulated_gaze ? 1U : 0U);
         }
+    }
+    if (settings.eye_independent_coverage) {
+        return calculate_afw_crop(settings, view_id, output_resource, render_width, render_height,
+            output_width, output_height, output_origin_x, output_origin_y, crop, reset_history, supplied_snapshot, resolved_center);
     }
     if (!uses_coordinated_center(settings)) {
         std::lock_guard lock(coordinator_mutex);

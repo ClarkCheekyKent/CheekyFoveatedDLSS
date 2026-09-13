@@ -42,6 +42,7 @@ struct Settings {
     bool afw_automatic_coverage{false};
     float afw_warp_margin{0.05F};
     bool eye_independent_coverage{}; // Transient: never mirror a resolved AFW envelope by guessed view role.
+    float afw_gaze_width{}, afw_gaze_height{}; // Requested size before the fixed fallback envelope expands it.
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};

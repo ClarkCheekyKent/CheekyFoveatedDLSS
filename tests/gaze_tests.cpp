@@ -1,6 +1,7 @@
 #include "cheeky_gaze_abi.h"
 #include "d3d12_ngx_dispatch.hpp"
 #include "afw_compatibility.hpp"
+#include "afw_gaze.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
@@ -1542,7 +1543,7 @@ void test_afw_dispatch_and_settings() {
     const auto effective = afw_experiment_settings(saved);
     expect(effective.width == .7F && effective.height == .9F && effective.x_offset == 0.F && effective.height_offset == 0.F &&
         !effective.auto_stereo_alignment && !effective.nr_enabled && effective.center_supersampling == 2.F &&
-        effective.center_mode == FoveationCenterMode::fixed, "AFW experiment uses symmetric generous fixed settings");
+        effective.center_mode == FoveationCenterMode::simulated_gaze, "AFW preserves the requested gaze source with a generous fixed fallback");
     expect(saved.width == .4F && saved.nr_enabled && saved.center_supersampling == 2.F, "AFW overrides leave saved settings intact");
     for (const auto width : {.2F, .55F, .7F, 1.F})
     for (const auto height : {.2F, .45F, .7F, 1.F})
@@ -1689,6 +1690,124 @@ void test_afw_projection_and_metadata() {
 
 int run_nr_lifetime_tests();
 
+void test_afw_gaze_integration() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation(); allow_afw_stereo_projection(true);
+    float matrices[2][16]{};
+    for (auto& m : matrices) { m[0] = m[5] = m[11] = 1.F; m[14] = 10.F; }
+    matrices[0][8] = .4F; matrices[1][8] = -.2F;
+    auto publish = [&] { publish_afw_stereo_projection(matrices, 2000, 1600, true); };
+    publish();
+    Settings requested;
+    requested.center_mode = FoveationCenterMode::openxr_gaze;
+    requested.width = requested.height = .2F; requested.afw_warp_margin = .02F;
+    requested.gaze_smoothing_ms = 0.F; requested.roundness = 1.F;
+    const auto projection = afw_stereo_projection();
+    auto settings = afw_experiment_settings(requested, &projection);
+    expect(settings.roundness == 0.F, "AFW gaze union retains covered corner pixels");
+    CheekyGazeSnapshotV1 sample{};
+    sample.abi_version = CHEEKY_GAZE_ABI_VERSION; sample.structure_size = sizeof(sample);
+    sample.view_count = 2; sample.session_generation = 41; sample.swapchain_generation = 42;
+    sample.status_flags = CHEEKY_GAZE_STATUS_LAYER_ACTIVE | CHEEKY_GAZE_STATUS_SESSION_FOCUSED | CHEEKY_GAZE_STATUS_GAZE_VALID;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& v = sample.views[eye]; v.structure_size = sizeof(v); v.view_index = eye;
+        v.flags = CHEEKY_GAZE_VIEW_ORIENTATION_VALID | CHEEKY_GAZE_VIEW_FOV_VALID;
+        v.fov_left = v.fov_down = -std::atan(1.F); v.fov_right = v.fov_up = std::atan(1.F);
+        v.center_u = .3F; v.center_v = .5F;
+    }
+    auto fresh = [&] { LARGE_INTEGER qpc{}; QueryPerformanceCounter(&qpc); sample.publication_qpc = qpc.QuadPart; ++sample.predicted_display_time; publish(); };
+    CropGeometry crop{}; bool reset{};
+    auto evaluate = [&](std::uint64_t handle = 700) {
+        return calculate_coordinated_crop(settings, handle, nullptr, 1000, 800, 2000, 1600, 0, 0, crop, reset, &sample);
+    };
+    fresh(); expect(evaluate() && reset && gaze_diagnostics().afw_fresh_sample && gaze_diagnostics().using_gaze,
+        "AFW gaze starts without two-eye resource or marker mapping");
+    expect(!gaze_diagnostics().views[0].resource_mapped && !gaze_diagnostics().views[1].resource_mapped,
+        "Bilateral gaze does not claim a DLSS handle-to-eye assignment");
+    const auto first = crop;
+    fresh(); expect(evaluate() && !reset && crop.input_width == first.input_width && crop.input_base_x == first.input_base_x,
+        "Stable gaze reuses geometry and does not reset history each frame");
+    for (auto& v : sample.views) v.center_u = .5F;
+    fresh(); expect(evaluate() && reset && crop.input_base_x > first.input_base_x && crop.input_width == first.input_width,
+        "Gaze jump translates a stable-size envelope and resets its center history");
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        FoveationCenter projected;
+        expect(afw_project_gaze(sample.views[eye], projection.projections[eye], .5F, .5F, projected), "Project both runtime gaze rays");
+        expect(crop.input_base_x <= projected.u * 1000 && crop.input_base_x + crop.input_width >= projected.u * 1000,
+            "Both possible eye gaze positions lie inside the rendered crop");
+    }
+    settings.gaze_smoothing_ms = 100.F;
+    for (auto& v : sample.views) v.center_u = .9F;
+    fresh(); expect(evaluate(), "Large filtered gaze movement evaluates");
+    expect(crop.input_base_x + crop.input_width == 1000, "Fresh edge gaze remains covered while smoothing trails behind");
+    const auto grown = crop.input_width;
+    for (auto& v : sample.views) v.center_u = .5F;
+    fresh(); expect(evaluate() && crop.input_width == grown, "Coverage does not shrink and recreate DLSS as gaze returns");
+    expect(evaluate(701) && reset, "A separate native DLSS handle starts an independent gaze history");
+    fresh(); expect(evaluate(700) && !reset, "Returning to the first handle retains its own temporal state");
+    sample.status_flags &= ~CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    fresh(); expect(evaluate() && !gaze_diagnostics().using_gaze, "Focus loss stops gaze immediately");
+    sample.status_flags |= CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    fresh(); expect(evaluate() && reset && gaze_diagnostics().using_gaze, "Focus reacquisition resets center history");
+    ++sample.session_generation;
+    fresh(); expect(evaluate() && reset && crop.input_width < grown, "New runtime session drops old smoothing and oversized allocation");
+    sample.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    fresh(); test_openvr_snapshot = &sample;
+    expect(calculate_coordinated_crop(settings, 700, nullptr, 1000, 800, 2000, 1600, 0, 0, crop, reset) && reset &&
+        gaze_diagnostics().afw_fresh_sample, "AFW consumes the OpenVR adapter without resource mapping and resets on backend change");
+    test_openvr_snapshot = nullptr;
+    sample.status_flags &= ~CHEEKY_GAZE_STATUS_OPENVR;
+    fresh(); expect(evaluate() && reset, "Returning to OpenXR resets even with identical session numbers");
+    Sleep(60); publish();
+    LARGE_INTEGER repeated_now{}; QueryPerformanceCounter(&repeated_now); sample.publication_qpc = repeated_now.QuadPart;
+    expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Republishing an old display time does not refresh gaze validity");
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+    fresh(); sample.publication_qpc -= frequency.QuadPart;
+    expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Old gaze publications are rejected");
+    fresh(); sample.publication_qpc += frequency.QuadPart;
+    expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Future gaze publications are rejected");
+    fresh(); sample.views[1].fov_right = std::numeric_limits<float>::quiet_NaN();
+    expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "One invalid eye rejects the stereo gaze sample");
+    sample.views[1].fov_right = std::atan(1.F);
+    sample.status_flags |= CHEEKY_GAZE_STATUS_SIMULATED;
+    fresh(); expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Real gaze mode rejects a simulated source");
+    requested.center_mode = FoveationCenterMode::simulated_gaze;
+    settings = afw_experiment_settings(requested, &projection);
+    fresh(); expect(evaluate(), "Simulation source change uses a safe transition");
+    fresh(); expect(evaluate() && gaze_diagnostics().afw_fresh_sample, "AFW simulated gaze uses the same production coverage path");
+    sample.status_flags &= ~CHEEKY_GAZE_STATUS_GAZE_VALID;
+    Sleep(110); publish(); expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Tracking loss enters hold/return policy");
+    Sleep(160); publish(); expect(evaluate() && !gaze_diagnostics().using_gaze && crop.input_width >= 700,
+        "Tracking loss returns to the generous fixed fallback");
+    allow_afw_stereo_projection(false);
+    expect(evaluate() && !gaze_diagnostics().using_gaze, "Host detach disables gaze despite a retained runtime snapshot");
+    reset_gaze_foveation();
+}
+
+void test_afw_gaze_pixel_coverage() {
+    using namespace cheeky::foveated_dlss;
+    for (unsigned extent : {33U, 128U, 999U, 2259U, 4096U}) {
+        for (unsigned quantum : {1U, 8U, 64U}) {
+            unsigned retained{};
+            for (unsigned step = 0; step <= 100; ++step) {
+                AfwGazeBounds bounds;
+                bounds.include({step / 100.F, .5F, 1}, .217F, .3F);
+                bounds.include({1.F - step / 100.F, .5F, 1}, .217F, .3F);
+                bounds.pad(.031F);
+                unsigned start{};
+                afw_gaze_axis(bounds.left, bounds.right, extent, quantum, retained, start);
+                FoveationParameters parameters{}; parameters.width = static_cast<float>(retained) / extent; parameters.height = 1.F;
+                CropGeometry crop;
+                expect(calculate_foveation_geometry_at_center(parameters, {(start + retained * .5F) / extent, .5F, 1},
+                    extent, extent, extent * 2, extent * 2, 0, 0, crop), "AFW integer envelope resolves at odd and even render dimensions");
+                expect(crop.input_base_x == start && crop.input_width == retained &&
+                    crop.input_base_x <= bounds.left * extent && crop.input_base_x + crop.input_width >= bounds.right * extent,
+                    "Quantized crop retains complete bilateral coverage at image boundaries");
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--afw-runtime-file") == 0) {
         const bool supported = cheeky::foveated_dlss::known_afw_warp_file(std::filesystem::path(argv[2]).c_str());
@@ -1754,6 +1873,8 @@ int main(int argc, char** argv) {
     failures += run_nr_processing_tests();
     test_afw_dispatch_and_settings();
     test_afw_projection_and_metadata();
+    test_afw_gaze_integration();
+    test_afw_gaze_pixel_coverage();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

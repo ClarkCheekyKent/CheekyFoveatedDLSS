@@ -9,6 +9,8 @@ struct AfwStereoProjection {
     bool valid{};
     unsigned output_width{}, output_height{};
     std::array<FoveationCenter, 2> centers{};
+    std::array<GazeProjection, 2> projections{};
+    std::uint64_t generation{};
     std::uint64_t age_ms{UINT64_MAX};
 };
 class AfwProjectionCache {
@@ -19,7 +21,8 @@ public:
         value_ = {}; published_ = now;
         if (!active || width < 32 || height < 32 || width > 16384 || height > 16384) return;
         for (unsigned eye = 0; eye < 2; ++eye) {
-            if (!projection_forward_center(gaze_projection_from_matrix(matrices[eye]),
+            value_.projections[eye] = gaze_projection_from_matrix(matrices[eye]);
+            if (!projection_forward_center(value_.projections[eye],
                     value_.centers[eye].u, value_.centers[eye].v)) return;
         }
         value_.output_width = width; value_.output_height = height; value_.valid = true;
@@ -38,10 +41,10 @@ void allow_afw_stereo_projection(bool allowed) noexcept;
 [[nodiscard]] AfwStereoProjection afw_stereo_projection() noexcept;
 struct AfwCoverageStatus {
     bool observed{};
-    unsigned mode{}; // 0 centered, 1 manual union, 2 automatic union
+    unsigned mode{}; // 0 centered, 1 manual union, 2 automatic union, 3 bilateral gaze
     float width{.7F}, height{.7F}, x_offset{}, height_offset{}, center_scale{1.F};
 };
-void note_afw_coverage(const Settings& settings, bool automatic_applied) noexcept;
+void note_afw_coverage(const Settings& settings, bool automatic_applied, bool gaze_applied = false) noexcept;
 [[nodiscard]] AfwCoverageStatus afw_coverage_status() noexcept;
 
 inline bool afw_projection_matches_output(const AfwStereoProjection& projection,
@@ -59,6 +62,8 @@ inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjec
     };
     const float width = finite(settings.width, .7F, .2F, 1.F);
     const float height = finite(settings.height, .7F, .2F, 1.F);
+    settings.afw_gaze_width = width; settings.afw_gaze_height = height;
+    settings.afw_warp_margin = finite(settings.afw_warp_margin, .05F, 0.F, .25F);
     const float manual_x = settings.x_offset;
     settings.x_offset = 0.F;
     if (settings.afw_automatic_coverage && projection && projection->valid) {
@@ -97,8 +102,8 @@ inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjec
     }
     settings.aligned_height_offset = 0.F;
     settings.eye_independent_coverage = true;
+    if (settings.center_mode != FoveationCenterMode::fixed) settings.roundness = 0.F;
     settings.auto_stereo_alignment = settings.invert_stereo_x_offset = false;
-    settings.center_mode = FoveationCenterMode::fixed;
     settings.center_supersampling = finite(settings.center_supersampling, 1.F, 1.F, 2.F);
     settings.next_jump_visible = false;
     settings.nr_enabled = false;

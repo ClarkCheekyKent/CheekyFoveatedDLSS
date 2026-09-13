@@ -111,6 +111,7 @@ std::string snapshot_locked(State& s) {
         << ",\"copies\":" << observer.copies << ",\"resets\":" << observer.resets << ",\"destroyed\":" << observer.destroyed << '}'
         << ",\"gaze\":{\"layer\":" << gaze.layer_present << ",\"abi\":" << gaze.abi_compatible
         << ",\"using_gaze\":" << gaze.using_gaze << ",\"alignment\":" << gaze.alignment_source
+        << ",\"afw_bilateral\":" << gaze.afw_bilateral << ",\"afw_fresh_sample\":" << gaze.afw_fresh_sample
         << ",\"ambiguous\":" << gaze.mapping_ambiguous << ",\"views\":" << views.active
         << ",\"submitted_copies\":" << gaze.submitted_copies
         << ",\"left_mapped\":" << gaze.views[0].resource_mapped << ",\"right_mapped\":" << gaze.views[1].resource_mapped

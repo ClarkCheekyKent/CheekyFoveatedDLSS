@@ -22,6 +22,7 @@ std::mutex afw_projection_mutex;
 AfwProjectionCache afw_projection_cache;
 AfwCoverageStatus afw_coverage;
 std::atomic<bool> afw_projection_allowed{};
+std::atomic<std::uint64_t> afw_projection_generation{};
 thread_local bool* afw_core_lower_seen{};
 
 struct AfwCoreScope {
@@ -58,18 +59,20 @@ void allow_afw_stereo_projection(bool allowed) noexcept {
     if (allowed) {
         std::lock_guard lock(afw_projection_mutex);
         afw_projection_cache = {};
+        ++afw_projection_generation;
     }
     afw_projection_allowed.store(allowed, std::memory_order_release);
 }
 AfwStereoProjection afw_stereo_projection() noexcept {
     std::lock_guard lock(afw_projection_mutex);
     auto result = afw_projection_cache.snapshot(GetTickCount64());
+    result.generation = afw_projection_generation.load();
     result.valid &= afw_projection_allowed.load(std::memory_order_acquire);
     return result;
 }
-void note_afw_coverage(const Settings& settings, bool automatic_applied) noexcept {
+void note_afw_coverage(const Settings& settings, bool automatic_applied, bool gaze_applied) noexcept {
     std::lock_guard lock(afw_projection_mutex);
-    afw_coverage = {true, automatic_applied ? 2U : !settings.afw_automatic_coverage && settings.afw_manual_coverage ? 1U : 0U,
+    afw_coverage = {true, gaze_applied ? 3U : automatic_applied ? 2U : !settings.afw_automatic_coverage && settings.afw_manual_coverage ? 1U : 0U,
         settings.width, settings.height, settings.x_offset, settings.height_offset, settings.center_supersampling};
 }
 AfwCoverageStatus afw_coverage_status() noexcept {
