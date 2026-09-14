@@ -116,6 +116,31 @@ void timing_row(const char* const label, const float milliseconds) {
     }
 }
 
+void overall_gpu_savings_row(
+    const DiagnosticSnapshot& data,
+    const float peripheral_ms
+) {
+    if (data.native_dlss_gpu_ms <= 0.0F ||
+        data.foveated_dlss_gpu_ms <= 0.0F ||
+        (peripheral_ms < 0.0F)) {
+        diagnostic_row("Overall measured GPU savings", "Not sampled yet");
+        return;
+    }
+    const auto foveated_pipeline_ms =
+        data.foveated_dlss_gpu_ms + peripheral_ms;
+    const auto saved_ms = data.native_dlss_gpu_ms - foveated_pipeline_ms;
+    const auto saved_percent =
+        saved_ms * 100.0F / data.native_dlss_gpu_ms;
+    diagnostic_row(
+        "Overall measured GPU savings",
+        "%+.3f ms (%+.1f%%) — foveated pipeline %.3f ms vs native %.3f ms",
+        saved_ms,
+        saved_percent,
+        foveated_pipeline_ms,
+        data.native_dlss_gpu_ms
+    );
+}
+
 void draw_api_diagnostics(
     const char* const label,
     const DiagnosticApi api
@@ -413,6 +438,12 @@ void draw_d3d11_gpu_performance(
         } else {
             diagnostic_row("Foveated savings", "Not sampled yet");
         }
+        const auto peripheral_ms = settings.peripheral_dlaa_enabled
+            ? (d3d11_peripheral_dlaa_total_gpu_ms() > 0.0F
+                ? d3d11_peripheral_dlaa_total_gpu_ms()
+                : -1.0F)
+            : 0.0F;
+        overall_gpu_savings_row(data, peripheral_ms);
     }
 
     if (!settings.d3d11_use_d3d12_transport) return;
@@ -464,6 +495,14 @@ void draw_d3d12_gpu_performance(
         if (settings.peripheral_dlaa_enabled) {
             timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
         }
+        overall_gpu_savings_row(
+            data,
+            settings.peripheral_dlaa_enabled
+                ? (data.peripheral_dlaa_gpu_ms > 0.0F
+                    ? data.peripheral_dlaa_gpu_ms
+                    : -1.0F)
+                : 0.0F
+        );
     }
 }
 
