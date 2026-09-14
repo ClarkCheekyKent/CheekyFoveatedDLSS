@@ -315,15 +315,15 @@ int run_crop_motion_lifetime_tests() {
         check(gpu.done->SetEventOnCompletion(gpu.value, gpu.event));
         require(WaitForSingleObject(gpu.event, 10000) == WAIT_OBJECT_0, "Crop replay queue timed out");
         collect_crop_motion12(); release_crop_motion12();
-        require(*old_destroyed == 20, "Retired crop resources did not drain on all queues");
+        require(*old_destroyed == 0, "Retired crop resources were released during overlay-safe retention");
         require(*new_destroyed == 0, "Old retirement released the new recording");
         gpu.reset();
         collect_crop_motion12(); release_crop_motion12();
-        require(*new_destroyed == 1, "New generation did not drain after Reset");
+        require(*new_destroyed == 0, "New generation was released during overlay-safe retention");
         // Abandoned recordings must drain too, without manufacturing a fence.
         open_recording(); record_passes(1, new_destroyed); check(gpu.list->Close());
         gpu.list.Reset(); collect_crop_motion12(); release_crop_motion12();
-        require(*new_destroyed == 2, "Destroyed unsubmitted list retained crop resources");
+        require(*new_destroyed == 0, "Destroyed unsubmitted list released crop resources during retention");
         gpu.validate();
         std::cout << "SR crop-motion lifetime: real resources, cache overflow, replay, blocked second queue, reset/re-record, destruction passed\n";
         return 0;

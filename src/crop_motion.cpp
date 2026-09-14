@@ -296,7 +296,11 @@ void collect_crop_motion12() noexcept {
         // GPU completion alone is insufficient: the recording may be replayed.
         // Reset/destruction must retire it, and every executing queue must drain.
         if (!pass->lifetime.empty()) { ++it; continue; }
-        if (available12.size() < 16) available12.push_back(pass);
+        // Do not destroy completed passes during a game/SteamVR overlay pause.
+        // SHf can still have D3D12/driver references in teardown even after the
+        // tracked fence reports complete. Retain the pass for process lifetime;
+        // dynamic-resolution changes add only a small number of cached sizes.
+        available12.push_back(pass);
         it = pending12.erase(it);
     }
 }
@@ -304,7 +308,8 @@ void release_crop_motion12() noexcept {
     collect_crop_motion12();
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(mutex12);
-    available12.clear();
-    // Pending work survives until recording retirement and all GPU uses complete.
+    // Keep completed passes alive for process lifetime. Clearing this cache
+    // during overlay/device teardown can release descriptor heaps while the
+    // game or driver still has an internal reference.
 }
 }
