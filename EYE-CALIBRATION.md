@@ -41,8 +41,9 @@ reject their pair and clear the learned rectangles before the next interval.
 
 ## Diagnostics
 
-Open **Diagnostics > Eye calibration** in ReShade or **Diagnostics and support
-> Eye calibration** in UEVR. Both show:
+Open **Stereo and gaze > Eye calibration** in UEVR for the runtime, status and
+session enable switch. Detailed calibration data is included in support ZIPs.
+ReShade's **Diagnostics > Eye calibration** panel shows:
 
 - Detected VR backend, graphics API, status and session enable switch.
 - **Corrections applied:** changes to an existing eye assignment. Swapping the

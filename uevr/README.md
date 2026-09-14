@@ -26,7 +26,7 @@ The OpenXR installation is shared across games. Install all plugin files and the
 
 For AFW, follow the dedicated instructions below; its coverage modes bypass the usual eye calibration setup.
 
-Keep **Fixed**, **Automatic stereo alignment** and **Automatic eye calibration** enabled. Use the red alignment border to check both eyes, then open **Diagnostics and support → Eye calibration**. Check for **Active** and valid samples through loading/menu transitions.
+Keep **Fixed**, **Automatic stereo alignment** and **Automatic eye calibration** enabled. Use the red alignment border to check both eyes, then open **Stereo and gaze → Eye calibration**. Check that calibration becomes **Active** and both regions stay aligned through loading/menu transitions.
 
 Manual stereo offsets are a troubleshooting fallback, not a replacement for calibration: scene changes can swap eye assignments. If calibration does not become active, check the layer installation and collect a report.
 
@@ -89,7 +89,7 @@ Switching UEVR away from AFW restores ordinary stereo controls and marker calibr
 
 ### Diagnostics and compatibility
 
-The overview reports whether UEVR has selected AFW. This does not mean AFW is actively warping during loading screens or other temporary suspensions. **Diagnostics and support → AFW details** shows recent warp calls, source-eye identification, projection availability and DLSS routing. Full counters remain in support ZIPs.
+The overview reports whether UEVR has selected AFW. This does not mean AFW is actively warping during loading screens or other temporary suspensions. **Performance** contains frame-rate comparisons, DLSS GPU timings and processing resolutions. Warp activity, source-eye identification, projection availability and routing details are collected in support ZIPs under **Support**.
 
 Cheeky keeps the game's original full-size evaluation at AFW's outer hook. Private center/periphery SR and NR run inside the nested DLSS call, keeping those dimensions out of AFW's resolution-change detector. Native exports, `_C` exports, Streamline's nested route and NVIDIA OTA SR runtimes are supported. Genuine game-resolution changes still invoke AFW's own suspension behavior.
 

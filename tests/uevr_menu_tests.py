@@ -140,9 +140,8 @@ def run(engine):
     count = len(g.sent)
     draw()
     assert any(t == "Selected" for t in g.drawn.values())
-    assert g.tree_parents["AFW details"] == "Diagnostics and support"
+    assert not g.trees["AFW details"] and g.trees["Support"] and g.trees["Performance"]
     assert not g.trees["Eye calibration"] and not g.trees["Eye mapping details"]
-    assert any("ordinary DLSS passes through" in t for t in g.drawn.values())
     assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
     assert "Foveation center" in g["values"] and "Enable DLSS-NR" in g["values"]
     assert "Automatic stereo alignment" not in g["values"] and "Invert stereo eye order" not in g["values"]
@@ -161,11 +160,9 @@ def run(engine):
     receive(afw)
     draw()
     assert not any("ordinary DLSS passes through" in t for t in g.drawn.values())
-    assert any("Lower SR runtime selected" in t for t in g.drawn.values())
     afw["afw_experiment"].update(warp_observer_ready=True, warp_calls=0, last_warp_age_ms=-1)
     receive(afw)
     draw()
-    assert any("No warp calls observed yet" in t for t in g.drawn.values())
     afw["settings"]["AfwManualCoverage"] = True
     afw["afw_experiment"].update(manual_coverage=True, warp_calls=3, last_warp_age_ms=20,
                                   effective_width=0.8, effective_height=0.6, effective_center_scale=1.25, coverage_observed=True)
@@ -174,11 +171,9 @@ def run(engine):
     assert "Stereo X offset" in g["values"] and "Extra margin per edge" in g["values"]
     assert "Roundness" in g["values"]
     assert "Depth-adaptive warp padding" in g["values"]
-    assert any("80.0% x 60.0%" in t and "1.25x" in t for t in g.drawn.values())
     afw["afw_experiment"]["last_warp_age_ms"] = 1500
     receive(afw)
     draw()
-    assert any("No recent warp calls" in t for t in g.drawn.values())
     assert len(g.sent) == count, "Drawing AFW status and overrides must not write settings"
     afw["settings"]["AfwAutomaticCoverage"] = True
     afw["afw_experiment"].update(coverage_mode=2, projection_valid=True, warp_metadata_supported=True,
@@ -187,11 +182,9 @@ def run(engine):
     draw()
     assert "Height offset" in g["values"] and "Stereo X offset" not in g["values"]
     assert g["values"]["AFW stereo coverage"] == 2
-    assert any(t == "Right" for t in g.drawn.values()) and any(t == "Combined" for t in g.drawn.values())
     afw["afw_experiment"]["last_warp_mode"] = 2
     receive(afw)
     draw()
-    assert any(t == "Previous frame" for t in g.drawn.values())
     afw["afw_experiment"].update(coverage_mode=0, projection_valid=False)
     receive(afw)
     draw()
@@ -224,7 +217,7 @@ def run(engine):
     afw["settings"]["CenterMode"] = 0
     # Collapsed diagnostics must keep the AFW dump out of the normal menu.
     receive(afw)
-    g.closed_trees["Diagnostics and support"] = True
+    g.closed_trees["Support"] = True
     g.closed_trees["Advanced AFW"] = True
     draw()
     assert not g.trees["AFW details"]
@@ -233,7 +226,7 @@ def run(engine):
     assert g["values"]["AFW stereo coverage"] == 2
     assert any(t == "Selected" for t in g.drawn.values())
     assert len(g.sent) == count
-    g.closed_trees["Diagnostics and support"] = False
+    g.closed_trees["Support"] = False
     g.closed_trees["Advanced AFW"] = False
     draw()
     assert g.tree_parents["Advanced AFW"] == "Stereo and gaze"
@@ -267,11 +260,34 @@ def run(engine):
     draw()  # Open every tree, validate all widget types and enum keys.
     order = list(g.tree_order.values())
     assert order.index("Stereo and gaze") < order.index("DLSS-SR") < order.index("DLSS-NR (experimental)")
-    assert g.tree_parents["Frame rate comparison"] == "DLSS-SR"
-    assert g.tree_parents["Eye calibration"] == "Diagnostics and support"
+    assert g.tree_parents["Performance"] == "Cheeky Foveated DLSS"
+    assert g.tree_parents["Eye calibration"] == "Stereo and gaze"
+    for removed in ("AFW details", "GPU timestamp collection", "Eye mapping details", "DLSS view details",
+                    "DX11 interception", "DX12 interception", "SR resolution and GPU timing", "NR status and GPU timing"):
+        assert not g.trees[removed], "Developer diagnostics must stay in support reports: " + removed
+    assert not any(t in ("Last result", "Settings revision / saved", "Crop input / output origin",
+                         "Recorded / submitted", "Layer or adapter / matching ABI") for t in g.drawn.values())
+    # Performance selects the actual NR order/shape, including a missing sample
+    # in that mode. It must not accidentally display another mode's saved time.
+    perf = copy.deepcopy(state)
+    perf["renderer"] = 1
+    perf["settings"]["NrEnabled"] = True
+    perf["apis"][1].update(before_nr_full_ms=11, before_nr_foveated_ms=12, nr_full_ms=21, nr_foveated_ms=22)
+    count = len(g.sent)
+    for before, foveated, expected in ((True, False, 11), (True, True, 12), (False, False, 21), (False, True, 22)):
+        perf["settings"].update(NrProcessingOrder=int(before), NrFoveated=foveated)
+        receive(perf)
+        draw()
+        assert ("NR + preparation (Before)" if before else "NR (After)") in list(g.drawn.values())
+        assert f"{expected:.3f} ms" in list(g.drawn.values())
+    perf["apis"][1]["nr_foveated_ms"] = None
+    receive(perf)
+    draw()
+    assert "21.000 ms" not in list(g.drawn.values()), "No full-frame fallback for an unsampled foveated NR call"
+    assert len(g.sent) == count, "Reading performance must not write settings"
+    receive(state)
+    draw()
     assert any("Waiting for VR" in str(t) for t in g.drawn.values())
-    draw("Reset eye calibration counters")
-    assert last().endswith("\ncalibration_reset")
     draw(changes={"Automatic eye calibration (this session)": False})
     assert last().endswith("\ncalibration_disable")
     draw(changes={"Automatic eye calibration (this session)": True})
@@ -354,7 +370,7 @@ def run(engine):
     state["settings"].update(Enabled=False, NrEnabled=False)
     receive(state)
     draw()
-    assert g.trees["DLSS-SR"] and g.trees["SR resolution and GPU timing"]
+    assert g.trees["DLSS-SR"] and g.trees["Performance"]
     assert g["values"]["Fovea width"] is None and g["values"]["NR intensity"] is None
     state["settings"].update(Enabled=True, NrEnabled=True, NrFoveated=False, NrAutomaticMask=False)
     receive(state)
@@ -465,7 +481,7 @@ def run(engine):
     receive(state)
     draw()
     assert any("100.0 FPS" in t for t in g.drawn.values())
-    assert any("+50.0 FPS (+100.0%)" in t for t in g.drawn.values())
+    assert any("10.000 ms (50.0%)" in t for t in g.drawn.values())
     assert any("Not sampled / unavailable" in t for t in g.drawn.values())
     state["renderer"] = 0
     receive(state)
