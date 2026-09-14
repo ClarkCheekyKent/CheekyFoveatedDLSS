@@ -368,8 +368,9 @@ uevr.sdk.callbacks.on_draw_ui(function()
             section("Center")
             combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
             slider("Center supersampling", "CenterSupersampling", 1, 2)
-            slider("Fovea width", "Width", 0.2, 1)
-            slider("Fovea height", "Height", 0.2, 1)
+            slider("Fovea width", "Width", 0.1, 1)
+            slider("Fovea height", "Height", 0.1, 1)
+            if afw_active then text("AFW adds stereo coverage and warp padding to the requested size, enlarging the visible sharp region.") end
             slider("Roundness", "Roundness", 0, 1)
             slider("Transition width", "TransitionWidth", 0, 0.3)
             check("Show red alignment border", "AlignmentBorder")
@@ -411,8 +412,9 @@ uevr.sdk.callbacks.on_draw_ui(function()
                     text("Uses Stereo and gaze settings, even with SR disabled.")
                     check("Use SR size and shape", "NrUseSrFoveation")
                     if not draft.NrUseSrFoveation then
-                        slider("NR width", "NrWidth", 0.2, 1)
-                        slider("NR height", "NrHeight", 0.2, 1)
+                        slider("NR width", "NrWidth", 0.1, 1)
+                        slider("NR height", "NrHeight", 0.1, 1)
+                        if afw_active then text("AFW adds stereo coverage and warp padding to the requested size.") end
                         slider("NR roundness", "NrRoundness", 0, 1)
                         slider("NR transition", "NrTransitionWidth", 0, 0.3)
                     end

@@ -116,8 +116,8 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
     const auto finite = [](float value, float fallback, float lo, float hi) {
         return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
     };
-    const float width = finite(settings.width, .7F, .2F, 1.F);
-    const float height = finite(settings.height, .7F, .2F, 1.F);
+    const float width = finite(settings.width, .7F, .1F, 1.F);
+    const float height = finite(settings.height, .7F, .1F, 1.F);
     settings.afw_gaze_width = width; settings.afw_gaze_height = height;
     settings.afw_warp_margin = finite(settings.afw_warp_margin, .05F, 0.F, .25F);
     const float depth_margin = settings.afw_depth_coverage ? finite(settings.afw_depth_margin, 0.F, 0.F, 1.F) : 0.F;

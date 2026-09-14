@@ -82,12 +82,13 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
     auto result = WaitForSingleObject(event, 10000); CloseHandle(event); require(result == WAIT_OBJECT_0, "GPU timeout");
 }
 void settings_tests(const std::filesystem::path& root) {
-    Settings s; require(set_named_setting(s, "Width", "0.72"), "Parse setting");
+    Settings s; require(set_named_setting(s, "Width", "0.1"), "Parse setting");
     require(!set_named_setting(s, "Width", "nan"), "Reject NaN");
     require(!set_named_setting(s, "Width", "0.7trailing"), "Reject trailing garbage");
     require(!set_named_setting(s, "Enabled", "maybe"), "Reject bad bool");
     require(!set_named_setting(s, "CenterMode", "99"), "Reject enum");
     require(!set_named_setting(s, "GazeQuantizationPixels", "-1"), "Reject negative unsigned");
+    s.height = s.nr_width = s.nr_height = .1F;
     s.enabled = false; s.nr_motion_scale_x_multiplier = -1.25f;
     require(set_named_setting(s, "NrStyle", "2"), "Parse Cinematic style");
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),

@@ -280,7 +280,7 @@ def run(engine):
     # Drag across many values, then hold still. Neither movement nor time may
     # send GPU-setting updates until ImGui reports the slider inactive.
     for label, key, samples in (
-        ("Fovea width", "Width", (0.35, 0.45, 0.55, 0.75)),
+        ("Fovea width", "Width", (0.35, 0.45, 0.55, 0.1)),
         ("Crop quantization (pixels)", "GazeQuantizationPixels", (2, 4, 8, 16)),
     ):
         count = len(g.sent)

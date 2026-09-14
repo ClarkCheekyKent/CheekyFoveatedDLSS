@@ -1220,7 +1220,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::SliderFloat(
         "Fovea width",
         &width_draft,
-        0.20F,
+        0.10F,
         1.0F,
         "%.2f",
         ImGuiSliderFlags_AlwaysClamp
@@ -1236,7 +1236,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::SliderFloat(
         "Fovea height",
         &height_draft,
-        0.20F,
+        0.10F,
         1.0F,
         "%.2f",
         ImGuiSliderFlags_AlwaysClamp
@@ -1444,7 +1444,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
                 settings.nr_width,
                 drafts.width,
                 drafts.editing_width,
-                0.20F,
+                0.10F,
                 1.0F,
                 "%.2f"
             );
@@ -1453,7 +1453,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
                 settings.nr_height,
                 drafts.height,
                 drafts.editing_height,
-                0.20F,
+                0.10F,
                 1.0F,
                 "%.2f"
             );

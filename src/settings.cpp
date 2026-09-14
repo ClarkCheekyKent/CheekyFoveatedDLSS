@@ -244,8 +244,8 @@ void update_settings(const Settings& settings) noexcept {
             : 5U,
         std::memory_order_release
     );
-    store_float(width_bits, std::clamp(settings.width, 0.20F, 1.0F));
-    store_float(height_bits, std::clamp(settings.height, 0.20F, 1.0F));
+    store_float(width_bits, std::clamp(settings.width, 0.10F, 1.0F));
+    store_float(height_bits, std::clamp(settings.height, 0.10F, 1.0F));
     store_float(x_offset_bits, std::clamp(settings.x_offset, -1.0F, 1.0F));
     store_float(
         height_offset_bits,
@@ -297,8 +297,8 @@ void update_settings(const Settings& settings) noexcept {
         settings.nr_alignment_border_enabled,
         std::memory_order_release
     );
-    store_float(nr_width_bits, std::clamp(settings.nr_width, 0.20F, 1.0F));
-    store_float(nr_height_bits, std::clamp(settings.nr_height, 0.20F, 1.0F));
+    store_float(nr_width_bits, std::clamp(settings.nr_width, 0.10F, 1.0F));
+    store_float(nr_height_bits, std::clamp(settings.nr_height, 0.10F, 1.0F));
     store_float(
         nr_roundness_bits,
         std::clamp(settings.nr_roundness, 0.0F, 1.0F)

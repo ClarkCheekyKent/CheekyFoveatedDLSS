@@ -1560,8 +1560,8 @@ void test_afw_dispatch_and_settings() {
     const auto linked = afw_experiment_settings(independent);
     expect(linked.afw_nr.width == linked.width && linked.afw_nr.height == linked.height,
         "Linked AFW NR includes the same fixed stereo envelope as SR");
-    for (const auto width : {.2F, .55F, .7F, 1.F})
-    for (const auto height : {.2F, .45F, .7F, 1.F})
+    for (const auto width : {.1F, .2F, .55F, .7F, 1.F})
+    for (const auto height : {.1F, .2F, .45F, .7F, 1.F})
     for (const auto x : {-1.F, -.6F, 0.F, .6F, 1.F})
     for (const auto y : {-1.F, -.45F, 0.F, .45F, 1.F})
     for (const auto margin : {0.F, .05F, .25F}) {
@@ -1913,7 +1913,7 @@ void test_afw_source_projection_coverage() {
     expect_near(fixed[0].afw_nr_mask.bounds[0][0] - fixed[1].afw_nr_mask.bounds[0][0], .242513F, 1e-5F,
         "Independent NR aligns its own shape to the source eye");
     expect_near(fixed[0].width, fixed[1].width, 1e-5F, "Fixed optical coverage keeps stable dimensions");
-    for (const float scale : {.7F, 1.F, 1.4F}) for (const float width : {.2F, .4F, .55F, .7F}) {
+    for (const float scale : {.7F, 1.F, 1.4F}) for (const float width : {.1F, .2F, .4F, .55F, .7F}) {
         matrices[1][0] = scale;
         publish_afw_stereo_projection(matrices, 2000, 1600, true);
         const auto asymmetric = afw_stereo_projection(); requested.width = width;

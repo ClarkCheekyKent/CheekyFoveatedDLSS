@@ -59,7 +59,9 @@ Updating either DLL requires a full game restart. Reloading the adapter does not
 
 This integration runs with the **public, unmodified AFW UEVR release on DX12**. No separate Cheeky build of UEVR is required. It does not add AFW to mainline UEVR. Compatibility was confirmed in the user's Hogwarts Legacy test; this candidate adds the remaining controls and recovery behavior for a final headset test.
 
-Install the complete `afw-rc-3` ZIP with the game closed. Replace both Cheeky DLLs and the Lua script. The optional matching OpenXR installer is in `OpenXR/`; run it for OpenXR gaze. NVIDIA binaries are not included. For NR, provide a compatible `nvngx_dlssnr.dll` beside the nested Cheeky runtime or the running game executable.
+Install the complete `afw-rc-4` ZIP with the game closed. Replace both Cheeky DLLs and the Lua script. The optional matching OpenXR installer is in `OpenXR/`; run it for OpenXR gaze. NVIDIA binaries are not included. For NR, provide a compatible `nvngx_dlssnr.dll` beside the nested Cheeky runtime or the running game executable.
+
+RC4 lowers the requested SR and NR fovea width/height minimum to 0.1 (10%). These are sizes before stereo coverage and warp padding; the visible region can be larger. For example, 0.1 plus 0.0625 padding on each edge becomes 0.225 (22.5%) before any extra stereo union. Existing saved sizes and the default sizes are retained.
 
 RC3 retains RC2's source-eye projection alignment, confirmed overlapping in the headset, and fixes a repeated center-history reset. A legacy preparation check compared projected settings bit-for-bit: the reported FOV produces slightly different floating-point widths for each eye even when both crops have identical pixel dimensions. That check reset SR on every alternation. History invalidation now belongs to the per-view backend's integer crop geometry, game reset requests and gaze policy. First use, actual resizing, bypassed/failed evaluations and disable/re-enable still invalidate history. The trace now records the actual NGX reset and cumulative reset/correction counts for each private history, including consecutive samples across alternating eyes.
 
