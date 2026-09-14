@@ -180,6 +180,7 @@ struct ViewState {
     std::deque<CachedFeature> retired_features;
     std::deque<GpuResources> gpu_resources;
     std::uint64_t gpu_use_sequence{};
+    std::uint64_t gpu_rebinds{};
 };
 
 std::mutex nr_mutex;
@@ -1150,6 +1151,48 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     return true;
 }
 
+// Descriptor contents belong to every recording that references the heap.
+// Rebind only after Reset/destruction AND all queue fences have retired them.
+[[nodiscard]] bool rebind_gpu_inputs(GpuResources& gpu, const DlssNrFrame& frame) noexcept {
+    if (!gpu.uses.empty()) return false;
+    Microsoft::WRL::ComPtr<ID3D12Device> device, incoming;
+    if (FAILED(gpu.game_output->GetDevice(IID_PPV_ARGS(&device)))) return false;
+    for (auto* resource : {frame.color, frame.motion_vectors, frame.depth}) {
+        if (FAILED(resource->GetDevice(IID_PPV_ARGS(&incoming))) || incoming.Get() != device.Get()) return false;
+        incoming.Reset();
+    }
+    const auto desc = frame.color->GetDesc();
+    if (!is_dlss_nr_output_compatible(desc)) return false;
+    // Hold replacements before releasing old references (some may alias).
+    frame.color->AddRef();
+    auto cpu = gpu.descriptors->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = desc.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1U;
+    device->CreateShaderResourceView(frame.color, &srv, cpu);
+    cpu.ptr += 6U * gpu.descriptor_size;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = desc.Format;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(frame.color, nullptr, &uav, cpu);
+    cpu.ptr += gpu.descriptor_size;
+    device->CreateUnorderedAccessView(frame.color, nullptr, &uav, cpu);
+    cpu = gpu.guides.heap->GetCPUDescriptorHandleForHeapStart();
+    const auto step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (auto* resource : {frame.motion_vectors, frame.depth}) {
+        srv.Format = NrGuidePass::readable(resource->GetDesc().Format);
+        device->CreateShaderResourceView(resource, &srv, cpu);
+        cpu.ptr += step;
+    }
+    gpu.guides.source_motion = frame.motion_vectors;
+    gpu.guides.source_depth = frame.depth;
+    release(gpu.game_output);
+    gpu.game_output = frame.color;
+    return true;
+}
+
 [[nodiscard]] GpuResources* find_or_create_gpu(
     ViewState& view,
     const DlssNrFrame& frame,
@@ -1167,6 +1210,19 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             gpu.last_use = ++view.gpu_use_sequence;
             return &gpu;
         }
+    }
+    // Rotating game textures need new bindings, not new shaders and scratch textures.
+    for (auto& gpu : view.gpu_resources) {
+        if (gpu.width != region.width || gpu.height != region.height ||
+            gpu.working_width != working_width || gpu.working_height != working_height) continue;
+        gpu.uses.collect();
+        if (!rebind_gpu_inputs(gpu, frame)) continue;
+        if (!gpu.uses.record(frame.command_list)) return nullptr;
+        gpu.last_use = ++view.gpu_use_sequence;
+        ++view.gpu_rebinds;
+        if (view.gpu_rebinds == 1U || view.gpu_rebinds % 300U == 0U)
+            trace_event("DLSS-NR codec reused view=%llu rebinds=%llu", frame.view_id, view.gpu_rebinds);
+        return &gpu;
     }
     if (view.gpu_resources.size() >= gpu_resource_cache_capacity) {
         auto oldest = view.gpu_resources.end();
