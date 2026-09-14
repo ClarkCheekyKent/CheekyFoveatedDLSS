@@ -94,7 +94,6 @@ void settings_tests(const std::filesystem::path& root) {
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
         "Parse AFW manual coverage settings");
     require(set_named_setting(s, "AfwAutomaticCoverage", "true"), "Parse AFW automatic coverage setting");
-    require(set_named_setting(s, "AfwDepthCoverage", "false"), "Parse AFW depth coverage setting");
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
@@ -117,19 +116,21 @@ void settings_tests(const std::filesystem::path& root) {
         require(!read_settings_file(path, r, error) && serialize_settings(r) == before,
             "Invalid NR order file was not rejected atomically");
     }
-    { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nNrWorkingScale=0.37\n"; }
+    { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nAfwDepthCoverage=1\nNrWorkingScale=0.37\n"; }
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
     require(r.nr_style == 0U, "Legacy settings must restore Standard style");
-    require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_depth_coverage && r.afw_warp_margin == .05F,
+    require(serialize_settings(r).find("AfwDepthCoverage") == std::string::npos,
+        "Retired depth setting is ignored when loading older files and omitted on save");
+    require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_warp_margin == .05F,
         "Legacy settings restore centered AFW mode even over existing manual settings");
-    for (const auto key : {"AfwManualCoverage", "AfwAutomaticCoverage", "AfwDepthCoverage", "AfwWarpMargin"})
+    for (const auto key : {"AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"})
         require(setting_group(key) == "gaze", "Shared AFW coverage belongs to the Stereo/gaze reset group");
     auto reset_afw = s;
-    require(reset_settings_group(reset_afw, "sr") && reset_afw.afw_manual_coverage && !reset_afw.afw_depth_coverage,
+    require(reset_settings_group(reset_afw, "sr") && reset_afw.afw_manual_coverage,
         "SR reset must preserve shared AFW coverage used by NR");
     require(reset_settings_group(reset_afw, "gaze") && !reset_afw.afw_manual_coverage &&
-        !reset_afw.afw_automatic_coverage && reset_afw.afw_depth_coverage && reset_afw.afw_warp_margin == .05F,
+        !reset_afw.afw_automatic_coverage && reset_afw.afw_warp_margin == .05F,
         "Stereo/gaze reset restores all shared AFW controls");
     require(setting_groups_json().find("\"NrProcessingOrder\":\"nr\"") != std::string::npos,
         "Rendering order is missing from NR group metadata");

@@ -6,7 +6,6 @@
 #include "d3d12_ngx_dispatch.hpp"
 #include "graphics_observer.hpp"
 #include "mock_ngx_parameters.hpp"
-#include "afw_depth_coverage.hpp"
 #include "afw_compatibility.hpp"
 
 #include <d3dcompiler.h>
@@ -619,16 +618,6 @@ void run_afw_copy_identity(ID3D12Device* device) {
         require(result == (mode == 2 ? 0x200U : 0x101U), "Native depth-copy hook must identify complete copies and reject partial ones");
         require(afw_current_source_eye() == UINT32_MAX, "Native source-eye observation escaped its core evaluation");
     }
-    float projections[2][16]{};
-    for (auto& p : projections) { p[0] = p[5] = p[11] = 1.F; p[14] = .1F; }
-    allow_afw_stereo_projection(true);
-    publish_afw_stereo_projection(projections, 256, 256, true);
-    auto depth = texture(device, list.Get(), 128, 64, 1, 1, 0x3F000000U, DXGI_FORMAT_R32_FLOAT); // Uniform 0.5 depth.
-    transition(list.Get(), depth.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-    AfwMatrix transform{}; transform[0] = transform[5] = transform[10] = transform[15] = 1.F; transform[8] = .4F;
-    capture_afw_depth_coverage(list.Get(), depth.resource.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, transform, 1);
-    require(afw_depth_coverage_status().pending == 1 && !afw_depth_coverage_status().valid,
-        "Recorded depth cannot be consumed before submission and retirement");
     check(list->Close());
     ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1, lists);
     ComPtr<ID3D12Fence> fence;
@@ -639,58 +628,6 @@ void run_afw_copy_identity(ID3D12Device* device) {
     const auto signal = fence->SetEventOnCompletion(1, done);
     const auto waited = SUCCEEDED(signal) ? WaitForSingleObject(done, 10000) : WAIT_FAILED;
     CloseHandle(done); require(waited == WAIT_OBJECT_0, "AFW copy test GPU timeout");
-    poll_afw_depth_coverage();
-    require(!afw_depth_coverage_status().valid, "A replayable depth readback must remain protected after first execution");
-    check(allocator->Reset()); check(list->Reset(allocator.Get(), nullptr));
-    poll_afw_depth_coverage();
-    const auto measured = afw_depth_coverage_status(1);
-    require(measured.valid && measured.margin >= .124F && measured.margin <= .126F && measured.completed == 1,
-        "GPU depth readback must measure 10% displacement plus its quantized sample guard");
-    require(!afw_depth_coverage_status(0).valid, "Another source eye cannot inherit depth estimates");
-    capture_afw_depth_coverage(list.Get(), depth.resource.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, transform, 0);
-    check(list->Close()); check(allocator->Reset()); check(list->Reset(allocator.Get(), nullptr));
-    poll_afw_depth_coverage();
-    require(!afw_depth_coverage_status(0).valid && afw_depth_coverage_status().pending == 0 && afw_depth_coverage_status().completed == 1,
-        "An unsubmitted Reset must discard depth work without accepting undefined readback bytes");
-    UINT64 packed_signal = 1;
-    for (const auto format : {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_D16_UNORM}) {
-        Sleep(110); // Capture throttle; no GPU sleeps in production.
-        publish_afw_stereo_projection(projections, 256, 256, true);
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; desc.Width = 128; desc.Height = 64;
-        desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
-        desc.Format = format; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        D3D12_HEAP_PROPERTIES properties{}; properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_CLEAR_VALUE clear{}; clear.Format = format; clear.DepthStencil.Depth = .5F;
-        ComPtr<ID3D12Resource> packed_depth;
-        check(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&packed_depth)));
-        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{}; heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; heap_desc.NumDescriptors = 1;
-        ComPtr<ID3D12DescriptorHeap> dsv_heap;
-        check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&dsv_heap)));
-        const auto dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
-        device->CreateDepthStencilView(packed_depth.Get(), nullptr, dsv);
-        list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, .5F, 0, 0, nullptr);
-        transition(list.Get(), packed_depth.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
-        const auto previous_completed = afw_depth_coverage_status().completed;
-        capture_afw_depth_coverage(list.Get(), packed_depth.Get(), D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, transform, 0);
-        check(list->Close()); queue->ExecuteCommandLists(1, lists);
-        const UINT64 value = ++packed_signal;
-        check(queue->Signal(fence.Get(), value));
-        HANDLE completed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        require(completed != nullptr, "Packed depth test event");
-        check(fence->SetEventOnCompletion(value, completed));
-        const auto wait = WaitForSingleObject(completed, 10000); CloseHandle(completed);
-        require(wait == WAIT_OBJECT_0, "Packed depth test GPU timeout");
-        check(allocator->Reset()); check(list->Reset(allocator.Get(), nullptr));
-        poll_afw_depth_coverage();
-        const auto packed = afw_depth_coverage_status(0);
-        require(packed.valid && packed.completed == previous_completed + 1 && packed.margin >= .124F && packed.margin <= .126F,
-            "D24, D32S8 and D16 depth-plane copies must decode real cleared GPU depth");
-    }
-    allow_afw_stereo_projection(false);
-    require(!afw_depth_coverage_status().valid, "Host detach invalidates depth feedback immediately");
-    check(list->Close());
     if (messages) {
         for (UINT64 i = 0; i < messages->GetNumStoredMessages(); ++i) {
             SIZE_T size{};
@@ -700,12 +637,11 @@ void run_afw_copy_identity(ID3D12Device* device) {
             check(messages->GetMessage(i, message, &size));
             if (message->Severity <= D3D12_MESSAGE_SEVERITY_ERROR) {
                 std::cerr << message->pDescription << '\n';
-                throw std::runtime_error("D3D12 debug layer rejected AFW depth capture/copy work");
+                throw std::runtime_error("D3D12 debug layer rejected AFW eye-identity copies");
             }
         }
     }
     std::cout << "AFW source eye: real CopyResource/CopyTextureRegion hooks, partial-copy rejection and scoped identity passed\n";
-    std::cout << "AFW depth padding: GPU readback, measured reprojection, replay protection, unsubmitted Reset and detach passed\n";
 }
 #endif
 } // namespace

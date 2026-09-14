@@ -15,7 +15,6 @@ struct NrRecording {
         bool needs_signal{};
     };
     bool retired{};
-    bool submitted{};
     std::vector<Point> points;
     std::uint64_t created{}, released{};
 };
@@ -109,7 +108,6 @@ void nr_recording_submitted(ID3D12CommandQueue* queue, ID3D12Object* list, NrSig
     const auto tag = identity(list);
     if (!tag || !tag->current) return;
     auto& recording = *tag->current;
-    recording.submitted = true;
     // Never share fence values between independent queues: completing one
     // queue must not satisfy a blocked execution on another queue.
     auto found = recording.points.end();
@@ -144,11 +142,6 @@ void NrLifetime::collect(NrSignal submit_signal) noexcept {
             it = uses_.erase(it);
         } else ++it;
     }
-}
-bool NrLifetime::has_submissions() const noexcept {
-    std::lock_guard execution_lock(calibration12_execution_mutex());
-    for (const auto& use : uses_) if (use->submitted) return true;
-    return false;
 }
 std::uint64_t NrLifetime::fences_created() const noexcept {
     auto total = created_;

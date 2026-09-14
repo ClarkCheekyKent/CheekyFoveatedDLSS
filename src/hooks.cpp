@@ -7,7 +7,6 @@
 #include "d3d11_peripheral_dlaa.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "afw_compatibility.hpp"
-#include "afw_depth_coverage.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
@@ -245,21 +244,6 @@ void __stdcall hook_afw_evaluate_warp(void* parameters) {
             AfwFramebuffer input{};
             std::memcpy(&input, prefix.input_framebuffer, sizeof(input));
             afw_bind_depth_eye(metadata.eye, observe_native_resource(static_cast<ID3D12Resource*>(input.depth.resource)));
-            const auto settings = current_settings();
-            if (settings.afw_depth_coverage && (settings.enabled || (settings.nr_enabled && settings.nr_foveated)) && afw_coverage_enabled()) {
-                AfwWarpCameraPrefix extended{};
-                std::memcpy(&extended, parameters, sizeof(extended));
-                if (extended.cameras) {
-                    std::array<AfwMatrix, 8> cameras{};
-                    std::memcpy(cameras.data(), extended.cameras, sizeof(cameras));
-                    if (gaze_projection_from_matrix(cameras[2].data()).valid && gaze_projection_from_matrix(cameras[6].data()).valid) {
-                        const auto transform = afw_multiply(afw_multiply(afw_multiply(cameras[2], cameras[0]), cameras[5]), cameras[7]);
-                        capture_afw_depth_coverage(static_cast<ID3D12GraphicsCommandList*>(prefix.command_list),
-                            static_cast<ID3D12Resource*>(input.depth.resource), static_cast<D3D12_RESOURCE_STATES>(input.depth.initial_state),
-                            transform, metadata.eye, afw_multiply(cameras[2], cameras[7]));
-                    }
-                }
-            }
         }
     }
     original(parameters);
@@ -4700,10 +4684,6 @@ NgxResult process_d3d12_evaluation_impl(
         auto projection = afw_stereo_projection();
         projection.valid = afw_projection_matches_output(projection, get_ui(call.parameters, "OutWidth"), get_ui(call.parameters, "OutHeight"),
             get_ui(call.parameters, "DLSS.Output.Subrect.Base.X"), get_ui(call.parameters, "DLSS.Output.Subrect.Base.Y"));
-        if (settings.afw_depth_coverage && projection.valid) {
-            const auto depth = afw_depth_coverage_status(); // One shared padding floor prevents alternate-eye size/quality oscillation.
-            settings.afw_depth_margin = depth.valid ? depth.margin : 0.F;
-        }
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
         if (d3d12_game_feature(call.handle) != 1U) settings.enabled = false;
@@ -4875,10 +4855,6 @@ NgxResult evaluate_d3d12_c_impl(
         auto projection = afw_stereo_projection();
         projection.valid = afw_projection_matches_output(projection, get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
             get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"));
-        if (settings.afw_depth_coverage && projection.valid) {
-            const auto depth = afw_depth_coverage_status();
-            settings.afw_depth_margin = depth.valid ? depth.margin : 0.F;
-        }
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
         if (d3d12_game_feature(handle) != 1U) settings.enabled = false;

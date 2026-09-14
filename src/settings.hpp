@@ -46,9 +46,7 @@ struct Settings {
     // Manual mode covers both offsets; the centered fallback starts at 70%.
     bool afw_manual_coverage{false};
     bool afw_automatic_coverage{false};
-    bool afw_depth_coverage{true};
     float afw_warp_margin{0.05F};
-    float afw_depth_margin{}; // Evaluation-local estimate, additional to the user's minimum padding.
     unsigned afw_source_eye{UINT32_MAX}; // Verified identity scoped to the original core evaluation.
     bool eye_independent_coverage{}; // Transient: never mirror a resolved AFW envelope by guessed view role.
     float afw_gaze_width{}, afw_gaze_height{}; // Requested size before the fixed fallback envelope expands it.

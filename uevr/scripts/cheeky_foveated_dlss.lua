@@ -38,7 +38,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwDepthCoverage", "AfwWarpMargin"}) do
+    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -228,15 +228,9 @@ local function afw_controls()
     end
     if gaze then text("Gaze follows both eyes. The fallback above applies when tracking is unavailable.")
     elseif mode == 0 then text("Centered coverage uses at least 70% of the image width and height.") end
-    if ((gaze or mode ~= 0) and draft.AfwWarpMargin ~= nil or draft.AfwDepthCoverage ~= nil) and imgui.tree_node("Advanced AFW") then
-        if (gaze or mode ~= 0) and draft.AfwWarpMargin ~= nil then
-            slider("Extra margin per edge", "AfwWarpMargin", 0, 0.25)
-            text("Adds a fixed fraction of the full image around each eye's region. Larger margins cost more GPU time.")
-        end
-        if draft.AfwDepthCoverage ~= nil then
-            check("Depth-adaptive warp padding", "AfwDepthCoverage")
-            text("Adds padding from recent depth samples. Rapid motion and newly revealed surfaces can need more margin.")
-        end
+    if (gaze or mode ~= 0) and draft.AfwWarpMargin ~= nil and imgui.tree_node("Advanced AFW") then
+        slider("Extra margin per edge", "AfwWarpMargin", 0, 0.25)
+        text("Adds a fixed fraction of the full image around each eye's region. Larger margins cost more GPU time.")
         imgui.tree_pop()
     end
 end

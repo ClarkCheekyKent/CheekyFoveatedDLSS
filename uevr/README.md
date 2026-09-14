@@ -73,11 +73,9 @@ The coverage selector offers:
 - **Manual:** uses mirrored horizontal offsets and a shared height offset.
 - **Centered (70% minimum):** uses at least 70% width and height. Larger requested sizes apply.
 
-**Advanced AFW → Extra margin per edge** adds a fixed allowance around the requested regions. It is a fraction of the full image, so 0.05 adds 5% on each edge. Stereo coverage and this margin can enlarge the visible region beyond the requested width and height. Existing coverage preferences and manual margin values are preserved.
+**Advanced AFW → Extra margin per edge** adds a fixed allowance around the requested regions. It is a fraction of the full image, so 0.05 adds 5% on each edge. Stereo coverage and this margin can enlarge the visible region beyond the requested width and height. Automatic depth adjustment is removed. Existing coverage preferences and manual margin values are preserved.
 
 The same controls apply to foveated NR with SR disabled. NR supports Before/After upscaling, full-frame or foveated processing, working scale, and independent or SR-linked size and shape. Supply a compatible `nvngx_dlssnr.dll` as described above.
-
-**Advanced AFW → Depth-adaptive warp padding** adds an estimate of geometric warp displacement from asynchronous depth samples, in addition to any fixed margin. It defaults to enabled and can also enlarge the centered fallback. Padding grows immediately and shrinks after sustained lower demand. Feedback expires after 500 ms; unsupported resources or unverified warp binaries use fixed coverage. Samples cannot predict abrupt motion, thin foreground objects or newly revealed surfaces. Disable it to compare fixed coverage.
 
 ### Gaze and transitions
 
@@ -93,7 +91,7 @@ The overview reports whether UEVR has selected AFW. This does not mean AFW is ac
 
 Cheeky keeps the game's original full-size evaluation at AFW's outer hook. Private center/periphery SR and NR run inside the nested DLSS call, keeping those dimensions out of AFW's resolution-change detector. Native exports, `_C` exports, Streamline's nested route and NVIDIA OTA SR runtimes are supported. Genuine game-resolution changes still invoke AFW's own suspension behavior.
 
-Source-eye identification uses the verified AFW beta 6 warp metadata and full depth-buffer copies already made by AFW. It does not guess eyes from frame order; depth sampling for adaptive padding is separate. Coverage maps both eyes' requested regions into the current source projection. Matching pixel dimensions preserve temporal history across alternate-eye crop origins; size changes, game resets and skipped/failed private passes invalidate the affected history.
+Source-eye identification uses the verified AFW beta 6 warp metadata and full depth-buffer copies already made by AFW. It does not sample depth or guess eyes from frame order. Coverage maps both eyes' requested regions into the current source projection. Matching pixel dimensions preserve temporal history across alternate-eye crop origins; size changes, game resets and skipped/failed private passes invalidate the affected history.
 
 Missing or ambiguous nested DLSS routes pass through to ordinary DLSS. Unknown warp binaries retain routing and conservative coverage but cannot provide verified source-eye metadata. Other NGX proxies can affect compatibility.
 

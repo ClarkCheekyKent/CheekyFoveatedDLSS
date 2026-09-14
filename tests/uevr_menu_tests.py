@@ -170,7 +170,7 @@ def run(engine):
     draw()
     assert "Stereo X offset" in g["values"] and "Extra margin per edge" in g["values"]
     assert "Roundness" in g["values"]
-    assert "Depth-adaptive warp padding" in g["values"]
+    assert "Depth-adaptive warp padding" not in g["values"]
     afw["afw_experiment"]["last_warp_age_ms"] = 1500
     receive(afw)
     draw()

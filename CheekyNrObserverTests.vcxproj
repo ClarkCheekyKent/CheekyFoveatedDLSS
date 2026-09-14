@@ -48,7 +48,6 @@
     <ClCompile Include="src\settings.cpp" />
     <ClCompile Include="src\graphics_observer.cpp" />
     <ClCompile Include="src\d3d12_ngx_dispatch.cpp" />
-    <ClCompile Include="src\afw_depth_coverage.cpp" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\buffer.c" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\hook.c" />
     <ClCompile Include="third_party\reshade\deps\minhook\src\trampoline.c" />

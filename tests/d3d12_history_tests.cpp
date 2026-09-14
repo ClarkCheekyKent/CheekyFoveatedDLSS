@@ -125,7 +125,7 @@ void run_alternating(bool low_res_motion, float margin) {
     Settings requested;
     requested.afw_automatic_coverage = true;
     requested.width = requested.height = .2F;
-    requested.afw_warp_margin = 0; requested.afw_depth_margin = margin;
+    requested.afw_warp_margin = margin;
     requested.aligned_height_offset = -.044F;
     float matrices[2][16]{};
     for (auto& m : matrices) { m[0] = m[5] = m[11] = 1.F; m[14] = .1F; }

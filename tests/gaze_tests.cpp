@@ -3,7 +3,6 @@
 #include "afw_compatibility.hpp"
 #include "afw_gaze.hpp"
 #include "afw_eye_identity.hpp"
-#include "afw_depth_coverage.hpp"
 #include "crop_motion.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
@@ -1936,24 +1935,6 @@ void test_afw_source_projection_coverage() {
 
 void test_afw_gaze_pixel_coverage() {
     using namespace cheeky::foveated_dlss;
-    AfwMatrix matrix{}; matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.F; matrix[8] = .4F;
-    float px{}, py{};
-    expect(afw_project_depth(matrix, .5F, .5F, .5F, px, py) && std::abs(px - .6F) < 1e-6F && py == .5F,
-        "Depth participates in homogeneous source-to-warp projection");
-    expect(afw_project_depth(matrix, .5F, .5F, 0.F, px, py) && px == .5F,
-        "Far-plane depth removes a depth-dependent disparity");
-    expect(!afw_project_depth(matrix, .5F, .5F, NAN, px, py), "Malformed depth is rejected");
-    AfwDepthMarginPolicy padding;
-    expect(padding.update(.2F, 100) >= .2F && padding.update(.05F, 200) >= .2F &&
-        padding.update(.05F, 1200) < .1F, "Depth padding grows immediately and shrinks only after sustained lower demand");
-    Settings padded;
-    padded.afw_manual_coverage = true; padded.width = padded.height = .2F; padded.x_offset = padded.height_offset = 0;
-    padded.afw_warp_margin = .05F; padded.afw_depth_margin = .1F;
-    expect(std::abs(afw_experiment_settings(padded).width - .5F) < 1e-6F,
-        "Observed depth displacement adds to manual padding for both SR and NR");
-    padded.afw_depth_coverage = false;
-    expect(std::abs(afw_experiment_settings(padded).width - .3F) < 1e-6F,
-        "Disabling adaptive depth coverage restores the requested manual padding");
     AfwGazeAllocation shrink;
     unsigned allocated = 800, allocation_start{};
     shrink.update(.3F, .7F, 1000, 8, 10., allocated);

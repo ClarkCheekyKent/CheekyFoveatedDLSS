@@ -14,7 +14,6 @@
 #include "dlss_nr.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "afw_compatibility.hpp"
-#include "afw_depth_coverage.hpp"
 #include "version.h"
 #include <atomic>
 #include <array>
@@ -66,7 +65,6 @@ std::string snapshot_locked(State& s) {
     const auto afw = afw_compatibility_status();
     const auto afw_projection = afw_stereo_projection();
     const auto afw_coverage = afw_coverage_status();
-    const auto afw_depth = afw_depth_coverage_status();
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
     out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr\",\"request\":" << s.request
@@ -94,12 +92,6 @@ std::string snapshot_locked(State& s) {
         << ",\"last_evaluation_eye\":" << (afw.last_evaluation_eye < 2 ? static_cast<int>(afw.last_evaluation_eye) : -1)
         << ",\"early_left_calls\":" << afw.early_left_calls << ",\"early_right_calls\":" << afw.early_right_calls
         << ",\"early_unknown_calls\":" << afw.early_unknown_calls
-        << ",\"depth_valid\":" << afw_depth.valid << ",\"depth_margin\":" << afw_depth.margin
-        << ",\"depth_captures\":" << afw_depth.captures << ",\"depth_completed\":" << afw_depth.completed
-        << ",\"depth_pending\":" << afw_depth.pending << ",\"depth_skipped\":" << afw_depth.skipped
-        << ",\"depth_format\":" << afw_depth.format << ",\"depth_initial_state\":" << afw_depth.initial_state
-        << ",\"depth_skip_reason\":" << afw_depth.skip_reason
-        << ",\"depth_age_ms\":" << (afw_depth.valid ? static_cast<long long>(afw_depth.age_ms) : -1)
         << ",\"projection_valid\":" << afw_projection.valid
         << ",\"projection_width\":" << afw_projection.output_width << ",\"projection_height\":" << afw_projection.output_height
         << ",\"coverage_observed\":" << afw_coverage.observed << ",\"coverage_mode\":" << afw_coverage.mode
@@ -391,7 +383,6 @@ extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, 
             publish_afw_stereo_projection(empty, 0, 0, false);
         }
         eye_calibration_tick();
-        poll_afw_depth_coverage();
         set_processing_allowed(s.started && s.graphics_ready);
         if (s.graphics_ready) {
             const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();

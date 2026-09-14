@@ -120,8 +120,6 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
     const float height = finite(settings.height, .7F, .2F, 1.F);
     settings.afw_gaze_width = width; settings.afw_gaze_height = height;
     settings.afw_warp_margin = finite(settings.afw_warp_margin, .05F, 0.F, .25F);
-    const float depth_margin = settings.afw_depth_coverage ? finite(settings.afw_depth_margin, 0.F, 0.F, 1.F) : 0.F;
-    settings.afw_warp_margin = (std::min)(1.F, settings.afw_warp_margin + depth_margin);
     const float manual_x = settings.x_offset;
     settings.afw_mask = {};
     settings.x_offset = 0.F;
@@ -159,8 +157,8 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
         settings.height_offset = settings.height < 1.F
             ? std::clamp(2.F * top / (1.F - settings.height) - 1.F, -1.F, 1.F) : 0.F;
     } else {
-        settings.width = (std::min)(1.F, (std::max)(width, .70F) + 2.F * depth_margin);
-        settings.height = (std::min)(1.F, (std::max)(height, .70F) + 2.F * depth_margin);
+        settings.width = (std::max)(width, .70F);
+        settings.height = (std::max)(height, .70F);
         settings.height_offset = 0.F;
         if (afw_has_source_projection(settings, projection))
             for (unsigned eye = 0; eye < 2; ++eye)

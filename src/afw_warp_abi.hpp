@@ -16,8 +16,6 @@ struct AfwWarpPrefix {
     std::uint32_t mode{}, source_eye{};
 };
 static_assert(offsetof(AfwWarpPrefix, mode) == 60 && offsetof(AfwWarpPrefix, source_eye) == 64);
-struct AfwWarpCameraPrefix { AfwWarpPrefix warp{}; void* cameras{}; };
-static_assert(offsetof(AfwWarpCameraPrefix, cameras) == 72);
 struct AfwTexturePrefix {
     std::uint32_t type{};
     void* resource{};
