@@ -448,12 +448,12 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     auto original_readback = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
     transition(list.Get(), color.resource.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (UINT i = 0; i < color.footprints.size(); ++i) {
-        D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
-        source.pResource = color.resource.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        source.SubresourceIndex = i;
+        D3D12_TEXTURE_COPY_LOCATION original_source{}, destination{};
+        original_source.pResource = color.resource.Get(); original_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        original_source.SubresourceIndex = i;
         destination.pResource = original_readback.Get(); destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         destination.PlacedFootprint = color.footprints[i];
-        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        list->CopyTextureRegion(&destination, 0, 0, 0, &original_source, nullptr);
     }
     check(list->Close());
     ID3D12CommandList* lists[]{list.Get()};

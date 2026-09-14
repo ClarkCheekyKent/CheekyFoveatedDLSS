@@ -17,7 +17,7 @@ scripts/
   cheeky_foveated_dlss.lua
 ```
 
-4. **For OpenXR gaze, or ordinary stereo alignment/calibration, run the matching `OpenXR/CheekyOpenXRSetup.exe` included in the release-candidate ZIP before starting the game.** AFW fixed/automatic coverage needs no OpenXR layer. Native OpenVR uses the built-in adapter, including when its compositor initialized before the plugin.
+4. **For OpenXR gaze, or ordinary stereo alignment/calibration, run the matching `OpenXR/CheekyOpenXRSetup.exe` included in the UEVR ZIP before starting the game.** AFW fixed/automatic coverage needs no OpenXR layer. Native OpenVR uses the built-in adapter, including when its compositor initialized before the plugin.
 5. Start the game with DLSS enabled, inject UEVR and open **LuaLoader → Cheeky Foveated DLSS**.
 
 The OpenXR installation is shared across games. Install all plugin files and the layer from the same release when updating.
@@ -38,8 +38,7 @@ automatically. Holding the shortcut toggles only once.
 
 NR **Style** offers Standard, Natural and Cinematic. **Intensity** runs from 0
 (no model edit) to 1 (full edit). **Skin structure** appears with Automatic mask
-enabled; **Paper white** appears for HDR NR input. The old preset hints and
-unverified UI correction checkbox have been removed from the menu.
+enabled; **Paper white** appears for HDR NR input.
 
 ## Reports and details
 
@@ -55,72 +54,49 @@ For D3D12 DLSS-NR, place a compatible `nvngx_dlssnr.dll` beside the nested runti
 
 Updating either DLL requires a full game restart. Reloading the adapter does not unload the resident runtime.
 
-## AFW release candidate
+## AFW
 
-This integration runs with the **public, unmodified AFW UEVR release on DX12**. No separate Cheeky build of UEVR is required. It does not add AFW to mainline UEVR. Compatibility was confirmed in the user's Hogwarts Legacy test; this candidate adds the remaining controls and recovery behavior for a final headset test.
+AFW integration works with the public, unmodified AFW UEVR release on **DX12**. It does not require a separate Cheeky build of UEVR. AFW UEVR itself supports DX12 only; selecting it in a DX11 game falls back to AFR.
 
-Install the complete `afw-rc-4` ZIP with the game closed. Replace both Cheeky DLLs and the Lua script. The optional matching OpenXR installer is in `OpenXR/`; run it for OpenXR gaze. NVIDIA binaries are not included. For NR, provide a compatible `nvngx_dlssnr.dll` beside the nested Cheeky runtime or the running game executable.
+Use the same installation steps above and replace both Cheeky DLLs and the Lua script together when updating. Fixed AFW coverage uses UEVR's public stereo projections and needs no Cheeky OpenXR layer. Runtime OpenXR gaze requires the matching layer; native OpenVR uses the built-in adapter.
 
-RC4 lowers the requested SR and NR fovea width/height minimum to 0.1 (10%). These are sizes before stereo coverage and warp padding; the visible region can be larger. For example, 0.1 plus 0.0625 padding on each edge becomes 0.225 (22.5%) before any extra stereo union. Existing saved sizes and the default sizes are retained.
+### Setup and controls
 
-RC3 retains RC2's source-eye projection alignment, confirmed overlapping in the headset, and fixes a repeated center-history reset. A legacy preparation check compared projected settings bit-for-bit: the reported FOV produces slightly different floating-point widths for each eye even when both crops have identical pixel dimensions. That check reset SR on every alternation. History invalidation now belongs to the per-view backend's integer crop geometry, game reset requests and gaze policy. First use, actual resizing, bypassed/failed evaluations and disable/re-enable still invalidate history. The trace now records the actual NGX reset and cumulative reset/correction counts for each private history, including consecutive samples across alternating eyes.
+1. Select AFW in UEVR and enable DLSS in the game.
+2. Open **Stereo and gaze**, leave **Foveation center** on Fixed, and select **Automatic** under **AFW stereo coverage**.
+3. Adjust width and height under **DLSS-SR**. The minimum is **0.2 (20%)** for SR and independent NR regions. Older saved values below 0.2 are clamped when loaded.
+4. Use the red alignment border to inspect both eyes. Disable the border when finished.
 
-### Coverage and eye identity
+The coverage selector offers:
 
-The outer AFW hook receives the game's original full-size inputs once. Cheeky's private SR and NR work runs only in a lower DLSS evaluation reached inside that call. This keeps center/periphery dimensions out of AFW's resolution-change detector. Native exports, `_C` exports, Streamline's nested route, and NVIDIA OTA `.bin` SR runtimes are covered. Genuine game-resolution changes still trigger AFW's own temporary suspension.
+- **Automatic:** aligns the requested regions using both UEVR eye projections. Height offset adjusts their vertical position. Missing or mismatched projections use centered coverage.
+- **Manual:** uses mirrored horizontal offsets and a shared height offset.
+- **Centered (70% minimum):** uses at least 70% width and height. Larger requested sizes apply.
 
-The **Stereo and gaze** section contains the shared AFW controls, including when SR is disabled and only NR is running:
+**Advanced AFW → Extra margin per edge** adds a fixed allowance around the requested regions. It is a fraction of the full image, so 0.05 adds 5% on each edge. Stereo coverage and this margin can enlarge the visible region beyond the requested width and height. Existing coverage preferences and manual margin values are preserved.
 
-- **Automatic stereo coverage** uses both optical centers from UEVR's public projections, the requested region sizes and height bias. It takes precedence over manual coverage. Fresh matching full-eye dimensions are required; a complete eye may occupy a subrectangle in a larger output allocation.
-- **Manual stereo coverage** contains both mirrored X-offset regions, with a shared vertical offset.
-- With both options off, the fixed fallback is at least 70% wide/high. With verified source identity it follows the optical center; otherwise it stays image-centered. Larger requested sizes apply.
-- **Warp padding per edge** supplies a manual safety allowance, measured as a fraction of the full image. Automatic and manual modes add it around the requested regions. **Depth-adaptive warp padding** adds measured geometric displacement, including to the centered fallback, when valid depth feedback is available.
-- **Roundness** applies independently to the covered eye regions. In gaze mode it includes both fresh and filtered positions. The private DLSS allocation remains their bounding rectangle; masking changes the composite, not the rectangular DLSS inference cost. Rectangle and rounded modes both use the actual projected region masks, so retained allocation headroom does not change the visible center/periphery boundary.
+The same controls apply to foveated NR with SR disabled. NR supports Before/After upscaling, full-frame or foveated processing, working scale, and independent or SR-linked size and shape. Supply a compatible `nvngx_dlssnr.dll` as described above.
 
-On the verified AFW beta 6 warp DLL, each warp callback explicitly identifies its source eye and depth buffer. A later core evaluation can identify its source eye **before its nested DLSS call** by copying its original depth into that exact buffer. This works without frame parity or permanently assigning an eye to an NGX handle. Partial copies, conflicting bindings, expired observations, resource destruction and session changes invalidate the match. The diagnostics distinguish **Source eye at last DLSS call** from the later warp callback's own eye/mode.
+**Advanced AFW → Depth-adaptive warp padding** adds an estimate of geometric warp displacement from asynchronous depth samples, in addition to any fixed margin. It defaults to enabled and can also enlarge the centered fallback. Padding grows immediately and shrinks after sustained lower demand. Feedback expires after 500 ms; unsupported resources or unverified warp binaries use fixed coverage. Samples cannot predict abrupt motion, thin foreground objects or newly revealed surfaces. Disable it to compare fixed coverage.
 
-Knowing the source eye does not eliminate the other eye's warp donors. Coverage therefore accounts for both requested eye regions after converting their viewing directions into the actual source projection. It reserves a common allocation size for either eye while moving the crop origin with that eye's projection. Gaze-jump detection compares successive observations of the same eye; private DLSS still receives the game's temporal motion convention with crop-origin compensation. Both eyes use the larger valid depth estimate, avoiding alternating padding sizes. Marker-based two-eye calibration is bypassed while AFW is selected because AFW's synthesized views are not ordinary stereo submissions. Automatic coverage provides alignment through the public projection API instead.
+### Gaze and transitions
 
-### Depth-adaptive padding
+Runtime gaze and simulated gaze cover both eyes' fresh and smoothed gaze positions. In gaze modes, **AFW tracking-loss fallback** selects the fixed coverage used when tracking is unavailable. Each eye must provide a valid sample and matching projection. Brief tracking loss holds the last position before returning to fixed coverage; loss of focus stops live gaze immediately.
 
-This option is enabled by default. The verified warp callback supplies the current source/destination camera matrices and depth resource. Cheeky copies depth asynchronously, restores the resource's declared state, and leaves the command list's shader bindings intact. It reads the copy only after the recording has retired and every executing queue has completed; replayable, unsubmitted, failed and pending work cannot supply an estimate.
+The allocation grows when needed and shrinks after one second of sustained smaller coverage. Small gaze movements retain temporal history. Jump simulations support **Show next jump target** without changing current coverage.
 
-A grid of at most 64 by 64 depth samples estimates the maximum geometric reprojection displacement beyond the static optical projection map. A sample-cell guard and upward quantization accompany the estimate. Padding grows immediately and shrinks after one second of sustained lower demand. The user's manual padding remains additional. Capture is limited to ten copies per second per eye, with four bounded readback slots. There are no render-thread GPU waits.
+Switching UEVR away from AFW restores ordinary stereo controls and marker calibration during the same session. AFW coverage returns when AFW is selected again. The resolution-protecting hooks remain installed while the AFW runtime is loaded.
 
-Feedback expires after 500 ms and is invalidated by host/projection changes. The readback path supports single-sample, single-mip, single-layer R32/D32 float, R16/D16 UNORM, D24S8 and D32S8 depth families, including their typeless resource formats, up to 64 MiB per depth-plane copy with a declared shader-readable state. Stencil is left untouched; planar readbacks follow [Microsoft's D3D12 depth/stencil layout](https://microsoft.github.io/DirectX-Specs/d3d/PlanarDepthStencilDDISpec.html). Unsupported layouts, camera data, unknown warp DLLs or unavailable readbacks use manual padding. **Fresh depth estimate**, capture/completion/pending counters, depth format/state and an explicit capture status explain whether it is active and why captures were rejected.
+### Diagnostics and compatibility
 
-This is recent sampled feedback, not a per-pixel prediction of a future warp. Thin foreground objects between samples, abrupt scene changes, object motion and disocclusion can need more manual padding. It can also expand coverage to the full image and reduce or remove the performance benefit. Turn the option off to reproduce the previous fixed-padding baseline.
+The overview reports whether UEVR has selected AFW. This does not mean AFW is actively warping during loading screens or other temporary suspensions. **Diagnostics and support → AFW details** shows recent warp calls, source-eye identification, projection availability and DLSS routing. Full counters remain in support ZIPs.
 
-### Gaze and previews
+Cheeky keeps the game's original full-size evaluation at AFW's outer hook. Private center/periphery SR and NR run inside the nested DLSS call, keeping those dimensions out of AFW's resolution-change detector. Native exports, `_C` exports, Streamline's nested route and NVIDIA OTA SR runtimes are supported. Genuine game-resolution changes still invoke AFW's own suspension behavior.
 
-**Runtime gaze** and **Simulated gaze** work through the matching OpenXR layer or native OpenVR adapter. Real gaze needs a compatible tracker/runtime; simulation does not. Each eye's gaze ray is converted into that same eye's UEVR projection. Both fresh and smoothed positions remain covered so filter lag cannot leave current gaze outside the sharp regions.
+Source-eye identification uses the verified AFW beta 6 warp metadata and full depth-buffer copies already made by AFW. It does not guess eyes from frame order; depth sampling for adaptive padding is separate. Coverage maps both eyes' requested regions into the current source projection. Matching pixel dimensions preserve temporal history across alternate-eye crop origins; size changes, game resets and skipped/failed private passes invalidate the affected history.
 
-Both eyes must supply valid samples. Samples older than 50 ms, stale display times, malformed FOVs and the wrong real/simulated source are rejected. Brief loss holds the previous position for 100 ms, then returns over 150 ms to fixed coverage. Focus loss drops live gaze immediately; missing projections select fixed coverage. Reacquisition, large crop jumps, session changes and allocation changes reset affected histories.
+Missing or ambiguous nested DLSS routes pass through to ordinary DLSS. Unknown warp binaries retain routing and conservative coverage but cannot provide verified source-eye metadata. Other NGX proxies can affect compatibility.
 
-Gaze allocation grows immediately and **shrinks automatically** after one second of sustained smaller coverage, retaining alignment headroom. Small gaze motion does not recreate DLSS features every frame. Settings and projection changes start a new geometry epoch. The effective coverage readout includes retained allocation as well as requested regions and padding.
+Hogwarts Legacy compatibility and overlapping fixed coverage have been tested in a headset. Automated tests cover native/Streamline/OTA routing, SR/NR histories, real copy hooks and GPU composites, gaze/fallback transitions and the Lua menu. Those tests substitute NVIDIA inference; additional games and real eye tracking still need headset testing.
 
-Jump simulation supports **Show next jump target**. Its green rectangle shows the upcoming target envelope using a separate preview size; displaying or hiding it never changes the current allocation. The preview is suppressed unless both future eye targets are valid. The red alignment border follows the current composite shape, including rounded eye-region unions.
-
-### NR and live transitions
-
-NR supports **Before upscaling** and **After upscaling**, full-frame and foveated processing, working scale, style/intensity, independent width/height/roundness, and linking to SR size/shape. Before NR processes a private original-size input copy and restores the game's parameters; After NR processes the completed SR image. NR also works with Cheeky's foveated SR disabled. Linked foveated NR uses the actual coordinated SR crop and mask; independent NR has its own gaze allocation. Its Before border uses the region actually processed rather than sampling gaze again after inference.
-
-Each game NGX handle retains its own private SR/periphery/NR histories. A shared game handle stays shared: splitting it solely by eye would also require changing the game's temporal motion convention. Skipped private passes, NR failures, order changes and transitions between processed and original Before inputs reset the affected histories. Native fallback resets stale game history once. Original Reset values and resource parameters are restored.
-
-Changing UEVR's rendering method away from AFW restores ordinary Cheeky stereo controls and marker calibration during the same game session. Selecting AFW again restores AFW coverage. The resolution-protecting hooks stay installed so warmup and suspension remain safe. Missing, malformed or stale host mode information keeps conservative compatibility behavior. Updating either DLL still requires a game restart.
-
-### Supported boundaries and final test
-
-An unambiguous nested DLSS route is required. Missing, ambiguous or reversed hook topologies remain ordinary-DLSS passthrough. Other NGX proxies may change that topology. Unknown warp DLLs retain SR/NR routing, bilateral coverage, public projection/gaze support and opaque warp activity reporting; resource/camera interpretation requires the verified ABI. These are explicit compatibility boundaries, not inferred eye assignments or unchecked memory layouts.
-
-The automated suite exercises real D3D12 copy hooks, rectangular and rounded GPU composites, float/UNORM/depth-stencil GPU readbacks, lifetime/replay protection, NR ordering and fallback, native/OTA/Streamline routes, projection/adapter resets, live mode publication, gaze allocation policy, and both supported Lua runtimes. The SR history regression uses the reported headset FOV through production preparation and private evaluation, checks actual reset parameters across eye changes and real invalidation events, and reads back the corrected motion resource passed to inference for input- and output-resolution vectors. It substitutes NVIDIA inference and does not establish final headset image quality or performance.
-
-For the final headset pass:
-
-1. Compare Cheeky off with SR on, starting with Fixed and center supersampling 1x. Check AFW's own state, increasing core/lower/warp counters, SR Active, and zero rejected core reentry. Disable depth-adaptive padding for the previous 70% centered baseline, then enable it and check the depth counters and effective size.
-2. Test automatic and manual coverage, padding, roundness, supersampling and periphery off/on. Inspect head motion, moving foreground objects and both eyes' region edges. Change the real game resolution and pass through loading screens.
-3. Test simulated sweep, jumps/green preview, tracking loss and allocation recovery; then test real gaze. Check fresh bilateral gaze and gaze-driven coverage.
-4. Test NR Before and After, linked and independent foveation/roundness, full-frame, working scale, NR off/on and NR with SR disabled. Check NR Active and timing alongside continued warp activity.
-5. Switch AFW off/on in UEVR and check ordinary stereo controls, calibration and AFW coverage recover. Adapter reload/reset must not reuse stale projection or depth data.
-
-If a route fails or warping looks wrong, disable Cheeky SR/NR and collect a support ZIP with the exact AFW build and settings. Nothing is uploaded automatically. Restore a previous complete Cheeky ZIP and restart to roll back.
+For final testing, compare SR off/on with peripheral DLAA, check both eyes during head and object motion, then exercise NR Before/After and gaze modes. Include loading screens, game-resolution changes and switching AFW off/on. If something fails, use **Report an issue...** to collect a support ZIP. Nothing is uploaded automatically. Restore a previous complete Cheeky package and restart the game to roll back.
