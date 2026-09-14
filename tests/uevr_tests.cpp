@@ -190,8 +190,11 @@ int main(int argc, char** argv) {
             require(cadence.average_ms == 0, "SR toggle starts a fresh cadence window");
         }
         const bool conflict_mode = argc > 1 && std::string(argv[1]) == "--conflict";
-        bool hardware{};
-        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--hardware") hardware = true;
+        bool hardware{}, inactive_afw{};
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--hardware") hardware = true;
+            if (std::string(argv[i]) == "--inactive-afw") inactive_afw = true;
+        }
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
         const bool afw = mode.starts_with("--afw-");
@@ -222,7 +225,8 @@ int main(int argc, char** argv) {
         vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
         vr_api.get_mod_value = get_mod_value;
         vr_api.get_hmd_width = vr_api.get_hmd_height = hmd_extent;
-        if (afw) api.vr = &vr_api;
+        if (afw || inactive_afw) api.vr = &vr_api;
+        if (inactive_afw) rendering_mode = "0";
         UEVR_OpenVRData openvr_api{}; openvr_api.get_vr_compositor = get_compositor;
         void* original_wait{};
         if (openvr_late) {
@@ -254,6 +258,12 @@ int main(int argc, char** argv) {
         }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
         if (afw) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
+        if (inactive_afw) {
+            require(late, "Inactive AFW fixture requires a late-attachment route");
+            const auto afw_path = root / "PDAFWPlugin.dll";
+            std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", afw_path);
+            require(LoadLibraryW(afw_path.c_str()) != nullptr, "Load inactive AFW before Cheeky");
+        }
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
         require(init != nullptr, "Plugin entry export");
@@ -313,6 +323,12 @@ int main(int argc, char** argv) {
         command("1\n82\ncalibration_reset");
         require(received.find("Waiting for OpenVR or OpenXR") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
+            if (inactive_afw) {
+                present();
+                require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos &&
+                    snapshot(get).find("\"warp_calls\":0") != std::string::npos,
+                    "Inactive fixture detects AFW without executing frame warp");
+            }
             command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
             verify_late_attach_test(get, command);
             return 0;

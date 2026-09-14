@@ -3206,8 +3206,14 @@ std::uint32_t hook_sl_evaluate_feature(
     detect_afw_runtime();
     if (afw_compatibility_enabled() && feature == 0U) {
         // Keep the game's viewport/tags/options intact through AFW. The nested
-        // native path owns SR; do not set inside_streamline_evaluation here.
-        return original(feature, frame, inputs, input_count, command_buffer);
+        // native DX12 path owns SR. DX11 still needs normal option discovery
+        // and native-fallback handling even when the AFW DLL is loaded.
+        ID3D12GraphicsCommandList* dx12{};
+        const bool dx12_call = command_buffer && SUCCEEDED(
+            static_cast<IUnknown*>(command_buffer)->QueryInterface(IID_PPV_ARGS(&dx12)));
+        if (dx12) dx12->Release();
+        if (!command_buffer || dx12_call)
+            return original(feature, frame, inputs, input_count, command_buffer);
     }
     if (feature != 0U) {
         StreamlineEvaluationScope scope;
@@ -5397,21 +5403,33 @@ template <typename T>
         L"nvngx_dlss.dll",
         require_runtime_stability
     ) ? observed_public_runtime : nullptr;
-    // Older snippets alias DX11 and DX12 exports to the same address. AFW's
-    // experiment is DX12-only; installing a DX11 detour first would steal it.
-    const auto public_d3d11_runtime = afw_compatibility_enabled() ? nullptr : public_runtime;
+    // DX11 discovery remains independent of AFW's DX12 snippet requirements.
+    // Loading AFW must not disable a game's ordinary cached DX11 exports.
+    static RuntimeStability public_d3d11_stability{};
+    const auto observed_d3d11_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto public_d3d11_runtime = runtime_ready_for_direct_hooks(
+        observed_d3d11_runtime, public_d3d11_stability, L"nvngx_dlss.dll",
+        require_runtime_stability) ? observed_d3d11_runtime : nullptr;
+    const auto install_public_d3d11_hook = [&](const char* name, const char* dx12_name,
+        void* detour, auto& storage) {
+        const auto get_proc = real_get_proc_address.load(std::memory_order_acquire);
+        // Some older snippets share entry points. Reserve only actual aliases
+        // for AFW's DX12 hooks; distinct DX11 entry points remain usable.
+        if (afw_compatibility_enabled() && public_d3d11_runtime && get_proc &&
+            get_proc(public_d3d11_runtime, name) == get_proc(public_d3d11_runtime, dx12_name)) return false;
+        return install_direct_hook(public_d3d11_runtime, name, detour, storage, DiagnosticApi::d3d11);
+    };
 
     if (public_runtime != nullptr) {
         diagnostic_note_runtime_loaded(DiagnosticApi::d3d11);
         diagnostic_note_runtime_loaded(DiagnosticApi::d3d12);
     }
     {
-        installed |= install_direct_hook(
-            public_d3d11_runtime,
+        installed |= install_public_d3d11_hook(
             "NVSDK_NGX_D3D11_Init",
+            "NVSDK_NGX_D3D12_Init",
             reinterpret_cast<void*>(&hook_init_d3d11),
-            real_init_d3d11,
-            DiagnosticApi::d3d11
+            real_init_d3d11
         );
         installed |= install_direct_hook(
             public_runtime,
@@ -5427,33 +5445,29 @@ template <typename T>
             real_shutdown_d3d12_1,
             DiagnosticApi::d3d12
         );
-        installed |= install_direct_hook(
-            public_d3d11_runtime,
+        installed |= install_public_d3d11_hook(
             "NVSDK_NGX_D3D11_CreateFeature",
+            "NVSDK_NGX_D3D12_CreateFeature",
             reinterpret_cast<void*>(&hook_create_d3d11),
-            real_create_d3d11,
-            DiagnosticApi::d3d11
+            real_create_d3d11
         );
-        installed |= install_direct_hook(
-            public_d3d11_runtime,
+        installed |= install_public_d3d11_hook(
             "NVSDK_NGX_D3D11_EvaluateFeature",
+            "NVSDK_NGX_D3D12_EvaluateFeature",
             reinterpret_cast<void*>(&hook_evaluate_d3d11),
-            real_evaluate_d3d11,
-            DiagnosticApi::d3d11
+            real_evaluate_d3d11
         );
-        installed |= install_direct_hook(
-            public_d3d11_runtime,
+        installed |= install_public_d3d11_hook(
             "NVSDK_NGX_D3D11_EvaluateFeature_C",
+            "NVSDK_NGX_D3D12_EvaluateFeature_C",
             reinterpret_cast<void*>(&hook_evaluate_d3d11_c),
-            real_evaluate_d3d11_c,
-            DiagnosticApi::d3d11
+            real_evaluate_d3d11_c
         );
-        installed |= install_direct_hook(
-            public_d3d11_runtime,
+        installed |= install_public_d3d11_hook(
             "NVSDK_NGX_D3D11_ReleaseFeature",
+            "NVSDK_NGX_D3D12_ReleaseFeature",
             reinterpret_cast<void*>(&hook_release_d3d11),
-            real_release_d3d11,
-            DiagnosticApi::d3d11
+            real_release_d3d11
         );
         installed |= install_direct_hook(
             public_runtime,
