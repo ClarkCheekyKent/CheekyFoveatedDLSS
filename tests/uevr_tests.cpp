@@ -328,9 +328,14 @@ int main(int argc, char** argv) {
                 require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos &&
                     snapshot(get).find("\"warp_calls\":0") != std::string::npos,
                     "Inactive fixture detects AFW without executing frame warp");
+                if (!dx11) require(snapshot(get).find("\"coverage_enabled\":false") != std::string::npos &&
+                    snapshot(get).find("\"rendering_mode_known\":true,\"rendering_mode\":0") != std::string::npos,
+                    "Native Stereo explicitly disables AFW coverage before standalone DX12 evaluation");
             }
             command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
-            verify_late_attach_test(get, command);
+            // Keep the host mode fresh just as real present callbacks do.
+            verify_late_attach_test(get, command, inactive_afw ? present : nullptr,
+                inactive_afw && !dx11 ? +[](unsigned mode) { rendering_mode = std::to_string(mode); } : nullptr);
             return 0;
         }
         if (afw) {

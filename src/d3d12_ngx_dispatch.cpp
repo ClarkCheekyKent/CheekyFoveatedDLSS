@@ -10,6 +10,7 @@ namespace {
 
 thread_local std::uint32_t interception_depth{};
 thread_local std::uint32_t afw_private_depth{};
+thread_local std::uint32_t afw_protected_private_depth{};
 std::atomic<bool> afw_enabled{};
 std::atomic<std::uint64_t> core_calls{}, lower_calls{}, missing_lower_calls{};
 std::atomic<std::uint64_t> standalone_lower_calls{}, rejected_core_reentry{};
@@ -145,7 +146,12 @@ void afw_note_runtime_discovery(unsigned candidates, bool selected) noexcept {
 }
 bool afw_claim_lower_evaluation() noexcept {
     if (!afw_compatibility_enabled()) return true;
-    if (!afw_core_lower_seen) { ++standalone_lower_calls; return false; }
+    if (!afw_core_lower_seen) {
+        ++standalone_lower_calls;
+        // A loaded DLL does not require nesting while the host explicitly
+        // selects Native Stereo/AFR. Unknown or stale mode stays protected.
+        return !afw_coverage_enabled();
+    }
     *afw_core_lower_seen = true;
     const auto eye = afw_current_source_eye();
     last_evaluation_eye.store(eye);
@@ -178,13 +184,20 @@ unsigned afw_current_source_eye() noexcept {
     return current_core_depth && !current_core_depth->ambiguous ? current_core_depth->eye : UINT32_MAX;
 }
 bool afw_reject_core_reentry() noexcept {
-    if (!afw_compatibility_enabled() || afw_private_depth == 0U) return false;
+    if (!afw_compatibility_enabled() || afw_protected_private_depth == 0U) return false;
     ++rejected_core_reentry;
     return true;
 }
 
-AfwPrivateWorkScope::AfwPrivateWorkScope() noexcept { ++afw_private_depth; }
-AfwPrivateWorkScope::~AfwPrivateWorkScope() { --afw_private_depth; }
+AfwPrivateWorkScope::AfwPrivateWorkScope() noexcept
+    : protect_core_(afw_core_lower_seen != nullptr || afw_coverage_enabled()) {
+    ++afw_private_depth;
+    if (protect_core_) ++afw_protected_private_depth;
+}
+AfwPrivateWorkScope::~AfwPrivateWorkScope() {
+    if (protect_core_) --afw_protected_private_depth;
+    --afw_private_depth;
+}
 
 D3D12NgxInterceptionScope::D3D12NgxInterceptionScope() noexcept
     : outermost_(interception_depth++ == 0U) {}
@@ -201,7 +214,8 @@ NgxResult dispatch_d3d12_ngx_evaluation(
     const D3D12NgxEvaluationCall& call,
     const D3D12NgxEvaluateFn original,
     const D3D12NgxEvaluationProcessorFn processor,
-    void* const context
+    void* const context,
+    void (*const skipped)(const D3D12NgxEvaluationCall&)
 ) noexcept {
     if (original == nullptr) return 0xBAD00007U;
     if (afw_compatibility_enabled() && call.route == D3D12NgxRoute::core_runtime) {
@@ -213,8 +227,10 @@ NgxResult dispatch_d3d12_ngx_evaluation(
     }
     // An independent public call may itself forward to the core runtime. Do
     // not mark that ordinary full-frame passthrough as private interception.
-    if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation())
+    if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
+        if (skipped) skipped(call);
         return original(call.command_list, call.handle, call.parameters, call.callback);
+    }
     D3D12NgxInterceptionScope scope;
     if (scope.outermost() && processor != nullptr) {
         return processor(call, original, context);

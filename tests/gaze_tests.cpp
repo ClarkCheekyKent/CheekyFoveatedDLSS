@@ -1662,10 +1662,41 @@ void test_afw_dispatch_and_settings() {
     allow_afw_stereo_projection(true);
     publish_afw_rendering_mode(0);
     expect(afw_compatibility_enabled() && !afw_coverage_enabled(), "AFW off restores normal geometry while routing stays protected");
+    for (unsigned mode : {0U, 1U, 2U}) {
+        publish_afw_rendering_mode(mode);
+        harness.nest_core_evaluation = false;
+        const auto processed = harness.processor_calls;
+        expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x200U &&
+            harness.processor_calls == processed + 1, "Known non-AFW modes retain standalone public processing");
+        harness.nest_core_evaluation = true;
+        const auto originals = harness.original_calls;
+        expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x100U &&
+            harness.processor_calls == processed + 2 && harness.original_calls == originals + 1 &&
+            !d3d12_ngx_interception_active(), "Non-AFW private public-to-core forwarding processes exactly once");
+    }
     publish_afw_rendering_mode(3);
     expect(afw_coverage_enabled(), "AFW can be re-enabled without restarting the process");
+    auto processed = harness.processor_calls;
+    expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x100U &&
+        harness.processor_calls == processed, "Re-enabling AFW protects independent public calls again");
+    const auto core_switches_off = +[](ID3D12GraphicsCommandList* cmd, const NgxHandle* h,
+        const NgxParameters* p, NgxProgressCallback cb) -> NgxResult {
+        publish_afw_rendering_mode(0);
+        return dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime, cmd, h, p, cb},
+            fake_d3d12_original, fake_d3d12_processor, dispatch_harness);
+    };
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, core_switches_off,
+        fake_d3d12_processor, &harness) == 0xBAD00007U,
+        "An existing AFW core scope stays protected if the host switches modes during the call");
+    processed = harness.processor_calls;
     publish_afw_rendering_mode(UINT32_MAX);
     expect(afw_coverage_enabled(), "Unknown host mode cannot disable compatibility coverage");
+    expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x100U &&
+        harness.processor_calls == processed, "Unknown host mode keeps standalone calls in passthrough");
+    publish_afw_rendering_mode(0);
+    Sleep(270);
+    expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x100U &&
+        harness.processor_calls == processed, "A stale non-AFW mode cannot bypass the protected route");
     allow_afw_stereo_projection(false);
     dispatch_harness = nullptr;
 }

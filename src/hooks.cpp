@@ -261,7 +261,10 @@ void detect_afw_runtime() noexcept {
 }
 
 void afw_private_succeeded(const NgxHandle* handle) {
-    if (!afw_compatibility_enabled()) return;
+    // Preserve ordinary Native Stereo/AFR fallback semantics when the AFW DLL
+    // is merely loaded. A pending reset from actual AFW work still survives
+    // a mode change and is consumed by the next successful native evaluation.
+    if (!afw_coverage_enabled()) return;
     std::lock_guard lock(d3d12_game_views_mutex);
     for (auto& view : d3d12_game_views)
         if (view.handle == handle) view.afw_native_history_stale = true;
@@ -1899,6 +1902,7 @@ struct StreamlineCropHistory {
     std::uint32_t render_width{}, render_height{}, output_width{}, output_height{};
     bool output_space{};
     bool valid{};
+    bool afw_skipped{};
 };
 // Accessed under streamline_evaluation_lock; never advance on a failed call.
 std::deque<StreamlineCropHistory> streamline_crop_history;
@@ -2281,6 +2285,9 @@ struct StreamlineEvaluation {
         evaluation.resources[0U].mip_levels = 1U;
     }
     evaluation.nr_input_reset = nr_reset;
+    for (const auto& history : streamline_crop_history)
+        if (history.viewport == evaluation.viewport.value && history.afw_skipped)
+            evaluation.nr_input_reset = true;
 
     // Constants are write-once per frame/viewport in some Streamline versions.
     // Keep the game's viewport untouched and use a separate SR feature instance.
@@ -3204,7 +3211,7 @@ std::uint32_t hook_sl_evaluate_feature(
     }
     if (original == nullptr) return 0x18U;
     detect_afw_runtime();
-    if (afw_compatibility_enabled() && feature == 0U) {
+    if (afw_coverage_enabled() && feature == 0U) {
         // Keep the game's viewport/tags/options intact through AFW. The nested
         // native DX12 path owns SR. DX11 still needs normal option discovery
         // and native-fallback handling even when the AFW DLL is loaded.
@@ -3212,8 +3219,25 @@ std::uint32_t hook_sl_evaluate_feature(
         const bool dx12_call = command_buffer && SUCCEEDED(
             static_cast<IUnknown*>(command_buffer)->QueryInterface(IID_PPV_ARGS(&dx12)));
         if (dx12) dx12->Release();
-        if (!command_buffer || dx12_call)
+        if (!command_buffer || dx12_call) {
+            EnterCriticalSection(&streamline_evaluation_lock);
+            // These private viewport histories miss this full-frame AFW call.
+            // Reset them once if the host returns to ordinary Streamline SR/NR.
+            for (auto& history : streamline_crop_history) {
+                skip_dlss_nr_history(static_cast<DlssViewId>(history.viewport) + 1U);
+                history.valid = false;
+                history.afw_skipped = true;
+            }
+            const SlViewportHandle viewport_type{};
+            if (inputs && input_count <= 32U) for (std::uint32_t i = 0; i < input_count; ++i) {
+                const auto* base = static_cast<const SlBaseStructure*>(inputs[i]);
+                if (base && std::memcmp(&base->struct_type, &viewport_type.struct_type, sizeof(SlStructType)) == 0)
+                    skip_dlss_nr_history(static_cast<DlssViewId>(static_cast<const SlViewportHandle*>(inputs[i])->value) + 1U);
+            }
+            streamline_foveation_active.store(false, std::memory_order_release);
+            LeaveCriticalSection(&streamline_evaluation_lock);
             return original(feature, frame, inputs, input_count, command_buffer);
+        }
     }
     if (feature != 0U) {
         StreamlineEvaluationScope scope;
@@ -4772,6 +4796,13 @@ NgxResult process_d3d12_evaluation(const D3D12NgxEvaluationCall& call,
     return result;
 }
 
+void skip_d3d12_evaluation(const D3D12NgxEvaluationCall& call) {
+    const auto view_id = static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(call.handle));
+    skip_d3d12_history(view_id);
+    skip_d3d12_history(peripheral_dlaa_view_id(view_id));
+    skip_dlss_nr_history(view_id);
+}
+
 NgxResult hook_evaluate_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxHandle* const handle,
@@ -4789,7 +4820,9 @@ NgxResult hook_evaluate_d3d12(
             callback,
         },
         original,
-        &process_d3d12_evaluation
+        &process_d3d12_evaluation,
+        nullptr,
+        &skip_d3d12_evaluation
     );
 }
 
@@ -4825,8 +4858,10 @@ NgxResult evaluate_d3d12_c_impl(
     const auto original = real_evaluate_d3d12_c.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
-    if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation())
+    if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
+        skip_d3d12_evaluation({D3D12NgxRoute::public_runtime, command_list, handle, parameters, nullptr});
         return original(command_list, handle, parameters, callback);
+    }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
         return original(command_list, handle, parameters, callback);

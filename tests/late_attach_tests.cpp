@@ -110,7 +110,9 @@ struct Fixture {
         }
     }
     NgxHandle* handle{}; bool use_c{},use_sl{};
+    void (*before_frame)(){};
     NgxResult evaluate() {
+        if (before_frame) before_frame();
         if(use_sl) { ++frame.index; submit_metadata(); const void* inputs[]{&viewport, &viewport}; return sl_evaluate(0,complete_sl_metadata ? &frame : nullptr,inputs,ambiguous_sl_inputs ? 2U : 1U,context ? static_cast<void*>(context.Get()) : static_cast<void*>(list.Get())); }
         if(context) return use_c ? evaluate11c(context.Get(),handle,&params,nullptr) : evaluate11(context.Get(),handle,&params,nullptr);
         return use_c ? evaluate12c(list.Get(),handle,&params,nullptr) : evaluate12(list.Get(),handle,&params,nullptr);
@@ -942,8 +944,9 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     puts("PASS: AFW full-frame routing, private resolution isolation, fallback, and lifecycle");
 }
 
-void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
+void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const char*), void (*before_frame)(), void (*set_mode)(unsigned)) {
     auto& f=fixture();
+    f.before_frame = before_frame;
     // Missing metadata must forward unchanged and must not create a feature.
     const auto complete=f.params.values;
     for(const auto* key : {"DLSS.Feature.Create.Flags","PerfQualityValue","OutWidth","Depth","MotionVectors","Output"}) {
@@ -1050,6 +1053,41 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
                 "Foveated center and peripheral GPU timings reach snapshot");
         }
         puts("GPU timestamps: discarded recordings, forwarding wrapper, native/center/peripheral readback passed");
+    }
+    if (set_mode && !f.context) {
+        command("1\n120\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=true\nNrProcessingOrder=0\nNrFoveated=true\nAutoStereoAlignment=false\nCenterMode=0\nWidth=0.5\nHeight=0.5\nXOffset=0\nHeightOffset=0");
+        f.params.Set("Reset", 0U);
+        if (f.use_sl) {
+            f.options.struct_version = 3;
+            require(f.sl_options(&f.viewport, &f.options) == 0, "Mode transition viewport options");
+            f.complete_sl_metadata = true;
+        }
+        proc<void(*)(void(*)(const NgxParameters*))>(f.ngx, "CheekyFakeObserve")(&observe_sr);
+        proc<void(*)(void(*)(const NgxParameters*))>(GetModuleHandleW(L"nvngx_dlssnr.dll"), "CheekyFakeObserve")(&observe_nr);
+        const auto evaluate = [&] {
+            sr_inputs.clear(); evaluation_order.clear();
+            const auto original = f.params.values;
+            require(ngx_succeeded(f.evaluate()), "Mode transition evaluation"); f.finish_gpu();
+            require(f.params.values == original, "Mode transition restores game parameters");
+        };
+        evaluate(); evaluate();
+        require(evaluation_order == "SSN" && sr_inputs[0].reset == 0 && sr_inputs[1].reset == 0 && nr_reset == 0,
+            "Non-AFW SR/NR histories settle before switching modes");
+        for (unsigned mode : {3U, UINT32_MAX, 0U}) {
+            set_mode(mode); before_frame();
+            if (mode == 0U) { f.before_frame = nullptr; Sleep(270); }
+            evaluate();
+            require(evaluation_order == "S" && sr_inputs[0].color == f.textures12[0].Get(),
+                "AFW or unknown/stale mode forwards the full-frame call without private SR/NR");
+            set_mode(0); f.before_frame = before_frame;
+            evaluate();
+            require(evaluation_order == "SSN" && sr_inputs[0].reset == 1 && sr_inputs[1].reset == 1 && nr_reset == 1,
+                "Returning from skipped AFW frames resets private center/peripheral SR and NR histories");
+            evaluate();
+            require(evaluation_order == "SSN" && sr_inputs[0].reset == 0 && sr_inputs[1].reset == 0 && nr_reset == 0,
+                "Recovered non-AFW histories reset only once");
+        }
+        puts("Inactive AFW: mode switches, stale-mode fallback and SR/NR history recovery passed");
     }
     require(ngx_succeeded(f.release(f.handle)),"Release recreated feature");
     puts("Late attachment: cached exports, pre-existing feature, missing metadata, private reuse, release/recreation passed");

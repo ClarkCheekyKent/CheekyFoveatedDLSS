@@ -13,7 +13,9 @@ enum class D3D12NgxRoute : std::uint32_t {
 };
 
 // Experimental AFW routing: the core observes the original game evaluation;
-// only a feature-runtime evaluation nested inside it may own reconstruction.
+// while AFW is selected (or mode is unknown), only a feature-runtime evaluation
+// nested inside it may own reconstruction. Known non-AFW modes also allow the
+// ordinary standalone public-runtime path.
 struct AfwCompatibilityStatus {
     bool enabled{};
     std::uint64_t core_calls{}, lower_calls{}, missing_lower_calls{};
@@ -57,6 +59,8 @@ public:
     ~AfwPrivateWorkScope();
     AfwPrivateWorkScope(const AfwPrivateWorkScope&) = delete;
     AfwPrivateWorkScope& operator=(const AfwPrivateWorkScope&) = delete;
+private:
+    bool protect_core_{};
 };
 
 using D3D12NgxEvaluateFn = NgxResult (*)(
@@ -100,7 +104,8 @@ private:
     const D3D12NgxEvaluationCall& call,
     D3D12NgxEvaluateFn original,
     D3D12NgxEvaluationProcessorFn processor,
-    void* context = nullptr
+    void* context = nullptr,
+    void (*skipped)(const D3D12NgxEvaluationCall&) = nullptr
 ) noexcept;
 
 [[nodiscard]] bool d3d12_ngx_interception_active() noexcept;
