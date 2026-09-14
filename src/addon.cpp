@@ -762,6 +762,9 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "CenterSupersampling", settings.center_supersampling
     ));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "AfwManualCoverage", settings.afw_manual_coverage));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "AfwAutomaticCoverage", settings.afw_automatic_coverage));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "AfwWarpMargin", settings.afw_warp_margin));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "PeripheralDlaaPreset",
         settings.peripheral_dlaa_preset
@@ -930,6 +933,9 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     reshade::set_config_value(
         nullptr, config_section, "CenterSupersampling", settings.center_supersampling
     );
+    reshade::set_config_value(nullptr, config_section, "AfwManualCoverage", settings.afw_manual_coverage);
+    reshade::set_config_value(nullptr, config_section, "AfwAutomaticCoverage", settings.afw_automatic_coverage);
+    reshade::set_config_value(nullptr, config_section, "AfwWarpMargin", settings.afw_warp_margin);
     reshade::set_config_value(
         nullptr, config_section, "PeripheralDlaaPreset",
         settings.peripheral_dlaa_preset

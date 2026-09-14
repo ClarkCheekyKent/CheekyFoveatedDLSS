@@ -25,9 +25,25 @@ cbuffer Constants : register(b0) {
     float NextJumpOffsetX;
     float NextJumpOffsetY;
     uint ShowNextJump;
+    float NextJumpWidth;
+    float NextJumpHeight;
+    uint MaskCount;
+    uint MaskPadding;
+    float4 MaskBounds[4];
 };
 
 float ShapeDistance(float2 centered) {
+    if (MaskCount != 0) {
+        const float2 uv = (centered + float2(ShapeOffsetX * (1.0 - ShapeWidth),
+            ShapeOffsetY * (1.0 - ShapeHeight)) + 1.0) * 0.5;
+        float distance = 1e10;
+        [unroll] for (uint i = 0; i < 4; ++i) if (i < MaskCount) {
+            const float4 bounds = MaskBounds[i];
+            const float2 p = abs(2.0 * uv - bounds.xy - bounds.zw) / max(bounds.zw - bounds.xy, 0.0001);
+            distance = min(distance, lerp(max(p.x, p.y), length(p), saturate(ShapeRoundness)));
+        }
+        return distance;
+    }
     const float2 shape_size = max(
         float2(ShapeWidth, ShapeHeight),
         float2(0.0001, 0.0001)
@@ -125,11 +141,18 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     );
     if (ShowNextJump != 0U) {
         float2 next_centered = (float2(local_pixel) + 0.5) / (0.5 * float2(OutputSize)) - 1.0;
-        next_centered -= float2(NextJumpOffsetX * (1.0 - ShapeWidth), NextJumpOffsetY * (1.0 - ShapeHeight));
-        const float next_distance = ShapeDistance(next_centered);
+        const float2 next_size = max(float2(NextJumpWidth, NextJumpHeight), 0.0001);
+        next_centered -= float2(NextJumpOffsetX, NextJumpOffsetY) * (1.0 - next_size);
+        const float2 p = abs(next_centered) / next_size;
+        // AFW previews the future allocation rectangle; ordinary gaze retains
+        // its requested shape. Preview allocation never resizes current DLSS.
+        const float rounding = MaskCount != 0 ? 0.0 : saturate(ShapeRoundness);
+        const float next_distance = lerp(max(p.x, p.y), length(p), rounding);
+        const float2 px = abs(next_centered + float2(pixel_size.x, 0)) / next_size;
+        const float2 py = abs(next_centered + float2(0, pixel_size.y)) / next_size;
         const float next_pixel_distance = max(
-            abs(ShapeDistance(next_centered + float2(pixel_size.x, 0.0)) - next_distance),
-            abs(ShapeDistance(next_centered + float2(0.0, pixel_size.y)) - next_distance));
+            abs(lerp(max(px.x, px.y), length(px), rounding) - next_distance),
+            abs(lerp(max(py.x, py.y), length(py), rounding) - next_distance));
         if (next_distance <= 1.0 && next_distance >= 1.0 - 5.0 * next_pixel_distance) {
             GameOutput[uint3(output_pixel, 0)] = float4(0.0, 1.0, 0.0, 1.0);
             return;

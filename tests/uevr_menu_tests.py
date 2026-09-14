@@ -45,7 +45,7 @@ def run(engine):
         callbacks, sent, clicked, changes, drawn, values, combos, trees = {}, {}, {}, {}, {}, {}, {}, {}
         disabled = {false}
         slider_ranges = {}
-        tree_stack, tree_order, tree_parents = {}, {}, {}
+        tree_stack, tree_order, tree_parents, closed_trees = {}, {}, {}, {}
         uevr = {api = {}, sdk = {callbacks = {}}}
         for _, name in ipairs({'on_lua_event', 'on_frame', 'on_draw_ui'}) do
             uevr.sdk.callbacks[name] = function(fn) callbacks[name] = fn end
@@ -64,7 +64,9 @@ def run(engine):
         imgui = {
             tree_node = function(label)
                 trees[label] = true; tree_parents[label] = tree_stack[#tree_stack]
-                table.insert(tree_order, label); table.insert(tree_stack, label); return true
+                table.insert(tree_order, label)
+                if closed_trees[label] then return false end
+                table.insert(tree_stack, label); return true
             end,
             tree_pop = function() assert(#tree_stack > 0); table.remove(tree_stack) end,
             text = function(text) table.insert(drawn, text) end,
@@ -129,15 +131,163 @@ def run(engine):
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
     state["settings"]["Enabled"] = True
+    afw = copy.deepcopy(state)
+    afw["renderer"] = 1  # AFW supports DX12; the newest ordinary host report may be DX11.
+    afw["afw_experiment"] = {"enabled": True, "core_calls": 100, "lower_calls": 0,
+                             "missing_lower_calls": 100, "rejected_core_reentry": 0,
+                             "rendering_mode_known": True, "rendering_mode": 3}
+    receive(afw)
+    count = len(g.sent)
+    draw()
+    assert any(t == "Selected" for t in g.drawn.values())
+    assert not g.trees["AFW details"] and g.trees["Support"] and g.trees["Performance"]
+    assert not g.trees["Eye calibration"] and not g.trees["Eye mapping details"]
+    assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
+    assert "Foveation center" in g["values"] and "Enable DLSS-NR" in g["values"]
+    assert "Automatic stereo alignment" not in g["values"] and "Invert stereo eye order" not in g["values"]
+    assert "Automatic eye calibration (this session)" not in g["values"]
+    assert "Center supersampling" in g["values"]
+    afw["settings"].update(NrEnabled=True, NrFoveated=True, NrUseSrFoveation=False)
+    receive(afw)
+    draw()
+    assert "Rendering order" in g["values"] and "NR width" in g["values"]
+    assert "NR roundness" in g["values"] and "NR working scale" in g["values"]
+    assert not any("after AFW motion preparation" in t for t in g.drawn.values())
+    for label in ("Fovea width", "Fovea height", "NR width", "NR height"):
+        assert g.slider_ranges[label][1] == 0.2 and g.slider_ranges[label][2] == 1
+    afw["afw_experiment"].update(lower_calls=100, missing_lower_calls=0)
+    afw["afw_experiment"].update(runtime_candidates=1, runtime_selected=True)
+    receive(afw)
+    draw()
+    assert not any("ordinary DLSS passes through" in t for t in g.drawn.values())
+    afw["afw_experiment"].update(warp_observer_ready=True, warp_calls=0, last_warp_age_ms=-1)
+    receive(afw)
+    draw()
+    afw["settings"]["AfwManualCoverage"] = True
+    afw["afw_experiment"].update(manual_coverage=True, warp_calls=3, last_warp_age_ms=20,
+                                  effective_width=0.8, effective_height=0.6, effective_center_scale=1.25, coverage_observed=True)
+    receive(afw)
+    draw()
+    assert "Stereo X offset" in g["values"] and "Extra margin per edge" in g["values"]
+    assert "Roundness" in g["values"]
+    assert "Depth-adaptive warp padding" not in g["values"]
+    afw["afw_experiment"]["last_warp_age_ms"] = 1500
+    receive(afw)
+    draw()
+    assert len(g.sent) == count, "Drawing AFW status and overrides must not write settings"
+    afw["settings"]["AfwAutomaticCoverage"] = True
+    afw["afw_experiment"].update(coverage_mode=2, projection_valid=True, warp_metadata_supported=True,
+                                  last_evaluation_eye=1, last_warp_source_eye=1, last_warp_mode=3, source_left_calls=10, source_right_calls=12)
+    receive(afw)
+    draw()
+    assert "Height offset" in g["values"] and "Stereo X offset" not in g["values"]
+    assert g["values"]["AFW stereo coverage"] == 2
+    afw["afw_experiment"]["last_warp_mode"] = 2
+    receive(afw)
+    draw()
+    afw["afw_experiment"].update(coverage_mode=0, projection_valid=False)
+    receive(afw)
+    draw()
+    assert any("waiting for matching UEVR projections" in t for t in g.drawn.values())
+    afw["settings"]["CenterMode"] = 2
+    afw["settings"]["SimulationPattern"] = 2
+    afw["gaze"].update(using_gaze=True, afw_bilateral=True, afw_fresh_sample=True)
+    afw["afw_experiment"].update(coverage_mode=3, projection_valid=True)
+    receive(afw)
+    draw()
+    assert "Simulation pattern" in g["values"] and "Gaze smoothing (ms)" in g["values"]
+    assert "Show next jump target" in g["values"] and "Roundness" in g["values"]
+    assert g["values"]["AFW tracking-loss fallback"] == 2
+    assert not any("waiting for matching UEVR projections" in t for t in g.drawn.values())
+    assert len(g.sent) == count, "Gaze diagnostics must not rewrite preferences"
+    afw["settings"]["Enabled"] = False
+    receive(afw)
+    draw()
+    assert "Extra margin per edge" in g["values"]
+    assert "Enable DLSS-NR" in g["values"] and "Fovea width" not in g["values"]
+    afw["settings"]["Enabled"] = True
+    afw["afw_experiment"].update(coverage_enabled=False, rendering_mode=2)
+    receive(afw)
+    draw()
+    assert "Automatic stereo alignment" in g["values"] and "Invert stereo eye order" in g["values"]
+    assert "Automatic eye calibration (this session)" in g["values"]
+    assert "AFW stereo coverage" not in g["values"]
+    assert len(g.sent) == count, "Live AFW off/on must not rewrite preferences"
+    afw["afw_experiment"].update(coverage_enabled=True, rendering_mode=3)
+    afw["settings"]["CenterMode"] = 0
+    # Collapsed diagnostics must keep the AFW dump out of the normal menu.
+    receive(afw)
+    g.closed_trees["Support"] = True
+    g.closed_trees["Advanced AFW"] = True
+    draw()
+    assert not g.trees["AFW details"]
+    assert not any("Full-frame core" in t or "Last warp call" in t for t in g.drawn.values())
+    assert "Extra margin per edge" not in g["values"]
+    assert g["values"]["AFW stereo coverage"] == 2
+    assert any(t == "Selected" for t in g.drawn.values())
+    assert len(g.sent) == count
+    g.closed_trees["Support"] = False
+    g.closed_trees["Advanced AFW"] = False
+    draw()
+    assert g.tree_parents["Advanced AFW"] == "Stereo and gaze"
+    # Each mode switch is one transaction setting both legacy flags. Loading
+    # an old file with both enabled must select Automatic without rewriting it.
+    for mode in (1, 0, 2):
+        count = len(g.sent)
+        draw(changes={"AFW stereo coverage": mode})
+        assert len(g.sent) == count + 1
+        assert "AfwManualCoverage=" + str(mode == 1).lower() in last()
+        assert "AfwAutomaticCoverage=" + str(mode == 2).lower() in last()
+        afw["request"] = afw["applied_request"] = int(last().splitlines()[1])
+        afw["settings"].update(AfwManualCoverage=mode == 1, AfwAutomaticCoverage=mode == 2)
+        receive(afw)
+        draw()
+        assert g["values"]["AFW stereo coverage"] == mode
+        assert len(g.sent) == count + 1
+    afw["afw_experiment"].update(rendering_mode_known=False)
+    receive(afw)
+    draw()
+    assert any(t == "Mode unavailable" for t in g.drawn.values())
+    assert not any(t == "Selected" for t in g.drawn.values())
+    legacy_afw = copy.deepcopy(afw)
+    del legacy_afw["settings"]["AfwManualCoverage"]
+    del legacy_afw["settings"]["AfwAutomaticCoverage"]
+    del legacy_afw["settings"]["AfwWarpMargin"]
+    receive(legacy_afw)
+    draw()
+    assert "AFW stereo coverage" not in g["values"] and "Extra margin per edge" not in g["values"]
     receive(state)
     draw()  # Open every tree, validate all widget types and enum keys.
     order = list(g.tree_order.values())
     assert order.index("Stereo and gaze") < order.index("DLSS-SR") < order.index("DLSS-NR (experimental)")
-    assert g.tree_parents["Frame rate comparison"] == "DLSS-SR"
-    assert g.tree_parents["Eye calibration"] == "Diagnostics and support"
+    assert g.tree_parents["Performance"] == "Cheeky Foveated DLSS"
+    assert g.tree_parents["Eye calibration"] == "Stereo and gaze"
+    for removed in ("AFW details", "GPU timestamp collection", "Eye mapping details", "DLSS view details",
+                    "DX11 interception", "DX12 interception", "SR resolution and GPU timing", "NR status and GPU timing"):
+        assert not g.trees[removed], "Developer diagnostics must stay in support reports: " + removed
+    assert not any(t in ("Last result", "Settings revision / saved", "Crop input / output origin",
+                         "Recorded / submitted", "Layer or adapter / matching ABI") for t in g.drawn.values())
+    # Performance selects the actual NR order/shape, including a missing sample
+    # in that mode. It must not accidentally display another mode's saved time.
+    perf = copy.deepcopy(state)
+    perf["renderer"] = 1
+    perf["settings"]["NrEnabled"] = True
+    perf["apis"][1].update(before_nr_full_ms=11, before_nr_foveated_ms=12, nr_full_ms=21, nr_foveated_ms=22)
+    count = len(g.sent)
+    for before, foveated, expected in ((True, False, 11), (True, True, 12), (False, False, 21), (False, True, 22)):
+        perf["settings"].update(NrProcessingOrder=int(before), NrFoveated=foveated)
+        receive(perf)
+        draw()
+        assert ("NR + preparation (Before)" if before else "NR (After)") in list(g.drawn.values())
+        assert f"{expected:.3f} ms" in list(g.drawn.values())
+    perf["apis"][1]["nr_foveated_ms"] = None
+    receive(perf)
+    draw()
+    assert "21.000 ms" not in list(g.drawn.values()), "No full-frame fallback for an unsampled foveated NR call"
+    assert len(g.sent) == count, "Reading performance must not write settings"
+    receive(state)
+    draw()
     assert any("Waiting for VR" in str(t) for t in g.drawn.values())
-    draw("Reset eye calibration counters")
-    assert last().endswith("\ncalibration_reset")
     draw(changes={"Automatic eye calibration (this session)": False})
     assert last().endswith("\ncalibration_disable")
     draw(changes={"Automatic eye calibration (this session)": True})
@@ -187,7 +337,7 @@ def run(engine):
     # Drag across many values, then hold still. Neither movement nor time may
     # send GPU-setting updates until ImGui reports the slider inactive.
     for label, key, samples in (
-        ("Fovea width", "Width", (0.35, 0.45, 0.55, 0.75)),
+        ("Fovea width", "Width", (0.35, 0.45, 0.55, 0.2)),
         ("Crop quantization (pixels)", "GazeQuantizationPixels", (2, 4, 8, 16)),
     ):
         count = len(g.sent)
@@ -220,7 +370,7 @@ def run(engine):
     state["settings"].update(Enabled=False, NrEnabled=False)
     receive(state)
     draw()
-    assert g.trees["DLSS-SR"] and g.trees["SR resolution and GPU timing"]
+    assert g.trees["DLSS-SR"] and g.trees["Performance"]
     assert g["values"]["Fovea width"] is None and g["values"]["NR intensity"] is None
     state["settings"].update(Enabled=True, NrEnabled=True, NrFoveated=False, NrAutomaticMask=False)
     receive(state)
@@ -331,7 +481,7 @@ def run(engine):
     receive(state)
     draw()
     assert any("100.0 FPS" in t for t in g.drawn.values())
-    assert any("+50.0 FPS (+100.0%)" in t for t in g.drawn.values())
+    assert any("10.000 ms (50.0%)" in t for t in g.drawn.values())
     assert any("Not sampled / unavailable" in t for t in g.drawn.values())
     state["renderer"] = 0
     receive(state)

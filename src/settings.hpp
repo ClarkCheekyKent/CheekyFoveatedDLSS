@@ -7,6 +7,13 @@
 
 namespace cheeky::foveated_dlss {
 
+// Up to four requested regions (two eyes, fresh and filtered gaze). Bounds
+// are normalized to the complete eye image, independently of the allocation.
+struct FoveationMask {
+    float bounds[4][4]{}; // left, top, right, bottom
+    std::uint32_t count{};
+};
+
 enum class FoveationCenterMode : std::uint32_t {
     fixed = 0U,
     openxr_gaze = 1U,
@@ -35,6 +42,19 @@ struct Settings {
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
     float center_supersampling{1.0F};
+    // AFW needs donors for both eye regions even when the source eye is known.
+    // Manual mode covers both offsets; the centered fallback starts at 70%.
+    bool afw_manual_coverage{false};
+    bool afw_automatic_coverage{false};
+    float afw_warp_margin{0.05F};
+    unsigned afw_source_eye{UINT32_MAX}; // Verified identity scoped to the original core evaluation.
+    bool eye_independent_coverage{}; // Transient: never mirror a resolved AFW envelope by guessed view role.
+    float afw_gaze_width{}, afw_gaze_height{}; // Requested size before the fixed fallback envelope expands it.
+    struct AfwNrCoverage {
+        float width{}, height{}, x{}, y{}, gaze_width{}, gaze_height{};
+    } afw_nr; // Evaluation-local NR envelope; never persisted.
+    bool afw_nr_coverage{}; // NR uses its own gaze allocation without replacing SR coverage diagnostics.
+    FoveationMask afw_mask{}, afw_nr_mask{};
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};
@@ -52,6 +72,7 @@ struct Settings {
     // Per-evaluation preview geometry; never persisted.
     bool next_jump_visible{};
     float next_jump_offset_x{}, next_jump_offset_y{};
+    float next_jump_width{}, next_jump_height{};
     float gaze_smoothing_ms{20.0F};
     std::uint32_t gaze_quantization_pixels{8U};
     float gaze_jump_reset_ratio{0.125F};

@@ -34,6 +34,18 @@ UEVR_OnDeviceResetCb reset{};
 UEVR_OnCustomEventCb custom{};
 void* cached_compositor{};
 bool openvr_active{};
+bool hmd_active{true};
+std::string rendering_mode{"3"};
+void get_mod_value(const char* key, char* value, unsigned size) {
+    if (std::string(key) == "VR_RenderingMethod") strncpy_s(value, size, rendering_mode.c_str(), _TRUNCATE);
+}
+bool is_hmd_active() { return hmd_active; }
+unsigned hmd_extent() { return 256; }
+void get_projection(UEVR_Eye eye, UEVR_Matrix4x4f* out) {
+    *out = {};
+    out->m[0][0] = out->m[1][1] = out->m[2][3] = 1.F; out->m[3][2] = 10.F;
+    out->m[2][0] = eye == 0 ? .4F : -.2F;
+}
 bool is_openvr() { return openvr_active; }
 UEVR_IVRCompositor get_compositor() { return reinterpret_cast<UEVR_IVRCompositor>(cached_compositor); }
 bool add_present(UEVR_OnPresentCb f) { present = f; return true; }
@@ -70,14 +82,18 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
     auto result = WaitForSingleObject(event, 10000); CloseHandle(event); require(result == WAIT_OBJECT_0, "GPU timeout");
 }
 void settings_tests(const std::filesystem::path& root) {
-    Settings s; require(set_named_setting(s, "Width", "0.72"), "Parse setting");
+    Settings s; require(set_named_setting(s, "Width", "0.2"), "Parse setting");
     require(!set_named_setting(s, "Width", "nan"), "Reject NaN");
     require(!set_named_setting(s, "Width", "0.7trailing"), "Reject trailing garbage");
     require(!set_named_setting(s, "Enabled", "maybe"), "Reject bad bool");
     require(!set_named_setting(s, "CenterMode", "99"), "Reject enum");
     require(!set_named_setting(s, "GazeQuantizationPixels", "-1"), "Reject negative unsigned");
+    s.height = s.nr_width = s.nr_height = .2F;
     s.enabled = false; s.nr_motion_scale_x_multiplier = -1.25f;
     require(set_named_setting(s, "NrStyle", "2"), "Parse Cinematic style");
+    require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
+        "Parse AFW manual coverage settings");
+    require(set_named_setting(s, "AfwAutomaticCoverage", "true"), "Parse AFW automatic coverage setting");
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
@@ -100,10 +116,22 @@ void settings_tests(const std::filesystem::path& root) {
         require(!read_settings_file(path, r, error) && serialize_settings(r) == before,
             "Invalid NR order file was not rejected atomically");
     }
-    { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nNrWorkingScale=0.37\n"; }
+    { std::ofstream out(path); out << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nAfwDepthCoverage=1\nNrWorkingScale=0.37\n"; }
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
     require(r.nr_style == 0U, "Legacy settings must restore Standard style");
+    require(serialize_settings(r).find("AfwDepthCoverage") == std::string::npos,
+        "Retired depth setting is ignored when loading older files and omitted on save");
+    require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_warp_margin == .05F,
+        "Legacy settings restore centered AFW mode even over existing manual settings");
+    for (const auto key : {"AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"})
+        require(setting_group(key) == "gaze", "Shared AFW coverage belongs to the Stereo/gaze reset group");
+    auto reset_afw = s;
+    require(reset_settings_group(reset_afw, "sr") && reset_afw.afw_manual_coverage,
+        "SR reset must preserve shared AFW coverage used by NR");
+    require(reset_settings_group(reset_afw, "gaze") && !reset_afw.afw_manual_coverage &&
+        !reset_afw.afw_automatic_coverage && reset_afw.afw_warp_margin == .05F,
+        "Stereo/gaze reset restores all shared AFW controls");
     require(setting_groups_json().find("\"NrProcessingOrder\":\"nr\"") != std::string::npos,
         "Rendering order is missing from NR group metadata");
     r = s;
@@ -162,10 +190,14 @@ int main(int argc, char** argv) {
             require(cadence.average_ms == 0, "SR toggle starts a fresh cadence window");
         }
         const bool conflict_mode = argc > 1 && std::string(argv[1]) == "--conflict";
-        bool hardware{};
-        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--hardware") hardware = true;
+        bool hardware{}, inactive_afw{};
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--hardware") hardware = true;
+            if (std::string(argv[i]) == "--inactive-afw") inactive_afw = true;
+        }
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
+        const bool afw = mode.starts_with("--afw-");
         const bool openvr_late = mode.starts_with("--openvr-late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
@@ -190,6 +222,11 @@ int main(int argc, char** argv) {
         }
         UEVR_PluginInitializeParam api{}; api.version = &version; api.functions = &functions; api.callbacks = &callbacks; api.renderer = &renderer;
         UEVR_VRData vr_api{}; vr_api.is_openvr = is_openvr;
+        vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
+        vr_api.get_mod_value = get_mod_value;
+        vr_api.get_hmd_width = vr_api.get_hmd_height = hmd_extent;
+        if (afw || inactive_afw) api.vr = &vr_api;
+        if (inactive_afw) rendering_mode = "0";
         UEVR_OpenVRData openvr_api{}; openvr_api.get_vr_compositor = get_compositor;
         void* original_wait{};
         if (openvr_late) {
@@ -207,7 +244,7 @@ int main(int argc, char** argv) {
             api.vr = &vr_api; api.openvr = &openvr_api;
         }
         auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
-        if (late && !dx11) {
+        if ((late && !dx11) || afw) {
             // Isolate the optional fake NR runtime from ordinary host fixtures
             // and from other concurrently running test processes.
             const auto isolated = root / "nr-hooks";
@@ -220,6 +257,13 @@ int main(int argc, char** argv) {
             plugin_path = isolated / plugin_path.filename();
         }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
+        if (afw) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
+        if (inactive_afw) {
+            require(late, "Inactive AFW fixture requires a late-attachment route");
+            const auto afw_path = root / "PDAFWPlugin.dll";
+            std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", afw_path);
+            require(LoadLibraryW(afw_path.c_str()) != nullptr, "Load inactive AFW before Cheeky");
+        }
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
         require(init != nullptr, "Plugin entry export");
@@ -279,8 +323,57 @@ int main(int argc, char** argv) {
         command("1\n82\ncalibration_reset");
         require(received.find("Waiting for OpenVR or OpenXR") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
+            if (inactive_afw) {
+                present();
+                require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos &&
+                    snapshot(get).find("\"warp_calls\":0") != std::string::npos,
+                    "Inactive fixture detects AFW without executing frame warp");
+                if (!dx11) require(snapshot(get).find("\"coverage_enabled\":false") != std::string::npos &&
+                    snapshot(get).find("\"rendering_mode_known\":true,\"rendering_mode\":0") != std::string::npos,
+                    "Native Stereo explicitly disables AFW coverage before standalone DX12 evaluation");
+            }
             command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
-            verify_late_attach_test(get, command);
+            // Keep the host mode fresh just as real present callbacks do.
+            verify_late_attach_test(get, command, inactive_afw ? present : nullptr,
+                inactive_afw && !dx11 ? +[](unsigned mode) { rendering_mode = std::to_string(mode); } : nullptr);
+            return 0;
+        }
+        if (afw) {
+            const auto publish_mode = reinterpret_cast<CheekyUEVRPublishRenderingModeFn>(GetProcAddress(runtime, "CheekyUEVR_PublishRenderingMode"));
+            require(publish_mode && !publish_mode(0, 0) && !publish_mode(999, 0), "Unowned AFW mode publication rejected");
+            rendering_mode = "0"; present();
+            require(snapshot(get).find("\"coverage_enabled\":false") != std::string::npos &&
+                snapshot(get).find("\"rendering_mode\":0") != std::string::npos, "Native Stereo restores ordinary coverage without removing hooks");
+            rendering_mode = "garbage"; present();
+            require(snapshot(get).find("\"coverage_enabled\":true") != std::string::npos &&
+                snapshot(get).find("\"rendering_mode_known\":false") != std::string::npos, "Malformed mode retains conservative AFW coverage");
+            rendering_mode = "3"; present();
+            auto publish = reinterpret_cast<CheekyUEVRPublishStereoFn>(GetProcAddress(runtime, "CheekyUEVR_PublishStereo"));
+            CheekyUEVRStereoProjection invalid;
+            require(publish && !publish(0, &invalid) && !publish(999, &invalid), "Unowned projection publication rejected");
+            invalid.abi = 9; require(!publish(1, &invalid), "Unknown projection ABI rejected");
+            require(snapshot(get).find("\"projection_valid\":true") != std::string::npos, "Adapter publishes public UEVR projections");
+            hmd_active = false; present();
+            require(snapshot(get).find("\"projection_valid\":false") != std::string::npos, "Inactive host HMD clears projection data");
+            hmd_active = true; present(); reset();
+            require(snapshot(get).find("\"projection_valid\":false") != std::string::npos, "Device reset invalidates automatic coverage immediately");
+            present();
+            verify_afw_test(get, command);
+            present = nullptr; custom = nullptr; reset = nullptr;
+            FreeLibrary(plugin);
+            require(snapshot(get).find("\"projection_valid\":false") != std::string::npos,
+                "Adapter unload immediately suppresses cached AFW projections");
+            plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Reload AFW adapter");
+            init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
+            require(init(&api), "Reconnect AFW adapter");
+            require(snapshot(get).find("\"projection_valid\":false") != std::string::npos,
+                "Reattachment does not inherit another adapter generation's projections");
+            invalid.abi = 1;
+            require(!publish(1, &invalid), "Old adapter generation cannot publish after reconnect");
+            require(!publish_mode(1, 0), "Old adapter cannot disable new attachment's AFW coverage");
+            present();
+            require(snapshot(get).find("\"projection_valid\":true") != std::string::npos,
+                "Reconnected AFW adapter publishes fresh projections");
             return 0;
         }
         if (dx11) {

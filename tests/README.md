@@ -13,6 +13,19 @@ For live verification, disable SR, enable foveated NR and its green alignment
 border, and use Simulated gaze before testing Runtime gaze. Check that the NR
 region moves and gaze diagnostics update; eye calibration must already be valid.
 
+# UEVR inactive AFW regression
+
+The standard build also replays cached DX11/DX12 native, `_C`, and Streamline exports
+with `PDAFWPlugin.dll` loaded but Native Stereo selected. Run an individual case
+with `CheekyUEVRTests.exe --late-dx11 --inactive-afw` (also `--late-dx11-c` and
+`--late-streamline-dx11`, `--late-dx12`, `--late-dx12-c`, and `--late-streamline`).
+These fixtures must retain private SR creation, reuse, release, and DX12 NR
+processing even though AFW is detected. The AFW DLL is a test stub and never
+performs frame warp. Dispatch tests also check mode changes, stale/unknown mode,
+and public-to-core forwarding without weakening active AFW's private-call guard.
+The DX12 fixtures switch through AFW, unknown, and stale host modes, then require
+center/peripheral SR and NR to reset their skipped histories once on recovery.
+
 # UEVR cached OpenVR compositor regression
 
 Run `CheekyUEVRTests.exe --openvr-late-027` after building. The same test supports

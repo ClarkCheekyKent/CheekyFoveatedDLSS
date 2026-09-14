@@ -12,6 +12,8 @@
 #include "gaze_foveation.hpp"
 #include "openvr_gaze.hpp"
 #include "dlss_nr.hpp"
+#include "d3d12_ngx_dispatch.hpp"
+#include "afw_compatibility.hpp"
 #include "version.h"
 #include <atomic>
 #include <array>
@@ -60,6 +62,9 @@ std::string snapshot_locked(State& s) {
     const auto views = stereo_view_statistics();
     const auto nr = dlss_nr_snapshot();
     const auto attach = late_attach_status();
+    const auto afw = afw_compatibility_status();
+    const auto afw_projection = afw_stereo_projection();
+    const auto afw_coverage = afw_coverage_status();
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
     out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-uevr\",\"request\":" << s.request
@@ -70,6 +75,30 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"afw_experiment\":{\"enabled\":" << afw.enabled
+        << ",\"core_calls\":" << afw.core_calls << ",\"lower_calls\":" << afw.lower_calls
+        << ",\"missing_lower_calls\":" << afw.missing_lower_calls
+        << ",\"standalone_lower_calls\":" << afw.standalone_lower_calls
+        << ",\"rejected_core_reentry\":" << afw.rejected_core_reentry
+        << ",\"runtime_candidates\":" << afw.runtime_candidates << ",\"runtime_selected\":" << afw.runtime_selected
+        << ",\"warp_observer_ready\":" << afw.warp_observer_ready << ",\"warp_calls\":" << afw.warp_calls
+        << ",\"last_warp_age_ms\":" << (afw.last_warp_age_ms == UINT64_MAX ? -1LL : static_cast<long long>(afw.last_warp_age_ms))
+        << ",\"warp_metadata_supported\":" << afw.warp_metadata_supported
+        << ",\"last_warp_source_eye\":" << (afw.last_warp_source_eye < 2 ? static_cast<int>(afw.last_warp_source_eye) : -1)
+        << ",\"last_warp_mode\":" << (afw.last_warp_mode <= 3 ? static_cast<int>(afw.last_warp_mode) : -1)
+        << ",\"source_left_calls\":" << afw.source_left_calls << ",\"source_right_calls\":" << afw.source_right_calls
+        << ",\"coverage_enabled\":" << afw.coverage_enabled << ",\"rendering_mode_known\":" << afw.rendering_mode_known
+        << ",\"rendering_mode\":" << (afw.rendering_mode_known ? static_cast<int>(afw.rendering_mode) : -1)
+        << ",\"last_evaluation_eye\":" << (afw.last_evaluation_eye < 2 ? static_cast<int>(afw.last_evaluation_eye) : -1)
+        << ",\"early_left_calls\":" << afw.early_left_calls << ",\"early_right_calls\":" << afw.early_right_calls
+        << ",\"early_unknown_calls\":" << afw.early_unknown_calls
+        << ",\"projection_valid\":" << afw_projection.valid
+        << ",\"projection_width\":" << afw_projection.output_width << ",\"projection_height\":" << afw_projection.output_height
+        << ",\"coverage_observed\":" << afw_coverage.observed << ",\"coverage_mode\":" << afw_coverage.mode
+        << ",\"manual_coverage\":" << (afw_coverage.mode == 1U)
+        << ",\"effective_width\":" << afw_coverage.width << ",\"effective_height\":" << afw_coverage.height
+        << ",\"effective_x_offset\":" << afw_coverage.x_offset << ",\"effective_height_offset\":" << afw_coverage.height_offset
+        << ",\"effective_center_scale\":" << afw_coverage.center_scale << '}'
         << ",\"eye_calibration\":" << eye_calibration_json()
         << ",\"support\":{\"busy\":" << s.report_busy.load() << ",\"zip\":\"" << json_escape(path_utf8(s.report_zip)) << "\"}"
         << ",\"gpu_timing\":{\"recorded\":" << gpu.recorded << ",\"submitted\":" << gpu.submitted
@@ -87,6 +116,7 @@ std::string snapshot_locked(State& s) {
         << ",\"copies\":" << observer.copies << ",\"resets\":" << observer.resets << ",\"destroyed\":" << observer.destroyed << '}'
         << ",\"gaze\":{\"layer\":" << gaze.layer_present << ",\"abi\":" << gaze.abi_compatible
         << ",\"using_gaze\":" << gaze.using_gaze << ",\"alignment\":" << gaze.alignment_source
+        << ",\"afw_bilateral\":" << gaze.afw_bilateral << ",\"afw_fresh_sample\":" << gaze.afw_fresh_sample
         << ",\"ambiguous\":" << gaze.mapping_ambiguous << ",\"views\":" << views.active
         << ",\"submitted_copies\":" << gaze.submitted_copies
         << ",\"left_mapped\":" << gaze.views[0].resource_mapped << ",\"right_mapped\":" << gaze.views[1].resource_mapped
@@ -148,7 +178,7 @@ std::string snapshot_locked(State& s) {
         const auto& v = details[i];
         if (i) out << ',';
         out << "{\"id\":\"" << v.view_id << "\",\"eye\":\""
-            << (v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : "Unassigned")
+            << (afw.coverage_enabled ? "Unknown (AFW source eye)" : v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : "Unassigned")
             << "\",\"evaluations\":" << v.evaluations
             << ",\"input_width\":" << v.render_width << ",\"input_height\":" << v.render_height
             << ",\"output_width\":" << v.output_width << ",\"output_height\":" << v.output_height
@@ -304,6 +334,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
         active_attachment = ++s.attachment_sequence;
         *input->attachment = s.attachment_sequence;
         adapter_attached = true;
+        allow_afw_stereo_projection(true);
         eye_calibration_enable(true);
         s.cadence.reset();
         set_processing_allowed(s.graphics_ready);
@@ -314,6 +345,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
 extern "C" __declspec(dllexport) void CheekyUEVR_Detach(std::uint64_t attachment) {
     if (!attachment || active_attachment.load(std::memory_order_acquire) != attachment) return;
     adapter_attached.store(false, std::memory_order_release);
+    allow_afw_stereo_projection(false);
     eye_calibration_suspend();
     set_processing_allowed(false);
 }
@@ -323,11 +355,33 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_AttachOpenVR(std::uint64_t atta
         return attach_openvr_compositor(compositor);
     } catch (...) { return false; }
 }
+extern "C" __declspec(dllexport) bool CheekyUEVR_PublishStereo(std::uint64_t attachment, const CheekyUEVRStereoProjection* input) {
+    try {
+        if (!input || input->size != sizeof(*input) || input->abi != 1) return false;
+        auto& s = state(); std::lock_guard lock(s.mutex);
+        if (!attachment || !adapter_attached.load() || attachment != active_attachment.load()) return false;
+        publish_afw_stereo_projection(input->matrices, input->output_width, input->output_height,
+            input->active == 1 && s.graphics_ready && s.renderer == 1);
+        return true;
+    } catch (...) { return false; }
+}
+extern "C" __declspec(dllexport) bool CheekyUEVR_PublishRenderingMode(std::uint64_t attachment, std::uint32_t mode) {
+    try {
+        auto& s = state(); std::lock_guard lock(s.mutex);
+        if (!attachment || !adapter_attached.load() || attachment != active_attachment.load()) return false;
+        publish_afw_rendering_mode(s.graphics_ready && s.renderer == 1 ? mode : UINT32_MAX);
+        return true;
+    } catch (...) { return false; }
+}
 extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, std::uint32_t renderer, void* device, void* queue) {
     try {
         if (!adapter_attached.load() || attachment != active_attachment.load()) return;
         auto& s = state(); std::lock_guard lock(s.mutex);
         configure_graphics(s, renderer, device, queue);
+        if (!s.graphics_ready || renderer != 1) {
+            const float empty[2][16]{};
+            publish_afw_stereo_projection(empty, 0, 0, false);
+        }
         eye_calibration_tick();
         set_processing_allowed(s.started && s.graphics_ready);
         if (s.graphics_ready) {

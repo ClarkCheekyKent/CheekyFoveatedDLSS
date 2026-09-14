@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build"
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build",
+    [switch]$IncludeOpenXRSetup
 )
 
 Set-StrictMode -Version Latest
@@ -23,6 +24,9 @@ $files = [ordered]@{
     "licenses\OpenVR.txt" = Join-Path $projectRoot "third_party\openvr\LICENSE"
     "licenses\UEVR-API-MIT.txt" = Join-Path $projectRoot "third_party\uevr\LICENSE.txt"
 }
+if ($IncludeOpenXRSetup) {
+    $files["OpenXR\CheekyOpenXRSetup.exe"] = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe"
+}
 $manifest = @()
 foreach ($entry in $files.GetEnumerator()) {
     if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "Missing input: $($entry.Value). Build first." }
@@ -41,7 +45,7 @@ $manifest | Set-Content -LiteralPath (Join-Path $stage "SHA256SUMS.txt") -Encodi
 $head = & git -C $projectRoot rev-parse HEAD
 $dirty = [bool](& git -C $projectRoot status --porcelain)
 @("Cheeky $version UEVR $Label ($Configuration)", "Source commit: $head", "Working tree modified: $dirty",
-  "UEVR API: 2.39.0", "No NVIDIA binaries or OpenXR installer included.") |
+  "UEVR API: 2.39.0", "No NVIDIA binaries included.", "Matching optional OpenXR installer included: $IncludeOpenXRSetup") |
     Set-Content -LiteralPath (Join-Path $stage "BUILD.txt") -Encoding utf8
 $archive = Join-Path $binaryRoot "CheekyFoveatedDLSS-$version-UEVR-$Label.zip"
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -Force

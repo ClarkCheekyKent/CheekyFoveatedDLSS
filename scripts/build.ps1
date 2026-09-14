@@ -76,9 +76,17 @@ foreach ($mode in @("dx11", "dx11-c", "dx12", "dx12-c", "streamline", "streamlin
     & $uevrTest "--late-$mode"
     if ($LASTEXITCODE -ne 0) { throw "UEVR late attachment ($mode) failed with exit code $LASTEXITCODE." }
 }
+foreach ($mode in @("dx11", "dx11-c", "streamline-dx11", "dx12", "dx12-c", "streamline")) {
+    & $uevrTest "--late-$mode" --inactive-afw
+    if ($LASTEXITCODE -ne 0) { throw "UEVR inactive AFW ($mode) failed with exit code $LASTEXITCODE." }
+}
 foreach ($abi in @("022", "027", "028", "029")) {
     & $uevrTest "--openvr-late-$abi"
     if ($LASTEXITCODE -ne 0) { throw "UEVR cached OpenVR compositor ($abi) test failed." }
+}
+foreach ($mode in @("native", "native-c", "streamline", "missing-lower", "public-first", "public-first-c", "ota", "ota-c", "ota-streamline", "ota-ambiguous")) {
+    & $uevrTest "--afw-$mode"
+    if ($LASTEXITCODE -ne 0) { throw "UEVR AFW routing ($mode) failed with exit code $LASTEXITCODE." }
 }
 
 Write-Host "Built and tested:"

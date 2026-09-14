@@ -20,6 +20,13 @@ using CheekyUEVRStartFn = bool (*)(const CheekyUEVRStart*);
 using CheekyUEVRDetachFn = void (*)(std::uint64_t);
 using CheekyUEVRTickFn = void (*)(std::uint64_t, std::uint32_t, void*, void*);
 using CheekyUEVRAttachOpenVRFn = bool (*)(std::uint64_t, void*);
+struct CheekyUEVRStereoProjection {
+    std::uint32_t size{sizeof(CheekyUEVRStereoProjection)}, abi{1};
+    std::uint32_t active{}, output_width{}, output_height{};
+    float matrices[2][16]{};
+};
+using CheekyUEVRPublishStereoFn = bool (*)(std::uint64_t, const CheekyUEVRStereoProjection*);
+using CheekyUEVRPublishRenderingModeFn = bool (*)(std::uint64_t, std::uint32_t);
 using CheekyUEVRCommandFn = bool (*)(std::uint64_t, const char*);
 using CheekyUEVRSnapshotFn = bool (*)(char*, std::uint32_t);
 // Every export contains exceptions. Detach is a loader-lock-safe atomic store.

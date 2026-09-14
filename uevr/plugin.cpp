@@ -15,6 +15,8 @@ CheekyUEVRStartFn runtime_start{};
 CheekyUEVRDetachFn runtime_detach{};
 CheekyUEVRTickFn runtime_tick{};
 CheekyUEVRAttachOpenVRFn runtime_attach_openvr{};
+CheekyUEVRPublishStereoFn runtime_publish_stereo{};
+CheekyUEVRPublishRenderingModeFn runtime_publish_mode{};
 CheekyUEVRCommandFn runtime_command{};
 CheekyUEVRSnapshotFn runtime_snapshot{};
 std::atomic<bool> initialized{};
@@ -56,6 +58,34 @@ void on_present() {
         }
         const auto* r = api->renderer;
         if (runtime_tick && r && attachment) runtime_tick(attachment, r->renderer_type, r->device, r->command_queue);
+        if (runtime_publish_mode && attachment) {
+            char value[32]{};
+            if (api->vr && api->vr->get_mod_value) api->vr->get_mod_value("VR_RenderingMethod", value, sizeof(value));
+            const auto mode = value[0] >= '0' && value[0] <= '3' && value[1] == '\0'
+                ? static_cast<unsigned>(value[0] - '0') : UINT32_MAX;
+            runtime_publish_mode(attachment, mode);
+        }
+        if (runtime_publish_stereo && attachment) {
+            CheekyUEVRStereoProjection projection;
+            if (r && r->renderer_type == UEVR_RENDERER_D3D12 && r->device && r->command_queue &&
+                    api->vr && api->vr->is_hmd_active && api->vr->is_hmd_active() &&
+                    api->vr->get_ue_projection_matrix && api->vr->get_hmd_width && api->vr->get_hmd_height) {
+                projection.output_width = api->vr->get_hmd_width();
+                projection.output_height = api->vr->get_hmd_height();
+                projection.active = 1;
+                UEVR_Matrix4x4f first[2]{}, second[2]{};
+                for (int eye = 0; eye < 2; ++eye) {
+                    api->vr->get_ue_projection_matrix(eye, &first[eye]);
+                }
+                for (int eye = 0; eye < 2; ++eye) api->vr->get_ue_projection_matrix(eye, &second[eye]);
+                // Public getter copies UE's projection in its native memory
+                // order. Reject either eye or extent changing across the pair.
+                if (memcmp(first, second, sizeof(first)) != 0 || projection.output_width != api->vr->get_hmd_width() ||
+                        projection.output_height != api->vr->get_hmd_height()) projection.active = 0;
+                memcpy(projection.matrices, first, sizeof(first));
+            }
+            runtime_publish_stereo(attachment, &projection);
+        }
         std::deque<std::string> pending;
         { std::lock_guard lock(commands_mutex); pending.swap(commands); }
         for (const auto& command : pending) {
@@ -106,6 +136,8 @@ extern "C" __declspec(dllexport) bool uevr_plugin_initialize(const UEVR_PluginIn
             !load_export(dll, "CheekyUEVR_AttachOpenVR", runtime_attach_openvr)) {
             runtime_detach = nullptr; FreeLibrary(dll); return false;
         }
+        load_export(dll, "CheekyUEVR_PublishStereo", runtime_publish_stereo); // Additive, optional for older resident runtimes.
+        load_export(dll, "CheekyUEVR_PublishRenderingMode", runtime_publish_mode);
         HMODULE pinned{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(runtime_start), &pinned)) {

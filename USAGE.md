@@ -2,6 +2,8 @@
 
 Start with the [installation guide](README.md#installation). This page contains the detailed control reference.
 
+For **UEVR AFW**, use the [AFW setup and validation guide](uevr/README.md#afw-routing-experiment). That DX12 path supports SR and NR with fixed or gaze-driven coverage of both possible source eyes and bypasses ordinary eye calibration. Effective coverage can exceed the stored fovea dimensions; the AFW banner reports SR coverage, while NR status reports its processing region and working resolution.
+
 ## Controls
 
 Start with the defaults, then tune the region while looking at a representative scene:
