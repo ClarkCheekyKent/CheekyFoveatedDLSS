@@ -1,4 +1,5 @@
 #include "crop_motion.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include "nr_guides.hpp"
 #include <d3d11.h>
 #include <dxgi1_4.h>
@@ -173,7 +174,7 @@ void run12() {
         list->ResourceBarrier(1, &barrier);
         check(list->Close());
         ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1, lists);
-        crop_motion12_submitted(queue.Get(), 1, lists); collect_crop_motion12();
+        nr_recording_submitted(queue.Get(), list.Get()); collect_crop_motion12();
         ComPtr<ID3D12Fence> fence; check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
         check(queue->Signal(fence.Get(), 1));
         HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);

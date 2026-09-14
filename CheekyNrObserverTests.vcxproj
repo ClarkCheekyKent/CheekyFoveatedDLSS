@@ -40,6 +40,7 @@
     <ClCompile Include="tests\nr_observer_tests.cpp" />
     <ClCompile Include="tests\nr_lifetime_tests.cpp" />
     <ClCompile Include="tests\d3d12_composite_tests.cpp" />
+    <ClCompile Include="src\crop_motion.cpp" />
     <ClCompile Include="src\dlss_nr_lifetime.cpp" />
     <ClCompile Include="src\dlss_nr_input.cpp" />
     <ClCompile Include="src\dlss_nr_contract.cpp" />

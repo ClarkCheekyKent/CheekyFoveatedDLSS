@@ -39,13 +39,12 @@ std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext*,
 ID3D11Resource* crop_motion_resource(const std::shared_ptr<CropMotion11>&) noexcept;
 void release_crop_motion11() noexcept;
 
-// D3D12 passes are retained until the command list's submission fence completes.
+// D3D12 passes survive recording retirement and completion on every executing queue.
 ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList*,
     ID3D12Resource*, unsigned x, unsigned y, unsigned width, unsigned height,
     CropMotionOffset, D3D12_RESOURCE_STATES source_state =
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
     unsigned output_width = 0U, unsigned output_height = 0U) noexcept;
-void crop_motion12_submitted(ID3D12CommandQueue*, unsigned, ID3D12CommandList* const*) noexcept;
 void collect_crop_motion12() noexcept;
 void release_crop_motion12() noexcept;
 }
