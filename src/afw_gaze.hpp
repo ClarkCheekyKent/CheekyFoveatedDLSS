@@ -40,43 +40,31 @@ struct AfwGazeBounds {
         right = (std::min)(1.F, right + margin); bottom = (std::min)(1.F, bottom + margin);
     }
 };
-// Grow only within one settings/session epoch. Gaze motion must not toggle
-// private DLSS dimensions by a pixel and recreate its temporal history.
-inline void afw_gaze_axis(float lower, float upper, unsigned extent, unsigned quantum,
-    unsigned& retained_size, unsigned& start) noexcept {
-    const auto lo = static_cast<unsigned>(std::floor(std::clamp(lower, 0.F, 1.F) * extent));
-    const auto hi = static_cast<unsigned>(std::ceil(std::clamp(upper, 0.F, 1.F) * extent));
+// Fixed allocation budget from configuration/projection, independent of gaze.
+inline unsigned afw_gaze_size(float fraction, unsigned extent, unsigned quantum) noexcept {
     quantum = std::clamp(quantum, 1U, 64U);
-    retained_size = (std::min)(extent, (std::max)(retained_size, ((hi - lo + quantum - 1) / quantum) * quantum));
-    const auto minimum = hi > retained_size ? hi - retained_size : 0U;
-    const auto maximum = (std::min)(lo, extent - retained_size);
-    const auto desired = (minimum + maximum) / 2;
-    const auto aligned = ((desired + quantum / 2) / quantum) * quantum;
-    start = std::clamp(aligned, minimum, maximum); // Coverage takes precedence over quantization at an edge.
+    const auto pixels = static_cast<unsigned>(std::ceil(std::clamp(fraction, .001F, 1.F) * extent));
+    return (std::min)(extent, ((pixels + quantum - 1) / quantum) * quantum);
 }
-
-// Grow immediately; shrink only after one second continuously below a useful
-// reduction threshold. Retain the largest request in that interval and a
-// quantum of headroom, so jitter cannot churn DLSS features every frame.
-struct AfwGazeAllocation {
-    unsigned candidate{};
-    double since{-1.};
-    void update(float lower, float upper, unsigned extent, unsigned quantum,
-        double now, unsigned& retained) noexcept {
-        quantum = std::clamp(quantum, 1U, 64U);
-        const unsigned lo = static_cast<unsigned>(std::floor(std::clamp(lower, 0.F, 1.F) * extent));
-        const unsigned hi = static_cast<unsigned>(std::ceil(std::clamp(upper, 0.F, 1.F) * extent));
-        const unsigned needed = (std::min)(extent, ((hi - lo + quantum - 1) / quantum) * quantum);
-        const unsigned headroom = (std::min)(extent, needed + quantum);
-        const unsigned threshold = (std::max)(2U * quantum, retained / 8U);
-        if (headroom >= retained || retained - headroom < threshold || !std::isfinite(now)) {
-            candidate = 0; since = -1.; return;
-        }
-        if (since < 0. || now < since) { since = now; candidate = headroom; }
-        candidate = (std::max)(candidate, headroom);
-        if (now - since >= 1.) {
-            retained = candidate; candidate = 0; since = -1.;
-        }
+inline unsigned afw_gaze_start(float center, unsigned extent, unsigned size, unsigned quantum) noexcept {
+    quantum = std::clamp(quantum, 1U, 64U);
+    const auto maximum = extent - size;
+    const auto desired = static_cast<unsigned>(std::lround(std::clamp(center * extent - size * .5F, 0.F, float(maximum))));
+    return (std::min)(maximum, ((desired + quantum / 2) / quantum) * quantum);
+}
+// The same budget is used for either source eye, including asymmetric FOVs.
+inline AfwMaskExtent afw_gaze_budget(const Settings& settings, const AfwStereoProjection& projection) noexcept {
+    AfwMaskExtent budget{};
+    for (unsigned source = 0; source < 2; ++source) {
+        FoveationMask mask{};
+        for (unsigned eye = 0; eye < 2; ++eye)
+            afw_mask_include(mask, projection.centers[eye], settings.afw_gaze_width,
+                settings.afw_gaze_height, settings.afw_warp_margin, &projection, eye,
+                settings.afw_source_eye < 2 ? source : UINT32_MAX);
+        const auto b = afw_mask_extent(mask, &projection, settings.afw_source_eye < 2 ? source : UINT32_MAX);
+        budget.width = (std::max)(budget.width, b.width);
+        budget.height = (std::max)(budget.height, b.height);
     }
-};
+    return budget;
+}
 }

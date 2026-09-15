@@ -136,6 +136,7 @@ bool verify_model_tuning(NgxParameters* parameters, const Settings& settings,
 }
 
 struct GpuResources {
+    bool border_only{};
     NrGuidePass guides;
     NrLifetime uses;
     std::uint64_t last_use{};
@@ -698,7 +699,8 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     const NrRegion& region,
     const std::uint32_t working_width,
     const std::uint32_t working_height,
-    GpuResources& gpu
+    GpuResources& gpu,
+    const GpuResources* shared = nullptr
 ) noexcept {
     ID3D12Device* device{};
     ID3DBlob* encoded{};
@@ -755,31 +757,33 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     texture.SampleDesc.Count = 1U;
     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    result = device->CreateCommittedResource(
-        &heap,
-        D3D12_HEAP_FLAG_NONE,
-        &texture,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        nullptr,
-        IID_PPV_ARGS(&gpu.original_output)
-    );
-    if (FAILED(result)) return fail("CreateCommittedResource(original)", result);
-    texture.Width = working_width;
-    texture.Height = working_height;
-    for (auto** destination : {&gpu.color_proxy, &gpu.neural_output}) {
+    if (!gpu.border_only) {
         result = device->CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &texture,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             nullptr,
-            IID_PPV_ARGS(destination)
+            IID_PPV_ARGS(&gpu.original_output)
         );
-        if (FAILED(result)) return fail("CreateCommittedResource", result);
+        if (FAILED(result)) return fail("CreateCommittedResource(original)", result);
+        texture.Width = working_width;
+        texture.Height = working_height;
+        for (auto** destination : {&gpu.color_proxy, &gpu.neural_output}) {
+            result = device->CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &texture,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                nullptr,
+                IID_PPV_ARGS(destination)
+            );
+            if (FAILED(result)) return fail("CreateCommittedResource", result);
+        }
+        gpu.original_output->SetName(L"Cheeky DLSS-NR original HDR output");
+        gpu.color_proxy->SetName(L"Cheeky DLSS-NR color proxy");
+        gpu.neural_output->SetName(L"Cheeky DLSS-NR neural output");
     }
-    gpu.original_output->SetName(L"Cheeky DLSS-NR original HDR output");
-    gpu.color_proxy->SetName(L"Cheeky DLSS-NR color proxy");
-    gpu.neural_output->SetName(L"Cheeky DLSS-NR neural output");
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap{};
     descriptor_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -833,6 +837,16 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     cpu.ptr += gpu.descriptor_size;
     device->CreateUnorderedAccessView(game_output, nullptr, &game_uav, cpu);
 
+    if (shared && shared->root_signature && shared->border_pipeline &&
+        (gpu.border_only || (shared->encode_pipeline && shared->decode_pipeline))) {
+        gpu.root_signature = shared->root_signature; gpu.root_signature->AddRef();
+        gpu.border_pipeline = shared->border_pipeline; gpu.border_pipeline->AddRef();
+        if (!gpu.border_only) {
+            gpu.encode_pipeline = shared->encode_pipeline; gpu.encode_pipeline->AddRef();
+            gpu.decode_pipeline = shared->decode_pipeline; gpu.decode_pipeline->AddRef();
+        }
+        cleanup(); return true;
+    }
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 3U;
@@ -1104,52 +1118,54 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
 }
 )";
 
-    result = D3DCompile(
-        shader,
-        sizeof(shader) - 1U,
-        "Cheeky DLSS-NR codec",
-        nullptr,
-        nullptr,
-        "EncodeMain",
-        "cs_5_1",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0U,
-        &encoded,
-        &shader_errors
-    );
-    if (FAILED(result)) return fail("D3DCompile(encode)", result);
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature = gpu.root_signature;
-    pipeline.CS = {encoded->GetBufferPointer(), encoded->GetBufferSize()};
-    result = device->CreateComputePipelineState(
-        &pipeline,
-        IID_PPV_ARGS(&gpu.encode_pipeline)
-    );
-    if (FAILED(result)) return fail("CreateComputePipelineState(encode)", result);
-    release(shader_errors);
-    result = D3DCompile(
-        shader,
-        sizeof(shader) - 1U,
-        "Cheeky DLSS-NR codec",
-        nullptr,
-        nullptr,
-        "DecodeMain",
-        "cs_5_1",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0U,
-        &decoded,
-        &shader_errors
-    );
-    if (FAILED(result)) return fail("D3DCompile(decode)", result);
-    pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
-    result = device->CreateComputePipelineState(
-        &pipeline,
-        IID_PPV_ARGS(&gpu.decode_pipeline)
-    );
-    if (FAILED(result)) return fail("CreateComputePipelineState(decode)", result);
-    release(decoded);
-    release(shader_errors);
-    result = D3DCompile(shader, sizeof(shader), nullptr, nullptr, nullptr,
+    if (!gpu.border_only) {
+        result = compile_nr_shader(
+            shader,
+            sizeof(shader) - 1U,
+            "Cheeky DLSS-NR codec",
+            nullptr,
+            nullptr,
+            "EncodeMain",
+            "cs_5_1",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0U,
+            &encoded,
+            &shader_errors
+        );
+        if (FAILED(result)) return fail("D3DCompile(encode)", result);
+        pipeline.CS = {encoded->GetBufferPointer(), encoded->GetBufferSize()};
+        result = device->CreateComputePipelineState(
+            &pipeline,
+            IID_PPV_ARGS(&gpu.encode_pipeline)
+        );
+        if (FAILED(result)) return fail("CreateComputePipelineState(encode)", result);
+        release(shader_errors);
+        result = compile_nr_shader(
+            shader,
+            sizeof(shader) - 1U,
+            "Cheeky DLSS-NR codec",
+            nullptr,
+            nullptr,
+            "DecodeMain",
+            "cs_5_1",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0U,
+            &decoded,
+            &shader_errors
+        );
+        if (FAILED(result)) return fail("D3DCompile(decode)", result);
+        pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
+        result = device->CreateComputePipelineState(
+            &pipeline,
+            IID_PPV_ARGS(&gpu.decode_pipeline)
+        );
+        if (FAILED(result)) return fail("CreateComputePipelineState(decode)", result);
+        release(decoded);
+        release(shader_errors);
+    }
+    result = compile_nr_shader(shader, sizeof(shader), nullptr, nullptr, nullptr,
         "BorderMain", "cs_5_0", 0U, 0U, &decoded, &shader_errors);
     if (FAILED(result)) return fail("D3DCompile(border)", result);
     pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
@@ -1173,22 +1189,55 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     const DlssNrFrame& frame,
     const NrRegion& region,
     const std::uint32_t working_width,
-    const std::uint32_t working_height
+    const std::uint32_t working_height,
+    const bool border_only = false
 ) noexcept {
     for (auto& gpu : view.gpu_resources) {
-        if (gpu.game_output == frame.color && gpu.width == region.width &&
-            gpu.height == region.height && gpu.working_width == working_width &&
-            gpu.working_height == working_height &&
+        if (gpu.border_only == border_only && gpu.game_output == frame.color &&
+            (border_only || (gpu.width == region.width && gpu.height == region.height &&
+            gpu.working_width == working_width && gpu.working_height == working_height &&
             gpu.guides.source_motion.Get() == frame.motion_vectors &&
-            gpu.guides.source_depth.Get() == frame.depth) {
+            gpu.guides.source_depth.Get() == frame.depth))) {
             if (!gpu.uses.record(frame.command_list)) return nullptr;
             gpu.last_use = ++view.gpu_use_sequence;
             return &gpu;
         }
     }
-    if (view.gpu_resources.size() >= gpu_resource_cache_capacity) {
+    // Rebind rotating inputs only after every recording referencing the old
+    // descriptors is complete. Keep the intermediate textures and pipelines.
+    for (auto& gpu : view.gpu_resources) {
+        if (gpu.border_only != border_only || (!border_only &&
+            (gpu.width != region.width || gpu.height != region.height ||
+             gpu.working_width != working_width || gpu.working_height != working_height))) continue;
+        gpu.uses.collect();
+        if (!gpu.uses.empty()) continue;
+        Microsoft::WRL::ComPtr<ID3D12Device> device, incoming;
+        if (FAILED(gpu.game_output->GetDevice(IID_PPV_ARGS(&device))) ||
+            FAILED(frame.color->GetDevice(IID_PPV_ARGS(&incoming))) || device != incoming) continue;
+        const auto desc = frame.color->GetDesc();
+        if (!is_dlss_nr_output_compatible(desc)) continue;
+        auto cpu = gpu.descriptors->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{}; srv.Format = desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(frame.color, &srv, cpu);
+        cpu.ptr += 6U * gpu.descriptor_size;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{}; uav.Format = desc.Format; uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(frame.color, nullptr, &uav, cpu);
+        cpu.ptr += gpu.descriptor_size;
+        device->CreateUnorderedAccessView(frame.color, nullptr, &uav, cpu);
+        frame.color->AddRef(); release(gpu.game_output); gpu.game_output = frame.color;
+        if (!border_only) gpu.guides.rebind(device.Get(), frame.motion_vectors, frame.depth);
+        ++diagnostics.resource_rebinds;
+        if (!gpu.uses.record(frame.command_list)) return nullptr;
+        gpu.last_use = ++view.gpu_use_sequence;
+        return &gpu;
+    }
+    if (std::count_if(view.gpu_resources.begin(), view.gpu_resources.end(),
+            [&](const auto& gpu) { return gpu.border_only == border_only; }) >= gpu_resource_cache_capacity) {
         auto oldest = view.gpu_resources.end();
         for (auto it = view.gpu_resources.begin(); it != view.gpu_resources.end(); ++it) {
+            if (it->border_only != border_only) continue;
             it->uses.collect();
             if (it->uses.empty() && (oldest == view.gpu_resources.end() ||
                     it->last_use < oldest->last_use)) oldest = it;
@@ -1202,21 +1251,32 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         release_gpu(*oldest);
         view.gpu_resources.erase(oldest);
     }
+    const GpuResources* shared{};
+    Microsoft::WRL::ComPtr<ID3D12Device> incoming;
+    if (FAILED(frame.color->GetDevice(IID_PPV_ARGS(&incoming)))) return nullptr;
+    for (const auto& candidate : view.gpu_resources) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        if ((!border_only && candidate.border_only) ||
+            FAILED(candidate.game_output->GetDevice(IID_PPV_ARGS(&device))) || device != incoming) continue;
+        shared = &candidate; break;
+    }
     view.gpu_resources.push_back(GpuResources{});
     auto& gpu = view.gpu_resources.back();
+    gpu.border_only = border_only;
     if (!gpu.uses.record(frame.command_list) || !initialize_gpu_resources(
             frame.command_list,
             frame.color,
             region,
             working_width,
             working_height,
-            gpu
-        ) || !gpu.guides.initialize(frame.motion_vectors, frame.depth, working_width, working_height)) {
+            gpu, shared
+        ) || (!border_only && !gpu.guides.initialize(frame.motion_vectors, frame.depth, working_width, working_height, shared ? &shared->guides : nullptr))) {
         release_gpu(gpu);
         view.gpu_resources.pop_back();
         return nullptr;
     }
     gpu.last_use = ++view.gpu_use_sequence;
+    if (border_only) ++diagnostics.border_creations; else ++diagnostics.codec_creations;
     return &gpu;
 }
 
@@ -1327,9 +1387,11 @@ void dispatch_codec(
         float mask_bounds[4][4];
     };
     static_assert(sizeof(CodecConstants) == 40U * sizeof(std::uint32_t));
+    const auto width = gpu.border_only ? region.width : gpu.width;
+    const auto height = gpu.border_only ? region.height : gpu.height;
     CodecConstants constants{
-        {gpu.width, gpu.height},
-        {gpu.width, gpu.height},
+        {width, height},
+        {width, height},
         {region.base_x, region.base_y},
         {gpu.working_width, gpu.working_height},
         settings.nr_paper_white_scale,
@@ -1337,7 +1399,7 @@ void dispatch_codec(
         settings.nr_color_strength,
         (frame.create_flags & 1U) != 0U ? 1U : 0U,
         {0U, 0U},
-        {gpu.width, gpu.height},
+        {width, height},
         region.shape_width,
         region.shape_height,
         region.roundness,
@@ -1347,8 +1409,8 @@ void dispatch_codec(
     };
     std::memcpy(constants.mask_bounds, region.mask.bounds, sizeof(constants.mask_bounds));
     frame.command_list->SetComputeRoot32BitConstants(2U, 40U, &constants, 0U);
-    const auto dispatch_width = (std::max)(gpu.width, gpu.working_width);
-    const auto dispatch_height = (std::max)(gpu.height, gpu.working_height);
+    const auto dispatch_width = (std::max)(width, gpu.working_width);
+    const auto dispatch_height = (std::max)(height, gpu.working_height);
     frame.command_list->Dispatch(
         (dispatch_width + 15U) / 16U,
         (dispatch_height + 15U) / 16U,
@@ -1893,7 +1955,7 @@ void draw_dlss_nr_border(const DlssNrFrame& input_frame, const Settings& input_s
     region.base_x = x.base; region.base_y = y.base;
     region.width = x.extent; region.height = y.extent;
     auto& view = find_or_create_view(frame.view_id);
-    auto* gpu = find_or_create_gpu(view, frame, region, 8U, 8U);
+    auto* gpu = find_or_create_gpu(view, frame, region, 8U, 8U, true);
     if (!gpu || !record_use(view, frame.command_list)) return;
     transition(frame.command_list, frame.color, frame.color_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     dispatch_codec(frame, *gpu, gpu->border_pipeline, 1U, 6U, settings, region);

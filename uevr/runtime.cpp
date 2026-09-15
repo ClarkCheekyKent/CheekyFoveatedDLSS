@@ -144,6 +144,9 @@ std::string snapshot_locked(State& s) {
         << ",\"region_width\":" << nr.region_width << ",\"region_height\":" << nr.region_height
         << ",\"region_x\":" << nr.region_base_x << ",\"region_y\":" << nr.region_base_y
         << ",\"working_width\":" << nr.working_width << ",\"working_height\":" << nr.working_height
+        << ",\"codec_creations\":" << nr.codec_creations
+        << ",\"border_creations\":" << nr.border_creations
+        << ",\"resource_rebinds\":" << nr.resource_rebinds
         << ",\"vram_bytes\":" << nr.intermediate_vram_bytes << "},\"apis\":[";
     for (unsigned index = 0; index < 2; ++index) {
         const auto d = diagnostic_snapshot(index ? DiagnosticApi::d3d12 : DiagnosticApi::d3d11);

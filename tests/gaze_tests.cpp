@@ -1820,17 +1820,18 @@ void test_afw_gaze_integration() {
     for (auto& v : sample.views) v.center_u = .9F;
     fresh(); expect(evaluate(), "Large filtered gaze movement evaluates");
     expect(crop.input_base_x + crop.input_width == 1000, "Fresh edge gaze remains covered while smoothing trails behind");
+    expect(crop.input_width == first.input_width, "Smoothing lag cannot enlarge the AFW allocation");
     const auto grown = crop.input_width;
     for (auto& v : sample.views) v.center_u = .5F;
     fresh(); expect(evaluate() && crop.input_width == grown, "Coverage does not shrink immediately as gaze returns");
     expect(evaluate(701) && reset, "A separate native DLSS handle starts an independent gaze history");
-    fresh(); expect(evaluate(700) && !reset, "Returning to the first handle retains its own temporal state");
+    fresh(); expect(evaluate(700) && crop.input_width == first.input_width, "Returning to the first handle retains fixed allocation dimensions");
     sample.status_flags &= ~CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
     fresh(); expect(evaluate() && !gaze_diagnostics().using_gaze, "Focus loss stops gaze immediately");
     sample.status_flags |= CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
     fresh(); expect(evaluate() && reset && gaze_diagnostics().using_gaze, "Focus reacquisition resets center history");
     ++sample.session_generation;
-    fresh(); expect(evaluate() && reset && crop.input_width < grown, "New runtime session drops old smoothing and oversized allocation");
+    fresh(); expect(evaluate() && reset && crop.input_width == grown, "New runtime session resets smoothing without resizing the configured allocation");
     sample.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
     fresh(); test_openvr_snapshot = &sample;
     expect(calculate_coordinated_crop(settings, 700, nullptr, 1000, 800, 2000, 1600, 0, 0, crop, reset) && reset &&
@@ -1865,6 +1866,17 @@ void test_afw_gaze_integration() {
     expect(preview.next_jump_visible && preview.next_jump_width > 0 && preview.next_jump_height > 0 &&
         preview.afw_mask.count == 4, "AFW publishes an independently sized jump preview and both raw/filtered eye masks");
     const auto preview_crop = crop;
+    settings.gaze_smoothing_ms = 100.F;
+    for (unsigned frame = 0; frame < 160; ++frame) {
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            sample.views[eye].center_u = (frame % 2 ? .99F : .01F) + (eye ? -.001F : .001F);
+            sample.views[eye].center_v = (frame % 3) * .49F + .01F;
+        }
+        fresh(); expect(evaluate() && crop.input_width == preview_crop.input_width &&
+            crop.input_height == preview_crop.input_height && crop.output_width == preview_crop.output_width &&
+            crop.output_height == preview_crop.output_height,
+            "Simulated jumps, binocular disparity and smoothing never resize SR/NR crop allocations");
+    }
     settings.show_next_jump_target = false;
     fresh(); expect(evaluate() && crop.input_width == preview_crop.input_width && crop.input_height == preview_crop.input_height,
         "Turning off the preview cannot resize current DLSS coverage");
@@ -1876,8 +1888,8 @@ void test_afw_gaze_integration() {
     expect(!preview.next_jump_visible, "One missing future eye suppresses an incomplete preview");
     sample.status_flags &= ~CHEEKY_GAZE_STATUS_GAZE_VALID;
     Sleep(110); publish(); expect(evaluate() && !gaze_diagnostics().afw_fresh_sample, "Tracking loss enters hold/return policy");
-    Sleep(160); publish(); expect(evaluate() && !gaze_diagnostics().using_gaze && crop.input_width >= 700,
-        "Tracking loss returns to the generous fixed fallback");
+    Sleep(160); publish(); expect(evaluate() && !gaze_diagnostics().using_gaze && crop.input_width == preview_crop.input_width,
+        "Tracking loss moves to fallback placement without resizing the gaze allocation");
     allow_afw_stereo_projection(false);
     expect(evaluate() && !gaze_diagnostics().using_gaze, "Host detach disables gaze despite a retained runtime snapshot");
     reset_gaze_foveation();
@@ -1916,6 +1928,16 @@ void test_afw_source_projection_coverage() {
         if (frame >= 2) expect(!reset, "Alternating optical offsets must not reset DLSS temporal history");
         apply_next_jump_preview(settings, 771); masks[eye] = settings.afw_mask;
         expect(crops[eye].input_width < 500, "Same gaze ray must not become a 70% raw-UV stereo union");
+    }
+    for (unsigned source : {UINT32_MAX, 0U, UINT32_MAX, 1U}) {
+        requested.afw_source_eye = source;
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now); sample.publication_qpc = now.QuadPart; ++sample.predicted_display_time;
+        publish_afw_stereo_projection(matrices, 2000, 1600, true);
+        const auto settings = afw_experiment_settings(requested, &projection);
+        CropGeometry current{}; bool reset{};
+        expect(calculate_coordinated_crop(settings, 771, nullptr, 1000, 800, 2000, 1600, 0, 0, current, reset, &sample) &&
+            current.input_width == crops[0].input_width && current.input_height == crops[0].input_height,
+            "Temporary source-eye metadata loss never resizes a warmed AFW gaze allocation");
     }
     expect(crops[0].input_width == crops[1].input_width && crops[0].input_height == crops[1].input_height,
         "Alternating source eyes retain the same private reconstruction allocation");
@@ -1966,19 +1988,14 @@ void test_afw_source_projection_coverage() {
 
 void test_afw_gaze_pixel_coverage() {
     using namespace cheeky::foveated_dlss;
-    AfwGazeAllocation shrink;
-    unsigned allocated = 800, allocation_start{};
-    shrink.update(.3F, .7F, 1000, 8, 10., allocated);
-    shrink.update(.3F, .7F, 1000, 8, 10.99, allocated);
-    expect(allocated == 800, "Transient smaller coverage cannot churn DLSS allocations");
-    shrink.update(.3F, .7F, 1000, 8, 11., allocated);
-    expect(allocated >= 400 && allocated <= 416, "Sustained smaller coverage releases excess allocation with headroom");
-    afw_gaze_axis(.1F, .9F, 1000, 8, allocated, allocation_start);
-    expect(allocated >= 800, "Coverage grows immediately after shrinking");
-    shrink.update(.3F, .7F, 1000, 8, 12., allocated);
-    shrink.update(.1F, .9F, 1000, 8, 12.9, allocated);
-    shrink.update(.3F, .7F, 1000, 8, 13., allocated);
-    expect(allocated >= 800, "A larger intervening request restarts the shrink delay");
+    for (unsigned extent : {999U, 1000U, 1651U}) {
+        const auto size = afw_gaze_size(.34F, extent, 8);
+        for (unsigned step = 0; step <= 1000; ++step) {
+            const auto start = afw_gaze_start(step / 1000.F, extent, size, 8);
+            expect(start + size <= extent, "Fixed AFW allocation stays inside the texture at both edges");
+            expect(size == afw_gaze_size(.34F, extent, 8), "Placement never changes AFW allocation dimensions");
+        }
+    }
     AfwDepthEyes identity;
     identity.record(1, 20, 100, 4); identity.record(0, 10, 101, 4);
     expect(identity.lookup(10, 102, 4) == 0 && identity.lookup(20, 102, 4) == 1,
@@ -2008,21 +2025,15 @@ void test_afw_gaze_pixel_coverage() {
             previous_width = region.width;
         }
         for (unsigned quantum : {1U, 8U, 64U}) {
-            unsigned retained{};
+            const auto size = afw_gaze_size(.217F, extent, quantum);
             for (unsigned step = 0; step <= 100; ++step) {
-                AfwGazeBounds bounds;
-                bounds.include({step / 100.F, .5F, 1}, .217F, .3F);
-                bounds.include({1.F - step / 100.F, .5F, 1}, .217F, .3F);
-                bounds.pad(.031F);
-                unsigned start{};
-                afw_gaze_axis(bounds.left, bounds.right, extent, quantum, retained, start);
-                FoveationParameters parameters{}; parameters.width = static_cast<float>(retained) / extent; parameters.height = 1.F;
-                CropGeometry crop;
-                expect(calculate_foveation_geometry_at_center(parameters, {(start + retained * .5F) / extent, .5F, 1},
-                    extent, extent, extent * 2, extent * 2, 0, 0, crop), "AFW integer envelope resolves at odd and even render dimensions");
-                expect(crop.input_base_x == start && crop.input_width == retained &&
-                    crop.input_base_x <= bounds.left * extent && crop.input_base_x + crop.input_width >= bounds.right * extent,
-                    "Quantized crop retains complete bilateral coverage at image boundaries");
+                const auto start = afw_gaze_start(step / 100.F, extent, size, quantum);
+                FoveationParameters p; p.width = p.height = float(size) / extent;
+                CropGeometry crop{};
+                expect(calculate_foveation_geometry_at_center(p, {(start + size * .5F) / extent, .5F, 1},
+                    extent, extent, extent * 2, extent * 2, 0, 0, crop), "Fixed AFW crop resolves at odd and even render dimensions");
+                expect(crop.input_width == size && crop.output_width == size * 2 && crop.input_base_x + size <= extent,
+                    "Quantized translation preserves input and output allocation extents at image boundaries");
             }
         }
     }
@@ -2031,6 +2042,11 @@ void test_afw_gaze_pixel_coverage() {
 int run_d3d12_history_tests();
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--afw-gaze") == 0) {
+        test_afw_gaze_integration(); test_afw_source_projection_coverage(); test_afw_gaze_pixel_coverage();
+        if (!failures) std::cout << "AFW fixed allocation gaze tests passed\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-history") == 0) return run_d3d12_history_tests();
     if (argc == 3 && std::strcmp(argv[1], "--afw-runtime-file") == 0) {
         const bool supported = cheeky::foveated_dlss::known_afw_warp_file(std::filesystem::path(argv[2]).c_str());
