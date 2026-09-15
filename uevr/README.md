@@ -79,9 +79,9 @@ The same controls apply to foveated NR with SR disabled. NR supports Before/Afte
 
 ### Gaze and transitions
 
-Runtime gaze and simulated gaze cover both eyes' fresh and smoothed gaze positions. In gaze modes, **AFW tracking-loss fallback** selects the fixed coverage used when tracking is unavailable. Each eye must provide a valid sample and matching projection. Brief tracking loss holds the last position before returning to fixed coverage; loss of focus stops live gaze immediately.
+Runtime gaze and simulated gaze use a fixed crop budget derived from the fovea dimensions, warp margin and stereo projection. Fresh gaze takes priority when smoothing trails outside that budget; widely separated eye samples or masks can be clipped to the budget. In gaze modes, **AFW tracking-loss fallback** selects the fixed coverage used when tracking is unavailable. Each eye must provide a valid sample and matching projection. Brief tracking loss holds the last position before returning to fixed coverage; loss of focus stops live gaze immediately.
 
-The allocation grows when needed and shrinks after one second of sustained smaller coverage. Small gaze movements retain temporal history. Jump simulations support **Show next jump target** without changing current coverage.
+Gaze movement, smoothing and tracking loss change placement without resizing the allocation. Tracking loss moves the fixed gaze allocation toward the configured fallback position. Changing fovea dimensions or stereo projection can resize it. Small gaze movements retain temporal history. Jump simulations support **Show next jump target** without changing current coverage.
 
 Switching UEVR away from AFW restores ordinary stereo controls and marker calibration during the same session. AFW coverage returns when AFW is selected again. The resolution-protecting hooks remain installed while the AFW runtime is loaded.
 

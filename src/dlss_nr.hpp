@@ -98,6 +98,7 @@ struct DlssNrSnapshot {
     std::uint32_t working_width{};
     std::uint32_t working_height{};
     std::uint64_t intermediate_vram_bytes{};
+    std::uint64_t codec_creations{}, border_creations{}, resource_rebinds{};
 };
 
 [[nodiscard]] bool evaluate_dlss_nr(

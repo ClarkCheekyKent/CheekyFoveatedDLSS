@@ -29,7 +29,6 @@ struct AfwGazeState {
     unsigned pattern{}, mode{}, quantum{};
     float width{}, height{}, margin{};
     bool configured{}, openvr{};
-    AfwGazeAllocation shrink_x{}, shrink_y{};
 };
 
 struct ViewState {
@@ -257,6 +256,7 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
     const bool epoch = !afw.configured || mode_changed || projection_changed || afw.host_generation != projection.generation ||
         afw.render_width != rw || afw.render_height != rh || afw.output_width != ow || afw.output_height != oh ||
         afw.width != settings.afw_gaze_width || afw.height != settings.afw_gaze_height ||
+        afw.margin != settings.afw_warp_margin ||
         afw.quantum != settings.gaze_quantization_pixels ||
         (loaded && (afw.session != snapshot.session_generation || afw.swapchain != snapshot.swapchain_generation ||
             afw.openvr != ((snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0)));
@@ -290,7 +290,7 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
         ? static_cast<float>(seconds_between(now, snapshot.publication_qpc) * 1000.) : -1.F;
     diagnostics.afw_fresh_sample = valid;
     if (loaded) strncpy_s(diagnostics.runtime_name, snapshot.runtime_name, _TRUNCATE);
-    if (!valid && !afw.temporal[0].has_filtered && !afw.temporal[1].has_filtered) return fallback();
+    if (!valid && !afw.temporal[0].has_filtered && !afw.temporal[1].has_filtered && !afw.allocated_width) return fallback();
     CropGeometry fixed{};
     if (!calculate_crop(settings, rw, rh, ow, oh, ox, oy, fixed)) return false;
     const auto fixed_center = foveation_center_from_geometry(fixed, rw, rh);
@@ -322,20 +322,33 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
     state.afw_mask = tracking ? mask : settings.afw_mask;
     if (source_known && state.afw_mask.count) {
         const auto b = afw_mask_extent(state.afw_mask, &projection, settings.afw_source_eye);
-        bounds = {std::clamp(b.left, 0.F, 1.F), std::clamp(b.top, 0.F, 1.F),
-            std::clamp(b.right, 0.F, 1.F), std::clamp(b.bottom, 0.F, 1.F)};
-        unsigned unused{};
-        afw.shrink_x.update(0, b.width, rw, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_width);
-        afw.shrink_y.update(0, b.height, rh, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_height);
-        afw_gaze_axis(0, b.width, rw, settings.gaze_quantization_pixels, afw.allocated_width, unused);
-        afw_gaze_axis(0, b.height, rh, settings.gaze_quantization_pixels, afw.allocated_height, unused);
-    } else {
-        afw.shrink_x.update(bounds.left, bounds.right, rw, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_width);
-        afw.shrink_y.update(bounds.top, bounds.bottom, rh, settings.gaze_quantization_pixels, seconds_between(now, 0), afw.allocated_height);
+        bounds = {b.left, b.top, b.right, b.bottom};
     }
-    unsigned x{}, y{};
-    afw_gaze_axis(bounds.left, bounds.right, rw, settings.gaze_quantization_pixels, afw.allocated_width, x);
-    afw_gaze_axis(bounds.top, bounds.bottom, rh, settings.gaze_quantization_pixels, afw.allocated_height, y);
+    if (!afw.allocated_width) {
+        // Source-eye metadata can briefly disappear. That changes placement,
+        // not the allocation chosen when this gaze session began.
+        const auto budget = afw_gaze_budget(settings, projection);
+        afw.allocated_width = afw_gaze_size(budget.width, rw, settings.gaze_quantization_pixels);
+        afw.allocated_height = afw_gaze_size(budget.height, rh, settings.gaze_quantization_pixels);
+    }
+    // Prefer fresh gaze when smoothing lags outside the fixed budget. Never
+    // enlarge the allocation to span a saccade or a tracking-loss transition.
+    if (valid) {
+        FoveationMask fresh_mask{};
+        for (unsigned eye = 0; eye < 2; ++eye)
+            afw_mask_include(fresh_mask, raw[eye], settings.afw_gaze_width, settings.afw_gaze_height,
+                settings.afw_warp_margin, &projection, eye, settings.afw_source_eye);
+        const auto fresh_bounds = afw_mask_extent(fresh_mask);
+        const auto fit = [](float center, float lo, float hi, float size) {
+            if (hi - lo >= size) return (lo + hi) * .5F;
+            return std::clamp(center, hi - size * .5F, lo + size * .5F);
+        };
+        const float u = fit((bounds.left + bounds.right) * .5F, fresh_bounds.left, fresh_bounds.right, float(afw.allocated_width) / rw);
+        const float v = fit((bounds.top + bounds.bottom) * .5F, fresh_bounds.top, fresh_bounds.bottom, float(afw.allocated_height) / rh);
+        bounds = {u, v, u, v};
+    }
+    const auto x = afw_gaze_start((bounds.left + bounds.right) * .5F, rw, afw.allocated_width, settings.gaze_quantization_pixels);
+    const auto y = afw_gaze_start((bounds.top + bounds.bottom) * .5F, rh, afw.allocated_height, settings.gaze_quantization_pixels);
     auto parameters = foveation_parameters(settings);
     parameters.width = static_cast<float>(afw.allocated_width) / rw;
     parameters.height = static_cast<float>(afw.allocated_height) / rh;
@@ -358,16 +371,13 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
         }
         if (next_valid) {
             next.pad(settings.afw_warp_margin);
-            unsigned nw = afw.allocated_width, nh = afw.allocated_height, nx{}, ny{};
+            const auto nw = afw.allocated_width, nh = afw.allocated_height;
             if (source_known) {
                 const auto b = afw_mask_extent(next_mask, &projection, settings.afw_source_eye);
-                next = {std::clamp(b.left, 0.F, 1.F), std::clamp(b.top, 0.F, 1.F),
-                    std::clamp(b.right, 0.F, 1.F), std::clamp(b.bottom, 0.F, 1.F)};
-                afw_gaze_axis(0, b.width, rw, settings.gaze_quantization_pixels, nw, nx);
-                afw_gaze_axis(0, b.height, rh, settings.gaze_quantization_pixels, nh, ny);
+                next = {b.left, b.top, b.right, b.bottom};
             }
-            afw_gaze_axis(next.left, next.right, rw, settings.gaze_quantization_pixels, nw, nx);
-            afw_gaze_axis(next.top, next.bottom, rh, settings.gaze_quantization_pixels, nh, ny);
+            const auto nx = afw_gaze_start((next.left + next.right) * .5F, rw, nw, settings.gaze_quantization_pixels);
+            const auto ny = afw_gaze_start((next.top + next.bottom) * .5F, rh, nh, settings.gaze_quantization_pixels);
             CropGeometry preview{nx, ny, nw, nh};
             state.next_jump_visible = true;
             state.next_jump_offsets = foveation_offsets_from_geometry(preview, rw, rh);

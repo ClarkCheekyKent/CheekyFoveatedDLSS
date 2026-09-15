@@ -1,4 +1,5 @@
 #pragma once
+#include "nr_shader_cache.hpp"
 #include <initializer_list>
 #include <cstdio>
 #include <d3d12.h>
@@ -82,7 +83,7 @@ struct NrGuidePass {
         default: return f;
         }
     }
-    bool initialize(ID3D12Resource* mv, ID3D12Resource* z, unsigned w, unsigned h) {
+    bool initialize(ID3D12Resource* mv, ID3D12Resource* z, unsigned w, unsigned h, const NrGuidePass* shared = nullptr) {
         source_motion=mv; source_depth=z;
         Ptr<ID3D12Device> device;
         if (FAILED(mv->GetDevice(IID_PPV_ARGS(&device)))) return false;
@@ -106,6 +107,9 @@ struct NrGuidePass {
             D3D12_UNORDERED_ACCESS_VIEW_DESC ud{}; ud.Format=target->GetDesc().Format; ud.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;
             device->CreateUnorderedAccessView(target,nullptr,&ud,cpu); cpu.ptr+=step;
         }
+        if (shared && shared->root && shared->pipeline) {
+            root = shared->root; pipeline = shared->pipeline; return true;
+        }
         D3D12_DESCRIPTOR_RANGE ranges[2]{};
         ranges[0]={D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0}; ranges[1]={D3D12_DESCRIPTOR_RANGE_TYPE_UAV,2,0,0,2};
         D3D12_ROOT_PARAMETER params[2]{}; params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; params[0].DescriptorTable={2,ranges};
@@ -114,9 +118,23 @@ struct NrGuidePass {
         Ptr<ID3DBlob> blob,errors,code;
         if (FAILED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors)) ||
             FAILED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))) ||
-            FAILED(D3DCompile(nr_guide_shader,sizeof(nr_guide_shader),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,&errors))) { if(errors) std::fprintf(stderr,"%s\n",static_cast<const char*>(errors->GetBufferPointer())); return false; }
+            FAILED(compile_nr_shader(nr_guide_shader,sizeof(nr_guide_shader),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,&errors))) { if(errors) std::fprintf(stderr,"%s\n",static_cast<const char*>(errors->GetBufferPointer())); return false; }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature=root.Get(); pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
         return SUCCEEDED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pipeline)));
+    }
+    // Caller must prove all recordings using this heap have completed.
+    void rebind(ID3D12Device* device, ID3D12Resource* mv, ID3D12Resource* z) {
+        auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        const auto step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        for (auto* source : {mv, z}) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+            desc.Format = readable(source->GetDesc().Format);
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            desc.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(source, &desc, cpu); cpu.ptr += step;
+        }
+        source_motion = mv; source_depth = z;
     }
     void dispatch(ID3D12GraphicsCommandList* list, const NrGuideConstants& c,
         D3D12_RESOURCE_STATES mv_state, D3D12_RESOURCE_STATES depth_state) {

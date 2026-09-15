@@ -731,6 +731,63 @@ void verify_afw_gaze_history(CheekyUEVRSnapshotFn get, void (*command)(const cha
     command("1\n239\nset\nNrUseSrFoveation=true\nNrProcessingOrder=1"); evaluate(); evaluate();
     require(snapshot(get).find("\"afw_fresh_sample\":true") != std::string::npos &&
         snapshot(get).find("\"processing_width\":128") != std::string::npos, "Before NR supports gaze and linked SR coverage");
+    // Exercise the production NR allocator and border path through the actual
+    // nested AFW hook. NVIDIA inference alone is replaced by the fixture.
+    command("1\n251\nset\nCenterMode=2\nGazeSmoothingMs=100\nNrAlignmentBorder=true\nAlignmentBorder=true");
+    gaze.status_flags |= CHEEKY_GAZE_STATUS_SIMULATED;
+    for (unsigned i = 0; i < 8; ++i) evaluate();
+    const auto counter = [&](const char* key) {
+        const auto text = snapshot(get); const auto token = std::string("\"") + key + "\":";
+        const auto start = text.find(token); require(start != std::string::npos, "NR allocation diagnostic is present");
+        return std::stoull(text.substr(start + token.size()));
+    };
+    const auto codecs = counter("codec_creations"), borders = counter("border_creations");
+    const auto sr_allocations = f.creates();
+    const auto nr_module = GetModuleHandleW(L"nvngx_dlssnr.dll");
+    require(nr_module != nullptr, "NR fixture is resident");
+    const auto nr_creates = proc<Counter>(nr_module, "CheekyFakeCreates");
+    const auto nr_allocations = nr_creates();
+    for (unsigned i = 0; i < 90; ++i) {
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            gaze.views[eye].center_u = .01F + .98F * ((i * 7 + eye) % 89) / 88.F;
+            gaze.views[eye].center_v = i % 2 ? .98F : .02F;
+        }
+        evaluate();
+        require(counter("codec_creations") == codecs && counter("border_creations") == borders,
+            "Moving simulated gaze with Before NR and border must not rebuild codecs or border resources");
+        require(f.creates() == sr_allocations && nr_creates() == nr_allocations,
+            "Moving simulated gaze must not recreate SR or NR features");
+    }
+    command("1\n252\nset\nNrProcessingOrder=0\nNrUseSrFoveation=false");
+    for (unsigned i = 0; i < 8; ++i) evaluate();
+    const auto original_textures = f.textures12;
+    std::vector<ComPtr<ID3D12Resource>> alternate_textures;
+    for (unsigned i = 0; i < 4; ++i) {
+        auto desc = original_textures[i]->GetDesc();
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        ComPtr<ID3D12Resource> texture;
+        check(f.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            i == 3 ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            nullptr, IID_PPV_ARGS(&texture)), "Create rotating AFW frame texture");
+        alternate_textures.push_back(texture);
+    }
+    const auto rebinds = counter("resource_rebinds");
+    const auto after_codecs = counter("codec_creations");
+    const auto after_sr = f.creates(), after_nr = nr_creates();
+    for (unsigned i = 0; i < 30; ++i) {
+        f.textures12 = i % 2 ? original_textures : alternate_textures;
+        const char* names[]{"Color", "Depth", "MotionVectors", "Output"};
+        for (unsigned index = 0; index < 4; ++index) f.params.Set(names[index], f.textures12[index].Get());
+        for (auto& view : gaze.views) { view.center_u = i / 29.F; view.center_v = 1.F - view.center_u; }
+        evaluate();
+        require(counter("codec_creations") == after_codecs && f.creates() == after_sr && nr_creates() == after_nr,
+            "Independent After NR gaze must retain codec and feature allocations");
+    }
+    f.textures12 = original_textures;
+    const char* names[]{"Color", "Depth", "MotionVectors", "Output"};
+    for (unsigned index = 0; index < 4; ++index) f.params.Set(names[index], f.textures12[index].Get());
+    require(counter("resource_rebinds") > rebinds, "Rotating frame textures reuse completed NR descriptor allocations");
+    puts("PASS: AFW simulated gaze: zero SR/NR feature and codec/border allocations after warm-up");
     command("1\n250\nset\nNrEnabled=false"); evaluate();
     command("1\n236\nset\nCenterMode=0");
     proc<void(*)(void(*)(const NgxHandle*, const NgxParameters*))>(f.ngx, "CheekyFakeObserveHandle")(nullptr);
