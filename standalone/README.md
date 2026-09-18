@@ -46,8 +46,10 @@ CheekyFoveatedDLSS/
 ```
 
 On the first DXGI call, Cheeky loads `dxgi2.dll` from its own directory and
-forwards exports through it. Missing exports fall back individually to Windows
-DXGI. If the file is absent or cannot load, Cheeky continues using Windows DXGI.
+forwards the three factory exports, `DXGIGetDebugInterface1`, and
+`DXGIDeclareAdapterRemovalSupport` through it. Missing exports and all other
+exports use Windows DXGI directly: some mods expose unusable private-export
+stubs when renamed. If the file is absent or cannot load, Cheeky continues using Windows DXGI.
 `CheekyFoveatedDLSS-Loader.log` beside `dxgi.dll` records the result and Windows
 error code (also sent to debug output). Restart after changing either DLL.
 

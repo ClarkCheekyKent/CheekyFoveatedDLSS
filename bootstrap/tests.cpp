@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <dxgi1_3.h>
+#include <d3d11.h>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
@@ -83,13 +84,14 @@ int wmain(int argc, wchar_t** argv) {
         const bool asi = std::wstring(argv[1]) == L"asi";
         const bool missing = std::wstring(argv[1]) == L"missing";
         const bool loop_chain = std::wstring(argv[1]) == L"loop-chain";
-        const bool chain = std::wstring(argv[1]) == L"chain" || loop_chain;
+        const bool device_chain = std::wstring(argv[1]) == L"device-chain";
+        const bool chain = std::wstring(argv[1]) == L"chain" || loop_chain || device_chain;
         SetEnvironmentVariableW(L"CHEEKY_TEST_CHAIN_LOOP", loop_chain ? L"1" : nullptr);
         const bool broken_chain = std::wstring(argv[1]) == L"broken-chain";
         wchar_t executable[32768]{};
         require(GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable)) != 0, "test executable path");
         const auto directory = fs::path(executable).parent_path() /
-            (L"bootstrap-fixture-" + std::to_wstring(GetCurrentProcessId()));
+            (L"bootstrap-fixture-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
         require(!fs::exists(directory), "fixture directory already exists");
         fs::create_directories(directory / L"CheekyFoveatedDLSS");
         const auto loader_path = directory / (asi ? L"CheekyFoveatedDLSS.asi" : L"dxgi.dll");
@@ -125,6 +127,16 @@ int wmain(int argc, wchar_t** argv) {
             check_exports(loader, system);
             check_factories(loader, system);
             check_debug_forward(loader, system);
+            if (std::wstring(argv[1]) == L"device" || device_chain) {
+                const auto d3d11 = LoadLibraryExW(L"d3d11.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                require(d3d11 != nullptr, "D3D11 library");
+                const auto create = reinterpret_cast<decltype(&D3D11CreateDevice)>(GetProcAddress(d3d11, "D3D11CreateDevice"));
+                require(create != nullptr, "D3D11CreateDevice export");
+                ID3D11Device* device{};
+                require(SUCCEEDED(create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                    D3D11_SDK_VERSION, &device, nullptr, nullptr)), "D3D11 device creation with chained proxy");
+                device->Release();
+            }
             if (chain) {
                 const auto second = GetModuleHandleW(chain_path.c_str());
                 require(second != nullptr, "dxgi2.dll did not load from loader directory");

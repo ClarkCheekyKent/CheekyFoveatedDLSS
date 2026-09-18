@@ -55,6 +55,12 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DXGIDeclareAdapterRemovalSupport
     return 0x1234; // Distinguishes MASM forwarding from System32 fallback.
 }
 
+// Private signatures are undocumented. This deliberately unusable stub must
+// never be forwarded to, even though GetProcAddress reports that it exists.
+extern "C" __declspec(dllexport) void CompatValue() {
+    RaiseFailFastException(nullptr, nullptr, 0);
+}
+
 extern "C" __declspec(dllexport) bool CheekyHost_Start(unsigned kind) {
     InterlockedIncrement(&g_starts);
     InterlockedExchange(&g_kind, static_cast<LONG>(kind));

@@ -104,7 +104,11 @@ FARPROC cheeky_dxgi_resolve(unsigned index) noexcept {
         !InitOnceExecuteOnce(&g_dxgi_once, load_system_dxgi, nullptr, nullptr)) missing_system_export();
     const bool reentrant = g_loading_chain;
     if (!reentrant) InitOnceExecuteOnce(&g_chain_once, load_chain, nullptr, nullptr);
-    FARPROC target = !reentrant && g_chain ? GetProcAddress(g_chain, exports[index]) : nullptr;
+    // Some proxies advertise private DXGI exports but leave their forwarding
+    // pointers null when renamed. Only chain the supported public entry points;
+    // Windows' own D3D11 runtime calls private helpers such as CompatValue.
+    const bool chainable = (index >= 9 && index <= 11) || index == 16 || index == 18;
+    FARPROC target = !reentrant && g_chain && chainable ? GetProcAddress(g_chain, exports[index]) : nullptr;
     if (!target) target = GetProcAddress(g_dxgi, exports[index]);
     if (target == nullptr) missing_system_export();
     // Do not permanently bypass the chain when resolving during its initialization.

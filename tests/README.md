@@ -37,6 +37,9 @@ export fallback, and a second proxy that calls back into all three Cheeky
 factory exports. The loop fixture bounds recursion so the old loader fails
 without exhausting the test process stack. An optional fifth argument supplies
 an external second DLL for a `proxy` smoke test in an isolated fixture folder.
+Use `device` with that argument to also create a real D3D11 device. The regular
+`device-chain` fixture exports an intentionally unusable `CompatValue` stub to
+verify that private DXGI calls bypass the second DLL during device creation.
 Core discovery fixtures verify a genuine-shaped NGX core
 alias is intercepted while an OptiScaler-shaped proxy is excluded. The fake
 DLLs are test fixtures only and must never be included in release packages.
