@@ -11,6 +11,18 @@ using NgxResult = std::uint32_t;
 
 struct NgxHandle;
 
+// Public NVSDK_NGX_FeatureCommonInfo layout. Path storage must outlive NGX.
+// https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_defs.h
+struct NgxFeatureCommonInfo {
+    struct { const wchar_t* const* paths{}; unsigned count{}; } path_list;
+    void* internal_data{};
+    struct {
+        void (*callback)(const char*, int, int){};
+        int minimum_level{};
+        bool disable_other_sinks{};
+    } logging;
+};
+
 // ABI-compatible public subset of NVSDK_NGX_Parameter. This keeps the add-on
 // independent from a particular NGX SDK release; the game owns every object.
 struct NgxParameters {

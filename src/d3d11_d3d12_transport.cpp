@@ -126,6 +126,46 @@ struct InitContract {
 std::mutex transport_mutex;
 InitContract init_contract;
 
+// Keep this storage independent of the captured game initialization contract:
+// a later game Init must not invalidate pointers retained by private NGX.
+struct TransportFeaturePaths {
+    std::array<std::wstring, 2> directories;
+    std::array<const wchar_t*, 2> pointers{};
+    NgxFeatureCommonInfo info{};
+    bool ready{};
+};
+TransportFeaturePaths transport_feature_paths;
+
+const void* private_feature_common_info() {
+    if (init_contract.feature_common_info) return init_contract.feature_common_info;
+    auto& paths = transport_feature_paths;
+    if (!paths.ready) {
+        // The processing DLL may live below the game directory. Explicitly
+        // register the already loaded SR library's directory, then the EXE
+        // directory, rather than relying on NGX's calling-module search path.
+        const HMODULE modules[]{GetModuleHandleW(L"nvngx_dlss.dll"), nullptr};
+        for (unsigned i = 0; i < 2; ++i) {
+            if (i == 0 && !modules[i]) continue;
+            std::array<wchar_t, 32768> buffer{};
+            const auto length = GetModuleFileNameW(modules[i], buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (!length || length >= buffer.size()) continue;
+            std::wstring directory(buffer.data(), length);
+            const auto slash = directory.find_last_of(L"\\/");
+            if (slash == std::wstring::npos) continue;
+            directory.resize(slash);
+            auto& count = paths.info.path_list.count;
+            if (count && directory == paths.directories[0]) continue;
+            paths.directories[count] = std::move(directory);
+            paths.pointers[count] = paths.directories[count].c_str();
+            trace_event("Private D3D12 NGX feature search path=%ls", paths.pointers[count]);
+            ++count;
+        }
+        paths.info.path_list.paths = paths.pointers.data();
+        paths.ready = true;
+    }
+    return paths.info.path_list.count ? &paths.info : nullptr;
+}
+
 struct SharedTexture {
     ID3D12Resource* resource12{};
     ID3D11Texture2D* texture11{};
@@ -635,7 +675,7 @@ void trace_format_support(
         init_contract.application_data_path.c_str(),
         device.device12,
         static_cast<int>(init_contract.sdk_version),
-        init_contract.feature_common_info,
+        private_feature_common_info(),
         init_exception
     );
     trace_event(
@@ -2196,6 +2236,7 @@ void release_d3d11_d3d12_transport() noexcept {
     for (auto& device : transport_devices) release_device(device);
     transport_devices.clear();
     init_contract = {};
+    transport_feature_paths = {};
 }
 
 }  // namespace cheeky::foveated_dlss

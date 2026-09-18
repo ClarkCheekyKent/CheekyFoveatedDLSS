@@ -13,6 +13,10 @@ NR-only processing and a compositor cached before Cheeky loaded. The OpenVR
 fixture must remain inactive until its runtime is initialized; Cheeky never
 initializes VR on the game's behalf.
 
+The transport fixture rejects private NGX initialization without an explicit
+search path containing its DLSS library. This covers the nested standalone/ASI
+layout that previously failed real NVIDIA feature creation with `0xBAD0000B`.
+
 `CheekyOverlayTests.exe [--dx11] [--hdr10|--scrgb]` renders the real F8 menu to
 WARP textures and reads the result back. It checks SDR/HDR luminance, input
 capture, resize, queue rejection and same-window swap-chain recreation. A

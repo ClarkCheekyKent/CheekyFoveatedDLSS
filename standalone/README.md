@@ -88,10 +88,17 @@ space; HDR10 alpha blending is approximate.
 
 DLSS-NR is experimental and off by default. Its compatible NVIDIA and Streamline
 runtimes are supplied separately. For these packages, put `nvngx_dlssnr.dll`
-beside the nested `CheekyFoveatedDLSSRuntime.dll`; keep Streamline components in
+beside the nested `CheekyFoveatedDLSSRuntime.dll` or the game executable; keep Streamline components in
 the locations expected by the game. D3D11 requires **DX12 Transport** for NR.
 See the [NR settings reference](https://github.com/ClarkCheekyKent/CheekyFoveatedDLSS/blob/master/USAGE.md#experimental-dlss-nr-support)
 for tuning and runtime compatibility notes.
+
+If NR does not activate in D3D11, enable `D3D11D3D12Transport` in **All settings**.
+The private DX12 path explicitly registers the loaded DLSS library's directory
+when the game's NGX initialization paths are unavailable. A log entry such as
+`D3D12 canonical create ... result=0xBAD0000B` means that private DLSS feature
+creation failed before after-upscaling NR could run; it is not evidence of a
+missing NR DLL. Include the nested runtime log when reporting this failure.
 
 The resident runtime enforces one active Cheeky host per process. Install one
 Cheeky loader for a game: standalone, OptiScaler ASI, UEVR plugin, or ReShade
