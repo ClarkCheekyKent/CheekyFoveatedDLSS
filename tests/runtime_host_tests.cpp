@@ -115,7 +115,7 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
 
 int main(int argc, char** argv) {
     try {
-        bool dx11{}, conflict{}, optiscaler{}, transport{};
+        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{};
         unsigned openvr_version{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
             else if (arg == "--conflict") conflict = true;
             else if (arg == "--optiscaler") optiscaler = true;
             else if (arg == "--transport") { transport = true; dx11 = true; }
+            else if (arg == "--transport-forwarded") { transport = true; dx11 = true; forwarded_transport = true; }
             else if (arg.starts_with("--openvr-late-")) {
                 openvr_version = static_cast<unsigned>(std::stoul(arg.substr(14)));
                 require(openvr_version == 22 || openvr_version == 27 || openvr_version == 28 || openvr_version == 29, "Supported OpenVR fixture version");
@@ -178,6 +179,12 @@ int main(int argc, char** argv) {
             std::filesystem::copy_file(fixture, isolated / "nvngx_dlss.dll");
             fake_ngx = LoadLibraryW((isolated / "nvngx_dlss.dll").c_str());
             require(fake_ngx && LoadLibraryW((isolated / "_nvngx.dll").c_str()), "Load fake public and private NGX runtimes");
+            if (forwarded_transport) {
+                // Real NVIDIA core dispatches private DX12 calls into the
+                // public feature DLL, whose exports are also intercepted.
+                proc<void(*)(HMODULE, bool)>(GetModuleHandleW(L"_nvngx.dll"),
+                    "CheekyFakeForwardTo")(fake_ngx, false);
+            }
         }
         const auto runtime = LoadLibraryW(runtime_path.c_str());
         require(runtime != nullptr, "Load resident runtime without ReShade or UEVR");

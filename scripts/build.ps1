@@ -90,7 +90,7 @@ foreach ($mode in @("native", "native-c", "streamline", "missing-lower", "public
 }
 
 $runtimeHostTest = Join-Path $projectRoot "bin\$Configuration\CheekyRuntimeHostTests.exe"
-foreach ($arguments in @(@(), @('--dx11'), @('--optiscaler'), @('--optiscaler','--dx11'), @('--conflict'), @('--transport'), @('--optiscaler','--transport'))) {
+foreach ($arguments in @(@(), @('--dx11'), @('--optiscaler'), @('--optiscaler','--dx11'), @('--conflict'), @('--transport'), @('--optiscaler','--transport'), @('--transport-forwarded'), @('--optiscaler','--transport-forwarded'))) {
     & $runtimeHostTest @arguments
     if ($LASTEXITCODE -ne 0) { throw "Generic runtime tests failed: $arguments" }
 }

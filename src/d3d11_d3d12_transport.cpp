@@ -1,5 +1,6 @@
 #include "dlss_nr_input.hpp"
 #include "d3d11_d3d12_transport.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
@@ -1299,6 +1300,10 @@ bool evaluate_d3d11_via_d3d12(
     const D3D11TransportNgx& ngx,
     NgxResult& result
 ) noexcept {
+    // The core can forward private DX12 work into hooked public DLSS exports.
+    // Those calls are not new game frames: recursively processing one would
+    // re-enter the backend while its non-recursive view mutex is held.
+    D3D12NgxInterceptionScope private_dx12_scope;
     result = 0xBAD00005U;
     if ((!settings.enabled && !settings.nr_enabled) || context == nullptr ||
         game_handle == nullptr ||
@@ -2213,6 +2218,7 @@ bool evaluate_d3d11_via_d3d12(
 }
 
 void release_d3d11_transport_view(const NgxHandle* const game_handle) noexcept {
+    D3D12NgxInterceptionScope private_dx12_scope;
     if (game_handle == nullptr) return;
     const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(game_handle)
@@ -2232,6 +2238,7 @@ void release_d3d11_transport_view(const NgxHandle* const game_handle) noexcept {
 }
 
 void release_d3d11_d3d12_transport() noexcept {
+    D3D12NgxInterceptionScope private_dx12_scope;
     std::lock_guard lock(transport_mutex);
     for (auto& device : transport_devices) release_device(device);
     transport_devices.clear();
