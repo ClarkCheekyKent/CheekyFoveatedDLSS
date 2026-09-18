@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833209}</ProjectGuid><RootNamespace>CheekyCoreDiscoveryTests</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>Application</ConfigurationType><TargetName>CheekyCoreDiscoveryTests</TargetName><CheekyOutputSubdir></CheekyOutputSubdir></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup><ClCompile Include="tests\core_discovery_tests.cpp" /></ItemGroup>
+
+
+  <ItemGroup><ProjectReference Include="CheekyFakeCore.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833210}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference><ProjectReference Include="CheekyFakeCoreProxy.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833211}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference><ProjectReference Include="CheekyFoveatedDLSSRuntime.vcxproj"><Project>{83F33170-9A67-419F-96D2-B71F20FF4B91}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

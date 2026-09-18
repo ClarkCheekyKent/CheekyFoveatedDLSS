@@ -73,6 +73,7 @@ EXPORT NgxResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID
 }
 EXPORT NgxResult NVSDK_NGX_D3D12_AllocateParameters(NgxParameters** out) { *out = new MockNgxParameters; return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D12_DestroyParameters(NgxParameters* params) { delete static_cast<MockNgxParameters*>(params); return 1U; }
+EXPORT NgxResult NVSDK_NGX_D3D12_Shutdown1(ID3D12Device*) { return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D11_Init(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned) { return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D12_Init(unsigned long long, const wchar_t*, ID3D12Device*, const void*, unsigned) { return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle** out) {

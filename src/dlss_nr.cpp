@@ -12,6 +12,7 @@
 #include "afw_compatibility.hpp"
 #include "gaze_foveation.hpp"
 #include "d3d12_ngx_dispatch.hpp"
+#include "ngx_runtime_discovery.hpp"
 
 #include <Windows.h>
 #include <d3dcompiler.h>
@@ -469,7 +470,7 @@ DWORD WINAPI hook_nr_get_module_file_name(
         "NVSDK_NGX_D3D12_ReleaseFeature"
     ));
     if (allocate == nullptr || destroy == nullptr) {
-        const auto core = GetModuleHandleW(L"_nvngx.dll");
+        const auto core = find_loaded_ngx_core_runtime();
         if (core != nullptr) {
             allocate = reinterpret_cast<NgxAllocateParametersFn>(GetProcAddress(
                 core,

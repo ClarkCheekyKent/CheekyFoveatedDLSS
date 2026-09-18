@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833204}</ProjectGuid><RootNamespace>CheekyRuntimeHostTests</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>Application</ConfigurationType><TargetName>CheekyRuntimeHostTests</TargetName><CheekyOutputSubdir></CheekyOutputSubdir><CheekyLibraries>d3d11.lib;d3d12.lib;dxgi.lib</CheekyLibraries></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup>
+    <ClCompile Include="tests\runtime_host_tests.cpp" />
+  </ItemGroup>
+
+  <ItemGroup><ProjectReference Include="CheekyFoveatedDLSSRuntime.vcxproj"><Project>{83F33170-9A67-419F-96D2-B71F20FF4B91}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemGroup><ProjectReference Include="CheekyFakeOpenVR.vcxproj"><Project>{A73087E1-1CD8-4313-AE49-8C0000000003}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <ItemGroup><ProjectReference Include="CheekyFakeNGX.vcxproj"><Project>{A73087E1-1CD8-4313-AE49-8C0000000001}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+
+</Project>

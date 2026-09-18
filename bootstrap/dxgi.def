@@ -1,0 +1,22 @@
+LIBRARY dxgi
+EXPORTS
+    ApplyCompatResolutionQuirking=cheeky_proxy_ApplyCompatResolutionQuirking @1
+    CompatString=cheeky_proxy_CompatString @2
+    CompatValue=cheeky_proxy_CompatValue @3
+    DXGIDumpJournal=cheeky_proxy_DXGIDumpJournal @4
+    PIXBeginCapture=cheeky_proxy_PIXBeginCapture @5
+    PIXEndCapture=cheeky_proxy_PIXEndCapture @6
+    PIXGetCaptureState=cheeky_proxy_PIXGetCaptureState @7
+    SetAppCompatStringPointer=cheeky_proxy_SetAppCompatStringPointer @8
+    UpdateHMDEmulationStatus=cheeky_proxy_UpdateHMDEmulationStatus @9
+    CreateDXGIFactory=cheeky_proxy_CreateDXGIFactory @10
+    CreateDXGIFactory1=cheeky_proxy_CreateDXGIFactory1 @11
+    CreateDXGIFactory2=cheeky_proxy_CreateDXGIFactory2 @12
+    DXGID3D10CreateDevice=cheeky_proxy_DXGID3D10CreateDevice @13
+    DXGID3D10CreateLayeredDevice=cheeky_proxy_DXGID3D10CreateLayeredDevice @14
+    DXGID3D10GetLayeredDeviceSize=cheeky_proxy_DXGID3D10GetLayeredDeviceSize @15
+    DXGID3D10RegisterLayers=cheeky_proxy_DXGID3D10RegisterLayers @16
+    DXGIDeclareAdapterRemovalSupport=cheeky_proxy_DXGIDeclareAdapterRemovalSupport @17
+    DXGIDisableVBlankVirtualization=cheeky_proxy_DXGIDisableVBlankVirtualization @18
+    DXGIGetDebugInterface1=cheeky_proxy_DXGIGetDebugInterface1 @19
+    DXGIReportAdapterConfiguration=cheeky_proxy_DXGIReportAdapterConfiguration @20

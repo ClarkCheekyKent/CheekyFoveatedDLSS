@@ -1532,6 +1532,21 @@ void test_native_dynamic_resolution_extent() {
 
 void test_afw_dispatch_and_settings() {
     using namespace cheeky::foveated_dlss;
+    expect(is_nvidia_ngx_core_alias_identity(L"C:/driver/NVNGX.DLL", L"NVIDIA Corporation",
+        L"nvngx.dll", L"NGX", true, false), "NVIDIA's documented nvngx core alias is recognized");
+    expect(is_nvidia_ngx_core_alias_identity(L"C:\\game\\nvngx.dll", L"NVIDIA Corporation",
+        L"_nvngx.dll", L"NGX", true, false), "Renamed original NVIDIA core retains its identity");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"OptiScaler",
+        L"OptiScaler.dll", L"OptiScaler", true, false), "OptiScaler renamed nvngx.dll is not a core runtime");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"NVIDIA Corporation",
+        L"nvngx.dll", L"NGX", true, true), "ASI or DXGI proxy exports reject a purported NVIDIA core");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"NVIDIA Corporation",
+        L"nvngx_dlss.dll", L"NGX", true, false), "A renamed feature snippet is not a core runtime");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"NVIDIA Corporation",
+        L"nvngx.dll", L"NGX", false, false) &&
+        !is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"", L"", L"", true, false) &&
+        !is_nvidia_ngx_core_alias_identity(L"C:/game/dxgi.dll", L"NVIDIA Corporation",
+            L"nvngx.dll", L"NGX", true, false), "Missing core exports, unknown metadata and other aliases fail closed");
     expect(is_dlss_sr_runtime_path(L"C:/game/NVNGX_DLSS.DLL") &&
         is_dlss_sr_runtime_path(L"C:/ProgramData/NVIDIA/NGX/models//DLSS/versions/20318464/files/160_E658700.BIN"),
         "SR discovery accepts normal DLLs and generated OTA names with mixed separators and case");

@@ -21,6 +21,7 @@
 #include "settings.hpp"
 
 #include <Windows.h>
+#include <winver.h>
 #include <Psapi.h>
 #include <MinHook.h>
 
@@ -39,6 +40,7 @@
 #include <deque>
 #include <iterator>
 #include <mutex>
+#include <vector>
 
 namespace cheeky::foveated_dlss {
 
@@ -3636,9 +3638,79 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
     return original == nullptr ? 0xBAD00007U : original(device);
 }
 
+[[nodiscard]] HMODULE find_core_runtime() noexcept {
+    // Keep exactly one core callback family for the process. In particular,
+    // NVIDIA's nvngx.dll can later load _nvngx.dll internally; switching then
+    // would cross-wire its wrappers with the second DLL's feature handles.
+    static std::atomic<HMODULE> selected{};
+    if (const auto result = selected.load(std::memory_order_acquire)) return result;
+    static std::mutex discovery_mutex;
+    static HMODULE rejected_alias{};
+    try {
+        std::lock_guard lock(discovery_mutex);
+        if (const auto result = selected.load(std::memory_order_relaxed)) return result;
+        auto candidate = GetModuleHandleW(L"_nvngx.dll");
+        if (!candidate) {
+            candidate = GetModuleHandleW(L"nvngx.dll");
+            if (!candidate || candidate == rejected_alias) return nullptr;
+            std::array<wchar_t, 32768> path{};
+            const auto length = GetModuleFileNameW(candidate, path.data(), static_cast<DWORD>(path.size()));
+            if (!length || length >= path.size()) return nullptr;
+            const auto complete_api = [&](const char* create, const char* evaluate, const char* release) {
+                return GetProcAddress(candidate, create) && GetProcAddress(candidate, evaluate) &&
+                    GetProcAddress(candidate, release);
+            };
+            const bool complete_exports = complete_api("NVSDK_NGX_D3D11_CreateFeature",
+                "NVSDK_NGX_D3D11_EvaluateFeature", "NVSDK_NGX_D3D11_ReleaseFeature") ||
+                complete_api("NVSDK_NGX_D3D12_CreateFeature", "NVSDK_NGX_D3D12_EvaluateFeature",
+                    "NVSDK_NGX_D3D12_ReleaseFeature");
+            const bool proxy_exports = GetProcAddress(candidate, "InitializeASI") ||
+                GetProcAddress(candidate, "CreateDXGIFactory") || GetProcAddress(candidate, "NVSDK_NGX_GetSnippetVersion");
+            DWORD unused{};
+            const DWORD bytes = GetFileVersionInfoSizeW(path.data(), &unused);
+            bool accepted{};
+            if (bytes && bytes <= 1024U * 1024U && complete_exports && !proxy_exports) {
+                std::vector<std::byte> version(bytes);
+                if (GetFileVersionInfoW(path.data(), 0, bytes, version.data())) {
+                    struct Translation { WORD language, code_page; };
+                    Translation* translations{};
+                    UINT size{};
+                    if (VerQueryValueW(version.data(), L"\\VarFileInfo\\Translation",
+                            reinterpret_cast<void**>(&translations), &size)) {
+                        for (UINT i = 0; i < size / sizeof(Translation) && i < 32U && !accepted; ++i) {
+                            const auto field = [&](const wchar_t* key) -> std::wstring_view {
+                                wchar_t query[128]{};
+                                swprintf_s(query, L"\\StringFileInfo\\%04x%04x\\%ls",
+                                    translations[i].language, translations[i].code_page, key);
+                                wchar_t* value{}; UINT chars{};
+                                if (!VerQueryValueW(version.data(), query, reinterpret_cast<void**>(&value), &chars) ||
+                                    !value || !chars) return {};
+                                return {value, wcsnlen_s(value, chars)};
+                            };
+                            accepted = is_nvidia_ngx_core_alias_identity({path.data(), length}, field(L"CompanyName"),
+                                field(L"OriginalFilename"), field(L"ProductName"), complete_exports, proxy_exports);
+                        }
+                    }
+                }
+            }
+            if (!accepted) {
+                rejected_alias = candidate;
+                trace_event("NGX core alias ignored: nvngx.dll is not an identified NVIDIA core (%ls)", path.data());
+                return nullptr;
+            }
+        }
+        HMODULE retained{};
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                reinterpret_cast<LPCWSTR>(candidate), &retained) || retained != candidate) return nullptr;
+        selected.store(retained, std::memory_order_release);
+        trace_event("NGX core callback owner selected module=%p (retained until game exit)", retained);
+        return retained;
+    } catch (...) { return nullptr; }
+}
+
 [[nodiscard]] D3D11TransportNgx current_transport_ngx() noexcept {
     D3D11TransportNgx ngx{};
-    ngx.runtime_module = GetModuleHandleW(L"_nvngx.dll");
+    ngx.runtime_module = find_core_runtime();
     if (ngx.runtime_module != nullptr) {
         ngx.init_ext = reinterpret_cast<NgxD3D12InitExtFn>(GetProcAddress(
             ngx.runtime_module, "NVSDK_NGX_D3D12_Init_Ext"
@@ -5534,7 +5606,7 @@ template <typename T>
         );
     }
 
-    const auto observed_core_runtime = GetModuleHandleW(L"_nvngx.dll");
+    const auto observed_core_runtime = find_core_runtime();
     const auto core_runtime = runtime_ready_for_direct_hooks(
         observed_core_runtime,
         core_runtime_stability,
@@ -5719,7 +5791,9 @@ void remember_original(
     }
 
     const bool public_runtime = _wcsicmp(target_name, L"nvngx_dlss.dll") == 0;
-    const bool core_runtime = _wcsicmp(target_name, L"_nvngx.dll") == 0;
+    const bool core_name = _wcsicmp(target_name, L"_nvngx.dll") == 0 || _wcsicmp(target_name, L"nvngx.dll") == 0;
+    const bool core_runtime = core_name && find_core_runtime() != nullptr &&
+        find_core_runtime() == GetModuleHandleW(target_name);
     if (!public_runtime && !core_runtime) return original;
 
 #define CHEEKY_REPLACE(export_name, storage, hook, api) \
@@ -6083,6 +6157,8 @@ void restore_patched_slots() noexcept {
 }
 
 }  // namespace
+
+HMODULE find_loaded_ngx_core_runtime() noexcept { return find_core_runtime(); }
 
 void note_d3d12_command_list_submission(
     ID3D12CommandQueue* const queue,

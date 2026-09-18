@@ -208,11 +208,26 @@ set_tests_properties(CheekyNrObserverTestsNoDebugLayer PROPERTIES
     ENVIRONMENT "CHEEKY_NR_TEST_NO_DEBUG_LAYER=1")
 
 option(CHEEKY_BUILD_UEVR "Build the UEVR plugin, resident runtime and host harness" ON)
-if(CHEEKY_BUILD_UEVR)
+option(CHEEKY_BUILD_STANDALONE "Build standalone DXGI and OptiScaler ASI integrations" ON)
+if(CHEEKY_BUILD_UEVR OR CHEEKY_BUILD_STANDALONE)
     set(CHEEKY_RUNTIME_SOURCES ${CHEEKY_FOVEATED_DLSS_SOURCES})
     list(FILTER CHEEKY_RUNTIME_SOURCES EXCLUDE REGEX "/(addon|support_report)\\.cpp$")
     add_library(CheekyFoveatedDLSSRuntime MODULE ${CHEEKY_RUNTIME_SOURCES}
         uevr/runtime.cpp uevr/settings_io.cpp)
+    target_compile_features(CheekyFoveatedDLSSRuntime PRIVATE cxx_std_20)
+    target_compile_definitions(CheekyFoveatedDLSSRuntime PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_include_directories(CheekyFoveatedDLSSRuntime PRIVATE src shared uevr
+        third_party/openvr/include third_party/reshade/deps/minhook/include)
+    target_link_libraries(CheekyFoveatedDLSSRuntime PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid version)
+    set_target_properties(CheekyFoveatedDLSSRuntime PROPERTIES CXX_EXTENSIONS OFF PREFIX ""
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/CheekyFoveatedDLSS"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/CheekyFoveatedDLSS")
+    if(MSVC)
+        target_compile_options(CheekyFoveatedDLSSRuntime PRIVATE /W4 /permissive- /utf-8)
+    endif()
+endif()
+if(CHEEKY_BUILD_UEVR)
     add_library(CheekyFoveatedDLSSUEVR MODULE uevr/plugin.cpp)
     add_executable(CheekyUEVRTests tests/uevr_tests.cpp tests/late_attach_tests.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp)
     add_library(CheekyFakeNGX MODULE tests/fake_ngx.cpp)
@@ -232,7 +247,7 @@ if(CHEEKY_BUILD_UEVR)
     set_target_properties(CheekyFakeNGX PROPERTIES OUTPUT_NAME "nvngx_dlss")
     set_target_properties(CheekyFakeStreamline PROPERTIES OUTPUT_NAME "sl.interposer")
     set_target_properties(CheekyFakeOpenVR PROPERTIES OUTPUT_NAME "openvr_api")
-    foreach(target CheekyFoveatedDLSSRuntime CheekyFoveatedDLSSUEVR CheekyUEVRTests)
+    foreach(target CheekyFoveatedDLSSUEVR CheekyUEVRTests)
         target_compile_features(${target} PRIVATE cxx_std_20)
         target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
         target_include_directories(${target} PRIVATE src shared uevr third_party/uevr/include
@@ -268,4 +283,8 @@ if(CHEEKY_BUILD_UEVR)
     foreach(mode native native-c streamline missing-lower public-first public-first-c ota ota-c ota-streamline ota-ambiguous)
         add_test(NAME CheekyAfw-${mode} COMMAND CheekyUEVRTests --afw-${mode})
     endforeach()
+endif()
+
+if(CHEEKY_BUILD_STANDALONE)
+    include(cmake/Standalone.cmake)
 endif()

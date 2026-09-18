@@ -2,9 +2,10 @@
 #include <Windows.h>
 #include <cstdint>
 #include <cstddef>
+#include "runtime_host_api.hpp"
 
-// Private, versioned boundary between the unloadable UEVR adapter and the
-// process-resident rendering module. No STL or host callbacks cross this ABI.
+// Legacy UEVR adapter boundary, retained byte-for-byte for existing adapters.
+// New hosts use runtime_host_api.hpp and the CheekyRuntime_* exports.
 constexpr std::uint32_t cheeky_uevr_abi = 1;
 constexpr std::size_t cheeky_uevr_message_capacity = 32768;
 struct CheekyUEVRStart {

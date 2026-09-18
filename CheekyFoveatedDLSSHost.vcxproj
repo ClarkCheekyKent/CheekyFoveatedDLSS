@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833201}</ProjectGuid><RootNamespace>CheekyFoveatedDLSSHost</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType><TargetName>CheekyFoveatedDLSSHost</TargetName><CheekyOutputSubdir>CheekyFoveatedDLSS\</CheekyOutputSubdir><CheekyLibraries>d3d11.lib;d3d12.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;user32.lib;imm32.lib;dwmapi.lib</CheekyLibraries></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup>
+    <ClCompile Include="standalone\host.cpp" />
+    <ClCompile Include="standalone\overlay.cpp" />
+    <ClCompile Include="uevr\settings_io.cpp" />
+    <ClCompile Include="src\settings.cpp" />
+    <ClCompile Include="src\foveation.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\imgui.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\imgui_draw.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\imgui_tables.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_dx11.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_dx12.cpp" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\buffer.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\hook.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\trampoline.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\hde\hde64.c" />
+  </ItemGroup>
+
+  <ItemGroup><ProjectReference Include="CheekyFoveatedDLSSRuntime.vcxproj"><Project>{83F33170-9A67-419F-96D2-B71F20FF4B91}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>

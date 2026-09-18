@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833203}</ProjectGuid><RootNamespace>CheekyOptiScaler</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType><TargetName>CheekyFoveatedDLSS</TargetName><CheekyOutputSubdir></CheekyOutputSubdir><CheekyLibraries></CheekyLibraries></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <PropertyGroup><TargetExt>.asi</TargetExt></PropertyGroup>
+  <ItemGroup>
+    <ClCompile Include="bootstrap\loader.cpp" />
+    <ClCompile Include="bootstrap\optiscaler_asi.cpp" />
+  </ItemGroup>
+  <ItemDefinitionGroup><Link><ImportLibrary>$(IntDir)CheekyOptiScaler.lib</ImportLibrary><ProgramDatabaseFile>$(OutDir)CheekyOptiScaler.pdb</ProgramDatabaseFile></Link></ItemDefinitionGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+</Project>

@@ -10,7 +10,12 @@ From PowerShell at the repository root:
 ./scripts/build.ps1 -Configuration Release
 ```
 
-Builds both integrations, the OpenXR layer and tests, then runs the native test suites. Outputs go to `bin/Release`. Use `-Configuration Debug` for a debug build. The solution also supports Visual Studio and CMake 3.24 or newer.
+Builds ReShade, UEVR, standalone, OptiScaler, the OpenXR layer and tests, then
+runs the native test suites. Outputs go to `bin/Release`; the standalone proxy
+is in `standalone-loader/dxgi.dll` so ordinary test executables do not load it
+implicitly. Use `-Configuration Debug` for a debug build. The solution also
+supports Visual Studio and CMake 3.24 or newer. The standalone proxy requires
+the x64 MASM tools included with the Visual C++ workload.
 
 ## Tests
 
@@ -33,6 +38,7 @@ GPU and host tests complement game/headset testing; they do not establish compat
 
 ```powershell
 ./scripts/package-uevr.ps1 -Configuration Release
+./scripts/package-standalone.ps1 -Configuration Release -Mode Both -Label local
 ./scripts/build-installer.ps1
 ```
 
@@ -46,7 +52,20 @@ Set the release version in `shared/version.h`; the UI, CMake and installer share
 
 - `src/`: shared settings, interception, rendering, calibration and resource observation; `addon.cpp` supplies the ReShade UI and host integration.
 - `uevr/plugin.cpp`: UEVR adapter; `uevr/runtime.cpp`: resident runtime, settings and reporting; `uevr/scripts/`: Lua controls.
+- `shared/runtime_host_api.hpp`: versioned host-neutral resident runtime ABI; legacy UEVR exports remain compatible.
+- `standalone/`: graphics observation and F8 ImGui controls shared by standalone and OptiScaler.
+- `bootstrap/`: DXGI export forwarding and OptiScaler `InitializeASI` loaders, with isolated loader fixtures.
 - `openxr_layer/`: shared OpenXR layer, installed separately for either integration.
 - `tests/`: native GPU/host fixtures and Lua menu tests.
 
-The UEVR runtime remains resident because hooks and GPU work can outlive adapter detach. See [eye calibration](EYE-CALIBRATION.md) for calibration ownership and lifetime rules.
+The shared runtime remains resident because hooks and GPU work can outlive
+adapter detach. The standalone host and loaders also remain resident. See
+[eye calibration](EYE-CALIBRATION.md) for calibration ownership and lifetime rules.
+
+The standalone host matrix reuses cached NGX/Streamline fixtures for both hosts,
+including native and `_C` exports on D3D11/D3D12, NR histories, actual queue
+submission, and resize. Generic runtime tests also cover D3D11-to-D3D12 SR/NR
+transport, ownership conflicts, settings atomicity and support ZIPs. The overlay
+suite reads GPU pixels for SDR, scRGB and HDR10 on both APIs. Its test-only focus
+adapter substitutes desktop foreground state in headless CI; real game input
+and multi-overlay interaction still require manual testing.

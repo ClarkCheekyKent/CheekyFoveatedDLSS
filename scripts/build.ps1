@@ -89,7 +89,46 @@ foreach ($mode in @("native", "native-c", "streamline", "missing-lower", "public
     if ($LASTEXITCODE -ne 0) { throw "UEVR AFW routing ($mode) failed with exit code $LASTEXITCODE." }
 }
 
+$runtimeHostTest = Join-Path $projectRoot "bin\$Configuration\CheekyRuntimeHostTests.exe"
+foreach ($arguments in @(@(), @('--dx11'), @('--optiscaler'), @('--optiscaler','--dx11'), @('--conflict'), @('--transport'), @('--optiscaler','--transport'))) {
+    & $runtimeHostTest @arguments
+    if ($LASTEXITCODE -ne 0) { throw "Generic runtime tests failed: $arguments" }
+}
+$standaloneHostTest = Join-Path $projectRoot "bin\$Configuration\CheekyStandaloneHostTests.exe"
+foreach ($abi in @('022','027','028','029')) {
+    & $runtimeHostTest "--openvr-late-$abi"
+    if ($LASTEXITCODE -ne 0) { throw "Standalone cached OpenVR compositor failed: $abi" }
+    & $runtimeHostTest --optiscaler "--openvr-late-$abi"
+    if ($LASTEXITCODE -ne 0) { throw "OptiScaler cached OpenVR compositor failed: $abi" }
+}
+foreach ($hostKind in @('standalone','optiscaler')) {
+    foreach ($mode in @('dx11','dx11-c','dx12','dx12-c','streamline','streamline-dx11')) {
+        & $standaloneHostTest $mode $hostKind
+        if ($LASTEXITCODE -ne 0) { throw "Standalone host tests failed: $hostKind $mode" }
+    }
+}
+$bootstrapTest = Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapTests.exe"
+foreach ($mode in @('proxy','asi','missing')) {
+    & $bootstrapTest $mode (Join-Path $projectRoot "bin\$Configuration\standalone-loader\dxgi.dll") (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.asi") (Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapFakeHost.dll")
+    if ($LASTEXITCODE -ne 0) { throw "Bootstrap tests failed: $mode" }
+}
+$overlayTest = Join-Path $projectRoot "bin\$Configuration\CheekyOverlayTests.exe"
+foreach ($api in @('dx11','dx12')) {
+    foreach ($color in @('sdr','scrgb','hdr10')) {
+        & $overlayTest "--$api" "--$color"
+        if ($LASTEXITCODE -ne 0) { throw "Overlay tests failed: $api $color" }
+    }
+}
+$coreDiscoveryTest = Join-Path $projectRoot "bin\$Configuration\CheekyCoreDiscoveryTests.exe"
+foreach ($mode in @('accept','reject')) {
+    & $coreDiscoveryTest $mode (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\CheekyFakeCore.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\CheekyFakeCoreProxy.dll")
+    if ($LASTEXITCODE -ne 0) { throw "NGX core discovery tests failed: $mode" }
+}
+
 Write-Host "Built and tested:"
+Write-Host (Join-Path $projectRoot "bin\$Configuration\standalone-loader\dxgi.dll")
+Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.asi")
+Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSHost.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.addon64")

@@ -5,7 +5,7 @@ This directory contains minimal, pinned source snapshots needed to build the add
 | Dependency | Pinned version | Files retained | Upstream |
 | --- | --- | --- | --- |
 | ReShade | API 20, commit `f596db33ef50c5898997b6dab044aaa9ebe73667` | Public add-on API headers | https://github.com/crosire/reshade |
-| Dear ImGui | 1.92.5, commit `3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c` | `imgui.h` and `imconfig.h` | https://github.com/ocornut/imgui |
+| Dear ImGui | 1.92.5, commit `3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c` | Core sources, headers, Win32 and DX11/DX12 backends | https://github.com/ocornut/imgui |
 | MinHook | commit `8fda4f5481fed5797dc2651cd91e238e9b3928c6` | Public header and x64 implementation | https://github.com/TsudaKageyu/minhook |
 | OpenXR SDK | 1.1.61, tag `release-1.1.61` | Core, platform, and API-layer negotiation headers | https://github.com/KhronosGroup/OpenXR-SDK |
 | OpenVR SDK | 2.15.6, commit `0924064316de3effbcd1acf1e309182a2deb1c05` | Public `openvr.h`; no runtime DLL replacement | https://github.com/ValveSoftware/openvr |
@@ -16,3 +16,11 @@ The UEVR header also retains its complete MIT notice. The UEVR runtime uses
 MinHook and OpenVR headers, but does not include ReShade's API or ImGui headers.
 
 ReShade's overlay header requires an exact Dear ImGui version, so update the ReShade API headers and ImGui headers together. Dependency updates should be deliberate and followed by both Debug and Release builds; the normal build does not download or update third-party code.
+
+The standalone host compiles its own copy of Dear ImGui. Its DX11/DX12 backend
+files carry a small local pixel-shader adaptation in backends/cheeky_overlay_color.h:
+sRGB UI colors are converted to scRGB or Rec.2020/PQ at a 203-nit white, or to
+linear values for sRGB render targets. Shader alpha blending uses the presentation
+target's color space (PQ blending is an approximation). All other retained ImGui
+sources match the pinned commit above apart from whitespace cleanup; the ReShade
+add-on still uses ReShade's UI.

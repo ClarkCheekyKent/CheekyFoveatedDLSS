@@ -22,12 +22,78 @@ Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "CheekyFakeOpenVR", "CheekyF
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyNrObserverTests", "CheekyNrObserverTests.vcxproj", "{59ACBE11-5049-4DFB-995E-B86BBA7F6031}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyFoveatedDLSSHost", "CheekyFoveatedDLSSHost.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833201}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyStandaloneProxy", "CheekyStandaloneProxy.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833202}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyOptiScaler", "CheekyOptiScaler.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833203}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyRuntimeHostTests", "CheekyRuntimeHostTests.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833204}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyBootstrapTests", "CheekyBootstrapTests.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833205}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyBootstrapFakeHost", "CheekyBootstrapFakeHost.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833206}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyStandaloneHostTests", "CheekyStandaloneHostTests.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833207}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyOverlayTests", "CheekyOverlayTests.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833208}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyCoreDiscoveryTests", "CheekyCoreDiscoveryTests.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833209}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyFakeCore", "CheekyFakeCore.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833210}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyFakeCoreProxy", "CheekyFakeCoreProxy.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833211}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
 		Release|x64 = Release|x64
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{514AE60D-49DA-46DE-8541-4A8F45833209}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833209}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833209}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833209}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833210}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833210}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833210}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833210}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833211}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833211}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833211}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833211}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833201}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833201}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833201}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833201}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833202}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833202}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833202}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833202}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833203}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833203}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833203}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833203}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833204}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833204}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833204}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833204}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833205}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833205}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833205}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833205}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833206}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833206}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833206}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833206}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833207}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833207}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833207}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833207}.Release|x64.Build.0 = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833208}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833208}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833208}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833208}.Release|x64.Build.0 = Release|x64
 		{59ACBE11-5049-4DFB-995E-B86BBA7F6031}.Debug|x64.ActiveCfg = Debug|x64
 		{59ACBE11-5049-4DFB-995E-B86BBA7F6031}.Debug|x64.Build.0 = Debug|x64
 		{59ACBE11-5049-4DFB-995E-B86BBA7F6031}.Release|x64.ActiveCfg = Release|x64

@@ -1,6 +1,6 @@
 # Cheeky Foveated DLSS
 
-Reduce the cost of DLSS Super Resolution by concentrating it on the center of the image. Available as a **ReShade add-on** or **UEVR plugin**, for Direct3D 11 and Direct3D 12 games, including VR. With DLSS Performance FPS gains of 20%+ are standard, even more with eye tracked headsets which can make the foveated region even smaller.
+Reduce the cost of DLSS Super Resolution by concentrating it on the center of the image. Available as a **ReShade add-on**, **UEVR plugin**, or experimental **standalone / OptiScaler integration**, for Direct3D 11 and Direct3D 12 games, including VR. With DLSS Performance FPS gains of 20%+ are standard, even more with eye tracked headsets which can make the foveated region even smaller.
 
 ![Diagram](assets/diagram.png)
 
@@ -8,7 +8,7 @@ Reduce the cost of DLSS Super Resolution by concentrating it on the center of th
 
 - Windows 10/11, 64-bit, and an NVIDIA RTX GPU.
 - A D3D11 or D3D12 game with DLSS Super Resolution.
-- Either ReShade **with full add-on support**, or UEVR with a compatible plugin API.
+- Choose standalone, OptiScaler's ASI loader, ReShade **with full add-on support**, or UEVR with a compatible plugin API.
 
 ## Compatibility
 This should work with most games that have DLSS. Here is a non-exhaustive list of community reports whether a game is supported. 
@@ -22,7 +22,24 @@ Please help maintain and expand this list by submitting if a game has worked for
 
 ## Installation
 
-Close the game and choose **one** integration. Do not load the Cheeky Reshade add-on and plugin together.
+Close the game and choose **one** Cheeky integration. Do not load multiple Cheeky loaders together.
+
+### Standalone or OptiScaler (experimental)
+
+Use the **Standalone** ZIP for native DLSS games: extract `dxgi.dll` and the
+`CheekyFoveatedDLSS` folder beside the game executable. If `dxgi.dll` already
+exists, do not overwrite it. For an existing OptiScaler installation, use the
+**OptiScaler** ZIP and enable `LoadAsiPlugins=true` in its `[Plugins]` section.
+Select OptiScaler's DLSS output backend.
+
+Press **F8** for Cheeky's in-game controls. These integrations share the SR/NR,
+gaze, calibration, settings and diagnostics runtime, with D3D11, D3D12 and
+Streamline routes. Their overlay supports SDR, scRGB and HDR10. Automated
+fixtures exercise these paths; actual game and headset compatibility still
+requires testing. [Installation, layout and limitations](standalone/README.md)
+
+Complete the OpenXR setup below when using OpenXR. The F8 controls appear on
+the desktop; an in-headset settings menu is not included.
 
 ### ReShade add-on
 

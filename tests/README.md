@@ -1,3 +1,31 @@
+# Standalone and OptiScaler
+
+`CheekyStandaloneHostTests.exe <mode> <host>` uses the actual host DLL and GPU
+swap chains with cached NGX/Streamline fixtures. Hosts are `standalone` and
+`optiscaler`; modes are `dx11`, `dx11-c`, `dx12`, `dx12-c`, `streamline` and
+`streamline-dx11`. Tests exercise private SR and DX12 NR, queue discovery,
+presentation and both resize entry points without ReShade or UEVR.
+
+`CheekyRuntimeHostTests.exe` checks the generic API and ownership. Options
+`--dx11`, `--optiscaler`, `--transport` and `--openvr-late-022` (also 027/028/029)
+cover each host, shared DX11/DX12 resources, full/foveated Before/After NR,
+NR-only processing and a compositor cached before Cheeky loaded. The OpenVR
+fixture must remain inactive until its runtime is initialized; Cheeky never
+initializes VR on the game's behalf.
+
+`CheekyOverlayTests.exe [--dx11] [--hdr10|--scrgb]` renders the real F8 menu to
+WARP textures and reads the result back. It checks SDR/HDR luminance, input
+capture, resize, queue rejection and same-window swap-chain recreation. A
+test-only focus adapter supplies foreground state for headless CI; production
+builds use Windows foreground state. `--capture=<absolute.bmp>` saves an SDR
+frame for visual inspection.
+
+Bootstrap tests stage isolated layouts, validate DXGI exports and ordinals,
+exercise recursive factory creation, concurrent ASI initialization and missing
+host pass-through. Core discovery fixtures verify a genuine-shaped NGX core
+alias is intercepted while an OptiScaler-shaped proxy is excluded. The fake
+DLLs are test fixtures only and must never be included in release packages.
+
 # NR-only gaze positioning regression
 
 For the feature-creation controls, preset cache, jitter/multiplier and SDR codec

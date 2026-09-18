@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833211}</ProjectGuid><RootNamespace>CheekyFakeCoreProxy</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType><TargetName>CheekyFakeCoreProxy</TargetName><CheekyOutputSubdir>test-fixtures\</CheekyOutputSubdir></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup><ClCompile Include="tests\fake_ngx_core.cpp" /><ResourceCompile Include="tests\fake_ngx_core.rc" /></ItemGroup>
+  <ItemDefinitionGroup><ClCompile><PreprocessorDefinitions>CHEEKY_FAKE_CORE_PROXY;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile><ResourceCompile><PreprocessorDefinitions>CHEEKY_FAKE_CORE_PROXY;%(PreprocessorDefinitions)</PreprocessorDefinitions></ResourceCompile></ItemDefinitionGroup>
+  <ItemDefinitionGroup><Link><AdditionalOptions>/OPT:NOICF %(AdditionalOptions)</AdditionalOptions></Link></ItemDefinitionGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
