@@ -32,7 +32,12 @@ frame for visual inspection.
 
 Bootstrap tests stage isolated layouts, validate DXGI exports and ordinals,
 exercise recursive factory creation, concurrent ASI initialization and missing
-host pass-through. Core discovery fixtures verify a genuine-shaped NGX core
+host pass-through. Chaining fixtures exercise missing/unloadable second DLLs,
+export fallback, and a second proxy that calls back into all three Cheeky
+factory exports. The loop fixture bounds recursion so the old loader fails
+without exhausting the test process stack. An optional fifth argument supplies
+an external second DLL for a `proxy` smoke test in an isolated fixture folder.
+Core discovery fixtures verify a genuine-shaped NGX core
 alias is intercepted while an OptiScaler-shaped proxy is excluded. The fake
 DLLs are test fixtures only and must never be included in release packages.
 

@@ -52,8 +52,12 @@ DXGI. If the file is absent or cannot load, Cheeky continues using Windows DXGI.
 error code (also sent to debug output). Restart after changing either DLL.
 
 This is a loading mechanism, not a guarantee of compatibility with another mod.
-The second mod must tolerate renaming and forward to the real Windows DXGI,
-without routing back through Cheeky. Luke Ross/R.E.A.L. VR compatibility still
+The second mod must tolerate renaming. Factory creation, debug-interface and
+adapter-removal-support calls that reenter Cheeky through another mod's hook
+bypass the chain and use Windows DXGI. If that path also loops back, Cheeky
+returns `DXGI_ERROR_INVALID_CALL` instead of overflowing the stack. This guard
+covers VRPerfKit's five hooked DXGI exports; arbitrary private exports are not
+covered. Luke Ross/R.E.A.L. VR compatibility still
 requires testing in the specific game. To undo chaining, remove Cheeky's loader
 and restore the other mod's original `dxgi.dll` filename.
 

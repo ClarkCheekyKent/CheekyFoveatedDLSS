@@ -8,16 +8,47 @@ HMODULE g_module{};
 volatile LONG g_chain_calls{};
 }
 
-// This DLL also serves as a partial DXGI proxy fixture.
-#pragma comment(linker, "/EXPORT:CreateDXGIFactory1=FakeCreateDXGIFactory1")
-extern "C" HRESULT WINAPI FakeCreateDXGIFactory1(REFIID iid, void** factory) {
-    InterlockedIncrement(&g_chain_calls);
+// The loop fixture simulates a mod whose original function points back into
+// Cheeky. Bound recursion so the unfixed loader fails a test without crashing.
+thread_local unsigned fake_depth{};
+struct FakeScope { FakeScope() { ++fake_depth; } ~FakeScope() { --fake_depth; } };
+HMODULE factory_target() {
+    wchar_t mode[2]{};
+    if (GetEnvironmentVariableW(L"CHEEKY_TEST_CHAIN_LOOP", mode, ARRAYSIZE(mode))) {
+        wchar_t path[32768]{};
+        GetModuleFileNameW(g_module, path, ARRAYSIZE(path));
+        auto slash = wcsrchr(path, L'\\');
+        wcscpy_s(slash + 1, ARRAYSIZE(path) - (slash + 1 - path), L"dxgi.dll");
+        return GetModuleHandleW(path);
+    }
     wchar_t path[MAX_PATH]{};
     GetSystemDirectoryW(path, ARRAYSIZE(path));
     wcscat_s(path, L"\\dxgi.dll");
-    const auto system = LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
+HRESULT fake_factory(const char* name, REFIID iid, void** factory) {
+    FakeScope scope;
+    if (fake_depth > 8) return E_UNEXPECTED;
+    InterlockedIncrement(&g_chain_calls);
     using Fn = HRESULT (WINAPI*)(REFIID, void**);
-    return reinterpret_cast<Fn>(GetProcAddress(system, "CreateDXGIFactory1"))(iid, factory);
+    return reinterpret_cast<Fn>(GetProcAddress(factory_target(), name))(iid, factory);
+}
+#pragma comment(linker, "/EXPORT:CreateDXGIFactory=FakeCreateDXGIFactory")
+#pragma comment(linker, "/EXPORT:CreateDXGIFactory1=FakeCreateDXGIFactory1")
+#pragma comment(linker, "/EXPORT:CreateDXGIFactory2=FakeCreateDXGIFactory2")
+extern "C" HRESULT WINAPI FakeCreateDXGIFactory(REFIID iid, void** factory) {
+    return fake_factory("CreateDXGIFactory", iid, factory);
+}
+extern "C" HRESULT WINAPI FakeCreateDXGIFactory1(REFIID iid, void** factory) {
+    return fake_factory("CreateDXGIFactory1", iid, factory);
+}
+extern "C" HRESULT WINAPI FakeCreateDXGIFactory2(UINT flags, REFIID iid, void** factory) {
+    FakeScope scope;
+    if (fake_depth > 8) return E_UNEXPECTED;
+    InterlockedIncrement(&g_chain_calls);
+    using Fn = HRESULT (WINAPI*)(UINT, REFIID, void**);
+    return reinterpret_cast<Fn>(GetProcAddress(factory_target(), "CreateDXGIFactory2"))(flags, iid, factory);
 }
 
 extern "C" __declspec(dllexport) HRESULT WINAPI DXGIDeclareAdapterRemovalSupport() {

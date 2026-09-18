@@ -19,6 +19,14 @@ HMODULE g_dxgi{};
 HMODULE g_proxy{}, g_chain{};
 INIT_ONCE g_chain_once = INIT_ONCE_STATIC_INIT;
 thread_local bool g_loading_chain{};
+// A chained mod may hook these proxy exports and keep a trampoline back here.
+// Nested calls bypass the chain; a second bounce fails instead of overflowing.
+thread_local unsigned g_forward_depth{};
+
+struct ForwardCallScope {
+    ForwardCallScope() noexcept { ++g_forward_depth; }
+    ~ForwardCallScope() { --g_forward_depth; }
+};
 
 BOOL CALLBACK load_chain(PINIT_ONCE, PVOID, PVOID*) noexcept {
     // Reentrant exports during the second proxy's DllMain use System32 directly.
@@ -106,30 +114,72 @@ FARPROC cheeky_dxgi_resolve(unsigned index) noexcept {
 }
 
 HRESULT WINAPI cheeky_proxy_CreateDXGIFactory(REFIID iid, void** factory) noexcept {
+    ForwardCallScope scope;
+    if (g_forward_depth > 2) {
+        if (factory) *factory = nullptr;
+        return static_cast<HRESULT>(0x887A0001L); // DXGI_ERROR_INVALID_CALL
+    }
     using Fn = HRESULT (WINAPI*)(REFIID, void**);
-    const HRESULT result = reinterpret_cast<Fn>(cheeky_dxgi_resolve(9))(iid, factory);
+    const FARPROC target = g_forward_depth > 1 ? GetProcAddress(g_dxgi, "CreateDXGIFactory") : cheeky_dxgi_resolve(9);
+    if (!target) missing_system_export();
+    const HRESULT result = reinterpret_cast<Fn>(target)(iid, factory);
     const DWORD error = GetLastError();
-    if (SUCCEEDED(result) && !g_loading_chain) cheeky_bootstrap_after_factory();
+    if (SUCCEEDED(result) && !g_loading_chain && g_forward_depth == 1) cheeky_bootstrap_after_factory();
     SetLastError(error);
     return result;
 }
 
 HRESULT WINAPI cheeky_proxy_CreateDXGIFactory1(REFIID iid, void** factory) noexcept {
+    ForwardCallScope scope;
+    if (g_forward_depth > 2) {
+        if (factory) *factory = nullptr;
+        return static_cast<HRESULT>(0x887A0001L);
+    }
     using Fn = HRESULT (WINAPI*)(REFIID, void**);
-    const HRESULT result = reinterpret_cast<Fn>(cheeky_dxgi_resolve(10))(iid, factory);
+    const FARPROC target = g_forward_depth > 1 ? GetProcAddress(g_dxgi, "CreateDXGIFactory1") : cheeky_dxgi_resolve(10);
+    if (!target) missing_system_export();
+    const HRESULT result = reinterpret_cast<Fn>(target)(iid, factory);
     const DWORD error = GetLastError();
-    if (SUCCEEDED(result) && !g_loading_chain) cheeky_bootstrap_after_factory();
+    if (SUCCEEDED(result) && !g_loading_chain && g_forward_depth == 1) cheeky_bootstrap_after_factory();
     SetLastError(error);
     return result;
 }
 
 HRESULT WINAPI cheeky_proxy_CreateDXGIFactory2(UINT flags, REFIID iid, void** factory) noexcept {
+    ForwardCallScope scope;
+    if (g_forward_depth > 2) {
+        if (factory) *factory = nullptr;
+        return static_cast<HRESULT>(0x887A0001L);
+    }
     using Fn = HRESULT (WINAPI*)(UINT, REFIID, void**);
-    const HRESULT result = reinterpret_cast<Fn>(cheeky_dxgi_resolve(11))(flags, iid, factory);
+    const FARPROC target = g_forward_depth > 1 ? GetProcAddress(g_dxgi, "CreateDXGIFactory2") : cheeky_dxgi_resolve(11);
+    if (!target) missing_system_export();
+    const HRESULT result = reinterpret_cast<Fn>(target)(flags, iid, factory);
     const DWORD error = GetLastError();
-    if (SUCCEEDED(result) && !g_loading_chain) cheeky_bootstrap_after_factory();
+    if (SUCCEEDED(result) && !g_loading_chain && g_forward_depth == 1) cheeky_bootstrap_after_factory();
     SetLastError(error);
     return result;
+}
+
+HRESULT WINAPI cheeky_proxy_DXGIDeclareAdapterRemovalSupport() noexcept {
+    ForwardCallScope scope;
+    if (g_forward_depth > 2) return static_cast<HRESULT>(0x887A0001L);
+    using Fn = HRESULT (WINAPI*)();
+    const FARPROC target = g_forward_depth > 1 ? GetProcAddress(g_dxgi, "DXGIDeclareAdapterRemovalSupport") : cheeky_dxgi_resolve(16);
+    if (!target) missing_system_export();
+    return reinterpret_cast<Fn>(target)();
+}
+
+HRESULT WINAPI cheeky_proxy_DXGIGetDebugInterface1(UINT flags, REFIID iid, void** output) noexcept {
+    ForwardCallScope scope;
+    if (g_forward_depth > 2) {
+        if (output) *output = nullptr;
+        return static_cast<HRESULT>(0x887A0001L);
+    }
+    using Fn = HRESULT (WINAPI*)(UINT, REFIID, void**);
+    const FARPROC target = g_forward_depth > 1 ? GetProcAddress(g_dxgi, "DXGIGetDebugInterface1") : cheeky_dxgi_resolve(18);
+    if (!target) missing_system_export();
+    return reinterpret_cast<Fn>(target)(flags, iid, output);
 }
 }
 

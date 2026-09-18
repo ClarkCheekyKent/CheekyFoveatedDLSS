@@ -79,10 +79,12 @@ void check_debug_forward(HMODULE proxy, HMODULE system) {
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        require(argc == 5, "Usage: bootstrap-tests proxy|asi|missing|chain|broken-chain <proxy.dll> <plugin.asi> <fake-host.dll>");
+        require(argc == 5 || argc == 6, "Usage: bootstrap-tests proxy|asi|missing|chain|broken-chain|loop-chain <proxy.dll> <plugin.asi> <fake-host.dll> [external-chain.dll]");
         const bool asi = std::wstring(argv[1]) == L"asi";
         const bool missing = std::wstring(argv[1]) == L"missing";
-        const bool chain = std::wstring(argv[1]) == L"chain";
+        const bool loop_chain = std::wstring(argv[1]) == L"loop-chain";
+        const bool chain = std::wstring(argv[1]) == L"chain" || loop_chain;
+        SetEnvironmentVariableW(L"CHEEKY_TEST_CHAIN_LOOP", loop_chain ? L"1" : nullptr);
         const bool broken_chain = std::wstring(argv[1]) == L"broken-chain";
         wchar_t executable[32768]{};
         require(GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable)) != 0, "test executable path");
@@ -96,6 +98,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!missing) fs::copy_file(argv[4], host_path);
         const auto chain_path = directory / L"dxgi2.dll";
         if (chain) fs::copy_file(argv[4], chain_path);
+        if (argc == 6) fs::copy_file(argv[5], chain_path);
         if (broken_chain) std::ofstream(chain_path) << "Not a DLL";
 
         const auto caller = GetCurrentThreadId();

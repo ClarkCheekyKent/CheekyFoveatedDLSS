@@ -58,8 +58,7 @@ FORWARD cheeky_proxy_DXGID3D10CreateDevice, 12
 FORWARD cheeky_proxy_DXGID3D10CreateLayeredDevice, 13
 FORWARD cheeky_proxy_DXGID3D10GetLayeredDeviceSize, 14
 FORWARD cheeky_proxy_DXGID3D10RegisterLayers, 15
-FORWARD cheeky_proxy_DXGIDeclareAdapterRemovalSupport, 16
+; Slots 16 and 18 have typed wrappers to guard third-party hook recursion.
 FORWARD cheeky_proxy_DXGIDisableVBlankVirtualization, 17
-FORWARD cheeky_proxy_DXGIGetDebugInterface1, 18
 FORWARD cheeky_proxy_DXGIReportAdapterConfiguration, 19
 END
