@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <dxgi1_3.h>
 #include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -78,9 +79,11 @@ void check_debug_forward(HMODULE proxy, HMODULE system) {
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        require(argc == 5, "Usage: bootstrap-tests proxy|asi|missing <proxy.dll> <plugin.asi> <fake-host.dll>");
+        require(argc == 5, "Usage: bootstrap-tests proxy|asi|missing|chain|broken-chain <proxy.dll> <plugin.asi> <fake-host.dll>");
         const bool asi = std::wstring(argv[1]) == L"asi";
         const bool missing = std::wstring(argv[1]) == L"missing";
+        const bool chain = std::wstring(argv[1]) == L"chain";
+        const bool broken_chain = std::wstring(argv[1]) == L"broken-chain";
         wchar_t executable[32768]{};
         require(GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable)) != 0, "test executable path");
         const auto directory = fs::path(executable).parent_path() /
@@ -91,6 +94,9 @@ int wmain(int argc, wchar_t** argv) {
         fs::copy_file(argv[asi ? 3 : 2], loader_path);
         const auto host_path = directory / L"CheekyFoveatedDLSS" / L"CheekyFoveatedDLSSHost.dll";
         if (!missing) fs::copy_file(argv[4], host_path);
+        const auto chain_path = directory / L"dxgi2.dll";
+        if (chain) fs::copy_file(argv[4], chain_path);
+        if (broken_chain) std::ofstream(chain_path) << "Not a DLL";
 
         const auto caller = GetCurrentThreadId();
         const HMODULE loader = LoadLibraryExW(loader_path.c_str(), nullptr,
@@ -116,6 +122,15 @@ int wmain(int argc, wchar_t** argv) {
             check_exports(loader, system);
             check_factories(loader, system);
             check_debug_forward(loader, system);
+            if (chain) {
+                const auto second = GetModuleHandleW(chain_path.c_str());
+                require(second != nullptr, "dxgi2.dll did not load from loader directory");
+                const auto value = reinterpret_cast<ValueFn>(GetProcAddress(second, "CheekyFakeHost_Value"));
+                require(value && value(4) >= 3, "factory calls bypassed dxgi2.dll");
+                const auto thunk = reinterpret_cast<HRESULT (WINAPI*)()>(GetProcAddress(loader, "DXGIDeclareAdapterRemovalSupport"));
+                require(thunk && thunk() == 0x1234 && thunk() == 0x1234, "ASM calls bypassed dxgi2.dll");
+            }
+            require(fs::file_size(directory / L"CheekyFoveatedDLSS-Loader.log") > 2, "loader log missing");
             require(wait_for_start(status) == (missing ? 3U : 2U), "proxy host startup status");
         }
         if (!missing) {

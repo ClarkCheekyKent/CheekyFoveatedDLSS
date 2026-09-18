@@ -16,6 +16,54 @@ constexpr const char* exports[] = {
 };
 INIT_ONCE g_dxgi_once = INIT_ONCE_STATIC_INIT;
 HMODULE g_dxgi{};
+HMODULE g_proxy{}, g_chain{};
+INIT_ONCE g_chain_once = INIT_ONCE_STATIC_INIT;
+thread_local bool g_loading_chain{};
+
+BOOL CALLBACK load_chain(PINIT_ONCE, PVOID, PVOID*) noexcept {
+    // Reentrant exports during the second proxy's DllMain use System32 directly.
+    g_loading_chain = true;
+    wchar_t path[32768]{};
+    const DWORD length = GetModuleFileNameW(g_proxy, path, ARRAYSIZE(path));
+    auto filename = wcsrchr(path, L'\\');
+    if (length && length < ARRAYSIZE(path) && filename) {
+        const size_t remaining = ARRAYSIZE(path) - (filename + 1 - path);
+        if (remaining >= ARRAYSIZE(L"CheekyFoveatedDLSS-Loader.log")) {
+            wcscpy_s(filename + 1, remaining, L"dxgi2.dll");
+            const DWORD attributes = GetFileAttributesW(path);
+            const wchar_t* message = L"dxgi2.dll absent; forwarding to System32 DXGI";
+            DWORD error = 0;
+            if (attributes != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) {
+                const HMODULE candidate = LoadLibraryExW(path, nullptr,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+                error = candidate ? 0 : GetLastError();
+                if (candidate && candidate != g_proxy && !GetProcAddress(candidate, "CheekyBootstrap_Status")) {
+                    g_chain = candidate;
+                    message = L"dxgi2.dll loaded; forwarding its exports, with System32 fallback for missing exports";
+                } else {
+                    message = candidate ? L"dxgi2.dll is another Cheeky loader; ignored" :
+                        L"dxgi2.dll failed to load; forwarding to System32 DXGI";
+                }
+                // Retain loaded DLLs: third-party initialization may install hooks.
+            }
+            wchar_t line[512]{};
+            swprintf_s(line, L"Cheeky: %s (Win32=%lu)\r\n", message, error);
+            OutputDebugStringW(line);
+            wcscpy_s(filename + 1, remaining, L"CheekyFoveatedDLSS-Loader.log");
+            const HANDLE log = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (log != INVALID_HANDLE_VALUE) {
+                const wchar_t bom = 0xfeff;
+                DWORD written{};
+                WriteFile(log, &bom, sizeof(bom), &written, nullptr);
+                WriteFile(log, line, static_cast<DWORD>(wcslen(line) * sizeof(wchar_t)), &written, nullptr);
+                CloseHandle(log);
+            }
+        }
+    }
+    g_loading_chain = false;
+    return TRUE;
+}
 
 BOOL CALLBACK load_system_dxgi(PINIT_ONCE, PVOID, PVOID*) noexcept {
     wchar_t path[MAX_PATH]{};
@@ -46,9 +94,13 @@ FARPROC cheeky_dxgi_resolve(unsigned index) noexcept {
     const DWORD error = GetLastError();
     if (index >= ARRAYSIZE(exports) ||
         !InitOnceExecuteOnce(&g_dxgi_once, load_system_dxgi, nullptr, nullptr)) missing_system_export();
-    const FARPROC target = GetProcAddress(g_dxgi, exports[index]);
+    const bool reentrant = g_loading_chain;
+    if (!reentrant) InitOnceExecuteOnce(&g_chain_once, load_chain, nullptr, nullptr);
+    FARPROC target = !reentrant && g_chain ? GetProcAddress(g_chain, exports[index]) : nullptr;
+    if (!target) target = GetProcAddress(g_dxgi, exports[index]);
     if (target == nullptr) missing_system_export();
-    InterlockedExchangePointer(&cheeky_dxgi_targets[index], reinterpret_cast<void*>(target));
+    // Do not permanently bypass the chain when resolving during its initialization.
+    if (!reentrant) InterlockedExchangePointer(&cheeky_dxgi_targets[index], reinterpret_cast<void*>(target));
     SetLastError(error);
     return target;
 }
@@ -57,7 +109,7 @@ HRESULT WINAPI cheeky_proxy_CreateDXGIFactory(REFIID iid, void** factory) noexce
     using Fn = HRESULT (WINAPI*)(REFIID, void**);
     const HRESULT result = reinterpret_cast<Fn>(cheeky_dxgi_resolve(9))(iid, factory);
     const DWORD error = GetLastError();
-    if (SUCCEEDED(result)) cheeky_bootstrap_after_factory();
+    if (SUCCEEDED(result) && !g_loading_chain) cheeky_bootstrap_after_factory();
     SetLastError(error);
     return result;
 }
@@ -66,7 +118,7 @@ HRESULT WINAPI cheeky_proxy_CreateDXGIFactory1(REFIID iid, void** factory) noexc
     using Fn = HRESULT (WINAPI*)(REFIID, void**);
     const HRESULT result = reinterpret_cast<Fn>(cheeky_dxgi_resolve(10))(iid, factory);
     const DWORD error = GetLastError();
-    if (SUCCEEDED(result)) cheeky_bootstrap_after_factory();
+    if (SUCCEEDED(result) && !g_loading_chain) cheeky_bootstrap_after_factory();
     SetLastError(error);
     return result;
 }
@@ -75,7 +127,7 @@ HRESULT WINAPI cheeky_proxy_CreateDXGIFactory2(UINT flags, REFIID iid, void** fa
     using Fn = HRESULT (WINAPI*)(UINT, REFIID, void**);
     const HRESULT result = reinterpret_cast<Fn>(cheeky_dxgi_resolve(11))(flags, iid, factory);
     const DWORD error = GetLastError();
-    if (SUCCEEDED(result)) cheeky_bootstrap_after_factory();
+    if (SUCCEEDED(result) && !g_loading_chain) cheeky_bootstrap_after_factory();
     SetLastError(error);
     return result;
 }
@@ -83,6 +135,7 @@ HRESULT WINAPI cheeky_proxy_CreateDXGIFactory2(UINT flags, REFIID iid, void** fa
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_proxy = module;
         cheeky_bootstrap_attach(module);
         // Start early, but perform all DLL loading and graphics work on a worker.
         // In particular, never wait for that worker in this entry point.

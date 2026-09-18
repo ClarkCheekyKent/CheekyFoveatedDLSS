@@ -29,9 +29,33 @@ readback; actual NVIDIA inference and headset behavior still need game testing.
 3. Start the game with its D3D11 or D3D12 renderer and enable DLSS.
 
 **If `dxgi.dll` already exists, do not overwrite it.** For an OptiScaler install,
-use the ASI package below. Other proxy combinations require separate testing;
-this loader forwards to Windows' real DXGI and does not chain arbitrary proxy
-DLLs. A game that bypasses the local `dxgi.dll` will not load this package.
+use the ASI package below. For another DXGI mod, see optional chaining below.
+A game that bypasses the local `dxgi.dll` will not load this package.
+
+### Optional second DXGI mod
+
+With the game closed, back up the other mod's `dxgi.dll`, then rename it to
+`dxgi2.dll` and put Cheeky's `dxgi.dll` beside it. Keep the other mod's remaining
+files in their original locations. Do not rename a second copy of Cheeky.
+
+```text
+Game.exe
+dxgi.dll                 (Cheeky)
+dxgi2.dll                (the other mod)
+CheekyFoveatedDLSS/
+```
+
+On the first DXGI call, Cheeky loads `dxgi2.dll` from its own directory and
+forwards exports through it. Missing exports fall back individually to Windows
+DXGI. If the file is absent or cannot load, Cheeky continues using Windows DXGI.
+`CheekyFoveatedDLSS-Loader.log` beside `dxgi.dll` records the result and Windows
+error code (also sent to debug output). Restart after changing either DLL.
+
+This is a loading mechanism, not a guarantee of compatibility with another mod.
+The second mod must tolerate renaming and forward to the real Windows DXGI,
+without routing back through Cheeky. Luke Ross/R.E.A.L. VR compatibility still
+requires testing in the specific game. To undo chaining, remove Cheeky's loader
+and restore the other mod's original `dxgi.dll` filename.
 
 ## OptiScaler installation
 
@@ -116,8 +140,8 @@ it does not require the OpenXR layer.
 ## Loader behavior and current limits
 
 - All 20 named exports and their ordinals from the tested Windows DXGI library
-  are forwarded to the absolute System32 DXGI path. A missing Cheeky host does
-  not disable DXGI forwarding.
+  are forwarded through optional `dxgi2.dll`, with the absolute System32 DXGI
+  path as fallback. A missing Cheeky host does not disable DXGI forwarding.
 - Cheeky host loading and graphics initialization run on a separate worker. Successful
   standalone factory creation waits up to ten seconds for this startup to
   finish before returning the factory to the game. Recursive factory creation
@@ -126,7 +150,8 @@ it does not require the OpenXR layer.
   A D3D12 swap chain created before the host hooks are ready may not provide a
   usable presentation queue. In that case, restart with normal early ASI
   loading; the host must observe a supported swap-chain creation path.
-- Loader startup diagnostics are sent to the Windows debug output. If no host
+- Chain selection is recorded in `CheekyFoveatedDLSS-Loader.log`; other loader
+  startup diagnostics are sent to the Windows debug output. If no host
   log appears, check the nested DLL layout and whether the selected loader was
   loaded at all.
 - Native NGX, Streamline, OptiScaler backend changes, multiple swap chains,

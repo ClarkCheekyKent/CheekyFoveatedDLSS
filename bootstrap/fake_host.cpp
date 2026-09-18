@@ -5,6 +5,23 @@
 namespace {
 volatile LONG g_starts{}, g_kind{}, g_thread{}, g_recursive_factory{};
 HMODULE g_module{};
+volatile LONG g_chain_calls{};
+}
+
+// This DLL also serves as a partial DXGI proxy fixture.
+#pragma comment(linker, "/EXPORT:CreateDXGIFactory1=FakeCreateDXGIFactory1")
+extern "C" HRESULT WINAPI FakeCreateDXGIFactory1(REFIID iid, void** factory) {
+    InterlockedIncrement(&g_chain_calls);
+    wchar_t path[MAX_PATH]{};
+    GetSystemDirectoryW(path, ARRAYSIZE(path));
+    wcscat_s(path, L"\\dxgi.dll");
+    const auto system = LoadLibraryExW(path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    using Fn = HRESULT (WINAPI*)(REFIID, void**);
+    return reinterpret_cast<Fn>(GetProcAddress(system, "CreateDXGIFactory1"))(iid, factory);
+}
+
+extern "C" __declspec(dllexport) HRESULT WINAPI DXGIDeclareAdapterRemovalSupport() {
+    return 0x1234; // Distinguishes MASM forwarding from System32 fallback.
 }
 
 extern "C" __declspec(dllexport) bool CheekyHost_Start(unsigned kind) {
@@ -30,6 +47,7 @@ extern "C" __declspec(dllexport) bool CheekyHost_Start(unsigned kind) {
 }
 
 extern "C" __declspec(dllexport) unsigned CheekyFakeHost_Value(unsigned which) {
+    if (which == 4) return static_cast<unsigned>(InterlockedCompareExchange(&g_chain_calls, 0, 0));
     volatile LONG* value = which == 0 ? &g_starts : which == 1 ? &g_kind : which == 2 ? &g_thread : &g_recursive_factory;
     return static_cast<unsigned>(InterlockedCompareExchange(value, 0, 0));
 }
