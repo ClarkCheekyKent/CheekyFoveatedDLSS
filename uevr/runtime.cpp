@@ -1,3 +1,4 @@
+#include "vulkan_backend.hpp"
 #include "runtime_api.hpp"
 #include "settings_io.hpp"
 #include "frame_cadence.hpp"
@@ -196,7 +197,13 @@ std::string snapshot_locked(State& s) {
             << ",\"output_width\":" << d.passed_crop.output_width << ",\"output_height\":" << d.passed_crop.output_height
             << ",\"output_x\":" << d.passed_crop.output_base_x << ",\"output_y\":" << d.passed_crop.output_base_y << "}}";
     }
-    out << "],\"view_details\":[";
+    const auto vk = vulkan_backend_status();
+    out << "],\"vulkan\":{\"state\":\"" << json_escape(vk.reason)
+        << "\",\"evaluations\":" << vk.calls << ",\"active\":" << vk.active
+        << ",\"passthrough\":" << vk.passthrough << ",\"failed\":" << vk.failed
+        << ",\"result\":" << vk.last_result << ",\"input_width\":" << vk.input_width
+        << ",\"input_height\":" << vk.input_height << ",\"output_width\":" << vk.output_width
+        << ",\"output_height\":" << vk.output_height << "},\"view_details\":[";
     const auto details = stereo_view_details();
     // Bound the event size even in games that churn many view identities.
     for (std::size_t i = 0; i < (std::min)(details.size(), std::size_t{16}); ++i) {
@@ -277,7 +284,7 @@ void request_save(State& s) { s.save_requested = true; SetEvent(s.save_event); }
 bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* queue) {
     const auto previous_renderer = s.renderer;
     s.renderer = renderer;
-    if (renderer > 1) {
+    if (renderer > 2) {
         s.graphics_ready = false;
         s.message = "Unsupported renderer; processing paused";
         return false;
@@ -330,7 +337,7 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
         if (!input || input->size != sizeof(*input) || input->abi != cheeky_runtime_abi ||
             !input->config_directory || !*input->config_directory || !input->attachment) return false;
         *input->attachment = 0;
-        if (input->renderer > 1 || static_cast<std::uint32_t>(input->host) > static_cast<std::uint32_t>(CheekyRuntimeHost::optiscaler)) return false;
+        if (input->renderer > 2 || static_cast<std::uint32_t>(input->host) > static_cast<std::uint32_t>(CheekyRuntimeHost::optiscaler)) return false;
         auto& s = state(); std::lock_guard lock(s.mutex);
         if (adapter_attached) { log_warning("Duplicate Cheeky host attachment rejected"); return false; }
         if (s.failed) return false;
@@ -549,4 +556,8 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Snapshot(char* output, std::
 }
 extern "C" __declspec(dllexport) bool CheekyUEVR_Snapshot(char* output, std::uint32_t capacity) {
     return CheekyRuntime_Snapshot(output, capacity);
+}
+
+extern "C" __declspec(dllexport) void CheekyRuntime_VulkanFrame(void* device, void* queue) {
+    CheekyRuntime_Tick(active_attachment.load(), 2, device, queue);
 }

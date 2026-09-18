@@ -6,6 +6,8 @@
   <ItemDefinitionGroup><ClCompile><PreprocessorDefinitions>CHEEKY_OVERLAY_TEST_DESKTOP;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile></ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="standalone\overlay.cpp" />
+    <ClCompile Include="standalone\overlay_ui.cpp" />
+    <ClCompile Include="standalone\overlay_input.cpp" />
     <ClCompile Include="uevr\settings_io.cpp" />
     <ClCompile Include="src\settings.cpp" />
     <ClCompile Include="src\foveation.cpp" />
@@ -17,6 +19,16 @@
     <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_dx12.cpp" />
     <ClCompile Include="tests\overlay_tests.cpp" />
+    <ClCompile Include="tests\vulkan_overlay_tests.cpp" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\buffer.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\hook.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\trampoline.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\hde\hde64.c" />
+
+    <ClCompile Include="standalone\vulkan_overlay.cpp" />
+    <ClCompile Include="src\vulkan_api.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_vulkan.cpp" />
+
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

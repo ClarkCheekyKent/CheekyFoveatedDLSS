@@ -1,3 +1,5 @@
+#include "vulkan_observer.hpp"
+#include "ngx_frame_contract.hpp"
 #include "eye_calibration.hpp"
 #include "dlss_nr_input.hpp"
 #include <optional>
@@ -3212,6 +3214,11 @@ std::uint32_t hook_sl_evaluate_feature(
         );
     }
     if (original == nullptr) return 0x18U;
+    // A Vulkan command buffer is a dispatchable handle, never an IUnknown.
+    // Streamline's native NGX calls already carry the full Vulkan contract;
+    // use that same processing path without rewriting tags or options twice.
+    if(command_buffer && vulkan_command_device(static_cast<VkCommandBuffer>(command_buffer)))
+        return original(feature,frame,inputs,input_count,command_buffer);
     detect_afw_runtime();
     if (afw_coverage_enabled() && feature == 0U) {
         // Keep the game's viewport/tags/options intact through AFW. The nested
@@ -4510,46 +4517,8 @@ void evaluate_nr_after_native_d3d12(
 
     AfwPrivateWorkScope afw_private_work;
     DlssFrameContract contract{};
-    contract.view_id = static_cast<DlssViewId>(
-        reinterpret_cast<std::uintptr_t>(handle)
-    );
-    contract.feature_id = d3d12_game_feature(handle);
-    contract.render_width = get_ui(parameters, "Width");
-    contract.render_height = get_ui(parameters, "Height");
-    const auto subrect_width = get_ui(
-        parameters, "DLSS.Render.Subrect.Dimensions.Width"
-    );
-    const auto subrect_height = get_ui(
-        parameters, "DLSS.Render.Subrect.Dimensions.Height"
-    );
-    if (subrect_width != 0U) contract.render_width = subrect_width;
-    if (subrect_height != 0U) contract.render_height = subrect_height;
-    contract.output_width = get_ui(parameters, "OutWidth");
-    contract.output_height = get_ui(parameters, "OutHeight");
-    if (!contract.render_width || !contract.render_height ||
-        !contract.output_width || !contract.output_height) return false;
-    contract.color_base_x = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.X");
-    contract.color_base_y = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.Y");
-    contract.depth_base_x = get_ui(parameters, "DLSS.Input.Depth.Subrect.Base.X");
-    contract.depth_base_y = get_ui(parameters, "DLSS.Input.Depth.Subrect.Base.Y");
-    contract.mv_base_x = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.X");
-    contract.mv_base_y = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.Y");
-    contract.output_base_x = get_ui(parameters, "DLSS.Output.Subrect.Base.X");
-    contract.output_base_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
-    if (!try_get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags", contract.create_flags))
-        return false;
-    contract.motion_vectors_low_res =
-        (contract.create_flags & (1U << 1U)) != 0U;
-    contract.depth_inverted = (contract.create_flags & (1U << 3U)) != 0U;
-    contract.reset = get_ui(parameters, "Reset") != 0U;
-    if (!try_get_ngx_integer_bits(parameters, "PerfQualityValue", contract.perf_quality))
-        return false;
-    contract.motion_vector_scale_x = get_d3d12_parameter_float(
-        parameters, "MV.Scale.X", 1.0F
-    );
-    contract.motion_vector_scale_y = get_d3d12_parameter_float(
-        parameters, "MV.Scale.Y", 1.0F
-    );
+    if (!read_ngx_frame_contract(parameters, reinterpret_cast<std::uintptr_t>(handle),
+            d3d12_game_feature(handle), contract)) return false;
 
     const auto effective_settings = settings_for_view(settings, contract.view_id);
 
@@ -5675,6 +5644,8 @@ template <typename T>
             DiagnosticApi::d3d12
         );
     }
+    vulkan_install_ngx_hooks(public_runtime);
+    vulkan_install_ngx_hooks(core_runtime);
     return installed;
 }
 
@@ -5835,6 +5806,8 @@ void remember_original(
     const FARPROC original
 ) noexcept {
     std::array<wchar_t, MAX_PATH> name{};
+    if(function_name && std::strncmp(function_name,"NVSDK_NGX_VULKAN_",17)==0)
+        vulkan_install_ngx_hooks(target);
     return module_name(target, name.data(), name.size())
         ? replacement_for_name(name.data(), function_name, original)
         : original;

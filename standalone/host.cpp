@@ -1,4 +1,5 @@
 #include "host_api.hpp"
+#include "vulkan_overlay.hpp"
 #include "runtime_host_api.hpp"
 #include "overlay.hpp"
 #include <d3d11.h>
@@ -266,14 +267,14 @@ template<class T> bool load(HMODULE dll,const char* name,T& out) {
 }
 }
 
-extern "C" __declspec(dllexport) bool CheekyHost_Start(std::uint32_t host) {
+bool start_host(std::uint32_t host,bool vulkan) {
     try {
         if (host!=1 && host!=2) return false;
         std::lock_guard lock(start_mutex);
         if (started) return host==active_host;
         HMODULE resident{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
-                reinterpret_cast<LPCWSTR>(&CheekyHost_Start),&resident)) return false;
+                reinterpret_cast<LPCWSTR>(&start_host),&resident)) return false;
         wchar_t path[32768]{};
         const auto length=GetModuleFileNameW(module,path,32768);
         if (!length || length>=32768) return false;
@@ -292,7 +293,7 @@ extern "C" __declspec(dllexport) bool CheekyHost_Start(std::uint32_t host) {
         input.config_directory=config.c_str(); input.attachment=&attachment;
         input.host=static_cast<CheekyRuntimeHost>(host);
         if (!start(&input)) { log_host("Resident runtime refused startup; see its log"); return false; }
-        if (!install_graphics_hooks()) { runtime_detach(attachment); attachment=0; log_host("Graphics hook discovery failed"); return false; }
+        if (!vulkan && !install_graphics_hooks()) { runtime_detach(attachment); attachment=0; log_host("Graphics hook discovery failed"); return false; }
         active_host=host; started=true;
         log_host("Host ready; waiting for game graphics. F8 opens settings.");
         return true;
@@ -301,6 +302,16 @@ extern "C" __declspec(dllexport) bool CheekyHost_Start(std::uint32_t host) {
         log_host("Host startup exception contained");
         return false;
     }
+}
+extern "C" __declspec(dllexport) bool CheekyHost_Start(std::uint32_t host) {return start_host(host,false);}
+extern "C" __declspec(dllexport) bool CheekyHost_StartVulkan(std::uint32_t host) {return start_host(host,true);}
+extern "C" __declspec(dllexport) VkResult CheekyHost_VulkanPresent(const CheekyVulkanPresent* present) {
+    if(!present || present->size!=sizeof(*present) || !present->next || !present->present)return VK_ERROR_INITIALIZATION_FAILED;
+    const cheeky::standalone::OverlayRuntime api{attachment,runtime_command,runtime_snapshot,active_host==2?"OptiScaler":"Standalone"};
+    return cheeky::standalone::overlay_vulkan_present(*present,api);
+}
+extern "C" __declspec(dllexport) void CheekyHost_VulkanDestroy(VkDevice device,VkSwapchainKHR chain) {
+    cheeky::standalone::overlay_vulkan_destroy(device,chain);
 }
 extern "C" __declspec(dllexport) bool CheekyHost_Snapshot(char* out,std::uint32_t capacity) {
     return started && runtime_snapshot && runtime_snapshot(out,capacity);

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{BE211A7D-6524-4FBD-A391-6B3FC631F310}</ProjectGuid><RootNamespace>CheekyVulkanLayer</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType><TargetName>CheekyVulkanLayer</TargetName></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup><ClCompile Include="vulkan_layer\bootstrap.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

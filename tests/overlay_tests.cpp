@@ -252,7 +252,10 @@ void capture(const std::string& path, const std::vector<unsigned char>& image) {
 }
 }
 
+int run_vulkan_overlay_tests(bool layer=false);
 int main(int argc, char** argv) {
+    if(argc==2 && std::strcmp(argv[1],"--vulkan-layer")==0)return run_vulkan_overlay_tests(true);
+    if(argc==2 && std::strcmp(argv[1],"--vulkan")==0)return run_vulkan_overlay_tests();
     try {
         bool dx11{}, hdr10{}, scrgb{}; std::string capture_path;
         for (int i = 1; i < argc; ++i) {

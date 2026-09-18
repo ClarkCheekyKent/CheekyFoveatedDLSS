@@ -44,7 +44,7 @@ void trace_event(const char*, ...) noexcept {}
 // Runtime discovery is excluded from deterministic coordinator tests. Live
 // OpenVR acquisition is tested separately, with snapshots exercising shared policy here.
 const CheekyGazeSnapshotV1* test_openvr_snapshot{};
-bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1& output) noexcept {
+bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1& output, std::uint64_t) noexcept {
     if (!test_openvr_snapshot) return false;
     output=*test_openvr_snapshot;
     return true;
@@ -2056,7 +2056,11 @@ void test_afw_gaze_pixel_coverage() {
 
 int run_d3d12_history_tests();
 
+int run_vulkan_tests(bool real=false, bool integration=false);
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan-layer-model") == 0) return run_vulkan_tests(true,true);
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan-model") == 0) return run_vulkan_tests(true);
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan") == 0) return run_vulkan_tests();
     if (argc == 2 && std::strcmp(argv[1], "--afw-gaze") == 0) {
         test_afw_gaze_integration(); test_afw_source_projection_coverage(); test_afw_gaze_pixel_coverage();
         if (!failures) std::cout << "AFW fixed allocation gaze tests passed\n";

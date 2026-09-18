@@ -6,6 +6,11 @@
   <ItemGroup>
     <ClCompile Include="standalone\host.cpp" />
     <ClCompile Include="standalone\overlay.cpp" />
+    <ClCompile Include="standalone\vulkan_overlay.cpp" />
+    <ClCompile Include="src\vulkan_api.cpp" />
+    <ClCompile Include="third_party\reshade\deps\imgui\backends\imgui_impl_vulkan.cpp" />
+    <ClCompile Include="standalone\overlay_ui.cpp" />
+    <ClCompile Include="standalone\overlay_input.cpp" />
     <ClCompile Include="uevr\settings_io.cpp" />
     <ClCompile Include="src\settings.cpp" />
     <ClCompile Include="src\foveation.cpp" />

@@ -2,6 +2,9 @@
 #include "dlss_nr_lifetime.hpp"
 #include "eye_calibration_d3d12.hpp"
 #include "dlss_nr.hpp"
+#include "nr_codec_shader.hpp"
+#include "nr_parameters.hpp"
+#include "nr_runtime_module.hpp"
 
 #include "d3d12_output_contract.hpp"
 #include "dlss_nr_contract.hpp"
@@ -66,14 +69,12 @@ void release(T*& object) noexcept {
 
 struct RuntimeState {
     HMODULE module{};
-    HMODULE addon{};
     ID3D12Device* device{};
     NgxAllocateParametersFn allocate_parameters{};
     NgxDestroyParametersFn destroy_parameters{};
     NgxCreateFeatureFn create_feature{};
     NgxEvaluateFeatureFn evaluate_feature{};
     NgxReleaseFeatureFn release_feature{};
-    GetModuleFileNameWFn get_module_file_name{};
     // 0 not attempted, 1 ready, 2 missing DLL, 3 failed.
     std::uint32_t state{};
 };
@@ -93,21 +94,6 @@ struct FeatureKey {
 
     bool operator==(const FeatureKey&) const = default;
 };
-
-void set_model_tuning(NgxParameters* parameters, const Settings& settings) noexcept {
-    // Match the reference forwarder's creation-time tuning contract. Keep these
-    // in FeatureKey as well, without depending on live retuning support.
-    parameters->Set("DLSSNR.Hint.Render.Preset", settings.nr_preset);
-    parameters->Set("DLSSNR.Intensity", settings.nr_intensity);
-    parameters->Set("DLSSNR.LocalToneStrength", settings.nr_local_tone_strength);
-    parameters->Set("DLSSNR.LocalStructureStrength", settings.nr_local_structure_strength);
-    parameters->Set("DLSSNR.SkinStructureStrength", settings.nr_skin_structure_strength);
-    // The driver distinguishes integer values from pointer values even on x64.
-    parameters->Set("DLSSNR.ControlMask", static_cast<void*>(nullptr));
-    parameters->Set("DLSSNR.UseAutoMask", settings.nr_automatic_mask ? 1U : 0U);
-    parameters->Set("DLSSNR.Style", settings.nr_style);
-    parameters->Set("DLSSNR.UICorrection", settings.nr_ui_correction ? 1U : 0U);
-}
 
 bool verify_model_tuning(NgxParameters* parameters, const Settings& settings,
     DlssViewId view_id) noexcept {
@@ -192,7 +178,7 @@ struct ViewState {
 std::mutex nr_mutex;
 RuntimeState runtime;
 std::deque<ViewState> views;
-std::atomic<std::uint64_t> requested_reset_generation{};
+
 DlssNrSnapshot diagnostics;
 // One active feature plus one alternate for full/foveated toggling. Pending
 // recordings count against this budget too; exhausted caches fall back to SR.
@@ -277,124 +263,6 @@ void evict_retired_features(ViewState& view) noexcept {
     }
 }
 
-[[nodiscard]] bool patch_slot(void** const slot, void* const replacement) noexcept {
-    if (slot == nullptr || replacement == nullptr) return false;
-    DWORD previous{};
-    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &previous)) {
-        return false;
-    }
-    InterlockedExchangePointer(
-        reinterpret_cast<PVOID volatile*>(slot),
-        replacement
-    );
-    DWORD ignored{};
-    static_cast<void>(VirtualProtect(
-        slot,
-        sizeof(*slot),
-        previous,
-        &ignored
-    ));
-    return true;
-}
-
-[[nodiscard]] bool patch_named_import(
-    const HMODULE module,
-    const char* const requested_name,
-    void* const replacement,
-    void** const original_output
-) noexcept {
-    if (module == nullptr || requested_name == nullptr || replacement == nullptr) {
-        return false;
-    }
-    auto* const image = reinterpret_cast<std::byte*>(module);
-    const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return false;
-    const auto* const headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-        image + dos->e_lfanew
-    );
-    if (headers->Signature != IMAGE_NT_SIGNATURE) return false;
-    const auto& imports = headers->OptionalHeader.DataDirectory[
-        IMAGE_DIRECTORY_ENTRY_IMPORT
-    ];
-    if (imports.VirtualAddress == 0U) return false;
-    auto* descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(
-        image + imports.VirtualAddress
-    );
-    for (; descriptor->Name != 0U; ++descriptor) {
-        if (descriptor->OriginalFirstThunk == 0U ||
-            descriptor->FirstThunk == 0U) continue;
-        auto* original = reinterpret_cast<IMAGE_THUNK_DATA64*>(
-            image + descriptor->OriginalFirstThunk
-        );
-        auto* resolved = reinterpret_cast<IMAGE_THUNK_DATA64*>(
-            image + descriptor->FirstThunk
-        );
-        for (; original->u1.AddressOfData != 0U; ++original, ++resolved) {
-            if (IMAGE_SNAP_BY_ORDINAL64(original->u1.Ordinal)) continue;
-            const auto* const import = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
-                image + original->u1.AddressOfData
-            );
-            if (std::strcmp(
-                    reinterpret_cast<const char*>(import->Name),
-                    requested_name
-                ) != 0) continue;
-            auto* const slot = reinterpret_cast<void**>(&resolved->u1.Function);
-            if (original_output != nullptr) *original_output = *slot;
-            return patch_slot(slot, replacement);
-        }
-    }
-    return false;
-}
-
-DWORD WINAPI hook_nr_get_module_file_name(
-    const HMODULE module,
-    LPWSTR const output,
-    const DWORD capacity
-) noexcept {
-    // DLSS-NR 310.8 checks the identity of its external caller. Match the
-    // working bridge implementation and present this add-on as nvngx.dll.
-    if (module == runtime.addon && output != nullptr && capacity != 0U) {
-        constexpr wchar_t identity[] = L"nvngx.dll";
-        constexpr DWORD length = static_cast<DWORD>(std::size(identity) - 1U);
-        if (capacity <= length) {
-            output[0] = L'\0';
-            SetLastError(ERROR_INSUFFICIENT_BUFFER);
-            return capacity;
-        }
-        std::memcpy(output, identity, sizeof(identity));
-        return length;
-    }
-    return runtime.get_module_file_name == nullptr
-        ? 0U
-        : runtime.get_module_file_name(module, output, capacity);
-}
-
-[[nodiscard]] bool addon_directory(
-    std::array<wchar_t, 32768U>& directory
-) noexcept {
-    HMODULE addon{};
-    if (!GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&evaluate_dlss_nr),
-            &addon
-        )) return false;
-    runtime.addon = addon;
-    const auto length = GetModuleFileNameW(
-        addon,
-        directory.data(),
-        static_cast<DWORD>(directory.size())
-    );
-    if (length == 0U || length >= directory.size()) return false;
-    for (DWORD index = length; index > 0U; --index) {
-        if (directory[index - 1U] == L'\\' || directory[index - 1U] == L'/') {
-            directory[index - 1U] = L'\0';
-            return true;
-        }
-    }
-    return false;
-}
-
 [[nodiscard]] bool initialize_runtime(ID3D12Device* const device) noexcept {
     if (runtime.state == 1U) {
         if (runtime.device == device) return true;
@@ -407,44 +275,15 @@ DWORD WINAPI hook_nr_get_module_file_name(
         return false;
     }
 
-    std::array<wchar_t, 32768U> directory{};
-    if (!addon_directory(directory)) {
-        runtime.state = 3U;
-        diagnostics.state = DlssNrState::runtime_failed;
-        trace_event("DLSS-NR runtime initialization failed: add-on directory unavailable");
+    const auto module=load_nr_runtime_module();
+    runtime.module=module.module;
+    const auto& directory=module.directory;
+    if(!runtime.module) {
+        runtime.state=module.error==ERROR_MOD_NOT_FOUND?2U:3U;
+        diagnostics.state=runtime.state==2U?DlssNrState::runtime_missing:DlssNrState::runtime_failed;
+        diagnostics.last_result=module.error;
         return false;
     }
-    std::array<wchar_t, 32768U> executable{};
-    const auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
-    auto* slash = length && length < executable.size() ? std::wcsrchr(executable.data(), L'\\') : nullptr;
-    if (slash) *slash = L'\0'; else executable[0] = L'\0';
-    const auto loaded = load_runtime_library(L"nvngx_dlssnr.dll", directory.data(), executable.data(),
-        [](const wchar_t* path, DWORD error) {
-            trace_event("DLSS-NR runtime search path=%ls error=%lu", path, static_cast<unsigned long>(error));
-        });
-    runtime.module = loaded.module;
-    if (runtime.module == nullptr) {
-        runtime.state = 2U;
-        diagnostics.state = DlssNrState::runtime_missing;
-        diagnostics.last_result = loaded.error;
-        return false;
-    }
-
-    void* original_get_module_file_name{};
-    if (!patch_named_import(
-            runtime.module,
-            "GetModuleFileNameW",
-            reinterpret_cast<void*>(&hook_nr_get_module_file_name),
-            &original_get_module_file_name
-        )) {
-        runtime.state = 3U;
-        diagnostics.state = DlssNrState::runtime_failed;
-        trace_event("DLSS-NR runtime identity import patch failed");
-        return false;
-    }
-    runtime.get_module_file_name = reinterpret_cast<GetModuleFileNameWFn>(
-        original_get_module_file_name
-    );
 
     const auto initialize = reinterpret_cast<NgxInitExtFn>(GetProcAddress(
         runtime.module,
@@ -514,14 +353,6 @@ DWORD WINAPI hook_nr_get_module_file_name(
     runtime.state = 1U;
     trace_event("DLSS-NR 310.8 feature-18 runtime initialized");
     return true;
-}
-
-NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcept {
-    if (parameters == nullptr) return 0xBAD00005U;
-    float scale{1.0F};
-    if (!ngx_succeeded(parameters->Get("DLSSNR.Scale", &scale))) scale = 1.0F;
-    parameters->Set("DLSSNR.ScalingRatio", std::clamp(scale, 0.1F, 1.0F));
-    return 1U;
 }
 
 [[nodiscard]] ViewState& find_or_create_view(const DlssViewId view_id) {
@@ -883,248 +714,14 @@ NgxResult neural_scaling_ratio_callback(NgxParameters* const parameters) noexcep
     );
     if (FAILED(result)) return fail("CreateRootSignature", result);
 
-    constexpr char shader[] = R"(
-Texture2D<float4> Source0 : register(t0);
-Texture2D<float4> Source1 : register(t1);
-Texture2D<float4> Source2 : register(t2);
-RWTexture2D<float4> Output0 : register(u0);
-RWTexture2D<float4> Output1 : register(u1);
 
-cbuffer CodecConstants : register(b0) {
-    uint2 Size;
-    uint2 SourceSize;
-    uint2 SourceBase;
-    uint2 ProxySize;
-    float PaperWhiteScale;
-    float TransferStrength;
-    float ColorStrength;
-    uint HdrMode;
-    uint2 RegionBase;
-    uint2 RegionSize;
-    float FoveationWidth;
-    float FoveationHeight;
-    float FoveationRoundness;
-    float FoveationFeather;
-    uint ShowAlignmentBorder;
-    uint MaskCount;
-    uint2 MaskPadding;
-    float4 MaskBounds[4];
-};
-
-float FoveationShapeDistance(float2 pixel) {
-    if (MaskCount != 0) {
-        const float2 uv = (pixel - float2(RegionBase) + 0.5) / max(float2(RegionSize), 1.0);
-        float distance = 1e10;
-        [unroll] for (uint i = 0; i < 4; ++i) if (i < MaskCount) {
-            const float4 b = MaskBounds[i];
-            const float2 p = abs(2.0 * uv - b.xy - b.zw) / max(b.zw - b.xy, 0.0001);
-            distance = min(distance, lerp(max(p.x, p.y), length(p), saturate(FoveationRoundness)));
-        }
-        return distance;
-    }
-    const float2 centered =
-        (pixel - float2(RegionBase) + 0.5) /
-        (0.5 * max(float2(RegionSize), 1.0)) - 1.0;
-    const float2 scaled = abs(centered);
-    return lerp(
-        max(scaled.x, scaled.y),
-        length(scaled),
-        saturate(FoveationRoundness)
-    );
-}
-
-float Luminance(float3 color) {
-    return dot(color, float3(0.2126, 0.7152, 0.0722));
-}
-
-float SrgbEncodeChannel(float value) {
-    value = saturate(value);
-    return value <= 0.0031308
-        ? 12.92 * value
-        : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
-}
-
-float3 SrgbEncode(float3 color) {
-    return float3(
-        SrgbEncodeChannel(color.r),
-        SrgbEncodeChannel(color.g),
-        SrgbEncodeChannel(color.b)
-    );
-}
-
-float SrgbDecodeChannel(float value) {
-    value = saturate(value);
-    return value <= 0.04045
-        ? value / 12.92
-        : pow((value + 0.055) / 1.055, 2.4);
-}
-
-float3 SrgbDecode(float3 color) {
-    return float3(
-        SrgbDecodeChannel(color.r),
-        SrgbDecodeChannel(color.g),
-        SrgbDecodeChannel(color.b)
-    );
-}
-
-float4 LoadSource0Bilinear(float2 position, uint2 origin, uint2 dimensions) {
-    const float2 base = floor(position);
-    const float2 fraction = position - base;
-    const int2 minimum = int2(origin);
-    const int2 maximum = minimum + int2(dimensions) - 1;
-    const int2 p00 = clamp(int2(base), minimum, maximum);
-    const int2 p10 = clamp(int2(base) + int2(1, 0), minimum, maximum);
-    const int2 p01 = clamp(int2(base) + int2(0, 1), minimum, maximum);
-    const int2 p11 = clamp(int2(base) + int2(1, 1), minimum, maximum);
-    return lerp(
-        lerp(Source0.Load(int3(p00, 0)), Source0.Load(int3(p10, 0)), fraction.x),
-        lerp(Source0.Load(int3(p01, 0)), Source0.Load(int3(p11, 0)), fraction.x),
-        fraction.y
-    );
-}
-
-float4 LoadSource1Bilinear(float2 position, uint2 dimensions) {
-    const float2 base = floor(position);
-    const float2 fraction = position - base;
-    const int2 maximum = int2(dimensions) - 1;
-    const int2 p00 = clamp(int2(base), int2(0, 0), maximum);
-    const int2 p10 = clamp(int2(base) + int2(1, 0), int2(0, 0), maximum);
-    const int2 p01 = clamp(int2(base) + int2(0, 1), int2(0, 0), maximum);
-    const int2 p11 = clamp(int2(base) + int2(1, 1), int2(0, 0), maximum);
-    return lerp(
-        lerp(Source1.Load(int3(p00, 0)), Source1.Load(int3(p10, 0)), fraction.x),
-        lerp(Source1.Load(int3(p01, 0)), Source1.Load(int3(p11, 0)), fraction.x),
-        fraction.y
-    );
-}
-
-float4 LoadSource2Bilinear(float2 position, uint2 dimensions) {
-    const float2 base = floor(position);
-    const float2 fraction = position - base;
-    const int2 maximum = int2(dimensions) - 1;
-    const int2 p00 = clamp(int2(base), int2(0, 0), maximum);
-    const int2 p10 = clamp(int2(base) + int2(1, 0), int2(0, 0), maximum);
-    const int2 p01 = clamp(int2(base) + int2(0, 1), int2(0, 0), maximum);
-    const int2 p11 = clamp(int2(base) + int2(1, 1), int2(0, 0), maximum);
-    return lerp(
-        lerp(Source2.Load(int3(p00, 0)), Source2.Load(int3(p10, 0)), fraction.x),
-        lerp(Source2.Load(int3(p01, 0)), Source2.Load(int3(p11, 0)), fraction.x),
-        fraction.y
-    );
-}
-
-float3 UpgradeToneMap(float3 original, float3 proxy, float3 neural) {
-    float original_y = Luminance(original);
-    float proxy_y = Luminance(proxy);
-    float neural_y = Luminance(neural);
-    float ratio;
-    if (original_y < proxy_y) {
-        ratio = proxy_y > 0.0 ? original_y / proxy_y : 0.0;
-    } else {
-        float new_y = neural_y + max(0.0, original_y - proxy_y);
-        ratio = neural_y > 0.0 ? new_y / neural_y : 0.0;
-    }
-    return lerp(original, max(neural * ratio, 0.0), TransferStrength);
-}
-
-[numthreads(16, 16, 1)]
-void EncodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
-    if (all(dispatch_id.xy < Size)) {
-        Output0[dispatch_id.xy] = Source0.Load(int3(SourceBase + dispatch_id.xy, 0));
-    }
-    if (all(dispatch_id.xy < ProxySize)) {
-        const float2 source_position =
-            float2(SourceBase) +
-            (float2(dispatch_id.xy) + 0.5) * float2(SourceSize) /
-            float2(ProxySize) - 0.5;
-        const float4 proxy_source = LoadSource0Bilinear(
-            source_position,
-            SourceBase,
-            SourceSize
-        );
-        const float3 linear_color = max(
-            proxy_source.rgb / max(PaperWhiteScale, 0.0001),
-            0.0
-        );
-        const float3 encoded = HdrMode != 0 ? SrgbEncode(linear_color) : proxy_source.rgb;
-        Output1[dispatch_id.xy] = float4(encoded, proxy_source.a);
-    }
-}
-
-[numthreads(16, 16, 1)]
-void BorderMain(uint3 dispatch_id : SV_DispatchThreadID) {
-    if (any(dispatch_id.xy >= Size)) return;
-    const float distance = FoveationShapeDistance(dispatch_id.xy);
-    const float step = max(
-        abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(1, 0)) - distance),
-        abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(0, 1)) - distance));
-    if (distance <= 1.0 && distance >= 1.0 - 5.0 * step)
-        Output0[SourceBase + dispatch_id.xy] = float4(0, 1, 0, 1);
-}
-
-[numthreads(16, 16, 1)]
-void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
-    if (any(dispatch_id.xy >= Size)) return;
-    const float4 original_sample = Source0.Load(int3(dispatch_id.xy, 0));
-    const bool inside_region = all(dispatch_id.xy >= RegionBase) &&
-        all(dispatch_id.xy < RegionBase + RegionSize);
-    const float distance_from_center = FoveationShapeDistance(dispatch_id.xy);
-    const float distance_per_pixel = max(
-        abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(1.0, 0.0)) -
-            distance_from_center),
-        abs(FoveationShapeDistance(float2(dispatch_id.xy) + float2(0.0, 1.0)) -
-            distance_from_center)
-    );
-    const bool alignment_border = ShowAlignmentBorder != 0U &&
-        inside_region && distance_from_center <= 1.0 &&
-        distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
-    if (alignment_border) {
-        Output0[SourceBase + dispatch_id.xy] = float4(0.0, 1.0, 0.0, 1.0);
-        return;
-    }
-    const float normalized_feather = FoveationFeather /
-        max(0.0001, min(FoveationWidth, FoveationHeight));
-    const float foveation_weight = FoveationFeather <= 0.0
-        ? (distance_from_center <= 1.0 ? 1.0 : 0.0)
-        : 1.0 - smoothstep(
-            max(0.0, 1.0 - normalized_feather),
-            1.0,
-            distance_from_center
-        );
-    if (!inside_region || foveation_weight <= 0.0) {
-        Output0[SourceBase + dispatch_id.xy] = original_sample;
-        return;
-    }
-    const float2 proxy_position =
-        (float2(dispatch_id.xy - RegionBase) + 0.5) * float2(ProxySize) /
-        float2(RegionSize) - 0.5;
-    const float4 proxy_sample = LoadSource1Bilinear(proxy_position, ProxySize);
-    const float4 neural_sample = LoadSource2Bilinear(proxy_position, ProxySize);
-    if (HdrMode == 0) {
-        const float4 processed = float4(lerp(original_sample.rgb, neural_sample.rgb,
-            TransferStrength * ColorStrength), original_sample.a);
-        Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
-        return;
-    }
-    const float3 original = max(
-        original_sample.rgb / max(PaperWhiteScale, 0.0001),
-        0.0
-    );
-    const float3 proxy = SrgbDecode(proxy_sample.rgb);
-    const float3 neural = SrgbDecode(neural_sample.rgb);
-    const float3 upgraded = UpgradeToneMap(original, proxy, neural);
-    const float3 decoded = lerp(original, upgraded, ColorStrength) * PaperWhiteScale;
-    const float4 processed = float4(max(decoded, 0.0), original_sample.a);
-    Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
-}
-)";
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature = gpu.root_signature;
     if (!gpu.border_only) {
         result = compile_nr_shader(
-            shader,
-            sizeof(shader) - 1U,
+            nr_codec_shader,
+            sizeof(nr_codec_shader) - 1U,
             "Cheeky DLSS-NR codec",
             nullptr,
             nullptr,
@@ -1144,8 +741,8 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         if (FAILED(result)) return fail("CreateComputePipelineState(encode)", result);
         release(shader_errors);
         result = compile_nr_shader(
-            shader,
-            sizeof(shader) - 1U,
+            nr_codec_shader,
+            sizeof(nr_codec_shader) - 1U,
             "Cheeky DLSS-NR codec",
             nullptr,
             nullptr,
@@ -1166,7 +763,7 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         release(decoded);
         release(shader_errors);
     }
-    result = compile_nr_shader(shader, sizeof(shader), nullptr, nullptr, nullptr,
+    result = compile_nr_shader(nr_codec_shader, sizeof(nr_codec_shader), nullptr, nullptr, nullptr,
         "BorderMain", "cs_5_0", 0U, 0U, &decoded, &shader_errors);
     if (FAILED(result)) return fail("D3DCompile(border)", result);
     pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
@@ -1281,45 +878,6 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     return &gpu;
 }
 
-[[nodiscard]] std::uint64_t settings_signature(
-    const Settings& settings,
-    const NrRegion& region
-) noexcept {
-    std::uint64_t signature = 1469598103934665603ULL;
-    const auto append = [&signature](const std::uint32_t value) noexcept {
-        signature ^= value;
-        signature *= 1099511628211ULL;
-    };
-    append(static_cast<std::uint32_t>(settings.nr_processing_order));
-    append(settings.nr_style);
-    for (const auto value : {
-            settings.nr_working_scale,
-            settings.nr_intensity,
-            settings.nr_local_tone_strength,
-            settings.nr_local_structure_strength,
-            settings.nr_skin_structure_strength,
-            settings.nr_paper_white_scale,
-            settings.nr_hdr_transfer_strength,
-            settings.nr_color_strength,
-            settings.nr_motion_scale_x_multiplier,
-            settings.nr_motion_scale_y_multiplier,
-            region.shape_width,
-            region.shape_height,
-            region.roundness,
-            region.transition,
-        }) {
-        std::uint32_t bits{};
-        std::memcpy(&bits, &value, sizeof(bits));
-        append(bits);
-    }
-    append(settings.nr_foveated ? 1U : 0U);
-    append(settings.nr_automatic_mask ? 1U : 0U);
-    append(settings.nr_ui_correction ? 1U : 0U);
-    append(settings.nr_depth_convention);
-    append(region.width);
-    append(region.height);
-    return signature;
-}
 
 void transition(
     ID3D12GraphicsCommandList* const command_list,
@@ -1368,26 +926,6 @@ void dispatch_codec(
     handle.ptr += static_cast<std::uint64_t>(destination_descriptor) *
         gpu.descriptor_size;
     frame.command_list->SetComputeRootDescriptorTable(1U, handle);
-    struct CodecConstants {
-        std::uint32_t size[2];
-        std::uint32_t source_size[2];
-        std::uint32_t source_base[2];
-        std::uint32_t proxy_size[2];
-        float paper_white_scale;
-        float transfer_strength;
-        float color_strength;
-        std::uint32_t hdr_mode;
-        std::uint32_t region_base[2];
-        std::uint32_t region_size[2];
-        float foveation_width;
-        float foveation_height;
-        float foveation_roundness;
-        float foveation_feather;
-        std::uint32_t show_alignment_border;
-        std::uint32_t mask_count, padding[2];
-        float mask_bounds[4][4];
-    };
-    static_assert(sizeof(CodecConstants) == 40U * sizeof(std::uint32_t));
     const auto width = gpu.border_only ? region.width : gpu.width;
     const auto height = gpu.border_only ? region.height : gpu.height;
     CodecConstants constants{
@@ -1616,7 +1154,7 @@ bool evaluate_dlss_nr(
         );
 
     auto* const parameters = view.parameters;
-    auto signature = settings_signature(settings, region);
+    auto signature = nr_settings_signature(settings, region);
     // Guides can change resolution/origin while the working texture stays the
     // same size (e.g. output-resolution motion with dynamic display sizing).
     for (const auto dimension : {frame.input_width, frame.input_height,
@@ -1634,7 +1172,7 @@ bool evaluate_dlss_nr(
         signature *= 1099511628211ULL;
         signature ^= dimension;
     }
-    const auto reset_generation = requested_reset_generation.load(
+    const auto reset_generation = requested_nr_reset_generation.load(
         std::memory_order_acquire
     );
     const char* reset_reason = frame.reset ? "explicit" :
@@ -2007,7 +1545,7 @@ void release_dlss_nr_resources() noexcept {
 }
 
 void reset_dlss_nr() noexcept {
-    requested_reset_generation.fetch_add(1U, std::memory_order_acq_rel);
+    requested_nr_reset_generation.fetch_add(1U, std::memory_order_acq_rel);
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     if (runtime.state == 2U) runtime.state = 0U;

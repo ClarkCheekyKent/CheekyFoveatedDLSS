@@ -1,6 +1,7 @@
 #pragma once
 
 #include "backend.hpp"
+#include "peripheral_contract.hpp"
 
 namespace cheeky::foveated_dlss {
 
@@ -66,17 +67,6 @@ struct PeripheralDlaaResources {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     };
 };
-
-struct PeripheralDlaaDimensions {
-    std::uint32_t width{};
-    std::uint32_t height{};
-};
-
-[[nodiscard]] PeripheralDlaaDimensions peripheral_dlaa_dimensions(
-    std::uint32_t render_width,
-    std::uint32_t render_height,
-    float scale
-) noexcept;
 
 [[nodiscard]] DlssViewId peripheral_dlaa_view_id(DlssViewId view_id) noexcept;
 

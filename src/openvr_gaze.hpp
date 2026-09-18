@@ -14,5 +14,5 @@ void enable_openvr_late_recovery(bool enabled) noexcept;
 bool attach_openvr_compositor(void* compositor) noexcept;
 // Called after worker exit and before global MinHook teardown.
 void stop_openvr_hooks() noexcept;
-bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1&) noexcept;
+bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1&,std::uint64_t native_identity=0) noexcept;
 }

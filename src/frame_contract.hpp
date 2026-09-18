@@ -1,8 +1,8 @@
 #pragma once
 
-#include <d3d12.h>
-
 #include <cstdint>
+
+struct ID3D12Resource;
 
 namespace cheeky::foveated_dlss {
 

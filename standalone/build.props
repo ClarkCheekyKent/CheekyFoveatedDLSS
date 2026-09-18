@@ -22,8 +22,8 @@
       <WarningLevel>Level4</WarningLevel><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard>
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'!='Debug'">MultiThreaded</RuntimeLibrary>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\standalone;$(MSBuildProjectDirectory)\src;$(MSBuildProjectDirectory)\shared;$(MSBuildProjectDirectory)\uevr;$(MSBuildProjectDirectory)\third_party\reshade\deps\imgui;$(MSBuildProjectDirectory)\third_party\reshade\deps\imgui\backends;$(MSBuildProjectDirectory)\third_party\reshade\deps\minhook\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>IMGUI_IMPL_VULKAN_NO_PROTOTYPES;WIN32_LEAN_AND_MEAN;NOMINMAX;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\third_party\vulkan\include;$(MSBuildProjectDirectory)\standalone;$(MSBuildProjectDirectory)\src;$(MSBuildProjectDirectory)\shared;$(MSBuildProjectDirectory)\uevr;$(MSBuildProjectDirectory)\third_party\reshade\deps\imgui;$(MSBuildProjectDirectory)\third_party\reshade\deps\imgui\backends;$(MSBuildProjectDirectory)\third_party\reshade\deps\minhook\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalDependencies>$(CheekyLibraries);%(AdditionalDependencies)</AdditionalDependencies></Link>

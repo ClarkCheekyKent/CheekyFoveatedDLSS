@@ -4,7 +4,8 @@ endif()
 enable_language(ASM_MASM)
 set(CHEEKY_IMGUI third_party/reshade/deps/imgui)
 add_library(CheekyFoveatedDLSSHost MODULE
-    standalone/host.cpp standalone/overlay.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp
+    standalone/host.cpp standalone/vulkan_overlay.cpp src/vulkan_api.cpp
+    ${CHEEKY_IMGUI}/backends/imgui_impl_vulkan.cpp standalone/overlay.cpp standalone/overlay_input.cpp standalone/overlay_ui.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp
     ${CHEEKY_IMGUI}/imgui.cpp ${CHEEKY_IMGUI}/imgui_draw.cpp
     ${CHEEKY_IMGUI}/imgui_tables.cpp ${CHEEKY_IMGUI}/imgui_widgets.cpp
     ${CHEEKY_IMGUI}/backends/imgui_impl_win32.cpp
@@ -13,14 +14,15 @@ add_library(CheekyFoveatedDLSSHost MODULE
     third_party/reshade/deps/minhook/src/hook.c
     third_party/reshade/deps/minhook/src/trampoline.c
     third_party/reshade/deps/minhook/src/hde/hde64.c)
-target_include_directories(CheekyFoveatedDLSSHost PRIVATE standalone shared src uevr
+target_compile_definitions(CheekyFoveatedDLSSHost PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
+target_include_directories(CheekyFoveatedDLSSHost PRIVATE third_party/vulkan/include standalone shared src uevr
     ${CHEEKY_IMGUI} ${CHEEKY_IMGUI}/backends third_party/reshade/deps/minhook/include)
 target_link_libraries(CheekyFoveatedDLSSHost PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid user32 imm32 dwmapi)
 add_dependencies(CheekyFoveatedDLSSHost CheekyFoveatedDLSSRuntime)
 add_library(CheekyStandaloneProxy MODULE bootstrap/loader.cpp bootstrap/dxgi_proxy.cpp
     bootstrap/dxgi_exports.asm bootstrap/dxgi.def)
 add_library(CheekyOptiScaler MODULE bootstrap/loader.cpp bootstrap/optiscaler_asi.cpp)
-add_executable(CheekyOverlayTests tests/overlay_tests.cpp standalone/overlay.cpp
+add_executable(CheekyOverlayTests tests/overlay_tests.cpp standalone/overlay.cpp standalone/overlay_input.cpp standalone/overlay_ui.cpp
     uevr/settings_io.cpp src/settings.cpp src/foveation.cpp
     ${CHEEKY_IMGUI}/imgui.cpp ${CHEEKY_IMGUI}/imgui_draw.cpp
     ${CHEEKY_IMGUI}/imgui_tables.cpp ${CHEEKY_IMGUI}/imgui_widgets.cpp
@@ -122,3 +124,10 @@ if(CHEEKY_BUILD_UEVR)
         endforeach()
     endforeach()
 endif()
+
+add_library(CheekyVulkanLayer MODULE vulkan_layer/bootstrap.cpp)
+target_compile_features(CheekyVulkanLayer PRIVATE cxx_std_20)
+target_compile_definitions(CheekyVulkanLayer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+set_target_properties(CheekyVulkanLayer PROPERTIES PREFIX "" MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")

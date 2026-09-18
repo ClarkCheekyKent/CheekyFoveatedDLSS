@@ -79,7 +79,8 @@ struct ScopedCoordinatedCrop {
     CropGeometry& crop,
     bool& reset_history,
     const CheekyGazeSnapshotV1* supplied_snapshot = nullptr,
-    FoveationCenter* resolved_center = nullptr
+    FoveationCenter* resolved_center = nullptr,
+    std::uint64_t native_resource_identity = 0
 ) noexcept;
 
 void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;

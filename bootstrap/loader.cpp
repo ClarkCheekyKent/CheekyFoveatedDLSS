@@ -14,6 +14,36 @@ void report(const wchar_t* message) noexcept {
     OutputDebugStringW(message);
 }
 
+void enable_local_vulkan(HMODULE module) noexcept {
+    // Publish before returning from DLL attach, before the game can create a
+    // Vulkan instance. Only Kernel32 path/environment operations occur here;
+    // the Vulkan loader loads the layer later, outside this entry point.
+    wchar_t directory[32768]{}, existing[32768]{}, combined[32768]{};
+    const DWORD length=GetModuleFileNameW(module,directory,ARRAYSIZE(directory));
+    auto* filename=wcsrchr(directory,L'\\');
+    constexpr wchar_t suffix[]=L"CheekyFoveatedDLSS\\Vulkan";
+    if(!length || length>=ARRAYSIZE(directory) || !filename ||
+        static_cast<size_t>(filename+1-directory)+ARRAYSIZE(suffix)>ARRAYSIZE(directory))return;
+    wcscpy_s(filename+1,ARRAYSIZE(directory)-static_cast<size_t>(filename+1-directory),suffix);
+    const auto attributes=GetFileAttributesW(directory);
+    if(attributes==INVALID_FILE_ATTRIBUTES || !(attributes&FILE_ATTRIBUTE_DIRECTORY))return;
+    // Respect and preserve an existing explicit search-path override as well
+    // as other mods' additional implicit-layer directories.
+    const wchar_t* variable=L"VK_IMPLICIT_LAYER_PATH";
+    DWORD count=GetEnvironmentVariableW(variable,existing,ARRAYSIZE(existing));
+    if(!count) {variable=L"VK_ADD_IMPLICIT_LAYER_PATH";count=GetEnvironmentVariableW(variable,existing,ARRAYSIZE(existing));}
+    if(count>=ARRAYSIZE(existing))return;
+    for(const wchar_t* part=existing;*part;) {
+        const auto* end=wcschr(part,L';');const size_t size=end?static_cast<size_t>(end-part):wcslen(part);
+        if(size==wcslen(directory) && _wcsnicmp(part,directory,size)==0)return;
+        if(!end)break;part=end+1;
+    }
+    if(wcslen(directory)+count+2>ARRAYSIZE(combined))return;
+    wcscpy_s(combined,directory);
+    if(count){wcscat_s(combined,L";");wcscat_s(combined,existing);}
+    if(!SetEnvironmentVariableW(variable,combined))report(L"Cheeky: could not activate the process-local Vulkan layer.\n");
+}
+
 DWORD WINAPI start_host(void*) noexcept {
     g_inside_worker = true;
     // Windows serializes thread startup against DllMain notifications. The
@@ -58,6 +88,7 @@ DWORD WINAPI start_host(void*) noexcept {
 
 void cheeky_bootstrap_attach(HMODULE module) noexcept {
     g_module = module;
+    enable_local_vulkan(module);
 }
 
 void cheeky_bootstrap_start(CheekyBootstrapHost host) noexcept {

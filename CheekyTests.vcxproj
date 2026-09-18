@@ -37,7 +37,11 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="tests\gaze_tests.cpp" />
+    <ClCompile Include="tests\gaze_tests.cpp" /><ClCompile Include="tests\vulkan_tests.cpp" /><ClCompile Include="src\vulkan_api.cpp" /><ClCompile Include="src\vulkan_gpu.cpp" /><ClCompile Include="src\vulkan_observer.cpp" /><ClCompile Include="src\vulkan_backend.cpp" />
+    <ClCompile Include="src\vulkan_peripheral.cpp" />
+    <ClCompile Include="src\vulkan_nr.cpp" />
+    <ClCompile Include="src\vulkan_nr_runtime.cpp" />
+    <ClCompile Include="src\nr_runtime_module.cpp" />
     <ClCompile Include="tests\eye_calibration_tests.cpp" />
     <ClCompile Include="tests\openxr_calibration_tests.cpp" />
     <ClCompile Include="src\eye_calibration.cpp" />

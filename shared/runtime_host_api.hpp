@@ -16,7 +16,7 @@ struct CheekyRuntimeStart {
     std::uint32_t size{sizeof(CheekyRuntimeStart)};
     std::uint32_t abi{cheeky_runtime_abi};
     const wchar_t* config_directory{};
-    std::uint32_t renderer{}; // 0 D3D11, 1 D3D12
+    std::uint32_t renderer{}; // 0 D3D11, 1 D3D12, 2 Vulkan
     void* device{};
     void* queue{}; // Required for D3D12 processing.
     std::uint64_t* attachment{};

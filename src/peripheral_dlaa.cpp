@@ -1,4 +1,5 @@
 #include "peripheral_dlaa.hpp"
+#include "peripheral_shaders.hpp"
 #include "motion_region.hpp"
 
 #include "runtime.hpp"
@@ -19,73 +20,6 @@ namespace {
 constexpr std::uint32_t dlss_feature_flag_mv_low_res = 1U << 1U;
 constexpr std::uint32_t perf_quality_dlaa = 5U;
 constexpr DlssViewId peripheral_view_mask = 0x8000000000000000ULL;
-
-constexpr char motion_convert_shader_source[] = R"(
-Texture2D<float2> SourceMotion : register(t0);
-RWTexture2D<float2> PackedMotion : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 SourceBase;
-    uint2 SourceSize;
-    uint2 DestSize;
-};
-[numthreads(16, 16, 1)]
-void Main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= DestSize)) return;
-    const uint2 numerator = (2U * id.xy + 1U) * SourceSize;
-    const uint2 denominator = 2U * DestSize;
-    const uint2 local = min(numerator / denominator, SourceSize - 1U);
-    PackedMotion[id.xy] = SourceMotion.Load(int3(SourceBase + local, 0));
-}
-)";
-
-constexpr char color_downsample_shader_source[] = R"(
-Texture2D<float4> SourceColor : register(t0);
-RWTexture2D<float4> PackedColor : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 SourceBase;
-    uint2 SourceSize;
-    uint2 DestSize;
-};
-float4 LoadClamped(int2 local) {
-    const int2 maximum = int2(SourceSize) - 1;
-    return SourceColor.Load(int3(int2(SourceBase) + clamp(local, int2(0, 0), maximum), 0));
-}
-[numthreads(16, 16, 1)]
-void Main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= DestSize)) return;
-    const float2 source =
-        (float2(id.xy) + 0.5) * float2(SourceSize) / float2(DestSize) - 0.5;
-    const int2 base = int2(floor(source));
-    const float2 fraction = source - floor(source);
-    const float4 p00 = LoadClamped(base);
-    const float4 p10 = LoadClamped(base + int2(1, 0));
-    const float4 p01 = LoadClamped(base + int2(0, 1));
-    const float4 p11 = LoadClamped(base + int2(1, 1));
-    PackedColor[id.xy] = lerp(
-        lerp(p00, p10, fraction.x),
-        lerp(p01, p11, fraction.x),
-        fraction.y
-    );
-}
-)";
-
-constexpr char depth_downsample_shader_source[] = R"(
-Texture2D<float> SourceDepth : register(t0);
-RWTexture2D<float> PackedDepth : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 SourceBase;
-    uint2 SourceSize;
-    uint2 DestSize;
-};
-[numthreads(16, 16, 1)]
-void Main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= DestSize)) return;
-    const uint2 numerator = (2U * id.xy + 1U) * SourceSize;
-    const uint2 denominator = 2U * DestSize;
-    const uint2 local = min(numerator / denominator, SourceSize - 1U);
-    PackedDepth[id.xy] = SourceDepth.Load(int3(SourceBase + local, 0));
-}
-)";
 
 template <typename T>
 void release(T*& object) noexcept {
@@ -769,22 +703,6 @@ void release_state(PeripheralViewState& state) noexcept {
 }
 
 }  // namespace
-
-PeripheralDlaaDimensions peripheral_dlaa_dimensions(
-    const std::uint32_t render_width,
-    const std::uint32_t render_height,
-    const float scale
-) noexcept {
-    if (render_width == 0U || render_height == 0U) return {};
-    const auto clamped = std::clamp(scale, 0.20F, 1.0F);
-    const auto scale_dimension = [clamped](const std::uint32_t value) noexcept {
-        const auto scaled = static_cast<std::uint32_t>(
-            static_cast<float>(value) * clamped + 0.5F
-        );
-        return (std::min)(value, (std::max)(32U, scaled));
-    };
-    return {scale_dimension(render_width), scale_dimension(render_height)};
-}
 
 DlssViewId peripheral_dlaa_view_id(const DlssViewId view_id) noexcept {
     return view_id ^ peripheral_view_mask;

@@ -1,6 +1,7 @@
 #include "backend.hpp"
 #include "d3d12_output_contract.hpp"
 #include "d3d12_composite_shader.hpp"
+#include "composite_constants.hpp"
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
@@ -251,30 +252,7 @@ struct D3D12Resources {
     D3D12Resources* next{};
 };
 
-struct CompositeConstants {
-    std::uint32_t output_size[2];
-    std::uint32_t output_origin[2];
-    std::uint32_t input_base[2];
-    std::uint32_t input_size[2];
-    std::uint32_t rect_base[2];
-    std::uint32_t rect_size[2];
-    float shape_width;
-    float shape_height;
-    float shape_offset_x;
-    float shape_offset_y;
-    float shape_roundness;
-    float feather;
-    std::uint32_t dlss_origin[2];
-    std::uint32_t show_alignment_border;
-    float next_jump_offset_x;
-    float next_jump_offset_y;
-    std::uint32_t show_next_jump;
-    float next_jump_width, next_jump_height;
-    std::uint32_t mask_count, padding;
-    float mask_bounds[4][4];
-};
 
-static_assert(sizeof(CompositeConstants) == 44U * sizeof(std::uint32_t));
 
 SRWLOCK resources_lock = SRWLOCK_INIT;
 D3D12Resources* resource_list{};

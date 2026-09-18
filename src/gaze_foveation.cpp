@@ -413,7 +413,8 @@ bool calculate_coordinated_crop(
     CropGeometry& crop,
     bool& reset_history,
     const CheekyGazeSnapshotV1* supplied_snapshot,
-    FoveationCenter* resolved_center
+    FoveationCenter* resolved_center,
+    std::uint64_t native_resource_identity
 ) noexcept {
     if (coordinated_crop_override && coordinated_crop_override->view_id == view_id && view_id != 0U) {
         crop = coordinated_crop_override->crop;
@@ -530,7 +531,7 @@ bool calculate_coordinated_crop(
             snapshot.structure_size >= sizeof(snapshot))
         : load_snapshot(snapshot);
     if (!supplied_snapshot && (!loaded || snapshot.session_generation == 0U)) {
-        if (read_openvr_gaze(settings, output_resource, snapshot)) {
+        if (read_openvr_gaze(settings, output_resource, snapshot,native_resource_identity)) {
             loaded = true;
             diagnostics.layer_present = true; // Runtime adapter present; UI labels this generically.
             diagnostics.abi_compatible = true;
@@ -552,7 +553,7 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous =
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE) != 0U;
 
-    const auto resource_identity = canonical_identity(output_resource);
+    const auto resource_identity = native_resource_identity?native_resource_identity:canonical_identity(output_resource);
     std::uint32_t matched_index{UINT32_MAX};
     std::uint32_t match_count{};
     bool packed_stereo_match{};

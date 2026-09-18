@@ -123,7 +123,7 @@ void observe_frame(bool focused) {
     for (unsigned eye=0;eye<2;++eye) {
         auto& history=submitted[eye];
         for (auto& entry:history) if (now-entry.observed>500) retired[eye].push_back(std::move(entry));
-        history.erase(std::remove_if(history.begin(),history.end(),[](const Submitted& s){return !s.identity;}),history.end());
+        history.erase(std::remove_if(history.begin(),history.end(),[](const Submitted& s){return !s.view.resource_identity;}),history.end());
         auto& view=snapshot.views[eye];
         if (!history.empty()) view=history.back().view;
         else mapped=false;
@@ -179,18 +179,22 @@ void observe_submit(vr::EVREye eye,const vr::Texture_t* texture,const vr::VRText
             width=static_cast<std::uint32_t>(desc.Width); height=desc.Height;
             data->m_pResource->QueryInterface(IID_PPV_ARGS(&entry.identity));
         }
+    } else if(valid && texture->eType==vr::TextureType_Vulkan) {
+        const auto* data=static_cast<const vr::VRVulkanTextureData_t*>(texture->handle);
+        valid=data->m_nImage!=0 && data->m_nSampleCount==1;
+        width=data->m_nWidth;height=data->m_nHeight;entry.view.resource_identity=data->m_nImage;
     } else valid=false;
     const vr::VRTextureBounds_t full{0,0,1,1};
     const auto& b=bounds ? *bounds : full;
     auto& view=entry.view;
-    valid=valid && entry.identity && openvr_bounds(b.uMin,b.uMax,width,view.image_rect_x,view.image_rect_width) &&
+    valid=valid && (entry.identity || entry.view.resource_identity) && openvr_bounds(b.uMin,b.uMax,width,view.image_rect_x,view.image_rect_width) &&
         openvr_bounds(b.vMin,b.vMax,height,view.image_rect_y,view.image_rect_height);
     std::lock_guard lock(state_mutex);
     if (runtime_stopping) return;
     auto& history=submitted[eye];
     if (!valid) { if (!history.empty()) { retired.swap(history); ++generation; } return; }
     view.structure_size=sizeof(view); view.view_index=eye;
-    view.resource_identity=reinterpret_cast<std::uint64_t>(entry.identity.Get());
+    if(entry.identity)view.resource_identity=reinterpret_cast<std::uint64_t>(entry.identity.Get());
     view.swapchain_identity=view.resource_identity;
     view.flags=CHEEKY_GAZE_VIEW_RESOURCE_VALID;
     entry.observed=GetTickCount64();
@@ -418,7 +422,7 @@ void stop_openvr_hooks() noexcept {
     // Trampolines are removed by the shared MinHook owner immediately after this.
     // Retain target modules through that teardown; process exit releases them.
 }
-bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnapshotV1& output) noexcept {
+bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnapshotV1& output,std::uint64_t native_identity) noexcept {
     std::lock_guard lock(state_mutex);
     const bool next_simulate=settings.center_mode==FoveationCenterMode::simulated_gaze;
     if (next_simulate!=simulate || pattern!=settings.simulation_pattern) simulation_start=0;
@@ -434,7 +438,7 @@ bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnap
         output.status_flags&=~(CHEEKY_GAZE_STATUS_GAZE_VALID|CHEEKY_GAZE_STATUS_SESSION_FOCUSED);
     ComPtr<IUnknown> identity;
     if (resource) resource->QueryInterface(IID_PPV_ARGS(&identity));
-    const auto id=reinterpret_cast<std::uint64_t>(identity.Get());
+    const auto id=native_identity?native_identity:reinterpret_cast<std::uint64_t>(identity.Get());
     const auto now=GetTickCount64();
     // Select an observed member of the game's rotating render-target set for
     // exact matching. Other-eye metadata remains available to existing routes.

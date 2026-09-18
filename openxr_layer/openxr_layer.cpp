@@ -1,10 +1,13 @@
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_GRAPHICS_API_D3D12
+#define XR_USE_GRAPHICS_API_VULKAN
 
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#define VK_NO_PROTOTYPES
+#include "../third_party/vulkan/include/vulkan/vulkan_core.h"
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_platform.h>
@@ -827,6 +830,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     session_state.system_id = info->systemId;
     for (auto* binding = static_cast<const XrBaseInStructure*>(info->next); binding; binding = binding->next) {
         if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) session_state.graphics_api = 11;
+        if (binding->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) session_state.graphics_api = 100;
         if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
             session_state.graphics_api = 12;
             session_state.graphics_queue = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(binding)->queue;
@@ -1435,6 +1439,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEnumerateSwapchainImages(
         }
     }
 
+    if(*count!=0U && images[0].type==XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) {
+        const auto* typed=reinterpret_cast<const XrSwapchainImageVulkanKHR*>(images);
+        for(std::uint32_t i=0;i<*count;++i)identities[i]=reinterpret_cast<std::uint64_t>(typed[i].image);
+    }
     std::lock_guard lock(state_mutex);
     const auto swapchain_it = swapchains.find(swapchain);
     if (swapchain_it != swapchains.end()) {

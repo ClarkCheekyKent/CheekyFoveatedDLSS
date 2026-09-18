@@ -4,7 +4,8 @@ param(
     [ValidateSet("Standalone", "OptiScaler", "Both")][string]$Mode = "Both",
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build",
     [string]$BinaryRoot = "",
-    [switch]$IncludeOpenXRSetup
+    [switch]$IncludeOpenXRSetup,
+    [switch]$VulkanFixedSrTest
 )
 
 Set-StrictMode -Version Latest
@@ -42,6 +43,13 @@ foreach ($packageMode in $modes) {
     $files["licenses\MinHook.txt"] = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     $files["licenses\OpenVR.txt"] = Join-Path $projectRoot "third_party\openvr\LICENSE"
     $files["licenses\DearImGui.txt"] = Join-Path $projectRoot "third_party\reshade\deps\imgui\LICENSE.txt"
+    if ($VulkanFixedSrTest) {
+        $files["CheekyVulkanLayer.dll"] = Join-Path $BinaryRoot "CheekyVulkanLayer.dll"
+        $files[$prefix + "CheekyFoveatedDLSS\Vulkan\Cheeky.json"] = Join-Path $projectRoot $(if($prefix){"vulkan_layer\Cheeky-OptiScaler.json"}else{"vulkan_layer\Cheeky.json"})
+        $files[$prefix + "CheekyFoveatedDLSS\CheekyFoveatedDLSS.ini"] = Join-Path $projectRoot "vulkan_layer\Fixed-SR.ini"
+        $files["Vulkan-Test-README.txt"] = Join-Path $projectRoot "vulkan_layer\TEST-README.txt"
+        $files["licenses\Vulkan-Headers.txt"] = Join-Path $projectRoot "third_party\vulkan\LICENSE.txt"
+    }
     if ($IncludeOpenXRSetup) {
         $files["OpenXR\CheekyOpenXRSetup.exe"] = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe"
     }
