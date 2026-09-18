@@ -37,7 +37,8 @@ double field(const std::string& text, const char* name) {
     return std::stod(text.substr(pos + token.size()));
 }
 void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn get,
-    std::uint64_t attachment, ID3D11Device* device, ID3D11DeviceContext* context, HMODULE ngx) {
+    std::uint64_t attachment, ID3D11Device* device, ID3D11DeviceContext* context, HMODULE ngx,
+    const std::filesystem::path& log_path) {
     using namespace cheeky::foveated_dlss;
     using Init = NgxResult (*)(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned);
     using Create = NgxResult (*)(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle**);
@@ -102,11 +103,65 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
         require(contains(snapshot(get), "\"observer\":{\"ready\":true"), "Private transport installs its native queue observer for NR");
         require(field(snapshot(get), "submissions") > 0, "Observer sees actual private transport submissions");
     }
+    // Drain every ring slot, then resize only NR. Unchanged SR/peripheral GPU
+    // textures must survive, even though the NR feature itself gets rebuilt.
+    ComPtr<ID3D11Query> completed;
+    const D3D11_QUERY_DESC completion_desc{D3D11_QUERY_EVENT, 0};
+    require(SUCCEEDED(device->CreateQuery(&completion_desc, &completed)), "Resize completion query");
+    const auto frames = [&](bool expect_nr = true) {
+        for (unsigned frame = 0; frame < 6; ++frame) {
+            require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "Resize evaluation");
+            context->End(completed.Get()); context->Flush();
+            HRESULT done = S_FALSE;
+            for (unsigned retry = 0; retry < 1000 && done == S_FALSE; ++retry) {
+                done = context->GetData(completed.Get(), nullptr, 0, 0);
+                if (done == S_FALSE) Sleep(1);
+            }
+            require(done == S_OK, "Resized frame completes on GPU");
+            require(parameters.values == original_parameters, "Resize restores game parameters");
+        }
+        if (expect_nr) require(contains(snapshot(get), "\"nr\":\"Active\""), "NR active after resize");
+    };
+    const auto allocations = [&] {
+        std::ifstream log(log_path);
+        require(log.good(), "Read allocation diagnostics");
+        std::array<unsigned, 3> counts{};
+        for (std::string line; std::getline(log, line);) {
+            if (line.find("Transport texture ") == std::string::npos || line.find(" shared via ") == std::string::npos) continue;
+            ++counts[line.find("Transport texture NR ") != std::string::npos ? 2 :
+                line.find("Transport texture peripheral ") != std::string::npos ? 1 : 0];
+        }
+        return counts;
+    };
+    require(command(attachment, "1\n24\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=true\nNrFoveated=true\nNrProcessingOrder=0\nNrWidth=0.5"), "Prepare NR resize");
+    frames();
+    const auto before_resize = allocations();
+    require(command(attachment, "1\n25\nset\nNrWidth=0.7"), "Change only NR width");
+    frames();
+    const auto after_nr_resize = allocations();
+    require(after_nr_resize[0] == before_resize[0] && after_nr_resize[1] == before_resize[1], "NR resize preserves SR and peripheral textures");
+    require(after_nr_resize[2] > before_resize[2], "NR resize replaces NR textures");
+    require(command(attachment, "1\n26\nset\nWidth=0.8"), "Change only SR width");
+    frames();
+    const auto after_sr_resize = allocations();
+    require(after_sr_resize[0] > after_nr_resize[0], "SR resize replaces SR textures");
+    require(after_sr_resize[1] == after_nr_resize[1] && after_sr_resize[2] == after_nr_resize[2], "SR resize preserves peripheral and independent NR textures");
+    frames();
+    require(allocations() == after_sr_resize, "Steady frames allocate no transport textures");
+    require(command(attachment, "1\n27\nset\nNrEnabled=false\nPeripheralDlaa=false\nWidth=0.6\nNrWidth=0.9"), "Resize with optional groups disabled");
+    frames(false);
+    const auto disabled_allocations = allocations();
+    require(command(attachment, "1\n28\nset\nNrEnabled=true\nPeripheralDlaa=true"), "Re-enable optional texture groups after resize");
+    frames();
+    const auto reenabled_allocations = allocations();
+    require(reenabled_allocations[0] == disabled_allocations[0], "Re-enable preserves unchanged SR textures");
+    require(reenabled_allocations[1] > disabled_allocations[1] && reenabled_allocations[2] > disabled_allocations[2], "Re-enable allocates current optional geometry");
+    puts("PASS: NR/SR resize preserves unrelated textures across all ring slots");
     require(command(attachment, "1\n22\nset\nEnabled=false\nNrEnabled=true"), "Enable independent NR-only transport");
     require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "NR-only transport evaluation");
     context->Flush();
     require(contains(snapshot(get), "\"nr\":\"Active\""), "NR continues while foveated SR is disabled");
-    require(command(attachment, "1\n23\nset\nEnabled=true\nNrEnabled=false"), "Disable transport NR");
+    require(command(attachment, "1\n23\nset\nEnabled=true\nNrEnabled=false\nWidth=0.63"), "Disable transport NR and restore shared fixture width");
     require(ngx_succeeded(release(handle)), "Release transported game feature");
     context->Flush();
     puts("PASS: DX11 private transport, full/foveated Before/After NR and NR-only with native queue observation");
@@ -275,7 +330,8 @@ int main(int argc, char** argv) {
             require(command(attachment, "1\n2\nset\nD3D11D3D12Transport=true\nNrEnabled=true"), "Generic DX11 host exposes transport and NR");
             require(contains(snapshot(get), "\"D3D11D3D12Transport\":true"), "Transport preference retained");
         }
-        if (transport) verify_transport(command, get, attachment, device11.Get(), context11.Get(), fake_ngx);
+        if (transport) verify_transport(command, get, attachment, device11.Get(), context11.Get(), fake_ngx,
+            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"));
         CheekyUEVRStereoProjection projection;
         require(!publish_stereo(attachment, &projection) && !publish_mode(attachment, 3), "UEVR-only publications reject generic host attachments");
         std::uint64_t duplicate = 99;

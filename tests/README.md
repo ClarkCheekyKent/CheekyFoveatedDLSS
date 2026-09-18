@@ -19,6 +19,9 @@ layout that previously failed real NVIDIA feature creation with `0xBAD0000B`.
 `--transport-forwarded` exercises the core-to-public DLSS call chain as well:
 private create/evaluate/release calls must bypass game-frame processing to
 avoid recursively locking the backend during the first evaluation.
+Transport tests also resize NR and SR independently across every ring slot,
+check that allocation logs show reuse of unaffected textures, and exercise
+resize while optional processing is disabled followed by re-enabling it.
 
 `CheekyOverlayTests.exe [--dx11] [--hdr10|--scrgb]` renders the real F8 menu to
 WARP textures and reads the result back. It checks SDR/HDR luminance, input
