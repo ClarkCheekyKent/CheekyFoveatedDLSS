@@ -484,6 +484,42 @@ void update_view_resource_locked(
     }
 }
 
+// Attach the layer's own action set when the host never calls
+// xrAttachSessionActionSets. Without this, the gaze pose action is never
+// bound and xrGetActionStatePose always reports isActive == false.
+[[nodiscard]] XrResult attach_layer_action_set_locked(
+    const XrSession session,
+    SessionState& session_state,
+    InstanceState& instance
+) noexcept {
+    if (session_state.action_attached) return XR_SUCCESS;
+    if (instance.action_set == XR_NULL_HANDLE ||
+        instance.dispatch.attach_action_sets == nullptr) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    XrActionSet action_set = instance.action_set;
+    XrSessionActionSetsAttachInfo attach_info{
+        XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+    attach_info.countActionSets = 1;
+    attach_info.actionSets = &action_set;
+    const auto result = instance.dispatch.attach_action_sets(
+        session, &attach_info);
+    if (XR_SUCCEEDED(result)) {
+        session_state.action_attached = true;
+        if (session_state.gaze_space == XR_NULL_HANDLE &&
+            instance.gaze_action != XR_NULL_HANDLE &&
+            instance.dispatch.create_action_space != nullptr) {
+            XrActionSpaceCreateInfo space_info{
+                XR_TYPE_ACTION_SPACE_CREATE_INFO };
+            space_info.action = instance.gaze_action;
+            space_info.poseInActionSpace.orientation.w = 1.0F;
+            static_cast<void>(instance.dispatch.create_action_space(
+                session, &space_info, &session_state.gaze_space));
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 extern "C" __declspec(dllexport) void __cdecl
@@ -840,24 +876,26 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
         XrSystemEyeGazeInteractionPropertiesEXT gaze_properties{
             XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT
         };
-        XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+        XrSystemProperties properties{ XR_TYPE_SYSTEM_PROPERTIES };
         properties.next = &gaze_properties;
         if (XR_SUCCEEDED(instance_state->dispatch.get_system_properties(
-                instance, info->systemId, &properties
-            ))) {
+            instance, info->systemId, &properties
+        ))) {
             session_state.system_supported =
                 gaze_properties.supportsEyeGazeInteraction == XR_TRUE;
         }
     }
-    if (session_state.system_supported &&
-        instance_state->gaze_action != XR_NULL_HANDLE &&
-        instance_state->dispatch.create_action_space != nullptr) {
-        XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
-        space_info.action = instance_state->gaze_action;
-        space_info.poseInActionSpace.orientation.w = 1.0F;
-        static_cast<void>(instance_state->dispatch.create_action_space(
-            *session, &space_info, &session_state.gaze_space
-        ));
+    // Suggest our gaze binding now, so the runtime knows about the path
+    // before the host calls xrAttachSessionActionSets. Without this, hosts
+    // that never call xrSuggestInteractionProfileBindings (IL2: Korea is one)
+    // leave the pose action unbound and xrGetActionStatePose reports
+    // isActive == false forever.
+    {
+        std::lock_guard lock(state_mutex);
+        const auto it = instances.find(instance);
+        if (it != instances.end()) {
+            static_cast<void>(ensure_gaze_binding_locked(it->second));
+        }
     }
 
     {
@@ -957,12 +995,22 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
-            iterator->second.view_configuration =
+            auto& session_state = iterator->second;
+            session_state.view_configuration =
                 info->primaryViewConfigurationType;
-            iterator->second.unsupported_view_configuration =
+            session_state.unsupported_view_configuration =
                 info->primaryViewConfigurationType !=
                 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-            publish_snapshot_locked(&iterator->second);
+            // If the host never uses OpenXR actions, attach our action set
+            // ourselves so that the gaze pose action becomes active.
+            if (!session_state.action_attached) {
+                auto* instance = find_instance_for_session_locked(session);
+                if (instance != nullptr) {
+                    static_cast<void>(attach_layer_action_set_locked(
+                        session, session_state, *instance));
+                }
+            }
+            publish_snapshot_locked(&session_state);
         }
     }
     return result;
@@ -1007,7 +1055,18 @@ cheeky_xrSuggestInteractionProfileBindings(
         gaze_path = iterator->second.gaze_path;
         gaze_profile = iterator->second.gaze_profile;
     }
-    if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+
+    // Ensure our gaze binding is suggested before the host calls
+    // xrAttachSessionActionSets. No-op if already submitted.
+    {
+        std::lock_guard lock(state_mutex);
+        const auto iterator = instances.find(instance);
+        if (iterator != instances.end()) {
+            static_cast<void>(ensure_gaze_binding_locked(iterator->second));
+        }
+    }
+
     if (gaze_action == XR_NULL_HANDLE ||
         suggested->interactionProfile != gaze_profile) {
         return next(instance, suggested);
@@ -1046,15 +1105,18 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
     const XrSessionActionSetsAttachInfo* const attach_info
 ) {
     if (attach_info == nullptr) return XR_ERROR_VALIDATION_FAILURE;
-    PFN_xrAttachSessionActionSets next{};
+       PFN_xrAttachSessionActionSets next{};
     XrActionSet layer_action_set{XR_NULL_HANDLE};
+    XrAction gaze_action{XR_NULL_HANDLE};
+    PFN_xrCreateActionSpace create_action_space{};
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.attach_action_sets;
         layer_action_set = instance->action_set;
-        static_cast<void>(ensure_gaze_binding_locked(*instance));
+        gaze_action = instance->gaze_action;
+        create_action_space = instance->dispatch.create_action_space;
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
     if (layer_action_set == XR_NULL_HANDLE) return next(session, attach_info);
@@ -1074,13 +1136,33 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
     auto merged = *attach_info;
     merged.countActionSets = static_cast<std::uint32_t>(action_sets.size());
     merged.actionSets = action_sets.data();
-    const auto result = next(session, &merged);
+        const auto result = next(session, &merged);
     if (XR_SUCCEEDED(result)) {
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
-            iterator->second.action_attached = true;
-            publish_snapshot_locked(&iterator->second);
+            auto& session_state = iterator->second;
+            session_state.action_attached = true;
+
+            // Create the gaze action space only now that the action set
+            // is attached to the session. VD validates this ordering
+            // strictly; creating the space earlier leaves gaze_space
+            // as XR_NULL_HANDLE and silently disables gaze.
+            if (session_state.gaze_space == XR_NULL_HANDLE &&
+                gaze_action != XR_NULL_HANDLE &&
+                create_action_space != nullptr) {
+                XrActionSpaceCreateInfo space_info{
+                    XR_TYPE_ACTION_SPACE_CREATE_INFO};
+                space_info.action = gaze_action;
+                space_info.poseInActionSpace.orientation.w = 1.0F;
+                static_cast<void>(create_action_space(
+                    session, &space_info, &session_state.gaze_space));
+                if (session_state.gaze_space == XR_NULL_HANDLE) {
+                    // leave it null; xrLocateViews will skip the gaze
+                    // block safely.
+                }
+            }
+            publish_snapshot_locked(&session_state);
         }
     }
     return result;
@@ -1570,11 +1652,48 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
     const XrSession session, const XrFrameBeginInfo* info) {
     PFN_xrBeginFrame next{};
-    { std::lock_guard lock(state_mutex);
-      const auto* instance = find_instance_for_session_locked(session);
-      if (!instance) return XR_ERROR_HANDLE_INVALID;
-      next = instance->dispatch.begin_frame; }
+    {
+        std::lock_guard lock(state_mutex);
+        const auto* instance = find_instance_for_session_locked(session);
+        if (!instance) return XR_ERROR_HANDLE_INVALID;
+        next = instance->dispatch.begin_frame;
+    }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
+
+    // Hosts that never touch the OpenXR action system (no xrAttachSession-
+    // ActionSets, no xrSyncActions) would otherwise leave the gaze pose
+    // action permanently inactive. Sync our own action set here and refresh
+    // the pose state so gaze can become valid.
+    {
+        std::lock_guard lock(state_mutex);
+        auto session_it = sessions.find(session);
+        if (session_it != sessions.end() && session_it->second.action_attached) {
+            auto* instance = find_instance_for_session_locked(session);
+            if (instance != nullptr &&
+                instance->action_set != XR_NULL_HANDLE &&
+                instance->gaze_action != XR_NULL_HANDLE &&
+                instance->dispatch.sync_actions != nullptr) {
+                XrActiveActionSet active{ instance->action_set, XR_NULL_PATH };
+                XrActionsSyncInfo sync_info{ XR_TYPE_ACTIONS_SYNC_INFO };
+                sync_info.countActiveActionSets = 1;
+                sync_info.activeActionSets = &active;
+                if (XR_SUCCEEDED(instance->dispatch.sync_actions(
+                    session, &sync_info)) &&
+                    instance->dispatch.get_action_state_pose != nullptr) {
+                    XrActionStateGetInfo state_info{
+                        XR_TYPE_ACTION_STATE_GET_INFO };
+                    state_info.action = instance->gaze_action;
+                    XrActionStatePose pose{ XR_TYPE_ACTION_STATE_POSE };
+                    if (XR_SUCCEEDED(instance->dispatch.get_action_state_pose(
+                        session, &state_info, &pose))) {
+                        session_it->second.action_active =
+                            pose.isActive == XR_TRUE;
+                    }
+                }
+            }
+        }
+    }
+
     // Some hosts render DLSS before BeginFrame and call it just before submitting.
     // Preserve the source markers collected since the previous EndFrame.
     return next(session, info);
