@@ -8,7 +8,7 @@ Reduce the cost of DLSS Super Resolution by concentrating it on the center of th
 
 - Windows 10/11, 64-bit, and an NVIDIA RTX GPU.
 - A D3D11 or D3D12 game with DLSS Super Resolution.
-- Either ReShade **with full add-on support**, or UEVR with a compatible plugin API.
+- Either ReShade **with full add-on support**, or UEVR (AFW works as well). (currently in progress to have it be standalone so that it can play nicer with other mods)
 
 ## Compatibility
 This should work with most games that have DLSS. Here is a non-exhaustive list of community reports whether a game is supported. 
