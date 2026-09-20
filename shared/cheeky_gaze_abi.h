@@ -27,6 +27,7 @@
 #define CHEEKY_GAZE_VIEW_RESOURCE_VALID (1U << 4U)
 #define CHEEKY_GAZE_VIEW_FOV_VALID (1U << 6U)
 #define CHEEKY_GAZE_VIEW_FORWARD_VALID (1U << 7U)
+#define CHEEKY_GAZE_VIEW_SUBMITTED_PROJECTION (1U << 8U)
 
 typedef struct CheekyGazeViewV1 {
     uint32_t structure_size;

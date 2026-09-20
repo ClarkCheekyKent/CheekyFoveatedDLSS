@@ -8,6 +8,10 @@
 #include <iostream>
 #include <vector>
 #include <stdexcept>
+#include <thread>
+#include <future>
+#include <condition_variable>
+#include <d3d11_4.h>
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_GRAPHICS_API_D3D12
@@ -20,6 +24,32 @@
 namespace {
 using namespace cheeky::foveated_dlss;
 using Microsoft::WRL::ComPtr;
+class XRThread {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::packaged_task<void()> work;
+    bool stopping{};
+    std::thread thread{[this] {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            changed.wait(lock, [&] { return stopping || work.valid(); });
+            if (stopping) return;
+            auto call = std::move(work);
+            lock.unlock(); call(); lock.lock();
+        }
+    }};
+public:
+    template<class F> void invoke(F call) {
+        std::packaged_task<void()> task(std::move(call));
+        auto result = task.get_future();
+        { std::lock_guard lock(mutex); work = std::move(task); }
+        changed.notify_one(); result.get();
+    }
+    ~XRThread() {
+        { std::lock_guard lock(mutex); stopping = true; }
+        changed.notify_one(); thread.join();
+    }
+};
 void require(bool ok, const char* message) {
     if (!ok)
         throw std::runtime_error(message);
@@ -416,6 +446,217 @@ void openxr11() {
         eye_calibration_tick();
     }
     require(!eye_calibration_stats().in_flight, "OpenXR D3D11 readbacks did not drain");
+    cleanup();
+}
+void openxr11_pipeline(bool hardware, bool separate_device = false) {
+    roles();
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP,
+        nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context));
+    D3D11_TEXTURE2D_DESC desc{128, 128, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    ComPtr<ID3D11Texture2D> a, b, array, stale, xr_array, transfer;
+    check(device->CreateTexture2D(&desc, nullptr, &a));
+    check(device->CreateTexture2D(&desc, nullptr, &b));
+    desc.ArraySize = 2;
+    check(device->CreateTexture2D(&desc, nullptr, &array));
+    check(device->CreateTexture2D(&desc, nullptr, &stale));
+    ComPtr<ID3D11Device> xr_device = device;
+    ComPtr<ID3D11DeviceContext> xr_context = context;
+    xr_array = array;
+    if (separate_device) {
+        check(D3D11CreateDevice(nullptr, hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP,
+            nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &xr_device, nullptr, &xr_context));
+        check(xr_device->CreateTexture2D(&desc, nullptr, &xr_array));
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        check(device->CreateTexture2D(&desc, nullptr, &transfer));
+    }
+    std::vector<unsigned> black(128 * 128);
+    context->UpdateSubresource(b.Get(), 0, nullptr, black.data(), 512, 0);
+    XrGraphicsBindingD3D11KHR binding{XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
+    binding.device = xr_device.Get();
+    XRLayer layer(xr_array.Get(), 11, &binding);
+    XRThread worker;
+    const auto xr = [&](auto call) { worker.invoke(call); };
+    const auto render = [&](bool swap, bool replay, bool mono, unsigned alternating = 0) {
+        xr([&] { layer.begin(); });
+        if (alternating != 2) {
+            context->UpdateSubresource(a.Get(), 0, nullptr, black.data(), 512, 0);
+            eye_calibration_stamp(context.Get(), a.Get(), 9101, 0, 0, 128, 128);
+        }
+        if (replay) context->CopyResource(array.Get(), stale.Get());
+        else {
+            context->CopySubresourceRegion(array.Get(), 0, 0, 0, 0, a.Get(), 0, nullptr);
+            context->CopySubresourceRegion(array.Get(), 1, 0, 0, 0, mono ? a.Get() : b.Get(), 0, nullptr);
+            context->CopyResource(stale.Get(), array.Get());
+        }
+        if (separate_device) {
+            // Test-only transport models host composition onto a second
+            // device. Calibration itself never copies between devices.
+            context->CopyResource(transfer.Get(), array.Get());
+            for (unsigned eye = 0; eye < 2; ++eye) {
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                check(context->Map(transfer.Get(), eye, D3D11_MAP_READ, 0, &mapped));
+                xr([&] { xr_context->UpdateSubresource(xr_array.Get(), eye, nullptr,
+                    mapped.pData, mapped.RowPitch, 0); });
+                context->Unmap(transfer.Get(), eye);
+            }
+        }
+        xr([&] {
+            layer.release();
+            // Runtime can overwrite released images before EndFrame.
+            xr_context->UpdateSubresource(xr_array.Get(), 0, nullptr, black.data(), 512, 0);
+            xr_context->UpdateSubresource(xr_array.Get(), 1, nullptr, black.data(), 512, 0);
+            if (separate_device) xr_context->Flush();
+        });
+        if (!mono && alternating != 1) {
+            context->UpdateSubresource(b.Get(), 0, nullptr, black.data(), 512, 0);
+            eye_calibration_stamp(context.Get(), b.Get(), 9102, 0, 0, 128, 128);
+        }
+        xr([&] { layer.end(swap); });
+        context->Flush(); // GPU progress is test-only.
+        Sleep(2);
+        eye_calibration_tick();
+    };
+    // Matches the BG3 trace: A, XR release on another thread, B, XR end.
+    for (unsigned i = 0; i < 100; ++i) render(false, false, false);
+    const auto warm = eye_calibration_stats();
+    require(warm.applied > 0 && stereo_eye_assignment(9101).calibrated &&
+        stereo_eye_assignment(9101).eye_index == 0,
+        "Cross-thread AER pipeline must map using both pre-release eye copies");
+    ComPtr<ID3D11Multithread> protection;
+    check(context.As(&protection));
+    require(protection->GetMultithreadProtected(), "Cross-thread copies require D3D context protection");
+    // One eye render per interval also works; changing labels must still correct.
+    for (unsigned i = 0; i < 100; ++i) render(true, false, false, 1 + i % 2);
+    require(eye_calibration_stats().valid > warm.valid && stereo_eye_assignment(9101).eye_index == 1,
+        "Alternating single-eye renders must calibrate across XR intervals");
+    require(eye_calibration_stats().allocations == warm.allocations,
+        "Continuous source stamping must reuse warmed GPU resources");
+    // Drain before measuring rejection of the frozen previous submission.
+    eye_calibration_enable(false);
+    render(true, true, false);
+    for (unsigned i = 0; i < 20; ++i) {
+        Sleep(2); xr([] { eye_calibration_tick(); }); eye_calibration_tick();
+    }
+    eye_calibration_reset_stats();
+    eye_calibration_enable(true);
+    for (unsigned i = 0; i < 100; ++i) render(true, true, false);
+    require(!eye_calibration_stats().valid && !stereo_eye_assignment(9101).calibrated,
+        "Markers from a previous calibration epoch must not validate a new capture");
+    for (unsigned i = 0; i < 100; ++i) render(false, false, true);
+    require(!eye_calibration_stats().valid && eye_calibration_stats().in_flight < 8,
+        "Mono must not invent a second source or exhaust the ring");
+    XRLayer::release_result = XR_ERROR_RUNTIME_FAILURE;
+    for (unsigned i = 0; i < 40; ++i) render(false, false, false);
+    require(!eye_calibration_stats().valid, "Failed releases must reject pipelined captures");
+    XRLayer::release_result = XR_SUCCESS;
+    for (unsigned i = 0; i < 40; ++i) render(false, false, false);
+    require(stereo_eye_assignment(9101).calibrated, "Capture must recover after failed releases");
+    eye_calibration_enable(false);
+    render(false, false, false);
+    context->Flush();
+    xr([&] { xr_context->Flush(); });
+    const auto deadline = GetTickCount64() + 5000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) {
+        Sleep(1); xr([] { eye_calibration_tick(); }); eye_calibration_tick();
+    }
+    require(!eye_calibration_stats().in_flight, "Pipelined captures must drain after disable");
+    cleanup();
+    std::cout << "OpenXR D3D11 " << (hardware ? "hardware" : "WARP")
+        << (separate_device ? " two devices" : " one device")
+        << ": cross-thread AER, alternating eyes, stale markers and failed releases passed\n";
+}
+void openxr11_singlethreaded() {
+    roles();
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_SINGLETHREADED,
+        nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context));
+    D3D11_TEXTURE2D_DESC desc{128, 128, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    ComPtr<ID3D11Texture2D> a, b;
+    check(device->CreateTexture2D(&desc, nullptr, &a));
+    check(device->CreateTexture2D(&desc, nullptr, &b));
+    std::thread begin([] { eye_calibration_frame(EyeCalibrationBackend::openxr, 951, 11); });
+    begin.join();
+    eye_calibration_stamp(context.Get(), a.Get(), 9101, 0, 0, 128, 128);
+    eye_calibration_stamp(context.Get(), b.Get(), 9102, 0, 0, 128, 128);
+    std::uint64_t ticket{1};
+    std::thread submit([&] {
+        ticket = eye_calibration_submit(a.Get(), 0, 0, 0, 1, 1, 0, EyeCalibrationBackend::openxr, 951);
+        eye_calibration_enable(false);
+        eye_calibration_frame(EyeCalibrationBackend::openxr, 951, 11);
+    });
+    submit.join();
+    require(!ticket, "SINGLETHREADED device must reject foreign-thread submission without D3D calls");
+    eye_calibration_tick();
+    context->Flush();
+    const auto deadline = GetTickCount64() + 5000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) {
+        Sleep(1); eye_calibration_tick();
+    }
+    require(!eye_calibration_stats().in_flight && !stereo_eye_assignment(9101).calibrated,
+        "Unsupported threading must drain without publishing a pair");
+    cleanup();
+}
+void openxr11_context_diagnostics(bool separate_device) {
+    roles();
+    XRThread worker;
+    ComPtr<ID3D11Device> source_device, submitted_device;
+    ComPtr<ID3D11DeviceContext> source_context, submitted_context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &source_device, nullptr, &source_context));
+    if (separate_device) {
+        check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &submitted_device, nullptr, &submitted_context));
+    } else {
+        submitted_device = source_device;
+        submitted_context = source_context;
+    }
+    D3D11_TEXTURE2D_DESC desc{128, 128, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    ComPtr<ID3D11Texture2D> a, b, submitted;
+    check(source_device->CreateTexture2D(&desc, nullptr, &a));
+    check(source_device->CreateTexture2D(&desc, nullptr, &b));
+    check(submitted_device->CreateTexture2D(&desc, nullptr, &submitted));
+    worker.invoke([] { eye_calibration_frame(EyeCalibrationBackend::openxr, 952, 11); });
+    eye_calibration_stamp(source_context.Get(), a.Get(), 9101, 0, 0, 128, 128);
+    eye_calibration_stamp(source_context.Get(), b.Get(), 9102, 0, 0, 128, 128);
+    ComPtr<ID3D11Multithread> protection;
+    check(source_context.As(&protection));
+    require(protection->GetMultithreadProtected(), "Source context protection was enabled");
+    if (!separate_device) protection->SetMultithreadProtected(FALSE);
+    std::uint64_t ticket{1};
+    worker.invoke([&] {
+        ticket = eye_calibration_submit(submitted.Get(), 0, 0, 0, 1, 1, 0, EyeCalibrationBackend::openxr, 952);
+        eye_calibration_enable(false);
+        eye_calibration_frame(EyeCalibrationBackend::openxr, 952, 11);
+    });
+    require(bool(ticket) == separate_device, "Separate-device capture is supported; lost source protection is rejected");
+    const auto json = eye_calibration_json();
+    require(json.find(separate_device ? "\"rejection\":\"none\"" :
+        "\"rejection\":\"submission_context_unprotected\"") != std::string::npos,
+        "Diagnostics must distinguish a second context from protection turned off on the same context");
+    require(json.find(separate_device ? "\"source_protected_when_stamped\":true,\"submitted_protected\":true" :
+        "\"source_protected_when_stamped\":true,\"submitted_protected\":false") != std::string::npos,
+        "Report must distinguish cached source protection from observed submission protection");
+    ComPtr<IUnknown> identity;
+    check(submitted_device.As(&identity));
+    require(json.find("\"submitted_device\":\"" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(identity.Get())) + "\"") != std::string::npos,
+        "Report must identify the actual submission device using COM identity");
+    eye_calibration_tick();
+    source_context->Flush();
+    worker.invoke([&] { submitted_context->Flush(); });
+    const auto deadline = GetTickCount64() + 5000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) {
+        Sleep(1); worker.invoke([] { eye_calibration_tick(); }); eye_calibration_tick();
+    }
+    require(!eye_calibration_stats().in_flight && !stereo_eye_assignment(9101).calibrated,
+        "Rejected context must drain without an eye assignment");
     cleanup();
 }
 struct GPU12 {
@@ -822,6 +1063,13 @@ int run_openxr_calibration_tests() {
         layer_policy();
         projection_policy();
         openxr11();
+        openxr11_pipeline(false);
+        openxr11_pipeline(true);
+        openxr11_pipeline(false, true);
+        openxr11_pipeline(true, true);
+        openxr11_singlethreaded();
+        openxr11_context_diagnostics(false);
+        openxr11_context_diagnostics(true);
         recording_lifetime12();
         for (bool array : {false, true})
             run12(EyeCalibrationBackend::openxr, array, false, DXGI_FORMAT_R8G8B8A8_UNORM,

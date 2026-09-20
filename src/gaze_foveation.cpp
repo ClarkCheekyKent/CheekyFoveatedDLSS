@@ -770,6 +770,10 @@ bool calculate_coordinated_crop(
         view_diagnostics.copy_mapping = copy_match;
         view_diagnostics.projection_mapping = projection_match;
         view_diagnostics.marker_mapping = marker_match;
+        const auto& projected = snapshot.views[state.mapping.view_index];
+        view_diagnostics.submitted_projection = (projected.flags & CHEEKY_GAZE_VIEW_SUBMITTED_PROJECTION) != 0;
+        view_diagnostics.fov_tangents = {std::tan(projected.fov_left), std::tan(projected.fov_right),
+            std::tan(projected.fov_up), std::tan(projected.fov_down)};
     }
     const bool mapping_stable = mapping_result.stable &&
         state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS;

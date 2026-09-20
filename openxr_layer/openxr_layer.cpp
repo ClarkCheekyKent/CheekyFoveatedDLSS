@@ -135,6 +135,18 @@ struct SubmittedView {
 };
 
 struct SessionState {
+    struct LocatedProjection {
+        XrTime time{};
+        XrSpace space{XR_NULL_HANDLE};
+        std::array<XrPosef, 2> poses{};
+        bool valid{};
+    };
+    std::array<LocatedProjection, 8> located_history{};
+    unsigned located_cursor{};
+    std::array<XrFovf, 2> submitted_fov{};
+    std::array<XrQuaternionf, 2> submitted_rotation_delta{};
+    XrTime submitted_projection_time{};
+    bool submitted_projection_valid{}, using_submitted_projection{};
     cheeky::openxr_calibration::Frame calibration;
     unsigned graphics_api{};
     void* graphics_queue{};
@@ -288,6 +300,7 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
             target.center_u = session->center_u[index];
             target.center_v = session->center_v[index];
             target.flags = session->gaze_location_flags & 0xFU;
+            if (session->using_submitted_projection) target.flags |= CHEEKY_GAZE_VIEW_SUBMITTED_PROJECTION;
             if (session->forward_valid) target.flags |= CHEEKY_GAZE_VIEW_FORWARD_VALID;
             target.forward_u = session->forward_u[index];
             target.forward_v = session->forward_v[index];
@@ -459,6 +472,18 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
     return result;
 }
 
+XrQuaternionf multiply_rotation(const XrQuaternionf& a, const XrQuaternionf& b) noexcept {
+    return {a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z};
+}
+bool normalize_rotation(XrQuaternionf& q) noexcept {
+    const float length = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (!std::isfinite(length) || length < 0.0001F) return false;
+    q = {q.x/length, q.y/length, q.z/length, q.w/length};
+    return true;
+}
 [[nodiscard]] cheeky::gaze_math::Pose convert_pose(
     const XrPosef& pose
 ) noexcept {
@@ -1191,6 +1216,31 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         return result;
     }
 
+    // The runtime's recommended optics can differ from the application's
+    // submitted projection. Apply the last submitted FOV and relative eye
+    // rotation to the current tracked poses; never reuse an old absolute pose.
+    std::array<XrView, 2> effective_views{views[0], views[1]};
+    bool submitted_projection{};
+    {
+        std::lock_guard lock(state_mutex);
+        auto it = sessions.find(session);
+        if (it != sessions.end()) {
+            auto& state = it->second;
+            auto& located = state.located_history[state.located_cursor++ % state.located_history.size()];
+            located.time = locate_info->displayTime;
+            located.space = locate_info->space;
+            located.poses = {views[0].pose, views[1].pose};
+            located.valid = view_state && (view_state->viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+            submitted_projection = state.submitted_projection_valid &&
+                locate_info->displayTime >= state.submitted_projection_time &&
+                locate_info->displayTime - state.submitted_projection_time <= 250000000;
+            if (submitted_projection) for (unsigned eye = 0; eye < 2; ++eye) {
+                effective_views[eye].fov = state.submitted_fov[eye];
+                effective_views[eye].pose.orientation = multiply_rotation(views[eye].pose.orientation,
+                    state.submitted_rotation_delta[eye]);
+            }
+        }
+    }
     cheeky::gaze_math::Pose forward_pose{};
     std::array<float, 2> forward_u{}, forward_v{};
     bool forward_valid = view_state != nullptr &&
@@ -1198,9 +1248,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         cheeky::gaze_math::stereo_forward_pose(convert_pose(views[0].pose), convert_pose(views[1].pose), forward_pose);
     if (forward_valid) {
         for (unsigned i = 0; i < 2; ++i) {
-            const auto& f = views[i].fov;
+            const auto& f = effective_views[i].fov;
             forward_valid &= cheeky::gaze_math::project_gaze_to_view(forward_pose,
-                convert_pose(views[i].pose), {f.angleLeft, f.angleRight, f.angleUp, f.angleDown},
+                convert_pose(effective_views[i].pose), {f.angleLeft, f.angleRight, f.angleUp, f.angleDown},
                 forward_u[i], forward_v[i]);
         }
     }
@@ -1277,16 +1327,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         const auto gaze_pose = convert_pose(gaze_location.pose);
         for (std::uint32_t index{}; index < CHEEKY_GAZE_MAX_VIEWS; ++index) {
             const cheeky::gaze_math::Fov fov{
-                views[index].fov.angleLeft,
-                views[index].fov.angleRight,
-                views[index].fov.angleUp,
-                views[index].fov.angleDown,
+                effective_views[index].fov.angleLeft,
+                effective_views[index].fov.angleRight,
+                effective_views[index].fov.angleUp,
+                effective_views[index].fov.angleDown,
             };
             if (next_jump_valid) next_jump_valid &= cheeky::gaze_math::project_gaze_to_view(
-                next_jump_pose, convert_pose(views[index].pose), fov, next_jump_u[index], next_jump_v[index]);
+                next_jump_pose, convert_pose(effective_views[index].pose), fov, next_jump_u[index], next_jump_v[index]);
             projections_valid &= cheeky::gaze_math::project_gaze_to_view(
                 gaze_pose,
-                convert_pose(views[index].pose),
+                convert_pose(effective_views[index].pose),
                 fov,
                 projected_u[index],
                 projected_v[index]
@@ -1306,7 +1356,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
             state.eye_fov_valid = !state.unsupported_view_configuration;
             state.forward_valid = forward_valid && !state.unsupported_view_configuration;
             state.forward_u = forward_u; state.forward_v = forward_v;
-            for (unsigned i = 0; i < CHEEKY_GAZE_MAX_VIEWS; ++i) state.eye_fov[i] = views[i].fov;
+            state.using_submitted_projection = submitted_projection;
+            for (unsigned i = 0; i < CHEEKY_GAZE_MAX_VIEWS; ++i) state.eye_fov[i] = effective_views[i].fov;
             state.next_jump_valid = next_jump_valid;
             state.next_jump_u = next_jump_u; state.next_jump_v = next_jump_v;
             state.simulated = simulated;
@@ -1602,13 +1653,63 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
 
     const auto result = next(session, frame_end_info);
-    std::lock_guard lock(state_mutex);
+    std::unique_lock lock(state_mutex);
     const auto selected = cheeky::openxr::select_projection(frame_end_info, [session](XrSwapchain handle) {
         const auto it = swapchains.find(handle);
         return it != swapchains.end() && it->second.session == session &&
             it->second.create_info.width == 4 && it->second.create_info.height == 4 &&
             it->second.create_info.arraySize == 1;
     });
+    {
+        auto owner = sessions.find(session);
+        if (owner != sessions.end()) {
+            const auto generation = owner->second.generation;
+            owner->second.submitted_projection_valid = false;
+            SessionState::LocatedProjection located{};
+            if (frame_end_info) for (const auto& candidate : owner->second.located_history)
+                if (candidate.valid && candidate.time == frame_end_info->displayTime) located = candidate;
+            const auto* projection = selected.projection;
+            bool valid = XR_SUCCEEDED(result) && projection && located.valid &&
+                !selected.ambiguous && !selected.unsupported;
+            XrQuaternionf space_rotation{0, 0, 0, 1};
+            if (valid && projection->space != located.space) {
+                auto* instance = find_instance_for_session_locked(session);
+                const auto locate = instance ? instance->dispatch.locate_space : nullptr;
+                XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+                // Runtime callbacks must not run under our state mutex.
+                lock.unlock();
+                valid = locate && XR_SUCCEEDED(locate(projection->space, located.space,
+                    frame_end_info->displayTime, &location)) &&
+                    (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+                lock.lock();
+                space_rotation = location.pose.orientation;
+            }
+            std::array<XrQuaternionf, 2> deltas{};
+            std::array<XrFovf, 2> fovs{};
+            if (valid) valid = normalize_rotation(space_rotation);
+            for (unsigned eye = 0; valid && eye < 2; ++eye) {
+                auto tracked = located.poses[eye].orientation;
+                auto submitted = projection->views[eye].pose.orientation;
+                const auto& fov = projection->views[eye].fov;
+                const float width = std::tan(fov.angleRight) - std::tan(fov.angleLeft);
+                const float height = std::tan(fov.angleUp) - std::tan(fov.angleDown);
+                valid = normalize_rotation(tracked) && normalize_rotation(submitted) &&
+                    std::isfinite(width) && std::isfinite(height) && width > 0.0001F && height > 0.0001F;
+                if (!valid) break;
+                const XrQuaternionf inverse{-tracked.x, -tracked.y, -tracked.z, tracked.w};
+                deltas[eye] = multiply_rotation(inverse, multiply_rotation(space_rotation, submitted));
+                valid = normalize_rotation(deltas[eye]);
+                fovs[eye] = fov;
+            }
+            owner = sessions.find(session);
+            if (valid && owner != sessions.end() && owner->second.generation == generation) {
+                owner->second.submitted_fov = fovs;
+                owner->second.submitted_rotation_delta = deltas;
+                owner->second.submitted_projection_time = frame_end_info->displayTime;
+                owner->second.submitted_projection_valid = true;
+            }
+        }
+    }
     {
         auto owner = sessions.find(session);
         if (owner != sessions.end()) {

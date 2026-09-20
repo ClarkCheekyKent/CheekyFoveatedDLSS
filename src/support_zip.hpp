@@ -14,6 +14,18 @@ struct SupportFile { std::string name, contents; };
 // Callers supply ASCII flat filenames and at most 20 MiB of report data.
 inline void write_support_zip(const std::filesystem::path& path,
                               const std::vector<SupportFile>& files) {
+    if (files.size() > 256U)
+        throw std::runtime_error("Support archive exceeds 256 files");
+    std::size_t total{};
+    for (const auto& file : files) {
+        if (file.contents.size() > 20U * 1024U * 1024U - total)
+            throw std::runtime_error("Support archive exceeds 20 MiB");
+        total += file.contents.size();
+        if (file.name.empty() || file.name.size() > 255U ||
+            file.name.find_first_of("/\\:") != std::string::npos)
+            throw std::runtime_error("Invalid filename in support archive: " + file.name);
+    }
+    // Validate before opening/truncating the destination, including .partial reports.
     std::ofstream out(path, std::ios::binary);
     out.exceptions(std::ios::failbit | std::ios::badbit);
     auto u16 = [&](std::uint16_t n) {
@@ -24,13 +36,7 @@ inline void write_support_zip(const std::filesystem::path& path,
     };
     struct Entry { std::uint32_t crc, size, offset; std::string name; };
     std::vector<Entry> entries;
-    std::size_t total{};
     for (const auto& file : files) {
-        total += file.contents.size();
-        if (total > 20U * 1024U * 1024U || files.size() > 100U ||
-            file.name.empty() || file.name.size() > 255U ||
-            file.name.find_first_of("/\\:") != std::string::npos)
-            throw std::runtime_error("Invalid support archive size or filename");
         std::uint32_t crc = 0xffffffffU;
         for (unsigned char c : file.contents) {
             crc ^= c;

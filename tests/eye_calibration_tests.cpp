@@ -1,9 +1,11 @@
 #include "eye_calibration_pixels.hpp"
 #include "eye_calibration.hpp"
 #include "settings.hpp"
+#include "support_zip.hpp"
 #include <wrl/client.h>
 #include <iostream>
 #include <vector>
+#include <thread>
 
 namespace {
 using namespace cheeky::foveated_dlss;
@@ -14,6 +16,93 @@ void require(bool ok, const char* text) {
 }
 void check(HRESULT hr) {
     require(SUCCEEDED(hr), "Eye calibration GPU operation failed");
+}
+void test_deferred_capture_close() {
+    eye_calibration_stop();
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &device, nullptr, &context));
+    D3D11_TEXTURE2D_DESC desc{128, 128, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    ComPtr<ID3D11Texture2D> output;
+    check(device->CreateTexture2D(&desc, nullptr, &output));
+    eye_calibration_enable(true);
+    eye_calibration_frame();
+    std::vector<unsigned> black(128 * 128);
+    context->UpdateSubresource(output.Get(), 0, nullptr, black.data(), 128 * 4, 0);
+    eye_calibration_stamp(context.Get(), output.Get(), 7101, 0, 0, 128, 128);
+    std::uint64_t ticket{1};
+    std::thread xr([&] {
+        ticket = eye_calibration_submit(output.Get(), 0, 0, 0, 1, 1);
+        eye_calibration_frame();
+    });
+    xr.join();
+    require(!ticket, "Unprotected cross-thread submission must be rejected");
+    const auto snapshot = eye_calibration_json();
+    require(snapshot.find("\"finish_wrong_thread\":1") != std::string::npos &&
+        snapshot.find("\"submit_wrong_thread\":1") != std::string::npos &&
+        snapshot.find("\"closed\":false") != std::string::npos &&
+        snapshot.find("\"close_requested\":true") != std::string::npos,
+        "Different XR thread must defer closure without touching the immediate context");
+    eye_calibration_tick(); // Finish the deferred query on its render thread.
+    context->Flush(); // Test-only GPU submission.
+    const auto deadline = GetTickCount64() + 3000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) {
+        Sleep(1);
+        eye_calibration_tick();
+    }
+    require(eye_calibration_stats().in_flight == 0 && !eye_calibration_stats().correction_active,
+        "Render thread must retire deferred closure without publishing incomplete eye mapping");
+    // More captures than the ring capacity must continue to drain. Each has
+    // one evaluation and an XR-thread close, matching the reported pipeline.
+    const auto previous_completed = eye_calibration_stats().completed;
+    for (unsigned frame = 0; frame < 120; ++frame) {
+        std::thread begin([] { eye_calibration_frame(); }); begin.join();
+        eye_calibration_stamp(context.Get(), output.Get(), 7101, 0, 0, 128, 128);
+        context->Flush();
+        Sleep(1);
+        eye_calibration_tick();
+    }
+    std::thread close([] { eye_calibration_enable(false); eye_calibration_frame(); }); close.join();
+    eye_calibration_tick();
+    context->Flush();
+    const auto drain_deadline = GetTickCount64() + 3000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < drain_deadline) {
+        Sleep(1); eye_calibration_tick();
+    }
+    require(eye_calibration_stats().completed >= previous_completed + 12 &&
+        eye_calibration_stats().in_flight == 0 && !eye_calibration_stats().correction_active,
+        "Cross-thread frames must keep sampling beyond ring capacity and drain after disable");
+    eye_calibration_stop();
+}
+void test_support_archive_limits() {
+    std::vector<SupportFile> report_files;
+    for (unsigned i = 0; i < 194; ++i) report_files.push_back({"entry-" + std::to_string(i) + ".txt", "report"});
+    for (unsigned i = 0; i < 6; ++i) report_files.push_back({"report-" + std::to_string(i) + ".txt", "report"});
+    const auto report_path = std::filesystem::temp_directory_path() /
+        ("Cheeky-support-archive-test-" + std::to_string(GetCurrentProcessId()) + ".zip");
+    write_support_zip(report_path, report_files);
+    std::ifstream archive(report_path, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(archive)), std::istreambuf_iterator<char>());
+    archive.close();
+    require(contents.size() >= 22, "Support ZIP has an end record");
+    const auto end = contents.size() - 22;
+    require(contents.compare(end, 4, "PK\x05\x06", 4) == 0 &&
+        static_cast<unsigned char>(contents[end + 10]) == 200 && contents[end + 11] == 0,
+        "Support ZIP retains all 200 archive entries");
+    const auto assert_rejected = [&](const std::vector<SupportFile>& invalid, const char* reason) {
+        bool rejected{};
+        try { write_support_zip(report_path, invalid); }
+        catch (const std::runtime_error& error) { rejected = std::string(error.what()).find(reason) != std::string::npos; }
+        require(rejected, "Invalid archive gets a specific validation error");
+        require(std::filesystem::file_size(report_path) == contents.size(),
+            "Validation failure must not truncate an existing archive");
+    };
+    assert_rejected(std::vector<SupportFile>(257, {"entry.txt", ""}), "256 files");
+    assert_rejected({{"bad/name.txt", ""}}, "filename");
+    assert_rejected({{"large.bin", std::string(20U * 1024U * 1024U + 1, 'x')}}, "20 MiB");
+    std::filesystem::remove(report_path);
 }
 void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
                      bool obscure = false, bool duplicate_eye = false) {
@@ -251,6 +340,8 @@ int run_eye_calibration_tests() {
                     calibration_pattern_classify(.5F, 1.F) == 1 &&
                     calibration_pattern_classify(calibration_half(0x7e00), 1.F) == -1,
                 "Pattern classification must reject weak, ambiguous and nonfinite scores");
+        test_deferred_capture_close();
+        test_support_archive_limits();
         pattern_tests();
         run_calibration();
         for (auto format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,

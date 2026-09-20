@@ -79,15 +79,16 @@ inline CalibrationPixel calibration_decode(const unsigned char* p, DXGI_FORMAT f
     return {p[bgra ? 2 : 0] / 255.0F, p[1] / 255.0F, p[bgra ? 0 : 2] / 255.0F, p[3] / 255.0F};
 }
 // Balanced, asymmetric 5x5 codes. Each cell is 8x8 source pixels.
-inline bool calibration_pattern_bit(unsigned candidate, unsigned x, unsigned y) {
+inline bool calibration_pattern_bit(unsigned candidate, unsigned x, unsigned y, std::uint32_t code = 0) {
+    if (code) return ((code >> (y * 5 + x)) & 1U) != 0;
     constexpr const char* codes[]{
         "11010" "00101" "11000" "10101" "00110",
         "10111" "00100" "00110" "11001" "01001"};
     return codes[candidate][y * 5 + x] == '1';
 }
 inline void calibration_encode_pattern(unsigned char* p, DXGI_FORMAT format, unsigned candidate,
-                                       unsigned x, unsigned y) {
-    const bool light = calibration_pattern_bit(candidate, x / 8, y / 8);
+                                       unsigned x, unsigned y, std::uint32_t code = 0) {
+    const bool light = calibration_pattern_bit(candidate, x / 8, y / 8, code);
     if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
         const auto v = std::uint16_t(light ? 0x3c00 : 0);
         const std::uint16_t values[]{v, v, v, 0x3c00};
@@ -112,7 +113,7 @@ inline void calibration_encode_pattern(unsigned char* p, DXGI_FORMAT format, uns
 // the submitted image orientation using the existing top/bottom checks.
 inline float calibration_pattern_score(const void* data, unsigned pitch, unsigned width,
                                         unsigned height, DXGI_FORMAT format, unsigned candidate,
-                                        bool submitted) {
+                                        bool submitted, std::uint32_t code = 0) {
     if (!data || !width || !height || candidate > 1 || !calibration_pixel_bytes(format)) return 0;
     const unsigned side = submitted ? calibration_sample_size : calibration_marker_size;
     std::array<float, calibration_sample_size * calibration_sample_size> luma{};
@@ -140,7 +141,7 @@ inline float calibration_pattern_score(const void* data, unsigned pitch, unsigne
                         const float v = (luma[(cy - 1) * side + cx - 1] + luma[(cy - 1) * side + cx + 1] +
                                          luma[(cy + 1) * side + cx - 1] + luma[(cy + 1) * side + cx + 1]) * .25F;
                         const bool light = calibration_pattern_bit(candidate, mirror & 1 ? 4 - x : x,
-                                                                    mirror & 2 ? 4 - y : y);
+                                                                    mirror & 2 ? 4 - y : y, code);
                         const float sign = light ? 1.F : -1.F;
                         values[y * 5 + x] = v; signs[y * 5 + x] = sign;
                         sum += v; square += v * v; dot += v * sign; sign_sum += sign;

@@ -7,7 +7,8 @@
 namespace cheeky::foveated_dlss {
 enum class EyeCalibrationBackend { none, openvr, openxr };
 // Asynchronous D3D11/D3D12 calibration for OpenVR and OpenXR. D3D11 work
-// stays on the immediate context's owning thread; UI only reads snapshots.
+// uses the render thread except protected native OpenXR pre-release copies;
+// UI only reads snapshots.
 struct EyeCalibrationStats {
     bool enabled{};
     EyeCalibrationBackend backend{};

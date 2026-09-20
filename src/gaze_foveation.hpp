@@ -32,6 +32,8 @@ struct GazeViewDiagnostics {
     bool copy_mapping{};
     bool projection_mapping{};
     bool marker_mapping{};
+    bool submitted_projection{};
+    std::array<float, 4> fov_tangents{};
     unsigned alignment_source{};
     float aligned_u{}, aligned_v{};
 };

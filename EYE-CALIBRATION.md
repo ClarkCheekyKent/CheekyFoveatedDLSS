@@ -3,7 +3,7 @@
 Cheeky follows marked DLSS outputs to the physical eyes submitted to OpenVR or
 OpenXR. The sharp region can then follow the correct eye when videos, menus or
 scenes change the order of the game's stereo views. Calibration samples immediately when enabled, then every 10 VR frames,
-and starts enabled when ReShade or UEVR attaches, independently of DLSS-SR's
+and starts enabled when a host attaches, independently of DLSS-SR's
 foveation switch. Pending readbacks still drain between samples; the established
 eye mapping remains active. A changed mapping can take up to 10 frames plus
 readback latency to detect. It does not rewrite saved stereo or gaze preferences.
@@ -15,7 +15,7 @@ readback latency to detect. It does not rewrite saved stereo or gaze preferences
 | D3D11 | Separate, packed/flipped bounds, array slices | Separate, packed projection rectangles, array slices |
 | D3D12 | Separate, packed/flipped bounds, array slices | Separate, packed projection rectangles, array slices |
 
-The same core and diagnostics ship in ReShade and UEVR. Native OpenXR needs the
+The same calibration core is shared by ReShade, UEVR, standalone and OptiScaler. Native OpenXR needs the
 **matching updated Cheeky OpenXR layer** installed using
 `CheekyOpenXRSetup.exe`, in addition to the new add-on or plugin/runtime.
 Close the game before installing and restart it afterward. Copying the layer DLL
@@ -29,9 +29,36 @@ OpenVR calibration backend in diagnostics.
 This covers the project's D3D11/D3D12 paths, not Vulkan or OpenGL. Unsupported
 formats, multisampled images, non-stereo/ambiguous game projection layers, missing
 markers, or unrecognized submission flags do not force an eye assignment.
-D3D11 marker/copy/readback work must use the immediate context's owning thread.
-Frame pipelines must expose both DLSS evaluations and their submissions in the
-same observed VR frame; extra or mismatched evaluations are rejected.
+D3D11 source stamping and readback stay on the original render thread.
+For native OpenXR D3D11 pipelines that submit on another thread, calibration
+enables the immediate context's `ID3D11Multithread` protection on the render
+thread. Pre-release patch copies then run under that D3D lock on the submission
+thread. Devices created with `D3D11_CREATE_DEVICE_SINGLETHREADED` still reject
+cross-thread capture. Protection remains enabled for the device lifetime; it
+adds D3D context locking overhead. Contention on calibration state skips the
+submission capture instead of waiting with the D3D lock held.
+When XR textures belong to a different D3D11 device, that submission context is
+protected separately. Its patch textures and per-eye completion queries are
+allocated on the submission device and polled on the submission thread. Source
+and submitted scores join only after both devices' readbacks complete; no texture
+or query is used through another device's context. The host's existing image
+transfer supplies the submitted markers; calibration adds no inter-device copy.
+If an XR frame ends on a different thread, query closure is deferred until the
+original render thread next stamps an output or ticks calibration. Unfinished
+slots remain owned until GPU readback completes.
+
+Native OpenXR D3D11 source captures may span up to four XR intervals / 250 ms,
+so alternating eye rendering can supply distinct DLSS views on adjacent frames.
+Each source render is stamped, including renders between readback samples.
+Codes and candidate slots stay bound to view identities for the calibration
+epoch, so a delayed submitted frame can still match. Toggling calibration,
+changing the backend/session or replacing a source view invalidates those codes.
+A sample retains the first source before/after proof for each candidate.
+Submissions before both candidates exist are skipped. Once submission copying
+starts, source evidence is frozen; both eyes must belong to that one submission
+interval and pass the normal release, rectangle, image-index and marker checks.
+Mono, third candidates, changed source dimensions/generations and expired
+windows cannot force a mapping. OpenVR and D3D12 retain their same-frame policy.
 
 OpenXR calibration records span one `xrEndFrame` to the next. `xrBeginFrame`
 does not reset the source markers: hosts may render DLSS before calling it.
@@ -40,6 +67,25 @@ subsequent samples retain the existing ten-frame cadence. Failed submissions
 reject their pair and clear the learned rectangles before the next interval.
 
 ## Diagnostics
+
+Support snapshots include D3D11 context/thread ownership, deferred query closes,
+readback rejection reasons, and separate-device submissions. Calibration support
+reports contain metadata only, without captured images.
+
+OpenXR gaze projection uses the application's submitted FOV and eye orientation
+relative to the corresponding located views, transformed between reference
+spaces when needed. The last submitted projection is applied to fresh tracked
+poses for up to 250 ms. Runtime-provided optics remain the fallback before a
+valid submitted projection is available. Support snapshots identify the selected
+projection and its FOV tangents.
+
+Known limitation: marker calibration identifies the eye; it does not recover an
+arbitrary source-to-submitted crop. BG3/RealVR currently needs a configuration
+that preserves the corner markers near their expected positions. In the tested
+setup, toggling Optimize FOV off and back on produced matching render/submission
+extents. This is a workaround, not automatic crop correction. Continuous stamping
+also retains visible markers while calibration is enabled; bounded marker bursts
+and general crop recovery remain future work.
 
 Open **Stereo and gaze > Eye calibration** in UEVR for the runtime, status and
 session enable switch. Detailed calibration data is included in support ZIPs.
@@ -54,9 +100,11 @@ ReShade's **Diagnostics > Eye calibration** panel shows:
 
 Resetting counters preserves the mapping. CPU work measures the core capture and
 polling calls, including warm-up allocation but excluding lock waiting and
-surrounding hook dispatch/post-submit fence bookkeeping. GPU time covers marker
-and patch-copy commands, not the whole frame. GPU/latency averages use the latest
+surrounding hook dispatch/post-submit fence bookkeeping. GPU time covers the
+instrumented source proof and submission copies, not the whole frame or repeated
+D3D11 marker refreshes while awaiting both sources. GPU/latency averages use the latest
 256 samples; CPU is cumulative since reset. Missing timestamps show unavailable.
+Separate-device D3D11 samples do not publish a combined GPU timing measurement.
 
 ReShade's support ZIP includes calibration in `diagnostics.txt`; UEVR includes
 `eye_calibration` in `diagnostics.json`. Both report marker-based crop routing.
@@ -76,6 +124,8 @@ Calibration does not automatically write images, ZIPs or logs.
 After a successful outer DLSS evaluation and final composition, candidates A/B
 get distinct 40x40 light/dark patterns near their top-left/top-right corners.
 Each pattern has 5x5 cells of 8x8 pixels. Both remain inset 12 pixels.
+Native OpenXR D3D11 patterns vary per calibration epoch to reject old-session images.
+The other paths use fixed A/B patterns.
 Source before/after readbacks cover the full 40x40 stamp. Submitted readbacks
 cover 60x60 source pixels, including a 10-pixel border around the expected stamp;
 these bounds scale with the submitted image and its vertical-flip alternatives.
@@ -154,6 +204,11 @@ actual OpenXR layer DLL through its instance/session/swapchain/frame entry point
 on D3D11 and D3D12. D3D11 also overwrites released textures before EndFrame to
 verify that calibration uses pre-release captures. Coordinator tests reject
 failed calls, changed rectangles and stale indices, and verify eye relabeling.
+D3D11 WARP and hardware tests reproduce split render/submit threads, submissions
+between the A/B renders, alternating single-eye renders, old-epoch image replay,
+mono, failed releases, allocation reuse and draining after disable.
+The AER fixtures also use two D3D11 devices with a persistent submission thread,
+including immediate image reuse after release and old-epoch submitted-image rejection.
 
 Gaze tests cover calibrated crop routing and foreign-session rejection. UEVR
 tests cover host ABI, diagnostics, reports, interception and lifecycle. The Lua

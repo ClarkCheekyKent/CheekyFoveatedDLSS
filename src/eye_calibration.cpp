@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <cmath>
 #include <locale>
+#include <bit>
+#include <memory>
+#include <d3d11_4.h>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -23,6 +26,7 @@ constexpr int margin = calibration_sample_margin;
 constexpr std::uint64_t ticket_bit = 1ULL << 63;
 struct Patch {
     ComPtr<ID3D11Texture2D> staging;
+    ComPtr<ID3D11Device> device;
     unsigned width{}, height{}, reference_width{}, reference_height{};
     DXGI_FORMAT format{};
     float score{};
@@ -34,17 +38,28 @@ struct View {
     int assigned{-1};
     std::uint64_t generation{};
 };
+struct Submitted11 {
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<ID3D11Query> done;
+    DWORD thread{};
+    bool active{}, ready{};
+};
 struct Frame {
     std::shared_ptr<Calibration12Frame> gpu12;
     ComPtr<ID3D12Device> device12;
     bool gpu12_used{}, classified{};
     ComPtr<ID3D11DeviceContext> context;
+    std::uintptr_t device_identity{}, context_identity{};
+    unsigned device_flags{};
     ComPtr<ID3D11Query> done, disjoint;
     std::array<ComPtr<ID3D11Query>, 8> timestamp;
     // Source before/after for A and B, then A/B at each submitted eye.
     std::array<Patch, 8> patches;
+    std::array<Submitted11, 2> submitted11;
     std::array<float, 4> flipped_scores{};
     std::array<View, 2> views;
+    std::array<std::uint32_t, 2> codes{};
+    bool pipelined{}, protected_context{};
     std::array<unsigned, 2> eye_submits{};
     std::array<int, 2> result{{-1, -1}};
     std::array<unsigned, 2> physical_eyes{{0, 1}};
@@ -53,7 +68,7 @@ struct Frame {
     std::uint64_t epoch{}, captured_ms{}, session_generation{};
     DWORD thread{};
     unsigned evaluations{}, submits{};
-    bool busy{}, closed{}, invalid{}, queries_started{};
+    bool busy{}, closed{}, close_requested{}, invalid{}, queries_started{};
 };
 struct Average {
     std::array<double, 256> values{};
@@ -70,6 +85,14 @@ struct Average {
         return count ? sum / count : 0;
     }
 };
+struct SubmissionContext {
+    std::uint64_t sequence{};
+    std::uintptr_t source_device{}, source_context{}, submitted_device{}, submitted_context{};
+    unsigned source_flags{}, submitted_flags{};
+    bool source_protected{}, submitted_protected{};
+    HRESULT protection_query{E_PENDING};
+    const char* rejection{"none"};
+};
 struct State {
     std::mutex mutex;
     std::array<Frame, ring_size> ring;
@@ -81,12 +104,20 @@ struct State {
     ComPtr<ID3D11Device> device;
     std::array<ComPtr<ID3D11Texture2D>, 2> markers;
     DXGI_FORMAT marker_format{};
+    std::array<std::uint32_t, 2> marker_codes{};
     EyeCalibrationStats stats;
     Average gpu, latency;
     double cpu_us{};
     std::uint64_t last_frame_ms{}, last_openvr_ms{}, session_generation{};
     EyeCalibrationBackend backend{};
     bool unsupported_submission{};
+    std::uint64_t finish_wrong_thread{}, submit_wrong_thread{}, poll_wrong_thread{};
+    std::uint64_t protected_submits{}, carried_frames{}, waiting_for_sources{};
+    std::uint64_t cross_device_submits{};
+    SubmissionContext submission_context;
+    DWORD frame_thread{}, stamp_thread{}, submit_thread{}, tick_thread{};
+    std::uint64_t continuous_epoch{};
+    std::array<View, 2> continuous_views;
 };
 State& state() {
     // Match the process-resident hook lifetime. Explicit stop releases GPU
@@ -95,6 +126,45 @@ State& state() {
     return *s;
 }
 std::atomic<bool> enabled{}, pending{};
+// Codes remain stable for a calibration epoch so delayed submissions can
+// match. Candidate slots remain bound to view identities throughout that epoch.
+std::array<std::uint32_t, 2> capture_codes(std::uint64_t sequence) {
+    std::array<std::uint32_t, 2> codes{};
+    auto random = [&] {
+        sequence += 0x9e3779b97f4a7c15ULL;
+        auto v = sequence;
+        v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        v = (v ^ (v >> 27)) * 0x94d049bb133111ebULL;
+        return std::uint32_t((v ^ (v >> 31)) & 0x1ffffffU);
+    };
+    for (unsigned c = 0; c < 2; ++c) {
+        for (;;) {
+            const auto code = random();
+            if (std::popcount(code) < 10 || std::popcount(code) > 15) continue;
+            bool distinct = true;
+            for (unsigned mirror = 0; c && mirror < 4; ++mirror) {
+                std::uint32_t reflected{};
+                for (unsigned y = 0; y < 5; ++y) for (unsigned x = 0; x < 5; ++x)
+                    reflected |= unsigned(calibration_pattern_bit(0, mirror & 1 ? 4 - x : x,
+                        mirror & 2 ? 4 - y : y, codes[0])) << (y * 5 + x);
+                if (std::popcount(code ^ reflected) < 8) distinct = false;
+            }
+            if (distinct) { codes[c] = code; break; }
+        }
+    }
+    return codes;
+}
+struct ContextLock {
+    ComPtr<ID3D11Multithread> protection;
+    HRESULT query_result{E_POINTER};
+    explicit ContextLock(ID3D11DeviceContext* context) {
+        if (context && SUCCEEDED(query_result = context->QueryInterface(IID_PPV_ARGS(&protection)))) {
+            if (protection->GetMultithreadProtected()) protection->Enter();
+            else protection.Reset();
+        }
+    }
+    ~ContextLock() { if (protection) protection->Leave(); }
+};
 constexpr const char* rejection_names[] = {
     "capture_or_readback", "evaluation_count", "eye_submissions", "submission_result",
     "patches_incomplete", "source_marker", "dimensions", "submitted_markers"
@@ -146,6 +216,12 @@ void ensure_queries(State& s, Frame& f, ID3D11DeviceContext* context) {
     f.thread = GetCurrentThreadId();
     ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
+    ComPtr<IUnknown> device_identity, context_identity;
+    device.As(&device_identity);
+    context->QueryInterface(IID_PPV_ARGS(&context_identity));
+    f.device_identity = reinterpret_cast<std::uintptr_t>(device_identity.Get());
+    f.context_identity = reinterpret_cast<std::uintptr_t>(context_identity.Get());
+    f.device_flags = device->GetCreationFlags();
     auto create = [&](ComPtr<ID3D11Query>& q, D3D11_QUERY type) {
         if (q)
             return true;
@@ -167,19 +243,55 @@ void ensure_queries(State& s, Frame& f, ID3D11DeviceContext* context) {
     context->Begin(f.disjoint.Get());
     f.queries_started = true;
 }
-void finish(Frame& f) {
+void finish(State& s, Frame& f) {
     if (!f.busy || f.closed)
         return;
+    f.close_requested = true;
     if (!f.gpu12_used && f.queries_started) {
-        if (f.thread != GetCurrentThreadId())
+        if (f.thread != GetCurrentThreadId()) {
+            ++s.finish_wrong_thread;
             return;
+        }
         f.context->End(f.disjoint.Get());
         f.context->End(f.done.Get());
     }
     f.closed = true;
 }
+void poll_submitted(Frame& f) {
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& capture = f.submitted11[eye];
+        if (!capture.active || capture.ready || capture.thread != GetCurrentThreadId()) continue;
+        const auto hr = capture.context->GetData(capture.done.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE) continue;
+        if (FAILED(hr)) { f.invalid = true; capture.ready = true; continue; }
+        bool waiting{};
+        for (unsigned c = 0; c < 2; ++c) {
+            const unsigned i = 4 + eye * 2 + c;
+            auto& p = f.patches[i];
+            if (!p.used || p.ready) continue;
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            const auto result = capture.context->Map(p.staging.Get(), 0, D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (result == DXGI_ERROR_WAS_STILL_DRAWING) { waiting = true; continue; }
+            if (FAILED(result)) { f.invalid = true; p.ready = true; continue; }
+            p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
+                p.format, c, true, f.codes[c]);
+            capture.context->Unmap(p.staging.Get(), 0);
+            p.ready = true;
+        }
+        capture.ready = !waiting;
+    }
+}
 void poll(State& s) {
     for (auto& f : s.ring) {
+        // Submission textures can belong to a second D3D11 device. Its tiny
+        // copies and completion query must be read on that context's thread.
+        if (f.busy && !f.gpu12_used) poll_submitted(f);
+        // XR may end the interval on its submission thread. Keep the slot
+        // alive and close its D3D11 queries when the render thread returns;
+        // the calibration mutex alone does not make the context thread-safe.
+        if (f.busy && !f.closed && f.close_requested && !f.gpu12_used &&
+            f.thread == GetCurrentThreadId()) finish(s, f);
         if (!f.busy || !f.closed)
             continue;
         bool gpu12_reusable{};
@@ -213,6 +325,8 @@ void poll(State& s) {
                 s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, result.gpu_us);
             }
         } else {
+            if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
+                [](const auto& capture) { return capture.active && !capture.ready; })) continue;
             if (!f.queries_started) {
                 f.busy = false;
                 if (f.sequence >= s.measurement_start) {
@@ -221,8 +335,10 @@ void poll(State& s) {
                 }
                 continue;
             }
-            if (f.thread != GetCurrentThreadId())
+            if (f.thread != GetCurrentThreadId()) {
+                ++s.poll_wrong_thread;
                 continue;
+            }
             const auto hr = f.context->GetData(f.done.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
             if (hr == S_FALSE)
                 continue;
@@ -240,6 +356,7 @@ void poll(State& s) {
             }
             bool waiting{};
             for (unsigned i = 0; i < f.patches.size(); ++i) {
+                if (i >= 4 && f.submitted11[(i - 4) / 2].active) continue;
                 auto& p = f.patches[i];
                 if (!p.used || p.ready)
                     continue;
@@ -257,7 +374,7 @@ void poll(State& s) {
                 }
                 const unsigned candidate = i < 4 ? i / 2 : (i - 4) % 2;
                 p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
-                                                    p.format, candidate, i >= 4);
+                                                    p.format, candidate, i >= 4, f.codes[candidate]);
                 f.context->Unmap(p.staging.Get(), 0);
                 p.ready = true;
             }
@@ -354,7 +471,11 @@ void poll(State& s) {
     pending = std::any_of(s.ring.begin(), s.ring.end(), [](const auto& f) { return f.busy; });
 }
 bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, unsigned x, unsigned y,
-                unsigned width, unsigned height, unsigned rw = 0, unsigned rh = 0, unsigned slice = 0) {
+                unsigned width, unsigned height, unsigned rw = 0, unsigned rh = 0, unsigned slice = 0,
+                ID3D11DeviceContext* capture_context = nullptr) {
+    auto* context = capture_context ? capture_context : f.context.Get();
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
     if (!calibration_pixel_bytes(desc.Format) || slice >= desc.ArraySize || desc.SampleDesc.Count != 1 ||
@@ -363,7 +484,7 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
         return false;
     const auto subresource = D3D11CalcSubresource(0, slice, desc.MipLevels);
     auto& p = f.patches[index];
-    if (!p.staging || p.width != width || p.height != height || p.format != desc.Format) {
+    if (!p.staging || p.device != device || p.width != width || p.height != height || p.format != desc.Format) {
         p.staging.Reset();
         desc.Width = width;
         desc.Height = height;
@@ -371,10 +492,9 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = desc.MiscFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        ComPtr<ID3D11Device> device;
-        f.context->GetDevice(&device);
         if (FAILED(device->CreateTexture2D(&desc, nullptr, &p.staging)))
             return false;
+        p.device = device;
         ++s.stats.allocations;
         p.width = width;
         p.height = height;
@@ -383,9 +503,74 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
     p.reference_width = rw;
     p.reference_height = rh;
     const D3D11_BOX box{x, y, 0, x + width, y + height, 1};
-    f.context->CopySubresourceRegion(p.staging.Get(), 0, 0, 0, 0, texture, subresource, &box);
+    context->CopySubresourceRegion(p.staging.Get(), 0, 0, 0, 0, texture, subresource, &box);
     p.used = true;
     return true;
+}
+bool prepare_marker(State& s, ID3D11DeviceContext* context, DXGI_FORMAT format,
+                    unsigned candidate, std::uint32_t code) {
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(&device);
+    if (s.device.Get() != device.Get() || s.marker_format != format) {
+        s.markers = {};
+        s.device = device;
+        s.marker_format = format;
+    }
+    if (s.markers[candidate] && s.marker_codes[candidate] == code) return true;
+    const auto bytes = calibration_pixel_bytes(format);
+    std::vector<unsigned char> data(block * block * bytes);
+    for (unsigned i = 0; i < block * block; ++i)
+        calibration_encode_pattern(data.data() + i * bytes, format, candidate, i % block, i / block, code);
+    if (!s.markers[candidate]) {
+        const D3D11_TEXTURE2D_DESC desc{block, block, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+        const D3D11_SUBRESOURCE_DATA initial{data.data(), block * bytes, 0};
+        if (FAILED(device->CreateTexture2D(&desc, &initial, &s.markers[candidate]))) return false;
+        ++s.stats.allocations;
+    } else context->UpdateSubresource(s.markers[candidate].Get(), 0, nullptr, data.data(), block * bytes, 0);
+    s.marker_codes[candidate] = code;
+    return true;
+}
+unsigned continuous_candidate(State& s, std::uint64_t view) {
+    if (s.continuous_epoch != s.epoch) {
+        s.continuous_views = {};
+        s.continuous_epoch = s.epoch;
+    }
+    const auto generation = stereo_view_generation(view);
+    // Replacing a source invalidates delayed pixels from its predecessor.
+    for (const auto& v : s.continuous_views) {
+        if (v.id && stereo_view_generation(v.id) != v.generation) {
+            ++s.epoch;
+            s.frames_until_capture = 0;
+            clear_stereo_calibration();
+            s.continuous_views = {};
+            s.continuous_epoch = s.epoch;
+            break;
+        }
+    }
+    for (unsigned i = 0; i < 2; ++i)
+        if (s.continuous_views[i].id == view && s.continuous_views[i].generation == generation) return i;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& v = s.continuous_views[i];
+        if (!v.id || stereo_view_generation(v.id) != v.generation) {
+            v.id = view; v.generation = generation;
+            return i;
+        }
+    }
+    return 2;
+}
+void continuous_stamp_only(State& s, ID3D11DeviceContext* context, ID3D11Resource* output,
+                           unsigned c, unsigned x, unsigned y, unsigned width, unsigned height) {
+    if (c >= 2 || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(output->QueryInterface(IID_PPV_ARGS(&texture)))) return;
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (!calibration_pixel_bytes(desc.Format) || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
+        width < 2 * inset + block || height < 2 * inset + block ||
+        std::uint64_t(x) + width > desc.Width || std::uint64_t(y) + height > desc.Height) return;
+    if (!prepare_marker(s, context, desc.Format, c, capture_codes(s.epoch)[c])) return;
+    context->CopySubresourceRegion(texture.Get(), 0, x + (c ? width - inset - block : inset), y + inset,
+        0, s.markers[c].Get(), 0, nullptr);
 }
 } // namespace
 void eye_calibration_enable(bool value) noexcept {
@@ -464,19 +649,29 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         return false;
     CpuScope cpu{s};
     ++s.sequence;
+    s.frame_thread = GetCurrentThreadId();
+    if (on) ++s.stats.frames;
+    const bool capture_due = s.frames_until_capture == 0;
+    if (s.frames_until_capture) --s.frames_until_capture;
     if (s.current >= 0) {
-        finish(s.ring[s.current]);
+        auto& f = s.ring[s.current];
+        // AER can submit the previous eye pair between the two DLSS renders.
+        // Keep sources across intervals, but never combine submission pairs.
+        if (on && f.pipelined && f.epoch == s.epoch && !f.invalid && !f.submits &&
+            s.sequence - f.sequence < 4 && now - f.captured_ms < 250) {
+            ++s.carried_frames;
+            poll(s);
+            return true;
+        }
+        finish(s, f);
         s.current = -1;
     }
     poll(s);
     if (!on)
         return false;
-    ++s.stats.frames;
-    // Drain previous readbacks on every frame, but stamp/capture only one in ten.
-    if (s.frames_until_capture) {
-        --s.frames_until_capture;
-        return false;
-    }
+    // Drain readbacks every frame and sample one in ten. Native OpenXR
+    // D3D11 stamps every source render independently of this readback cadence.
+    if (!capture_due) return false;
     s.frames_until_capture = 9;
     // Rotate through all slots so the warm-up is bounded and reproducible.
     for (unsigned n = 0; n < ring_size; ++n) {
@@ -487,14 +682,19 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         if (f.gpu12 && !calibration12_begin(*f.gpu12))
             continue;
         f.gpu12_used = f.classified = false;
+        f.pipelined = backend == EyeCalibrationBackend::openxr && graphics_api == 11;
+        f.protected_context = false;
+        f.codes = f.pipelined ? capture_codes(s.epoch) :
+            std::array<std::uint32_t, 2>{};
         f.sequence = s.sequence;
         f.busy = true;
-        f.closed = f.invalid = f.queries_started = false;
+        f.closed = f.close_requested = f.invalid = f.queries_started = false;
         f.epoch = s.epoch;
         f.session_generation = session_generation;
         f.captured_ms = GetTickCount64();
         f.evaluations = f.submits = 0;
         f.views = {};
+        for (auto& capture : f.submitted11) capture.active = capture.ready = false;
         f.eye_submits = {};
         f.result = {{-1, -1}};
         f.physical_eyes = {{0, 1}};
@@ -517,6 +717,7 @@ void eye_calibration_tick() noexcept {
     auto& s = state();
     std::lock_guard lock(s.mutex);
     CpuScope cpu{s};
+    s.tick_thread = GetCurrentThreadId();
     poll(s);
 }
 void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output, std::uint64_t view,
@@ -527,6 +728,17 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         auto& s = state();
         std::lock_guard lock(s.mutex);
         CpuScope cpu{s};
+        s.stamp_thread = GetCurrentThreadId();
+        // Drain deferred closes even when this interval was not sampled or
+        // all ring slots were occupied at the last XR frame boundary.
+        poll(s);
+        const bool continuous = s.backend == EyeCalibrationBackend::openxr;
+        const unsigned continuous_c = continuous ? continuous_candidate(s, view) : 2;
+        if (continuous && (s.current < 0 || s.ring[s.current].epoch != s.epoch ||
+                s.ring[s.current].submits || s.ring[s.current].invalid)) {
+            continuous_stamp_only(s, context, output, continuous_c, x, y, width, height);
+            return;
+        }
         if (s.current < 0)
             return;
         s.stats.graphics_api = 11;
@@ -535,7 +747,14 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
             return;
         }
         auto& f = s.ring[s.current];
-        const unsigned c = f.evaluations++;
+        if (f.pipelined && (f.submits || f.invalid)) return;
+        unsigned c = f.evaluations;
+        bool repeated{};
+        if (f.pipelined) {
+            c = continuous_c;
+            repeated = c < 2 && f.views[c].id == view;
+        }
+        if (!repeated) ++f.evaluations;
         if (c >= 2) {
             f.invalid = true;
             return;
@@ -543,6 +762,19 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) {
             f.invalid = true;
             return;
+        }
+        if (f.pipelined && (s.frame_thread != GetCurrentThreadId() ||
+            (s.submit_thread && s.submit_thread != GetCurrentThreadId()))) {
+            // Only D3D's serialization also covers the game's context calls.
+            // Enable on the render thread, never on SINGLETHREADED devices.
+            ComPtr<ID3D11Device> device;
+            context->GetDevice(&device);
+            ComPtr<ID3D11Multithread> protection;
+            if (!(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) &&
+                SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&protection)))) {
+                protection->SetMultithreadProtected(TRUE);
+                f.protected_context = protection->GetMultithreadProtected() != FALSE;
+            }
         }
         if (!f.queries_started)
             ensure_queries(s, f, context);
@@ -564,32 +796,24 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
             f.invalid = true;
             return;
         }
-        ComPtr<ID3D11Device> device;
-        context->GetDevice(&device);
-        if (s.device.Get() != device.Get() || s.marker_format != desc.Format) {
-            s.markers = {};
-            s.device = device;
-            s.marker_format = desc.Format;
+        if (!prepare_marker(s, context, desc.Format, c, f.codes[c])) {
+            f.invalid = true;
+            return;
         }
-        if (!s.markers[c]) {
-            std::vector<unsigned char> data(block * block * bytes);
-            for (unsigned i = 0; i < block * block; ++i)
-                calibration_encode_pattern(data.data() + i * bytes, desc.Format, c, i % block, i / block);
-            desc.Width = desc.Height = block;
-            desc.MipLevels = 1;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = desc.CPUAccessFlags = desc.MiscFlags = 0;
-            const D3D11_SUBRESOURCE_DATA initial{data.data(), block * bytes, 0};
-            if (FAILED(device->CreateTexture2D(&desc, &initial, &s.markers[c]))) {
-                f.invalid = true;
-                return;
-            }
-            ++s.stats.allocations;
+        if (repeated && (f.views[c].generation != stereo_view_generation(view) ||
+            f.views[c].width != width || f.views[c].height != height)) {
+            f.invalid = true;
+            return;
         }
         const auto assignment = stereo_eye_assignment(view);
         f.views[c] = {view, width, height, assignment.assigned ? int(assignment.eye_index) : -1,
                       stereo_view_generation(view)};
         const unsigned px = x + (c ? width - inset - block : inset), py = y + inset;
+        if (repeated) {
+            // Refresh new renders; retain the first before/after proof.
+            context->CopySubresourceRegion(texture.Get(), 0, px, py, 0, s.markers[c].Get(), 0, nullptr);
+            return;
+        }
         context->End(f.timestamp[c * 2].Get());
         if (!copy_patch(s, f, c * 2, texture.Get(), px, py, block, block))
             f.invalid = true;
@@ -738,25 +962,96 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     if (!enabled || !texture || eye > 1)
         return 0;
     auto& s = state();
-    std::lock_guard lock(s.mutex);
-    CpuScope cpu{s};
-    if (s.backend != backend || s.session_generation != session_generation)
-        return 0;
-    s.unsupported_submission = false;
-    if (s.current < 0)
-        return 0;
-    auto& f = s.ring[s.current];
-    ++f.submits;
-    ++f.eye_submits[eye];
-    if (f.submits > 2 || f.eye_submits[eye] > 1 || !f.queries_started || f.thread != GetCurrentThreadId()) {
-        f.invalid = true;
-        return 0;
+    std::uint64_t capture_sequence{};
+    std::uintptr_t source_device_identity{};
+    bool pipelined{};
+    {
+        std::unique_lock lock(s.mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return 0;
+        if (s.backend != backend || s.session_generation != session_generation || s.current < 0)
+            return 0;
+        auto& f = s.ring[s.current];
+        if (f.invalid || f.epoch != s.epoch) return 0;
+        capture_sequence = f.sequence;
+        source_device_identity = f.device_identity;
+        pipelined = f.pipelined;
+        // Reject unprotected foreign-thread access before any D3D calls,
+        // including GetDevice/QueryInterface on a SINGLETHREADED device.
+        if (f.queries_started && f.thread != GetCurrentThreadId() && !f.protected_context) {
+            s.submit_thread = GetCurrentThreadId();
+            ++f.submits; ++f.eye_submits[eye];
+            ++s.submit_wrong_thread;
+            s.submission_context = {f.sequence, f.device_identity, f.context_identity, 0, 0,
+                f.device_flags, 0, f.protected_context, false, E_PENDING, "source_context_unprotected"};
+            f.invalid = true;
+            return 0;
+        }
+        if (!f.queries_started) {
+            s.submit_thread = GetCurrentThreadId();
+            if (f.pipelined) {
+                ++s.waiting_for_sources;
+            }
+            return 0;
+        }
     }
     ComPtr<ID3D11Device> device;
     texture->GetDevice(&device);
     ComPtr<ID3D11DeviceContext> context;
     device->GetImmediateContext(&context);
-    if (!same_context(f, context.Get())) {
+    ComPtr<IUnknown> device_identity, context_identity;
+    device.As(&device_identity);
+    context.As(&context_identity);
+    const bool separate_device = source_device_identity != reinterpret_cast<std::uintptr_t>(device_identity.Get());
+    if (pipelined && separate_device && !(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)) {
+        // This is the submission device, used here before XR releases its
+        // texture. It needs its own serialization and readback resources.
+        ComPtr<ID3D11Multithread> protection;
+        if (SUCCEEDED(context.As(&protection))) protection->SetMultithreadProtected(TRUE);
+    }
+    ContextLock context_lock(context.Get());
+    // Host code may already hold the D3D lock when it calls the render hook.
+    // Never wait for our mutex while holding that lock: a contended capture
+    // is skipped, avoiding an inversion with render-thread polling/stamping.
+    std::unique_lock lock(s.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return 0;
+    CpuScope cpu{s};
+    if (s.backend != backend || s.session_generation != session_generation)
+        return 0;
+    s.submit_thread = GetCurrentThreadId();
+    s.unsupported_submission = false;
+    if (s.current < 0)
+        return 0;
+    auto& f = s.ring[s.current];
+    if (f.sequence != capture_sequence) return 0;
+    if (f.epoch != s.epoch || f.invalid) return 0;
+    if (f.pipelined && f.evaluations < 2) {
+        ++s.waiting_for_sources;
+        return 0;
+    }
+    ++f.submits;
+    ++f.eye_submits[eye];
+    const bool other_thread = f.thread != GetCurrentThreadId();
+    s.submission_context = {f.sequence, f.device_identity, f.context_identity,
+        reinterpret_cast<std::uintptr_t>(device_identity.Get()),
+        reinterpret_cast<std::uintptr_t>(context_identity.Get()), f.device_flags, device->GetCreationFlags(),
+        f.protected_context, context_lock.protection != nullptr, context_lock.query_result};
+    auto& observed = s.submission_context;
+    const bool independent_capture = f.pipelined && separate_device && context_lock.protection &&
+        !(observed.submitted_flags & D3D11_CREATE_DEVICE_SINGLETHREADED);
+    if (f.context.Get() != context.Get() && !independent_capture) observed.rejection = "different_submission_context";
+    else if (other_thread && (observed.submitted_flags & D3D11_CREATE_DEVICE_SINGLETHREADED))
+        observed.rejection = "singlethreaded_submission_device";
+    else if (other_thread && !context_lock.protection) observed.rejection = "submission_context_unprotected";
+    const bool protected_copy = f.pipelined && context_lock.protection &&
+        !(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED);
+    if (f.submits > 2 || f.eye_submits[eye] > 1 || !f.queries_started || (other_thread && !protected_copy)) {
+        if (f.queries_started && other_thread && !protected_copy) {
+            ++s.submit_wrong_thread;
+        }
+        f.invalid = true;
+        return 0;
+    }
+    if (f.context.Get() != context.Get() && !independent_capture) {
         f.invalid = true;
         return 0;
     }
@@ -771,7 +1066,23 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     }
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
-    context->End(f.timestamp[4 + eye * 2].Get());
+    auto& submitted = f.submitted11[eye];
+    if (independent_capture) {
+        if (submitted.context.Get() != context.Get()) {
+            submitted.done.Reset();
+            submitted.context = context;
+        }
+        if (!submitted.done) {
+            const D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
+            if (FAILED(device->CreateQuery(&query, &submitted.done))) {
+                observed.rejection = "submission_query_creation_failed";
+                f.invalid = true;
+                return 0;
+            }
+            ++s.stats.allocations;
+        }
+        submitted.thread = GetCurrentThreadId();
+    } else context->End(f.timestamp[4 + eye * 2].Get());
     for (unsigned c = 0; c < 2; ++c) {
         const auto& ref = f.views[c].width ? f.views[c] : f.views[0];
         if (!ref.width || !ref.height) {
@@ -788,11 +1099,20 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
                        y = unsigned(std::floor((std::min)(ay, by)));
         const unsigned w = unsigned(std::ceil((std::max)(ax, bx))) - x,
                        h = unsigned(std::ceil((std::max)(ay, by))) - y;
-        if (!copy_patch(s, f, 4 + eye * 2 + c, texture, x, y, w, h, ref.width, ref.height, slice))
+        if (!copy_patch(s, f, 4 + eye * 2 + c, texture, x, y, w, h, ref.width, ref.height, slice, context.Get()))
             f.invalid = true;
     }
-    context->End(f.timestamp[5 + eye * 2].Get());
-    f.segments[2 + eye] = true;
+    if (independent_capture) {
+        context->End(submitted.done.Get());
+        submitted.active = true;
+        ++s.cross_device_submits;
+    } else {
+        context->End(f.timestamp[5 + eye * 2].Get());
+        f.segments[2 + eye] = true;
+    }
+    if (other_thread) {
+        ++s.protected_submits;
+    }
     return ticket_bit | (f.sequence << 1) | eye;
 }
 void eye_calibration_result(std::uint64_t ticket, int result, unsigned physical_eye) noexcept {
@@ -832,6 +1152,13 @@ void eye_calibration_stop() noexcept {
     s.last_frame_ms = s.last_openvr_ms = s.session_generation = 0;
     s.backend = EyeCalibrationBackend::none;
     s.unsupported_submission = false;
+    s.finish_wrong_thread = s.submit_wrong_thread = s.poll_wrong_thread = 0;
+    s.protected_submits = s.carried_frames = s.waiting_for_sources = 0;
+    s.cross_device_submits = 0;
+    s.submission_context = {};
+    s.frame_thread = s.stamp_thread = s.submit_thread = s.tick_thread = 0;
+    s.continuous_epoch = 0;
+    s.continuous_views = {};
 }
 
 const char* eye_calibration_status(const EyeCalibrationStats& stats) noexcept {
@@ -920,6 +1247,44 @@ std::string eye_calibration_json() {
         << "\",\"capture_hresult\":" << s.d3d12_capture_error
         << ",\"last_readback_failure\":\"" << s.d3d12_last_readback_failure
         << "\",\"readback_hresult\":" << s.d3d12_readback_error << '}';
+    {
+        auto& live = state();
+        std::lock_guard lock(live.mutex);
+        out << ",\"d3d11_lifecycle\":{\"frame_thread\":" << live.frame_thread
+            << ",\"stamp_thread\":" << live.stamp_thread << ",\"submit_thread\":" << live.submit_thread
+            << ",\"tick_thread\":" << live.tick_thread << ",\"finish_wrong_thread\":" << live.finish_wrong_thread
+            << ",\"submit_wrong_thread\":" << live.submit_wrong_thread << ",\"poll_wrong_thread\":" << live.poll_wrong_thread
+            << ",\"protected_submits\":" << live.protected_submits << ",\"carried_frames\":" << live.carried_frames
+            << ",\"waiting_for_sources\":" << live.waiting_for_sources
+            << ",\"cross_device_submits\":" << live.cross_device_submits
+            << ",\"last_submission_context\":{\"sequence\":" << live.submission_context.sequence
+            << ",\"source_device\":\"" << live.submission_context.source_device
+            << "\",\"source_context\":\"" << live.submission_context.source_context
+            << "\",\"submitted_device\":\"" << live.submission_context.submitted_device
+            << "\",\"submitted_context\":\"" << live.submission_context.submitted_context
+            << "\",\"source_device_flags\":" << live.submission_context.source_flags
+            << ",\"submitted_device_flags\":" << live.submission_context.submitted_flags
+            << ",\"source_protected_when_stamped\":" << live.submission_context.source_protected
+            << ",\"submitted_protected\":" << live.submission_context.submitted_protected
+            << ",\"protection_query_hresult\":" << live.submission_context.protection_query
+            << ",\"rejection\":\"" << live.submission_context.rejection << "\"}"
+            << ",\"slots\":[";
+        bool slot_separator = false;
+        for (const auto& f : live.ring) {
+            if (!f.busy) continue;
+            if (slot_separator) out << ',';
+            slot_separator = true;
+            out << "{\"sequence\":" << f.sequence << ",\"age_ms\":" << GetTickCount64() - f.captured_ms
+                << ",\"thread\":" << f.thread << ",\"context\":\"" << reinterpret_cast<std::uintptr_t>(f.context.Get())
+                << "\",\"closed\":" << f.closed << ",\"queries_started\":" << f.queries_started
+                << ",\"close_requested\":" << f.close_requested
+                << ",\"pipelined\":" << f.pipelined
+                << ",\"protected_context\":" << f.protected_context
+                << ",\"invalid\":" << f.invalid << ",\"gpu12\":" << f.gpu12_used
+                << ",\"evaluations\":" << f.evaluations << ",\"submits\":" << f.submits << '}';
+        }
+        out << "]}";
+    }
     out << ",\"marker_mode\":\"pattern5x5\",\"pattern_min_score\":0.90,\"pattern_min_gap\":0.15";
     out
         // View identities are pointers; strings preserve all bits through Lua.

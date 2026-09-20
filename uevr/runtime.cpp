@@ -153,7 +153,10 @@ std::string snapshot_locked(State& s) {
             << ",\"delta_x\":" << v.crop_delta_x << ",\"delta_y\":" << v.crop_delta_y
             << ",\"mapped\":" << v.resource_mapped << ",\"packed\":" << v.packed_stereo_mapping
             << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping
-            << ",\"marker\":" << v.marker_mapping << '}';
+            << ",\"marker\":" << v.marker_mapping
+            << ",\"submitted_projection\":" << v.submitted_projection
+            << ",\"fov_tangents\":[" << v.fov_tangents[0] << ',' << v.fov_tangents[1]
+            << ',' << v.fov_tangents[2] << ',' << v.fov_tangents[3] << "]}";
     }
     out << "]},\"nr\":\"" << json_escape(dlss_nr_state_name(nr.state)) << "\",\"nr_details\":{"
         << "\"route\":\"" << json_escape(dlss_nr_route_name(nr.route)) << "\",\"candidates\":" << nr.candidate_calls

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Release"
+    [string]$Configuration = "Release",
+    [switch]$SkipTests
 )
 
 Set-StrictMode -Version Latest
@@ -54,6 +55,11 @@ $toolset = if ($availableToolsets -contains "v143") {
     "/p:PlatformToolset=$toolset"
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."
+}
+
+if ($SkipTests) {
+    Write-Host "Build completed. Test execution skipped."
+    return
 }
 
 & (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe")

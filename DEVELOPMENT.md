@@ -17,6 +17,9 @@ implicitly. Use `-Configuration Debug` for a debug build. The solution also
 supports Visual Studio and CMake 3.24 or newer. The standalone proxy requires
 the x64 MASM tools included with the Visual C++ workload.
 
+Use `./scripts/build.ps1 -Configuration Release -SkipTests` to build without
+running the tests (test executables are still compiled).
+
 ## Tests
 
 The native suites exercise GPU processing, eye calibration, the OpenXR layer, UEVR host lifecycle and late NGX/Streamline attachment using local fixtures. They do not launch games or evaluate NVIDIA DLSS.
