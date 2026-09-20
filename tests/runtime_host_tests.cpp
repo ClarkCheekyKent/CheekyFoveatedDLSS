@@ -39,7 +39,7 @@ double field(const std::string& text, const char* name) {
 }
 void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn get,
     std::uint64_t attachment, ID3D11Device* device, ID3D11DeviceContext* context, HMODULE ngx,
-    const std::filesystem::path& log_path,bool depth24=false,bool backpressure=false) {
+    const std::filesystem::path& log_path,bool depth24=false,bool backpressure=false,bool init_failure=false) {
     using namespace cheeky::foveated_dlss;
     using Init = NgxResult (*)(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned);
     using Create = NgxResult (*)(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle**);
@@ -49,10 +49,14 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     require(contains(snapshot(get), "\"direct_detour\":true"), "NGX detours installed for transport fixture");
     require(ngx_succeeded(proc<Init>(ngx, "NVSDK_NGX_D3D11_Init")(42, L".", device, nullptr, 1)), "Record DX11 initialization for private transport");
     // Standalone/ASI runtime DLLs are nested away from the game's DLSS DLL.
-    // The snippet must receive an explicit feature path when Init was recovered
+    // The core must receive an explicit feature path when Init was recovered
     // or the game's Init supplied no FeatureCommonInfo.
-    proc<void(*)(bool)>(ngx, "CheekyFakeRequireFeaturePath")(true);
     const auto core_runtime = GetModuleHandleW(L"_nvngx.dll");
+    proc<void(*)(bool)>(core_runtime, "CheekyFakeRequireFeaturePath")(true);
+    // Real SR rejects direct Init_Ext callers outside core NGX. The synthetic
+    // core does not forward Init, so this rejects the incorrect direct route.
+    proc<void(*)(bool)>(ngx, "CheekyFakeFailInitialization")(true);
+    if (init_failure) proc<void(*)(bool)>(core_runtime, "CheekyFakeFailInitialization")(true);
     // A game/VR core hook may reject private-device evaluations. Transport
     // must use the snippet lifecycle even when all core callbacks exist.
     proc<void(*)(bool)>(core_runtime, "CheekyFakeFailEvaluations")(true);
@@ -61,6 +65,17 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     parameters.Set("OutWidth", 256U); parameters.Set("OutHeight", 256U);
     parameters.Set("DLSS.Feature.Create.Flags", 2U); parameters.Set("PerfQualityValue", 2U);
     parameters.Set("MV.Scale.X", 1.F); parameters.Set("MV.Scale.Y", 1.F);
+    if (init_failure) {
+        // Native DX11 fallback restores absent optional fields as zero. Seed
+        // their defaults so exact map equality also checks their restoration.
+        for (const char* key : {"DLSS.Render.Subrect.Dimensions.Width", "DLSS.Render.Subrect.Dimensions.Height",
+                "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+                "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y",
+                "DLSS.Input.MV.Subrect.Base.X", "DLSS.Input.MV.Subrect.Base.Y",
+                "DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y"}) parameters.Set(key, 0U);
+        parameters.Set("DLSS.Enable.Output.Subrects", 0);
+        parameters.Set("Reset", 0);
+    }
     const char* names[]{"Color", "Depth", "MotionVectors", "Output"};
     std::array<ComPtr<ID3D11Texture2D>, 4> textures;
     for (unsigned i = 0; i < textures.size(); ++i) {
@@ -86,6 +101,21 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     const auto release = proc<Release>(ngx, "NVSDK_NGX_D3D11_ReleaseFeature");
     const auto original_parameters = parameters.values;
     require(command(attachment, "1\n20\nset\nEnabled=true\nWidth=0.63\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nD3D11D3D12Transport=true\nNrEnabled=false"), "Enable standalone DX11 transport");
+    if (init_failure) {
+        const auto attempts = proc<unsigned(*)()>(core_runtime, "CheekyFakeInitializations");
+        require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "Failed initialization falls back to DX11");
+        require(parameters.values == original_parameters, "Initial fallback preserves game parameters");
+        require(attempts() == 1, "Exercise a real private initialization failure");
+        const auto began = GetTickCount64();
+        for (unsigned i = 0; i < 20; ++i) {
+            require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "Native frames continue during retry cooldown");
+            require(parameters.values == original_parameters, "Failed initialization preserves game parameters");
+        }
+        require(GetTickCount64() - began < 5000 && attempts() == 1,
+            "Failed initialization is not repeated on each frame");
+        proc<void(*)(bool)>(core_runtime, "CheekyFakeFailInitialization")(false);
+        Sleep(5100);
+    }
     bool active{};
     for (unsigned i = 0; i < 100 && !active; ++i) {
         if(depth24)parameters.values=original_parameters;
@@ -97,6 +127,9 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     }
     if (!active) puts(snapshot(get).c_str());
     require(active, "Actual private DX12 transport executes from generic DX11 host");
+    require(proc<unsigned(*)()>(core_runtime, "CheekyFakeInitializations")() == (init_failure ? 2U : 1U) &&
+        proc<unsigned(*)()>(ngx, "CheekyFakeInitializations")() == 0,
+        "Transport initializes through core and recovers after a deferred retry");
     require(proc<unsigned(*)()>(core_runtime, "CheekyFakeCreates")() == 0 &&
         proc<unsigned(*)()>(core_runtime, "CheekyFakeEvaluates")() == 0,
         "Private transport SR must bypass the game's core feature hooks");
@@ -220,6 +253,19 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
         }
         return counts;
     };
+    // BG3 also crashes with NR disabled: the first private peripheral SR
+    // evaluation enters the game's core DX12 hook. Exercise both SR features
+    // while the fake core evaluator remains deliberately unusable.
+    require(command(attachment, "1\n29\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=false"),
+        "Enable peripheral DLAA without NR");
+    const auto sr_evaluations = proc<unsigned(*)()>(ngx, "CheekyFakeEvaluates")();
+    frames(false);
+    require(contains(snapshot(get), "\"execution_path\":\"DX12 Transport\"") &&
+        proc<unsigned(*)()>(ngx, "CheekyFakeEvaluates")() >= sr_evaluations + 12,
+        "Center SR and peripheral DLAA both evaluate through the snippet without NR");
+    require(proc<unsigned(*)()>(core_runtime, "CheekyFakeCreates")() == 0 &&
+        proc<unsigned(*)()>(core_runtime, "CheekyFakeEvaluates")() == 0,
+        "Peripheral DLAA must bypass the game's core feature hooks");
     require(command(attachment, "1\n24\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=true\nNrFoveated=true\nNrProcessingOrder=0\nNrWidth=0.5"), "Prepare NR resize");
     frames();
     const auto before_resize = allocations();
@@ -257,7 +303,7 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
 
 int main(int argc, char** argv) {
     try {
-        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{},backpressure{};
+        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{},backpressure{},init_failure{};
         unsigned openvr_version{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -265,6 +311,7 @@ int main(int argc, char** argv) {
             else if (arg == "--conflict") conflict = true;
             else if (arg == "--optiscaler") optiscaler = true;
             else if (arg == "--transport") { transport = true; dx11 = true; }
+            else if (arg == "--transport-init-failure") { transport = dx11 = init_failure = true; }
             else if (arg == "--transport-depth24") { transport = dx11 = depth24 = true; }
             else if (arg == "--transport-backpressure") { transport = dx11 = backpressure = true; }
             else if (arg == "--transport-forwarded") { transport = true; dx11 = true; forwarded_transport = true; }
@@ -420,7 +467,7 @@ int main(int argc, char** argv) {
             require(contains(snapshot(get), "\"D3D11D3D12Transport\":true"), "Transport preference retained");
         }
         if (transport) verify_transport(command, get, attachment, device11.Get(), context11.Get(), fake_ngx,
-            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24,backpressure);
+            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24,backpressure,init_failure);
         if(depth24 || backpressure){detach(attachment);return 0;}
         CheekyUEVRStereoProjection projection;
         require(!publish_stereo(attachment, &projection) && !publish_mode(attachment, 3), "UEVR-only publications reject generic host attachments");

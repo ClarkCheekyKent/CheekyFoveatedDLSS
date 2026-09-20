@@ -16,6 +16,11 @@ initializes VR on the game's behalf.
 The transport fixture rejects private NGX initialization without an explicit
 search path containing its DLSS library. This covers the nested standalone/ASI
 layout that previously failed real NVIDIA feature creation with `0xBAD0000B`.
+Initialization must use the NGX core while private SR feature calls use the
+snippet, bypassing game core feature hooks. The fixture rejects direct snippet
+initialization and core feature evaluation. `--transport-init-failure` also
+checks that rejected initialization falls back without retrying every frame,
+then recovers after the five-second retry cooldown.
 `--transport-forwarded` exercises the core-to-public DLSS call chain as well:
 private create/evaluate/release calls must bypass game-frame processing to
 avoid recursively locking the backend during the first evaluation.

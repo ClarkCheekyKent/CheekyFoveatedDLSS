@@ -21,6 +21,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -259,6 +260,7 @@ struct TransportDevice {
     NgxD3D12Shutdown1Fn shutdown{};
     bool ngx_initialized{};
     bool format_support_logged{};
+    ULONGLONG initialization_retry_after{};
 };
 
 std::deque<TransportDevice> transport_devices;
@@ -775,13 +777,33 @@ void trace_format_support(
     ID3D11Device* const device11,
     const D3D11TransportNgx& ngx
 ) noexcept {
+    TransportDevice* entry{};
     for (auto& device : transport_devices) {
-        if (device.device11 == device11) return &device;
+        if (device.device11 != device11) continue;
+        if (device.ngx_initialized) return &device;
+        if (GetTickCount64() < device.initialization_retry_after) return nullptr;
+        entry = &device;
+        break;
+    }
+    if (!entry) {
+        transport_devices.emplace_back();
+        entry = &transport_devices.back();
+        // Retain identity across failures so a recycled COM address cannot
+        // inherit another device's retry deadline.
+        entry->device11 = device11;
+        device11->AddRef();
     }
     TransportDevice created{};
-    if (!create_transport_device(device11, ngx, created)) return nullptr;
-    transport_devices.push_back(created);
-    return &transport_devices.back();
+    if (!create_transport_device(device11, ngx, created)) {
+        // Device/NGX initialization can take tens of milliseconds. Retrying
+        // every frame makes even the native DX11 fallback unusably slow.
+        entry->initialization_retry_after = GetTickCount64() + 5000ULL;
+        trace_event("Private DX12 transport initialization failed; retry deferred for 5 seconds");
+        return nullptr;
+    }
+    release(entry->device11);
+    *entry = std::move(created);
+    return entry;
 }
 
 [[nodiscard]] TransportView* find_or_create_view(

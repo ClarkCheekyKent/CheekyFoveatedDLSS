@@ -25,6 +25,8 @@ Release12 forward_release{};
 bool fail_evaluation{};
 bool copy_nr_color{};
 bool require_feature_path{};
+bool fail_initialization{};
+std::atomic<unsigned> initializations{};
 unsigned fail_next{};
 NgxResult evaluate(const NgxHandle* handle, const NgxParameters* params) {
     ++evaluates;
@@ -53,6 +55,8 @@ EXPORT void CheekyFakeObserveCreated(Observe callback) { observe_created = callb
 EXPORT void CheekyFakeFailEvaluations(bool fail) { fail_evaluation = fail; }
 EXPORT void CheekyFakeCopyNrColor(bool enabled) { copy_nr_color = enabled; }
 EXPORT void CheekyFakeRequireFeaturePath(bool enabled) { require_feature_path = enabled; }
+EXPORT void CheekyFakeFailInitialization(bool fail) { fail_initialization = fail; }
+EXPORT unsigned CheekyFakeInitializations() { return initializations.load(); }
 EXPORT void CheekyFakeFailNextEvaluations(unsigned count) { fail_next = count; }
 // A separately loaded copy acts as the core runtime and deliberately wraps the
 // lower handle. Cache these addresses before Cheeky installs its real detours.
@@ -70,6 +74,8 @@ EXPORT void* CheekyFakeLastWarpParameters() { return last_warp_parameters; }
 EXPORT unsigned CheekyFakeWarpCalls() { return warp_calls; }
 // The hook harness loads a second copy as its optional feature-18 runtime.
 EXPORT NgxResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID3D12Device*, unsigned, const void* common) {
+    ++initializations;
+    if (fail_initialization) return 0xBAD00002U;
     if (require_feature_path) {
         const auto* info = static_cast<const NgxFeatureCommonInfo*>(common);
         bool found{};

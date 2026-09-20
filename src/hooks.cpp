@@ -3719,8 +3719,9 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
     // Transport owns a private device and private feature handles. A core
     // trampoline can still chain into a game's VR hook (RealVR hooks the core
     // DX12 evaluator even in DX11 games). Its game-device state is not valid
-    // for this private device. Use the SR snippet's own complete lifecycle;
-    // never create a core handle and pass it to a snippet evaluator.
+    // for this private device. Create/evaluate/release handles in the SR
+    // snippet; never mix a core handle with a snippet evaluator. Initialization
+    // still goes through core: SR's Init_Ext validates its caller as NGX.
     static std::mutex selection_mutex;
     static D3D11TransportNgx selected{};
     std::lock_guard lock(selection_mutex);
@@ -3734,9 +3735,9 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
 
     D3D11TransportNgx ngx{};
     ngx.init_ext = reinterpret_cast<NgxD3D12InitExtFn>(
-        get_proc(public_runtime, "NVSDK_NGX_D3D12_Init_Ext"));
-    // Parameter allocation is a core service; the feature lifecycle below
-    // belongs entirely to the snippet initialized on the transport device.
+        get_proc(core_runtime, "NVSDK_NGX_D3D12_Init_Ext"));
+    // Core initializes the snippet on our device and supplies parameters.
+    // Feature handles and their evaluation remain entirely in the snippet.
     ngx.allocate_parameters = reinterpret_cast<NgxD3D12AllocateParametersFn>(
         get_proc(core_runtime, "NVSDK_NGX_D3D12_AllocateParameters"));
     ngx.backend = {
@@ -3757,9 +3758,9 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
     HMODULE retained{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(public_runtime), &retained) || retained != public_runtime) return {};
-    ngx.runtime_module = retained;
+    ngx.runtime_module = core_runtime;
     selected = ngx;
-    trace_event("Private DX12 transport uses SR snippet lifecycle module=%p (core game hooks bypassed)", retained);
+    trace_event("Private DX12 transport uses core initialization module=%p and SR snippet feature callbacks module=%p", core_runtime, retained);
     return selected;
 }
 
