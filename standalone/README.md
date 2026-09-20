@@ -1,7 +1,7 @@
 # Cheeky standalone and OptiScaler integration
 
 These two packages use Cheeky's shared processing runtime and desktop settings
-overlay. The standalone package loads through `dxgi.dll`; the OptiScaler package
+overlay. The standalone package offers `dxgi.dll` and `version.dll` loaders; the OptiScaler package
 loads as an ASI plugin through an existing OptiScaler installation. Neither needs
 ReShade or the Cheeky UEVR plugin.
 
@@ -16,7 +16,13 @@ readback; actual NVIDIA inference and headset behavior still need game testing.
 
 1. Exit the game. Locate the directory containing the executable that renders
    the game (often `<game>\Binaries\Win64` in Unreal games).
-2. Extract the **Standalone** package there, preserving this layout:
+2. Copy the `CheekyFoveatedDLSS` folder and **one** loader from the Standalone ZIP:
+   - `dxgi.dll`: default choice; also supports another mod as `dxgi2.dll`.
+   - `version.dll`: use when another mod must keep its own `dxgi.dll`, or when
+     the game's loading path needs this alternative. Keep the other mod unchanged.
+
+   Do not copy both Cheeky loaders or rename one to the other's filename.
+   Example using the DXGI loader:
 
    ```text
    Game.exe
@@ -28,9 +34,9 @@ readback; actual NVIDIA inference and headset behavior still need game testing.
 
 3. Start the game with its D3D11 or D3D12 renderer and enable DLSS.
 
-**If `dxgi.dll` already exists, do not overwrite it.** For an OptiScaler install,
-use the ASI package below. For another DXGI mod, see optional chaining below.
-A game that bypasses the local `dxgi.dll` will not load this package.
+**Do not overwrite another mod's loader.** Both choices use the same shared
+folder and F8 controls. The game must load the selected local DLL for Cheeky to
+start. For OptiScaler, use the ASI package below.
 
 ### Optional second DXGI mod
 
@@ -145,14 +151,15 @@ it does not require the OpenXR layer.
 
 ## Loader behavior and current limits
 
-- All 20 named exports and their ordinals from the tested Windows DXGI library
-  are forwarded through optional `dxgi2.dll`, with the absolute System32 DXGI
-  path as fallback. A missing Cheeky host does not disable DXGI forwarding.
+- The DXGI loader forwards the five public entry points described above through
+  optional `dxgi2.dll`; the other exports use System32 DXGI. The VERSION loader
+  forwards all 17 exports to System32 VERSION and does not load `dxgi2.dll`.
+  A missing Cheeky host does not disable system function forwarding.
 - Cheeky host loading and graphics initialization run on a separate worker. Successful
   standalone factory creation waits up to ten seconds for this startup to
   finish before returning the factory to the game. Recursive factory creation
   by the host bypasses that wait. Failed DXGI calls retain their original error.
-- ASI startup is asynchronous and duplicate `InitializeASI` calls are harmless.
+- VERSION and ASI startup are asynchronous; duplicate `InitializeASI` calls are harmless.
   A D3D12 swap chain created before the host hooks are ready may not provide a
   usable presentation queue. In that case, restart with normal early ASI
   loading; the host must observe a supported swap-chain creation path.
@@ -165,8 +172,8 @@ it does not require the OpenXR layer.
 
 ## Uninstall or update
 
-Exit the game first. Remove the **Cheeky** loader you installed (`dxgi.dll` only
-if it is Cheeky's, or `CheekyFoveatedDLSS.asi`) and its sibling
+Exit the game first. Remove the **Cheeky** loader you installed (`dxgi.dll`,
+`version.dll`, or `CheekyFoveatedDLSS.asi`, only if it is Cheeky's) and its sibling
 `CheekyFoveatedDLSS` directory. Keep that directory's INI if you want your settings
 for a later install. Leave OptiScaler's loader and configuration in place.
 

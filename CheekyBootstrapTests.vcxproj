@@ -7,5 +7,6 @@
     <ClCompile Include="bootstrap\tests.cpp" />
   </ItemGroup>
   <ItemGroup><ProjectReference Include="CheekyBootstrapFakeHost.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833206}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference><ProjectReference Include="CheekyStandaloneProxy.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833202}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference><ProjectReference Include="CheekyOptiScaler.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833203}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <ItemGroup><ProjectReference Include="CheekyVersionProxy.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833212}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

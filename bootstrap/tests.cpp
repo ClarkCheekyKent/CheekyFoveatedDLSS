@@ -38,7 +38,7 @@ void check_exports(HMODULE proxy, HMODULE system) {
         require(named != nullptr, name);
         require(named == GetProcAddress(proxy, MAKEINTRESOURCEA(ordinal)), "DXGI ordinal differs from system");
     }
-    std::printf("Verified %lu system DXGI exports and ordinals\n", exports->NumberOfNames);
+    std::printf("Verified %lu system exports and ordinals\n", exports->NumberOfNames);
 }
 
 void check_factories(HMODULE proxy, HMODULE system) {
@@ -80,8 +80,9 @@ void check_debug_forward(HMODULE proxy, HMODULE system) {
 
 int wmain(int argc, wchar_t** argv) {
     try {
-        require(argc == 5 || argc == 6, "Usage: bootstrap-tests proxy|asi|missing|chain|broken-chain|loop-chain <proxy.dll> <plugin.asi> <fake-host.dll> [external-chain.dll]");
+        require(argc == 5 || argc == 6, "Usage: bootstrap-tests proxy|version|asi|missing|chain|broken-chain|loop-chain <proxy.dll> <plugin.asi> <fake-host.dll> [external-chain.dll]");
         const bool asi = std::wstring(argv[1]) == L"asi";
+        const bool version = std::wstring(argv[1]) == L"version";
         const bool missing = std::wstring(argv[1]) == L"missing";
         const bool loop_chain = std::wstring(argv[1]) == L"loop-chain";
         const bool device_chain = std::wstring(argv[1]) == L"device-chain";
@@ -94,7 +95,7 @@ int wmain(int argc, wchar_t** argv) {
             (L"bootstrap-fixture-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
         require(!fs::exists(directory), "fixture directory already exists");
         fs::create_directories(directory / L"CheekyFoveatedDLSS");
-        const auto loader_path = directory / (asi ? L"CheekyFoveatedDLSS.asi" : L"dxgi.dll");
+        const auto loader_path = directory / (asi ? L"CheekyFoveatedDLSS.asi" : version ? L"version.dll" : L"dxgi.dll");
         fs::copy_file(argv[asi ? 3 : 2], loader_path);
         const auto host_path = directory / L"CheekyFoveatedDLSS" / L"CheekyFoveatedDLSSHost.dll";
         if (!missing) fs::copy_file(argv[4], host_path);
@@ -119,6 +120,31 @@ int wmain(int argc, wchar_t** argv) {
             for (auto& thread : callers) thread.join();
             require(wait_for_start(status) == 2, "ASI startup failed");
             initialize();
+        } else if (version) {
+            wchar_t path[MAX_PATH]{};
+            require(GetSystemDirectoryW(path, ARRAYSIZE(path)) != 0, "system path");
+            const auto system = LoadLibraryExW((fs::path(path) / L"version.dll").c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            require(system != nullptr, "system VERSION");
+            check_exports(loader, system);
+            const auto file = (fs::path(path) / L"kernel32.dll").wstring();
+            using Size = decltype(&GetFileVersionInfoSizeW);
+            using Info = decltype(&GetFileVersionInfoExW);
+            using Query = decltype(&VerQueryValueW);
+            const auto size = reinterpret_cast<Size>(GetProcAddress(loader, "GetFileVersionInfoSizeW"));
+            const auto info = reinterpret_cast<Info>(GetProcAddress(loader, "GetFileVersionInfoExW"));
+            const auto query = reinterpret_cast<Query>(GetProcAddress(loader, "VerQueryValueW"));
+            DWORD ignored{};
+            const auto bytes = size(file.c_str(), &ignored);
+            require(bytes && bytes == reinterpret_cast<Size>(GetProcAddress(system, "GetFileVersionInfoSizeW"))(file.c_str(), &ignored), "VERSION size forwarding");
+            std::vector<char> actual(bytes), expected(bytes);
+            for (unsigned pass = 0; pass < 2; ++pass) {
+                require(info(FILE_VER_GET_LOCALISED, file.c_str(), 0, bytes, actual.data()), "VERSION five-argument forwarding");
+                require(reinterpret_cast<Info>(GetProcAddress(system, "GetFileVersionInfoExW"))(FILE_VER_GET_LOCALISED, file.c_str(), 0, bytes, expected.data()), "System version info");
+                void* a{}; void* b{}; UINT an{}, bn{};
+                require(query(actual.data(), L"\\", &a, &an) && reinterpret_cast<Query>(GetProcAddress(system, "VerQueryValueW"))(expected.data(), L"\\", &b, &bn), "VERSION query forwarding");
+                require(an == bn && !memcmp(a, b, an), "Forwarded version data matches Windows");
+            }
+            require(wait_for_start(status) == 2, "VERSION host startup");
         } else {
             wchar_t path[MAX_PATH]{};
             require(GetSystemDirectoryW(path, ARRAYSIZE(path)) != 0, "system path");

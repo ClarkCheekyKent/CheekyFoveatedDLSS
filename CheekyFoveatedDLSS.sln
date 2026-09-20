@@ -46,12 +46,18 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyFakeCoreProxy", "Chee
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyVulkanLayer", "CheekyVulkanLayer.vcxproj", "{BE211A7D-6524-4FBD-A391-6B3FC631F310}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CheekyVersionProxy", "CheekyVersionProxy.vcxproj", "{514AE60D-49DA-46DE-8541-4A8F45833212}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
 		Release|x64 = Release|x64
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{514AE60D-49DA-46DE-8541-4A8F45833212}.Debug|x64.ActiveCfg = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833212}.Debug|x64.Build.0 = Debug|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833212}.Release|x64.ActiveCfg = Release|x64
+		{514AE60D-49DA-46DE-8541-4A8F45833212}.Release|x64.Build.0 = Release|x64
 		{BE211A7D-6524-4FBD-A391-6B3FC631F310}.Debug|x64.ActiveCfg = Debug|x64
 		{BE211A7D-6524-4FBD-A391-6B3FC631F310}.Debug|x64.Build.0 = Debug|x64
 		{BE211A7D-6524-4FBD-A391-6B3FC631F310}.Release|x64.ActiveCfg = Release|x64

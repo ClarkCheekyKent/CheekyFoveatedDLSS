@@ -8,7 +8,7 @@
     <ClCompile Include="bootstrap\dxgi_proxy.cpp" />
   </ItemGroup>
   <ItemGroup><MASM Include="bootstrap\dxgi_exports.asm" /></ItemGroup>
-  <ItemDefinitionGroup><Link><ModuleDefinitionFile>bootstrap\dxgi.def</ModuleDefinitionFile><ImportLibrary>$(IntDir)CheekyStandaloneProxy.lib</ImportLibrary></Link></ItemDefinitionGroup>
+  <ItemDefinitionGroup><MASM><IncludePaths>$(MSBuildProjectDirectory)\bootstrap;%(IncludePaths)</IncludePaths></MASM><Link><ModuleDefinitionFile>bootstrap\dxgi.def</ModuleDefinitionFile><ImportLibrary>$(IntDir)CheekyStandaloneProxy.lib</ImportLibrary></Link></ItemDefinitionGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets"><Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" /></ImportGroup>

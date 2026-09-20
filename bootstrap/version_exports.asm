@@ -1,0 +1,23 @@
+option casemap:none
+EXTERN cheeky_version_targets:QWORD
+EXTERN cheeky_version_resolve:PROC
+.code
+include proxy_forward.inc
+FORWARD cheeky_version_GetFileVersionInfoA, 0, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoByHandle, 1, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoExA, 2, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoExW, 3, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoSizeA, 4, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoSizeExA, 5, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoSizeExW, 6, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoSizeW, 7, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_GetFileVersionInfoW, 8, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerFindFileA, 9, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerFindFileW, 10, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerInstallFileA, 11, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerInstallFileW, 12, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerLanguageNameA, 13, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerLanguageNameW, 14, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerQueryValueA, 15, cheeky_version_targets, cheeky_version_resolve
+FORWARD cheeky_version_VerQueryValueW, 16, cheeky_version_targets, cheeky_version_resolve
+END

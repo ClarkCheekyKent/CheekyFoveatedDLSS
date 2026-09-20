@@ -108,8 +108,9 @@ foreach ($hostKind in @('standalone','optiscaler')) {
     }
 }
 $bootstrapTest = Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapTests.exe"
-foreach ($mode in @('proxy','asi','missing','chain','broken-chain','loop-chain','device-chain')) {
-    & $bootstrapTest $mode (Join-Path $projectRoot "bin\$Configuration\standalone-loader\dxgi.dll") (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.asi") (Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapFakeHost.dll")
+foreach ($mode in @('proxy','version','asi','missing','chain','broken-chain','loop-chain','device-chain')) {
+    $proxyInput = if ($mode -eq 'version') { 'version-loader\version.dll' } else { 'standalone-loader\dxgi.dll' }
+    & $bootstrapTest $mode (Join-Path $projectRoot "bin\$Configuration\$proxyInput") (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.asi") (Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapFakeHost.dll")
     if ($LASTEXITCODE -ne 0) { throw "Bootstrap tests failed: $mode" }
 }
 $overlayTest = Join-Path $projectRoot "bin\$Configuration\CheekyOverlayTests.exe"
@@ -127,6 +128,7 @@ foreach ($mode in @('accept','reject')) {
 
 Write-Host "Built and tested:"
 Write-Host (Join-Path $projectRoot "bin\$Configuration\standalone-loader\dxgi.dll")
+Write-Host (Join-Path $projectRoot "bin\$Configuration\version-loader\version.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.asi")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSHost.dll")
 Write-Host (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.dll")

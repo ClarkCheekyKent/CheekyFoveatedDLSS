@@ -1,0 +1,19 @@
+LIBRARY version
+EXPORTS
+    GetFileVersionInfoA=cheeky_version_GetFileVersionInfoA @1
+    GetFileVersionInfoByHandle=cheeky_version_GetFileVersionInfoByHandle @2
+    GetFileVersionInfoExA=cheeky_version_GetFileVersionInfoExA @3
+    GetFileVersionInfoExW=cheeky_version_GetFileVersionInfoExW @4
+    GetFileVersionInfoSizeA=cheeky_version_GetFileVersionInfoSizeA @5
+    GetFileVersionInfoSizeExA=cheeky_version_GetFileVersionInfoSizeExA @6
+    GetFileVersionInfoSizeExW=cheeky_version_GetFileVersionInfoSizeExW @7
+    GetFileVersionInfoSizeW=cheeky_version_GetFileVersionInfoSizeW @8
+    GetFileVersionInfoW=cheeky_version_GetFileVersionInfoW @9
+    VerFindFileA=cheeky_version_VerFindFileA @10
+    VerFindFileW=cheeky_version_VerFindFileW @11
+    VerInstallFileA=cheeky_version_VerInstallFileA @12
+    VerInstallFileW=cheeky_version_VerInstallFileW @13
+    VerLanguageNameA=cheeky_version_VerLanguageNameA @14
+    VerLanguageNameW=cheeky_version_VerLanguageNameW @15
+    VerQueryValueA=cheeky_version_VerQueryValueA @16
+    VerQueryValueW=cheeky_version_VerQueryValueW @17

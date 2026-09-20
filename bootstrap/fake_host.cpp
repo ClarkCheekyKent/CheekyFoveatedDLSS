@@ -73,6 +73,7 @@ extern "C" __declspec(dllexport) bool CheekyHost_Start(unsigned kind) {
         slash = wcsrchr(path, L'\\'); if (!slash) return false;
         wcscpy_s(slash + 1, ARRAYSIZE(path) - static_cast<size_t>(slash + 1 - path), L"dxgi.dll");
         auto proxy = GetModuleHandleW(path);
+        if (!proxy) proxy = factory_target(); // Non-DXGI bootstrap fixture.
         using FactoryFn = HRESULT (WINAPI*)(REFIID, void**);
         const auto factory = reinterpret_cast<FactoryFn>(GetProcAddress(proxy, "CreateDXGIFactory1"));
         IDXGIFactory1* value{};
