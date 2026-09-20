@@ -125,6 +125,13 @@ configuration field set. D3D11 NR uses the existing D3D12 transport path.
 The overlay renders SDR, scRGB and HDR10 with the game's presentation color
 space; HDR10 alpha blending is approximate.
 
+The **DLSS-SR** tab compares SR on/off FPS, FPS gain (including percent), and
+frame-time change using the same comparison formulas as the add-on. Sample
+both modes for about two seconds each in the same scene; each mode retains its
+last sample. Standalone uses presentation cadence, while the add-on uses
+ReShade's FPS counter. GPU-time savings are a separate comparison. SR and NR
+GPU timings, resolutions, and crop pixel percentages live in their respective tabs.
+
 DLSS-NR is experimental and off by default. Its compatible NVIDIA and Streamline
 runtimes are supplied separately. For these packages, put `nvngx_dlssnr.dll`
 beside the nested `CheekyFoveatedDLSSRuntime.dll` or the game executable; keep Streamline components in
@@ -132,7 +139,8 @@ the locations expected by the game. D3D11 requires **DX12 Transport** for NR.
 See the [NR settings reference](https://github.com/ClarkCheekyKent/CheekyFoveatedDLSS/blob/master/USAGE.md#experimental-dlss-nr-support)
 for tuning and runtime compatibility notes.
 
-If NR does not activate in D3D11, enable `D3D11D3D12Transport` in **All settings**.
+Select `D3D11D3D12Transport` manually in the **DLSS-NR** tab
+or **All settings**. The NR toggle and hotkey do not change the transport setting.
 The private DX12 path explicitly registers the loaded DLSS library's directory
 when the game's NGX initialization paths are unavailable. A log entry such as
 `D3D12 canonical create ... result=0xBAD0000B` means that private DLSS feature

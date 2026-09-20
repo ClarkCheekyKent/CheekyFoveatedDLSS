@@ -120,6 +120,8 @@ foreach ($mode in @('proxy','version','asi','missing','chain','broken-chain','lo
     if ($LASTEXITCODE -ne 0) { throw "Bootstrap tests failed: $mode" }
 }
 $overlayTest = Join-Path $projectRoot "bin\$Configuration\CheekyOverlayTests.exe"
+& $overlayTest --ui
+if ($LASTEXITCODE -ne 0) { throw "Overlay diagnostic UI tests failed." }
 foreach ($api in @('dx11','dx12')) {
     foreach ($color in @('sdr','scrgb','hdr10')) {
         & $overlayTest "--$api" "--$color"

@@ -49,9 +49,13 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     require(contains(snapshot(get), "\"direct_detour\":true"), "NGX detours installed for transport fixture");
     require(ngx_succeeded(proc<Init>(ngx, "NVSDK_NGX_D3D11_Init")(42, L".", device, nullptr, 1)), "Record DX11 initialization for private transport");
     // Standalone/ASI runtime DLLs are nested away from the game's DLSS DLL.
-    // The core must receive an explicit feature path when Init was recovered
+    // The snippet must receive an explicit feature path when Init was recovered
     // or the game's Init supplied no FeatureCommonInfo.
-    proc<void(*)(bool)>(GetModuleHandleW(L"_nvngx.dll"), "CheekyFakeRequireFeaturePath")(true);
+    proc<void(*)(bool)>(ngx, "CheekyFakeRequireFeaturePath")(true);
+    const auto core_runtime = GetModuleHandleW(L"_nvngx.dll");
+    // A game/VR core hook may reject private-device evaluations. Transport
+    // must use the snippet lifecycle even when all core callbacks exist.
+    proc<void(*)(bool)>(core_runtime, "CheekyFakeFailEvaluations")(true);
     MockNgxParameters parameters;
     parameters.Set("Width", 128U); parameters.Set("Height", 128U);
     parameters.Set("OutWidth", 256U); parameters.Set("OutHeight", 256U);
@@ -93,6 +97,9 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     }
     if (!active) puts(snapshot(get).c_str());
     require(active, "Actual private DX12 transport executes from generic DX11 host");
+    require(proc<unsigned(*)()>(core_runtime, "CheekyFakeCreates")() == 0 &&
+        proc<unsigned(*)()>(core_runtime, "CheekyFakeEvaluates")() == 0,
+        "Private transport SR must bypass the game's core feature hooks");
     if (backpressure) {
         // Hold GPU work behind a CPU-signaled fence, filling all three slots.
         // The fourth evaluation must wait for a slot, not silently omit NR.

@@ -18,6 +18,7 @@ struct EyeCalibrationStats {
         gpu_samples{};
     unsigned in_flight{};
     double cpu_us_per_frame{}, max_cpu_call_us{}, gpu_us{}, max_gpu_us{}, latency_frames{};
+    const char* gpu_timing_status{"Waiting for a complete GPU timestamp sample"};
     std::uint64_t left_view{}, right_view{};
     std::uint64_t corrections{}, applied{};
     bool correction_active{};

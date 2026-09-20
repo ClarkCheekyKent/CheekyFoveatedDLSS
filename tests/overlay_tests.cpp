@@ -1,4 +1,5 @@
 #include "overlay.hpp"
+#include "overlay_ui.hpp"
 #include "settings_io.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -33,6 +35,114 @@ bool cheeky_overlay_test_foreground(HWND window) { return window && window == te
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 void check(HRESULT value, const char* message) { require(SUCCEEDED(value), message); }
+
+// Exercise the real tab renderer with snapshots, including nested API/eye
+// objects. This catches incorrect JSON-member selection and misleading status
+// warnings without depending on a headset or a particular GPU timing sample.
+void test_ui_diagnostics() {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    auto* context = ImGui::CreateContext();
+    auto& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2(800, 900);
+    unsigned char* pixels{}; int width{}, height{};
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    OverlayUiState state;
+    state.draft.center_mode = FoveationCenterMode::openxr_gaze;
+    const OverlayRuntime runtime{};
+    auto render = [&](const char* tab, bool expand_details = true) {
+        if (context->TabBars.GetAliveCount()) {
+            auto* bar = context->TabBars.GetByIndex(0);
+            for (auto& item : bar->Tabs)
+                if (std::strcmp(ImGui::TabBarGetTabName(bar, &item), tab) == 0) ImGui::TabBarQueueFocus(bar, &item);
+        }
+        bool open = true;
+        ImGui::NewFrame();
+        ImGui::Begin("Diagnostic capture");
+        ImGui::LogToBuffer(expand_details ? 8 : 0);
+        draw_overlay_ui(state, runtime, "D3D12", "Ready", open);
+        const std::string text = context->LogBuffer.c_str();
+        ImGui::LogFinish();
+        ImGui::End();
+        ImGui::Render();
+        return text;
+    };
+    state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":0}})";
+    render("Stereo / Gaze"); render("Stereo / Gaze");
+    auto text = render("Stereo / Gaze");
+    auto* bar = context->TabBars.GetByIndex(0);
+    require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "Stereo / Gaze") == 0, "Stereo / Gaze should be the first tab");
+    require(bar->Tabs.Size == 5, "Performance should live inside the SR and NR tabs");
+    require(text.find("no active OpenXR layer") != text.npos, "Missing gaze adapter warning");
+    require(text.find("manual fallback placement") != text.npos, "Missing stereo fallback warning");
+    state.draft.center_mode = FoveationCenterMode::fixed;
+    state.snapshot = R"({"gaze":{"layer":false,"views":1,"alignment":0}})";
+    require(render("Stereo / Gaze").find("manual fallback placement") == std::string::npos, "Flat games do not require stereo alignment");
+    state.draft.center_mode = FoveationCenterMode::openxr_gaze;
+    state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":1}})";
+    text = render("Stereo / Gaze");
+    require(text.find("manual fallback placement") == text.npos, "Streamline alignment does not need eye tracking");
+    state.snapshot = R"({"gaze":{"layer":true,"abi":false,"views":2,"alignment":0}})";
+    require(render("Stereo / Gaze").find("update the OpenXR layer") != std::string::npos, "ABI mismatch warning");
+    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"views":2,"alignment":2,"status_flags":12}})";
+    require(render("Stereo / Gaze").find("No valid eye-tracking signal") != std::string::npos, "Invalid gaze signal warning");
+    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"views":2,"alignment":2,"status_flags":108,"using_gaze":false,"ambiguous":true}})";
+    require(render("Stereo / Gaze").find("Eye mapping is ambiguous") != std::string::npos, "Ambiguous eye mapping warning");
+    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"views":2,"alignment":3,"status_flags":108,"using_gaze":true},
+        "frame":{"present_ms":10,"sr_enabled_ms":10,"sr_disabled_ms":12},
+        "apis":[{"evaluations":0},{"evaluations":10,"state":"Active","native_ms":2,"foveated_ms":1.25,"nr_full_ms":3,
+            "motion_width":2000,"motion_height":1600,"motion_space":"Output-resolution",
+            "crop":{"input_width":500,"input_height":400},"input_width":1000,"input_height":800}],
+        "nr_details":{"result":1,"output_width":2000,"output_height":1600,"processing_width":2000,"processing_height":1600,
+            "region_width":1000,"region_height":800,"region_x":100,"region_y":200},
+        "eye_calibration":{"enabled":true,"backend":"OpenVR","graphics_api":12,"status":"Ready, {mapped}",
+            "corrections":7,"applied":9,"gpu_samples":2,"gpu_us":12.5,"left_view":"18446744073709551614","right_view":"42"}})";
+    text = render("Stereo / Gaze");
+    require(text.find("fixed fallback") == text.npos && text.find("manual fallback placement") == text.npos, "Healthy tracking reported as fallback");
+    require(text.find("Eye Tracking Ready: Yes") != text.npos, "Visible eye tracking readiness missing");
+    require(text.find("Eye tracking details") == text.npos && text.find("Corrections applied") == text.npos, "Tracking details belong in Diagnostics");
+    render("DLSS-SR"); text = render("DLSS-SR");
+    require(text.find("Full DLSS call: 2.000 ms") != text.npos, "GPU timing from the second API object");
+    require(text.find("Foveated FPS gain: +16.7 FPS (+20.0%)") != text.npos, "FPS gain must use the non-foveated FPS baseline");
+    require(text.find("Frame-time change: -2.00 ms (-16.7%)") != text.npos, "Frame-time change must use the non-foveated frame time baseline");
+    require(text.find("Foveated savings: 0.750 ms (37.5%)") != text.npos, "GPU savings must remain separate from FPS gain");
+    require(text.find("DLSS input: 1000 x 800") != text.npos, "Nested crop dimensions leaked into input dimensions");
+    require(text.find("Center input: 500 x 400 (25.0% of original) at 0,0") != text.npos, "Crop pixel percentage and origin missing");
+    require(text.find("Peripheral DLAA: Enabled (auto MV conversion)") != text.npos, "Motion-vector compatibility status missing");
+    require(text.find("Full DLSS-NR call") == text.npos, "NR timings should not appear in SR");
+    render("DLSS-NR"); text = render("DLSS-NR");
+    require(text.find("Full DLSS-NR call: 3.000 ms") != text.npos, "NR timings belong in NR");
+    require(text.find("DLSS-NR region: 1000 x 800 (25.0% of original) at 100,200") != text.npos, "NR region comparison missing");
+    require(text.find("Last NGX result: 0x00000001") != text.npos, "NR result missing");
+    render("Diagnostics", false); text = render("Diagnostics", false);
+    require(text.find("Eye tracking details") != text.npos && text.find("Eye calibration diagnostics") != text.npos, "Diagnostic groups missing");
+    require(text.find("Corrections applied") == text.npos && text.find("Sample age") == text.npos, "Detailed diagnostics should start collapsed");
+    render("Diagnostics"); text = render("Diagnostics");
+    require(text.find("Corrections applied: 7") != text.npos, "Calibration counters missing");
+    require(text.find("Ready, {mapped}") != text.npos, "Quoted diagnostic braces parsed as structure");
+    require(text.find("18446744073709551614") != text.npos, "Calibration view identity lost integer precision");
+    // Cover slower/equal modes and incomplete baselines without inventing a
+    // percentage or confusing percentage FPS gain with frame-time savings.
+    for (const auto& sample : {std::pair{
+            R"({"frame":{"sr_disabled_ms":10,"sr_enabled_ms":12}})",
+            "Foveated FPS gain: -16.7 FPS (-16.7%)"},
+            {R"({"frame":{"sr_disabled_ms":10,"sr_enabled_ms":10}})", "Foveated FPS gain: +0.0 FPS (+0.0%)"},
+            {R"({"frame":{"sr_disabled_ms":0,"sr_enabled_ms":10}})", "Foveated FPS gain: Not sampled yet"},
+            {R"({"frame":{"sr_disabled_ms":10,"sr_enabled_ms":0}})", "Foveated FPS gain: Not sampled yet"},
+            {R"({"frame":{}})", "Foveated FPS gain: Not sampled yet"}}) {
+        state.snapshot = sample.first;
+        render("DLSS-SR"); text = render("DLSS-SR");
+        require(text.find(sample.second) != text.npos, "Incorrect SR on/off comparison for slower, equal or unsampled frames");
+    }
+    state.draft.enabled = false;
+    state.draft.nr_enabled = false;
+    state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":0}})";
+    require(render("Stereo / Gaze").find("no active OpenXR layer") == std::string::npos, "Inactive features should not report tracking failure");
+    state.draft.nr_enabled = true;
+    require(render("Stereo / Gaze").find("no active OpenXR layer") != std::string::npos, "NR-only foveation still requires tracking warnings");
+    ImGui::DestroyContext(context);
+    std::puts("PASS: overlay snapshot parsing, GPU diagnostics, calibration and gaze/alignment warnings");
+}
 unsigned snapshots{}, game_keys{}, game_button_down{}, game_button_up{};
 unsigned game_pointer_messages{};
 bool pointer_checkbox{};
@@ -276,6 +386,7 @@ int main(int argc, char** argv) {
     if(argc==2 && std::strcmp(argv[1],"--vulkan-layer")==0)return run_vulkan_overlay_tests(true);
     if(argc==2 && std::strcmp(argv[1],"--vulkan")==0)return run_vulkan_overlay_tests();
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--ui") == 0) { test_ui_diagnostics(); return 0; }
         bool dx11{}, hdr10{}, scrgb{}; std::string capture_path;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]); dx11 |= arg == "--dx11"; hdr10 |= arg == "--hdr10"; scrgb |= arg == "--scrgb";

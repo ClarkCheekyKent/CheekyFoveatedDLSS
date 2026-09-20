@@ -3716,39 +3716,51 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
 }
 
 [[nodiscard]] D3D11TransportNgx current_transport_ngx() noexcept {
-    D3D11TransportNgx ngx{};
-    ngx.runtime_module = find_core_runtime();
-    if (ngx.runtime_module != nullptr) {
-        ngx.init_ext = reinterpret_cast<NgxD3D12InitExtFn>(GetProcAddress(
-            ngx.runtime_module, "NVSDK_NGX_D3D12_Init_Ext"
-        ));
-        ngx.allocate_parameters =
-            reinterpret_cast<NgxD3D12AllocateParametersFn>(GetProcAddress(
-                ngx.runtime_module, "NVSDK_NGX_D3D12_AllocateParameters"
-            ));
-        ngx.backend.create_feature = real_core_create_d3d12.load(
-            std::memory_order_acquire
-        );
-        ngx.backend.evaluate_feature = real_core_evaluate_d3d12.load(
-            std::memory_order_acquire
-        );
-        ngx.backend.release_feature = real_core_release_d3d12.load(
-            std::memory_order_acquire
-        );
-        ngx.shutdown = real_core_shutdown_d3d12_1.load(
-            std::memory_order_acquire
-        );
-    }
+    // Transport owns a private device and private feature handles. A core
+    // trampoline can still chain into a game's VR hook (RealVR hooks the core
+    // DX12 evaluator even in DX11 games). Its game-device state is not valid
+    // for this private device. Use the SR snippet's own complete lifecycle;
+    // never create a core handle and pass it to a snippet evaluator.
+    static std::mutex selection_mutex;
+    static D3D11TransportNgx selected{};
+    std::lock_guard lock(selection_mutex);
+    if (selected.runtime_module) return selected;
+
+    const auto core_runtime = find_core_runtime();
     const auto public_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
-    if (public_runtime != nullptr) {
-        ngx.get_application_id = reinterpret_cast<NgxGetApplicationIdFn>(
-            GetProcAddress(public_runtime, "NVSDK_NGX_GetApplicationId")
-        );
-        ngx.get_api_version = reinterpret_cast<NgxGetApiVersionFn>(
-            GetProcAddress(public_runtime, "NVSDK_NGX_GetAPIVersion")
-        );
-    }
-    return ngx;
+    const auto get_proc = real_get_proc_address.load(std::memory_order_acquire);
+    if (!core_runtime || !public_runtime || !get_proc ||
+        !get_proc(public_runtime, "NVSDK_NGX_GetSnippetVersion")) return {};
+
+    D3D11TransportNgx ngx{};
+    ngx.init_ext = reinterpret_cast<NgxD3D12InitExtFn>(
+        get_proc(public_runtime, "NVSDK_NGX_D3D12_Init_Ext"));
+    // Parameter allocation is a core service; the feature lifecycle below
+    // belongs entirely to the snippet initialized on the transport device.
+    ngx.allocate_parameters = reinterpret_cast<NgxD3D12AllocateParametersFn>(
+        get_proc(core_runtime, "NVSDK_NGX_D3D12_AllocateParameters"));
+    ngx.backend = {
+        real_create_d3d12.load(std::memory_order_acquire),
+        real_evaluate_d3d12.load(std::memory_order_acquire),
+        real_release_d3d12.load(std::memory_order_acquire),
+    };
+    ngx.shutdown = real_shutdown_d3d12_1.load(std::memory_order_acquire);
+    ngx.get_application_id = reinterpret_cast<NgxGetApplicationIdFn>(
+        get_proc(public_runtime, "NVSDK_NGX_GetApplicationId"));
+    ngx.get_api_version = reinterpret_cast<NgxGetApiVersionFn>(
+        get_proc(public_runtime, "NVSDK_NGX_GetAPIVersion"));
+    if (!ngx.init_ext || !ngx.allocate_parameters || !ngx.shutdown ||
+        !ngx.backend.create_feature || !ngx.backend.evaluate_feature ||
+        !ngx.backend.release_feature) return {};
+
+    // Keep one owner and callback family for every existing transport handle.
+    HMODULE retained{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(public_runtime), &retained) || retained != public_runtime) return {};
+    ngx.runtime_module = retained;
+    selected = ngx;
+    trace_event("Private DX12 transport uses SR snippet lifecycle module=%p (core game hooks bypassed)", retained);
+    return selected;
 }
 
 constexpr std::array<const char*, 6U> dlss_preset_parameter_names{

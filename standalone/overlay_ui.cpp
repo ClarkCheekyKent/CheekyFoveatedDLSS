@@ -1,13 +1,18 @@
 #include "overlay_ui.hpp"
 #include "settings_io.hpp"
 #include "version.h"
+#include "cheeky_gaze_abi.h"
 #include <imgui.h>
 #include <array>
+#include <algorithm>
 #include <cfloat>
+#include <charconv>
+#include <cmath>
 #include <locale>
 #include <sstream>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 namespace cheeky::standalone {
 using namespace cheeky::foveated_dlss;
 // Snapshot is emitted by our runtime. This reader only extracts a direct
@@ -103,12 +108,20 @@ void commit(OverlayUiState& r, const OverlayRuntime& runtime, const Settings& pr
 }
 
 void slider(const char* label, float& value, float low, float high, const char* format = "%.2f") {
-    ImGui::SliderFloat(label, &value, low, high, format, ImGuiSliderFlags_AlwaysClamp);
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-1);
+    ImGui::SliderFloat("##value", &value, low, high, format, ImGuiSliderFlags_AlwaysClamp);
+    ImGui::PopID();
 }
 
 template<class T> void combo(const char* label, T& value, const char* names) {
     int index = static_cast<int>(value);
-    if (ImGui::Combo(label, &index, names)) value = static_cast<T>(index);
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##value", &index, names)) value = static_cast<T>(index);
+    ImGui::PopID();
 }
 
 void preset(const char* label, std::uint32_t& value, bool game_default) {
@@ -117,62 +130,85 @@ void preset(const char* label, std::uint32_t& value, bool game_default) {
     const int first = game_default ? 0 : 1;
     int selected{};
     for (int i = first; i < static_cast<int>(std::size(values)); ++i) if (values[i] == value) selected = i - first;
-    if (ImGui::Combo(label, &selected, names + first, static_cast<int>(std::size(values)) - first)) value = values[first + selected];
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##value", &selected, names + first, static_cast<int>(std::size(values)) - first)) value = values[first + selected];
+    ImGui::PopID();
 }
 
 void draw_sr(Settings& s) {
     ImGui::Checkbox("Enable foveated DLSS-SR", &s.enabled);
-    ImGui::BeginDisabled(!s.enabled);
+    ImGui::SeparatorText("Center quality");
     preset("Center preset", s.center_preset, true);
     slider("Center supersampling", s.center_supersampling, 1.0F, 2.0F, "%.2fx");
     ImGui::Checkbox("Peripheral DLAA", &s.peripheral_dlaa_enabled);
-    ImGui::BeginDisabled(!s.peripheral_dlaa_enabled);
-    preset("Peripheral preset", s.peripheral_dlaa_preset, false);
-    slider("Periphery scale", s.peripheral_dlaa_scale, .2F, 1.0F);
-    ImGui::EndDisabled();
+    if (s.peripheral_dlaa_enabled) {
+        preset("Peripheral preset", s.peripheral_dlaa_preset, false);
+        slider("Periphery scale", s.peripheral_dlaa_scale, .2F, 1.0F);
+    }
+    ImGui::SeparatorText("Size and shape");
     slider("Fovea width", s.width, .2F, 1.0F);
     slider("Fovea height", s.height, .2F, 1.0F);
     slider("Roundness", s.roundness, 0.0F, 1.0F);
     slider("Transition width", s.transition_width, 0.0F, .3F, "%.3f");
     ImGui::Checkbox("Show red alignment border", &s.alignment_border_enabled);
-    ImGui::EndDisabled();
 }
 
 void draw_gaze(Settings& s) {
     combo("Foveation center", s.center_mode, "Fixed\0Runtime gaze (OpenXR / OpenVR)\0Simulated gaze\0");
     ImGui::Checkbox("Automatic stereo alignment", &s.auto_stereo_alignment);
-    ImGui::TextWrapped("Runtime gaze needs the Cheeky OpenXR layer or a supported OpenVR runtime. Fixed placement is used when tracking is unavailable.");
-    slider("Stereo X offset", s.x_offset, -1.0F, 1.0F);
-    slider("Height offset", s.auto_stereo_alignment ? s.aligned_height_offset : s.height_offset, -1.0F, 1.0F);
-    ImGui::Checkbox("Invert stereo eye order", &s.invert_stereo_x_offset);
+    if (s.center_mode == FoveationCenterMode::openxr_gaze)
+        ImGui::TextWrapped("Runtime gaze needs the Cheeky OpenXR layer or a supported OpenVR runtime. Fixed placement is used when tracking is unavailable.");
+    if (!s.auto_stereo_alignment && s.center_mode == FoveationCenterMode::fixed)
+        slider("Stereo X offset", s.x_offset, -1.0F, 1.0F);
+    slider(s.center_mode == FoveationCenterMode::fixed ? "Height offset" : "Fallback height offset",
+        s.auto_stereo_alignment ? s.aligned_height_offset : s.height_offset, -1.0F, 1.0F);
+    if (ImGui::TreeNode("Stereo mapping override")) {
+        ImGui::Checkbox("Invert stereo eye order", &s.invert_stereo_x_offset);
+        ImGui::TextWrapped("For packed layouts with reversed eye order; normally leave off.");
+        ImGui::TreePop();
+    }
     if (s.center_mode == FoveationCenterMode::simulated_gaze) {
         combo("Simulation pattern", s.simulation_pattern, "Figure eight (8 s)\0Slow sweep (20 s)\0Jump every 2 s\0Jump every 8 s\0Tracking loss\0Hold center\0");
-        ImGui::Checkbox("Show next jump target", &s.show_next_jump_target);
+        if (s.simulation_pattern == 2 || s.simulation_pattern == 3)
+            ImGui::Checkbox("Show next jump target", &s.show_next_jump_target);
     }
-    slider("Gaze smoothing", s.gaze_smoothing_ms, 0.0F, 100.0F, "%.0f ms");
-    int pixels = static_cast<int>(s.gaze_quantization_pixels);
-    if (ImGui::SliderInt("Crop origin quantization", &pixels, 1, 64, "%d px", ImGuiSliderFlags_AlwaysClamp)) s.gaze_quantization_pixels = static_cast<std::uint32_t>(pixels);
-    slider("Jump reset threshold", s.gaze_jump_reset_ratio, .01F, 1.0F, "%.3f crop");
+    if (s.center_mode != FoveationCenterMode::fixed && ImGui::TreeNode("Advanced eye tracking")) {
+        slider("Gaze smoothing", s.gaze_smoothing_ms, 0.0F, 100.0F, "%.0f ms");
+        int pixels = static_cast<int>(s.gaze_quantization_pixels);
+        ImGui::TextUnformatted("Crop origin quantization");
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderInt("##quantization", &pixels, 1, 64, "%d px", ImGuiSliderFlags_AlwaysClamp)) s.gaze_quantization_pixels = static_cast<std::uint32_t>(pixels);
+        slider("Jump reset threshold", s.gaze_jump_reset_ratio, .01F, 1.0F, "%.3f crop");
+        ImGui::TreePop();
+    }
     if (ImGui::TreeNode("AFW coverage")) {
         ImGui::Checkbox("Automatic AFW coverage", &s.afw_automatic_coverage);
         ImGui::Checkbox("Manual AFW coverage", &s.afw_manual_coverage);
-        slider("AFW warp margin", s.afw_warp_margin, 0.0F, .3F, "%.3f");
+        if (s.afw_automatic_coverage || s.afw_manual_coverage)
+            slider("AFW warp margin", s.afw_warp_margin, 0.0F, .25F, "%.3f");
         ImGui::TreePop();
     }
 }
 
 void draw_nr(Settings& s) {
     ImGui::Checkbox("Enable DLSS-NR", &s.nr_enabled);
-    ImGui::BeginDisabled(!s.nr_enabled);
+    ImGui::SeparatorText("Size and shape");
     ImGui::Checkbox("Foveated DLSS-NR", &s.nr_foveated);
-    ImGui::Checkbox("Use DLSS-SR size and shape", &s.nr_use_sr_foveation);
-    ImGui::BeginDisabled(!s.nr_foveated || s.nr_use_sr_foveation);
-    slider("NR fovea width", s.nr_width, .2F, 1.0F);
-    slider("NR fovea height", s.nr_height, .2F, 1.0F);
-    slider("NR roundness", s.nr_roundness, 0.0F, 1.0F);
-    slider("NR transition width", s.nr_transition_width, 0.0F, .3F, "%.3f");
-    ImGui::EndDisabled();
-    ImGui::Checkbox("Show green alignment border", &s.nr_alignment_border_enabled);
+    if (s.nr_foveated) {
+        ImGui::Checkbox("Use DLSS-SR size and shape", &s.nr_use_sr_foveation);
+        if (s.nr_use_sr_foveation) {
+            ImGui::TextWrapped("Width, height, roundness and transition follow the DLSS-SR settings, even with SR disabled.");
+        } else {
+            slider("NR fovea width", s.nr_width, .2F, 1.0F);
+            slider("NR fovea height", s.nr_height, .2F, 1.0F);
+            slider("NR roundness", s.nr_roundness, 0.0F, 1.0F);
+            slider("NR transition width", s.nr_transition_width, 0.0F, .3F, "%.3f");
+        }
+        ImGui::Checkbox("Show green alignment border", &s.nr_alignment_border_enabled);
+    }
+    ImGui::SeparatorText("Neural rendering");
     combo("Rendering order", s.nr_processing_order, "After upscaling\0Before upscaling (experimental)\0");
     slider("Working scale", s.nr_working_scale, .1F, 1.0F);
     combo("DLSS-NR style", s.nr_style, "Standard\0Natural\0Cinematic\0");
@@ -181,7 +217,8 @@ void draw_nr(Settings& s) {
         slider("Local tone strength", s.nr_local_tone_strength, 0.0F, 2.0F);
         slider("Local structure strength", s.nr_local_structure_strength, 0.0F, 2.0F);
         ImGui::Checkbox("Automatic mask", &s.nr_automatic_mask);
-        slider("Skin structure strength", s.nr_skin_structure_strength, 0.0F, 2.0F);
+        if (s.nr_automatic_mask)
+            slider("Skin structure strength", s.nr_skin_structure_strength, 0.0F, 2.0F);
         ImGui::Checkbox("UI correction", &s.nr_ui_correction);
         slider("Paper white scale", s.nr_paper_white_scale, .01F, 8.0F);
         slider("HDR transfer strength", s.nr_hdr_transfer_strength, 0.0F, 2.0F);
@@ -191,22 +228,363 @@ void draw_nr(Settings& s) {
         slider("Motion scale Y multiplier", s.nr_motion_scale_y_multiplier, -4.0F, 4.0F);
         ImGui::TreePop();
     }
-    ImGui::EndDisabled();
 }
 
 void diagnostic_line(std::string_view object, const char* label, const char* key) {
-    const auto value = plain(member(object, key));
+    auto value = plain(member(object, key));
+    if (value == "true") value = "Yes";
+    else if (value == "false") value = "No";
     ImGui::TextWrapped("%s: %s", label, value.empty() ? "unavailable" : value.c_str());
 }
 
-template<class T> void raw_setting(const char* name, T& value) {
-    if constexpr (std::is_same_v<T, bool>) ImGui::Checkbox(name, &value);
-    else if constexpr (std::is_floating_point_v<T>) ImGui::InputFloat(name, &value, 0.0F, 0.0F, "%.6g");
-    else {
-        std::uint32_t number = static_cast<std::uint32_t>(value);
-        if (ImGui::InputScalar(name, ImGuiDataType_U32, &number)) value = static_cast<T>(number);
+// Arrays contain nested objects (including strings with braces). Never split
+// on commas: crop and per-eye diagnostics have their own members and arrays.
+std::string_view array_object(std::string_view array, unsigned index) {
+    int depth{};
+    bool quoted{}, escaped{};
+    std::size_t start{};
+    for (std::size_t i = 0; i < array.size(); ++i) {
+        const char c = array[i];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') quoted = false;
+            continue;
+        }
+        if (c == '"') quoted = true;
+        else if (c == '{') { if (depth++ == 0) start = i; }
+        else if (c == '}' && depth > 0 && --depth == 0) {
+            if (index-- == 0) return array.substr(start, i - start + 1);
+        }
+    }
+    return {};
+}
+
+double number(std::string_view object, const char* key) {
+    const auto text = member(object, key);
+    double result{};
+    if (text.empty()) return 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+    return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && std::isfinite(result) ? result : 0;
+}
+
+bool flag(std::string_view object, const char* key) { return member(object, key) == "true"; }
+
+const char* gaze_warning(const Settings& s, std::string_view snapshot) {
+    if (s.center_mode != FoveationCenterMode::openxr_gaze ||
+        (!s.enabled && !(s.nr_enabled && s.nr_foveated))) return nullptr;
+    const auto gaze = member(snapshot, "gaze");
+    if (gaze.empty()) return "Waiting for eye-tracking diagnostics.";
+    if (!flag(gaze, "layer")) return "Eye tracking unavailable: no active OpenXR layer or supported OpenVR adapter. Using fixed placement.";
+    if (!flag(gaze, "abi")) return "Eye tracking unavailable: update the OpenXR layer to match this runtime. Using fixed placement.";
+    const auto flags = static_cast<unsigned>(number(gaze, "status_flags"));
+    if (!(flags & CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED)) return "Eye tracking not detected. Using fixed placement.";
+    if (flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) return "Eye tracking unavailable for this stereo layout. Using fixed placement.";
+    if (!(flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED)) return "VR session is not focused. Using fixed fallback.";
+    if (!(flags & CHEEKY_GAZE_STATUS_GAZE_VALID)) return "No valid eye-tracking signal. Using fixed fallback.";
+    if (!flag(gaze, "using_gaze")) {
+        if (flag(gaze, "ambiguous")) return "Eye mapping is ambiguous. Waiting for a reliable left/right eye assignment.";
+        return "Waiting for a fresh eye-tracking sample or stable eye mapping.";
+    }
+    return nullptr;
+}
+
+const char* alignment_warning(const Settings& s, std::string_view snapshot) {
+    if (!s.auto_stereo_alignment || (!s.enabled && !(s.nr_enabled && s.nr_foveated))) return nullptr;
+    const auto gaze = member(snapshot, "gaze");
+    if (gaze.empty()) return "Waiting for automatic stereo alignment diagnostics.";
+    // Fixed foveation in an ordinary flat game does not require stereo data.
+    if (number(gaze, "views") < 2 && !flag(gaze, "layer") && s.center_mode == FoveationCenterMode::fixed)
+        return nullptr;
+    // Projection alignment can work without an eye tracker, and calibrated
+    // mappings can resolve ambiguous runtime resources. Trust the used source.
+    if (number(gaze, "alignment") != 0) return nullptr;
+    return "Automatic stereo alignment has no usable projection or eye mapping. Using manual fallback placement.";
+}
+
+void warning(const char* text) {
+    if (!text) return;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0F, .65F, .25F, 1.0F));
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
+
+const char* alignment_name(unsigned source) {
+    switch (source) {
+    case 1: return "Streamline projection";
+    case 2: return "OpenXR";
+    case 3: return "OpenVR";
+    default: return "Manual fallback";
     }
 }
+
+void draw_gaze_status(const Settings& s, std::string_view snapshot) {
+    const auto gaze = member(snapshot, "gaze");
+    ImGui::SeparatorText("Tracking and alignment status");
+    if (s.center_mode == FoveationCenterMode::fixed)
+        ImGui::TextWrapped("Eye Tracking Ready: Not in use (fixed placement selected).");
+    else if (s.center_mode == FoveationCenterMode::simulated_gaze)
+        ImGui::TextWrapped("Eye Tracking Ready: Not in use (simulated gaze selected).");
+    else if (!s.enabled && !(s.nr_enabled && s.nr_foveated))
+        ImGui::TextWrapped("Eye Tracking Ready: Not evaluated (SR and foveated NR are off).");
+    else if (const auto reason = gaze_warning(s, snapshot)) {
+        ImGui::TextUnformatted("Eye Tracking Ready: No");
+        warning(reason);
+    } else ImGui::TextUnformatted("Eye Tracking Ready: Yes");
+    ImGui::TextWrapped("Latest alignment: %s", alignment_name(static_cast<unsigned>(number(gaze, "alignment"))));
+    warning(alignment_warning(s, snapshot));
+}
+
+void draw_gaze_details(std::string_view snapshot) {
+    const auto gaze = member(snapshot, "gaze");
+    if (ImGui::TreeNode("Eye tracking details")) {
+        diagnostic_line(gaze, "Runtime", "runtime");
+        diagnostic_line(gaze, "Runtime adapter loaded", "layer");
+        diagnostic_line(gaze, "Compatible gaze ABI", "abi");
+        diagnostic_line(gaze, "Mapping ambiguity", "ambiguous");
+        diagnostic_line(gaze, "Active stereo views", "views");
+        diagnostic_line(gaze, "Sample age (ms)", "age_ms");
+        const auto flags = static_cast<unsigned>(number(gaze, "status_flags"));
+        for (const auto& item : {std::pair{"System supports eye tracking", CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED},
+                 {"Session focused", CHEEKY_GAZE_STATUS_SESSION_FOCUSED},
+                 {"Gaze input active", CHEEKY_GAZE_STATUS_ACTION_ACTIVE},
+                 {"Tracking valid", CHEEKY_GAZE_STATUS_GAZE_VALID},
+                 {"Submission mapping ready", CHEEKY_GAZE_STATUS_MAPPING_READY}})
+            ImGui::TextWrapped("%s: %s", item.first, gaze.empty() ? "unavailable" : (flags & item.second) ? "Yes" : "No");
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto eye = array_object(member(gaze, "eyes"), i);
+            ImGui::SeparatorText(i ? "Right eye" : "Left eye");
+            diagnostic_line(eye, "Mapped", "mapped");
+            diagnostic_line(eye, "DLSS view", "view_id");
+            diagnostic_line(eye, "Stable matches", "stable_matches");
+            ImGui::TextWrapped("Alignment: %s", alignment_name(static_cast<unsigned>(number(eye, "alignment"))));
+            ImGui::Text("Aligned center: %.4f, %.4f", number(eye, "aligned_u"), number(eye, "aligned_v"));
+            if (flags & CHEEKY_GAZE_STATUS_GAZE_VALID)
+                ImGui::Text("Gaze center: %.4f, %.4f", number(eye, "center_u"), number(eye, "center_v"));
+            ImGui::Text("Crop delta: %.0f, %.0f px", number(eye, "delta_x"), number(eye, "delta_y"));
+        }
+        ImGui::TreePop();
+    }
+}
+
+void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
+    if (!ImGui::TreeNode("Eye calibration diagnostics")) return;
+    // Commands refresh r.snapshot, so consume all views before sending one.
+    const auto data = member(r.snapshot, "eye_calibration");
+    bool enabled = flag(data, "enabled");
+    const bool changed = ImGui::Checkbox("Automatic eye calibration (this session)", &enabled);
+    diagnostic_line(data, "Backend", "backend");
+    const auto api = number(data, "graphics_api");
+    ImGui::Text("Graphics API: %s", api == 12 ? "D3D12" : api == 11 ? "D3D11" : "Waiting for DLSS");
+    diagnostic_line(data, "Status", "status");
+    diagnostic_line(data, "Corrections applied", "corrections");
+    diagnostic_line(data, "Confirmed mapping updates", "applied");
+    ImGui::Text("Valid / completed samples: %.0f / %.0f", number(data, "valid"), number(data, "completed"));
+    ImGui::Text("Skipped / in flight: %.0f / %.0f", number(data, "skipped"), number(data, "in_flight"));
+    ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
+    if (number(data, "gpu_samples") > 0) ImGui::Text("GPU marker / copy work: %.2f us", number(data, "gpu_us"));
+    else diagnostic_line(data, "GPU marker / copy work", "gpu_timing_status");
+    ImGui::Text("Readback latency: %.2f VR frames", number(data, "latency_frames"));
+    diagnostic_line(data, "Last recognized left view", "left_view");
+    diagnostic_line(data, "Last recognized right view", "right_view");
+    ImGui::TextWrapped("Samples every 10 VR frames. Corrections count changes to an existing eye assignment. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
+    if (changed) command(r, runtime, enabled ? "calibration_enable" : "calibration_disable");
+    if (ImGui::Button("Reset calibration counters")) command(r, runtime, "calibration_reset");
+    ImGui::TreePop();
+}
+
+void timing_line(std::string_view data, const char* label, const char* key) {
+    const auto ms = number(data, key);
+    if (ms > 0) ImGui::TextWrapped("%s: %.3f ms", label, ms);
+    else ImGui::TextWrapped("%s: Not sampled yet", label);
+}
+
+void savings_line(std::string_view data, const char* full, const char* foveated) {
+    const auto baseline = number(data, full), optimized = number(data, foveated);
+    if (baseline > 0 && optimized > 0)
+        ImGui::TextWrapped("Foveated savings: %.3f ms (%.1f%%)", baseline - optimized, (baseline - optimized) * 100 / baseline);
+    else ImGui::TextWrapped("Foveated savings: Sample both full and foveated modes to compare.");
+}
+
+void resolution_line(std::string_view data, const char* label, const char* width, const char* height) {
+    const auto w = number(data, width), h = number(data, height);
+    if (w > 0 && h > 0) ImGui::TextWrapped("%s: %.0f x %.0f", label, w, h);
+    else ImGui::TextWrapped("%s: Not sampled yet", label);
+}
+
+void region_line(std::string_view region, std::string_view original, const char* label,
+    const char* width, const char* height, const char* x, const char* y,
+    const char* original_width, const char* original_height) {
+    const auto w = number(region, width), h = number(region, height);
+    const auto ow = number(original, original_width), oh = number(original, original_height);
+    if (w > 0 && h > 0 && ow > 0 && oh > 0)
+        ImGui::TextWrapped("%s: %.0f x %.0f (%.1f%% of original) at %.0f,%.0f",
+            label, w, h, 100 * w * h / (ow * oh), number(region, x), number(region, y));
+    else resolution_line(region, label, width, height);
+}
+
+void draw_sr_performance(std::string_view snapshot, const Settings& s) {
+    ImGui::SeparatorText("Frame rate (250 ms average)");
+    const auto frame = member(snapshot, "frame");
+    for (const auto& item : {std::pair{"Current presentation", "present_ms"},
+             {"Non-foveated FPS (SR off)", "sr_disabled_ms"}, {"Foveated FPS (SR on)", "sr_enabled_ms"}}) {
+        const auto ms = number(frame, item.second);
+        if (ms > 0) ImGui::TextWrapped("%s: %.1f FPS (%.2f ms)", item.first, 1000 / ms, ms);
+        else ImGui::TextWrapped("%s: Not sampled yet", item.first);
+    }
+    const auto native_ms = number(frame, "sr_disabled_ms"), foveated_ms = number(frame, "sr_enabled_ms");
+    if (native_ms > 0 && foveated_ms > 0) {
+        // Match the addon's comparison: FPS gain is relative to SR off.
+        // It is different from the percentage reduction in frame/GPU time.
+        const auto native_fps = 1000 / native_ms, foveated_fps = 1000 / foveated_ms;
+        const auto gain = foveated_fps - native_fps;
+        ImGui::TextWrapped("Foveated FPS gain: %+.1f FPS (%+.1f%%)", gain, 100 * gain / native_fps);
+        ImGui::TextWrapped("Frame-time change: %+.2f ms (%+.1f%%)",
+            foveated_ms - native_ms, 100 * (foveated_ms - native_ms) / native_ms);
+    } else {
+        ImGui::TextWrapped("Foveated FPS gain: Not sampled yet");
+        ImGui::TextWrapped("Frame-time change: Not sampled yet");
+        ImGui::TextWrapped("Sample SR both on and off for about two seconds each to compare. Keep the scene and other settings the same.");
+    }
+    ImGui::TextWrapped("Frame comparisons use presentation cadence and retain the last sample from each mode.");
+    ImGui::TextWrapped("GPU timings are 250 ms averages. Comparisons retain the last sampled value for each mode.");
+    bool active{};
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto api = array_object(member(snapshot, "apis"), i);
+        if (number(api, "evaluations") == 0) continue;
+        active = true;
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::CollapsingHeader(i ? "Direct3D 12" : "Direct3D 11", ImGuiTreeNodeFlags_DefaultOpen)) {
+            diagnostic_line(api, "State", "state");
+            resolution_line(api, "DLSS input", "input_width", "input_height");
+            resolution_line(api, "DLSS output", "output_width", "output_height");
+            region_line(member(api, "crop"), api, "Center input", "input_width", "input_height",
+                "input_x", "input_y", "input_width", "input_height");
+            region_line(member(api, "crop"), api, "Center output", "output_width", "output_height",
+                "output_x", "output_y", "output_width", "output_height");
+            resolution_line(api, "Motion vectors", "motion_width", "motion_height");
+            diagnostic_line(api, "Motion-vector space", "motion_space");
+            const auto motion_space = plain(member(api, "motion_space"));
+            ImGui::TextWrapped("Peripheral DLAA: %s", !s.peripheral_dlaa_enabled ? "Disabled" :
+                motion_space == "Output-resolution" ? "Enabled (auto MV conversion)" :
+                motion_space == "Input-resolution" ? "Enabled (direct MVs)" : "Enabled (waiting for compatible MV info)");
+            ImGui::SeparatorText("DLSS-SR GPU timing");
+            timing_line(api, "Full DLSS call", "native_ms");
+            if (s.enabled && number(api, "native_ms") <= 0)
+                ImGui::TextWrapped("Turn off foveated DLSS-SR briefly to sample the full-frame baseline.");
+            timing_line(api, "Foveated DLSS call", "foveated_ms");
+            if (s.peripheral_dlaa_enabled) {
+                timing_line(api, "Peripheral DLAA call", "peripheral_ms");
+                if (!i && plain(member(api, "execution_path")) == "DX11 Direct") {
+                    timing_line(api, "Peripheral preparation", "peripheral_preparation_ms");
+                    timing_line(api, "Peripheral prep + DLAA total", "peripheral_total_ms");
+                }
+            }
+            savings_line(api, "native_ms", "foveated_ms");
+            if (!i) {
+                diagnostic_line(api, "Execution path", "execution_path");
+                if (s.d3d11_use_d3d12_transport) {
+                    diagnostic_line(api, "Transport status", "transport_status");
+                    timing_line(api, "Total time with transport", "transport_ms");
+                    const auto transport_ms = number(api, "transport_ms");
+                    const auto sr_ms = number(api, s.enabled ? "foveated_ms" : "native_ms");
+                    const auto peripheral_ms = s.enabled && s.peripheral_dlaa_enabled ? number(api, "peripheral_ms") : 0;
+                    const auto nr_ms = !s.nr_enabled ? 0 : number(api,
+                        s.nr_processing_order == NrProcessingOrder::before_upscaling
+                            ? (s.nr_foveated ? "before_nr_foveated_ms" : "before_nr_full_ms")
+                            : (s.nr_foveated ? "nr_foveated_ms" : "nr_full_ms"));
+                    if (transport_ms > 0 && sr_ms > 0 && (!s.nr_enabled || nr_ms > 0) &&
+                        (!(s.enabled && s.peripheral_dlaa_enabled) || peripheral_ms > 0))
+                        ImGui::TextWrapped("Transport overhead (excludes DLSS): %.3f ms",
+                            (std::max)(0.0, transport_ms - sr_ms - peripheral_ms - nr_ms));
+                    else ImGui::TextWrapped("Transport overhead (excludes DLSS): Not sampled yet");
+                }
+            }
+        }
+        ImGui::PopID();
+    }
+    if (!active) ImGui::TextWrapped("Waiting for the first Direct3D DLSS evaluation. GPU timings are unavailable for Vulkan.");
+}
+
+void draw_nr_performance(std::string_view snapshot, const Settings& s) {
+    ImGui::TextWrapped("GPU timings are 250 ms averages. Comparisons retain the last sampled value for each mode.");
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto api = array_object(member(snapshot, "apis"), i);
+        if (number(api, "evaluations") == 0) continue;
+        ImGui::SeparatorText(i ? "Direct3D 12 NR timing" : "DX11 -> DX12 NR timing");
+        if (s.nr_processing_order == NrProcessingOrder::before_upscaling) {
+            timing_line(api, "Full NR + preparation", "before_nr_full_ms");
+            timing_line(api, "Foveated NR + preparation", "before_nr_foveated_ms");
+            timing_line(api, "Total intercepted pipeline", "before_pipeline_ms");
+            savings_line(api, "before_nr_full_ms", "before_nr_foveated_ms");
+        } else {
+            timing_line(api, "Full DLSS-NR call", "nr_full_ms");
+            timing_line(api, "Foveated DLSS-NR call", "nr_foveated_ms");
+            timing_line(api, "Total intercepted pipeline", "after_pipeline_ms");
+            savings_line(api, "nr_full_ms", "nr_foveated_ms");
+        }
+        ImGui::PushID(static_cast<int>(i));
+        if (ImGui::TreeNode("Other processing order timings")) {
+            if (s.nr_processing_order == NrProcessingOrder::before_upscaling) {
+                timing_line(api, "After: full DLSS-NR call", "nr_full_ms");
+                timing_line(api, "After: foveated DLSS-NR call", "nr_foveated_ms");
+                timing_line(api, "After: total intercepted pipeline", "after_pipeline_ms");
+            } else {
+                timing_line(api, "Before: full NR + preparation", "before_nr_full_ms");
+                timing_line(api, "Before: foveated NR + preparation", "before_nr_foveated_ms");
+                timing_line(api, "Before: total intercepted pipeline", "before_pipeline_ms");
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+    ImGui::SeparatorText("DLSS-NR status and resolution");
+    {
+        diagnostic_line(snapshot, "State", "nr");
+        const auto nr = member(snapshot, "nr_details");
+        diagnostic_line(nr, "Current route", "route");
+        if (!plain(member(nr, "skip_reason")).empty()) diagnostic_line(nr, "Skipped", "skip_reason");
+        diagnostic_line(nr, "Candidates", "candidates");
+        diagnostic_line(nr, "Evaluations", "evaluations");
+        diagnostic_line(nr, "Failures", "failures");
+        if (!member(nr, "result").empty())
+            ImGui::Text("Last NGX result: 0x%08X", static_cast<std::uint32_t>(number(nr, "result")));
+        ImGui::TextWrapped("Rendering order: %s", number(nr, "processing_order") == 1 ? "Before upscaling" : "After upscaling");
+        resolution_line(nr, "Processing resolution", "processing_width", "processing_height");
+        resolution_line(nr, "DLSS-SR output", "output_width", "output_height");
+        region_line(nr, nr, "DLSS-NR region", "region_width", "region_height", "region_x", "region_y",
+            "processing_width", "processing_height");
+        resolution_line(nr, "DLSS-NR working size", "working_width", "working_height");
+        if (number(nr, "vram_bytes") > 0)
+            ImGui::Text("Intermediate VRAM: %.1f MiB", number(nr, "vram_bytes") / (1024 * 1024));
+        else ImGui::TextUnformatted("Intermediate VRAM: Not allocated yet");
+    }
+}
+
+template<class T> void raw_setting(const char* name, T& value) {
+    if constexpr (std::is_same_v<T, bool>) {
+        ImGui::Checkbox(name, &value);
+    } else {
+        ImGui::PushID(name);
+        ImGui::TextUnformatted(name);
+        ImGui::SetNextItemWidth(-1);
+        if constexpr (std::is_floating_point_v<T>) ImGui::InputFloat("##value", &value, 0.0F, 0.0F, "%.6g");
+        else {
+            std::uint32_t number = static_cast<std::uint32_t>(value);
+            if (ImGui::InputScalar("##value", ImGuiDataType_U32, &number)) value = static_cast<T>(number);
+        }
+        ImGui::PopID();
+    }
+}
+
+bool begin_tab(const char* label) {
+    if (!ImGui::BeginTabItem(label)) return false;
+    // Keep the header and tabs reachable while long pages scroll independently.
+    ImGui::BeginChild(label, ImVec2(0, 0), ImGuiChildFlags_None);
+    return true;
+}
+
+void end_tab() { ImGui::EndChild(); ImGui::EndTabItem(); }
 
 void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char* renderer,const char* status,bool& open) {
     refresh(r, runtime);
@@ -215,62 +593,77 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
     if (ImGui::Begin("Cheeky Foveated DLSS###CheekyStandalone", &open, ImGuiWindowFlags_NoCollapse)) {
         ImGui::TextDisabled("v" CHEEKY_VERSION " | %s | %s | F8 to close", runtime.host_name ? runtime.host_name : "Standalone", renderer);
         ImGui::TextWrapped("Changes apply when you release a control and are saved automatically.");
-        ImGui::TextWrapped("%s", r.message.c_str());
+        if (!r.message.empty()) ImGui::TextWrapped("%s", r.message.c_str());
         ImGui::Separator();
         const auto previous = r.draft;
         if (ImGui::BeginTabBar("controls")) {
-            if (ImGui::BeginTabItem("DLSS-SR")) {
-                draw_sr(r.draft);
-                if (ImGui::Button("Reset SR defaults")) command(r, runtime, "defaults_sr");
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("Gaze / stereo")) {
+            if (begin_tab("Stereo / Gaze")) {
+                draw_gaze_status(r.draft, r.snapshot);
+                ImGui::SeparatorText("Placement");
                 draw_gaze(r.draft);
                 if (ImGui::Button("Reset gaze defaults")) command(r, runtime, "defaults_gaze");
-                ImGui::EndTabItem();
+                end_tab();
             }
-            if (ImGui::BeginTabItem("DLSS-NR")) {
+            if (begin_tab("DLSS-SR")) {
+                draw_sr(r.draft);
+                if (ImGui::Button("Reset SR defaults")) command(r, runtime, "defaults_sr");
+                if (ImGui::CollapsingHeader("Performance##sr", ImGuiTreeNodeFlags_DefaultOpen))
+                    draw_sr_performance(r.snapshot, r.draft);
+                end_tab();
+            }
+            if (begin_tab("DLSS-NR")) {
+                if (member(r.snapshot, "renderer") == "0") {
+                    ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
+                    ImGui::TextWrapped("Required for DLSS-NR in DX11 games. Changing NR does not change this setting.");
+                }
+                diagnostic_line(r.snapshot, "Runtime state", "nr");
+                if (r.draft.nr_enabled) {
+                    const auto reason = plain(member(member(r.snapshot, "nr_details"), "skip_reason"));
+                    if (!reason.empty()) warning(reason.c_str());
+                }
                 draw_nr(r.draft);
                 if (ImGui::Button("Reset NR history / retry")) command(r, runtime, "reset_nr");
-                ImGui::SameLine();
                 if (ImGui::Button("Reset NR defaults")) command(r, runtime, "defaults_nr");
-                ImGui::EndTabItem();
+                if (ImGui::CollapsingHeader("Performance##nr", ImGuiTreeNodeFlags_DefaultOpen))
+                    draw_nr_performance(r.snapshot, r.draft);
+                end_tab();
             }
-            if (ImGui::BeginTabItem("Diagnostics")) {
+            if (begin_tab("Diagnostics")) {
                 diagnostic_line(r.snapshot, "Runtime ready", "ready");
                 diagnostic_line(r.snapshot, "NR state", "nr");
-                const auto gaze = member(r.snapshot, "gaze");
-                diagnostic_line(gaze, "Gaze source", "runtime");
-                diagnostic_line(gaze, "Gaze driving foveation", "using_gaze");
-                diagnostic_line(gaze, "Active stereo views", "views");
                 diagnostic_line(member(r.snapshot, "frame"), "Frame time (ms)", "present_ms");
                 diagnostic_line(member(r.snapshot, "observer"), "Native observer ready", "ready");
                 diagnostic_line(member(r.snapshot, "nr_details"), "NR skip reason", "skip_reason");
                 ImGui::TextWrapped("Overlay: %s", status);
+                draw_gaze_details(r.snapshot);
+                draw_calibration(r, runtime);
                 if (ImGui::Button("Report an issue...")) command(r, runtime, "report_issue");
-                ImGui::SameLine();
                 if (ImGui::Button("Create support ZIP")) command(r, runtime, "report");
-                ImGui::SameLine();
                 if (ImGui::Button("Show support ZIP")) command(r, runtime, "show_report");
                 if (ImGui::Button("Copy diagnostic snapshot")) ImGui::SetClipboardText(r.snapshot.c_str());
-                if (ImGui::Button("Enable eye calibration")) command(r, runtime, "calibration_enable");
-                ImGui::SameLine();
-                if (ImGui::Button("Disable eye calibration")) command(r, runtime, "calibration_disable");
-                if (ImGui::Button("Reset calibration counters")) command(r, runtime, "calibration_reset");
+                if (ImGui::TreeNode("DX12 GPU timing collection")) {
+                    ImGui::TextWrapped("These counters cover the DX12 collector only. DX11 direct SR and eye calibration use separate timers.");
+                    const auto gpu = member(r.snapshot, "gpu_timing");
+                    diagnostic_line(gpu, "Published samples", "published");
+                    diagnostic_line(gpu, "Waiting for submission", "waiting_submission");
+                    diagnostic_line(gpu, "Waiting for GPU", "waiting_gpu");
+                    diagnostic_line(gpu, "Discarded samples", "discarded");
+                    diagnostic_line(gpu, "Failures", "failures");
+                    diagnostic_line(gpu, "Last error", "last_error");
+                    ImGui::TreePop();
+                }
                 if (ImGui::TreeNode("Full diagnostic snapshot")) {
                     ImGui::TextWrapped("%s", r.snapshot.c_str());
                     ImGui::TreePop();
                 }
-                ImGui::EndTabItem();
+                end_tab();
             }
-            if (ImGui::BeginTabItem("All settings")) {
+            if (begin_tab("All settings")) {
                 ImGui::TextWrapped("Advanced values use the same keys as the configuration file. The runtime validates and clamps each transaction.");
-                ImGui::BeginChild("fields", ImVec2(0, 0), ImGuiChildFlags_None);
 #define CHEEKY_SETTING(name, field) raw_setting(name, r.draft.field);
 #include "settings_fields.inc"
 #undef CHEEKY_SETTING
-                ImGui::EndChild();
-                ImGui::EndTabItem();
+                end_tab();
             }
             ImGui::EndTabBar();
         }

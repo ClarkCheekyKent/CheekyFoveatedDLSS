@@ -31,6 +31,7 @@ add_executable(CheekyOverlayTests tests/overlay_tests.cpp standalone/overlay.cpp
 target_include_directories(CheekyOverlayTests PRIVATE standalone shared src uevr ${CHEEKY_IMGUI})
 target_link_libraries(CheekyOverlayTests PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid user32 imm32 dwmapi)
 target_compile_definitions(CheekyOverlayTests PRIVATE CHEEKY_OVERLAY_TEST_DESKTOP)
+add_test(NAME CheekyOverlay-UI COMMAND CheekyOverlayTests --ui)
 foreach(target CheekyFoveatedDLSSHost CheekyStandaloneProxy CheekyOptiScaler CheekyOverlayTests)
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)

@@ -620,7 +620,7 @@ void draw_eye_calibration_diagnostics() {
         diagnostic_row("Skipped / in flight", "%llu / %u", s.skipped, s.in_flight);
         diagnostic_row("CPU work", "%.2f us/frame", s.cpu_us_per_frame);
         if (s.gpu_samples) diagnostic_row("GPU marker / copy work", "%.2f us", s.gpu_us);
-        else diagnostic_row("GPU marker / copy work", "%s", "Not sampled / unavailable");
+        else diagnostic_row("GPU marker / copy work", "%s", s.gpu_timing_status);
         diagnostic_row("Readback latency", "%.2f VR frames", s.latency_frames);
         diagnostic_row("Last recognized left / right", "%llu / %llu", s.left_view, s.right_view);
     }
@@ -1113,7 +1113,6 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     changed |= ImGui::Checkbox("Enable foveated DLSS-SR", &settings.enabled);
     ImGui::SameLine();
     ImGui::TextDisabled("(Alt+Shift+/)");
-    ImGui::BeginDisabled(!settings.enabled);
     preset_combo("Center preset", settings.center_preset, true);
     static float supersampling_draft = 1.0F;
     static bool editing_supersampling{};
@@ -1141,31 +1140,31 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (!editing_peripheral_scale) {
         peripheral_scale_draft = settings.peripheral_dlaa_scale;
     }
-    ImGui::BeginDisabled(!settings.peripheral_dlaa_enabled);
-    preset_combo(
-        "Peripheral preset",
-        settings.peripheral_dlaa_preset,
-        false
-    );
-    if (ImGui::SliderFloat(
-        "Periphery scale",
-        &peripheral_scale_draft,
-        0.20F,
-        1.0F,
-        "%.2f",
-        ImGuiSliderFlags_AlwaysClamp
-    )) {
-        editing_peripheral_scale = true;
+    if (settings.peripheral_dlaa_enabled) {
+        preset_combo(
+            "Peripheral preset",
+            settings.peripheral_dlaa_preset,
+            false
+        );
+        if (ImGui::SliderFloat(
+            "Periphery scale",
+            &peripheral_scale_draft,
+            0.20F,
+            1.0F,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        )) {
+            editing_peripheral_scale = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            settings.peripheral_dlaa_scale = peripheral_scale_draft;
+            editing_peripheral_scale = false;
+            changed = true;
+        }
+        ImGui::TextDisabled(
+            "Downscale periphery even more from original resolution"
+        );
     }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        settings.peripheral_dlaa_scale = peripheral_scale_draft;
-        editing_peripheral_scale = false;
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::TextDisabled(
-        "Downscale periphery even more from original resolution"
-    );
     int center_mode = static_cast<int>(settings.center_mode);
     if (ImGui::Combo(
             "Foveation center",
@@ -1341,7 +1340,6 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         );
         ImGui::TreePop();
     }
-    ImGui::EndDisabled();
 
     ImGui::Spacing();
     if (ImGui::Button("Reset DLSS-SR defaults", ImVec2(0.0F, 0.0F))) {
@@ -1467,10 +1465,12 @@ void draw_nr_controls(Settings& settings, bool& changed) {
             );
         }
     }
-    changed |= ImGui::Checkbox(
-        "Show 5 px green alignment border",
-        &settings.nr_alignment_border_enabled
-    );
+    if (settings.nr_foveated) {
+        changed |= ImGui::Checkbox(
+            "Show 5 px green alignment border",
+            &settings.nr_alignment_border_enabled
+        );
+    }
 
     ImGui::SeparatorText("Neural rendering");
     int order = static_cast<int>(settings.nr_processing_order);
@@ -1645,14 +1645,14 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         ImGui::TextDisabled(
             "Requires nvngx_dlssnr.dll beside this add-on and a DX12 processing path."
         );
+        if (ImGui::TreeNodeEx(
+                "Controls##dlss_nr",
+                ImGuiTreeNodeFlags_DefaultOpen
+            )) {
+            draw_nr_controls(settings, changed);
+            ImGui::TreePop();
+        }
         if (settings.nr_enabled) {
-            if (ImGui::TreeNodeEx(
-                    "Controls##dlss_nr",
-                    ImGuiTreeNodeFlags_DefaultOpen
-                )) {
-                draw_nr_controls(settings, changed);
-                ImGui::TreePop();
-            }
             if (ImGui::TreeNodeEx(
                     "Performance##dlss_nr",
                     ImGuiTreeNodeFlags_DefaultOpen

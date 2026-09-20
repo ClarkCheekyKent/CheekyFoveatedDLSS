@@ -320,10 +320,11 @@ void poll(State& s) {
             }
             std::copy_n(result.scores.begin() + 8, 4, f.flipped_scores.begin());
             if (result.timing_valid) {
+                s.stats.gpu_timing_status = "Available";
                 s.gpu.add(result.gpu_us);
                 ++s.stats.gpu_samples;
                 s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, result.gpu_us);
-            }
+            } else s.stats.gpu_timing_status = "D3D12 marker/copy timestamps unavailable for this capture";
         } else {
             if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
                 [](const auto& capture) { return capture.active && !capture.ready; })) continue;
@@ -381,8 +382,20 @@ void poll(State& s) {
             if (waiting)
                 continue;
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
-            if (f.context->GetData(f.disjoint.Get(), &disjoint, sizeof(disjoint),
-                                   D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            const auto timing_result = f.context->GetData(f.disjoint.Get(), &disjoint, sizeof(disjoint),
+                                   D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (std::any_of(f.submitted11.begin(), f.submitted11.end(), [](const auto& capture) { return capture.active; }))
+                s.stats.gpu_timing_status = "Unavailable across separate D3D11 devices (submission copies have no timestamps)";
+            else if (!std::all_of(f.segments.begin(), f.segments.end(), [](bool segment) { return segment; }))
+                s.stats.gpu_timing_status = "Incomplete marker/copy timestamp coverage";
+            else if (timing_result == S_FALSE)
+                s.stats.gpu_timing_status = "D3D11 timestamp results were not ready when the capture completed";
+            else if (FAILED(timing_result))
+                s.stats.gpu_timing_status = "D3D11 timestamp query failed";
+            else if (disjoint.Disjoint || !disjoint.Frequency)
+                s.stats.gpu_timing_status = "D3D11 timestamps invalid (GPU clock disjoint or frequency unavailable)";
+            else s.stats.gpu_timing_status = "D3D11 marker/copy timestamps incomplete or not ready";
+            if (timing_result == S_OK &&
                 !disjoint.Disjoint && disjoint.Frequency) {
                 double us{};
                 bool valid_time =
@@ -400,6 +413,7 @@ void poll(State& s) {
                             us += double(last - first) * 1e6 / double(disjoint.Frequency);
                     }
                 if (valid_time) {
+                    s.stats.gpu_timing_status = "Available";
                     s.gpu.add(us);
                     s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, us);
                     ++s.stats.gpu_samples;
@@ -1210,6 +1224,7 @@ std::string eye_calibration_json() {
         << ",\"corrections\":" << s.corrections << ",\"applied\":" << s.applied
         << ",\"mismatches\":" << s.mismatches << ",\"allocations\":" << s.allocations
         << ",\"gpu_samples\":" << s.gpu_samples << ",\"cpu_us_per_frame\":" << s.cpu_us_per_frame
+        << ",\"gpu_timing_status\":\"" << s.gpu_timing_status << '"'
         << ",\"max_cpu_call_us\":" << s.max_cpu_call_us << ",\"gpu_us\":" << s.gpu_us
         << ",\"max_gpu_us\":" << s.max_gpu_us << ",\"latency_frames\":"
         << s.latency_frames

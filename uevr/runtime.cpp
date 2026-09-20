@@ -9,6 +9,7 @@
 #include "processing_owner.hpp"
 #include "runtime.hpp"
 #include "diagnostics.hpp"
+#include "d3d11_peripheral_dlaa.hpp"
 #include "eye_calibration.hpp"
 #include "gaze_foveation.hpp"
 #include "openvr_gaze.hpp"
@@ -154,6 +155,8 @@ std::string snapshot_locked(State& s) {
             << ",\"mapped\":" << v.resource_mapped << ",\"packed\":" << v.packed_stereo_mapping
             << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping
             << ",\"marker\":" << v.marker_mapping
+            << ",\"alignment\":" << v.alignment_source
+            << ",\"aligned_u\":" << v.aligned_u << ",\"aligned_v\":" << v.aligned_v
             << ",\"submitted_projection\":" << v.submitted_projection
             << ",\"fov_tangents\":[" << v.fov_tangents[0] << ',' << v.fov_tangents[1]
             << ',' << v.fov_tangents[2] << ',' << v.fov_tangents[3] << "]}";
@@ -182,6 +185,9 @@ std::string snapshot_locked(State& s) {
             << ",\"output_width\":" << d.received_output_width << ",\"output_height\":" << d.received_output_height
             << ",\"foveated_ms\":" << d.foveated_dlss_gpu_ms << ",\"native_ms\":" << d.native_dlss_gpu_ms
             << ",\"peripheral_ms\":" << d.peripheral_dlaa_gpu_ms << ",\"result\":" << d.last_result
+            << ",\"transport_ms\":" << d.transport_gpu_ms
+            << ",\"peripheral_preparation_ms\":" << (index ? 0.0F : d3d11_peripheral_dlaa_preparation_gpu_ms())
+            << ",\"peripheral_total_ms\":" << (index ? 0.0F : d3d11_peripheral_dlaa_total_gpu_ms())
             << ",\"runtime_loaded\":" << d.runtime_loaded << ",\"streamline\":" << d.streamline_detected
             << ",\"direct_detour\":" << d.direct_detour_installed << ",\"has_private_result\":" << d.has_private_result
             << ",\"private_result\":" << d.last_private_result << ",\"nr_full_ms\":" << d.full_dlss_nr_gpu_ms
