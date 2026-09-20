@@ -38,7 +38,7 @@ double field(const std::string& text, const char* name) {
 }
 void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn get,
     std::uint64_t attachment, ID3D11Device* device, ID3D11DeviceContext* context, HMODULE ngx,
-    const std::filesystem::path& log_path) {
+    const std::filesystem::path& log_path,bool depth24=false) {
     using namespace cheeky::foveated_dlss;
     using Init = NgxResult (*)(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned);
     using Create = NgxResult (*)(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle**);
@@ -64,8 +64,16 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
         desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
         desc.Format = i == 1 ? DXGI_FORMAT_R32_FLOAT : i == 2 ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+        if(depth24 && i==1){desc.Format=DXGI_FORMAT_R24G8_TYPELESS;desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_DEPTH_STENCIL;}
         require(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &textures[i])), "Transport game texture");
         parameters.Set(names[i], static_cast<ID3D11Resource*>(textures[i].Get()));
+    }
+    ComPtr<ID3D11DepthStencilView> depth_target;
+    if(depth24) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC desc{};desc.Format=DXGI_FORMAT_D24_UNORM_S8_UINT;desc.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D;
+        require(SUCCEEDED(device->CreateDepthStencilView(textures[1].Get(),&desc,&depth_target)),"24-bit depth target");
+        context->ClearDepthStencilView(depth_target.Get(),D3D11_CLEAR_DEPTH,.375F,0);
+        context->OMSetRenderTargets(0,nullptr,depth_target.Get());
     }
     NgxHandle* handle{};
     require(ngx_succeeded(proc<Create>(ngx, "NVSDK_NGX_D3D11_CreateFeature")(context, 1, &parameters, &handle)), "Create DX11 game feature");
@@ -75,10 +83,11 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     require(command(attachment, "1\n20\nset\nEnabled=true\nWidth=0.63\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nD3D11D3D12Transport=true\nNrEnabled=false"), "Enable standalone DX11 transport");
     bool active{};
     for (unsigned i = 0; i < 100 && !active; ++i) {
+        if(depth24)parameters.values=original_parameters;
         require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "DX11 transport evaluation");
         context->Flush();
-        require(parameters.values == original_parameters, "Transport preserves the original game parameters");
         active = contains(snapshot(get), "\"execution_path\":\"DX12 Transport\"");
+        if(!depth24 || active)require(parameters.values == original_parameters, "Transport preserves the original game parameters");
         if (!active) Sleep(25);
     }
     if (!active) puts(snapshot(get).c_str());
@@ -102,6 +111,12 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
         require(nr_active, "Before/After NR executes through standalone DX11 transport");
         require(contains(snapshot(get), "\"observer\":{\"ready\":true"), "Private transport installs its native queue observer for NR");
         require(field(snapshot(get), "submissions") > 0, "Observer sees actual private transport submissions");
+    }
+    if(depth24) {
+        ComPtr<ID3D11DepthStencilView> restored;context->OMGetRenderTargets(0,nullptr,&restored);
+        require(restored.Get()==depth_target.Get(),"Depth conversion restores the game's depth target");
+        context->OMSetRenderTargets(0,nullptr,nullptr);release(handle);
+        puts("PASS 24-bit DX11 depth transport and before/after NR, full/foveated");return;
     }
     // Drain every ring slot, then resize only NR. Unchanged SR/peripheral GPU
     // textures must survive, even though the NR feature itself gets rebuilt.
@@ -170,7 +185,7 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
 
 int main(int argc, char** argv) {
     try {
-        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{};
+        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{};
         unsigned openvr_version{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -178,6 +193,7 @@ int main(int argc, char** argv) {
             else if (arg == "--conflict") conflict = true;
             else if (arg == "--optiscaler") optiscaler = true;
             else if (arg == "--transport") { transport = true; dx11 = true; }
+            else if (arg == "--transport-depth24") { transport = dx11 = depth24 = true; }
             else if (arg == "--transport-forwarded") { transport = true; dx11 = true; forwarded_transport = true; }
             else if (arg.starts_with("--openvr-late-")) {
                 openvr_version = static_cast<unsigned>(std::stoul(arg.substr(14)));
@@ -263,7 +279,7 @@ int main(int argc, char** argv) {
         input.host = optiscaler ? CheekyRuntimeHost::optiscaler : CheekyRuntimeHost::standalone;
         auto bad = input; ++bad.abi; require(!start(&bad), "Reject unknown ABI");
         bad = input; --bad.size; require(!start(&bad), "Reject invalid Start size");
-        bad = input; bad.renderer = 2; require(!start(&bad), "Reject unsupported renderer");
+        bad = input; bad.renderer = UINT32_MAX; require(!start(&bad), "Reject unsupported renderer");
         bad = input; bad.host = static_cast<CheekyRuntimeHost>(99); require(!start(&bad), "Reject unknown host");
         if (conflict) {
             require(!start(&input) && attachment == 0, "Generic host cannot steal another integration's owner");
@@ -331,7 +347,8 @@ int main(int argc, char** argv) {
             require(contains(snapshot(get), "\"D3D11D3D12Transport\":true"), "Transport preference retained");
         }
         if (transport) verify_transport(command, get, attachment, device11.Get(), context11.Get(), fake_ngx,
-            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"));
+            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24);
+        if(depth24){detach(attachment);return 0;}
         CheekyUEVRStereoProjection projection;
         require(!publish_stereo(attachment, &projection) && !publish_mode(attachment, 3), "UEVR-only publications reject generic host attachments");
         std::uint64_t duplicate = 99;

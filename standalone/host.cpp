@@ -9,10 +9,12 @@
 #include <wrl/client.h>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <vector>
+#include <utility>
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -29,8 +31,24 @@ CheekyRuntimeSnapshotFn runtime_snapshot{};
 CheekyRuntimeDetachFn runtime_detach{};
 thread_local bool internal{};
 struct InternalScope { bool prior{internal}; InternalScope() { internal = true; } ~InternalScope() { internal = prior; } };
-struct Hook { void* target; void* original; };
+struct Hook { void* target; void* handler; };
 std::vector<Hook> hooks;
+// A hook's continuation belongs to its entry point, not the object's current
+// vtable. Other injectors may replace that table and forward back through us.
+constexpr std::size_t max_method_hooks=128;
+std::array<std::atomic<void*>,max_method_hooks> continuations{};
+template<auto Handler,class Signature> struct MethodEntry;
+template<auto Handler,class Result,class... Args>
+struct MethodEntry<Handler,Result(STDMETHODCALLTYPE*)(Args...)> {
+    using Function=Result(STDMETHODCALLTYPE*)(Args...);
+    template<std::size_t Index> static Result STDMETHODCALLTYPE call(Args... args) {
+        const auto next=reinterpret_cast<Function>(continuations[Index].load(std::memory_order_acquire));
+        return Handler(next,args...);
+    }
+    template<std::size_t... Index> static auto entries(std::index_sequence<Index...>) {
+        return std::array<Function,sizeof...(Index)>{&call<Index>...};
+    }
+};
 constexpr GUID queue_key{0x1a149631,0x8908,0x4f69,{0xb8,0x35,0x75,0xf9,0x01,0xb2,0x98,0x31}};
 constexpr GUID color_key{0x721c2760,0x327d,0x46cf,{0x94,0x82,0x55,0x3d,0x2e,0xf9,0x13,0xe6}};
 // Deliberately not the presentation queue: only used to discover native observer
@@ -49,20 +67,20 @@ void log_host(const char* message) noexcept {
 }
 
 void* method(void* object, unsigned slot) { return (*static_cast<void***>(object))[slot]; }
-template<class T> T original(void* object, unsigned slot) {
+template<class Signature,auto Handler> bool hook_method(void* object, unsigned slot) {
     const auto target = method(object, slot);
     std::lock_guard lock(hooks_mutex);
-    for (const auto& hook : hooks) if (hook.target == target) return reinterpret_cast<T>(hook.original);
-    return nullptr;
-}
-bool hook_method(void* object, unsigned slot, void* detour) {
-    const auto target = method(object, slot);
-    std::lock_guard lock(hooks_mutex);
-    for (const auto& hook : hooks) if (hook.target == target) return true;
+    const auto handler=reinterpret_cast<void*>(Handler);
+    for (const auto& hook : hooks) if (hook.target == target) return hook.handler==handler;
+    if(hooks.size()==max_method_hooks)return false;
+    const auto index=hooks.size();
+    static const auto entries=MethodEntry<Handler,Signature>::entries(std::make_index_sequence<max_method_hooks>{});
+    const auto detour=reinterpret_cast<void*>(entries[index]);
     void* trampoline{};
     if (MH_CreateHook(target, detour, &trampoline) != MH_OK) return false;
     // Publish before enabling: another game thread can enter immediately.
-    hooks.push_back({target, trampoline});
+    continuations[index].store(trampoline,std::memory_order_release);
+    hooks.push_back({target, handler});
     if (MH_EnableHook(target) == MH_OK) return true;
     hooks.pop_back(); MH_RemoveHook(target); return false;
 }
@@ -112,8 +130,7 @@ using Present1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*,UINT,UINT,const 
 using ResizeFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*,UINT,UINT,UINT,DXGI_FORMAT,UINT);
 using Resize1Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*,UINT,UINT,UINT,DXGI_FORMAT,UINT,const UINT*,IUnknown* const*);
 using ColorSpaceFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*,DXGI_COLOR_SPACE_TYPE);
-HRESULT STDMETHODCALLTYPE color_space(IDXGISwapChain3* chain, DXGI_COLOR_SPACE_TYPE value) {
-    auto next = original<ColorSpaceFn>(chain,38);
+HRESULT color_space(ColorSpaceFn next, IDXGISwapChain3* chain, DXGI_COLOR_SPACE_TYPE value) {
     auto result = next ? next(chain,value) : E_UNEXPECTED;
     if (SUCCEEDED(result)) {
         const auto color=static_cast<UINT>(value);
@@ -121,29 +138,25 @@ HRESULT STDMETHODCALLTYPE color_space(IDXGISwapChain3* chain, DXGI_COLOR_SPACE_T
     }
     return result;
 }
-HRESULT STDMETHODCALLTYPE present(IDXGISwapChain* chain, UINT sync, UINT flags) {
-    auto next = original<PresentFn>(chain, 8);
+HRESULT present(PresentFn next, IDXGISwapChain* chain, UINT sync, UINT flags) {
     present_frame(chain, flags);
     InternalScope guard;
     return next ? next(chain, sync, flags) : E_UNEXPECTED;
 }
-HRESULT STDMETHODCALLTYPE present1(IDXGISwapChain1* chain, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* params) {
-    auto next = original<Present1Fn>(chain, 22);
+HRESULT present1(Present1Fn next, IDXGISwapChain1* chain, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* params) {
     present_frame(chain, flags);
     InternalScope guard;
     return next ? next(chain, sync, flags, params) : E_UNEXPECTED;
 }
-HRESULT STDMETHODCALLTYPE resize(IDXGISwapChain* chain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
-    auto next = original<ResizeFn>(chain, 13);
+HRESULT resize(ResizeFn next, IDXGISwapChain* chain, UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags) {
     if (internal) return next ? next(chain,count,width,height,format,flags) : E_UNEXPECTED;
     InternalScope guard;
     std::lock_guard lock(frame_mutex);
     cheeky::standalone::overlay_before_resize(chain);
     return next ? next(chain, count, width, height, format, flags) : E_UNEXPECTED;
 }
-HRESULT STDMETHODCALLTYPE resize1(IDXGISwapChain3* chain, UINT count, UINT width, UINT height, DXGI_FORMAT format,
+HRESULT resize1(Resize1Fn next, IDXGISwapChain3* chain, UINT count, UINT width, UINT height, DXGI_FORMAT format,
         UINT flags, const UINT* masks, IUnknown* const* queues) {
-    auto next = original<Resize1Fn>(chain, 39);
     if (internal) return next ? next(chain,count,width,height,format,flags,masks,queues) : E_UNEXPECTED;
     InternalScope guard;
     std::lock_guard lock(frame_mutex);
@@ -169,15 +182,15 @@ bool observe_chain(IDXGISwapChain* chain, IUnknown* source) {
         if (SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&queue))) && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
             chain->SetPrivateDataInterface(queue_key, queue.Get());
     }
-    bool ok = hook_method(chain,8,reinterpret_cast<void*>(&present));
-    ok = hook_method(chain,13,reinterpret_cast<void*>(&resize)) && ok;
+    bool ok = hook_method<PresentFn,present>(chain,8);
+    ok = hook_method<ResizeFn,resize>(chain,13) && ok;
     ComPtr<IDXGISwapChain1> chain1;
     if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&chain1))))
-        ok = hook_method(chain1.Get(),22,reinterpret_cast<void*>(&present1)) && ok;
+        ok = hook_method<Present1Fn,present1>(chain1.Get(),22) && ok;
     ComPtr<IDXGISwapChain3> chain3;
     if (SUCCEEDED(chain->QueryInterface(IID_PPV_ARGS(&chain3))))
-        ok = hook_method(chain3.Get(),39,reinterpret_cast<void*>(&resize1)) && ok;
-    if (chain3) ok = hook_method(chain3.Get(),38,reinterpret_cast<void*>(&color_space)) && ok;
+        ok = hook_method<Resize1Fn,resize1>(chain3.Get(),39) && ok;
+    if (chain3) ok = hook_method<ColorSpaceFn,color_space>(chain3.Get(),38) && ok;
     if (!internal && started) {
         std::lock_guard lock(frame_mutex); auto queue = chain_queue(chain); tick(chain,queue.Get());
         char text[192]{};
@@ -190,29 +203,25 @@ using CreateFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*,IUnknown*,DXGI_SWAP_C
 using HwndFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*,IUnknown*,HWND,const DXGI_SWAP_CHAIN_DESC1*,const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,IDXGIOutput*,IDXGISwapChain1**);
 using CoreFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*,IUnknown*,IUnknown*,const DXGI_SWAP_CHAIN_DESC1*,IDXGIOutput*,IDXGISwapChain1**);
 using CompositionFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*,IUnknown*,const DXGI_SWAP_CHAIN_DESC1*,IDXGIOutput*,IDXGISwapChain1**);
-HRESULT STDMETHODCALLTYPE create_chain(IDXGIFactory* f,IUnknown* d,DXGI_SWAP_CHAIN_DESC* desc,IDXGISwapChain** out) {
-    auto next = original<CreateFn>(f,10);
+HRESULT create_chain(CreateFn next,IDXGIFactory* f,IUnknown* d,DXGI_SWAP_CHAIN_DESC* desc,IDXGISwapChain** out) {
     if (!internal && desc) cheeky::standalone::overlay_before_create(desc->OutputWindow);
     auto result = next ? next(f,d,desc,out) : E_UNEXPECTED;
     if (SUCCEEDED(result) && out && *out) { try { observe_chain(*out,d); } catch (...) {} }
     return result;
 }
-HRESULT STDMETHODCALLTYPE create_hwnd(IDXGIFactory2* f,IUnknown* d,HWND w,const DXGI_SWAP_CHAIN_DESC1* desc,
+HRESULT create_hwnd(HwndFn next,IDXGIFactory2* f,IUnknown* d,HWND w,const DXGI_SWAP_CHAIN_DESC1* desc,
         const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,IDXGIOutput* output,IDXGISwapChain1** out) {
-    auto next = original<HwndFn>(f,15);
     if (!internal) cheeky::standalone::overlay_before_create(w);
     auto result = next ? next(f,d,w,desc,fullscreen,output,out) : E_UNEXPECTED;
     if (SUCCEEDED(result) && out && *out) { try { observe_chain(*out,d); } catch (...) {} }
     return result;
 }
-HRESULT STDMETHODCALLTYPE create_core(IDXGIFactory2* f,IUnknown* d,IUnknown* w,const DXGI_SWAP_CHAIN_DESC1* desc,IDXGIOutput* output,IDXGISwapChain1** out) {
-    auto next = original<CoreFn>(f,16);
+HRESULT create_core(CoreFn next,IDXGIFactory2* f,IUnknown* d,IUnknown* w,const DXGI_SWAP_CHAIN_DESC1* desc,IDXGIOutput* output,IDXGISwapChain1** out) {
     auto result = next ? next(f,d,w,desc,output,out) : E_UNEXPECTED;
     if (SUCCEEDED(result) && out && *out) { try { observe_chain(*out,d); } catch (...) {} }
     return result;
 }
-HRESULT STDMETHODCALLTYPE create_composition(IDXGIFactory2* f,IUnknown* d,const DXGI_SWAP_CHAIN_DESC1* desc,IDXGIOutput* output,IDXGISwapChain1** out) {
-    auto next = original<CompositionFn>(f,24);
+HRESULT create_composition(CompositionFn next,IDXGIFactory2* f,IUnknown* d,const DXGI_SWAP_CHAIN_DESC1* desc,IDXGIOutput* output,IDXGISwapChain1** out) {
     auto result = next ? next(f,d,desc,output,out) : E_UNEXPECTED;
     if (SUCCEEDED(result) && out && *out) { try { observe_chain(*out,d); } catch (...) {} }
     return result;
@@ -229,10 +238,10 @@ bool install_graphics_hooks() {
     auto factory_fn = reinterpret_cast<HRESULT(WINAPI*)(REFIID,void**)>(GetProcAddress(dxgi,"CreateDXGIFactory1"));
     ComPtr<IDXGIFactory2> factory;
     if (!factory_fn || FAILED(factory_fn(IID_PPV_ARGS(&factory)))) return false;
-    if (!hook_method(factory.Get(),10,reinterpret_cast<void*>(&create_chain)) ||
-        !hook_method(factory.Get(),15,reinterpret_cast<void*>(&create_hwnd)) ||
-        !hook_method(factory.Get(),16,reinterpret_cast<void*>(&create_core)) ||
-        !hook_method(factory.Get(),24,reinterpret_cast<void*>(&create_composition))) return false;
+    if (!hook_method<CreateFn,create_chain>(factory.Get(),10) ||
+        !hook_method<HwndFn,create_hwnd>(factory.Get(),15) ||
+        !hook_method<CoreFn,create_core>(factory.Get(),16) ||
+        !hook_method<CompositionFn,create_composition>(factory.Get(),24)) return false;
     // Discover Present implementations for swapchains created before ASI attach.
     // The window is hidden, created and destroyed on this initialization thread.
     HWND window = CreateWindowExW(0,L"STATIC",L"Cheeky graphics discovery",WS_POPUP,0,0,16,16,nullptr,nullptr,module,nullptr);

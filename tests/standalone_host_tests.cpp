@@ -6,6 +6,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <array>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
@@ -20,6 +21,12 @@ template<class T> T proc(HMODULE m,const char* name) {
     auto result=reinterpret_cast<T>(GetProcAddress(m,name)); require(result!=nullptr,name); return result;
 }
 ComPtr<IDXGISwapChain1> chain;
+using HwndFn=HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory2*,IUnknown*,HWND,const DXGI_SWAP_CHAIN_DESC1*,const DXGI_SWAP_CHAIN_FULLSCREEN_DESC*,IDXGIOutput*,IDXGISwapChain1**);
+HwndFn chained_hwnd{};
+HRESULT STDMETHODCALLTYPE wrapper_hwnd(IDXGIFactory2* factory,IUnknown* device,HWND window,const DXGI_SWAP_CHAIN_DESC1* desc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fullscreen,IDXGIOutput* output,IDXGISwapChain1** result) {
+    return chained_hwnd(factory,device,window,desc,fullscreen,output,result);
+}
 bool (*send)(const char*);
 void command(const char* text) { require(send(text),"Host command accepted"); }
 void frame() { check(chain->Present(0,0),"Host presentation callback"); }
@@ -31,6 +38,7 @@ int main(int argc,char** argv) {
     try {
         const std::string mode=argc>1 ? argv[1] : "dx12";
         const bool dx11=mode.find("dx11")!=std::string::npos;
+        const bool chained_table=mode.find("method-chain")!=std::string::npos;
         const bool streamline=mode.find("streamline")!=std::string::npos;
         const bool c_callback=mode.ends_with("-c");
         const unsigned host=argc>2 && std::string(argv[2])=="optiscaler" ? 2U : 1U;
@@ -40,7 +48,7 @@ int main(int argc,char** argv) {
         std::filesystem::create_directories(root);
         for (const auto* name : {L"CheekyFoveatedDLSSHost.dll",L"CheekyFoveatedDLSSRuntime.dll"})
             std::filesystem::copy_file(bin/"CheekyFoveatedDLSS"/name,root/name);
-        std::filesystem::copy_file(bin/"test-fixtures"/"nvngx_dlss.dll",root/"nvngx_dlssnr.dll");
+        if(!chained_table)std::filesystem::copy_file(bin/"test-fixtures"/"nvngx_dlss.dll",root/"nvngx_dlssnr.dll");
         // Exercise the direct DX11 route here. A separate suite exercises its
         // optional DX12 transport and NR; settings must not select it implicitly.
         std::ofstream(root/"CheekyFoveatedDLSS.ini") << "[CheekyFoveatedDLSS]\nD3D11D3D12Transport=false\n";
@@ -53,7 +61,7 @@ int main(int argc,char** argv) {
             check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)),"DX12");
             D3D12_COMMAND_QUEUE_DESC desc{}; check(d12->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue)),"Queue");
         }
-        prepare_late_attach_test(bin,d11.Get(),d12.Get(),queue.Get(),c_callback,streamline);
+        if(!chained_table)prepare_late_attach_test(bin,d11.Get(),d12.Get(),queue.Get(),c_callback,streamline);
         auto dll=LoadLibraryExW((root/L"CheekyFoveatedDLSSHost.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
         require(dll!=nullptr,"Load actual standalone host");
         const auto start=proc<CheekyHostStartFn>(dll,"CheekyHost_Start");
@@ -66,7 +74,25 @@ int main(int argc,char** argv) {
         DXGI_SWAP_CHAIN_DESC1 desc{}; desc.Width=320; desc.Height=240; desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count=1; desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; desc.BufferCount=2;
         desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        check(factory->CreateSwapChainForHwnd(dx11 ? static_cast<IUnknown*>(d11.Get()) : queue.Get(),window,&desc,nullptr,nullptr,&chain),"Observed game swapchain");
+        // A second mod can replace an object's vtable entry while forwarding
+        // to the native method Cheeky already detoured. The hook must select
+        // its trampoline by its entry point, not the now-replaced vtable entry.
+        auto** native_table=*reinterpret_cast<void***>(factory.Get());
+        std::array<void*,28> wrapper_table{};
+        if(chained_table) {
+            std::copy_n(native_table,wrapper_table.size(),wrapper_table.begin());
+            chained_hwnd=reinterpret_cast<HwndFn>(native_table[15]);wrapper_table[15]=reinterpret_cast<void*>(&wrapper_hwnd);
+            *reinterpret_cast<void***>(factory.Get())=wrapper_table.data();
+        }
+        const auto created=factory->CreateSwapChainForHwnd(dx11 ? static_cast<IUnknown*>(d11.Get()) : queue.Get(),window,&desc,nullptr,nullptr,&chain);
+        if(chained_table)*reinterpret_cast<void***>(factory.Get())=native_table;
+        std::printf("Game swapchain creation: 0x%08lX\n",static_cast<unsigned long>(created));
+        check(created,"Observed game swapchain");
+        if(chained_table){
+            frame();check(chain->ResizeBuffers(2,400,300,DXGI_FORMAT_UNKNOWN,0),"Chained host resize");frame();
+            chain.Reset();DestroyWindow(window);
+            std::puts("PASS: chained factory vtable preserves creation, presentation and resize");return 0;
+        }
         frame();
         auto state=snapshot(get);
         require(state.find("\"ready\":true")!=state.npos,"Graphics independently discovered");

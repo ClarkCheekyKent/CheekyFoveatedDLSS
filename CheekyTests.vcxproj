@@ -47,6 +47,8 @@
     <ClCompile Include="src\eye_calibration.cpp" />
     <ClCompile Include="src\eye_calibration_d3d12.cpp" />
     <ClCompile Include="tests\d3d12_composite_tests.cpp" />
+    <ClCompile Include="tests\d3d11_binding_tests.cpp" />
+    <ClCompile Include="src\d3d11_backend.cpp" />
     <ClCompile Include="tests\motion_resample_tests.cpp" />
     <ClCompile Include="tests\d3d12_history_tests.cpp" />
     <ClCompile Include="src\d3d12_backend.cpp" />

@@ -4,6 +4,7 @@
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
 #include "crop_motion.hpp"
+#include "d3d11_write_bindings.hpp"
 
 #include <d3dcompiler.h>
 
@@ -1273,6 +1274,7 @@ void finish_d3d11(
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(evaluation->constant_buffer, 0U);
 
+    D3D11WriteBindingsScope write_bindings(context);
     ID3D11ComputeShader* previous_shader{};
     std::array<ID3D11ClassInstance*, 256U> previous_classes{};
     UINT previous_class_count = static_cast<UINT>(previous_classes.size());
@@ -1416,6 +1418,7 @@ bool composite_d3d11_crop(
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(resources->constant_buffer, 0U);
 
+    D3D11WriteBindingsScope write_bindings(context);
     ID3D11ComputeShader* previous_shader{};
     std::array<ID3D11ClassInstance*, 256U> previous_classes{};
     UINT previous_class_count = static_cast<UINT>(previous_classes.size());

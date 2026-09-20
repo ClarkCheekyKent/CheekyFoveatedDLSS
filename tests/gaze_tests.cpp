@@ -2057,7 +2057,9 @@ void test_afw_gaze_pixel_coverage() {
 int run_d3d12_history_tests();
 
 int run_vulkan_tests(bool real=false, bool integration=false);
+int run_d3d11_binding_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--d3d11-bindings") == 0) return run_d3d11_binding_tests();
     if (argc == 2 && std::strcmp(argv[1], "--vulkan-layer-model") == 0) return run_vulkan_tests(true,true);
     if (argc == 2 && std::strcmp(argv[1], "--vulkan-model") == 0) return run_vulkan_tests(true);
     if (argc == 2 && std::strcmp(argv[1], "--vulkan") == 0) return run_vulkan_tests();

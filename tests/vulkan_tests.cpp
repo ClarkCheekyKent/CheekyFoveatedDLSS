@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <vector>
 #include <cmath>
+#include <array>
 
 using namespace cheeky::foveated_dlss;
 namespace cheeky::foveated_dlss {
@@ -17,11 +18,16 @@ HMODULE find_loaded_ngx_core_runtime() noexcept {return GetModuleHandleW(L"_nvng
 }
 extern "C" PFN_vkVoidFunction VKAPI_CALL CheekyVkGetDeviceProcAddr(VkDevice,const char*);
 namespace {
-void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
+void require(bool ok,const char* message){if(!ok){std::fprintf(stderr,"Vulkan check failed: %s\n",message);throw std::runtime_error(message);}}
 VulkanDeviceApi api;
 unsigned creations{},releases{},evaluations{};
 struct FakeFeature {unsigned type{},quality{};};
 unsigned nr_evaluations{},peripheral_evaluations{};
+VulkanNgxResource* original_motion{};
+VkBuffer motion_readback{};
+VkDeviceSize motion_readback_offset{};
+bool inspect_motion{},expect_converted_motion{};
+int expected_history_reset{-1};
 template<class T> T load(const char* name){return reinterpret_cast<T>(api.gdpa(api.device,name));}
 NgxResult create(VkCommandBuffer,unsigned feature,NgxParameters* p,NgxHandle** out) {
     require((feature==1 || feature==18) && get_ui(p,"Width") && get_ui(p,"OutWidth"),"private create contract");
@@ -34,6 +40,21 @@ NgxResult evaluate(VkCommandBuffer cmd,const NgxHandle* handle,const NgxParamete
     const auto& image=static_cast<VulkanNgxResource*>(value)->resource.image;
     require(image.width==get_ui(p,"OutWidth") && image.height==get_ui(p,"OutHeight"),"private output extent");
     const bool nr=feature.type==18,peripheral=feature.quality==5;
+    if(expected_history_reset>=0 && !nr && !peripheral)
+        require(get_ui(p,"Reset")==static_cast<unsigned>(expected_history_reset),"private history must reset after a bypass and stay warm on consecutive frames");
+    if(inspect_motion && !nr && !peripheral) {
+        void* mv{};require(ngx_succeeded(p->Get("MotionVectors",&mv)),"motion binding");
+        require((mv!=original_motion)==expect_converted_motion,"fixed crop must preserve game motion resource; moving crop must convert");
+        const auto x=get_ui(p,"DLSS.Input.MV.Subrect.Base.X"),y=get_ui(p,"DLSS.Input.MV.Subrect.Base.Y");
+        require(x==(expect_converted_motion?0U:get_ui(p,"DLSS.Input.Color.Subrect.Base.X")) &&
+            y==(expect_converted_motion?0U:get_ui(p,"DLSS.Input.Depth.Subrect.Base.Y")),"motion crop coordinates");
+        const auto& source=static_cast<VulkanNgxResource*>(mv)->resource.image;
+        vulkan_barrier(api,cmd,source,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};copy.bufferOffset=motion_readback_offset;copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        copy.imageOffset={static_cast<int>(x),static_cast<int>(y),0};copy.imageExtent={1,1,1};
+        load<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(cmd,source.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,motion_readback,1,&copy);
+        vulkan_barrier(api,cmd,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL);
+    }
     const VkClearColorValue color{{nr||peripheral?1.0F:0, nr?0.0F:1,0,1}};
     load<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(cmd,image.image,VK_IMAGE_LAYOUT_GENERAL,&color,1,&image.range);
     if(nr)++nr_evaluations;else {++evaluations;if(peripheral)++peripheral_evaluations;}return 1;
@@ -111,7 +132,7 @@ int run_vulkan_tests(bool real, bool integration) {
         require(color.create(api,input_size,input_size,VK_FORMAT_R32G32B32A32_SFLOAT) && depth.create(api,input_size,input_size,VK_FORMAT_R32_SFLOAT) &&
             motion.create(api,input_size,input_size,VK_FORMAT_R32G32_SFLOAT) && output.create(api,output_size,output_size,VK_FORMAT_R32G32B32A32_SFLOAT),"test images");
         VkBuffer readback{};VkDeviceMemory memory{};
-        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=output_size*output_size*16;bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bi.size=output_size*output_size*16+16;bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         require(api.CreateBuffer(device,&bi,nullptr,&readback)==VK_SUCCESS,"readback buffer");
         VkMemoryRequirements mr{};api.GetBufferMemoryRequirements(device,readback,&mr);
         unsigned type{};const auto flags=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -119,6 +140,7 @@ int run_vulkan_tests(bool real, bool integration) {
         require(type<api.memory.memoryTypeCount,"readback memory type");
         VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ma.allocationSize=mr.size;ma.memoryTypeIndex=type;
         require(api.AllocateMemory(device,&ma,nullptr,&memory)==VK_SUCCESS && api.BindBufferMemory(device,readback,memory,0)==VK_SUCCESS,"readback memory");
+        original_motion=&motion.ngx;motion_readback=readback;motion_readback_offset=output_size*output_size*16;
         MockNgxParameters p;p.Set("Width",input_size);p.Set("Height",input_size);p.Set("OutWidth",output_size);p.Set("OutHeight",output_size);
         p.Set("DLSS.Feature.Create.Flags",real?66U:2U);p.Set("PerfQualityValue",real?5U:1U);p.Set("MV.Scale.X",1.0F);p.Set("MV.Scale.Y",1.0F);
         p.Set("Color",static_cast<void*>(&color.ngx));p.Set("Depth",static_cast<void*>(&depth.ngx));p.Set("MotionVectors",static_cast<void*>(&motion.ngx));p.Set("Output",static_cast<void*>(&output.ngx));
@@ -151,11 +173,13 @@ int run_vulkan_tests(bool real, bool integration) {
                 b.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;b.newLayout=VK_IMAGE_LAYOUT_GENERAL;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
                 b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
                 barrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
-                const VkClearColorValue fill{{0,0,image==&color?1.0F:0.0F,1}};
+                const VkClearColorValue fill{{!real && image==&motion?4.0F:0.0F,!real && image==&motion?-2.0F:0.0F,image==&color?1.0F:0.0F,1}};
                 load<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(cmd,b.image,VK_IMAGE_LAYOUT_GENERAL,&fill,1,&b.subresourceRange);
             }
             DlssFrameContract contract{};require(read_ngx_frame_contract(&p,123,1,contract),"frame decode");
             if(frame==2)settings.width=.75F;
+            if(!real)settings.height_offset=frame==3?.25F:0.0F;
+            inspect_motion=!real && frame<8;expect_converted_motion=frame==3 || frame==4;
             if(frame==4){settings.peripheral_dlaa_enabled=true;settings.alignment_border_enabled=false;}
             if(frame==6){settings.peripheral_dlaa_enabled=false;settings.nr_enabled=true;settings.nr_width=settings.nr_height=.5F;settings.nr_transition_width=0;}
             if(frame==7)settings.nr_processing_order=NrProcessingOrder::before_upscaling;
@@ -189,6 +213,11 @@ int run_vulkan_tests(bool real, bool integration) {
                 require(finite==output_size*output_size*4 && energy>output_size*output_size*.1,"real model pixels invalid");
                 if(frame>=6)require(vulkan_backend_status().nr_active==frame-5,"real NR evaluation failed");
             }else {
+            if(inspect_motion) {
+                const auto* mv=pixels+output_size*output_size*4;
+                require(std::abs(mv[0]-4.0F)<.001F && std::abs(mv[1]-(frame==3?2.0F:frame==4?-6.0F:-2.0F))<.001F,
+                    "motion values changed for fixed crop or wrong moving-crop correction");
+            }
             const auto center=(64*128+64)*4;
             if(frame==6 || frame==8)require(pixels[center]>.99F && pixels[center+1]<.01F,"post-SR NR output missing");
             else require(std::abs(pixels[center+1]-1)<.01F && pixels[center]<.01F,"center is not private DLSS output");
@@ -201,6 +230,43 @@ int run_vulkan_tests(bool real, bool integration) {
             api.UnmapMemory(device,memory);
         }
         if(!real)require(creations==6 && evaluations==11 && nr_evaluations==3 && peripheral_evaluations==2,"feature cache or pass count mismatch");
+        if(!real) {
+            // Worker threads can retain more command recordings than there are
+            // queued frames. A single mono view must handle the whole rotation.
+            std::array<VkCommandBuffer,16> rotation{};cai.commandBufferCount=static_cast<unsigned>(rotation.size());
+            require(reinterpret_cast<PFN_vkAllocateCommandBuffers>(observed(device,"vkAllocateCommandBuffers"))(device,&cai,rotation.data())==VK_SUCCESS,"rotation command buffers");
+            Settings fixed;fixed.auto_stereo_alignment=false;fixed.width=fixed.height=.5F;fixed.x_offset=fixed.height_offset=0;
+            fixed.peripheral_dlaa_enabled=false;fixed.nr_enabled=false;fixed.transition_width=0;fixed.alignment_border_enabled=true;
+            inspect_motion=false;
+            for(unsigned frame=0;frame<rotation.size()*2;++frame) {
+                const auto recording=rotation[frame%rotation.size()];
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                require(reinterpret_cast<PFN_vkBeginCommandBuffer>(observed(device,"vkBeginCommandBuffer"))(recording,&begin)==VK_SUCCESS,"begin rotation command");
+                vulkan_barrier(api,recording,output.ngx.resource.image,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL);
+                DlssFrameContract contract{};require(read_ngx_frame_contract(&p,456,1,contract),"rotation frame contract");NgxResult result{};
+                if(frame==16) {
+                    auto missing=contract;missing.mv_base_x=UINT32_MAX;
+                    require(!evaluate_vulkan_backend(recording,&p,missing,fixed,callbacks,result),"invalid motion region must bypass");
+                }
+                expected_history_reset=frame==0 || frame==16?1:0;
+                const bool handled=evaluate_vulkan_backend(recording,&p,contract,fixed,callbacks,result);
+                if(!handled)std::printf("Rotation frame %u: %s\n",frame,vulkan_backend_status().reason);
+                require(handled,"mono command rotation bypassed Cheeky");
+                vulkan_barrier(api,recording,output.ngx.resource.image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={output_size,output_size,1};
+                load<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(recording,output.ngx.resource.image.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback,1,&copy);
+                require(load<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(recording)==VK_SUCCESS,"end rotation command");
+                VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.commandBufferCount=1;submit.pCommandBuffers=&recording;
+                require(reinterpret_cast<PFN_vkQueueSubmit>(observed(device,"vkQueueSubmit"))(queue,1,&submit,VK_NULL_HANDLE)==VK_SUCCESS,"rotation submit");
+                require(load<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(queue)==VK_SUCCESS,"rotation completion");
+                float* pixels{};require(api.MapMemory(device,memory,0,bi.size,0,reinterpret_cast<void**>(&pixels))==VK_SUCCESS,"rotation readback");
+                require(pixels[(64*128+32)*4]>.99F,"border disappeared during command-buffer rotation");api.UnmapMemory(device,memory);
+            }
+            expected_history_reset=-1;
+            vulkan_release_view(456);
+            reinterpret_cast<PFN_vkFreeCommandBuffers>(observed(device,"vkFreeCommandBuffers"))(device,pool,static_cast<unsigned>(rotation.size()),rotation.data());
+            std::puts("PASS mono view: border present across 32 frames using 16 command buffers; history reset after bypass");
+        }
         std::puts("Test releasing game feature");
         if(integrated_feature)real_sr.release(integrated_feature);
         if(!integration){vulkan_release_view(123);vulkan_forget_command(cmd);vulkan_backend_release_device(device);}

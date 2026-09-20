@@ -39,6 +39,7 @@ struct View {
     VulkanPeripheralHistory peripheral;
     VulkanNrHistory nr;
     std::deque<Slot> slots;
+    unsigned diagnostic_frames{};
 };
 struct Pipelines {
     std::shared_ptr<VulkanDeviceApi> api;
@@ -118,7 +119,24 @@ bool evaluate_vulkan_backend(VkCommandBuffer cmd,const NgxParameters* original,c
     auto c=input_contract;
     std::lock_guard lock(mutex);
     ++stats.calls;stats.input_width=c.render_width;stats.input_height=c.render_height;stats.output_width=c.output_width;stats.output_height=c.output_height;
-    const auto skip=[&](const char* reason){++stats.passthrough;stats.reason=reason;return false;};
+    const auto skip=[&](const char* reason){
+        ++stats.passthrough;stats.reason=reason;
+        // The next frame's vectors refer to a frame our private features did
+        // not evaluate. Their histories cannot be resumed across that gap.
+        const auto it=views.find(c.view_id);
+        if(it!=views.end()) {
+            if(it->second.feature)it->second.feature->history=false;
+            it->second.nr.valid=false;it->second.peripheral.valid=false;
+        }
+        if(settings.enabled || settings.nr_enabled) {
+            static std::uint64_t logged_skips{};const auto n=++logged_skips;
+            if(n<=16 || (n&(n-1))==0)
+                trace_event("Vulkan bypass view=%llu cmd=%p count=%llu active=%llu bypass=%llu recordings=%zu reason=%s",
+                    static_cast<unsigned long long>(c.view_id),cmd,n,stats.active,stats.passthrough,
+                    it==views.end()?0U:it->second.slots.size(),reason);
+        }
+        return false;
+    };
     bool handled{};
     try {
         collect();
@@ -154,7 +172,17 @@ bool evaluate_vulkan_backend(VkCommandBuffer cmd,const NgxParameters* original,c
         auto* composite=gpu.composite(output->resource.image.format);if(!composite)return skip("Unsupported Vulkan output format");
         auto& view=views[c.view_id];if(view.api && view.api->device!=a->device){retired.push_back(std::move(view));view={};}view.api=a;
         Slot* slot{};for(auto& candidate:view.slots)if(completed(view,candidate)){slot=&candidate;break;}
-        if(!slot) {if(view.slots.size()>=8)return skip("Vulkan frame resources still in flight");view.slots.emplace_back();slot=&view.slots.back();}
+        if(!slot) {
+            // Recordings belong to worker-thread command pools, not just the
+            // frames queued on the GPU. Mono sends their whole rotation to one
+            // DLSS view, so an eight-slot limit periodically bypassed SR.
+            // Grow on demand, retaining resources until reset/free as before.
+            constexpr std::size_t max_recordings=64;
+            if(view.slots.size()>=max_recordings)return skip("Vulkan recorded command resource limit");
+            view.slots.emplace_back();slot=&view.slots.back();
+            if(view.slots.size()==9 || view.slots.size()==17 || view.slots.size()==33)
+                trace_event("Vulkan recording pool grew view=%llu recordings=%zu",static_cast<unsigned long long>(c.view_id),view.slots.size());
+        }
         slot->clear_bindings(*a);
         const auto mv=resolve_motion_region(true,c.create_flags,true,motion->resource.image.width,motion->resource.image.height,c.mv_base_x,c.mv_base_y,crop,
             c.render_width,c.render_height,c.output_width,c.output_height,c.output_base_x,c.output_base_y);
@@ -185,10 +213,9 @@ bool evaluate_vulkan_backend(VkCommandBuffer cmd,const NgxParameters* original,c
         const unsigned motion_height=c.motion_vectors_low_res?mv.rectangle.height:key.out_height;
         const bool changed=!view.feature || !(view.feature->key==key);
         if(!slot->output.create(*a,key.out_width,key.out_height,output->resource.image.format) ||
-            !slot->motion.create(*a,motion_width,motion_height,VK_FORMAT_R32G32_SFLOAT) ||
-            !slot->composite_dispatch.create(*a,*composite,sizeof(CompositeConstants)) || !slot->motion_dispatch.create(*a,gpu.motion,32) ||
-            !view_array(*a,color->resource.image,slot->game_views[0]) || !view_array(*a,output->resource.image,slot->game_views[1]) ||
-            !view_array(*a,motion->resource.image,slot->game_views[2]))return skip("Vulkan frame resource creation failed");
+            !slot->composite_dispatch.create(*a,*composite,sizeof(CompositeConstants)) ||
+            !view_array(*a,color->resource.image,slot->game_views[0]) || !view_array(*a,output->resource.image,slot->game_views[1]))
+            return skip("Vulkan frame resource creation failed");
         if(changed) {
             auto feature=std::make_shared<Feature>();feature->key=key;feature->release=callbacks.release;
             NgxParameterOverlay parameters(original);vulkan_feature_parameters(parameters,key);
@@ -202,21 +229,43 @@ bool evaluate_vulkan_backend(VkCommandBuffer cmd,const NgxParameters* original,c
         CropMotionOffset offset{};
         if(history.history && !reset && !crop_motion_offset(history.previous,crop,c.motion_vectors_low_res,c.motion_vector_scale_x,c.motion_vector_scale_y,offset))reset=true;
         if(reset)offset={};
+        // Keep the game's original view and vector representation unless crop
+        // movement or output-space supersampling actually requires conversion.
+        // This also preserves view swizzles and other layers' resource identity.
+        const bool convert_motion=offset.x!=0.0F || offset.y!=0.0F ||
+            motion_width!=mv.rectangle.width || motion_height!=mv.rectangle.height;
+        if(convert_motion && (!slot->motion.create(*a,motion_width,motion_height,VK_FORMAT_R32G32_SFLOAT) ||
+            !slot->motion_dispatch.create(*a,gpu.motion,32) || !view_array(*a,motion->resource.image,slot->game_views[2])))
+            return skip("Vulkan motion-vector conversion creation failed");
         // Every incoming image is restored before the game resumes. Only our
         // own images remain in GENERAL between submissions.
-        vulkan_prepare_image(*a,cmd,slot->output);vulkan_prepare_image(*a,cmd,slot->motion);
-        struct MotionConstants {unsigned base[2],size[2];float offset[2];unsigned source[2];};
-        const MotionConstants motion_constants{{mv.rectangle.x,mv.rectangle.y},{motion_width,motion_height},{offset.x,offset.y},{mv.rectangle.width,mv.rectangle.height}};
-        const VkImageView motion_inputs[]={slot->game_views[2]};
-        slot->motion_dispatch.record(*a,cmd,gpu.motion,motion_inputs,slot->motion.ngx.resource.image.view,&motion_constants,sizeof(motion_constants),
-            (motion_width+7)/8,(motion_height+7)/8);
-        vulkan_barrier(*a,cmd,slot->motion.ngx.resource.image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL);
+        vulkan_prepare_image(*a,cmd,slot->output);
+        if(convert_motion) {
+            vulkan_prepare_image(*a,cmd,slot->motion);
+            struct MotionConstants {unsigned base[2],size[2];float offset[2];unsigned source[2];};
+            const MotionConstants motion_constants{{mv.rectangle.x,mv.rectangle.y},{motion_width,motion_height},{offset.x,offset.y},{mv.rectangle.width,mv.rectangle.height}};
+            const VkImageView motion_inputs[]={slot->game_views[2]};
+            slot->motion_dispatch.record(*a,cmd,gpu.motion,motion_inputs,slot->motion.ngx.resource.image.view,&motion_constants,sizeof(motion_constants),
+                (motion_width+7)/8,(motion_height+7)/8);
+            vulkan_barrier(*a,cmd,slot->motion.ngx.resource.image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL);
+        }
         NgxParameterOverlay parameters(original);vulkan_feature_parameters(parameters,key);
-        parameters.Set("Output",static_cast<void*>(&slot->output.ngx));parameters.Set("MotionVectors",static_cast<void*>(&slot->motion.ngx));
+        parameters.Set("Output",static_cast<void*>(&slot->output.ngx));
+        if(convert_motion)parameters.Set("MotionVectors",static_cast<void*>(&slot->motion.ngx));
         parameters.Set("DLSS.Input.Color.Subrect.Base.X",c.color_base_x+crop.input_base_x);parameters.Set("DLSS.Input.Color.Subrect.Base.Y",c.color_base_y+crop.input_base_y);
         parameters.Set("DLSS.Input.Depth.Subrect.Base.X",c.depth_base_x+crop.input_base_x);parameters.Set("DLSS.Input.Depth.Subrect.Base.Y",c.depth_base_y+crop.input_base_y);
-        parameters.Set("DLSS.Input.MV.Subrect.Base.X",0U);parameters.Set("DLSS.Input.MV.Subrect.Base.Y",0U);
+        parameters.Set("DLSS.Input.MV.Subrect.Base.X",convert_motion?0U:mv.rectangle.x);
+        parameters.Set("DLSS.Input.MV.Subrect.Base.Y",convert_motion?0U:mv.rectangle.y);
+        parameters.Set("DLSS.Enable.Output.Subrects",0U);
         parameters.Set("DLSS.Output.Subrect.Base.X",0U);parameters.Set("DLSS.Output.Subrect.Base.Y",0U);parameters.Set("Reset",reset?1U:0U);
+        const auto diagnostic_frame=view.diagnostic_frames++;
+        if(diagnostic_frame<4 || (diagnostic_frame<14400 && diagnostic_frame%600==0))
+            trace_event("Vulkan SR motion view=%llu frame=%u input=%ux%u output=%ux%u crop=%u,%u %ux%u flags=0x%X MV=%ux%u fmt=%u base=%u,%u scale=%.6g,%.6g jitter=%.6g,%.6g reset=%u path=%s recordings=%zu calls=%llu active=%llu bypass=%llu",
+                static_cast<unsigned long long>(c.view_id),diagnostic_frame,c.render_width,c.render_height,c.output_width,c.output_height,
+                crop.input_base_x,crop.input_base_y,crop.input_width,crop.input_height,c.create_flags,
+                motion->resource.image.width,motion->resource.image.height,static_cast<unsigned>(motion->resource.image.format),
+                mv.rectangle.x,mv.rectangle.y,c.motion_vector_scale_x,c.motion_vector_scale_y,c.jitter_x,c.jitter_y,reset,
+                convert_motion?"converted":"original",view.slots.size(),stats.calls,stats.active,stats.passthrough);
         VulkanNgxScope private_call;
         result=callbacks.evaluate(cmd,history.handle,&parameters,nullptr);stats.last_result=result;
         if(ngx_succeeded(result)) {

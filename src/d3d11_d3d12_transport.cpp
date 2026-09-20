@@ -1,3 +1,5 @@
+#include "depth_formats.hpp"
+#include "d3d11_write_bindings.hpp"
 #include "dlss_nr_input.hpp"
 #include "d3d11_d3d12_transport.hpp"
 #include "d3d12_ngx_dispatch.hpp"
@@ -1031,19 +1033,6 @@ void trace_format_support(
     return true;
 }
 
-[[nodiscard]] DXGI_FORMAT depth_srv_format(const DXGI_FORMAT format) noexcept {
-    switch (format) {
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-    default:
-        return DXGI_FORMAT_UNKNOWN;
-    }
-}
 
 [[nodiscard]] bool convert_depth_crop(
     TransportDevice& device,
@@ -1057,7 +1046,18 @@ void trace_format_support(
     SharedTexture& destination
 ) noexcept {
     const auto srv_format = depth_srv_format(source_format);
-    if (srv_format == DXGI_FORMAT_UNKNOWN) return false;
+    const auto fail=[&](const char* stage,HRESULT hr) {
+        static std::uint64_t failures{};const auto n=++failures;
+        if(n<=8 || (n&(n-1))==0) {
+            D3D11_TEXTURE2D_DESC desc{};ID3D11Texture2D* texture{};
+            if(SUCCEEDED(depth->QueryInterface(IID_PPV_ARGS(&texture)))){texture->GetDesc(&desc);texture->Release();}
+            trace_event("DX11 depth conversion failed stage=%s hr=0x%08X sourceFormat=%u srvFormat=%u texture=%ux%u bind=0x%X misc=0x%X samples=%u array=%u crop=%u,%u %ux%u count=%llu",
+                stage,static_cast<unsigned>(hr),static_cast<unsigned>(source_format),static_cast<unsigned>(srv_format),
+                desc.Width,desc.Height,desc.BindFlags,desc.MiscFlags,desc.SampleDesc.Count,desc.ArraySize,source_x,source_y,width,height,n);
+        }
+        return false;
+    };
+    if (srv_format == DXGI_FORMAT_UNKNOWN) return fail("unsupported source format",E_INVALIDARG);
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Format = srv_format;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -1067,20 +1067,21 @@ void trace_format_support(
     uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     ID3D11ShaderResourceView* srv{};
     ID3D11UnorderedAccessView* uav{};
-    if (FAILED(device.device11->CreateShaderResourceView(depth, &srv_desc, &srv)) ||
-        FAILED(device.device11->CreateUnorderedAccessView(
-            destination.texture11, &uav_desc, &uav))) {
+    const auto srv_result=device.device11->CreateShaderResourceView(depth, &srv_desc, &srv);
+    if(FAILED(srv_result))return fail("create depth SRV",srv_result);
+    const auto uav_result=device.device11->CreateUnorderedAccessView(destination.texture11, &uav_desc, &uav);
+    if (FAILED(uav_result)) {
         release(uav);
         release(srv);
-        return false;
+        return fail("create shared depth UAV",uav_result);
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context->Map(device.depth_constants, 0U,
-            D3D11_MAP_WRITE_DISCARD, 0U, &mapped))) {
+    const auto map_result=context->Map(device.depth_constants, 0U,D3D11_MAP_WRITE_DISCARD, 0U, &mapped);
+    if (FAILED(map_result)) {
         release(uav);
         release(srv);
-        return false;
+        return fail("map depth constants",map_result);
     }
     const std::uint32_t constants[4]{
         source_x, source_y, width, height
@@ -1088,6 +1089,7 @@ void trace_format_support(
     std::memcpy(mapped.pData, constants, sizeof(constants));
     context->Unmap(device.depth_constants, 0U);
 
+    D3D11WriteBindingsScope write_bindings(context);
     ID3D11ComputeShader* old_shader{};
     ID3D11ShaderResourceView* old_srv{};
     ID3D11UnorderedAccessView* old_uav{};
