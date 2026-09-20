@@ -3,7 +3,7 @@
 #include "processing_owner.hpp"
 #include "mock_ngx_parameters.hpp"
 #include <Windows.h>
-#include <d3d11.h>
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -14,6 +14,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -38,7 +39,7 @@ double field(const std::string& text, const char* name) {
 }
 void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn get,
     std::uint64_t attachment, ID3D11Device* device, ID3D11DeviceContext* context, HMODULE ngx,
-    const std::filesystem::path& log_path,bool depth24=false) {
+    const std::filesystem::path& log_path,bool depth24=false,bool backpressure=false) {
     using namespace cheeky::foveated_dlss;
     using Init = NgxResult (*)(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned);
     using Create = NgxResult (*)(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle**);
@@ -92,6 +93,70 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     }
     if (!active) puts(snapshot(get).c_str());
     require(active, "Actual private DX12 transport executes from generic DX11 host");
+    if (backpressure) {
+        // Hold GPU work behind a CPU-signaled fence, filling all three slots.
+        // The fourth evaluation must wait for a slot, not silently omit NR.
+        ComPtr<ID3D11Device5> device5;
+        ComPtr<ID3D11DeviceContext4> context4;
+        ComPtr<ID3D11Fence> gate11;
+        ComPtr<ID3D12Fence> gate12;
+        ComPtr<ID3D12Device> device12;
+        ComPtr<IDXGIDevice> dxgi_device;
+        ComPtr<IDXGIAdapter> adapter;
+        require(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5))) &&
+            SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context4))) &&
+            SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgi_device))) &&
+            SUCCEEDED(dxgi_device->GetAdapter(&adapter)) &&
+            SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12))),
+            "Backpressure devices");
+        require(SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&gate11))), "Backpressure fence");
+        HANDLE shared{};
+        require(SUCCEEDED(gate11->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &shared)), "Share backpressure fence");
+        const auto opened = device12->OpenSharedHandle(shared, IID_PPV_ARGS(&gate12));
+        CloseHandle(shared);
+        require(SUCCEEDED(opened), "Open backpressure fence");
+        ComPtr<ID3D11Query> completed;
+        const D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT, 0};
+        require(SUCCEEDED(device->CreateQuery(&desc, &completed)), "Backpressure completion query");
+        for (unsigned order = 0; order < 2; ++order) {
+            const auto cmd = std::string("1\n30\nset\nNrEnabled=true\nNrFoveated=false\nNrProcessingOrder=") + std::to_string(order);
+            require(command(attachment, cmd.c_str()), "Enable backpressure NR");
+            // Warm and drain all slots before deliberately holding the queue.
+            for (unsigned i = 0; i < 6; ++i) {
+                parameters.values = original_parameters;
+                require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "Warm backpressure slot");
+                context->End(completed.Get()); context->Flush();
+                HRESULT done = S_FALSE;
+                for (unsigned retry = 0; retry < 2000 && done == S_FALSE; ++retry) {
+                    done = context->GetData(completed.Get(), nullptr, 0, 0);
+                    if (done == S_FALSE) Sleep(1);
+                }
+                require(done == S_OK, "Drain backpressure warmup");
+            }
+            const auto before = snapshot(get);
+            const auto nr_begin = before.find("\"nr_details\":");
+            const auto evaluations = field(before.substr(nr_begin), "evaluations");
+            require(SUCCEEDED(context4->Wait(gate11.Get(), order + 1)), "Hold GPU queue");
+            // Always release the gate, including when an assertion throws.
+            std::jthread release_gate([gate12, order] { Sleep(250); gate12->Signal(order + 1); });
+            for (unsigned frame = 0; frame < 4; ++frame) {
+                parameters.values = original_parameters;
+                require(ngx_succeeded(evaluate(context, handle, &parameters, nullptr)), "Backlogged evaluation");
+                const auto state = snapshot(get);
+                if (!contains(state, "\"execution_path\":\"DX12 Transport\"") ||
+                    !contains(state, "\"nr\":\"Active\"")) puts(state.c_str());
+                require(contains(state, "\"execution_path\":\"DX12 Transport\"") &&
+                    contains(state, "\"nr\":\"Active\""), "GPU backlog must not bypass transport/NR");
+            }
+            context->Flush();
+            const auto after = snapshot(get);
+            require(field(after.substr(after.find("\"nr_details\":")), "evaluations") == evaluations + 4,
+                "Every backlogged frame evaluates NR");
+        }
+        release(handle);
+        puts("PASS GPU backlog preserves transport and Before/After NR on every frame");
+        return;
+    }
     for (unsigned mode = 0; mode < 4; ++mode) {
         const auto order = mode % 2;
         const auto cmd = std::string("1\n21\nset\nNrEnabled=true\nNrFoveated=") + (mode >= 2 ? "true" : "false") +
@@ -185,7 +250,7 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
 
 int main(int argc, char** argv) {
     try {
-        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{};
+        bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{},backpressure{};
         unsigned openvr_version{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -194,6 +259,7 @@ int main(int argc, char** argv) {
             else if (arg == "--optiscaler") optiscaler = true;
             else if (arg == "--transport") { transport = true; dx11 = true; }
             else if (arg == "--transport-depth24") { transport = dx11 = depth24 = true; }
+            else if (arg == "--transport-backpressure") { transport = dx11 = backpressure = true; }
             else if (arg == "--transport-forwarded") { transport = true; dx11 = true; forwarded_transport = true; }
             else if (arg.starts_with("--openvr-late-")) {
                 openvr_version = static_cast<unsigned>(std::stoul(arg.substr(14)));
@@ -347,8 +413,8 @@ int main(int argc, char** argv) {
             require(contains(snapshot(get), "\"D3D11D3D12Transport\":true"), "Transport preference retained");
         }
         if (transport) verify_transport(command, get, attachment, device11.Get(), context11.Get(), fake_ngx,
-            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24);
-        if(depth24){detach(attachment);return 0;}
+            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24,backpressure);
+        if(depth24 || backpressure){detach(attachment);return 0;}
         CheekyUEVRStereoProjection projection;
         require(!publish_stereo(attachment, &projection) && !publish_mode(attachment, 3), "UEVR-only publications reject generic host attachments");
         std::uint64_t duplicate = 99;

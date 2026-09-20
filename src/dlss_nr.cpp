@@ -1024,7 +1024,15 @@ bool evaluate_dlss_nr(
     struct HistoryGuard {
         ViewState& view;
         bool succeeded{};
-        ~HistoryGuard() { if (!succeeded) view.was_enabled = false; }
+        ~HistoryGuard() {
+            if (succeeded) return;
+            view.was_enabled = false;
+            const auto count = diagnostics.failed_calls;
+            if (count <= 8U || (count & (count - 1U)) == 0U)
+                trace_event("DLSS-NR rejected view=%llu state=%s reason=%s result=0x%X failures=%llu",
+                    view.view_id, dlss_nr_state_name(diagnostics.state),
+                    diagnostics.skip_reason ? diagnostics.skip_reason : "none", diagnostics.last_result, count);
+        }
     } history_guard{view};
     if (frame.command_list == nullptr || frame.view_id == 0U ||
         frame.color == nullptr || frame.depth == nullptr ||

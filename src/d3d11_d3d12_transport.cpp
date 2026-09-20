@@ -248,6 +248,8 @@ struct TransportDevice {
     ID3D12GraphicsCommandList* command_list12{};
     ID3D11Fence* fence11{};
     ID3D12Fence* fence12{};
+    HANDLE slot_ready_event{};
+    std::uint64_t slot_waits{};
     ID3D11ComputeShader* depth_shader{};
     ID3D11Buffer* depth_constants{};
     NgxParameters* ngx_parameters{};
@@ -332,6 +334,8 @@ void release_device(TransportDevice& device) noexcept {
     }
     release(device.depth_constants);
     release(device.depth_shader);
+    if (device.slot_ready_event) CloseHandle(device.slot_ready_event);
+    device.slot_ready_event = nullptr;
     release(device.fence12);
     release(device.fence11);
     release(device.command_list12);
@@ -1258,7 +1262,48 @@ struct TimingScope {
     const D3D11TransportStatus status
 ) noexcept {
     diagnostic_note_d3d11_transport_status(status);
+    static std::array<std::atomic<std::uint64_t>,
+        static_cast<std::size_t>(D3D11TransportStatus::compositing_failed) + 1U> failures{};
+    const auto count = ++failures[static_cast<std::size_t>(status)];
+    if (count <= 8U || (count & (count - 1U)) == 0U)
+        trace_event("DX11 transport rejected: %s count=%llu", d3d11_transport_status_name(status), count);
     return false;
+}
+
+[[nodiscard]] bool wait_for_slot(TransportDevice& device,
+    ID3D11DeviceContext* context, const TransportSlot& slot) noexcept {
+    if (!slot.done_value) return true;
+    auto completed = device.fence12->GetCompletedValue();
+    if (completed == UINT64_MAX) return false; // Device removed.
+    if (completed >= slot.done_value) return true;
+
+    // The ring limits overlapping work, not which frames receive NR/SR.
+    // Flush the DX11 signals that the private DX12 queue is waiting on before
+    // waiting on the CPU, otherwise buffered DX11 commands can deadlock us.
+    context->Flush();
+    if (!device.slot_ready_event)
+        device.slot_ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!device.slot_ready_event || FAILED(device.fence12->SetEventOnCompletion(
+            slot.done_value, device.slot_ready_event))) return false;
+    const auto start = GetTickCount64();
+    constexpr DWORD timeout_ms = 1000U;
+    bool ready{};
+    for (;;) {
+        completed = device.fence12->GetCompletedValue();
+        if (completed == UINT64_MAX) break;
+        if (completed >= slot.done_value) { ready = true; break; }
+        const auto elapsed = GetTickCount64() - start;
+        if (elapsed >= timeout_ms) break;
+        // Check the fence after every wake: a previously timed-out registration
+        // may also signal this reusable event. Never reset an in-flight allocator.
+        if (WaitForSingleObject(device.slot_ready_event,
+                timeout_ms - static_cast<DWORD>(elapsed)) != WAIT_OBJECT_0) break;
+    }
+    const auto count = ++device.slot_waits;
+    if (!ready || count <= 8U || (count & (count - 1U)) == 0U)
+        trace_event("DX11 transport slot wait ready=%s elapsedMs=%llu target=%llu completed=%llu waits=%llu",
+            ready ? "yes" : "no", GetTickCount64() - start, slot.done_value, completed, count);
+    return ready;
 }
 
 [[nodiscard]] bool recover_init_contract(
@@ -1385,14 +1430,16 @@ bool evaluate_d3d11_via_d3d12(
     );
     struct NrTransportAttempt {
         const Settings& settings;
+        DlssViewId view_id;
         bool attempted{};
         ~NrTransportAttempt() {
-            if (!attempted && settings.nr_enabled &&
-                settings.nr_processing_order == NrProcessingOrder::before_upscaling)
+            if (!attempted && settings.nr_enabled) {
+                skip_dlss_nr_history(view_id);
                 note_dlss_nr_skipped(DlssNrRoute::d3d11_transport, settings,
                     "DX12 Transport preparation rejected; see transport status");
+            }
         }
-    } nr_attempt{settings};
+    } nr_attempt{settings, view_id};
     auto transport_settings = settings;
     if (!transport_settings.enabled && transport_settings.nr_enabled) {
         // NR-only mode still runs the game's SR feature through transport.
@@ -1692,8 +1739,7 @@ bool evaluate_d3d11_via_d3d12(
 
     auto* const view = find_or_create_view(*device, contract.view_id);
     auto& slot = view->slots[view->next_slot++ % transport_slot_count];
-    if (slot.done_value != 0U &&
-        device->fence12->GetCompletedValue() < slot.done_value) {
+    if (!wait_for_slot(*device, context, slot)) {
         release(context4);
         return reject_transport(D3D11TransportStatus::transport_slot_busy);
     }
@@ -2212,6 +2258,7 @@ bool evaluate_d3d11_via_d3d12(
             nr_frame.center = nr_center;
             nr_frame.has_center = has_nr_center;
             nr_frame.reset = nr_frame.reset || nr_gaze_reset;
+            nr_attempt.attempted = true;
             nr_succeeded = evaluate_dlss_nr(nr_frame, nr_settings);
             if (measure_dlss && nr_succeeded) {
                 device->command_list12->EndQuery(
