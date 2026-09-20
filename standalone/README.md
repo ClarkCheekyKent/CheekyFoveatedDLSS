@@ -32,7 +32,10 @@ readback; actual NVIDIA inference and headset behavior still need game testing.
      CheekyFoveatedDLSSRuntime.dll
    ```
 
-3. Start the game with its D3D11 or D3D12 renderer and enable DLSS.
+3. For Vulkan, also copy `CheekyVulkanLayer.dll` beside the game executable and
+   keep the included `CheekyFoveatedDLSS/Vulkan` folder. The loader enables the
+   layer for the game process; no separate layer installer is needed.
+4. Start the game with its D3D11, D3D12 or Vulkan renderer and enable DLSS.
 
 **Do not overwrite another mod's loader.** Both choices use the same shared
 folder and F8 controls. The game must load the selected local DLL for Cheeky to
