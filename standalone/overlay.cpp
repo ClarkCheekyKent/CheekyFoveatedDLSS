@@ -75,10 +75,12 @@ struct Renderer : OverlayUiState {
     InputState* input{};
     ImGuiContext* context{};
     bool win32_ready{}, gpu_ready{}, dx12{}, poisoned{};
+    bool menu_was_open{};
     DXGI_FORMAT format{};
     DXGI_COLOR_SPACE_TYPE color_space{};
     std::uint64_t chain_identity{};
     UINT width{}, height{};
+    UINT framebuffer_width{}, framebuffer_height{};
     ULONGLONG last_present{};
     ComPtr<ID3D11Device> device11;
     ComPtr<ID3D11DeviceContext> context11;
@@ -190,12 +192,18 @@ bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queu
             r.device12->CreateRenderTargetView(r.buffers[index].Get(), nullptr, handle);
             handle.ptr += r.rtv_stride;
         }
+        const auto backbuffer = r.buffers.front()->GetDesc();
+        r.framebuffer_width = static_cast<UINT>(backbuffer.Width); r.framebuffer_height = backbuffer.Height;
         if (FAILED(r.device12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, r.frames.front().allocator.Get(), nullptr, IID_PPV_ARGS(&r.command_list))) ||
             FAILED(r.command_list->Close()) || FAILED(r.device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&r.fence)))) return false;
         r.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!r.fence_event) return false;
     } else {
         r.device11->GetImmediateContext(&r.context11);
+        ComPtr<ID3D11Texture2D> backbuffer;
+        if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&backbuffer)))) return false;
+        D3D11_TEXTURE2D_DESC backbuffer_desc{}; backbuffer->GetDesc(&backbuffer_desc);
+        r.framebuffer_width = backbuffer_desc.Width; r.framebuffer_height = backbuffer_desc.Height;
         ComPtr<ID3D11Device1> device1;
         if (FAILED(r.device11.As(&device1)) || FAILED(r.context11.As(&r.context11_state))) {
             set_status("Overlay needs D3D11.1 context-state isolation"); return false;
@@ -349,17 +357,22 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         // retire an atlas still referenced by a queued frame.
         if (r.dx12 && r.fence->GetCompletedValue() < r.frames[r.serial % r.frames.size()].fence_value) return;
         r.input->enabled = true;
+        poll_overlay_hotkey(*r.input);
+        const bool menu_open = r.input->open.load();
+        if (menu_open != r.menu_was_open) {
+            r.menu_was_open = menu_open;
+            set_status(menu_open ? "F8 menu opened" : "F8 menu closed");
+        }
         cheeky_overlay_color_mode = shader_color_mode(color_space, r.format);
         ContextScope scope(r.context);
         if (r.attachment != runtime.attachment) { r.attachment = runtime.attachment; r.next_snapshot = 0; }
-        std::vector<InputMessage> messages;
-        { std::lock_guard input_lock(r.input->mutex); messages.swap(r.input->messages); }
-        for (const auto& message : messages) ImGui_ImplWin32_WndProcHandler(r.window, message.message, message.wparam, message.lparam);
+        process_overlay_input(*r.input);
         if (!r.input->open) { ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
         release_cursor(*r.input);
         ImGui::GetIO().MouseDrawCursor = true;
         if (r.dx12) ImGui_ImplDX12_NewFrame(); else ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
+        set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
         ImGui::NewFrame();
         bool open=r.input->open.load();
         draw_overlay_ui(r,runtime,r.dx12?"D3D12":"D3D11",status.load(),open);

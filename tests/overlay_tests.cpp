@@ -1,5 +1,7 @@
 #include "overlay.hpp"
 #include "settings_io.hpp"
+#include <imgui.h>
+#include <imgui_internal.h>
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -23,11 +25,27 @@ using namespace cheeky::foveated_dlss;
 // foreground HWND. Production retains GetForegroundWindow; only this binary
 // supplies an explicit foreground state for reproducible input tests.
 HWND test_foreground{};
+bool test_f8_down{};
+bool test_mouse_down[5]{};
+bool cheeky_overlay_test_mouse_down(unsigned button) { return test_mouse_down[button]; }
+bool cheeky_overlay_test_f8_down() { return test_f8_down; }
 bool cheeky_overlay_test_foreground(HWND window) { return window && window == test_foreground; }
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 void check(HRESULT value, const char* message) { require(SUCCEEDED(value), message); }
 unsigned snapshots{}, game_keys{}, game_button_down{}, game_button_up{};
+unsigned game_pointer_messages{};
+bool pointer_checkbox{};
+ImVec2 pointer_checkbox_position{};
+void pointer_checkbox_hook(ImGuiContext*, ImGuiContextHook*) {
+    ImGui::SetNextWindowPos(ImVec2(650, 40));
+    ImGui::SetNextWindowSize(ImVec2(140, 90));
+    ImGui::Begin("Pointer fixture", nullptr, ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove);
+    ImGui::Checkbox("Toggle", &pointer_checkbox);
+    const auto p = ImGui::GetItemRectMin();
+    pointer_checkbox_position = ImVec2(p.x + 6, p.y + 6);
+    ImGui::End();
+}
 Settings settings;
 bool snapshot(char* output, std::uint32_t capacity) {
     ++snapshots;
@@ -36,6 +54,7 @@ bool snapshot(char* output, std::uint32_t capacity) {
 }
 bool command(std::uint64_t attachment, const char*) { return attachment == 1; }
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_POINTERDOWN || message == WM_POINTERUP || message == WM_POINTERUPDATE) ++game_pointer_messages;
     if (message == WM_KEYDOWN || message == WM_KEYUP) ++game_keys;
     if (message == WM_LBUTTONDOWN) ++game_button_down;
     if (message == WM_LBUTTONUP) ++game_button_up;
@@ -299,10 +318,83 @@ int main(int argc, char** argv) {
         require(visible > 10000, "Overlay draw coverage is unexpectedly small");
         require(red(image.data() + image.size() - stride, format) == 0.0F, "Overlay changed pixels outside its window");
         require(hdr10 ? peak > .5F && peak < .65F : scrgb ? peak > 2.0F && peak < 3.0F : peak > .9F, "Overlay white does not match its target transfer function");
+        // Pointer-capable games can deliver no legacy mouse-button messages.
+        // Exercise an actual checkbox, and verify that the game sees no click.
+        auto* imgui = ImGui::GetCurrentContext();
+        require(imgui != nullptr, "Overlay ImGui context");
+        ImGuiContextHook hook{};
+        hook.Type = ImGuiContextHookType_EndFramePre;
+        hook.Callback = pointer_checkbox_hook;
+        const auto hook_id = ImGui::AddContextHook(imgui, &hook);
+        const auto draw = [&] { gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle(); };
+        draw(); draw();
+        POINT pointer{static_cast<LONG>(pointer_checkbox_position.x), static_cast<LONG>(pointer_checkbox_position.y)};
+        ClientToScreen(window.value, &pointer);
+        const auto position = MAKELPARAM(pointer.x, pointer.y);
+        const auto game_pointer_before = game_pointer_messages;
+        SendMessageW(window.value, WM_POINTERUPDATE, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
+        draw();
+        SendMessageW(window.value, WM_POINTERDOWN, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY | POINTER_MESSAGE_FLAG_FIRSTBUTTON | POINTER_MESSAGE_FLAG_INCONTACT), position);
+        draw();
+        SendMessageW(window.value, WM_POINTERUP, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
+        draw();
+        require(pointer_checkbox, "Pointer click must toggle the overlay checkbox");
+        require(game_pointer_messages == game_pointer_before, "Menu pointer click leaked to game");
+        // FH6 polls mouse buttons directly instead of delivering click messages.
+        test_mouse_down[0] = true;
+        require((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0, "Open menu leaked a polled mouse press to the game");
+        draw(); draw();
+        require(pointer_checkbox, "Checkbox changed before physical button release");
+        test_mouse_down[0] = false;
+        draw(); draw();
+        require(!pointer_checkbox, "Physical mouse click without messages must toggle the menu checkbox once");
+        test_foreground = nullptr; test_mouse_down[0] = true;
+        require((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0, "Unfocused menu suppressed the game's mouse polling");
+        test_foreground = window.value; test_mouse_down[0] = false;
+        const auto* draw_data = ImGui::GetDrawData();
+        require(std::abs(draw_data->DisplaySize.x * draw_data->FramebufferScale.x - 800.0F) < .1F &&
+            std::abs(draw_data->DisplaySize.y * draw_data->FramebufferScale.y - 720.0F) < .1F,
+            "Menu viewport must match actual backbuffer, not window client size");
+        require(ImGui::GetIO().MouseDrawCursor, "Menu cursor must remain visible at the hit-test position");
+        ImGui::RemoveContextHook(imgui, hook_id);
         toggle(window.value, true); gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
         require(gpu.pixels() != baseline, "F8 autorepeat incorrectly closed the overlay");
         toggle(window.value); gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
         require(gpu.pixels() == baseline, "F8 did not close the overlay");
+        test_mouse_down[0] = true;
+        require((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0, "Closed menu suppressed the game's mouse polling");
+        test_mouse_down[0] = false;
+        SendMessageW(window.value, WM_POINTERDOWN, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY | POINTER_MESSAGE_FLAG_FIRSTBUTTON), position);
+        SendMessageW(window.value, WM_POINTERUP, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
+        require(game_pointer_messages == game_pointer_before + 2, "Closed overlay must pass pointer clicks to game");
+        const auto pump = [] {
+            MSG message;
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message); DispatchMessageW(&message);
+            }
+        };
+        // No keyboard window message: simulate a game consuming F8 upstream.
+        test_f8_down = true;
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
+        pump();
+        for (unsigned frame = 0; frame < 3; ++frame) {
+            gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle(); pump();
+        }
+        require(gpu.pixels() != baseline, "Polled F8 must open the overlay without a key message and stay open while held");
+        // A normal key message arriving after polling must not toggle again.
+        SendMessageW(window.value, WM_KEYDOWN, VK_F8, 1);
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() != baseline, "Polled and window F8 toggled the same press twice");
+        test_f8_down = false;
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
+        // Also check the opposite order: message first, polling second.
+        test_f8_down = true;
+        SendMessageW(window.value, WM_KEYDOWN, VK_F8, 1);
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle(); pump();
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() == baseline, "Window and polled F8 reopened the menu on one press");
+        test_f8_down = false;
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
         if (test_clip) { RECT restored{}; require(GetClipCursor(&restored) && EqualRect(&actual_clip, &restored), "Closing overlay did not restore cursor confinement"); }
         SendMessageW(window.value, WM_KEYDOWN, 'W', 1); SendMessageW(window.value, WM_KEYUP, 'W', LPARAM{1} << 31);
         require(game_keys == 2, "Closed overlay did not pass keyboard input through");

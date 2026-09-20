@@ -133,10 +133,8 @@ VkResult overlay_vulkan_present(const CheekyVulkanPresent& p,const OverlayRuntim
         }
         auto& r=*renderer;r.last_present=now;
         if(r.poisoned)return forward();
-        r.input->enabled=true;Context scope(r.context);
-        std::vector<InputMessage> messages;
-        {std::lock_guard input_lock(r.input->mutex);messages.swap(r.input->messages);}
-        for(const auto& message:messages)ImGui_ImplWin32_WndProcHandler(r.window,message.message,message.wparam,message.lparam);
+        r.input->enabled=true;poll_overlay_hotkey(*r.input);Context scope(r.context);
+        process_overlay_input(*r.input);
         if(!r.input->open){ImGui::GetIO().ClearInputKeys();ImGui::GetIO().ClearInputMouse();return forward();}
         if(!r.ready)initialize_gpu(r);
         auto& f=r.frames[r.serial%r.frames.size()];
@@ -144,7 +142,7 @@ VkResult overlay_vulkan_present(const CheekyVulkanPresent& p,const OverlayRuntim
         const auto image=p.present->pImageIndices[p.present_index];if(image>=r.targets.size())return forward();
         auto& target=r.targets[image];
         release_cursor(*r.input);ImGui::GetIO().MouseDrawCursor=true;
-        ImGui_ImplVulkan_NewFrame();ImGui_ImplWin32_NewFrame();ImGui::NewFrame();
+        ImGui_ImplVulkan_NewFrame();ImGui_ImplWin32_NewFrame();set_overlay_framebuffer_scale(r.extent.width,r.extent.height);ImGui::NewFrame();
         bool open=r.input->open.load();draw_overlay_ui(r,runtime,"Vulkan","Native Vulkan F8 menu",open);
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
         ImGui::Render();
