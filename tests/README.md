@@ -1,3 +1,17 @@
+# Automatic fixed-alignment history
+
+`CheekyTests.exe --alignment-history` exercises the production crop coordinator
+with OpenXR/OpenVR snapshots and camera projections. One-pixel alignment
+oscillations must move the crop without resetting DLSS history, allowing the
+backend's existing crop-motion correction to preserve accumulation. Mapping
+changes or loss, large jumps and crop resizing must still reset history. The
+snapshot cases use the BG3 report's 1464-to-2928 resolution and odd crop sizes.
+These checks also run in the default suite.
+
+For an in-game retest, select Fixed with Automatic stereo alignment enabled,
+move the headset, and inspect fine detail for shimmer. This change preserves
+the existing alignment placement and adds no smoothing or deadband.
+
 # SR resource safety and NR observer retries
 
 `CheekyTests.exe --d3d12-safety` links the production SR backend and uses WARP.

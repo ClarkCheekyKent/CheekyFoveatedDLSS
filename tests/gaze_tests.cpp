@@ -1173,6 +1173,87 @@ void test_packed_alignment_coordinator(bool openvr = false) {
     reset_gaze_foveation();
 }
 
+void test_auto_alignment_history(bool openvr) {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation();
+    register_stereo_view(1903U); register_stereo_view(1904U);
+    Settings settings{};
+    settings.center_mode = FoveationCenterMode::fixed;
+    settings.auto_stereo_alignment = true;
+    settings.width = .55F; settings.height = .45F;
+    settings.x_offset = settings.height_offset = 0.F;
+    settings.aligned_height_offset = -.11F;
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    snapshot.structure_size = sizeof(snapshot);
+    snapshot.view_count = 2U;
+    snapshot.session_generation = snapshot.swapchain_generation = 1U;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    // Avoid half-pixel ties from the support report's odd crop dimensions.
+    constexpr float forward_center = .5002F;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& view = snapshot.views[eye];
+        view.view_index = eye;
+        view.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID;
+        view.resource_identity = 1903U + eye;
+        view.image_rect_width = view.image_rect_height = 2928U;
+        view.forward_u = view.forward_v = forward_center;
+    }
+    CropGeometry crops[2]{};
+    bool resets[2]{};
+    const auto frame = [&]() {
+        ++snapshot.predicted_display_time;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            expect(calculate_coordinated_crop(settings, 1903U + eye, nullptr,
+                1464U, 1464U, 2928U, 2928U, 0U, 0U, crops[eye], resets[eye],
+                &snapshot, nullptr, 1903U + eye), "Fixed alignment history fixture resolves both eyes");
+        }
+    };
+    frame(); frame(); frame();
+    expect(gaze_diagnostics().alignment_source == (openvr ? 3U : 2U),
+        "Fixed history regression exercises runtime alignment");
+    const auto initial = crops[0];
+    for (unsigned cycle = 0; cycle < 16; ++cycle) {
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const float delta = cycle % 2 == 0 ? (eye == 0 ? 1.F : -1.F) / 1464.F : 0.F;
+            snapshot.views[eye].forward_u = snapshot.views[eye].forward_v = forward_center + delta;
+        }
+        frame();
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const int delta = cycle % 2 == 0 ? (eye == 0 ? 1 : -1) : 0;
+            expect(crops[eye].input_base_x == initial.input_base_x + delta &&
+                crops[eye].input_base_y == initial.input_base_y + delta,
+                "Fixed alignment still follows one-pixel movement in both axes");
+            expect(!resets[eye], "One-pixel automatic alignment fluctuations must preserve DLSS history");
+        }
+    }
+    // A new mapping must reset even when its crop is numerically identical.
+    ++snapshot.swapchain_generation;
+    frame();
+    expect(resets[0] && resets[1] && crops[0].input_base_x == initial.input_base_x &&
+        crops[0].input_base_y == initial.input_base_y, "Fixed alignment remapping resets unchanged crop history");
+    frame(); frame();
+    expect(!resets[0] && !resets[1], "Stable fixed mapping does not repeatedly reset");
+    for (auto& view : snapshot.views) view.flags &= ~CHEEKY_GAZE_VIEW_RESOURCE_VALID;
+    frame();
+    expect(resets[0] && resets[1], "Losing a fixed eye mapping invalidates history");
+    for (auto& view : snapshot.views) view.flags |= CHEEKY_GAZE_VIEW_RESOURCE_VALID;
+    frame(); frame(); frame();
+    for (auto& view : snapshot.views) view.forward_u += .15F;
+    frame();
+    expect(resets[0] && resets[1], "Large automatic alignment jumps still reset history");
+    frame();
+    expect(!resets[0] && !resets[1], "History settles after a large alignment jump");
+    settings.width = .5F;
+    frame();
+    expect(resets[0] && resets[1], "Fixed aligned crop resizing still resets history");
+    frame();
+    expect(!resets[0] && !resets[1], "History settles after aligned crop resizing");
+    unregister_stereo_view(1903U); unregister_stereo_view(1904U);
+    reset_gaze_foveation();
+}
+
 void test_auto_alignment() {
     using namespace cheeky::foveated_dlss;
     using namespace cheeky::gaze_math;
@@ -1216,6 +1297,13 @@ void test_auto_alignment() {
         settings.invert_stereo_x_offset = true;
         expect(calculate() && crop.input_base_x == 150U && !reset,
             "manual eye inversion does not affect automatic alignment");
+        {
+            ScopedGazeProjection moved(901U, {-0.802F, 1.198F, 1.202F, -0.798F, true});
+            expect(calculate() && crop.input_base_x == 151U && crop.input_base_y == 351U && !reset,
+                "One-pixel camera-projection alignment movement preserves history");
+        }
+        expect(calculate() && crop.input_base_x == 150U && crop.input_base_y == 350U && !reset,
+            "Returning camera-projection alignment by one pixel preserves history");
         settings.width = 0.3F;
         expect(calculate() && crop.input_base_x == 250U && reset,
             "resizing preserves center and resets changed crop history");
@@ -2060,6 +2148,11 @@ int run_d3d12_safety_tests();
 int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--alignment-history") == 0) {
+        test_auto_alignment_history(false); test_auto_alignment_history(true); test_auto_alignment();
+        if (!failures) std::cout << "Automatic alignment history tests passed\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--d3d11-bindings") == 0) return run_d3d11_binding_tests();
     if (argc == 2 && std::strcmp(argv[1], "--vulkan-layer-model") == 0) return run_vulkan_tests(true,true);
     if (argc == 2 && std::strcmp(argv[1], "--vulkan-model") == 0) return run_vulkan_tests(true);
@@ -2096,6 +2189,8 @@ int main(int argc, char** argv) {
     test_packed_alignment_coordinator(true);
     test_openvr_geometry();
     test_auto_alignment();
+    test_auto_alignment_history(false);
+    test_auto_alignment_history(true);
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {
         failures += run_d3d12_composite_tests();
         return failures ? 1 : 0;

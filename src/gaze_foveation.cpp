@@ -497,7 +497,7 @@ bool calculate_coordinated_crop(
         }
         return center;
     };
-    const auto auto_crop = [&](const CheekyGazeViewV1* xr_view) {
+    const auto auto_crop = [&](const CheekyGazeViewV1* xr_view, bool remapped = false) {
         const auto center = aligned_center(xr_view);
         if (resolved_center) *resolved_center = center;
         const bool valid = diagnostics.alignment_source == 0U && settings.aligned_height_offset == 0.F
@@ -509,11 +509,20 @@ bool calculate_coordinated_crop(
         diagnostics.using_gaze = false;
         if (valid) {
             auto& state = state_for_view(view_id);
-            reset_history = state.has_crop &&
-                (state.last_crop.input_base_x != crop.input_base_x ||
-                 state.last_crop.input_base_y != crop.input_base_y ||
-                 state.last_crop.input_width != crop.input_width ||
-                 state.last_crop.input_height != crop.input_height);
+            // Automatic alignment can fluctuate by a pixel. Preserve history
+            // through the backend's crop-motion correction, just as gaze does;
+            // only mapping changes, resizing and large jumps require a reset.
+            const auto decision = evaluate_gaze_reset(
+                {state.last_crop.input_base_x, state.last_crop.input_base_y,
+                    state.last_crop.input_width, state.last_crop.input_height, state.has_crop},
+                {crop.input_base_x, crop.input_base_y, crop.input_width, crop.input_height, true},
+                false, false, remapped, settings.gaze_jump_reset_ratio);
+            reset_history = decision.reason != GazeResetReason::none;
+            if (reset_history) {
+                diagnostics.last_reset_reason = decision.reason;
+                trace_event("VR alignment history reset view=%llu reason=%u",
+                    static_cast<unsigned long long>(view_id), static_cast<unsigned>(decision.reason));
+            }
             state.last_crop = crop;
             state.has_crop = true;
         }
@@ -651,7 +660,8 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
-    if (state.calibrated_vertical_flip != calibrated_vertical_flip) {
+    const bool calibration_changed = state.calibrated_vertical_flip != calibrated_vertical_flip;
+    if (calibration_changed) {
         state.calibrated_vertical_flip = calibrated_vertical_flip;
         state.temporal = {};
     }
@@ -794,7 +804,8 @@ bool calculate_coordinated_crop(
             seconds_between(now, snapshot.publication_qpc) <= gaze_stale_seconds &&
             sample_age_seconds <= gaze_stale_seconds;
     if (settings.center_mode == FoveationCenterMode::fixed)
-        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr);
+        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr,
+            mapping_result.changed || mapping_result.invalidated || calibration_changed);
     const bool source_matches =
         ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U) ==
         (settings.center_mode == FoveationCenterMode::simulated_gaze);
@@ -844,7 +855,8 @@ bool calculate_coordinated_crop(
     );
     diagnostics.using_gaze = temporal_result.using_gaze;
     if (!state.temporal.has_filtered) {
-        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr);
+        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr,
+            mapping_result.changed || mapping_result.invalidated || calibration_changed);
     }
 
     if (resolved_center) *resolved_center = {temporal_result.center_u, temporal_result.center_v,
