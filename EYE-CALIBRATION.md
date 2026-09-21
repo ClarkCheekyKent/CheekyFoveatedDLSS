@@ -49,7 +49,8 @@ slots remain owned until GPU readback completes.
 
 Native OpenXR D3D11 source captures may span up to four XR intervals / 250 ms,
 so alternating eye rendering can supply distinct DLSS views on adjacent frames.
-Each source render is stamped, including renders between readback samples.
+Source renders retain the current corner pair or selected tracking marker between
+readback samples. This supports hosts that submit images rendered earlier.
 Codes and candidate slots stay bound to view identities for the calibration
 epoch, so a delayed submitted frame can still match. Toggling calibration,
 changing the backend/session or replacing a source view invalidates those codes.
@@ -79,26 +80,36 @@ poses for up to 250 ms. Runtime-provided optics remain the fallback before a
 valid submitted projection is available. Support snapshots identify the selected
 projection and its FOV tangents.
 
-Calibration first tries inexpensive crop hypotheses. If those cannot locate the
-markers, it acquires full submitted images asynchronously and searches their
+Calibration tries one crop hypothesis at a time, stamping at most a nearby
+outer/inner corner pair per source (40px markers with an 8px gap). It never
+displays the full hypothesis bank. If small patches cannot locate the markers,
+it acquires full submitted images asynchronously and searches their
 codes across the submitted view. Each eye gets an independently estimated crop
 and horizontal/vertical scale. Successful acquisition locks the selected marker;
 subsequent samples stamp only the selected location(s) and read small tracking
-patches. Marker loss or changed source/submission geometry unlocks placement and
-permits acquisition again. Wide acquisitions are limited to one stereo pair in
+patches. Three consecutive complete samples with missing submitted markers, or changed
+source/submission geometry, unlock placement and permit acquisition again. A
+single failed sample retains the tracking layout but cannot refresh eye identity. Wide acquisitions are limited to one stereo pair in
 flight, with at least one second between attempts; they stop while tracking is
 locked. Image conversion is bounded to a 2048-pixel maximum dimension, and up to
 two CPU workers search owned pixels without accessing graphics contexts.
 
-Among authenticated markers, prefer the one nearest a submitted-image edge that
+Among authenticated markers, prefer the one nearest a submitted-image corner that
 still leaves room for the complete tracking patch. This reduces visibility but
 does not prove the marker is outside the headset's visible area: no hidden-area
 mask is used. Acquisition still requires a surviving complete code. Severe
 distortion, clipping, or very small markers can prevent recognition. The search
 covers axis-aligned crop/resize and vertical flips, not arbitrary reprojection.
 The learned crop locates tracking patches; existing camera/XR projection logic
-continues to place gaze. Continuous stamping retains the selected markers while
-calibration is enabled.
+continues to place gaze. After acquisition, a stereo source stamps only its one
+selected marker. A shared mono source may need one marker
+per eye. Reacquisition first tries the learned crop corner with 12 submitted-pixel
+padding mapped back into the source (at least 12 source pixels), plus its nearby
+inset fallback. This is computed from the crop boundary, not from the previous
+inset marker, to avoid drifting inward after repeated losses. These stamps are
+not erased from submitted frames. Keeping one marker at a usable crop corner
+reduces their footprint but does not guarantee that the marker is outside the
+headset lens view.
 
 Open **Stereo and gaze > Eye calibration** in UEVR for the runtime, status and
 session enable switch. Detailed calibration data is included in support ZIPs.
@@ -241,9 +252,17 @@ Automated tests do not establish compatibility or performance in every game. Val
 
 `CheekyTests --crop-calibration` also covers arbitrary asymmetric crops outside
 the hypothesis bank on D3D11, D3D12 and mixed D3D12-to-D3D11 paths, tracking after
-acquisition, loss/reacquisition, edge preference, and conflicting codes. The
+acquisition, three-miss loss/reacquisition, corner preference, and conflicting codes. The
 Cyberpunk support-capture regression reconstructs sequence 42182's 6288x3568
 source markers and 4693x3498 submissions with the crop inferred from the previews:
 source B at (0,70), source A at (1595,70). It selects B's (4268,924) marker for
 submitted eye 0 and A's (1980,924) marker for eye 1. These are reconstructed
 full-resolution codes, not a lossless replay of the downsampled support images.
+
+The Hogwarts 13844 regression reconstructs the 3440x1440 source / 1493x1440
+submitted dimensions and location codes. It checks an intact outer corner,
+a clipped outer corner with a nearby surviving inset marker, and a decodable
+top-center distractor. Acquisition must select the corner, then stamp only one
+tracking marker. Padding is checked against the learned crop boundary and must
+not drift inward after repeated reacquisition. All GPU crop captures assert
+that acquisition never stamps more than two markers per source.

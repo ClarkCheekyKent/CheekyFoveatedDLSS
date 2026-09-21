@@ -122,6 +122,7 @@ struct State {
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::uint64_t placement_epoch{}, placement_sequence{}, placement_locks{}, placement_losses{};
     bool search_needed{};
+    unsigned search_candidate{}, tracking_misses{};
     std::uint64_t wide_searches{}, last_wide_search_ms{};
     std::array<CalibrationSearchResult, 2> last_search_results;
     std::array<Frame, ring_size> ring;
@@ -165,6 +166,7 @@ void placement_epoch(State& s) {
     s.placement_epoch = s.epoch;
     s.placements = {}; s.submitted_sizes = {}; s.placement_sequence = 0;
     s.search_needed = false; s.last_wide_search_ms = 0;
+    s.search_candidate = s.tracking_misses = 0;
 }
 CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t view, unsigned width, unsigned height) {
     placement_epoch(s);
@@ -176,7 +178,17 @@ CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t vi
     }
     if (lock.locked) { ++s.placement_losses; s.search_needed = true; }
     lock.locked = false;
-    return calibration_placement_plan(width, height, c, s.submitted_sizes[0][0], s.submitted_sizes[0][1]);
+    // Probe only one corner and its nearby clipping fallback at a time.
+    // A recent lost lock gets first chance at its known location before cycling
+    // the bounded hypotheses. Never put the full hypothesis bank on screen.
+    const bool known = lock.view.id == view && lock.view.generation == stereo_view_generation(view) &&
+        lock.view.width == width && lock.view.height == height && lock.placement.width > 0;
+    if (known && !s.search_candidate)
+        return calibration_corner_pair(calibration_padded_corner(lock.placement, width, height, c,
+            s.submitted_sizes[c][0], s.submitted_sizes[c][1]), width, height, c);
+    const auto bank = calibration_placement_plan(width, height, c, s.submitted_sizes[0][0], s.submitted_sizes[0][1]);
+    const unsigned index = (s.search_candidate - unsigned(known)) % bank.count;
+    return calibration_corner_pair(bank.at(index), width, height, c);
 }
 void submitted_geometry(State& s, Frame& f, unsigned eye, unsigned width, unsigned height,
                         float u0, float v0, float u1, float v1) {
@@ -628,30 +640,30 @@ void poll(State& s) {
         const auto right_slot = 1U - left_slot;
         if (f.physical_eyes[0] >= 2 || f.physical_eyes[1] >= 2 ||
                 f.physical_eyes[0] == f.physical_eyes[1]) rejection |= 4U;
-        int left = -1, right = -1, selected = -1;
+        int left = -1, right = -1, selected = -1, selected_right = -1;
         bool flipped_pair{}, ambiguous{};
         float selected_score{};
         double selected_edge = 1e30;
-        for (unsigned h = 0; h < f.placement_count; ++h) {
-            if (!f.usable_placements[0][h] || !f.usable_placements[1][h]) continue;
+        for (unsigned h = 0; h < f.placement_count; ++h) for (unsigned rh = 0; rh < f.placement_count; ++rh) {
+            if (!f.usable_placements[left_slot][h] || !f.usable_placements[right_slot][rh]) continue;
             for (unsigned flip = 0; flip < 2; ++flip) {
                 const auto base = 4 + h * 8 + flip * 4;
+                const auto right_base = 4 + rh * 8 + flip * 4;
                 const int a = calibration_pattern_classify(f.patches[base + left_slot * 2].score,
                                                           f.patches[base + left_slot * 2 + 1].score);
-                const int b = calibration_pattern_classify(f.patches[base + right_slot * 2].score,
-                                                          f.patches[base + right_slot * 2 + 1].score);
+                const int b = calibration_pattern_classify(f.patches[right_base + right_slot * 2].score,
+                                                          f.patches[right_base + right_slot * 2 + 1].score);
                 if (a < 0 || b < 0 || (mono ? a != b || !(source_mask & (1U << a)) : a == b)) continue;
                 if (selected >= 0 && (left != a || right != b || flipped_pair != bool(flip))) ambiguous = true;
                 const auto score = (std::min)(f.patches[base + left_slot * 2 + unsigned(a)].score,
-                                              f.patches[base + right_slot * 2 + unsigned(b)].score);
+                                              f.patches[right_base + right_slot * 2 + unsigned(b)].score);
                 const auto edge_distance = [](const CalibrationPlacement& p) {
-                    return (std::min)({(p.marker.x - p.x) / p.width, (p.marker.y - p.y) / p.height,
-                        (p.x + p.width - p.marker.x - block) / p.width, (p.y + p.height - p.marker.y - block) / p.height});
+                    return calibration_corner_distance(p.marker.x - p.x, p.marker.y - p.y, p.width, p.height);
                 };
                 const double edge = edge_distance(f.placement_plans[a].for_eye(left_slot, h)) +
-                    edge_distance(f.placement_plans[b].for_eye(right_slot, h));
+                    edge_distance(f.placement_plans[b].for_eye(right_slot, rh));
                 if (selected < 0 || edge < selected_edge || (edge == selected_edge && score > selected_score)) {
-                    selected = int(h); left = a; right = b; flipped_pair = flip != 0; selected_score = score;
+                    selected = int(h); selected_right = int(rh); left = a; right = b; flipped_pair = flip != 0; selected_score = score;
                     selected_edge = edge;
                 }
             }
@@ -675,6 +687,7 @@ void poll(State& s) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
             if (!rejection) {
+                s.tracking_misses = s.search_candidate = 0;
                 for (unsigned c = 0; c < 2; ++c) {
                     if (!(source_mask & (1U << c))) continue;
                     if (!s.placements[c].locked) ++s.placement_locks;
@@ -687,21 +700,37 @@ void poll(State& s) {
                                 f.search[eye]->result.placement : learned.placement;
                     } else {
                         const auto& plan = f.placement_plans[c];
-                        learned = {f.views[c], f.submitted_sizes, plan.at(unsigned(selected)), true, plan.per_eye, plan.eye_placements};
+                        const unsigned eye = int(c) == left ? left_slot : right_slot;
+                        const auto& chosen = plan.for_eye(eye, unsigned(int(c) == left ? selected : selected_right));
+                        learned = {f.views[c], f.submitted_sizes, chosen, true, plan.per_eye || mono, plan.eye_placements};
+                        if (learned.per_eye) {
+                            learned.eye_placements.fill(chosen);
+                            if (int(c) == left) learned.eye_placements[left_slot] = plan.for_eye(left_slot, unsigned(selected));
+                            if (int(c) == right) learned.eye_placements[right_slot] = plan.for_eye(right_slot, unsigned(selected_right));
+                        }
                     }
                 }
                 s.search_needed = false;
                 // A slow acquisition may only seed tracking. Publication still
                 // uses the normal age check; verify immediately on fresh pixels.
                 if (acquired) s.frames_until_capture = 0;
-            } else if (rejection & 128U) {
-                s.search_needed = true;
-                bool lost{};
-                for (auto& lock : s.placements) {
-                    if (lock.locked) { ++s.placement_losses; lost = true; }
-                    lock.locked = false;
+            } else if (rejection == 128U) {
+                const bool locked = s.placements[0].locked || s.placements[1].locked;
+                // A missed readback is not proof that the placement was lost.
+                // Keep the one-marker layout for three independent bad samples;
+                // failed samples still cannot publish/refresh eye identity.
+                if (!locked || ++s.tracking_misses >= 3) {
+                    s.search_needed = true;
+                    if (locked) {
+                        for (auto& lock : s.placements) {
+                            if (lock.locked) ++s.placement_losses;
+                            lock.locked = false;
+                        }
+                        s.search_candidate = 0;
+                        s.frames_until_capture = 0;
+                    } else ++s.search_candidate;
+                    s.tracking_misses = 0;
                 }
-                if (lost) s.frames_until_capture = 0;
             }
         }
         if (rejection) record_rejection(s, f, rejection);
@@ -988,12 +1017,12 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         return false;
     placement_epoch(s);
     // A single acquisition pair owns the wide readbacks and CPU workers.
-    // Keep stamping between frames, but never queue more full-image searches.
+    // Keep only the current corner pair/selected marker; never queue more full-image searches.
     if (std::any_of(s.ring.begin(), s.ring.end(), [](const auto& frame) {
         return frame.busy && frame.wide_search;
     })) return false;
     // Drain readbacks every frame and sample one in ten. DX11 OpenXR
-    // submissions use continuously stamped sources, including DX12 sources.
+    // submissions use stable corner stamps on intervening renders, including DX12 sources.
     if (!capture_due) return false;
     s.frames_until_capture = 9;
     // Rotate through all slots so the warm-up is bounded and reproducible.
@@ -1646,6 +1675,10 @@ std::string eye_calibration_json() {
         std::lock_guard lock(live.mutex);
         out << ",\"placement_search\":{\"hypotheses\":" << calibration_placement_count
             << ",\"locks\":" << live.placement_locks << ",\"losses\":" << live.placement_losses
+            << ",\"search_candidate\":" << live.search_candidate
+            << ",\"tracking_misses\":" << live.tracking_misses
+            << ",\"max_acquisition_markers_per_source\":2"
+            << ",\"stamping\":\"corner_pair_then_selected\""
             << ",\"wide_searches\":" << live.wide_searches
             << ",\"wide_search_pending\":" << std::any_of(live.ring.begin(), live.ring.end(), [](const auto& f) { return f.busy && f.wide_search; })
             << ",\"last_wide_results\":[";

@@ -53,6 +53,44 @@ void test_wide_search() {
     require(!calibration_search(image, targets).valid, "Flat or missing markers must never lock");
     std::cout << "PASS wide marker search: displacement, independent scale, edge preference, ambiguity and flip\n";
 }
+void test_hogwarts_corner_pair() {
+    // Support 13844: source 3440x1440, submitted eye 1493x1440.
+    // Reconstruct codes to test clipping/corner choice without lossy ZIP previews.
+    const CalibrationPlacement outer{973.5, 0, 1493, 1440, {1020, 12}};
+    const auto padded = calibration_padded_corner({973.5, 20, 1493, 1420, {1980, 108}}, 3440, 1440, 0, 1493, 1420);
+    require(padded.marker.x == 986 && padded.marker.y == 32,
+        "Reacquisition padding must follow the actual crop boundary, not the previous inset marker");
+    const auto twice = calibration_padded_corner(padded, 3440, 1440, 0, 1493, 1420);
+    require(twice.marker == padded.marker, "Repeated crop padding must not drift toward image center");
+    const auto pair = calibration_corner_pair(outer, 3440, 1440, 0);
+    require(pair.count == 2 && pair.at(1).marker.x == 1068 && pair.at(1).marker.y == 60,
+        "Acquisition must use a close non-overlapping outer/inner corner pair");
+    auto points = calibration_marker_points(pair, 0, 0, 3440, 0, 9918158);
+    std::vector<CalibrationSearchTarget> targets;
+    for (unsigned i = 0; i < points.count; ++i) targets.push_back({points.points[i], 0, 3440, 1440});
+    CalibrationMarkerPoint middle{1980, 12};
+    middle.code = calibration_location_code(middle, 3440, 0, 9918158);
+    targets.push_back({middle, 0, 3440, 1440});
+    for (bool clipped : {false, true}) {
+        CalibrationSearchImage image;
+        image.width = 1493; image.height = 1440;
+        image.original_width = 1493; image.original_height = 1440;
+        image.pixels.assign(image.width * image.height, .2F);
+        for (const auto& t : targets) for (unsigned y = 0; y < 40; ++y) for (unsigned x = 0; x < 40; ++x) {
+            const int px = int(t.marker.x + x) - 974;
+            const int py = int(t.marker.y + y) - (clipped ? 20 : 0);
+            if (px < 0 || py < 0 || px >= int(image.width) || py >= int(image.height)) continue;
+            image.pixels[py * image.width + px] = calibration_pattern_bit(0, x / 8, y / 8, t.marker.code) ? .85F : .12F;
+        }
+        const auto found = calibration_search(image, targets);
+        require(found.valid && found.placement.marker == points.points[clipped ? 1 : 0],
+            "Prefer outer corner over top-center; use nearby inner marker if outer code clips");
+        CalibrationPlacementPlan locked; locked.placements[0] = found.placement;
+        require(calibration_marker_points(locked, 0, 0, 3440, 0, 9918158).count == 1,
+            "A acquired pair must collapse to one tracking marker");
+    }
+    std::cout << "PASS Hogwarts corner pair: outer priority, clipping fallback, single-marker tracking\n";
+}
 void test_cyberpunk_capture_search() {
     // Support capture 16380, sequence 42182: exact source/submitted dimensions,
     // source marker positions and epoch codes. The submitted previews show
@@ -247,9 +285,21 @@ void crop_calibration11() {
         require(!eye_calibration_stats().in_flight, "Cropped readbacks must drain without blocking production");
         const auto report = collect_calibration_images(support);
         require(report.files.size() == 5, "Search captures must include all production stamp/read evidence");
+        require(support->images[0].info.markers.count <= 2 && support->images[1].info.markers.count <= 2,
+            "Acquisition must never display the full marker bank");
         return support;
     };
-    auto first = attempt(50, 0, 300, 300, 300);
+    auto acquire = [&](auto render) {
+        const auto before = eye_calibration_stats().valid;
+        CalibrationImageRequestPtr support;
+        for (unsigned i = 0; i < 40; ++i) {
+            support = render();
+            if (eye_calibration_stats().valid > before) return support;
+            Sleep(100);
+        }
+        throw std::runtime_error("Sequential corner acquisition did not converge");
+    };
+    auto first = acquire([&] { return attempt(50, 0, 300, 300, 300); });
     require(eye_calibration_stats().valid == 1 && first->images[0].info.markers.count > 1,
         "Centered 4:3-to-square crop must find an inner marker");
     auto locked = attempt(50, 0, 300, 300, 300, false, false, true);
@@ -258,14 +308,13 @@ void crop_calibration11() {
         "A locked crop must stamp one marker and read only its two identity/orientation probes per eye");
     const auto before = eye_calibration_stats().valid;
     attempt(100, 0, 300, 300, 300);
-    require(eye_calibration_stats().valid == before && eye_calibration_json().find("\"locked\":true") == std::string::npos,
-        "Changed crop at the same resolution must unlock after the cached mapping fails");
-    auto recovered = attempt(100, 0, 300, 300, 300);
-    require(eye_calibration_stats().valid > before && recovered->images[0].info.markers.count > 1,
+    require(eye_calibration_stats().valid == before && eye_calibration_json().find("\"locked\":true") != std::string::npos,
+        "One failed sample must retain the tracking layout without publishing invalid identity");
+    auto recovered = acquire([&] { return attempt(100, 0, 300, 300, 300); });
+    require(eye_calibration_stats().valid > before && recovered->images[0].info.markers.count <= 2,
         "Search must recover an edge-aligned crop");
     // Changed scale, simultaneous horizontal/vertical crop and shader flip.
-    attempt(87.5, 37.5, 225, 225, 192, true);
-    attempt(87.5, 37.5, 225, 225, 192, true);
+    acquire([&] { return attempt(87.5, 37.5, 225, 225, 192, true); });
     auto zoom = attempt(87.5, 37.5, 225, 225, 192, true);
     require(eye_calibration_stats().vertical_flip && zoom->images[0].info.markers.count == 1,
         "Crop-plus-resize and vertical flip must lock to one inner placement");
@@ -273,14 +322,12 @@ void crop_calibration11() {
     attempt(87.5, 37.5, 225, 225, 192, true, true);
     require(eye_calibration_stats().valid == visible, "Missing markers must never authenticate a crop guess");
     auto resumed = attempt(87.5, 37.5, 225, 225, 192, true);
-    require(eye_calibration_stats().valid == visible + 1 && resumed->images[0].info.markers.count > 1,
-        "Marker loss must reopen the bank and recover on fresh pixels");
+    require(eye_calibration_stats().valid == visible + 1 && resumed->images[0].info.markers.count == 1,
+        "A transient miss must recover without reopening acquisition");
     // Neither eye uses one of the predefined crop hypotheses, and their scales
     // differ. Acquisition must fit the actual pixels independently.
-    attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
-    Sleep(1050); // Test-only: permit the rate-limited acquisition retry.
     const auto prior_acquisition = eye_calibration_stats().valid;
-    attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
+    acquire([&] { return attempt(34.3, 21.7, 330, 250, 300, false, false, false, true); });
     if (eye_calibration_stats().valid == prior_acquisition) std::cerr << eye_calibration_json() << '\n';
     require(eye_calibration_stats().valid > prior_acquisition && eye_calibration_json().find("\"per_eye\":true") != std::string::npos,
         "A wide search must acquire arbitrary, different crops in the two submitted eyes");
@@ -296,11 +343,12 @@ void crop_calibration11() {
     }
     require(search_count() == searches && eye_calibration_stats().valid == acquired_valid + 3,
         "Stable acquired geometry must not schedule any further wide searches");
-    attempt(34.3, 21.7, 330, 250, 300, false, true, false, true);
-    Sleep(1050);
-    attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
-    require(search_count() > searches && eye_calibration_stats().valid == acquired_valid + 4,
-        "Losing the tracked marker must resume wide acquisition and recover");
+    for (unsigned i = 0; i < 3; ++i) attempt(34.3, 21.7, 330, 250, 300, false, true, false, true);
+    require(eye_calibration_json().find("\"locked\":true") == std::string::npos,
+        "Three consecutive marker misses must release placement locks");
+    auto recovered_pair = acquire([&] { return attempt(34.3, 21.7, 330, 250, 300, false, false, false, true); });
+    require(recovered_pair->images[0].info.markers.count <= 2 && eye_calibration_stats().valid == acquired_valid + 4,
+        "Sustained marker loss must reacquire using only a local corner pair");
     eye_calibration_enable(false); eye_calibration_frame(); eye_calibration_stop();
     unregister_stereo_view(7101); unregister_stereo_view(7102);
     std::cout << "PASS DX11 crop search: centered/edge crop, packed bounds, source origin, resize/flip, lock/loss/recovery\n";
@@ -563,7 +611,7 @@ void run_calibration_policy() {
 }
 } // namespace
 int run_crop_calibration_tests() {
-    try { test_wide_search(); test_cyberpunk_capture_search(); crop_calibration11(); return 0; }
+    try { test_wide_search(); test_hogwarts_corner_pair(); test_cyberpunk_capture_search(); crop_calibration11(); return 0; }
     catch (const std::exception& e) { std::cerr << "Crop calibration: " << e.what() << '\n'; eye_calibration_stop(); return 1; }
 }
 int run_stereo_support_tests() {
@@ -608,6 +656,7 @@ int run_stereo_support_tests() {
 int run_eye_calibration_tests() {
     try {
         test_wide_search();
+        test_hogwarts_corner_pair();
         test_cyberpunk_capture_search();
         crop_calibration11();
         run_calibration_policy();

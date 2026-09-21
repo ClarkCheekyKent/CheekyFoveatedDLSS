@@ -173,11 +173,10 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
         CalibrationPlacement placement{target.marker.x - px,
             pattern.flip ? target.marker.y + 40 - height + py : target.marker.y - py,
             width, height, target.marker};
-        // Prefer a complete, decodable marker nearest an edge of the submitted
+        // Prefer a complete, decodable marker nearest a corner of the submitted
         // view. Actual headset hidden-area visibility is not available here.
-        const double edge = (std::min)({hit.x / image.width, hit.y / image.height,
-            (image.width - hit.x - hit.cw * 5) / image.width,
-            (image.height - hit.y - hit.ch * 5) / image.height});
+        const double edge = calibration_corner_distance(hit.x, hit.y, image.width, image.height,
+            hit.cw * 5, hit.ch * 5);
         if (!result.valid || edge < best_edge) {
             best_edge = edge;
             result = {true, bool(pattern.flip), false, target.candidate, placement, hit.score};

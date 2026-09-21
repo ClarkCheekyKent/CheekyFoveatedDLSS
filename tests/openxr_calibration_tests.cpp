@@ -1333,7 +1333,18 @@ void crop_calibration12(bool mixed) {
         require(collect_calibration_images(support).files.size() == 5, "Crop capture must retain both APIs' image evidence");
         return support;
     };
-    auto first = attempt(16);
+    auto acquire = [&](auto render) {
+        const auto before = eye_calibration_stats().valid;
+        CalibrationImageRequestPtr support;
+        for (unsigned i = 0; i < 40; ++i) {
+            support = render();
+            require(support->images[0].info.markers.count <= 2, "Only a corner pair may be stamped during acquisition");
+            if (eye_calibration_stats().valid > before) return support;
+            Sleep(100);
+        }
+        throw std::runtime_error("Sequential DX12 corner acquisition did not converge");
+    };
+    auto first = acquire([&] { return attempt(16); });
     require(eye_calibration_stats().valid && first->images[0].info.markers.count > 1,
         "DX12 inner markers must survive shader crop and resize");
     auto locked = attempt(16);
@@ -1342,9 +1353,9 @@ void crop_calibration12(bool mixed) {
     const auto before = eye_calibration_stats().valid;
     attempt(16 | 32);
     require(eye_calibration_stats().valid == before, "An old centered-crop lock must fail on an edge crop");
-    auto edge = attempt(16 | 32);
-    require(eye_calibration_stats().valid > before && edge->images[0].info.markers.count > 1, "DX12 must reacquire from the full bank");
-    attempt(16 | 64, true); attempt(16 | 64, true);
+    auto edge = acquire([&] { return attempt(16 | 32); });
+    require(eye_calibration_stats().valid > before && edge->images[0].info.markers.count <= 2, "DX12 must reacquire from a local corner pair");
+    acquire([&] { return attempt(16 | 64, true); });
     auto zoom = attempt(16 | 64, true);
     require(eye_calibration_stats().vertical_flip && zoom->images[0].info.markers.count == 1,
         "DX12 crop, resize and flip must keep the authenticated placement");
@@ -1353,10 +1364,8 @@ void crop_calibration12(bool mixed) {
     require(eye_calibration_stats().valid == visible, "DX12 obscured codes must not authenticate any hypothesis");
     attempt(16 | 64, true);
     require(eye_calibration_stats().valid == visible + 1, "DX12 marker loss must reopen search and recover");
-    attempt(256);
-    Sleep(1050); // Test-only wait for the wide-search retry cadence.
     const auto before_wide = eye_calibration_stats().valid;
-    attempt(256);
+    acquire([&] { return attempt(256); });
     require(eye_calibration_stats().valid > before_wide && eye_calibration_json().find("\"per_eye\":true") != std::string::npos,
         "Wide acquisition must decode arbitrary per-eye shader crops across both D3D paths");
     const auto before_tracking = eye_calibration_stats().valid;

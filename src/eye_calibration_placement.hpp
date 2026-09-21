@@ -103,6 +103,44 @@ inline CalibrationPlacementPlan calibration_placement_plan(unsigned width, unsig
     add(15, w * .5, h * .5);
     return plan;
 }
+// Rank distance to a corner, not merely distance to any one edge. A marker
+// halfway across the top edge must not beat a slightly inset corner marker.
+inline double calibration_corner_distance(double x, double y, double w, double h,
+                                           double marker_w = 40, double marker_h = 40) {
+    if (w <= 0 || h <= 0) return 1e30;
+    const double dx = (std::min)(x, w - x - marker_w) / w;
+    const double dy = (std::min)(y, h - y - marker_h) / h;
+    return dx * dx + dy * dy;
+}
+inline CalibrationPlacement calibration_padded_corner(CalibrationPlacement p, unsigned width,
+    unsigned height, unsigned candidate, double submitted_width, double submitted_height) {
+    // Padding is measured in the submitted eye, then mapped into source pixels.
+    // Rebuild from the learned crop boundary, not from the last inset marker:
+    // repeated reacquisition must not walk the marker farther into the view.
+    const double px = (std::max)(12., submitted_width > 0 ? 12. * p.width / submitted_width : 12.);
+    const double py = (std::max)(12., submitted_height > 0 ? 12. * p.height / submitted_height : 12.);
+    p.marker.x = unsigned(std::clamp(candidate ? std::floor(p.x + p.width - 40 - px) :
+        std::ceil(p.x + px), 0., double(width - 40)));
+    p.marker.y = unsigned(std::clamp(std::ceil(p.y + py), 0., double(height - 40)));
+    return p;
+}
+inline CalibrationPlacementPlan calibration_corner_pair(CalibrationPlacement outer,
+                                                        unsigned width, unsigned height, unsigned candidate) {
+    CalibrationPlacementPlan plan;
+    plan.placements[0] = outer;
+    // 40px code + 8px gap: close enough to remain near the same corner without
+    // overwriting either code. The inset protects against clipping/reprojection.
+    auto inner = outer;
+    const int x = int(outer.marker.x) + (candidate ? -48 : 48);
+    const unsigned y = outer.marker.y + 48;
+    if (x >= 0 && unsigned(x) + 40 <= width && y + 40 <= height &&
+        y + 40 < height / 2) {
+        inner.marker.x = unsigned(x); inner.marker.y = y;
+        plan.placements[1] = inner;
+        plan.count = 2;
+    }
+    return plan;
+}
 inline unsigned calibration_patch_index(unsigned box, unsigned eye) {
     return 4 + (box / 4) * 8 + ((box % 4) / 2) * 4 + eye * 2 + box % 2;
 }
