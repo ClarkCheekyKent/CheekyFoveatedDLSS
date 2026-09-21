@@ -482,6 +482,12 @@ void test_reset_policy() {
     );
     expect(result.reason == GazeResetReason::none,
         "small gaze motion preserves history");
+    const GazeCropPolicyState boundary{164U, 100U, 400U, 300U, true};
+    result = evaluate_gaze_reset(
+        first, boundary, true, false, false, 0.125F
+    );
+    expect(result.reason == GazeResetReason::large_jump,
+        "origin jump at the 64-pixel floor resets history");
     const GazeCropPolicyState large{180U, 100U, 400U, 300U, true};
     result = evaluate_gaze_reset(
         first, large, true, false, false, 0.125F
