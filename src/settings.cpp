@@ -26,7 +26,7 @@ std::atomic<std::uint32_t> afw_warp_margin_bits{0x3D4CCCCDU};
 std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
 std::atomic<std::uint32_t> width_bits{0x3F0CCCCDU};
 std::atomic<std::uint32_t> height_bits{0x3EE66666U};
-std::atomic<std::uint32_t> x_offset_bits{0x3F19999AU};
+std::atomic<std::uint32_t> x_offset_bits{0U};
 std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
 std::atomic<bool> auto_stereo_alignment{true};

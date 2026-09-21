@@ -21,7 +21,10 @@ struct CalibrationPlacement {
 struct CalibrationPlacementPlan {
     std::array<CalibrationPlacement, calibration_placement_count> placements{};
     unsigned count{1};
+    bool per_eye{};
+    std::array<CalibrationPlacement, 2> eye_placements{};
     const CalibrationPlacement& at(unsigned i) const { return placements[i < count ? i : 0]; }
+    const CalibrationPlacement& for_eye(unsigned eye, unsigned i) const { return per_eye ? eye_placements[eye] : at(i); }
 };
 struct CalibrationMarkerPoints {
     std::array<CalibrationMarkerPoint, calibration_placement_count> points{};
@@ -51,6 +54,13 @@ inline CalibrationMarkerPoints calibration_marker_points(const CalibrationPlacem
     CalibrationMarkerPoints result;
     for (unsigned i = 0; i < plan.count; ++i) {
         auto p = plan.at(i).marker;
+        p.code = calibration_location_code(p, width, candidate, base);
+        p.x += x; p.y += y;
+        if (std::find(result.points.begin(), result.points.begin() + result.count, p) == result.points.begin() + result.count)
+            result.points[result.count++] = p;
+    }
+    if (plan.per_eye) for (const auto& placement : plan.eye_placements) {
+        auto p = placement.marker;
         p.code = calibration_location_code(p, width, candidate, base);
         p.x += x; p.y += y;
         if (std::find(result.points.begin(), result.points.begin() + result.count, p) == result.points.begin() + result.count)

@@ -136,6 +136,9 @@ struct Calibration12Frame {
     std::array<unsigned, calibration_patch_count> patch_mirrors{};
     std::array<std::array<std::uint32_t, calibration_placement_count>, 2> stamp_codes{};
     std::array<SupportReadback, 4> support;
+    std::array<SupportReadback, 2> search_readbacks;
+    std::array<CalibrationSearchPtr, 2> searches;
+    std::array<std::array<float, 4>, 2> search_bounds{};
     // Four timed segments plus bounded lifetime tracking for source refreshes
     // while an alternating-eye submission waits for its second source.
     std::array<Segment, 12> segments;
@@ -152,6 +155,43 @@ struct Calibration12Frame {
     std::uint64_t asynchronous_allocations{};
 };
 namespace {
+void search_copy(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
+    unsigned subresource, unsigned eye, const CalibrationSearchPtr& request, std::array<float, 4> bounds) noexcept {
+    if (!request) return;
+    try {
+        auto& capture = f.search_readbacks[eye];
+        f.searches[eye] = request; f.search_bounds[eye] = bounds;
+        auto desc = texture->GetDesc(); desc.DepthOrArraySize = desc.MipLevels = 1;
+        f.device->GetCopyableFootprints(&desc, 0, 1, 0, &capture.patch.footprint, nullptr, nullptr, &capture.patch.bytes);
+        capture.memory = reserve_calibration_image_memory(capture.patch.bytes);
+        if (!capture.memory || !buffer(f.device.Get(), D3D12_HEAP_TYPE_READBACK, capture.patch.bytes, capture.patch.buffer)) {
+            capture.memory.reset(); request->ready = true; return;
+        }
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        src.pResource = texture; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = subresource;
+        dst.pResource = capture.patch.buffer.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = capture.patch.footprint;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        capture.patch.used = true;
+    } catch (...) { request->ready = true; }
+}
+void search_poll(Calibration12Frame& f) noexcept {
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& capture = f.search_readbacks[eye];
+        if (!capture.patch.used || capture.published) continue;
+        CalibrationSearchImage image;
+        void* data{};
+        const D3D12_RANGE range{0, SIZE_T(capture.patch.bytes)};
+        if (f.segments[2 + eye].submitted && SUCCEEDED(capture.patch.buffer->Map(0, &range, &data))) {
+            const auto& d = capture.patch.footprint.Footprint;
+            try { image = calibration_search_image(static_cast<const unsigned char*>(data) + capture.patch.footprint.Offset,
+                d.RowPitch, d.Width, d.Height, d.Format, f.search_bounds[eye]); } catch (...) {}
+            const D3D12_RANGE empty{0, 0}; capture.patch.buffer->Unmap(0, &empty);
+        }
+        calibration_search_start(f.searches[eye], std::move(image));
+        capture.published = true; capture.patch.buffer.Reset(); capture.memory.reset();
+    }
+}
 // Called within the existing COPY_SOURCE interval; no compute state changes.
 void support_copy(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
     unsigned subresource, unsigned index, const CalibrationImageRequestPtr& request) noexcept {
@@ -360,6 +400,7 @@ bool calibration12_begin(Calibration12Frame& f, std::uint64_t* allocations) noex
     f.failure = {};
     f.capture_counts = {};
     f.support = {}; // reusable() above includes retirement and all GPU fences.
+    f.search_readbacks = {}; f.searches = {};
     for (auto& p : f.patches)
         p.used = false;
     for (auto& s : f.segments) {
@@ -513,10 +554,11 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
                            std::span<const D3D12_BOX> boxes, std::uint64_t& allocations,
                            Calibration12Failure* failure, const CalibrationImageRequestPtr& support,
                            const CalibrationImageInfo& support_info, std::span<const std::uint32_t> codes,
-                           std::span<const unsigned> mirrors) noexcept {
+                           std::span<const unsigned> mirrors, const CalibrationSearchPtr& search) noexcept {
     if (failure) *failure = {};
     const bool capture_image = begin_calibration_image(support, 2 + eye, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
+        if (search && !search->started) search->ready = true;
         if (failure) *failure = {stage, hr};
         if (capture_image) fail_calibration_image(support, 2 + eye, stage);
         return false;
@@ -581,6 +623,7 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     for (unsigned c = 0; c < boxes.size(); ++c)
         copy_patch(f, list.Get(), calibration_patch_index(c, eye), texture, subresource, boxes[c]);
     if (capture_image) support_copy(f, list.Get(), texture, subresource, 2 + eye, support);
+    search_copy(f, list.Get(), texture, subresource, eye, search, support_info.bounds);
     transition(list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     end_segment(f, list.Get(), 2 + eye);
     hr = list->Close();
@@ -638,6 +681,7 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
     f.asynchronous_allocations = 0;
     const auto device_status = f.device->GetDeviceRemovedReason();
     if (FAILED(device_status)) {
+        for (auto& search : f.searches) if (search && !search->started) search->ready = true;
         out.ready = out.reusable = true;
         out.failure = {"device_removed", device_status};
         return out;
@@ -652,6 +696,7 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
             return out;
     out.ready = true;
     support_poll(f); // Preserve evidence even when marker classification fails.
+    search_poll(f);
     out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason()) &&
         (source_only || (f.capture_counts[0] && f.capture_counts[1]));
     out.failure = f.failure;

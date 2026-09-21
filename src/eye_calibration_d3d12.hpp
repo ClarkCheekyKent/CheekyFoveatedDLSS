@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include "eye_calibration_capture.hpp"
+#include "eye_calibration_search.hpp"
 
 namespace cheeky::foveated_dlss {
 struct Calibration12Frame;
@@ -38,7 +39,8 @@ bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resou
                            const CalibrationImageRequestPtr& support = {},
                            const CalibrationImageInfo& support_info = {},
                            std::span<const std::uint32_t> codes = {},
-                           std::span<const unsigned> mirrors = {}) noexcept;
+                           std::span<const unsigned> mirrors = {},
+                           const CalibrationSearchPtr& search = {}) noexcept;
 // Mixed API frames have only source proof in DX12; submitted patches arrive
 // independently from DX11 and must not be treated as missing DX12 readbacks.
 Calibration12Readback calibration12_poll(Calibration12Frame&, bool source_only = false, unsigned source_mask = 3) noexcept;

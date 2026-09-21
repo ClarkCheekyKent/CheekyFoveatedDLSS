@@ -26,7 +26,7 @@ The main controls and their defaults are:
 | Periphery scale | `0.75` | Downscales the periphery further from the original render resolution. |
 | Fovea width / height | `0.55` / `0.45` | Sets the normalized size of the DLSS-processed region. |
 | Automatic stereo alignment | On | Uses OpenXR or usable Streamline projection data to align each eye without manual X adjustment. |
-| Stereo X offset | `0.60` | Manual horizontal placement; shown when two views are detected, Fixed is selected, and automatic alignment is off. |
+| Stereo X offset | `0.00` | Manual horizontal placement; shown when two views are detected, Fixed is selected, and automatic alignment is off. |
 | Invert stereo eye order | Off | Advanced override under Stereo mapping override for reversed packed eye order and manual stereo offsets. |
 | Height offset | `0.00` with automatic alignment; `-0.45` in manual placement | Moves fixed placement up (negative) or down (positive). With automatic alignment, zero preserves the detected center. In gaze modes this is Fallback height offset and does not shift valid gaze. |
 | Roundness | `0.00` | Blends the region shape from rectangular (`0`) to elliptical (`1`). This does not affect performance. |

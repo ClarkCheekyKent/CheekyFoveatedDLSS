@@ -79,13 +79,26 @@ poses for up to 250 ms. Runtime-provided optics remain the fallback before a
 valid submitted projection is available. Support snapshots identify the selected
 projection and its FOV tangents.
 
-Known limitation: marker calibration identifies the eye; it does not recover an
-arbitrary source-to-submitted crop. BG3/RealVR currently needs a configuration
-that preserves the corner markers near their expected positions. In the tested
-setup, toggling Optimize FOV off and back on produced matching render/submission
-extents. This is a workaround, not automatic crop correction. Continuous stamping
-also retains visible markers while calibration is enabled; bounded marker bursts
-and general crop recovery remain future work.
+Calibration first tries inexpensive crop hypotheses. If those cannot locate the
+markers, it acquires full submitted images asynchronously and searches their
+codes across the submitted view. Each eye gets an independently estimated crop
+and horizontal/vertical scale. Successful acquisition locks the selected marker;
+subsequent samples stamp only the selected location(s) and read small tracking
+patches. Marker loss or changed source/submission geometry unlocks placement and
+permits acquisition again. Wide acquisitions are limited to one stereo pair in
+flight, with at least one second between attempts; they stop while tracking is
+locked. Image conversion is bounded to a 2048-pixel maximum dimension, and up to
+two CPU workers search owned pixels without accessing graphics contexts.
+
+Among authenticated markers, prefer the one nearest a submitted-image edge that
+still leaves room for the complete tracking patch. This reduces visibility but
+does not prove the marker is outside the headset's visible area: no hidden-area
+mask is used. Acquisition still requires a surviving complete code. Severe
+distortion, clipping, or very small markers can prevent recognition. The search
+covers axis-aligned crop/resize and vertical flips, not arbitrary reprojection.
+The learned crop locates tracking patches; existing camera/XR projection logic
+continues to place gaze. Continuous stamping retains the selected markers while
+calibration is enabled.
 
 Open **Stereo and gaze > Eye calibration** in UEVR for the runtime, status and
 session enable switch. Detailed calibration data is included in support ZIPs.
@@ -139,6 +152,16 @@ resolve image orientation. Both eyes must identify different candidates.
 Uniform, clipped and ambiguous patches remain rejected. Grading that destroys
 the light/dark structure can still prevent recognition. Scores in diagnostic
 exports now measure pattern correlation, not the previous color contrast.
+
+Wide acquisition uses the same 0.90 correlation, 0.15 separation, 24/25 cell and
+0.04 contrast requirements. It searches positions and scales, then refines each
+axis separately. Conflicting source identities or orientations are rejected.
+The existing source before/after proof, physical-eye pair checks, epoch,
+generation and submission-result checks still apply. An acquisition older than
+the one-second publication limit may seed tracking for up to ten seconds, but
+must pass a fresh small-patch capture before it can publish an eye mapping.
+The support JSON's `placement_search` includes `wide_searches`,
+`wide_search_pending`, `last_wide_results`, and per-eye learned placements.
 
 `src/eye_calibration.cpp` owns an eight-slot reusable readback ring. Busy slots
 are skipped, never waited on or overwritten. The D3D11 implementation uses
@@ -215,3 +238,12 @@ tests cover host ABI, diagnostics, reports, interception and lifecycle. The Lua
 menu tests preserve slider apply-on-release behavior in LuaJIT and Lua 5.4.
 
 Automated tests do not establish compatibility or performance in every game. Validate each integration and graphics/runtime combination in actual game/headset sessions.
+
+`CheekyTests --crop-calibration` also covers arbitrary asymmetric crops outside
+the hypothesis bank on D3D11, D3D12 and mixed D3D12-to-D3D11 paths, tracking after
+acquisition, loss/reacquisition, edge preference, and conflicting codes. The
+Cyberpunk support-capture regression reconstructs sequence 42182's 6288x3568
+source markers and 4693x3498 submissions with the crop inferred from the previews:
+source B at (0,70), source A at (1595,70). It selects B's (4268,924) marker for
+submitted eye 0 and A's (1980,924) marker for eye 1. These are reconstructed
+full-resolution codes, not a lossless replay of the downsampled support images.

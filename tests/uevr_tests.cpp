@@ -316,7 +316,11 @@ int main(int argc, char** argv) {
             puts("UEVR ownership conflict test passed"); return 0;
         }
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
-        require(received.find("\"eye_calibration\":{\"backend\":\"Waiting for VR\",\"graphics_api\":0,\"enabled\":true") != received.npos,
+        const auto calibration_start = received.find("\"eye_calibration\":{");
+        require(calibration_start != received.npos, "Shared eye calibration diagnostics present");
+        const auto calibration = received.substr(calibration_start, received.find('}', calibration_start) - calibration_start);
+        require(calibration.find("\"backend\":\"Waiting for VR\"") != calibration.npos &&
+            field(calibration, "graphics_api") == 0 && calibration.find("\"enabled\":true") != calibration.npos,
             "Shared eye calibration diagnostics enabled on attachment");
         command("1\n80\ncalibration_disable");
         require(received.find("\"status\":\"Disabled\"") != received.npos, "Calibration disable command");

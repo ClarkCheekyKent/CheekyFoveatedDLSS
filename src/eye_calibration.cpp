@@ -51,6 +51,10 @@ struct SupportReadback11 {
 struct Frame {
     CalibrationImageRequestPtr support;
     std::array<SupportReadback11, 4> support11;
+    bool wide_search{};
+    std::array<CalibrationSearchPtr, 2> search;
+    std::array<SupportReadback11, 2> search11;
+    std::array<CalibrationImageInfo, 2> search_info;
     std::shared_ptr<Calibration12Frame> gpu12;
     ComPtr<ID3D12Device> device12;
     bool gpu12_used{}, classified{};
@@ -109,12 +113,17 @@ struct PlacementLock {
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     CalibrationPlacement placement;
     bool locked{};
+    bool per_eye{};
+    std::array<CalibrationPlacement, 2> eye_placements{};
 };
 struct State {
     std::mutex mutex;
     std::array<PlacementLock, 2> placements;
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::uint64_t placement_epoch{}, placement_sequence{}, placement_locks{}, placement_losses{};
+    bool search_needed{};
+    std::uint64_t wide_searches{}, last_wide_search_ms{};
+    std::array<CalibrationSearchResult, 2> last_search_results;
     std::array<Frame, ring_size> ring;
     int current{-1};
     std::uint64_t sequence{};
@@ -155,15 +164,17 @@ void placement_epoch(State& s) {
     if (s.placement_epoch == s.epoch) return;
     s.placement_epoch = s.epoch;
     s.placements = {}; s.submitted_sizes = {}; s.placement_sequence = 0;
+    s.search_needed = false; s.last_wide_search_ms = 0;
 }
 CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t view, unsigned width, unsigned height) {
     placement_epoch(s);
     auto& lock = s.placements[c];
     if (lock.locked && lock.view.id == view && lock.view.generation == stereo_view_generation(view) &&
         lock.view.width == width && lock.view.height == height && lock.submitted_sizes == s.submitted_sizes) {
-        CalibrationPlacementPlan plan; plan.placements[0] = lock.placement; return plan;
+        CalibrationPlacementPlan plan; plan.placements[0] = lock.placement;
+        plan.per_eye = lock.per_eye; plan.eye_placements = lock.eye_placements; return plan;
     }
-    if (lock.locked) ++s.placement_losses;
+    if (lock.locked) { ++s.placement_losses; s.search_needed = true; }
     lock.locked = false;
     return calibration_placement_plan(width, height, c, s.submitted_sizes[0][0], s.submitted_sizes[0][1]);
 }
@@ -185,13 +196,62 @@ std::array<unsigned, 4> submitted_rect(Frame& f, unsigned eye, unsigned index, u
         for (unsigned i = 0; i < plan.count; ++i)
             plan.placements[i].marker.x = f.views[source].width - block - plan.placements[i].marker.x;
     }
-    f.patch_codes[calibration_patch_index(index, eye)] = calibration_location_code(plan.at(h).marker,
+    const auto& placement = plan.for_eye(eye, h);
+    f.patch_codes[calibration_patch_index(index, eye)] = calibration_location_code(placement.marker,
         f.views[source].width, c, f.codes[c]);
     const unsigned mirror = (u1 < u0 ? 1U : 0U) | ((v1 < v0) != (index % 4 >= 2) ? 2U : 0U);
     f.patch_mirrors[calibration_patch_index(index, eye)] = 1U << mirror;
-    auto rect = calibration_sample_rect(plan.at(h), index % 4 >= 2, width, height, u0, v0, u1, v1);
+    auto rect = calibration_sample_rect(placement, index % 4 >= 2, width, height, u0, v0, u1, v1);
     if (!rect[2] || !rect[3]) { f.usable_placements[eye][h] = false; rect = {0, 0, 1, 1}; }
     return rect;
+}
+CalibrationSearchPtr prepare_search(Frame& f, unsigned eye) noexcept try {
+    if (!f.wide_search) return {};
+    auto request = std::make_shared<CalibrationSearch>();
+    for (unsigned c = 0; c < 2; ++c) {
+        if (!f.views[c].id) continue;
+        const auto points = calibration_marker_points(f.placement_plans[c], 0, 0, f.views[c].width, c, f.codes[c]);
+        for (unsigned i = 0; i < points.count; ++i)
+            request->targets.push_back({points.points[i], c, f.views[c].width, f.views[c].height});
+    }
+    return f.search[eye] = request;
+} catch (...) { return {}; }
+void capture_search11(Frame& f, unsigned eye, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+    const CalibrationImageInfo& info) noexcept try {
+    auto request = prepare_search(f, eye);
+    if (!request) return;
+    f.search_info[eye] = info;
+    auto& capture = f.search11[eye];
+    D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
+    const auto bytes = calibration_pixel_bytes(desc.Format);
+    if (!bytes || desc.SampleDesc.Count != 1 || info.slice >= desc.ArraySize) { request->ready = true; return; }
+    capture.memory = reserve_calibration_image_memory(std::uint64_t((desc.Width * bytes + 255) & ~255U) * desc.Height);
+    if (!capture.memory) { request->ready = true; return; }
+    const auto subresource = info.slice * desc.MipLevels;
+    desc.MipLevels = desc.ArraySize = 1; desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = desc.MiscFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Device> device; texture->GetDevice(&device);
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &capture.staging))) {
+        capture.memory.reset(); request->ready = true; return;
+    }
+    context->CopySubresourceRegion(capture.staging.Get(), 0, 0, 0, 0, texture, subresource, nullptr);
+} catch (...) { if (f.search[eye]) f.search[eye]->ready = true; }
+bool poll_search11(Frame& f, unsigned eye, ID3D11DeviceContext* context) {
+    auto& capture = f.search11[eye];
+    if (!capture.staging) return true;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const auto hr = context->Map(capture.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    CalibrationSearchImage image;
+    if (SUCCEEDED(hr)) {
+        const auto& info = f.search_info[eye];
+        try { image = calibration_search_image(mapped.pData, mapped.RowPitch, info.width, info.height, info.format, info.bounds); }
+        catch (...) {}
+        context->Unmap(capture.staging.Get(), 0);
+    }
+    calibration_search_start(f.search[eye], std::move(image));
+    capture.staging.Reset(); capture.memory.reset();
+    return true;
 }
 
 // Codes remain stable for a calibration epoch so delayed submissions can
@@ -369,6 +429,7 @@ void poll_submitted(Frame& f) {
         if (hr == S_FALSE) continue;
         if (FAILED(hr)) { f.invalid = true; capture.ready = true; continue; }
         bool waiting = !poll_support11(f, capture.context.Get(), 2 + eye);
+        waiting |= !poll_search11(f, eye, capture.context.Get());
         for (unsigned index = 0; index < f.placement_count * 4; ++index) {
             const unsigned c = index % 2;
             auto& p = f.patches[calibration_patch_index(index, eye)];
@@ -389,6 +450,8 @@ void poll_submitted(Frame& f) {
 }
 void poll(State& s) {
     for (auto& f : s.ring) {
+        if (f.epoch != s.epoch || !enabled) for (auto& request : f.search)
+            if (request) request->canceled = true;
         // Submission textures can belong to a second D3D11 device. Its tiny
         // copies and completion query must be read on that context's thread.
         if (f.busy) poll_submitted(f);
@@ -403,6 +466,8 @@ void poll(State& s) {
         // recycle either half until submission-thread DX11 queries also finish.
         if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
             [](const auto& capture) { return capture.active && !capture.ready; })) continue;
+        if (f.search[0] && f.search[1] && f.search[0]->started && f.search[1]->started &&
+            (!f.search[0]->ready.load(std::memory_order_acquire) || !f.search[1]->ready.load(std::memory_order_acquire))) continue;
         bool gpu12_reusable{};
         const unsigned source_mask = (f.views[0].id ? 1U : 0U) | (f.views[1].id ? 2U : 0U);
         const bool mono = f.pipelined && f.evaluations == 1 && (source_mask == 1 || source_mask == 2);
@@ -496,6 +561,9 @@ void poll(State& s) {
             }
             if (waiting)
                 continue;
+            for (unsigned eye = 0; eye < 2; ++eye)
+                waiting |= !poll_search11(f, eye, f.context.Get());
+            if (waiting) continue;
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
             const auto timing_result = f.context->GetData(f.disjoint.Get(), &disjoint, sizeof(disjoint),
                                    D3D11_ASYNC_GETDATA_DONOTFLUSH);
@@ -535,6 +603,9 @@ void poll(State& s) {
                 }
             }
         }
+        if (std::any_of(f.search.begin(), f.search.end(), [](const auto& search) {
+            return search && !search->ready.load(std::memory_order_acquire);
+        })) continue;
         unsigned rejection = f.invalid ? 1U : 0U;
         if (f.evaluations != 2 && !mono) rejection |= 2U;
         if (f.submits != 2 || f.eye_submits[0] != 1 || f.eye_submits[1] != 1) rejection |= 4U;
@@ -560,6 +631,7 @@ void poll(State& s) {
         int left = -1, right = -1, selected = -1;
         bool flipped_pair{}, ambiguous{};
         float selected_score{};
+        double selected_edge = 1e30;
         for (unsigned h = 0; h < f.placement_count; ++h) {
             if (!f.usable_placements[0][h] || !f.usable_placements[1][h]) continue;
             for (unsigned flip = 0; flip < 2; ++flip) {
@@ -572,24 +644,58 @@ void poll(State& s) {
                 if (selected >= 0 && (left != a || right != b || flipped_pair != bool(flip))) ambiguous = true;
                 const auto score = (std::min)(f.patches[base + left_slot * 2 + unsigned(a)].score,
                                               f.patches[base + right_slot * 2 + unsigned(b)].score);
-                if (selected < 0 || score > selected_score) {
+                const auto edge_distance = [](const CalibrationPlacement& p) {
+                    return (std::min)({(p.marker.x - p.x) / p.width, (p.marker.y - p.y) / p.height,
+                        (p.x + p.width - p.marker.x - block) / p.width, (p.y + p.height - p.marker.y - block) / p.height});
+                };
+                const double edge = edge_distance(f.placement_plans[a].for_eye(left_slot, h)) +
+                    edge_distance(f.placement_plans[b].for_eye(right_slot, h));
+                if (selected < 0 || edge < selected_edge || (edge == selected_edge && score > selected_score)) {
                     selected = int(h); left = a; right = b; flipped_pair = flip != 0; selected_score = score;
+                    selected_edge = edge;
                 }
             }
         }
-        if (selected < 0 || ambiguous) rejection |= 128U;
+        bool acquired{};
+        if (f.wide_search) for (unsigned eye = 0; eye < 2; ++eye)
+            s.last_search_results[eye] = f.search[eye] ? f.search[eye]->result : CalibrationSearchResult{};
+        if (selected < 0 && !ambiguous && f.search[0] && f.search[1]) {
+            const auto& a = f.search[left_slot]->result;
+            const auto& b = f.search[right_slot]->result;
+            if (a.valid && b.valid && !a.ambiguous && !b.ambiguous && a.flipped == b.flipped &&
+                (mono ? a.candidate == b.candidate && (source_mask & (1U << a.candidate)) : a.candidate != b.candidate)) {
+                left = int(a.candidate); right = int(b.candidate); flipped_pair = a.flipped;
+                acquired = true;
+            }
+        }
+        if ((selected < 0 && !acquired) || ambiguous) rejection |= 128U;
         // Do not let an old asynchronous completion undo a newer placement.
         if (enabled && f.epoch == s.epoch && f.sequence > s.placement_sequence &&
-            GetTickCount64() - f.captured_ms < 1000) {
+            GetTickCount64() - f.captured_ms < (acquired ? 10000U : 1000U)) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
             if (!rejection) {
                 for (unsigned c = 0; c < 2; ++c) {
                     if (!(source_mask & (1U << c))) continue;
                     if (!s.placements[c].locked) ++s.placement_locks;
-                    s.placements[c] = {f.views[c], f.submitted_sizes, f.placement_plans[c].at(unsigned(selected)), true};
+                    auto& learned = s.placements[c];
+                    if (acquired) {
+                        const unsigned first_eye = f.search[0]->result.candidate == c ? 0U : 1U;
+                        learned = {f.views[c], f.submitted_sizes, f.search[first_eye]->result.placement, true, true, {}};
+                        for (unsigned eye = 0; eye < 2; ++eye)
+                            learned.eye_placements[eye] = f.search[eye]->result.candidate == c ?
+                                f.search[eye]->result.placement : learned.placement;
+                    } else {
+                        const auto& plan = f.placement_plans[c];
+                        learned = {f.views[c], f.submitted_sizes, plan.at(unsigned(selected)), true, plan.per_eye, plan.eye_placements};
+                    }
                 }
+                s.search_needed = false;
+                // A slow acquisition may only seed tracking. Publication still
+                // uses the normal age check; verify immediately on fresh pixels.
+                if (acquired) s.frames_until_capture = 0;
             } else if (rejection & 128U) {
+                s.search_needed = true;
                 bool lost{};
                 for (auto& lock : s.placements) {
                     if (lock.locked) { ++s.placement_losses; lost = true; }
@@ -828,7 +934,7 @@ void eye_calibration_reset_stats() noexcept {
     s.cpu_us = 0;
     s.gpu = {};
     s.latency = {};
-    s.placement_locks = s.placement_losses = 0;
+    s.placement_locks = s.placement_losses = s.wide_searches = 0;
     s.measurement_start = s.sequence + 1;
 }
 bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_generation,
@@ -880,6 +986,12 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     poll(s);
     if (!on)
         return false;
+    placement_epoch(s);
+    // A single acquisition pair owns the wide readbacks and CPU workers.
+    // Keep stamping between frames, but never queue more full-image searches.
+    if (std::any_of(s.ring.begin(), s.ring.end(), [](const auto& frame) {
+        return frame.busy && frame.wide_search;
+    })) return false;
     // Drain readbacks every frame and sample one in ten. DX11 OpenXR
     // submissions use continuously stamped sources, including DX12 sources.
     if (!capture_due) return false;
@@ -900,6 +1012,9 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.sequence = s.sequence;
         f.support = claim_calibration_images(f.sequence, session_generation, f.codes);
         f.support11 = {};
+        f.search = {}; f.search11 = {};
+        f.wide_search = s.search_needed && (!s.last_wide_search_ms || now - s.last_wide_search_ms >= 1000);
+        if (f.wide_search) { ++s.wide_searches; s.last_wide_search_ms = now; }
         f.busy = true;
         f.closed = f.close_requested = f.invalid = f.queries_started = false;
         f.epoch = s.epoch;
@@ -1208,7 +1323,8 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     for (unsigned i = 0; i < box_count; ++i) image.sample_rects[i] =
         {boxes[i].left, boxes[i].top, boxes[i].right - boxes[i].left, boxes[i].bottom - boxes[i].top};
     if (!calibration12_capture(*f.gpu12, queue, texture, eye, slice, expected_state, {boxes.data(), box_count},
-                               s.stats.allocations, &failure, f.support, image, {codes.data(), box_count}, {mirrors.data(), box_count})) {
+                               s.stats.allocations, &failure, f.support, image, {codes.data(), box_count}, {mirrors.data(), box_count},
+                               prepare_search(f, eye))) {
         f.invalid = true;
         ++s.stats.d3d12_capture_failures;
         s.stats.d3d12_last_capture_failure = failure.stage;
@@ -1368,6 +1484,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
             f.invalid = true;
     }
     capture_support11(f, context.Get(), texture, 2 + eye, image);
+    capture_search11(f, eye, context.Get(), texture, image);
     if (independent_capture) {
         context->End(submitted.done.Get());
         submitted.active = true;
@@ -1412,6 +1529,7 @@ void eye_calibration_stop() noexcept {
     std::lock_guard lock(s.mutex);
     ++s.epoch;
     clear_stereo_calibration();
+    for (auto& f : s.ring) for (auto& search : f.search) if (search) search->canceled = true;
     s.ring = {};
     s.markers = {};
     s.device.Reset();
@@ -1528,14 +1646,32 @@ std::string eye_calibration_json() {
         std::lock_guard lock(live.mutex);
         out << ",\"placement_search\":{\"hypotheses\":" << calibration_placement_count
             << ",\"locks\":" << live.placement_locks << ",\"losses\":" << live.placement_losses
-            << ",\"sources\":[";
+            << ",\"wide_searches\":" << live.wide_searches
+            << ",\"wide_search_pending\":" << std::any_of(live.ring.begin(), live.ring.end(), [](const auto& f) { return f.busy && f.wide_search; })
+            << ",\"last_wide_results\":[";
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            if (eye) out << ',';
+            const auto& r = live.last_search_results[eye];
+            out << "{\"valid\":" << r.valid << ",\"ambiguous\":" << r.ambiguous << ",\"candidate\":" << r.candidate
+                << ",\"flipped\":" << r.flipped << ",\"score\":" << r.score
+                << ",\"marker_xy\":[" << r.placement.marker.x << ',' << r.placement.marker.y << "]}";
+        }
+        out << "],\"sources\":[";
         for (unsigned c = 0; c < 2; ++c) {
             if (c) out << ',';
             const auto& p = live.placements[c];
             out << "{\"locked\":" << (p.locked && live.placement_epoch == live.epoch)
                 << ",\"visible_source_xywh\":[" << p.placement.x << ',' << p.placement.y << ','
                 << p.placement.width << ',' << p.placement.height << "],\"marker_xy\":["
-                << p.placement.marker.x << ',' << p.placement.marker.y << "]}";
+                << p.placement.marker.x << ',' << p.placement.marker.y << "]"
+                << ",\"per_eye\":" << p.per_eye << ",\"eye_placements\":[";
+            for (unsigned eye = 0; eye < 2; ++eye) {
+                if (eye) out << ',';
+                const auto& e = p.per_eye ? p.eye_placements[eye] : p.placement;
+                out << "{\"visible_source_xywh\":[" << e.x << ',' << e.y << ',' << e.width << ',' << e.height
+                    << "],\"marker_xy\":[" << e.marker.x << ',' << e.marker.y << "]}";
+            }
+            out << "]}";
         }
         out << "]}";
         out << ",\"d3d11_lifecycle\":{\"frame_thread\":" << live.frame_thread

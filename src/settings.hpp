@@ -58,7 +58,7 @@ struct Settings {
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};
-    float x_offset{0.60F};
+    float x_offset{0.0F};
     float height_offset{-0.45F};
     bool invert_stereo_x_offset{false};
     bool auto_stereo_alignment{true};

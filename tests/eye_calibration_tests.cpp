@@ -1,6 +1,7 @@
 #include "eye_calibration_pixels.hpp"
 #include "eye_calibration.hpp"
 #include "eye_calibration_capture.hpp"
+#include "eye_calibration_search.hpp"
 #include "settings.hpp"
 #include "support_zip.hpp"
 #include <wrl/client.h>
@@ -17,6 +18,96 @@ void require(bool ok, const char* text) {
 }
 void check(HRESULT hr) {
     require(SUCCEEDED(hr), "Eye calibration GPU operation failed");
+}
+void test_wide_search() {
+    CalibrationSearchImage image;
+    image.width = 380; image.height = 280;
+    image.original_width = image.width; image.original_height = image.height;
+    image.pixels.assign(image.width * image.height, .2F);
+    const std::vector<CalibrationSearchTarget> targets{
+        {{84, 76, 3377866}, 0, 640, 480}, {{276, 172, 10377015}, 0, 640, 480},
+        {{508, 60, 8094815}, 1, 640, 480}};
+    auto stamp = [&](unsigned target, double left, double top, double sx, double sy, bool flip = false) {
+        for (unsigned y = 0; y < image.height; ++y) for (unsigned x = 0; x < image.width; ++x) {
+            const int px = int(std::floor((x + .5 - left) / sx)), py = int(std::floor((y + .5 - top) / sy));
+            if (px < 0 || py < 0 || px >= 40 || py >= 40) continue;
+            const auto& t = targets[target];
+            image.pixels[y * image.width + x] = calibration_pattern_bit(t.candidate, px / 8, flip ? 4 - py / 8 : py / 8, t.marker.code) ? .85F : .12F;
+        }
+    };
+    stamp(0, 16.7, 91.3, 1.13, .96);
+    stamp(1, 233.66, 183.46, 1.13, .96);
+    auto found = calibration_search(image, targets);
+    require(found.valid && found.candidate == 0 && !found.flipped && found.placement.marker == targets[0].marker,
+        "Wide acquisition must find displaced scaled markers and prefer the complete marker nearest an edge");
+    require(std::abs(found.placement.width - 380 / 1.13) < 30 && std::abs(found.placement.height - 280 / .96) < 30,
+        "Acquisition must estimate independent horizontal and vertical scale");
+    stamp(2, 150, 140, 1, 1);
+    found = calibration_search(image, targets);
+    require(!found.valid && found.ambiguous, "Two source identities in one eye must not produce a mapping");
+    image.pixels.assign(image.width * image.height, .2F);
+    stamp(1, 210, 110, .9, 1.1, true);
+    found = calibration_search(image, targets);
+    require(found.valid && found.flipped, "Wide acquisition must identify a shader vertical flip");
+    image.pixels.assign(image.width * image.height, .2F);
+    require(!calibration_search(image, targets).valid, "Flat or missing markers must never lock");
+    std::cout << "PASS wide marker search: displacement, independent scale, edge preference, ambiguity and flip\n";
+}
+void test_cyberpunk_capture_search() {
+    // Support capture 16380, sequence 42182: exact source/submitted dimensions,
+    // source marker positions and epoch codes. The submitted previews show
+    // source B cropped at (0,70), source A at (1595,70), with no pixel resize.
+    // Reconstruct full-resolution codes; the ZIP's 634x472 previews reduce a
+    // 40px code to ~5px and cannot serve as lossless recognition fixtures.
+    constexpr std::array<std::array<unsigned, 2>, 13> positions{{
+        {12,12},{780,12},{828,60},{1404,12},{1020,204},{1404,492},{1980,924},
+        {1548,12},{12,60},{1644,60},{828,12},{828,108},{1596,924}}};
+    constexpr std::array<std::uint32_t, 2> bases{3377866,8094815};
+    std::vector<CalibrationSearchTarget> targets;
+    for (unsigned c = 0; c < 2; ++c) for (const auto& xy : positions) {
+        CalibrationMarkerPoint p{c ? 6288 - 40 - xy[0] : xy[0], xy[1]};
+        p.code = calibration_location_code(p, 6288, c, bases[c]);
+        targets.push_back({p, c, 6288, 3568});
+    }
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        const unsigned candidate = 1 - eye, crop_x = eye ? 1595 : 0;
+        CalibrationSearchImage image;
+        image.width = 2048; image.height = unsigned(3498. * 2048 / 4693);
+        image.original_width = 4693; image.original_height = 3498;
+        image.pixels.assign(image.width * image.height, .2F);
+        for (unsigned y = 0; y < image.height; ++y) for (unsigned x = 0; x < image.width; ++x) {
+            const unsigned sx = crop_x + unsigned((x + .5) * 4693 / image.width);
+            const unsigned sy = 70 + unsigned((y + .5) * 3498 / image.height);
+            for (const auto& target : targets) {
+                const auto& p = target.marker;
+                if (target.candidate != candidate || sx < p.x || sy < p.y || sx >= p.x + 40 || sy >= p.y + 40) continue;
+                image.pixels[y * image.width + x] = calibration_pattern_bit(candidate, (sx - p.x) / 8, (sy - p.y) / 8, p.code) ? .85F : .12F;
+            }
+        }
+        const auto start = GetTickCount64();
+        const auto result = calibration_search(image, targets);
+        std::cout << "Cyberpunk eye=" << eye << " valid=" << result.valid << " candidate=" << result.candidate
+            << " marker=" << result.placement.marker.x << ',' << result.placement.marker.y
+            << " search_ms=" << GetTickCount64() - start << '\n';
+        require(result.valid && result.candidate == candidate && !result.flipped,
+            "Reported Cyberpunk dimensions, codes and asymmetric crop must identify each physical eye");
+        require(result.placement.marker.x == (eye ? 1980U : 4268U) && result.placement.marker.y == 924,
+            "Cyberpunk must track the complete side marker, rejecting clipped top and border-adjacent codes");
+        const auto rect = calibration_sample_rect(result.placement, false, 4693, 3498, 0, 0, 1, 1);
+        require(rect[2] && rect[3], "Chosen Cyberpunk edge marker must admit a complete tiny tracking patch");
+        std::vector<unsigned char> patch(std::size_t(rect[2]) * rect[3] * 4);
+        const auto& marker = result.placement.marker;
+        for (unsigned y = 0; y < rect[3]; ++y) for (unsigned x = 0; x < rect[2]; ++x) {
+            const unsigned sx = crop_x + rect[0] + x, sy = 70 + rect[1] + y;
+            auto* pixel = patch.data() + (std::size_t(y) * rect[2] + x) * 4;
+            pixel[0] = pixel[1] = pixel[2] = 51; pixel[3] = 255;
+            if (sx >= marker.x && sy >= marker.y && sx < marker.x + 40 && sy < marker.y + 40)
+                calibration_encode_pattern(pixel, DXGI_FORMAT_R8G8B8A8_UNORM, candidate, sx - marker.x, sy - marker.y, marker.code);
+        }
+        require(calibration_pattern_score(patch.data(), rect[2] * 4, rect[2], rect[3], DXGI_FORMAT_R8G8B8A8_UNORM,
+            candidate, true, marker.code, 1) >= calibration_pattern_min_score,
+            "Cyberpunk acquisition must hand off to the production tiny-patch tracker at its actual full-resolution location");
+    }
 }
 void test_deferred_capture_close() {
     eye_calibration_stop();
@@ -119,7 +210,7 @@ void crop_calibration11() {
     const std::vector<unsigned> background(sw * sh, 0xff404040);
     eye_calibration_enable(true);
     auto attempt = [&](double crop_x, double crop_y, double crop_w, double crop_h,
-                       unsigned size, bool flip = false, bool obscure = false, bool swapped = false) {
+                       unsigned size, bool flip = false, bool obscure = false, bool swapped = false, bool asymmetric = false) {
         auto support = request_calibration_images(true);
         for (unsigned n = 0; !eye_calibration_frame() && n < 20; ++n) {}
         auto target_desc = desc;
@@ -135,8 +226,10 @@ void crop_calibration11() {
             D3D11_MAPPED_SUBRESOURCE mapped{};
             check(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)); // Test host only.
             for (unsigned y = 0; y < size; ++y) for (unsigned x = 0; x < size; ++x) {
-                const auto sx = origin + unsigned(crop_x + (x + .5) * crop_w / size);
-                const auto sy = origin + unsigned(crop_y + ((flip ? size - 1 - y : y) + .5) * crop_h / size);
+                const double dx = asymmetric && c ? 7.3 : 0, dy = asymmetric && c ? 3.2 : 0;
+                const double dw = asymmetric && c ? 13.1 : 0, dh = asymmetric && c ? 4.6 : 0;
+                const auto sx = origin + unsigned(crop_x + dx + (x + .5) * (crop_w - dw) / size);
+                const auto sy = origin + unsigned(crop_y + dy + ((flip ? size - 1 - y : y) + .5) * (crop_h - dh) / size);
                 const auto* row = reinterpret_cast<const unsigned*>(static_cast<const unsigned char*>(mapped.pData) + sy * mapped.RowPitch);
                 pixels[y * size * 2 + (swapped ? 1 - c : c) * size + x] = obscure ? 0xff404040 : row[sx];
             }
@@ -182,6 +275,32 @@ void crop_calibration11() {
     auto resumed = attempt(87.5, 37.5, 225, 225, 192, true);
     require(eye_calibration_stats().valid == visible + 1 && resumed->images[0].info.markers.count > 1,
         "Marker loss must reopen the bank and recover on fresh pixels");
+    // Neither eye uses one of the predefined crop hypotheses, and their scales
+    // differ. Acquisition must fit the actual pixels independently.
+    attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
+    Sleep(1050); // Test-only: permit the rate-limited acquisition retry.
+    const auto prior_acquisition = eye_calibration_stats().valid;
+    attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
+    if (eye_calibration_stats().valid == prior_acquisition) std::cerr << eye_calibration_json() << '\n';
+    require(eye_calibration_stats().valid > prior_acquisition && eye_calibration_json().find("\"per_eye\":true") != std::string::npos,
+        "A wide search must acquire arbitrary, different crops in the two submitted eyes");
+    const auto search_count = [&] {
+        const auto json = eye_calibration_json(); const auto at = json.find("\"wide_searches\":");
+        return std::stoull(json.substr(at + 16));
+    };
+    const auto searches = search_count(), acquired_valid = eye_calibration_stats().valid;
+    for (unsigned i = 0; i < 3; ++i) {
+        auto tracked = attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
+        require(tracked->images[0].info.markers.count == 1 && tracked->images[2].info.sample_count == 4,
+            "Acquired geometry must use one edge marker and tiny readbacks");
+    }
+    require(search_count() == searches && eye_calibration_stats().valid == acquired_valid + 3,
+        "Stable acquired geometry must not schedule any further wide searches");
+    attempt(34.3, 21.7, 330, 250, 300, false, true, false, true);
+    Sleep(1050);
+    attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
+    require(search_count() > searches && eye_calibration_stats().valid == acquired_valid + 4,
+        "Losing the tracked marker must resume wide acquisition and recover");
     eye_calibration_enable(false); eye_calibration_frame(); eye_calibration_stop();
     unregister_stereo_view(7101); unregister_stereo_view(7102);
     std::cout << "PASS DX11 crop search: centered/edge crop, packed bounds, source origin, resize/flip, lock/loss/recovery\n";
@@ -444,7 +563,7 @@ void run_calibration_policy() {
 }
 } // namespace
 int run_crop_calibration_tests() {
-    try { crop_calibration11(); return 0; }
+    try { test_wide_search(); test_cyberpunk_capture_search(); crop_calibration11(); return 0; }
     catch (const std::exception& e) { std::cerr << "Crop calibration: " << e.what() << '\n'; eye_calibration_stop(); return 1; }
 }
 int run_stereo_support_tests() {
@@ -488,6 +607,8 @@ int run_stereo_support_tests() {
 }
 int run_eye_calibration_tests() {
     try {
+        test_wide_search();
+        test_cyberpunk_capture_search();
         crop_calibration11();
         run_calibration_policy();
         require(calibration_half(0x3c00) == 1 && calibration_half(0x3800) == 0.5F,

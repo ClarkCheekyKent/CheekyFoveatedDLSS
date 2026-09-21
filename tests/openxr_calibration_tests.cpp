@@ -1212,6 +1212,13 @@ cbuffer Options : register(b0) { uint options; }
         if (options & 2) uv.y = 1 - uv.y;
         p = uint2(start + uv * side);
     } else if (options & 2) p.y = 127 - p.y;
+    if (options & 256) {
+        float2 uv = (float2(id.xy) + .5) / 192;
+        if (options & 2) uv.y = 1 - uv.y;
+        float2 start = id.z ? float2(34.3, 21.7) : float2(41.6, 24.9);
+        float2 extent = id.z ? float2(330, 250) : float2(316.9, 245.4);
+        p = uint2(start + uv * extent);
+    }
     if (options & 4) p.y = min(p.y, 127 - p.y);
     if (options & 8) p = uint2(clamp(int2(p) + int2(8, 8), int2(0, 0), int2(127, 127)));
     float4 color = ((id.z ^ (options & 1)) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
@@ -1346,6 +1353,20 @@ void crop_calibration12(bool mixed) {
     require(eye_calibration_stats().valid == visible, "DX12 obscured codes must not authenticate any hypothesis");
     attempt(16 | 64, true);
     require(eye_calibration_stats().valid == visible + 1, "DX12 marker loss must reopen search and recover");
+    attempt(256);
+    Sleep(1050); // Test-only wait for the wide-search retry cadence.
+    const auto before_wide = eye_calibration_stats().valid;
+    attempt(256);
+    require(eye_calibration_stats().valid > before_wide && eye_calibration_json().find("\"per_eye\":true") != std::string::npos,
+        "Wide acquisition must decode arbitrary per-eye shader crops across both D3D paths");
+    const auto before_tracking = eye_calibration_stats().valid;
+    for (unsigned i = 0; i < 3; ++i) {
+        auto tracked = attempt(256);
+        require(tracked->images[0].info.markers.count == 1 && tracked->images[2].info.sample_count == 4,
+            "D3D12 acquired transform must reduce to tiny tracking patches");
+    }
+    require(eye_calibration_stats().valid == before_tracking + 3,
+        "D3D12 and mixed-API acquisition must remain locked on fresh captures");
     cleanup();
     // Registry collection is deliberately lazy; release our retired support
     // allocations before the next test exercises the process-wide budget.
