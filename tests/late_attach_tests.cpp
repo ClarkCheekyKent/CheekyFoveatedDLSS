@@ -607,8 +607,9 @@ void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx1
 void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::path& root, ID3D12Device* device,
     ID3D12CommandQueue* queue, std::string_view mode) {
     const bool use_c = mode.ends_with("-c"), use_sl = mode.find("streamline") != mode.npos;
-    const bool missing_lower = mode == "--afw-missing-lower", public_first = mode.starts_with("--afw-public-first");
-    afw_ota = mode.starts_with("--afw-ota"); afw_ambiguous = mode == "--afw-ota-ambiguous";
+    const bool realvr = mode.starts_with("--realvr-");
+    const bool missing_lower = mode.ends_with("-missing-lower"), public_first = mode.find("-public-first") != mode.npos;
+    afw_ota = mode.find("-ota") != mode.npos; afw_ambiguous = mode.ends_with("-ota-ambiguous");
     std::filesystem::path ngx_path;
     if (afw_ota) {
         ngx_path = root / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
@@ -629,12 +630,13 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
     require(ngx_succeeded(f.release(f.handle)), "Release initial public fixture handle");
     const auto dir = root / "afw-fixtures";
     std::filesystem::create_directories(dir);
-    for (const auto* name : {L"_nvngx.dll", L"PDAFWPlugin.dll"})
-        std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", dir / name);
+    std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", dir / "_nvngx.dll");
+    std::filesystem::copy_file(bin / "test-fixtures" / (realvr ? "CheekyFakeRealVR.dll" : "nvngx_dlss.dll"),
+        dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll"));
     afw_core = LoadLibraryW((dir / "_nvngx.dll").c_str());
-    afw_warp_module = LoadLibraryW((dir / "PDAFWPlugin.dll").c_str());
+    afw_warp_module = LoadLibraryW((dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll")).c_str());
     require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
-    afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
+    if (!realvr) afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
     afw_missing_lower = missing_lower || public_first || afw_ambiguous;
     afw_public_first = public_first;
     if (public_first) {
@@ -651,6 +653,68 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
     if (use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, f.handle, &f.params);
     proc<void(*)(void(*)(const NgxParameters*))>(afw_core, "CheekyFakeObserve")(&observe_afw_core);
     if (!public_first) proc<void(*)(void(*)(const NgxParameters*))>(f.ngx, "CheekyFakeObserve")(&observe_afw_lower);
+}
+
+void verify_realvr_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
+    auto& f = fixture();
+    require(snapshot(get).find("\"realvr_compatibility\":true")!=std::string::npos,
+        "Installed R.E.A.L. VR product identity was not detected");
+    command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=1\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false\nAlignmentBorder=true");
+    const auto creates_before = f.creates();
+    for (unsigned i=0; i<100; ++i) {
+        require(ngx_succeeded(f.evaluate()),"R.E.A.L. VR game evaluation succeeds"); f.finish_gpu();
+        require(afw_contract_ok && afw_order_ok,"VR hook received private/cropped work instead of one full-frame game call");
+        require(get_ui(&f.params,"Width")==128 && get_ui(&f.params,"OutWidth")==256,"Game dimensions were not restored");
+    }
+    require(afw_full_calls==100 && proc<Counter>(afw_core,"CheekyFakeCreates")()==1,
+        "VR core must receive exactly one original evaluation per frame and no private creates");
+    require(snapshot(get).find("\"afw_experiment\":{\"enabled\":false")!=std::string::npos,
+        "R.E.A.L. VR routing must not activate AFW coverage or warp metadata");
+    if (afw_missing_lower) {
+        require(f.creates()==creates_before,"Unavailable nested SR route must leave ordinary game DLSS intact");
+    } else {
+        require(f.creates()==creates_before+2 && afw_lower_calls==200 && afw_reduced_depth_calls==100,
+            "R.E.A.L. VR needs real center SR and reduced peripheral DLAA evaluations");
+        require(snapshot(get).find("\"active\":100")!=std::string::npos,"SR reported no active frames");
+        // Read the actual compositor output. Successful NGX return values alone
+        // previously hid the enabled-but-inactive SR failure.
+        const auto output_desc=f.textures12[3]->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 bytes{};
+        f.device->GetCopyableFootprints(&output_desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width=bytes;
+        desc.Height=desc.DepthOrArraySize=desc.MipLevels=1; desc.SampleDesc.Count=1; desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> readback;
+        check(f.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,IID_PPV_ARGS(&readback)),"Create border readback");
+        D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition={f.textures12[3].Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE};
+        f.list->ResourceBarrier(1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};
+        src.pResource=f.textures12[3].Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=readback.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=footprint;
+        f.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter); f.list->ResourceBarrier(1,&barrier);
+        f.finish_gpu();
+        unsigned char* pixels{}; check(readback->Map(0,nullptr,reinterpret_cast<void**>(&pixels)),"Read SR border pixels");
+        unsigned red{};
+        for(unsigned y=0;y<output_desc.Height;++y) for(unsigned x=0;x<output_desc.Width;++x) {
+            const auto* rgba=reinterpret_cast<const unsigned short*>(pixels+footprint.Offset+y*footprint.Footprint.RowPitch+x*8);
+            if(rgba[0]==0x3c00 && rgba[1]==0 && rgba[2]==0 && rgba[3]==0x3c00) ++red;
+        }
+        readback->Unmap(0,nullptr);
+        require(red>100 && red<5000,"SR did not write its red alignment border into the game output");
+        command("1\n201\nset\nPeripheralDlaa=false");
+        require(ngx_succeeded(f.evaluate()),"Center-only SR succeeds"); f.finish_gpu();
+        require(afw_full_calls==101 && afw_lower_calls==201,"Center-only SR executes below VR exactly once");
+        command("1\n202\nset\nEnabled=false");
+        require(ngx_succeeded(f.evaluate()),"Disabled SR passes through"); f.finish_gpu();
+        require(afw_full_calls==102 && afw_lower_calls==202,"Disabling SR keeps ordinary game DLSS running");
+        require(afw_full_resets==1 && get_ui(&f.params,"Reset")==0,
+            "Resuming original DLSS must reset its stale history once and restore the game's Reset parameter");
+    }
+    puts("PASS: R.E.A.L. VR full-frame core, nested SR/peripheral execution and passthrough");
 }
 
 void verify_afw_gaze_history(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {

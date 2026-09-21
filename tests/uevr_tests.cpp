@@ -198,6 +198,7 @@ int main(int argc, char** argv) {
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
         const bool afw = mode.starts_with("--afw-");
+        const bool realvr = mode.starts_with("--realvr-");
         const bool openvr_late = mode.starts_with("--openvr-late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
@@ -244,7 +245,7 @@ int main(int argc, char** argv) {
             api.vr = &vr_api; api.openvr = &openvr_api;
         }
         auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
-        if ((late && !dx11) || afw) {
+        if ((late && !dx11) || afw || realvr) {
             // Isolate the optional fake NR runtime from ordinary host fixtures
             // and from other concurrently running test processes.
             const auto isolated = root / "nr-hooks";
@@ -257,7 +258,7 @@ int main(int argc, char** argv) {
             plugin_path = isolated / plugin_path.filename();
         }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
-        if (afw) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
+        if (afw || realvr) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
         if (inactive_afw) {
             require(late, "Inactive AFW fixture requires a late-attachment route");
             const auto afw_path = root / "PDAFWPlugin.dll";
@@ -336,6 +337,10 @@ int main(int argc, char** argv) {
             // Keep the host mode fresh just as real present callbacks do.
             verify_late_attach_test(get, command, inactive_afw ? present : nullptr,
                 inactive_afw && !dx11 ? +[](unsigned mode) { rendering_mode = std::to_string(mode); } : nullptr);
+            return 0;
+        }
+        if (realvr) {
+            verify_realvr_test(get,command);
             return 0;
         }
         if (afw) {

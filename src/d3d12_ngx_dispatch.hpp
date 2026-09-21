@@ -34,6 +34,9 @@ struct AfwCompatibilityStatus {
     std::uint64_t early_left_calls{}, early_right_calls{}, early_unknown_calls{};
 };
 void enable_afw_compatibility() noexcept;
+void enable_realvr_compatibility() noexcept;
+[[nodiscard]] bool realvr_compatibility_enabled() noexcept;
+[[nodiscard]] bool protected_ngx_core_enabled() noexcept;
 [[nodiscard]] bool afw_compatibility_enabled() noexcept;
 [[nodiscard]] bool afw_coverage_enabled() noexcept;
 void publish_afw_rendering_mode(unsigned mode) noexcept;

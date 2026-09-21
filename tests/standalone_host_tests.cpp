@@ -38,6 +38,7 @@ int main(int argc,char** argv) {
     try {
         const std::string mode=argc>1 ? argv[1] : "dx12";
         const bool dx11=mode.find("dx11")!=std::string::npos;
+        const bool realvr=mode.starts_with("realvr-");
         const bool chained_table=mode.find("method-chain")!=std::string::npos;
         const bool streamline=mode.find("streamline")!=std::string::npos;
         const bool c_callback=mode.ends_with("-c");
@@ -61,7 +62,8 @@ int main(int argc,char** argv) {
             check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)),"DX12");
             D3D12_COMMAND_QUEUE_DESC desc{}; check(d12->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue)),"Queue");
         }
-        if(!chained_table)prepare_late_attach_test(bin,d11.Get(),d12.Get(),queue.Get(),c_callback,streamline);
+        if(realvr) prepare_afw_test(bin,root,d12.Get(),queue.Get(),"--"+mode);
+        else if(!chained_table)prepare_late_attach_test(bin,d11.Get(),d12.Get(),queue.Get(),c_callback,streamline);
         auto dll=LoadLibraryExW((root/L"CheekyFoveatedDLSSHost.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
         require(dll!=nullptr,"Load actual standalone host");
         const auto start=proc<CheekyHostStartFn>(dll,"CheekyHost_Start");
@@ -100,7 +102,8 @@ int main(int argc,char** argv) {
         command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
         // Let discovery's bounded late-load stability window expire.
         Sleep(300);
-        verify_late_attach_test(get,command,frame);
+        if(realvr) verify_realvr_test(get,command);
+        else verify_late_attach_test(get,command,frame);
         check(chain->ResizeBuffers(2,400,300,DXGI_FORMAT_UNKNOWN,0),"Resize without retained backbuffers"); frame();
         ComPtr<IDXGISwapChain3> chain3;
         if (!dx11 && SUCCEEDED(chain.As(&chain3))) {

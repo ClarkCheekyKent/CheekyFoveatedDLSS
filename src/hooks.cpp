@@ -11,6 +11,8 @@
 #include "afw_compatibility.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
+#include "realvr_runtime.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include "ngx_runtime_discovery.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
@@ -254,7 +256,25 @@ void __stdcall hook_afw_evaluate_warp(void* parameters) {
     afw_note_warp_call(metadata.eye, metadata.mode); // Late observation only; never predict a future eye.
 }
 
-void detect_afw_runtime() noexcept {
+void detect_vr_dlss_runtime() noexcept {
+    // This function also runs at game evaluations, before any private work.
+    // Check each resident proxy once; ordinary ReShade must not enable this route.
+    if (!realvr_compatibility_enabled()) {
+        static std::mutex detection_mutex;
+        static std::array<HMODULE, 4> inspected{};
+        const wchar_t* names[]{L"dxgi2.dll", L"dxgi.dll", L"RealVR64.dll", L"ReShade64.dll"};
+        std::lock_guard lock(detection_mutex);
+        for (unsigned i = 0; i < std::size(names); ++i) {
+            const auto module = GetModuleHandleW(names[i]);
+            if (!module || module == inspected[i]) continue;
+            inspected[i] = module;
+            if (is_realvr_runtime(module)) {
+                enable_realvr_compatibility();
+                log_info("R.E.A.L. VR compatibility: original full-frame core calls; private SR/NR work only inside the nested DLSS runtime");
+                break;
+            }
+        }
+    }
     if (afw_compatibility_enabled()) return;
     const auto module = GetModuleHandleW(L"PDAFWPlugin.dll");
     if (!module || !GetProcAddress(module, "EvaluateFrameWarp") ||
@@ -268,7 +288,7 @@ void afw_private_succeeded(const NgxHandle* handle) {
     // Preserve ordinary Native Stereo/AFR fallback semantics when the AFW DLL
     // is merely loaded. A pending reset from actual AFW work still survives
     // a mode change and is consumed by the next successful native evaluation.
-    if (!afw_coverage_enabled()) return;
+    if (!afw_coverage_enabled() && !realvr_compatibility_enabled()) return;
     std::lock_guard lock(d3d12_game_views_mutex);
     for (auto& view : d3d12_game_views)
         if (view.handle == handle) view.afw_native_history_stale = true;
@@ -279,7 +299,7 @@ struct AfwNativeResetScope {
     NgxParameters* parameters{};
     unsigned saved{};
     AfwNativeResetScope(const NgxHandle* h, const NgxParameters* p) : handle(h) {
-        if (!afw_compatibility_enabled() || !p) return;
+        if (!protected_ngx_core_enabled() || !p) return;
         std::lock_guard lock(d3d12_game_views_mutex);
         for (const auto& view : d3d12_game_views) {
             if (view.handle == h && view.afw_native_history_stale && ngx_succeeded(p->Get("Reset", &saved))) {
@@ -3222,8 +3242,8 @@ std::uint32_t hook_sl_evaluate_feature(
     // use that same processing path without rewriting tags or options twice.
     if(command_buffer && vulkan_command_device(static_cast<VkCommandBuffer>(command_buffer)))
         return original(feature,frame,inputs,input_count,command_buffer);
-    detect_afw_runtime();
-    if (afw_coverage_enabled() && feature == 0U) {
+    detect_vr_dlss_runtime();
+    if ((afw_coverage_enabled() || realvr_compatibility_enabled()) && feature == 0U) {
         // Keep the game's viewport/tags/options intact through AFW. The nested
         // native DX12 path owns SR. DX11 still needs normal option discovery
         // and native-fallback handling even when the AFW DLL is loaded.
@@ -4259,7 +4279,7 @@ NgxResult hook_create_d3d12(
 ) {
     const auto original = real_create_d3d12.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
-    detect_afw_runtime();
+    detect_vr_dlss_runtime();
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
         return original(command_list, feature, parameters, handle);
@@ -4298,8 +4318,8 @@ NgxResult hook_core_create_d3d12(
 ) {
     const auto original = real_core_create_d3d12.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
-    detect_afw_runtime();
-    if (afw_compatibility_enabled()) {
+    detect_vr_dlss_runtime();
+    if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
         // Let the lower create hook track its own handle and output contract.
         return original(command_list, feature, parameters, handle);
@@ -4544,6 +4564,14 @@ void evaluate_nr_after_native_d3d12(
         get_d3d12_parameter_resource(parameters, "MotionVectors");
     auto* const full_output = get_d3d12_parameter_resource(parameters, "Output");
     if (!full_color || !full_depth || !full_motion || !full_output) return false;
+    // Check tracking before peripheral DLAA as well as center allocation. A
+    // rejected center must not leave private work recorded on an untracked list.
+    if (!ensure_dlss_nr_recording(command_list)) {
+        static std::atomic<unsigned> rejected{};
+        if (rejected.fetch_add(1) < 8)
+            trace_event("D3D12 SR preparation rejected: command-list recording/observer unavailable list=%p", command_list);
+        return false;
+    }
     const auto full_color_x = contract.color_base_x;
     const auto full_color_y = contract.color_base_y;
     const auto full_depth_x = contract.depth_base_x;
@@ -4867,7 +4895,7 @@ NgxResult hook_evaluate_d3d12(
     const NgxProgressCallback callback
 ) {
     const auto original = real_evaluate_d3d12.load(std::memory_order_acquire);
-    detect_afw_runtime();
+    detect_vr_dlss_runtime();
     return dispatch_d3d12_ngx_evaluation(
         {
             D3D12NgxRoute::public_runtime,
@@ -4889,7 +4917,7 @@ NgxResult hook_core_evaluate_d3d12(
     const NgxParameters* const parameters,
     const NgxProgressCallback callback
 ) {
-    detect_afw_runtime();
+    detect_vr_dlss_runtime();
     const auto original = real_core_evaluate_d3d12.load(
         std::memory_order_acquire
     );
@@ -4914,7 +4942,7 @@ NgxResult evaluate_d3d12_c_impl(
 ) {
     const auto original = real_evaluate_d3d12_c.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
-    detect_afw_runtime();
+    detect_vr_dlss_runtime();
     if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
         skip_d3d12_evaluation({D3D12NgxRoute::public_runtime, command_list, handle, parameters, nullptr});
         return original(command_list, handle, parameters, callback);
@@ -5025,8 +5053,8 @@ NgxResult hook_core_release_d3d12(NgxHandle* const handle) {
         std::memory_order_acquire
     );
     if (original == nullptr) return 0xBAD00007U;
-    detect_afw_runtime();
-    if (afw_compatibility_enabled()) {
+    detect_vr_dlss_runtime();
+    if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
         return original(handle);
     }
@@ -5417,7 +5445,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] HMODULE find_afw_sr_runtime() noexcept {
+[[nodiscard]] HMODULE find_vr_sr_runtime() noexcept {
     // One callback set owns one snippet for this process. Retain the selected
     // image so a later unload/reload cannot leave its detours or private feature
     // callbacks pointing into freed memory. Never switch them to another DLL.
@@ -5444,13 +5472,13 @@ template <typename T>
     }
     static unsigned previous_count = ~0U;
     if (count != previous_count) {
-        trace_event("AFW lower-runtime discovery candidates=%u; %s", count,
+        trace_event("VR lower-runtime discovery candidates=%u; %s", count,
             count == 1 ? "one SR snippet found" : count ? "ambiguous SR snippets; passing through" : "waiting for an SR snippet");
         previous_count = count;
     }
     if (count == 1 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(candidate), &selected)) {
-        trace_event("AFW lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
+        trace_event("VR lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
     }
     afw_note_runtime_discovery(count, selected != nullptr);
     return selected;
@@ -5462,7 +5490,7 @@ template <typename T>
     if (!minhook_initialized.load(std::memory_order_acquire)) return false;
     bool installed{};
 
-    detect_afw_runtime();
+    detect_vr_dlss_runtime();
     if (afw_compatibility_enabled() && !afw_compatibility_status().warp_observer_ready) {
         static RuntimeStability warp_stability{};
         static HMODULE attempted_module{};
@@ -5487,8 +5515,8 @@ template <typename T>
         }
     }
 
-    const auto observed_public_runtime = afw_compatibility_enabled()
-        ? find_afw_sr_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto observed_public_runtime = protected_ngx_core_enabled()
+        ? find_vr_sr_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
     const auto public_runtime = runtime_ready_for_direct_hooks(
         observed_public_runtime,
         public_runtime_stability,
@@ -5507,7 +5535,7 @@ template <typename T>
         const auto get_proc = real_get_proc_address.load(std::memory_order_acquire);
         // Some older snippets share entry points. Reserve only actual aliases
         // for AFW's DX12 hooks; distinct DX11 entry points remain usable.
-        if (afw_compatibility_enabled() && public_d3d11_runtime && get_proc &&
+        if (protected_ngx_core_enabled() && public_d3d11_runtime && get_proc &&
             get_proc(public_d3d11_runtime, name) == get_proc(public_d3d11_runtime, dx12_name)) return false;
         return install_direct_hook(public_d3d11_runtime, name, detour, storage, DiagnosticApi::d3d11);
     };
@@ -6211,7 +6239,7 @@ LateAttachStatus late_attach_status() noexcept {
 
 bool start_interception() noexcept {
     if (started.exchange(true, std::memory_order_acq_rel)) return true;
-    detect_afw_runtime();
+    detect_vr_dlss_runtime();
     real_get_proc_address.store(&GetProcAddress, std::memory_order_release);
     trace_event("Interception startup begin");
     install_hook_debug_diagnostics();

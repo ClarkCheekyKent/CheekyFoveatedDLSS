@@ -64,6 +64,12 @@ if ($SkipTests) {
 
 & (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe")
 if ($LASTEXITCODE -ne 0) { throw "NR native observer tests failed with exit code $LASTEXITCODE." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe") --opaque-vr
+if ($LASTEXITCODE -ne 0) { throw "Opaque VR/native D3D12 observer tests failed." }
+foreach ($proxy in @('reshade','streamline')) {
+    & (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe") "--wrapped-$proxy"
+    if ($LASTEXITCODE -ne 0) { throw "Wrapped D3D12 observer failed: $proxy" }
+}
 
 $testExecutable = Join-Path $projectRoot "bin\$Configuration\CheekyTests.exe"
 & $testExecutable
@@ -101,6 +107,12 @@ foreach ($arguments in @(@(), @('--dx11'), @('--optiscaler'), @('--optiscaler','
     if ($LASTEXITCODE -ne 0) { throw "Generic runtime tests failed: $arguments" }
 }
 $standaloneHostTest = Join-Path $projectRoot "bin\$Configuration\CheekyStandaloneHostTests.exe"
+foreach ($mode in @('native','native-c','streamline','missing-lower','public-first','public-first-c','ota','ota-c','ota-streamline','ota-ambiguous')) {
+    & $uevrTest "--realvr-$mode"
+    if ($LASTEXITCODE -ne 0) { throw "R.E.A.L. VR runtime routing failed: $mode" }
+    & $standaloneHostTest "realvr-$mode" standalone
+    if ($LASTEXITCODE -ne 0) { throw "R.E.A.L. VR standalone routing failed: $mode" }
+}
 foreach ($abi in @('022','027','028','029')) {
     & $runtimeHostTest "--openvr-late-$abi"
     if ($LASTEXITCODE -ne 0) { throw "Standalone cached OpenVR compositor failed: $abi" }
