@@ -140,6 +140,7 @@ std::string snapshot_locked(State& s) {
         << ",\"observer\":{\"ready\":" << observer.ready << ",\"submissions\":" << observer.submissions
         << ",\"copies\":" << observer.copies << ",\"resets\":" << observer.resets << ",\"destroyed\":" << observer.destroyed << '}'
         << ",\"gaze\":{\"layer\":" << gaze.layer_present << ",\"abi\":" << gaze.abi_compatible
+        << ",\"input\":" << gaze_input_diagnostics_json(gaze.input)
         << ",\"using_gaze\":" << gaze.using_gaze << ",\"alignment\":" << gaze.alignment_source
         << ",\"afw_bilateral\":" << gaze.afw_bilateral << ",\"afw_fresh_sample\":" << gaze.afw_fresh_sample
         << ",\"ambiguous\":" << gaze.mapping_ambiguous << ",\"views\":" << views.active

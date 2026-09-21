@@ -202,6 +202,7 @@ std::string diagnostics_text() {
     out << "\n[Eye calibration]\n" << eye_calibration_json() << '\n';
     const auto g = gaze_diagnostics();
     out << "\n[OpenXR]\n";
+    out << "input=" << gaze_input_diagnostics_json(g.input) << '\n';
     out << "runtime_name=" << g.runtime_name << '\n';
     out << "submitted_copies=" << g.submitted_copies << '\n';
     out << "alignment_source=" << g.alignment_source << '\n';

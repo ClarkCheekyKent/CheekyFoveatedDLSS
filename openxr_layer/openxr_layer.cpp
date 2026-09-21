@@ -16,6 +16,7 @@
 #include "gaze_math.hpp"
 #include "eye_calibration.hpp"
 #include "projection_selection.hpp"
+#include "../src/realvr_runtime.hpp"
 #include <deque>
 
 #include <algorithm>
@@ -159,6 +160,15 @@ struct SessionState {
     std::uint64_t generation{};
     bool system_supported{};
     bool action_attached{};
+    bool running{};
+    bool fallback_setup_attempted{};
+    XrTime last_fallback_sync_time{};
+    CheekyGazeInputDiagnosticsV1 input{
+        CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION, sizeof(CheekyGazeInputDiagnosticsV1), 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        CHEEKY_GAZE_RESULT_NOT_CALLED, CHEEKY_GAZE_RESULT_NOT_CALLED,
+        CHEEKY_GAZE_RESULT_NOT_CALLED, CHEEKY_GAZE_RESULT_NOT_CALLED,
+        CHEEKY_GAZE_RESULT_NOT_CALLED, CHEEKY_GAZE_RESULT_NOT_CALLED};
     bool action_active{};
     bool gaze_valid{};
     bool simulated{};
@@ -203,6 +213,8 @@ struct InstanceState {
     XrPath gaze_path{XR_NULL_PATH};
     XrPath gaze_profile{XR_NULL_PATH};
     bool gaze_binding_submitted{};
+    bool host_action_sets_created{};
+    XrResult binding_result{static_cast<XrResult>(CHEEKY_GAZE_RESULT_NOT_CALLED)};
 };
 
 std::atomic<bool> simulated_gaze_enabled{};
@@ -217,6 +229,7 @@ std::atomic<std::uint64_t> swapchain_generation{1U};
 struct SnapshotSlot {
     std::atomic<std::uint32_t> readers{};
     CheekyGazeSnapshotV1 snapshot{};
+    CheekyGazeInputDiagnosticsV1 input{};
 };
 
 std::array<SnapshotSlot, 2U> snapshot_slots{};
@@ -338,6 +351,15 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
     if (snapshot_slots[target].readers.load(std::memory_order_acquire) != 0U) {
         return;
     }
+    auto input = session ? session->input : CheekyGazeInputDiagnosticsV1{};
+    input.version = CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION;
+    input.structure_size = sizeof(input);
+    input.session_generation = session ? session->generation : 0;
+    input.action_attached = session && session->action_attached;
+    input.host_action_sets_created = instance && instance->host_action_sets_created;
+    input.binding_submitted = instance && instance->gaze_binding_submitted;
+    input.binding_result = instance ? instance->binding_result : CHEEKY_GAZE_RESULT_NOT_CALLED;
+    snapshot_slots[target].input = input;
     snapshot_slots[target].snapshot = snapshot;
     active_snapshot_slot.store(target, std::memory_order_release);
 }
@@ -468,8 +490,64 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
     const auto result = instance.dispatch.suggest_bindings(
         instance.instance, &info
     );
+    instance.binding_result = result;
     if (XR_SUCCEEDED(result)) instance.gaze_binding_submitted = true;
     return result;
+}
+
+// Only identified RealVR hosts get independent input calls. Cache inspected modules;
+// proxy filenames alone must never opt an ordinary OpenXR application into this.
+bool realvr_present() noexcept {
+    static std::array<HMODULE, 4> inspected{};
+    static bool detected{};
+    if (detected) return true;
+    const wchar_t* names[]{L"dxgi2.dll", L"dxgi.dll", L"RealVR64.dll", L"ReShade64.dll"};
+    for (unsigned i = 0; i < inspected.size(); ++i) {
+        const auto module = GetModuleHandleW(names[i]);
+        if (!module || inspected[i] == module) continue;
+        inspected[i] = module;
+        if (cheeky::foveated_dlss::is_realvr_runtime(module)) detected = true;
+    }
+    return detected;
+}
+
+// Called under state_mutex before reading gaze, once per distinct display time.
+// Once a host has synchronized input, it owns synchronization for that session:
+// an extra gaze-only sync could deactivate controllers or consume input changes.
+void poll_realvr_gaze_locked(InstanceState& instance, SessionState& state, XrTime time) {
+    state.input.realvr_detected = realvr_present();
+    if (!state.input.realvr_detected || !state.running ||
+        state.state != XR_SESSION_STATE_FOCUSED || !state.system_supported ||
+        instance.gaze_action == XR_NULL_HANDLE || state.gaze_space == XR_NULL_HANDLE ||
+        state.input.host_sync_calls || time <= 0) return;
+    const auto& d = instance.dispatch;
+    if (!state.action_attached) {
+        // Attachment is irreversible for this session. Leave hosts that created
+        // actions in control, and never repeatedly attach after a runtime failure.
+        if (instance.host_action_sets_created || state.input.host_attach_calls ||
+            state.fallback_setup_attempted || !d.attach_action_sets) return;
+        state.fallback_setup_attempted = true;
+        const auto binding = ensure_gaze_binding_locked(instance);
+        if (XR_FAILED(binding) || !instance.gaze_binding_submitted) return;
+        XrSessionActionSetsAttachInfo info{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+        info.countActionSets = 1;
+        info.actionSets = &instance.action_set;
+        ++state.input.fallback_attach_calls;
+        state.input.attach_result = d.attach_action_sets(state.session, &info);
+        state.action_attached = XR_SUCCEEDED(state.input.attach_result);
+    }
+    if (!state.action_attached || !d.sync_actions || state.last_fallback_sync_time == time) return;
+    state.last_fallback_sync_time = time;
+    XrActiveActionSet active{instance.action_set, XR_NULL_PATH};
+    XrActionsSyncInfo info{XR_TYPE_ACTIONS_SYNC_INFO};
+    info.countActiveActionSets = 1;
+    info.activeActionSets = &active;
+    ++state.input.fallback_sync_calls;
+    state.input.sync_result = d.sync_actions(state.session, &info);
+    if (state.input.sync_result != XR_SUCCESS) {
+        state.action_active = false;
+        state.gaze_valid = false;
+    }
 }
 
 XrQuaternionf multiply_rotation(const XrQuaternionf& a, const XrQuaternionf& b) noexcept {
@@ -548,6 +626,36 @@ CheekyOpenXR_GetGazeSnapshot(
         slot.readers.fetch_sub(1U, std::memory_order_release);
         return 1U;
     }
+}
+
+extern "C" __declspec(dllexport) std::uint32_t __cdecl
+CheekyOpenXR_GetGazeInputDiagnostics(std::uint32_t version, void* output, std::uint32_t size) {
+    if (version != CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION || !output ||
+        size < sizeof(CheekyGazeInputDiagnosticsV1)) return 0;
+    for (;;) {
+        const auto index = active_snapshot_slot.load(std::memory_order_acquire);
+        auto& slot = snapshot_slots[index];
+        slot.readers.fetch_add(1U, std::memory_order_acquire);
+        if (index != active_snapshot_slot.load(std::memory_order_acquire)) {
+            slot.readers.fetch_sub(1U, std::memory_order_release);
+            continue;
+        }
+        std::memcpy(output, &slot.input, sizeof(slot.input));
+        slot.readers.fetch_sub(1U, std::memory_order_release);
+        return 1;
+    }
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateActionSet(
+    XrInstance instance, const XrActionSetCreateInfo* info, XrActionSet* action_set) {
+    std::lock_guard lock(state_mutex);
+    const auto it = instances.find(instance);
+    if (it == instances.end()) return XR_ERROR_HANDLE_INVALID;
+    auto& state = it->second;
+    if (!state.dispatch.create_action_set) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result = state.dispatch.create_action_set(instance, info, action_set);
+    if (XR_SUCCEEDED(result)) state.host_action_sets_created = true;
+    return result;
 }
 
 // Forward declarations for entry points returned by the layer GIPA.
@@ -630,6 +738,7 @@ namespace {
     CHEEKY_INTERCEPT("xrCreateSession", cheeky_xrCreateSession)
     CHEEKY_INTERCEPT("xrDestroySession", cheeky_xrDestroySession)
     CHEEKY_INTERCEPT("xrPollEvent", cheeky_xrPollEvent)
+    CHEEKY_INTERCEPT("xrCreateActionSet", cheeky_xrCreateActionSet)
     CHEEKY_INTERCEPT("xrBeginSession", cheeky_xrBeginSession)
     CHEEKY_INTERCEPT("xrEndSession", cheeky_xrEndSession)
     CHEEKY_INTERCEPT(
@@ -884,9 +993,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
         XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
         space_info.action = instance_state->gaze_action;
         space_info.poseInActionSpace.orientation.w = 1.0F;
-        static_cast<void>(instance_state->dispatch.create_action_space(
+        session_state.input.space_result = instance_state->dispatch.create_action_space(
             *session, &space_info, &session_state.gaze_space
-        ));
+        );
     }
 
     {
@@ -952,6 +1061,11 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrPollEvent(
         const auto iterator = sessions.find(changed->session);
         if (iterator != sessions.end()) {
             iterator->second.state = changed->state;
+            if (changed->state != XR_SESSION_STATE_FOCUSED) {
+                iterator->second.action_active = false;
+                iterator->second.gaze_valid = false;
+                iterator->second.gaze_location_flags = 0;
+            }
             if (changed->state == XR_SESSION_STATE_STOPPING ||
                 changed->state == XR_SESSION_STATE_LOSS_PENDING ||
                 changed->state == XR_SESSION_STATE_EXITING) {
@@ -986,6 +1100,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
+            iterator->second.running = true;
+            iterator->second.last_fallback_sync_time = 0;
             iterator->second.view_configuration =
                 info->primaryViewConfigurationType;
             iterator->second.unsupported_view_configuration =
@@ -1008,6 +1124,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndSession(
         next = instance->dispatch.end_session;
         auto& session_state = sessions.at(session);
         session_state.calibration.destroy(cheeky::openxr_calibration::bridge());
+        session_state.running = false;
         session_state.action_active = false;
         session_state.gaze_valid = false;
         publish_snapshot_locked(&session_state);
@@ -1065,6 +1182,7 @@ cheeky_xrSuggestInteractionProfileBindings(
         const auto iterator = instances.find(instance);
         if (iterator != instances.end()) {
             iterator->second.gaze_binding_submitted = true;
+            iterator->second.binding_result = result;
         }
     }
     return result;
@@ -1082,6 +1200,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
         auto* instance = find_instance_for_session_locked(session);
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.attach_action_sets;
+        ++sessions.at(session).input.host_attach_calls;
         layer_action_set = instance->action_set;
         static_cast<void>(ensure_gaze_binding_locked(*instance));
     }
@@ -1104,11 +1223,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
     merged.countActionSets = static_cast<std::uint32_t>(action_sets.size());
     merged.actionSets = action_sets.data();
     const auto result = next(session, &merged);
-    if (XR_SUCCEEDED(result)) {
+    {
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
-            iterator->second.action_attached = true;
+            iterator->second.input.attach_result = result;
+            if (XR_SUCCEEDED(result)) iterator->second.action_attached = true;
             publish_snapshot_locked(&iterator->second);
         }
     }
@@ -1134,6 +1254,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         action_set = instance->action_set;
         gaze_action = instance->gaze_action;
         attached = sessions.at(session).action_attached;
+        ++sessions.at(session).input.host_sync_calls;
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
 
@@ -1159,12 +1280,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
     const auto result = next(session, &merged);
 
     bool active{};
-    if (XR_SUCCEEDED(result) && attached && gaze_action != XR_NULL_HANDLE &&
+    XrResult pose_result{static_cast<XrResult>(CHEEKY_GAZE_RESULT_NOT_CALLED)};
+    if (result == XR_SUCCESS && attached && gaze_action != XR_NULL_HANDLE &&
         get_pose != nullptr) {
         XrActionStateGetInfo state_info{XR_TYPE_ACTION_STATE_GET_INFO};
         state_info.action = gaze_action;
         XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
-        if (XR_SUCCEEDED(get_pose(session, &state_info, &state))) {
+        pose_result = get_pose(session, &state_info, &state);
+        if (XR_SUCCEEDED(pose_result)) {
             active = state.isActive == XR_TRUE;
         }
     }
@@ -1172,6 +1295,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
+            iterator->second.input.sync_result = result;
+            iterator->second.input.pose_result = pose_result;
             iterator->second.action_active = active;
             if (!active) iterator->second.gaze_valid = false;
             publish_snapshot_locked(&iterator->second);
@@ -1202,9 +1327,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         get_pose = instance->dispatch.get_action_state_pose;
         locate_space = instance->dispatch.locate_space;
         gaze_action = instance->gaze_action;
-        const auto& session_state = sessions.at(session);
+        auto& session_state = sessions.at(session);
+        if (locate_info && locate_info->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+            poll_realvr_gaze_locked(*instance, session_state, locate_info->displayTime);
         gaze_space = session_state.gaze_space;
-        action_attached = session_state.action_attached;
+        action_attached = session_state.running && session_state.action_attached &&
+            session_state.state == XR_SESSION_STATE_FOCUSED &&
+            session_state.input.sync_result == XR_SUCCESS;
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const auto result = next(
@@ -1256,6 +1385,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
     }
 
     bool action_active{};
+    XrResult pose_result{static_cast<XrResult>(CHEEKY_GAZE_RESULT_NOT_CALLED)};
+    XrResult locate_result{static_cast<XrResult>(CHEEKY_GAZE_RESULT_NOT_CALLED)};
     XrSpaceLocation gaze_location{XR_TYPE_SPACE_LOCATION};
     XrEyeGazeSampleTimeEXT sample_time{XR_TYPE_EYE_GAZE_SAMPLE_TIME_EXT};
     gaze_location.next = &sample_time;
@@ -1265,15 +1396,17 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         XrActionStateGetInfo state_info{XR_TYPE_ACTION_STATE_GET_INFO};
         state_info.action = gaze_action;
         XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE};
-        if (XR_SUCCEEDED(get_pose(session, &state_info, &state)) &&
+        pose_result = get_pose(session, &state_info, &state);
+        if (XR_SUCCEEDED(pose_result) &&
             state.isActive == XR_TRUE) {
             action_active = true;
-            static_cast<void>(locate_space(
+            locate_result = locate_space(
                 gaze_space,
                 locate_info->space,
                 locate_info->displayTime,
                 &gaze_location
-            ));
+            );
+            if (XR_FAILED(locate_result)) gaze_location.locationFlags = 0;
         }
     }
 
@@ -1362,6 +1495,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
             state.next_jump_u = next_jump_u; state.next_jump_v = next_jump_v;
             state.simulated = simulated;
             state.sample_time = sample_time.time;
+            state.input.pose_result = pose_result;
+            state.input.locate_result = locate_result;
             state.action_active = action_active;
             state.gaze_location_flags = static_cast<std::uint32_t>(
                 gaze_location.locationFlags

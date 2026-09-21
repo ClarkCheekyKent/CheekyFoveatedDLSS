@@ -201,3 +201,34 @@ peripheral DLAA on/off, live order switching, dynamic resolution/resizing, both
 eyes, and gaze movement. Record image quality, actual NR working dimensions,
 NR GPU time, and total pipeline GPU time for both orders. Support reports include
 the selected order, dimensions, skip state, and separate timing samples.
+
+### RealVR OpenXR gaze without game input actions
+
+The OpenXR layer enables `XR_EXT_eye_gaze_interaction` when available and creates
+its own gaze action. For an identified R.E.A.L. VR runtime, it can also attach that
+action and synchronize it independently when the game never initializes OpenXR
+input. Acquisition starts at a focused stereo `xrLocateViews` call in a running
+session; synchronization runs once per display time. Focus loss or a failed sync
+invalidates gaze, and focus recovery resumes polling without attaching again.
+
+Standalone attachment is attempted once per session and only if the host has not
+created action sets or attempted attachment. If the host has created actions,
+Cheeky waits and appends gaze to the host's attachment. Once the host calls
+`xrSyncActions`, Cheeky uses that merged synchronization path for the remainder of
+the session. It does not issue extra gaze-only syncs that could deactivate host
+controller actions. A host that starts creating and attaching input only after
+Cheeky's standalone attachment cannot attach additional sets to that session;
+OpenXR's already-attached error is preserved. Restart with a host-managed input
+path in that case.
+
+Support reports include `gaze.input` with the detected RealVR state, host and
+fallback call counts, binding/attachment state, and the runtime results for binding,
+attachment, synchronization, action-state queries, action-space creation and gaze
+location. A `null` result means the operation has not been called. Old layer builds
+without these diagnostics report `input: null`. Extension support alone does not
+mean the headset/runtime is providing gaze. Independent polling cannot override
+runtime focus or eye-tracking permissions.
+
+This change requires updating the installed **OpenXR layer**, as well as the game
+runtime. Close VR applications and run the matching OpenXR setup included in the
+RealVR gaze test package; replacing only the game's DLLs will not update the layer.

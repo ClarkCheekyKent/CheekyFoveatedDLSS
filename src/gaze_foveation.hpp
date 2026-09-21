@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace cheeky::foveated_dlss {
 
@@ -39,6 +40,7 @@ struct GazeViewDiagnostics {
 };
 
 struct GazeDiagnostics {
+    CheekyGazeInputDiagnosticsV1 input{};
     std::uint64_t submitted_copies{};
     char runtime_name[128]{};
     std::uint32_t status_flags{};
@@ -96,6 +98,7 @@ void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
     FoveationCenter& center, bool& reset_history,
     const CheekyGazeSnapshotV1* supplied_snapshot = nullptr) noexcept;
 [[nodiscard]] GazeDiagnostics gaze_diagnostics() noexcept;
+[[nodiscard]] std::string gaze_input_diagnostics_json(const CheekyGazeInputDiagnosticsV1& input);
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;
 void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept;

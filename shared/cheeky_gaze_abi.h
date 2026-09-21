@@ -69,3 +69,16 @@ typedef uint32_t(__cdecl* CheekyOpenXRGetGazeSnapshotFn)(
     uint32_t output_size
 );
 
+// Optional export, separate from the gaze ABI so older consumers remain compatible.
+#define CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION 1U
+#define CHEEKY_GAZE_RESULT_NOT_CALLED INT32_MAX
+typedef struct CheekyGazeInputDiagnosticsV1 {
+    uint32_t version, structure_size;
+    uint64_t session_generation;
+    uint32_t realvr_detected, host_action_sets_created, binding_submitted, action_attached;
+    uint32_t host_attach_calls, host_sync_calls, fallback_attach_calls, fallback_sync_calls;
+    int32_t binding_result, attach_result, sync_result, pose_result, space_result, locate_result;
+} CheekyGazeInputDiagnosticsV1;
+typedef uint32_t(__cdecl* CheekyOpenXRGetGazeInputDiagnosticsFn)(
+    uint32_t requested_version, void* output, uint32_t output_size);
+

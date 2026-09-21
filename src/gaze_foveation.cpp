@@ -12,6 +12,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include <sstream>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -982,7 +983,40 @@ void apply_next_jump_preview(Settings& settings, const DlssViewId view_id) noexc
 
 GazeDiagnostics gaze_diagnostics() noexcept {
     std::lock_guard lock(coordinator_mutex);
-    return diagnostics;
+    auto result = diagnostics;
+    // Read independently of DLSS evaluation, so support captures also diagnose
+    // sessions where the SR interception path has not run yet.
+    HMODULE module{};
+    if (GetModuleHandleExW(0, L"CheekyOpenXRLayer.dll", &module)) {
+        const auto get = reinterpret_cast<CheekyOpenXRGetGazeInputDiagnosticsFn>(
+            GetProcAddress(module, "CheekyOpenXR_GetGazeInputDiagnostics"));
+        if (get) {
+            CheekyGazeInputDiagnosticsV1 input{};
+            if (get(CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION, &input, sizeof(input)) &&
+                input.version == CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION &&
+                input.structure_size == sizeof(input)) result.input = input;
+        }
+        FreeLibrary(module);
+    }
+    return result;
+}
+
+std::string gaze_input_diagnostics_json(const CheekyGazeInputDiagnosticsV1& input) {
+    if (input.version != CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION) return "null";
+    std::ostringstream out;
+    out << "{\"session_generation\":" << input.session_generation;
+#define INPUT_FIELD(name) out << ",\"" #name "\":" << input.name
+    INPUT_FIELD(realvr_detected); INPUT_FIELD(host_action_sets_created);
+    INPUT_FIELD(binding_submitted); INPUT_FIELD(action_attached);
+    INPUT_FIELD(host_attach_calls); INPUT_FIELD(host_sync_calls);
+    INPUT_FIELD(fallback_attach_calls); INPUT_FIELD(fallback_sync_calls);
+#undef INPUT_FIELD
+#define INPUT_RESULT(name) out << ",\"" #name "\":" << \
+    (input.name == CHEEKY_GAZE_RESULT_NOT_CALLED ? "null" : std::to_string(input.name))
+    INPUT_RESULT(binding_result); INPUT_RESULT(attach_result); INPUT_RESULT(sync_result);
+    INPUT_RESULT(pose_result); INPUT_RESULT(space_result); INPUT_RESULT(locate_result);
+#undef INPUT_RESULT
+    return out.str() + "}";
 }
 
 void forget_gaze_view(const DlssViewId view_id) noexcept {

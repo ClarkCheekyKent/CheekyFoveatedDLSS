@@ -1599,6 +1599,7 @@ int run_stereo_support_tests();
 int run_stereo_support12_tests();
 int run_mixed_api_calibration_tests();
 int run_openxr_calibration_tests();
+int run_openxr_input_tests();
 int run_support_summary_tests();
 int run_nr_processing_tests();
 
@@ -2249,6 +2250,7 @@ int run_d3d12_safety_tests();
 int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--openxr-input") == 0) return run_openxr_input_tests();
     if (argc == 2 && std::strcmp(argv[1], "--crop-calibration") == 0) return run_crop_calibration_tests() + run_crop_calibration12_tests();
     if (argc == 2 && std::strcmp(argv[1], "--mixed-calibration") == 0) return run_mixed_api_calibration_tests();
     if (argc == 2 && std::strcmp(argv[1], "--stereo-support") == 0)
@@ -2337,6 +2339,7 @@ int main(int argc, char** argv) {
     failures += run_stereo_support_tests();
     failures += run_stereo_support12_tests();
     failures += run_mixed_api_calibration_tests();
+    failures += run_openxr_input_tests();
     failures += run_openxr_calibration_tests();
     failures += run_openxr_calibration_format_tests();
     failures += run_nr_processing_tests();

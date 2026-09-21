@@ -110,7 +110,7 @@ target_compile_definitions(
     CheekyOpenXRLayer
     PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
 )
-target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 dxgi dxguid)
+target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 dxgi dxguid version)
 set_target_properties(
     CheekyOpenXRLayer
     PROPERTIES
@@ -150,6 +150,7 @@ add_executable(
 
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/eye_calibration_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/openxr_calibration_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/openxr_input_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration_d3d12.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_composite_tests.cpp"
@@ -175,7 +176,17 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gaze_foveation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings.cpp"
 )
-add_dependencies(CheekyTests CheekyOpenXRLayer)
+add_library(CheekyFakeRealVR MODULE tests/fake_ngx_core.cpp tests/fake_ngx_core.rc)
+target_compile_features(CheekyFakeRealVR PRIVATE cxx_std_20)
+target_include_directories(CheekyFakeRealVR PRIVATE src)
+target_compile_definitions(CheekyFakeRealVR PRIVATE CHEEKY_FAKE_REALVR WIN32_LEAN_AND_MEAN NOMINMAX)
+set_target_properties(CheekyFakeRealVR PROPERTIES PREFIX "" MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/test-fixtures"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/test-fixtures")
+if(MSVC)
+    target_link_options(CheekyFakeRealVR PRIVATE /OPT:NOICF)
+endif()
+add_dependencies(CheekyTests CheekyOpenXRLayer CheekyFakeRealVR)
 target_link_libraries(CheekyTests PRIVATE d3d11 d3d12 dxgi d3dcompiler)
 target_compile_features(CheekyTests PRIVATE cxx_std_20)
 target_compile_definitions(CheekyTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -193,6 +204,7 @@ if(MSVC)
     target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
+add_test(NAME CheekyOpenXRInputTests COMMAND CheekyTests --openxr-input)
 add_test(NAME CheekyStereoSupportTests COMMAND CheekyTests --stereo-support)
 set_tests_properties(CheekyStereoSupportTests PROPERTIES TIMEOUT 60)
 add_test(NAME CheekyMixedCalibrationTests COMMAND CheekyTests --mixed-calibration)
@@ -256,9 +268,7 @@ if(CHEEKY_BUILD_UEVR)
     add_library(CheekyFakeNGX MODULE tests/fake_ngx.cpp)
     add_library(CheekyFakeStreamline MODULE tests/fake_streamline.cpp)
     add_library(CheekyFakeOpenVR MODULE tests/fake_openvr.cpp)
-    add_library(CheekyFakeRealVR MODULE tests/fake_ngx_core.cpp tests/fake_ngx_core.rc)
-    target_compile_definitions(CheekyFakeRealVR PRIVATE CHEEKY_FAKE_REALVR)
-    foreach(fixture CheekyFakeNGX CheekyFakeStreamline CheekyFakeOpenVR CheekyFakeRealVR)
+    foreach(fixture CheekyFakeNGX CheekyFakeStreamline CheekyFakeOpenVR)
         target_compile_features(${fixture} PRIVATE cxx_std_20)
         target_include_directories(${fixture} PRIVATE src)
         target_compile_definitions(${fixture} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

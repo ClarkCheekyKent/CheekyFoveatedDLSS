@@ -661,6 +661,11 @@ void draw_openxr_gaze_diagnostics() {
             (gaze.status_flags & CHEEKY_GAZE_STATUS_ACTION_ACTIVE) != 0U
         )
     );
+    if (gaze.input.version == CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION) {
+        diagnostic_row("Gaze action attached", "%s", yes_no(gaze.input.action_attached != 0));
+        diagnostic_row("RealVR independent gaze", "%s", gaze.input.fallback_sync_calls ? "Polling" :
+            gaze.input.realvr_detected ? "Waiting / host input" : "Not needed");
+    }
     diagnostic_row(
         "Tracking valid", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U
