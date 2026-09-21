@@ -2,6 +2,8 @@
 
 Reduce the cost of DLSS Super Resolution by concentrating it on the center of the image. Available as a **ReShade add-on** or **UEVR plugin**, for Direct3D 11 and Direct3D 12 games, including VR. With DLSS Performance FPS gains of 20%+ are standard, even more with eye tracked headsets which can make the foveated region even smaller.
 
+This also supports foveating DLSS Neural Resolution (DLSS5), including running it pre-upscale and at lower resolutions (improves performance at a cost of quality).
+
 ![Diagram](assets/diagram.png)
 
 ## Requirements
@@ -69,7 +71,7 @@ If calibration stays inactive or reports manual fallback, check the installed la
 Start with defaults, then compare native and foveated DLSS timings in the performance panel. Smaller foveas reduce processing cost; higher center supersampling improves center resolution at additional cost. Results depend on the game and GPU.
 
 - **Eye tracking:** select **Runtime gaze (OpenXR / OpenVR)** only with a compatible eye-tracked headset and runtime. Quest 3 users should use **Fixed** with automatic alignment.
-- **DLSS-NR:** experimental and off by default. Compatible NVIDIA runtimes must be supplied separately. Read the [DLSS-NR instructions](USAGE.md#experimental-dlss-nr-support) before enabling it.
+- **DLSS-NR (DLSS5):** experimental and off by default. Compatible NVIDIA runtimes must be supplied separately. Read the [DLSS-NR instructions](USAGE.md#experimental-dlss-nr-support) before enabling it.
 - [Full settings reference](USAGE.md) · [Eye calibration details and limitations](EYE-CALIBRATION.md)
 
 ## Troubleshooting
