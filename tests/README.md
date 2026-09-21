@@ -182,6 +182,18 @@ In a fresh game log, verify `motion constants applied`, `prepare complete`,
 and `original begin foveated=yes`. A failure now logs the constants result code.
 ## Stereo images in support reports
 
+`CheekyTests.exe --mixed-calibration` reproduces a DX12 game whose host submits
+DX11 textures to OpenXR. It uses WARP and the real layer bridge, with test-only
+CPU transport modeling the host's resize, vertical flip and crop. Source and
+submission rendering run on different threads. Tests cover wrapped device
+identity, alternating eye rendering, projection-eye swaps, stale marker epochs,
+cropped-away markers, bounded/stable allocations, refresh-command lifetime, and
+all four support images. Examples are in `%TEMP%/Cheeky-mixed-calibration-tests/<pid>`.
+The production path only reads each API's own textures; it adds no interop
+transport and performs no GPU waits. Mixed API GPU timing is reported unavailable
+because the query timelines are separate. Original same-API tests remain in
+`--stereo-support` and the default test run; headset validation is still required.
+
 `CheekyTests.exe --stereo-support` checks DX11 and DX12 WARP captures at the
 production marker stamp/read points, including failed recognition, array slices,
 packed UV bounds and shader-resized/flipped HDR submissions. It verifies preview

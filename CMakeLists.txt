@@ -195,6 +195,8 @@ endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
 add_test(NAME CheekyStereoSupportTests COMMAND CheekyTests --stereo-support)
 set_tests_properties(CheekyStereoSupportTests PROPERTIES TIMEOUT 60)
+add_test(NAME CheekyMixedCalibrationTests COMMAND CheekyTests --mixed-calibration)
+set_tests_properties(CheekyMixedCalibrationTests PROPERTIES TIMEOUT 60)
 add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
 add_test(NAME CheekyNrLifetimeTestsNoDebugLayer COMMAND CheekyTests --nr-lifetime)
 set_tests_properties(CheekyNrLifetimeTestsNoDebugLayer PROPERTIES

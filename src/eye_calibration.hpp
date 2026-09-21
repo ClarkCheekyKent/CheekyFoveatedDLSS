@@ -14,6 +14,7 @@ struct EyeCalibrationStats {
     EyeCalibrationBackend backend{};
     bool runtime_active{};
     unsigned graphics_api{};
+    unsigned source_graphics_api{}, submission_graphics_api{};
     std::uint64_t frames{}, captures{}, completed{}, valid{}, skipped{}, allocations{}, mismatches{},
         gpu_samples{};
     unsigned in_flight{};

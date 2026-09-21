@@ -1,6 +1,7 @@
 #include "eye_calibration.hpp"
 #include "eye_calibration_pixels.hpp"
 #include "eye_calibration_d3d12.hpp"
+#include "d3d12_native.hpp"
 #include "settings.hpp"
 #include "eye_calibration_bridge.h"
 #include <wrl/client.h>
@@ -62,6 +63,7 @@ struct Frame {
     std::array<ComPtr<ID3D11Query>, 8> timestamp;
     // Source before/after for A and B, then A/B at each submitted eye.
     std::array<Patch, 8> patches;
+    std::array<Patch, 4> flipped_patches11;
     std::array<Submitted11, 2> submitted11;
     std::array<float, 4> flipped_scores{};
     std::array<View, 2> views;
@@ -308,9 +310,9 @@ void poll_submitted(Frame& f) {
         if (hr == S_FALSE) continue;
         if (FAILED(hr)) { f.invalid = true; capture.ready = true; continue; }
         bool waiting = !poll_support11(f, capture.context.Get(), 2 + eye);
-        for (unsigned c = 0; c < 2; ++c) {
-            const unsigned i = 4 + eye * 2 + c;
-            auto& p = f.patches[i];
+        for (unsigned index = 0; index < (f.gpu12_used ? 4U : 2U); ++index) {
+            const unsigned c = index % 2;
+            auto& p = index < 2 ? f.patches[4 + eye * 2 + c] : f.flipped_patches11[eye * 2 + c];
             if (!p.used || p.ready) continue;
             D3D11_MAPPED_SUBRESOURCE mapped{};
             const auto result = capture.context->Map(p.staging.Get(), 0, D3D11_MAP_READ,
@@ -319,6 +321,7 @@ void poll_submitted(Frame& f) {
             if (FAILED(result)) { f.invalid = true; p.ready = true; continue; }
             p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
                 p.format, c, true, f.codes[c]);
+            if (index >= 2) f.flipped_scores[eye * 2 + c] = p.score;
             capture.context->Unmap(p.staging.Get(), 0);
             p.ready = true;
         }
@@ -329,7 +332,7 @@ void poll(State& s) {
     for (auto& f : s.ring) {
         // Submission textures can belong to a second D3D11 device. Its tiny
         // copies and completion query must be read on that context's thread.
-        if (f.busy && !f.gpu12_used) poll_submitted(f);
+        if (f.busy) poll_submitted(f);
         // XR may end the interval on its submission thread. Keep the slot
         // alive and close its D3D11 queries when the render thread returns;
         // the calibration mutex alone does not make the context thread-safe.
@@ -337,9 +340,14 @@ void poll(State& s) {
             f.thread == GetCurrentThreadId()) finish(s, f);
         if (!f.busy || !f.closed)
             continue;
+        // A mixed frame owns two independent GPU timelines. Do not classify or
+        // recycle either half until submission-thread DX11 queries also finish.
+        if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
+            [](const auto& capture) { return capture.active && !capture.ready; })) continue;
         bool gpu12_reusable{};
         if (f.gpu12_used) {
-            const auto result = calibration12_poll(*f.gpu12);
+            const bool mixed = f.pipelined;
+            const auto result = calibration12_poll(*f.gpu12, mixed);
             if (f.sequence >= s.measurement_start)
                 s.stats.allocations += result.allocations;
             if (!result.ready)
@@ -357,20 +365,19 @@ void poll(State& s) {
                 s.stats.d3d12_last_readback_failure = result.failure.stage;
                 s.stats.d3d12_readback_error = result.failure.result;
             }
-            for (unsigned i = 0; i < 8; ++i) {
+            for (unsigned i = 0; i < (mixed ? 4U : 8U); ++i) {
                 f.patches[i].used = f.patches[i].ready = true;
                 f.patches[i].score = result.scores[i];
             }
-            std::copy_n(result.scores.begin() + 8, 4, f.flipped_scores.begin());
+            if (!mixed) std::copy_n(result.scores.begin() + 8, 4, f.flipped_scores.begin());
             if (result.timing_valid) {
                 s.stats.gpu_timing_status = "Available";
                 s.gpu.add(result.gpu_us);
                 ++s.stats.gpu_samples;
                 s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, result.gpu_us);
-            } else s.stats.gpu_timing_status = "D3D12 marker/copy timestamps unavailable for this capture";
+            } else s.stats.gpu_timing_status = mixed ? "Unavailable across D3D12 source and D3D11 submission" :
+                "D3D12 marker/copy timestamps unavailable for this capture";
         } else {
-            if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
-                [](const auto& capture) { return capture.active && !capture.ready; })) continue;
             if (!f.queries_started) {
                 f.busy = false;
                 if (f.sequence >= s.measurement_start) {
@@ -544,7 +551,7 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
         std::uint64_t(y) + height > desc.Height)
         return false;
     const auto subresource = D3D11CalcSubresource(0, slice, desc.MipLevels);
-    auto& p = f.patches[index];
+    auto& p = index < 8 ? f.patches[index] : f.flipped_patches11[index - 8];
     if (!p.staging || p.device != device || p.width != width || p.height != height || p.format != desc.Format) {
         p.staging.Reset();
         desc.Width = width;
@@ -674,8 +681,10 @@ void eye_calibration_reset_stats() noexcept {
     // Reset measurement, not the established mapping or its ordering guard.
     const auto left = s.stats.left_view, right = s.stats.right_view;
     const auto graphics_api = s.stats.graphics_api;
+    const auto source_api = s.stats.source_graphics_api, submission_api = s.stats.submission_graphics_api;
     s.stats = {};
     s.stats.graphics_api = graphics_api;
+    s.stats.source_graphics_api = source_api; s.stats.submission_graphics_api = submission_api;
     s.stats.left_view = left;
     s.stats.right_view = right;
     s.cpu_us = 0;
@@ -703,8 +712,10 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         s.unsupported_submission = false;
     }
     const bool on = enabled;
-    if (graphics_api)
+    if (graphics_api) {
         s.stats.graphics_api = graphics_api;
+        s.stats.submission_graphics_api = graphics_api;
+    }
     s.last_frame_ms = GetTickCount64();
     if (!on && !pending)
         return false;
@@ -757,6 +768,8 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.captured_ms = GetTickCount64();
         f.evaluations = f.submits = 0;
         f.views = {};
+        f.flipped_scores = {};
+        for (auto& p : f.flipped_patches11) { p.used = p.ready = false; p.score = 0; }
         for (auto& capture : f.submitted11) capture.active = capture.ready = false;
         f.eye_submits = {};
         f.result = {{-1, -1}};
@@ -805,6 +818,7 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         if (s.current < 0)
             return;
         s.stats.graphics_api = 11;
+        s.stats.source_graphics_api = 11;
         if (s.ring[s.current].gpu12_used) {
             s.ring[s.current].invalid = true;
             return;
@@ -911,7 +925,15 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         if (s.current < 0)
             return;
         auto& f = s.ring[s.current];
-        const auto c = f.evaluations++;
+        unsigned c = f.evaluations;
+        bool repeated{};
+        if (f.pipelined) {
+            if (f.submits || f.invalid || f.epoch != s.epoch) return;
+            c = continuous_candidate(s, view);
+            if (f.epoch != s.epoch) { f.invalid = true; return; }
+            repeated = c < 2 && f.views[c].id == view;
+        }
+        if (!repeated) ++f.evaluations;
         if (c >= 2 || f.queries_started || width < 2 * inset + block || height < 2 * inset + block) {
             f.invalid = true;
             return;
@@ -923,24 +945,37 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
             return;
         }
         ComPtr<ID3D12Device> device;
-        if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) {
+        // Own allocations through the texture's device. The backend separately
+        // verifies that the command list belongs to the same underlying device.
+        if (FAILED(output->GetDevice(IID_PPV_ARGS(&device)))) {
             f.invalid = true;
             return;
         }
-        if (!f.gpu12 || device.Get() != f.device12.Get()) {
-            if (c) {
+        device = canonical_d3d12_device(device.Get());
+        if (!device) { f.invalid = true; return; }
+        if (!f.gpu12 || !same_d3d12_device(device.Get(), f.device12.Get())) {
+            if (f.gpu12_used) {
                 f.invalid = true;
                 return;
             }
             f.gpu12 = calibration12_create(device.Get());
             f.device12 = device;
-            if (!calibration12_begin(*f.gpu12)) {
+            if (!f.gpu12 || !calibration12_begin(*f.gpu12)) {
                 f.invalid = true;
                 return;
             }
         }
         f.gpu12_used = true;
+        f.thread = GetCurrentThreadId();
+        s.stamp_thread = f.thread;
+        ComPtr<IUnknown> identity; device.As(&identity);
+        f.device_identity = reinterpret_cast<std::uintptr_t>(identity.Get());
+        f.context_identity = reinterpret_cast<std::uintptr_t>(list);
+        f.device_flags = 0;
         s.stats.graphics_api = 12;
+        s.stats.source_graphics_api = 12;
+        if (repeated && (f.views[c].generation != stereo_view_generation(view) ||
+            f.views[c].width != width || f.views[c].height != height)) { f.invalid = true; return; }
         const auto assignment = stereo_eye_assignment(view);
         f.views[c] = {view, width, height, assignment.assigned ? int(assignment.eye_index) : -1,
                       stereo_view_generation(view)};
@@ -950,7 +985,8 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         image.width = unsigned(d.Width); image.height = d.Height; image.format = d.Format; image.graphics_api = 12;
         image.view = view; image.prior_eye = f.views[c].assigned;
         image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block};
-        if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure, f.support, image)) {
+        if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure,
+            f.support, image, f.codes[c], repeated)) {
             f.invalid = true;
             ++s.stats.d3d12_stamp_failures;
             s.stats.d3d12_last_stamp_failure = failure.stage;
@@ -974,6 +1010,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     if (s.backend != backend || s.session_generation != generation || s.current < 0)
         return 0;
     auto& f = s.ring[s.current];
+    s.stats.submission_graphics_api = 12;
     ++f.submits;
     ++f.eye_submits[eye];
     if (!f.gpu12_used || f.submits > 2 || f.eye_submits[eye] > 1) {
@@ -1042,7 +1079,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     auto& s = state();
     std::uint64_t capture_sequence{};
     std::uintptr_t source_device_identity{};
-    bool pipelined{};
+    bool pipelined{}, mixed{};
     {
         std::unique_lock lock(s.mutex, std::try_to_lock);
         if (!lock.owns_lock()) return 0;
@@ -1053,6 +1090,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
         capture_sequence = f.sequence;
         source_device_identity = f.device_identity;
         pipelined = f.pipelined;
+        mixed = f.gpu12_used && f.pipelined;
         // Reject unprotected foreign-thread access before any D3D calls,
         // including GetDevice/QueryInterface on a SINGLETHREADED device.
         if (f.queries_started && f.thread != GetCurrentThreadId() && !f.protected_context) {
@@ -1064,7 +1102,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
             f.invalid = true;
             return 0;
         }
-        if (!f.queries_started) {
+        if (!f.queries_started && !mixed) {
             s.submit_thread = GetCurrentThreadId();
             if (f.pipelined) {
                 ++s.waiting_for_sources;
@@ -1096,6 +1134,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     if (s.backend != backend || s.session_generation != session_generation)
         return 0;
     s.submit_thread = GetCurrentThreadId();
+    s.stats.submission_graphics_api = 11;
     s.unsupported_submission = false;
     if (s.current < 0)
         return 0;
@@ -1122,7 +1161,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     else if (other_thread && !context_lock.protection) observed.rejection = "submission_context_unprotected";
     const bool protected_copy = f.pipelined && context_lock.protection &&
         !(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED);
-    if (f.submits > 2 || f.eye_submits[eye] > 1 || !f.queries_started || (other_thread && !protected_copy)) {
+    if (f.submits > 2 || f.eye_submits[eye] > 1 || (!f.queries_started && !mixed) || (other_thread && !protected_copy)) {
         if (f.queries_started && other_thread && !protected_copy) {
             ++s.submit_wrong_thread;
         }
@@ -1163,15 +1202,16 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     } else context->End(f.timestamp[4 + eye * 2].Get());
     CalibrationImageInfo image;
     image.width = desc.Width; image.height = desc.Height; image.format = desc.Format; image.graphics_api = 11;
-    image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1}; image.sample_count = 2;
-    for (unsigned c = 0; c < 2; ++c) {
+    image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1}; image.sample_count = mixed ? 4U : 2U;
+    for (unsigned index = 0; index < image.sample_count; ++index) {
+        const unsigned c = index % 2;
         const auto& ref = f.views[c].width ? f.views[c] : f.views[0];
         if (!ref.width || !ref.height) {
             f.invalid = true;
             continue;
         }
         const float nx = (float(c ? ref.width - inset - block : inset) + margin) / ref.width,
-                    ny = (float(inset) + margin) / ref.height;
+                    ny = (float(index < 2 ? inset : ref.height - inset - block) + margin) / ref.height;
         const float ax = (u0 + nx * (u1 - u0)) * desc.Width,
                     bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * desc.Width;
         const float ay = (v0 + ny * (v1 - v0)) * desc.Height,
@@ -1180,8 +1220,9 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
                        y = unsigned(std::floor((std::min)(ay, by)));
         const unsigned w = unsigned(std::ceil((std::max)(ax, bx))) - x,
                        h = unsigned(std::ceil((std::max)(ay, by))) - y;
-        image.sample_rects[c] = {x, y, w, h};
-        if (!copy_patch(s, f, 4 + eye * 2 + c, texture, x, y, w, h, ref.width, ref.height, slice, context.Get()))
+        image.sample_rects[index] = {x, y, w, h};
+        if (!copy_patch(s, f, (index < 2 ? 4U : 8U) + eye * 2 + c, texture, x, y, w, h,
+            ref.width, ref.height, slice, context.Get()))
             f.invalid = true;
     }
     capture_support11(f, context.Get(), texture, 2 + eye, image);
@@ -1284,6 +1325,7 @@ std::string eye_calibration_json() {
     out.imbue(std::locale::classic());
     out << std::boolalpha << std::setprecision(6) << "{\"backend\":\""
         << eye_calibration_backend_name(s.backend) << "\",\"graphics_api\":" << s.graphics_api
+        << ",\"source_graphics_api\":" << s.source_graphics_api << ",\"submission_graphics_api\":" << s.submission_graphics_api
         << ",\"enabled\":" << s.enabled << ",\"status\":\"" << eye_calibration_status(s)
         << "\",\"active\":" << s.correction_active << ",\"openvr_active\":" << s.openvr_active
         << ",\"vertical_flip\":" << s.vertical_flip

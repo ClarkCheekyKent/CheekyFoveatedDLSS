@@ -20,6 +20,7 @@
 #include "../third_party/openxr/include/openxr/openxr_loader_negotiation.h"
 #include "../openxr_layer/projection_selection.hpp"
 #include "cheeky_gaze_abi.h"
+#include "timing_list_alias.hpp"
 
 namespace {
 using namespace cheeky::foveated_dlss;
@@ -744,6 +745,280 @@ struct GPU12 {
         list->CopyTextureRegion(&d, x, 0, 0, &s, nullptr);
     }
 };
+// Model the older R.E.A.L. VR device address returned by GetDevice. Its COM
+// identity is native, but its ID3D12Device pointer differs from texture.GetDevice.
+struct CalibrationDeviceAlias {
+    void** vtable;
+    std::array<void*, 44> methods;
+    ID3D12Device* target;
+    bool distinct{};
+    bool shared_private_data{};
+    explicit CalibrationDeviceAlias(ID3D12Device* device) : vtable(methods.data()), target(device) {
+        methods.fill(reinterpret_cast<void*>(&TimingListAlias::unexpected));
+        methods[0] = reinterpret_cast<void*>(&query); methods[1] = reinterpret_cast<void*>(&addref);
+        methods[2] = reinterpret_cast<void*>(&release); methods[37] = reinterpret_cast<void*>(&removed);
+        methods[3] = reinterpret_cast<void*>(&get_private); methods[5] = reinterpret_cast<void*>(&set_interface);
+    }
+    static HRESULT STDMETHODCALLTYPE query(CalibrationDeviceAlias* s, REFIID id, void** out) {
+        if (s->distinct) {
+            if (!out) return E_POINTER;
+            *out = nullptr;
+            if (id != __uuidof(IUnknown) && id != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+            *out = s; addref(s); return S_OK;
+        }
+        return s->target->QueryInterface(id, out);
+    }
+    static ULONG STDMETHODCALLTYPE addref(CalibrationDeviceAlias* s) { return s->target->AddRef(); }
+    static ULONG STDMETHODCALLTYPE release(CalibrationDeviceAlias* s) { return s->target->Release(); }
+    static HRESULT STDMETHODCALLTYPE removed(CalibrationDeviceAlias* s) { return s->target->GetDeviceRemovedReason(); }
+    static HRESULT STDMETHODCALLTYPE get_private(CalibrationDeviceAlias* s, REFGUID key, UINT* size, void* data) {
+        return s->shared_private_data ? s->target->GetPrivateData(key, size, data) : DXGI_ERROR_NOT_FOUND;
+    }
+    static HRESULT STDMETHODCALLTYPE set_interface(CalibrationDeviceAlias* s, REFGUID key, const IUnknown* value) {
+        return s->shared_private_data ? s->target->SetPrivateDataInterface(key, value) : E_FAIL;
+    }
+};
+struct CalibrationListAlias : TimingListAlias {
+    CalibrationDeviceAlias device;
+    CalibrationListAlias(ID3D12GraphicsCommandList* list, ID3D12Device* d) : TimingListAlias(list), device(d) {
+        methods[7] = reinterpret_cast<void*>(&get_device);
+        methods[8] = reinterpret_cast<void*>(&get_type);
+        methods[16] = reinterpret_cast<void*>(&copy_texture);
+        methods[26] = reinterpret_cast<void*>(&barriers);
+    }
+    static HRESULT STDMETHODCALLTYPE get_device(CalibrationListAlias* s, REFIID id, void** out) {
+        if (id != __uuidof(ID3D12Device)) return s->target->GetDevice(id, out);
+        *out = &s->device; CalibrationDeviceAlias::addref(&s->device); return S_OK;
+    }
+    static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE get_type(CalibrationListAlias* s) { return s->target->GetType(); }
+    static void STDMETHODCALLTYPE copy_texture(CalibrationListAlias* s, const D3D12_TEXTURE_COPY_LOCATION* d,
+        UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* r, const D3D12_BOX* b) {
+        s->target->CopyTextureRegion(d, x, y, z, r, b);
+    }
+    static void STDMETHODCALLTYPE barriers(CalibrationListAlias* s, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+        s->target->ResourceBarrier(n, b);
+    }
+};
+void calibration_device_identity12() {
+    GPU12 gpu;
+    auto texture = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto frame = calibration12_create(gpu.device.Get());
+    require(calibration12_begin(*frame), "Device identity test frame initialization");
+    CalibrationListAlias alias(gpu.list.Get(), gpu.device.Get());
+    std::uint64_t allocations{};
+    Calibration12Failure failure;
+    gpu.begin();
+    const bool stamp_accepted = calibration12_stamp(*frame, alias.get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, &failure);
+    gpu.execute(); gpu.wait(gpu.queue.Get()); calibration12_retired(gpu.list.Get());
+    require(stamp_accepted, "Wrapped source and native texture with the same COM device must not fail stamp_device_mismatch");
+    require(calibration12_poll(*frame).ready, "Native submission/reset must retire a wrapped calibration recording");
+    require(calibration12_begin(*frame), "Wrapped calibration resources must be reusable after retirement");
+    alias.device.distinct = true;
+    alias.device.shared_private_data = true;
+    gpu.begin();
+    const auto opaque_accepted = calibration12_stamp(*frame, alias.get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, &failure);
+    gpu.execute(); gpu.wait(gpu.queue.Get()); calibration12_retired(gpu.list.Get());
+    require(opaque_accepted, "Opaque wrapper identity must be verified through shared device-private data");
+    require(calibration12_begin(*frame), "Opaque source must retire through the native queue");
+    alias.device.shared_private_data = false;
+    gpu.begin();
+    require(!calibration12_stamp(*frame, alias.get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, &failure) &&
+        std::string(failure.stage) == "stamp_device_mismatch", "Different device identities must remain rejected");
+    check(gpu.list->Close());
+    std::cout << "PASS calibration device identity: aliases accepted, distinct devices rejected\n";
+}
+void refresh_recording_lifetime12() {
+    GPU12 gpu;
+    auto texture = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto frame = calibration12_create(gpu.device.Get());
+    require(calibration12_begin(*frame), "Fresh refresh-lifetime frame");
+    std::uint64_t allocations{};
+    gpu.begin();
+    require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations), "Initial refresh-lifetime stamp");
+    gpu.execute(); gpu.wait(gpu.queue.Get()); calibration12_retired(gpu.list.Get());
+    const auto first = calibration12_poll(*frame, true);
+    gpu.begin();
+    require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, nullptr, {}, {}, 0, true), "Marker refresh on a new recording");
+    Calibration12Failure failure;
+    require(!calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, &failure, {}, {}, 42, true) &&
+        std::string(failure.stage) == "refresh_source_changed", "An in-flight upload must not change marker epochs");
+    ComPtr<ID3D12Fence> gate;
+    check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+    check(gpu.queue->Wait(gate.Get(), 1));
+    gpu.execute(); calibration12_retired(gpu.list.Get());
+    const auto blocked = calibration12_poll(*frame, true);
+    const auto reused_early = calibration12_begin(*frame);
+    check(gate->Signal(1)); // Always release the test queue before any assertion.
+    gpu.wait(gpu.queue.Get());
+    require(!blocked.ready && !reused_early, "Pending marker refresh must retain the upload and prevent slot reuse");
+    const auto after = calibration12_poll(*frame, true);
+    require(after.ready && after.reusable && after.scores[0] == first.scores[0] && after.scores[1] == first.scores[1],
+        "Refresh must retain the original before/after marker proof");
+    require(calibration12_begin(*frame), "Refresh resources must drain after its fence completes");
+    std::cout << "PASS DX12 marker refresh lifetime: pending fence, immutable upload and original proof\n";
+}
+void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false) {
+    roles();
+    GPU12 gpu;
+    CalibrationListAlias alias(gpu.list.Get(), gpu.device.Get());
+    if (wrapped) { alias.device.distinct = true; alias.device.shared_private_data = true; }
+    constexpr auto format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    std::array<ComPtr<ID3D12Resource>, 2> sources{
+        gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format),
+        gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, format)};
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; buffer_desc.Width = 128 * 128 * 8;
+    buffer_desc.Height = buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.DepthOrArraySize = buffer_desc.MipLevels = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    ComPtr<ID3D12Resource> black, transfer;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&black)));
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&transfer)));
+    void* bytes{}; check(black->Map(0, nullptr, &bytes)); memset(bytes, 0, SIZE_T(buffer_desc.Width)); black->Unmap(0, nullptr);
+    ComPtr<ID3D11Device> device11;
+    ComPtr<ID3D11DeviceContext> context11;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &device11, nullptr, &context11));
+    constexpr unsigned target_size = 192;
+    D3D11_TEXTURE2D_DESC desc{target_size, target_size, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    ComPtr<ID3D11Texture2D> submitted;
+    check(device11->CreateTexture2D(&desc, nullptr, &submitted));
+    XrGraphicsBindingD3D11KHR binding{XR_TYPE_GRAPHICS_BINDING_D3D11_KHR}; binding.device = device11.Get();
+    XRLayer layer(submitted.Get(), 11, &binding, target_size, 2, target_size);
+    XRThread xr;
+    std::array<std::vector<unsigned char>, 2> transported;
+    for (auto& pixels : transported) pixels.resize(target_size * target_size * 4);
+    const std::vector<unsigned char> blank(target_size * target_size * 4);
+    const auto render_eye = [&](unsigned eye) {
+        gpu.begin();
+        auto* source = sources[eye].Get();
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{}, readback{};
+        src.pResource = black.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint = {format, 128, 128, 1, 1024};
+        dst.pResource = source; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        gpu.barrier(source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        gpu.barrier(source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        eye_calibration_stamp12(wrapped ? alias.get() : gpu.list.Get(), source, 9101 + eye, 0, 0, 128, 128);
+        gpu.barrier(source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        readback = src; readback.pResource = transfer.Get();
+        gpu.list->CopyTextureRegion(&readback, 0, 0, 0, &dst, nullptr);
+        gpu.barrier(source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        gpu.execute(); gpu.wait(gpu.queue.Get()); calibration12_retired(gpu.list.Get());
+        // Test-only host transport. Production calibration never moves textures
+        // between devices or waits for a queue. Model resize/flip/crop by the host.
+        check(transfer->Map(0, nullptr, &bytes));
+        for (unsigned y = 0; y < target_size; ++y)
+            for (unsigned x = 0; x < target_size; ++x) {
+                const unsigned sx = cropped ? 52 + x * 24 / target_size : x * 128 / target_size;
+                const unsigned sy = flipped ? 127 - y * 128 / target_size : y * 128 / target_size;
+                const auto p = calibration_decode(static_cast<const unsigned char*>(bytes) + sy * 1024 + sx * 8, format);
+                auto* out = transported[eye].data() + (y * target_size + x) * 4;
+                out[0] = static_cast<unsigned char>(p.r * 255); out[1] = static_cast<unsigned char>(p.g * 255);
+                out[2] = static_cast<unsigned char>(p.b * 255); out[3] = 255;
+            }
+        transfer->Unmap(0, nullptr);
+    };
+    auto support = request_calibration_images(true);
+    const auto frame = [&](bool swap, bool replay, bool alternating, unsigned n) {
+        xr.invoke([&] { layer.begin(); });
+        if (!alternating || !(n & 1)) render_eye(0);
+        if (alternating && (n & 1)) render_eye(1);
+        xr.invoke([&] {
+            if (!replay) for (unsigned eye = 0; eye < 2; ++eye)
+                context11->UpdateSubresource(submitted.Get(), eye, nullptr, transported[eye].data(), target_size * 4, 0);
+            layer.release();
+            if (!replay) for (unsigned eye = 0; eye < 2; ++eye)
+                context11->UpdateSubresource(submitted.Get(), eye, nullptr, blank.data(), target_size * 4, 0);
+            context11->Flush();
+        });
+        if (!alternating) render_eye(1);
+        xr.invoke([&] { layer.end(swap); eye_calibration_tick(); });
+        Sleep(2); eye_calibration_tick();
+    };
+    for (unsigned i = 0; i < 100; ++i) frame(false, false, false, i);
+    const auto report = collect_calibration_images(support);
+    require(report.files.size() == 5, "DX12-to-DX11 support ZIP must contain both stamped and both submitted images");
+    require(report.diagnostics.find("\"graphics_api\":12") != std::string::npos &&
+        report.diagnostics.find("\"graphics_api\":11") != std::string::npos,
+        "Mixed support images must identify their source and submission APIs");
+    require(eye_calibration_stats().source_graphics_api == 12 && eye_calibration_stats().submission_graphics_api == 11,
+        "Calibration diagnostics must retain both API identities rather than whichever handler ran last");
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        const auto& source = report.files[eye].contents;
+        const auto& destination = report.files[eye + 2].contents;
+        require(source.size() < 1000000 && destination.size() < 1000000, "Mixed support previews must stay below 1 MB each");
+        require(std::any_of(source.begin() + 54, source.end(), [](char value) { return value != 0; }),
+            "Mixed source preview must contain the actual stamped pattern");
+        for (unsigned y = 0; y < target_size; ++y)
+            for (unsigned x = 0; x < target_size; ++x) {
+                const unsigned sx = cropped ? 52 + x * 24 / target_size : x * 128 / target_size;
+                const unsigned sy = flipped ? 127 - y * 128 / target_size : y * 128 / target_size;
+                require(destination.compare(54 + ((target_size - 1 - y) * target_size + x) * 3, 3,
+                    source, 54 + ((127 - sy) * 128 + sx) * 3, 3) == 0,
+                    "Mixed submitted preview must match the host's resize/flip/crop before released images are overwritten");
+            }
+    }
+    if (cropped) {
+        require(!eye_calibration_stats().valid && !stereo_eye_assignment(9101).calibrated,
+            "Cropped-away markers must remain unmapped even though support images are captured");
+    } else {
+        require(stereo_eye_assignment(9101).calibrated && stereo_eye_assignment(9101).eye_index == 0 &&
+            stereo_eye_assignment(9101).vertical_flip == flipped, "Mixed API pipeline must map both eyes and orientation");
+        for (unsigned i = 0; i < 100; ++i) frame(true, false, true, i);
+        require(stereo_eye_assignment(9101).eye_index == 1 && eye_calibration_stats().corrections == 1,
+            "Mixed API alternating-eye rendering must follow changed projection eye labels");
+        const auto warmed = eye_calibration_stats().allocations;
+        for (unsigned i = 0; i < 100; ++i) frame(true, false, true, i);
+        require(eye_calibration_stats().allocations == warmed, "Mixed API readback and marker allocations must settle after warm-up");
+    }
+    eye_calibration_enable(false); frame(false, false, false, 0);
+    for (unsigned i = 0; i < 20; ++i) { xr.invoke([] { eye_calibration_tick(); }); eye_calibration_tick(); Sleep(1); }
+    require(!eye_calibration_stats().in_flight, "Mixed API queries and command recordings must drain after disabling");
+    if (!cropped) {
+        // Replay known readable submitted pixels from the *old* marker epoch.
+        // New source proof alone must not authenticate an old headset image.
+        eye_calibration_reset_stats();
+        xr.invoke([&] {
+            for (unsigned eye = 0; eye < 2; ++eye) {
+                const auto& bitmap = report.files[eye + 2].contents;
+                std::vector<unsigned char> stale(target_size * target_size * 4);
+                for (unsigned y = 0; y < target_size; ++y) for (unsigned x = 0; x < target_size; ++x) {
+                    const auto* pixel = bitmap.data() + 54 + ((target_size - 1 - y) * target_size + x) * 3;
+                    auto* out = stale.data() + (y * target_size + x) * 4;
+                    out[0] = pixel[2]; out[1] = pixel[1]; out[2] = pixel[0]; out[3] = 255;
+                }
+                context11->UpdateSubresource(submitted.Get(), eye, nullptr, stale.data(), target_size * 4, 0);
+            }
+        });
+        eye_calibration_enable(true);
+        for (unsigned i = 0; i < 80; ++i) frame(false, true, false, i);
+        require(!eye_calibration_stats().valid && !stereo_eye_assignment(9101).calibrated,
+            "Mixed API stale markers from before disable/re-enable must not publish eye assignments");
+        for (unsigned i = 0; i < 60; ++i) frame(false, false, false, i);
+        require(stereo_eye_assignment(9101).calibrated, "Mixed API path must recover when fresh submitted pixels resume");
+        eye_calibration_enable(false); frame(false, false, false, 0);
+        for (unsigned i = 0; i < 20; ++i) { xr.invoke([] { eye_calibration_tick(); }); eye_calibration_tick(); Sleep(1); }
+    }
+    const auto root = std::filesystem::temp_directory_path() / "Cheeky-mixed-calibration-tests" / std::to_string(GetCurrentProcessId());
+    std::filesystem::create_directories(root);
+    write_support_zip(root / (cropped ? "mixed-cropped.zip" : wrapped ? "mixed-wrapped-flipped.zip" : "mixed.zip"), report.files);
+    cleanup();
+    std::cout << "PASS DX12-to-DX11 OpenXR: " << (wrapped ? "wrapped source" : "native source")
+        << (flipped ? ", flipped" : "") << (cropped ? ", cropped markers rejected" : ", eye mapping") << ", four support images\n";
+}
 // A shader conversion/resize does not appear in the resource-copy graph.
 // Follow the markers through that path, including swapped array destinations.
 struct ScaledSubmission12 {
@@ -1095,6 +1370,18 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     cleanup();
 }
 } // namespace
+int run_mixed_api_calibration_tests() {
+    int failures{};
+    try { calibration_device_identity12(); }
+    catch (const std::exception& e) { std::cerr << "FAIL device identity: " << e.what() << '\n'; ++failures; }
+    try { refresh_recording_lifetime12(); }
+    catch (const std::exception& e) { std::cerr << "FAIL marker refresh lifetime: " << e.what() << '\n'; ++failures; }
+    for (unsigned variant = 0; variant < 3; ++variant) {
+        try { mixed_api12to11(variant == 1, variant == 1, variant == 2); }
+        catch (const std::exception& e) { std::cerr << "FAIL mixed API " << variant << ": " << e.what() << '\n'; ++failures; cleanup(); }
+    }
+    return failures;
+}
 int run_stereo_support12_tests() {
     try {
         openxr11_pipeline(false, false, true);

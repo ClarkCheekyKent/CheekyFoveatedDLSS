@@ -1,6 +1,7 @@
 #include "eye_calibration_d3d12.hpp"
 #include "eye_calibration_pixels.hpp"
 #include "graphics_observer.hpp"
+#include "d3d12_native.hpp"
 #include <wrl/client.h>
 #include <atomic>
 #include <mutex>
@@ -52,6 +53,9 @@ class ListLifetime final : public IUnknown {
     }
 };
 std::uint64_t list_id(ID3D12GraphicsCommandList* list, bool create) {
+    const auto native = native_d3d12_interface(list);
+    if (!native) return 0;
+    list = native.Get();
     IUnknown* value{};
     UINT bytes = sizeof(value);
     if (SUCCEEDED(list->GetPrivateData(list_key, &bytes, &value)) && value) {
@@ -128,9 +132,12 @@ struct Calibration12Frame {
     ComPtr<ID3D12Device> device;
     std::array<Patch, 12> patches;
     std::array<SupportReadback, 4> support;
-    std::array<Segment, 4> segments;
+    // Four timed segments plus bounded lifetime tracking for source refreshes
+    // while an alternating-eye submission waits for its second source.
+    std::array<Segment, 12> segments;
     std::array<ComPtr<ID3D12Resource>, 2> markers;
     std::array<DXGI_FORMAT, 2> marker_formats{};
+    std::array<std::uint32_t, 2> marker_codes{};
     std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> marker_footprints{};
     ComPtr<ID3D12QueryHeap> queries;
     ComPtr<ID3D12Resource> timestamps;
@@ -322,7 +329,8 @@ void end_segment(Calibration12Frame& f, ID3D12GraphicsCommandList* list, unsigne
 
 std::shared_ptr<Calibration12Frame> calibration12_create(ID3D12Device* device) {
     auto f = std::make_shared<Calibration12Frame>();
-    f->device = device;
+    f->device = canonical_d3d12_device(device);
+    if (!f->device) return {};
     std::lock_guard execution_lock(calibration12_execution_mutex());
     auto& r = registry();
     std::lock_guard lock(r.mutex);
@@ -357,7 +365,8 @@ bool calibration12_begin(Calibration12Frame& f) noexcept {
 bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
                          unsigned candidate, unsigned x, unsigned y, D3D12_RESOURCE_STATES state,
                          std::uint64_t& allocations, Calibration12Failure* failure,
-                         const CalibrationImageRequestPtr& support, const CalibrationImageInfo& support_info) noexcept {
+                         const CalibrationImageRequestPtr& support, const CalibrationImageInfo& support_info,
+                         std::uint32_t marker_code, bool refresh) noexcept {
     if (failure) *failure = {};
     const bool capture_image = begin_calibration_image(support, candidate, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
@@ -373,18 +382,11 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (FAILED(hr)) return reject("stamp_list_device", hr);
         hr = texture->GetDevice(IID_PPV_ARGS(&texture_device));
         if (FAILED(hr)) return reject("stamp_texture_device", hr);
-        if (list_device.Get() != f.device.Get() || texture_device.Get() != f.device.Get())
+        if (!same_d3d12_device(list_device.Get(), f.device.Get()) ||
+            !same_d3d12_device(texture_device.Get(), f.device.Get()))
             return reject("stamp_device_mismatch");
         // Install post-Execute observation before recording any marker commands.
-        if (!native_observer_status().ready) {
-            D3D12_COMMAND_QUEUE_DESC q{};
-            q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-            ComPtr<ID3D12CommandQueue> queue;
-            hr = f.device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue));
-            if (FAILED(hr)) return reject("observer_queue", hr);
-            if (!initialize_native_observer(f.device.Get(), queue.Get()))
-                return reject("observer_install");
-        }
+        if (!ensure_native_observer(list)) return reject("observer_install");
         const auto recording = list_id(list, true);
         if (!recording)
             return reject("recording_identity");
@@ -393,14 +395,35 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (!texture_supported(d, 0)) return reject("stamp_texture_format_or_layout");
         if (UINT64(x) + marker_size > d.Width || UINT64(y) + marker_size > d.Height)
             return reject("stamp_bounds");
+        if (refresh) {
+            if (!f.segments[candidate].used || !f.markers[candidate] || f.marker_formats[candidate] != d.Format ||
+                f.marker_codes[candidate] != marker_code) return reject("refresh_source_changed");
+            Segment* lifetime{};
+            for (auto& segment : f.segments)
+                if (segment.used && !segment.retired && segment.recording == recording) { lifetime = &segment; break; }
+            if (!lifetime) for (unsigned i = 4; i < f.segments.size(); ++i)
+                if (!f.segments[i].used) { lifetime = &f.segments[i]; break; }
+            if (!lifetime) return reject("refresh_recording_limit");
+            lifetime->used = true; lifetime->recording = recording;
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = texture; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = f.markers[candidate].Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint = f.marker_footprints[candidate];
+            transition(list, texture, 0, state, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyTextureRegion(&dst, x, y, 0, &src, nullptr);
+            transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, state);
+            return true; // Keep the first source proof and support image intact.
+        }
+        if (f.segments[candidate].used) return reject("stamp_already_recorded");
         if (!initialize(f, allocations)) return reject("stamp_query_buffers");
         const D3D12_BOX box{x, y, 0, x + marker_size, y + marker_size, 1};
         if (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
             !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations))
             return reject("stamp_readback_buffers");
-        if (f.marker_formats[candidate] != d.Format) {
+        if (f.marker_formats[candidate] != d.Format || f.marker_codes[candidate] != marker_code) {
             f.markers[candidate].Reset();
             f.marker_formats[candidate] = d.Format;
+            f.marker_codes[candidate] = marker_code;
         }
         auto& footprint = f.marker_footprints[candidate];
         if (!f.markers[candidate]) {
@@ -424,7 +447,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
                 for (unsigned xx = 0; xx < marker_size; ++xx)
                     calibration_encode_pattern(static_cast<unsigned char*>(data) +
                                                   yy * footprint.Footprint.RowPitch + xx * bpp,
-                                              d.Format, candidate, xx, yy);
+                                              d.Format, candidate, xx, yy, marker_code);
             f.markers[candidate]->Unmap(0, nullptr);
         }
         begin_segment(f, list, candidate);
@@ -470,11 +493,11 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     ComPtr<ID3D12Device> device;
     auto hr = queue->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(hr)) return reject("capture_queue_device", hr);
-    if (device.Get() != f.device.Get()) return reject("capture_queue_device_mismatch");
+    if (!same_d3d12_device(device.Get(), f.device.Get())) return reject("capture_queue_device_mismatch");
     device.Reset();
     hr = texture->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(hr)) return reject("capture_texture_device", hr);
-    if (device.Get() != f.device.Get()) return reject("capture_texture_device_mismatch");
+    if (!same_d3d12_device(device.Get(), f.device.Get())) return reject("capture_texture_device_mismatch");
     for (unsigned c = 0; c < boxes.size(); ++c) {
         if (boxes[c].right > d.Width || boxes[c].bottom > d.Height)
             return reject("capture_bounds");
@@ -565,7 +588,7 @@ std::recursive_mutex& calibration12_execution_mutex() noexcept {
     static auto* mutex = new std::recursive_mutex;
     return *mutex;
 }
-Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
+Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only) noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(f.mutex);
     Calibration12Readback out;
@@ -589,7 +612,7 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
     support_poll(f); // Preserve evidence even when marker classification fails.
     out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason());
     out.failure = f.failure;
-    for (unsigned i = 0; i < f.patches.size(); ++i) {
+    for (unsigned i = 0; i < (source_only ? 4U : unsigned(f.patches.size())); ++i) {
         auto& p = f.patches[i];
         if (!p.used) {
             out.valid = false;
@@ -606,17 +629,19 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
             continue;
         }
         const auto candidate = i < 4 ? i / 2 : (i - 4) % 2;
-        out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4);
+        out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4,
+            f.marker_codes[candidate]);
         const D3D12_RANGE empty{0, 0};
         p.buffer->Unmap(0, &empty);
     }
-    out.timing_valid = true;
-    for (const auto& s : f.segments)
+    out.timing_valid = !source_only;
+    for (unsigned i = 0; i < 4; ++i) {
+        const auto& s = f.segments[i];
         if (!s.used || !s.submitted || !s.frequency)
             out.timing_valid = false;
-    for (const auto& s : f.segments)
         if (std::count_if(s.points.begin(), s.points.end(), [](const auto& p) { return p.active; }) > 1)
             out.timing_valid = false;
+    }
     if (out.timing_valid) {
         void* data{};
         const D3D12_RANGE range{0, sizeof(UINT64) * 8};
