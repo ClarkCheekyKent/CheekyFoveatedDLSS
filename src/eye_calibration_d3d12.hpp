@@ -5,6 +5,7 @@
 #include <mutex>
 #include "eye_calibration_capture.hpp"
 #include "eye_calibration_search.hpp"
+#include "eye_calibration_tracking.hpp"
 
 namespace cheeky::foveated_dlss {
 struct Calibration12Frame;
@@ -18,6 +19,7 @@ struct Calibration12Readback {
     // Source before/after, then eight submitted scores per placement:
     // A/B per eye, followed by vertically flipped A/B per eye.
     std::array<float, calibration_patch_count> scores{};
+    std::array<CalibrationSearchResult, calibration_patch_count> tracked{};
     double gpu_us{};
     std::uint64_t allocations{};
     Calibration12Failure failure{};
@@ -40,7 +42,8 @@ bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resou
                            const CalibrationImageInfo& support_info = {},
                            std::span<const std::uint32_t> codes = {},
                            std::span<const unsigned> mirrors = {},
-                           const CalibrationSearchPtr& search = {}) noexcept;
+                           const CalibrationSearchPtr& search = {},
+                           std::span<const CalibrationTrackingPatch> tracking = {}) noexcept;
 // Mixed API frames have only source proof in DX12; submitted patches arrive
 // independently from DX11 and must not be treated as missing DX12 readbacks.
 Calibration12Readback calibration12_poll(Calibration12Frame&, bool source_only = false, unsigned source_mask = 3) noexcept;

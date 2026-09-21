@@ -2,6 +2,7 @@
 #include "eye_calibration.hpp"
 #include "eye_calibration_capture.hpp"
 #include "eye_calibration_search.hpp"
+#include "eye_calibration_tracking.hpp"
 #include "settings.hpp"
 #include "support_zip.hpp"
 #include <wrl/client.h>
@@ -90,6 +91,62 @@ void test_hogwarts_corner_pair() {
             "A acquired pair must collapse to one tracking marker");
     }
     std::cout << "PASS Hogwarts corner pair: outer priority, clipping fallback, single-marker tracking\n";
+}
+void test_hogwarts_tracking() {
+    // Support 41612: use the logged stale transforms and actual marker codes.
+    // Reconstruct full-resolution pixels; support BMPs are reduced previews.
+    constexpr unsigned w = 1493, h = 1440;
+    const std::array<CalibrationPlacement, 2> stale{{
+        {976, -24.6531, 1484.44, 1431.74, {1020, 12}},
+        {874.8, -29.8868, 1629.32, 1482.53, {2332, 60}}}};
+    const auto started = GetTickCount64();
+    for (unsigned eye = 0; eye < 2; ++eye) for (bool reversed : {false, true}) for (bool flip : {false, true}) {
+        auto learned = stale[eye];
+        learned.marker.code = calibration_location_code(learned.marker, 3440, eye, eye ? 33300034 : 9918158);
+        const float u0 = reversed ? 1.F : .5F, u1 = reversed ? .5F : 1.F;
+        const float v0 = reversed ? 1.F : 0.F, v1 = reversed ? 0.F : 1.F;
+        std::vector<unsigned> pixels(w * 2 * h, 0xff404040);
+        auto render = [&](unsigned step, bool missing = false, bool wrong_code = false) {
+            std::fill(pixels.begin(), pixels.end(), 0xff404040);
+            if (missing) return;
+            const int mx = int(learned.marker.x) - 974 + (eye ? -1 : 1) * int(step * 24);
+            const unsigned my = learned.marker.y + step * 20;
+            for (unsigned y = 0; y < 40; ++y) for (unsigned x = 0; x < 40; ++x) {
+                const unsigned px = w + (reversed ? w - 1 - (mx + x) : mx + x);
+                unsigned py = flip ? h - 1 - (my + y) : my + y;
+                if (reversed) py = h - 1 - py;
+                const bool light = calibration_pattern_bit(eye, x / 8, y / 8,
+                    wrong_code ? (learned.marker.code ^ 0x1555555) : learned.marker.code);
+                pixels[py * w * 2 + px] = light ? 0xffdddddd : 0xff202020;
+            }
+        };
+        for (unsigned step = 0; step < 5; ++step) {
+            render(step);
+            if (!step && !reversed && !flip) {
+                const auto old = calibration_sample_rect(learned, false, w * 2, h, u0, v0, u1, v1);
+                require(old[2] && calibration_pattern_score(pixels.data() + old[1] * w * 2 + old[0], w * 8,
+                    old[2], old[3], DXGI_FORMAT_R8G8B8A8_UNORM, eye, true, learned.marker.code, 1) < .9F,
+                    "The reported Hogwarts displacement must fail the old fixed patch");
+            }
+            const auto patch = calibration_tracking_patch(learned, eye, flip, w * 2, h, u0, v0, u1, v1);
+            require(patch.enabled && patch.rect[0] >= w && patch.rect[0] + patch.rect[2] <= w * 2 &&
+                patch.rect[2] <= 256 && patch.rect[3] <= 256,
+                "Local tracking must remain bounded inside its own packed eye");
+            const auto found = calibration_track(pixels.data() + patch.rect[1] * w * 2 + patch.rect[0], w * 8,
+                DXGI_FORMAT_R8G8B8A8_UNORM, patch);
+            require(found.valid && found.flipped == flip && found.candidate == eye,
+                "Local tracking must recover displaced corner markers, flips and reversed bounds");
+            learned = found.placement;
+        }
+        const auto patch = calibration_tracking_patch(learned, eye, flip, w * 2, h, u0, v0, u1, v1);
+        for (bool missing : {false, true}) {
+            render(4, missing, !missing);
+            require(!calibration_track(pixels.data() + patch.rect[1] * w * 2 + patch.rect[0], w * 8,
+                DXGI_FORMAT_R8G8B8A8_UNORM, patch).valid, "Missing or wrong codes must not refresh tracking");
+        }
+    }
+    std::cout << "PASS Hogwarts moving-marker tracking: reported displacement, recentering, packed/reversed bounds, flip, wrong/missing code ("
+        << GetTickCount64() - started << " ms)\n";
 }
 void test_cyberpunk_capture_search() {
     // Support capture 16380, sequence 42182: exact source/submitted dimensions,
@@ -248,7 +305,8 @@ void crop_calibration11() {
     const std::vector<unsigned> background(sw * sh, 0xff404040);
     eye_calibration_enable(true);
     auto attempt = [&](double crop_x, double crop_y, double crop_w, double crop_h,
-                       unsigned size, bool flip = false, bool obscure = false, bool swapped = false, bool asymmetric = false) {
+                       unsigned size, bool flip = false, bool obscure = false, bool swapped = false, bool asymmetric = false,
+                       bool delayed_completion = false) {
         auto support = request_calibration_images(true);
         for (unsigned n = 0; !eye_calibration_frame() && n < 20; ++n) {}
         auto target_desc = desc;
@@ -279,6 +337,8 @@ void crop_calibration11() {
             require(ticket != 0, "Cropped DX11 submission must enqueue readback");
             eye_calibration_result(ticket, 0);
         }
+        // Age the actual production capture, rather than mocking the retry policy.
+        if (delayed_completion) Sleep(1100);
         eye_calibration_frame(); context->Flush();
         const auto deadline = GetTickCount64() + 5000;
         while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) { Sleep(1); eye_calibration_tick(); }
@@ -307,9 +367,10 @@ void crop_calibration11() {
         locked->images[0].info.markers.count == 1 && locked->images[2].info.sample_count == 4,
         "A locked crop must stamp one marker and read only its two identity/orientation probes per eye");
     const auto before = eye_calibration_stats().valid;
-    attempt(100, 0, 300, 300, 300);
-    require(eye_calibration_stats().valid == before && eye_calibration_json().find("\"locked\":true") != std::string::npos,
-        "One failed sample must retain the tracking layout without publishing invalid identity");
+    const auto moved = attempt(100, 0, 300, 300, 300);
+    require(eye_calibration_stats().valid == before + 1 && moved->images[0].info.markers.count == 1 &&
+        eye_calibration_stats().left_view == 7101,
+        "A 50px crop displacement must update the transform and eye identity without reopening acquisition");
     auto recovered = acquire([&] { return attempt(100, 0, 300, 300, 300); });
     require(eye_calibration_stats().valid > before && recovered->images[0].info.markers.count <= 2,
         "Search must recover an edge-aligned crop");
@@ -346,9 +407,31 @@ void crop_calibration11() {
     for (unsigned i = 0; i < 3; ++i) attempt(34.3, 21.7, 330, 250, 300, false, true, false, true);
     require(eye_calibration_json().find("\"locked\":true") == std::string::npos,
         "Three consecutive marker misses must release placement locks");
-    auto recovered_pair = acquire([&] { return attempt(34.3, 21.7, 330, 250, 300, false, false, false, true); });
+    const auto candidate = [&] {
+        const auto json = eye_calibration_json(); const auto key = std::string("\"search_candidate\":");
+        return std::stoul(json.substr(json.find(key) + key.size()));
+    };
+    const auto failed_candidate = candidate();
+    const auto failed_searches = search_count();
+    const auto applied_before_retry = eye_calibration_stats().applied;
+    Sleep(1100); // Make the next capture eligible for the throttled wide search.
+    attempt(34.3, 21.7, 330, 250, 300, false, true, false, true, true);
+    require(search_count() == failed_searches + 1 && candidate() == failed_candidate + 1,
+        "A failed wide search older than one second must advance to the next corner");
+    require(eye_calibration_stats().valid == acquired_valid + 3 &&
+        eye_calibration_stats().applied == applied_before_retry &&
+        eye_calibration_json().find("\"locked\":true") == std::string::npos,
+        "A slow failed search must not publish eye identity or restore a placement lock");
+    auto recovered_pair = acquire([&] { return attempt(34.3, 21.7, 330, 250, 300, false, false, false, true, true); });
     require(recovered_pair->images[0].info.markers.count <= 2 && eye_calibration_stats().valid == acquired_valid + 4,
         "Sustained marker loss must reacquire using only a local corner pair");
+    require(eye_calibration_stats().applied == applied_before_retry,
+        "A slow successful acquisition must not publish stale eye identity");
+    const auto handoff_searches = search_count();
+    const auto handoff = attempt(34.3, 21.7, 330, 250, 300, false, false, false, true);
+    require(eye_calibration_stats().applied == applied_before_retry + 1 && search_count() == handoff_searches &&
+        handoff->images[0].info.markers.count == 1,
+        "Slow acquisition must hand off to a fresh one-marker mapping without another full search");
     eye_calibration_enable(false); eye_calibration_frame(); eye_calibration_stop();
     unregister_stereo_view(7101); unregister_stereo_view(7102);
     std::cout << "PASS DX11 crop search: centered/edge crop, packed bounds, source origin, resize/flip, lock/loss/recovery\n";
@@ -611,7 +694,7 @@ void run_calibration_policy() {
 }
 } // namespace
 int run_crop_calibration_tests() {
-    try { test_wide_search(); test_hogwarts_corner_pair(); test_cyberpunk_capture_search(); crop_calibration11(); return 0; }
+    try { test_wide_search(); test_hogwarts_corner_pair(); test_hogwarts_tracking(); test_cyberpunk_capture_search(); crop_calibration11(); return 0; }
     catch (const std::exception& e) { std::cerr << "Crop calibration: " << e.what() << '\n'; eye_calibration_stop(); return 1; }
 }
 int run_stereo_support_tests() {
@@ -657,6 +740,7 @@ int run_eye_calibration_tests() {
     try {
         test_wide_search();
         test_hogwarts_corner_pair();
+        test_hogwarts_tracking();
         test_cyberpunk_capture_search();
         crop_calibration11();
         run_calibration_policy();

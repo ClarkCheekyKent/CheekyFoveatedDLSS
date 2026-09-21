@@ -27,6 +27,7 @@ struct Patch {
     ComPtr<ID3D11Texture2D> staging;
     ComPtr<ID3D11Device> device;
     unsigned width{}, height{}, reference_width{}, reference_height{};
+    unsigned capacity_width{}, capacity_height{};
     DXGI_FORMAT format{};
     float score{};
     bool used{}, ready{};
@@ -68,6 +69,8 @@ struct Frame {
     std::array<CalibrationPlacementPlan, 2> placement_plans;
     std::array<std::uint32_t, calibration_patch_count> patch_codes{};
     std::array<unsigned, calibration_patch_count> patch_mirrors{};
+    std::array<CalibrationTrackingPatch, calibration_patch_count> tracking{};
+    std::array<CalibrationSearchResult, calibration_patch_count> tracked{};
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::array<std::array<bool, calibration_placement_count>, 2> usable_placements{};
     unsigned placement_count{1};
@@ -214,6 +217,14 @@ std::array<unsigned, 4> submitted_rect(Frame& f, unsigned eye, unsigned index, u
     const unsigned mirror = (u1 < u0 ? 1U : 0U) | ((v1 < v0) != (index % 4 >= 2) ? 2U : 0U);
     f.patch_mirrors[calibration_patch_index(index, eye)] = 1U << mirror;
     auto rect = calibration_sample_rect(placement, index % 4 >= 2, width, height, u0, v0, u1, v1);
+    auto& tracking = f.tracking[calibration_patch_index(index, eye)];
+    tracking = {};
+    if (plan.per_eye) {
+        auto coded = placement;
+        coded.marker.code = f.patch_codes[calibration_patch_index(index, eye)];
+        tracking = calibration_tracking_patch(coded, c, index % 4 >= 2, width, height, u0, v0, u1, v1);
+        if (tracking.enabled) rect = tracking.rect;
+    }
     if (!rect[2] || !rect[3]) { f.usable_placements[eye][h] = false; rect = {0, 0, 1, 1}; }
     return rect;
 }
@@ -451,7 +462,11 @@ void poll_submitted(Frame& f) {
                 D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
             if (result == DXGI_ERROR_WAS_STILL_DRAWING) { waiting = true; continue; }
             if (FAILED(result)) { f.invalid = true; p.ready = true; continue; }
-            p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
+            const auto patch_index = calibration_patch_index(index, eye);
+            if (f.tracking[patch_index].enabled) {
+                f.tracked[patch_index] = calibration_track(mapped.pData, mapped.RowPitch, p.format, f.tracking[patch_index]);
+                p.score = f.tracked[patch_index].valid ? f.tracked[patch_index].score : 0;
+            } else p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
                 p.format, c, true, f.patch_codes[calibration_patch_index(index, eye)],
                 f.patch_mirrors[calibration_patch_index(index, eye)]);
             capture.context->Unmap(p.staging.Get(), 0);
@@ -507,6 +522,7 @@ void poll(State& s) {
                 if (mixed && !(source_mask & (1U << (i / 2)))) continue;
                 f.patches[i].used = f.patches[i].ready = true;
                 f.patches[i].score = result.scores[i];
+                f.tracked[i] = result.tracked[i];
             }
             if (result.timing_valid) {
                 s.stats.gpu_timing_status = "Available";
@@ -566,7 +582,10 @@ void poll(State& s) {
                     continue;
                 }
                 const unsigned candidate = i < 4 ? i / 2 : (i - 4) % 2;
-                p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
+                if (i >= 4 && f.tracking[i].enabled) {
+                    f.tracked[i] = calibration_track(mapped.pData, mapped.RowPitch, p.format, f.tracking[i]);
+                    p.score = f.tracked[i].valid ? f.tracked[i].score : 0;
+                } else p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
                                                     p.format, candidate, i >= 4, f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
                 f.context->Unmap(p.staging.Get(), 0);
                 p.ready = true;
@@ -681,9 +700,13 @@ void poll(State& s) {
             }
         }
         if ((selected < 0 && !acquired) || ambiguous) rejection |= 128U;
-        // Do not let an old asynchronous completion undo a newer placement.
+        // A failed wide search only advances acquisition; it never authenticates
+        // pixels. Its CPU work can exceed the publication/tracking age limit.
+        // Discarding that failure would retry the same clipped corner forever.
+        const bool failed_wide_search = f.wide_search && rejection == 128U;
+        // Do not let an old epoch or out-of-order completion undo a newer placement.
         if (enabled && f.epoch == s.epoch && f.sequence > s.placement_sequence &&
-            GetTickCount64() - f.captured_ms < (acquired ? 10000U : 1000U)) {
+            (failed_wide_search || GetTickCount64() - f.captured_ms < (f.wide_search ? 10000U : 1000U))) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
             if (!rejection) {
@@ -701,19 +724,23 @@ void poll(State& s) {
                     } else {
                         const auto& plan = f.placement_plans[c];
                         const unsigned eye = int(c) == left ? left_slot : right_slot;
-                        const auto& chosen = plan.for_eye(eye, unsigned(int(c) == left ? selected : selected_right));
-                        learned = {f.views[c], f.submitted_sizes, chosen, true, plan.per_eye || mono, plan.eye_placements};
+                        const auto chosen_for = [&](unsigned physical_eye, unsigned hypothesis) {
+                            const unsigned patch = 4 + hypothesis * 8 + unsigned(flipped_pair) * 4 + physical_eye * 2 + c;
+                            return f.tracked[patch].valid ? f.tracked[patch].placement : plan.for_eye(physical_eye, hypothesis);
+                        };
+                        const auto chosen = chosen_for(eye, unsigned(int(c) == left ? selected : selected_right));
+                        learned = {f.views[c], f.submitted_sizes, chosen, true, true, plan.eye_placements};
                         if (learned.per_eye) {
                             learned.eye_placements.fill(chosen);
-                            if (int(c) == left) learned.eye_placements[left_slot] = plan.for_eye(left_slot, unsigned(selected));
-                            if (int(c) == right) learned.eye_placements[right_slot] = plan.for_eye(right_slot, unsigned(selected_right));
+                            if (int(c) == left) learned.eye_placements[left_slot] = chosen_for(left_slot, unsigned(selected));
+                            if (int(c) == right) learned.eye_placements[right_slot] = chosen_for(right_slot, unsigned(selected_right));
                         }
                     }
                 }
                 s.search_needed = false;
                 // A slow acquisition may only seed tracking. Publication still
                 // uses the normal age check; verify immediately on fresh pixels.
-                if (acquired) s.frames_until_capture = 0;
+                if (f.wide_search) s.frames_until_capture = 0;
             } else if (rejection == 128U) {
                 const bool locked = s.placements[0].locked || s.placements[1].locked;
                 // A missed readback is not proof that the placement was lost.
@@ -779,10 +806,15 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
         return false;
     const auto subresource = D3D11CalcSubresource(0, slice, desc.MipLevels);
     auto& p = f.patches[index];
-    if (!p.staging || p.device != device || p.width != width || p.height != height || p.format != desc.Format) {
+    // Recentered edge patches change shape by a few pixels. Reserve their
+    // bounded maximum once instead of reallocating GPU resources on each fit.
+    const unsigned capacity_width = f.tracking[index].enabled ? 256U : width;
+    const unsigned capacity_height = f.tracking[index].enabled ? 256U : height;
+    if (!p.staging || p.device != device || p.capacity_width != capacity_width ||
+        p.capacity_height != capacity_height || p.format != desc.Format) {
         p.staging.Reset();
-        desc.Width = width;
-        desc.Height = height;
+        desc.Width = capacity_width;
+        desc.Height = capacity_height;
         desc.MipLevels = desc.ArraySize = 1;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = desc.MiscFlags = 0;
@@ -791,10 +823,12 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
             return false;
         p.device = device;
         ++s.stats.allocations;
-        p.width = width;
-        p.height = height;
+        p.capacity_width = capacity_width;
+        p.capacity_height = capacity_height;
         p.format = desc.Format;
     }
+    p.width = width;
+    p.height = height;
     p.reference_width = rw;
     p.reference_height = rh;
     const D3D11_BOX box{x, y, 0, x + width, y + height, 1};
@@ -1052,6 +1086,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.evaluations = f.submits = 0;
         f.views = {};
         f.placement_plans = {}; f.submitted_sizes = {}; f.placement_count = 1;
+        f.tracking = {}; f.tracked = {};
         for (auto& usable : f.usable_placements) usable.fill(true);
         for (auto& capture : f.submitted11) capture.active = capture.ready = false;
         f.eye_submits = {};
@@ -1329,6 +1364,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     std::array<D3D12_BOX, calibration_box_count> boxes;
     std::array<std::uint32_t, calibration_box_count> codes;
     std::array<unsigned, calibration_box_count> mirrors;
+    std::array<CalibrationTrackingPatch, calibration_box_count> tracking;
     const unsigned box_count = f.placement_count * 4;
     for (unsigned index = 0; index < box_count; ++index) {
         const auto c = index % 2;
@@ -1337,6 +1373,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         const auto r = submitted_rect(f, eye, index, unsigned(d.Width), d.Height, u0, v0, u1, v1);
         codes[index] = f.patch_codes[calibration_patch_index(index, eye)];
         mirrors[index] = f.patch_mirrors[calibration_patch_index(index, eye)];
+        tracking[index] = f.tracking[calibration_patch_index(index, eye)];
         boxes[index] = {r[0], r[1], 0, r[0] + r[2], r[1] + r[3], 1};
         f.patches[calibration_patch_index(index, eye)].reference_width = ref.width;
         f.patches[calibration_patch_index(index, eye)].reference_height = ref.height;
@@ -1353,7 +1390,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         {boxes[i].left, boxes[i].top, boxes[i].right - boxes[i].left, boxes[i].bottom - boxes[i].top};
     if (!calibration12_capture(*f.gpu12, queue, texture, eye, slice, expected_state, {boxes.data(), box_count},
                                s.stats.allocations, &failure, f.support, image, {codes.data(), box_count}, {mirrors.data(), box_count},
-                               prepare_search(f, eye))) {
+                               prepare_search(f, eye), {tracking.data(), box_count})) {
         f.invalid = true;
         ++s.stats.d3d12_capture_failures;
         s.stats.d3d12_last_capture_failure = failure.stage;
@@ -1677,6 +1714,7 @@ std::string eye_calibration_json() {
             << ",\"locks\":" << live.placement_locks << ",\"losses\":" << live.placement_losses
             << ",\"search_candidate\":" << live.search_candidate
             << ",\"tracking_misses\":" << live.tracking_misses
+            << ",\"tracking_mode\":\"local_recenter\",\"tracking_padding_px\":64,\"tracking_max_patch_px\":256"
             << ",\"max_acquisition_markers_per_source\":2"
             << ",\"stamping\":\"corner_pair_then_selected\""
             << ",\"wide_searches\":" << live.wide_searches

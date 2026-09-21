@@ -1,0 +1,65 @@
+#pragma once
+#include "eye_calibration_search.hpp"
+
+namespace cheeky::foveated_dlss {
+// A bounded readback around the last observation, clipped to this eye's viewport.
+// Pixel coordinates are retained so recognition can update the full-eye transform.
+struct CalibrationTrackingPatch {
+    bool enabled{}, flip{}, reverse_x{}, reverse_y{};
+    unsigned candidate{};
+    CalibrationPlacement placement;
+    std::array<unsigned, 4> rect{};
+    double eye_width{}, eye_height{}, offset_x{}, offset_y{}, cell_x{}, cell_y{};
+};
+inline CalibrationTrackingPatch calibration_tracking_patch(CalibrationPlacement placement,
+    unsigned candidate, bool flip, unsigned width, unsigned height,
+    float u0, float v0, float u1, float v1) {
+    CalibrationTrackingPatch p;
+    if (placement.width <= 0 || placement.height <= 0) return p;
+    p.placement = placement; p.candidate = candidate; p.flip = flip;
+    p.reverse_x = u1 < u0; p.reverse_y = v1 < v0;
+    p.eye_width = width * std::abs(double(u1) - u0);
+    p.eye_height = height * std::abs(double(v1) - v0);
+    p.cell_x = p.eye_width * 8 / placement.width;
+    p.cell_y = p.eye_height * 8 / placement.height;
+    if (p.cell_x < 1.5 || p.cell_y < 1.5 || p.cell_x > 24 || p.cell_y > 24) return p;
+    const double sx = (placement.marker.x - placement.x + 20) / placement.width;
+    const double sy = (placement.marker.y - placement.y + 20) / placement.height;
+    const double cx = width * (u0 + sx * (u1 - u0));
+    const double cy = height * (v0 + (flip ? 1 - sy : sy) * (v1 - v0));
+    const double x0 = width * (std::min)(u0, u1), x1 = width * (std::max)(u0, u1);
+    const double y0 = height * (std::min)(v0, v1), y1 = height * (std::max)(v0, v1);
+    const double left = (std::max)(std::ceil(x0), std::floor(cx - p.cell_x * 2.5 - 64));
+    const double top = (std::max)(std::ceil(y0), std::floor(cy - p.cell_y * 2.5 - 64));
+    const double right = (std::min)(std::floor(x1), std::ceil(cx + p.cell_x * 2.5 + 64));
+    const double bottom = (std::min)(std::floor(y1), std::ceil(cy + p.cell_y * 2.5 + 64));
+    if (left < 0 || top < 0 || right > width || bottom > height || right <= left || bottom <= top ||
+        right - left > 256 || bottom - top > 256) return p;
+    p.rect = {unsigned(left), unsigned(top), unsigned(right - left), unsigned(bottom - top)};
+    p.offset_x = p.reverse_x ? x1 - right : left - x0;
+    p.offset_y = p.reverse_y ? y1 - bottom : top - y0;
+    p.enabled = true;
+    return p;
+}
+inline CalibrationSearchResult calibration_track(const void* data, unsigned pitch, DXGI_FORMAT format,
+    const CalibrationTrackingPatch& patch) {
+    if (!patch.enabled) return {};
+    const auto image = calibration_search_image(data, pitch, patch.rect[2], patch.rect[3], format,
+        {patch.reverse_x ? 1.F : 0.F, patch.reverse_y ? 1.F : 0.F,
+         patch.reverse_x ? 0.F : 1.F, patch.reverse_y ? 0.F : 1.F});
+    CalibrationSearchOptions options;
+    options.min_cell = (std::max)(1.5, patch.cell_x * .72);
+    options.max_cell = patch.cell_x * 1.4;
+    options.aspect = patch.cell_y / patch.cell_x;
+    options.flip_mask = 1U << unsigned(patch.flip);
+    options.tracking = true;
+    auto result = calibration_search(image, {{patch.placement.marker, patch.candidate, 0, 0}}, nullptr, options);
+    if (!result.valid || result.ambiguous) return {};
+    auto& p = result.placement;
+    const double sx = p.width / image.width, sy = p.height / image.height;
+    p.x -= patch.offset_x * sx;
+    p.y -= (patch.flip ? patch.eye_height - patch.offset_y - image.height : patch.offset_y) * sy;
+    p.width = patch.eye_width * sx; p.height = patch.eye_height * sy;
+    return result;
+}
+} // namespace cheeky::foveated_dlss

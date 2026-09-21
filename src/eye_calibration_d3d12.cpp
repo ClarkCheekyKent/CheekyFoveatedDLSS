@@ -134,6 +134,7 @@ struct Calibration12Frame {
     std::array<unsigned, 2> capture_counts{};
     std::array<std::uint32_t, calibration_patch_count> patch_codes{};
     std::array<unsigned, calibration_patch_count> patch_mirrors{};
+    std::array<CalibrationTrackingPatch, calibration_patch_count> tracking{};
     std::array<std::array<std::uint32_t, calibration_placement_count>, 2> stamp_codes{};
     std::array<SupportReadback, 4> support;
     std::array<SupportReadback, 2> search_readbacks;
@@ -337,6 +338,8 @@ bool prepare_patch(Calibration12Frame& f, unsigned index, DXGI_FORMAT format, co
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64 bytes{};
     f.device->GetCopyableFootprints(&d, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
+    if (index >= 4 && f.tracking[index].enabled)
+        bytes = (std::max)(bytes, UINT64(256) * 256 * calibration_pixel_bytes(format));
     if (!p.buffer || p.bytes < bytes) {
         p.buffer.Reset();
         if (!buffer(f.device.Get(), D3D12_HEAP_TYPE_READBACK, bytes, p.buffer))
@@ -554,7 +557,8 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
                            std::span<const D3D12_BOX> boxes, std::uint64_t& allocations,
                            Calibration12Failure* failure, const CalibrationImageRequestPtr& support,
                            const CalibrationImageInfo& support_info, std::span<const std::uint32_t> codes,
-                           std::span<const unsigned> mirrors, const CalibrationSearchPtr& search) noexcept {
+                           std::span<const unsigned> mirrors, const CalibrationSearchPtr& search,
+                           std::span<const CalibrationTrackingPatch> tracking) noexcept {
     if (failure) *failure = {};
     const bool capture_image = begin_calibration_image(support, 2 + eye, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
@@ -565,6 +569,7 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     };
     if (!queue || !texture || eye > 1 || boxes.empty() || boxes.size() > calibration_box_count || boxes.size() % 4 ||
         (!codes.empty() && codes.size() != boxes.size()) || (!mirrors.empty() && mirrors.size() != boxes.size()) ||
+        (!tracking.empty() && tracking.size() != boxes.size()) ||
         queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return reject("capture_arguments");
     std::lock_guard lock(f.mutex);
@@ -585,6 +590,7 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
         const auto index = calibration_patch_index(c, eye);
         f.patch_codes[index] = codes.empty() ? f.marker_codes[c % 2] : codes[c];
         f.patch_mirrors[index] = mirrors.empty() ? 15U : mirrors[c];
+        f.tracking[index] = tracking.empty() ? CalibrationTrackingPatch{} : tracking[c];
         if (!prepare_patch(f, index, d.Format, boxes[c], allocations))
             return reject("capture_readback_buffers");
     }
@@ -721,7 +727,10 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
             continue;
         }
         const auto candidate = i < 4 ? i / 2 : (i - 4) % 2;
-        out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4,
+        if (i >= 4 && f.tracking[i].enabled) {
+            out.tracked[i] = calibration_track(data, d.RowPitch, d.Format, f.tracking[i]);
+            out.scores[i] = out.tracked[i].valid ? out.tracked[i].score : 0;
+        } else out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4,
             i < 4 ? f.marker_codes[candidate] : f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
         const D3D12_RANGE empty{0, 0};
         p.buffer->Unmap(0, &empty);

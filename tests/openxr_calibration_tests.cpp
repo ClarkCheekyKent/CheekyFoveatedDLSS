@@ -1351,8 +1351,9 @@ void crop_calibration12(bool mixed) {
     require(locked->images[0].info.markers.count == 1 && locked->images[2].info.sample_count == 4 &&
         eye_calibration_stats().left_view == 9102, "DX12 must lock to one authenticated location and swapped eye identity");
     const auto before = eye_calibration_stats().valid;
-    attempt(16 | 32);
-    require(eye_calibration_stats().valid == before, "An old centered-crop lock must fail on an edge crop");
+    const auto moved = attempt(16 | 32);
+    require(eye_calibration_stats().valid == before + 1 && moved->images[0].info.markers.count == 1,
+        "Local tracking must follow the displaced edge crop without reopening acquisition");
     auto edge = acquire([&] { return attempt(16 | 32); });
     require(eye_calibration_stats().valid > before && edge->images[0].info.markers.count <= 2, "DX12 must reacquire from a local corner pair");
     acquire([&] { return attempt(16 | 64, true); });

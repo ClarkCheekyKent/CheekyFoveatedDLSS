@@ -86,8 +86,12 @@ displays the full hypothesis bank. If small patches cannot locate the markers,
 it acquires full submitted images asynchronously and searches their
 codes across the submitted view. Each eye gets an independently estimated crop
 and horizontal/vertical scale. Successful acquisition locks the selected marker;
-subsequent samples stamp only the selected location(s) and read small tracking
-patches. Three consecutive complete samples with missing submitted markers, or changed
+subsequent samples stamp only the selected location(s) and read bounded tracking
+patches. Each patch has 64 submitted pixels of movement allowance around the
+predicted marker, clipped to its own eye viewport and capped at 256 by 256 pixels.
+Local recognition fits translation and scale with the same code/contrast thresholds
+and recenters the next patch from the new observation, independently for each eye.
+Three consecutive complete samples with missing submitted markers, or changed
 source/submission geometry, unlock placement and permit acquisition again. A
 single failed sample retains the tracking layout but cannot refresh eye identity. Wide acquisitions are limited to one stereo pair in
 flight, with at least one second between attempts; they stop while tracking is
@@ -171,6 +175,12 @@ The existing source before/after proof, physical-eye pair checks, epoch,
 generation and submission-result checks still apply. An acquisition older than
 the one-second publication limit may seed tracking for up to ten seconds, but
 must pass a fresh small-patch capture before it can publish an eye mapping.
+This seeding allowance also applies when a small patch already matched in a
+wide-search frame: waiting for the worker must not discard the successful seed.
+Failed wide searches may advance to the next corner even after the one-second
+tracking limit; otherwise a slow search can keep retrying markers clipped by a
+changed resolution or crop. This only updates acquisition, never publishes eye
+identity, and still rejects old epochs and out-of-order completions.
 The support JSON's `placement_search` includes `wide_searches`,
 `wide_search_pending`, `last_wide_results`, and per-eye learned placements.
 

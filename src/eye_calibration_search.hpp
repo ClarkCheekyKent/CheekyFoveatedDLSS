@@ -49,8 +49,14 @@ inline CalibrationSearchImage calibration_search_image(const void* data, unsigne
     }
     return image;
 }
+struct CalibrationSearchOptions {
+    double min_cell{1.5}, max_cell{20.}, aspect{1.};
+    unsigned flip_mask{3};
+    bool tracking{};
+};
 inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& image,
-    const std::vector<CalibrationSearchTarget>& targets, const std::atomic<bool>* canceled = nullptr) {
+    const std::vector<CalibrationSearchTarget>& targets, const std::atomic<bool>* canceled = nullptr,
+    CalibrationSearchOptions options = {}) {
     CalibrationSearchResult result;
     if (image.width < 10 || image.height < 10 || targets.empty()) return result;
     struct Template { unsigned target{}, flip{}; std::uint32_t code{}; };
@@ -59,6 +65,7 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     // every template at every pixel. Colliding words remain explicitly ambiguous.
     std::unordered_map<std::uint32_t, std::vector<unsigned>> words;
     for (unsigned t = 0; t < targets.size(); ++t) for (unsigned flip = 0; flip < 2; ++flip) {
+        if (!(options.flip_mask & (1U << flip))) continue;
         std::uint32_t code{};
         for (unsigned y = 0; y < 5; ++y) for (unsigned x = 0; x < 5; ++x)
             code |= unsigned(calibration_pattern_bit(targets[t].candidate, x, flip ? 4 - y : y,
@@ -100,11 +107,11 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     std::vector<Hit> hits;
     // Covers 7.5--100 pixel patterns in the acquisition image. Both axes are
     // refined independently below; do not infer a crop from aspect ratio alone.
-    for (double cell = 1.5; cell <= 20.; cell *= 1.12) {
+    for (double cell = options.min_cell; cell <= options.max_cell; cell *= 1.12) {
         if (canceled && canceled->load(std::memory_order_relaxed)) return {};
         const double step = (std::max)(1., cell * .5);
         for (double aspect : {.8, 1., 1.25}) {
-            const double cy = cell * aspect;
+            const double cy = cell * aspect * options.aspect;
             for (double y = 0; y + 5 * cy <= image.height; y += step)
                 for (double x = 0; x + 5 * cell <= image.width; x += step) {
                     float v[25], low = 1e30F, high = -1e30F;
@@ -163,8 +170,8 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
         if (hit.score - other < calibration_pattern_min_gap) continue;
         // Keep enough margin for the 60-source-pixel tracking patch. A marker
         // clipped by the submission boundary cannot provide stable tracking.
-        if (hit.x < 1.25 * hit.cw || hit.y < 1.25 * hit.ch ||
-            hit.x + 6.25 * hit.cw > image.width || hit.y + 6.25 * hit.ch > image.height) continue;
+        if (!options.tracking && (hit.x < 1.25 * hit.cw || hit.y < 1.25 * hit.ch ||
+            hit.x + 6.25 * hit.cw > image.width || hit.y + 6.25 * hit.ch > image.height)) continue;
         if (result.valid && (result.candidate != target.candidate || result.flipped != bool(pattern.flip))) {
             result.valid = false; result.ambiguous = true; return result;
         }
