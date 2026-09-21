@@ -103,7 +103,8 @@ bool calibration_live() {
 }
 StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
-    if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip};
+    if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip,
+        calibration.left == calibration.right};
     if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip};
     return {};
 }
@@ -397,7 +398,7 @@ void unregister_stereo_view(const std::uint64_t view_id) noexcept {
 
 bool has_multiple_stereo_views() noexcept {
     std::lock_guard lock(stereo_views_mutex);
-    if (calibration_live()) return true;
+    if (calibration_live()) return calibration.left != calibration.right;
     return eye_roles[0].view_id != 0U && eye_roles[1].view_id != 0U;
 }
 
@@ -434,9 +435,9 @@ std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept {
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected,
-    std::uint64_t session_generation, bool vertical_flip) noexcept {
+    std::uint64_t session_generation, bool vertical_flip, bool shared_source) noexcept {
     if (corrected) *corrected = false;
-    if (!left || !right || left == right || !left_generation || !right_generation) return false;
+    if (!left || !right || (left == right) != shared_source || !left_generation || !right_generation) return false;
     std::lock_guard lock(stereo_views_mutex);
     const auto now = GetTickCount64();
     constexpr std::uint64_t lifetime_ms = 1000;
@@ -459,7 +460,9 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     };
     const int previous_left = previous_eye(left), previous_right = previous_eye(right);
     if (corrected) {
-        *corrected = (previous_left >= 0 && previous_left != 0) || (previous_right >= 0 && previous_right != 1);
+        *corrected = shared_source ? calibration.left != left || calibration.right != right :
+            (calibration.left && calibration.left == calibration.right) || (previous_left >= 0 && previous_left != 0) ||
+            (previous_right >= 0 && previous_right != 1);
     }
     calibration = {left, right, sequence, session_generation, vertical_flip};
     return true;
@@ -536,7 +539,7 @@ Settings settings_for_view(
         const auto corrected = calibrated_assignment(view_id);
         matched_view->has_eye_assignment = corrected.assigned;
         matched_view->second_eye = corrected.eye_index == 1;
-        result.x_offset = corrected.assigned
+        result.x_offset = corrected.assigned && !corrected.shared_source
             ? ((matched_view->second_eye != settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
             : 0.0F;
         return result;

@@ -350,9 +350,11 @@ void poll(State& s) {
         if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
             [](const auto& capture) { return capture.active && !capture.ready; })) continue;
         bool gpu12_reusable{};
+        const unsigned source_mask = (f.views[0].id ? 1U : 0U) | (f.views[1].id ? 2U : 0U);
+        const bool mono = f.pipelined && f.evaluations == 1 && (source_mask == 1 || source_mask == 2);
         if (f.gpu12_used) {
             const bool mixed = f.pipelined;
-            const auto result = calibration12_poll(*f.gpu12, mixed);
+            const auto result = calibration12_poll(*f.gpu12, mixed, mixed ? source_mask : 3U);
             if (f.sequence >= s.measurement_start)
                 s.stats.allocations += result.allocations;
             if (!result.ready)
@@ -371,6 +373,7 @@ void poll(State& s) {
                 s.stats.d3d12_readback_error = result.failure.result;
             }
             for (unsigned i = 0; i < (mixed ? 4U : 8U); ++i) {
+                if (mixed && !(source_mask & (1U << (i / 2)))) continue;
                 f.patches[i].used = f.patches[i].ready = true;
                 f.patches[i].score = result.scores[i];
             }
@@ -480,12 +483,15 @@ void poll(State& s) {
             }
         }
         unsigned rejection = f.invalid ? 1U : 0U;
-        if (f.evaluations != 2) rejection |= 2U;
+        if (f.evaluations != 2 && !mono) rejection |= 2U;
         if (f.submits != 2 || f.eye_submits[0] != 1 || f.eye_submits[1] != 1) rejection |= 4U;
         if (f.result[0] != 0 || f.result[1] != 0) rejection |= 8U;
-        for (const auto& p : f.patches)
-            if (!p.used || !p.ready) rejection |= 16U;
+        for (unsigned i = 0; i < f.patches.size(); ++i) {
+            if (mono && i < 4 && !(source_mask & (1U << (i / 2)))) continue;
+            if (!f.patches[i].used || !f.patches[i].ready) rejection |= 16U;
+        }
         for (unsigned c = 0; c < 2; ++c) {
+            if (mono && !(source_mask & (1U << c))) continue;
             if (!(f.patches[c * 2 + 1].score >= 0.8F &&
                     f.patches[c * 2 + 1].score - f.patches[c * 2].score >= 0.3F)) rejection |= 32U;
             for (unsigned eye = 0; eye < 2; ++eye) {
@@ -506,21 +512,25 @@ void poll(State& s) {
             f.flipped_scores[left_slot * 2], f.flipped_scores[left_slot * 2 + 1]) : -1;
         const int flipped_right = f.gpu12_used ? calibration_pattern_classify(
             f.flipped_scores[right_slot * 2], f.flipped_scores[right_slot * 2 + 1]) : -1;
-        const bool normal_pair = left >= 0 && right >= 0 && left != right;
-        const bool flipped_pair = flipped_left >= 0 && flipped_right >= 0 && flipped_left != flipped_right;
+        const auto verified_pair = [&](int a, int b) {
+            return a >= 0 && b >= 0 && (mono ? a == b && (source_mask & (1U << a)) : a != b);
+        };
+        const bool normal_pair = verified_pair(left, right);
+        const bool flipped_pair = verified_pair(flipped_left, flipped_right);
         // A post-DLSS shader may flip the image. Accept exactly one complete
         // stereo pair; conflicting orientation evidence must never guess.
         if (normal_pair == flipped_pair) rejection |= 128U;
         if (flipped_pair) { left = flipped_left; right = flipped_right; }
         if (rejection) record_rejection(s, f, rejection);
         if (!rejection) {
+            if (mono) calibration_image_shared_source(f.support, unsigned(left));
             ++s.stats.valid;
             if (f.sequence > s.last_valid_sequence) {
                 s.stats.left_view = f.views[left].id;
                 s.stats.right_view = f.views[right].id;
                 s.last_valid_sequence = f.sequence;
             }
-            if (f.views[left].assigned >= 0 && f.views[right].assigned >= 0 &&
+            if (!mono && f.views[left].assigned >= 0 && f.views[right].assigned >= 0 &&
                 (f.views[left].assigned != 0 || f.views[right].assigned != 1))
                 ++s.stats.mismatches;
             // Readbacks may complete out of order or after a toggle. The settings
@@ -529,7 +539,7 @@ void poll(State& s) {
                 bool corrected{};
                 if (publish_stereo_calibration(f.views[left].id, f.views[right].id, f.views[left].generation,
                                                f.views[right].generation, f.sequence, f.captured_ms,
-                                               &corrected, f.session_generation, flipped_pair)) {
+                                               &corrected, f.session_generation, flipped_pair, mono)) {
                     ++s.stats.applied;
                     if (corrected)
                         ++s.stats.corrections;
@@ -1188,7 +1198,10 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     auto& f = s.ring[s.current];
     if (f.sequence != capture_sequence) return 0;
     if (f.epoch != s.epoch || f.invalid) return 0;
-    if (f.pipelined && f.evaluations < 2) {
+    // Give alternating-eye rendering time to produce its second source.
+    // After two intervals, one source may be captured, but publication still
+    // requires its marker in BOTH successfully submitted physical eyes.
+    if (f.pipelined && f.evaluations < 2 && !(f.evaluations == 1 && s.sequence - f.sequence >= 2)) {
         ++s.waiting_for_sources;
         return 0;
     }
@@ -1252,7 +1265,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1}; image.sample_count = mixed ? 4U : 2U;
     for (unsigned index = 0; index < image.sample_count; ++index) {
         const unsigned c = index % 2;
-        const auto& ref = f.views[c].width ? f.views[c] : f.views[0];
+        const auto& ref = f.views[c].width ? f.views[c] : f.views[f.views[0].width ? 0 : 1];
         if (!ref.width || !ref.height) {
             f.invalid = true;
             continue;
@@ -1344,7 +1357,7 @@ const char* eye_calibration_status(const EyeCalibrationStats& stats) noexcept {
     if (stats.unsupported_submission)
         return "Unsupported texture or queue path";
     if (stats.correction_active)
-        return "Active";
+        return stats.left_view == stats.right_view ? "Active (shared mono source)" : "Active";
     return "Waiting for a valid stereo marker pair";
 }
 
@@ -1378,6 +1391,7 @@ std::string eye_calibration_json() {
         << ",\"source_graphics_api\":" << s.source_graphics_api << ",\"submission_graphics_api\":" << s.submission_graphics_api
         << ",\"enabled\":" << s.enabled << ",\"status\":\"" << eye_calibration_status(s)
         << "\",\"active\":" << s.correction_active << ",\"openvr_active\":" << s.openvr_active
+        << ",\"shared_source\":" << (s.correction_active && s.left_view == s.right_view)
         << ",\"vertical_flip\":" << s.vertical_flip
         << ",\"unsupported_submission\":" << s.unsupported_submission
         << ",\"unsupported_submissions\":" << s.unsupported_submissions << ",\"frames\":" << s.frames

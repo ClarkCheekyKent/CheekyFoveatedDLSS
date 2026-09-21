@@ -1179,6 +1179,96 @@ void test_packed_alignment_coordinator(bool openvr = false) {
     reset_gaze_foveation();
 }
 
+void test_mono_gaze_coordinator() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation(); clear_stereo_calibration();
+    constexpr std::uint64_t view = 19901, session = 19902;
+    register_stereo_view(view);
+    const auto generation = stereo_view_generation(view);
+    expect(!publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session),
+        "Stereo publication must not silently accept duplicated source IDs");
+    expect(publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session, false, true),
+        "Explicitly verified shared-source calibration publishes");
+    expect(stereo_eye_assignment(view).shared_source && !has_multiple_stereo_views(),
+        "Shared mono identity must not invent a second stereo source");
+    Settings settings{};
+    settings.width = settings.height = .2F;
+    settings.x_offset = .6F;
+    settings.gaze_smoothing_ms = 0;
+    settings.gaze_quantization_pixels = 1;
+    settings.auto_stereo_alignment = true;
+    expect(settings_for_view(settings, view).x_offset == 0, "Mono fallback must not inherit a stereo horizontal offset");
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION; snapshot.structure_size = sizeof(snapshot);
+    snapshot.session_generation = session; snapshot.swapchain_generation = 1;
+    snapshot.view_count = 2;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED |
+        CHEEKY_GAZE_STATUS_GAZE_VALID;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& eye = snapshot.views[i];
+        eye.view_index = i;
+        eye.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID | CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID;
+        eye.resource_identity = 19000 + i; eye.swapchain_identity = 19100 + i;
+        eye.image_rect_width = eye.image_rect_height = 1000;
+        eye.center_u = i ? .6F : .2F; eye.center_v = i ? .5F : .3F;
+        eye.forward_u = i ? .65F : .45F; eye.forward_v = i ? .5F : .3F;
+        eye.next_jump_u = i ? .8F : .4F; eye.next_jump_v = i ? .4F : .2F;
+    }
+    CropGeometry crop{};
+    FoveationCenter center{};
+    const auto frame = [&] {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart; ++snapshot.predicted_display_time;
+        bool reset{};
+        expect(calculate_coordinated_crop(settings, view, nullptr, 1000, 1000, 1000, 1000, 0, 0,
+            crop, reset, &snapshot, &center), "Mono gaze resolves a crop");
+    };
+    for (const auto mode : {FoveationCenterMode::openxr_gaze, FoveationCenterMode::simulated_gaze}) {
+        settings.center_mode = mode;
+        if (mode == FoveationCenterMode::simulated_gaze) snapshot.status_flags |= CHEEKY_GAZE_STATUS_SIMULATED;
+        settings.simulation_pattern = 2;
+        frame(); frame(); frame();
+        expect(gaze_diagnostics().using_gaze, "Cold mono supports real and simulated gaze without prior stereo");
+        expect_near(center.u, .4F, .002F, "Mono gaze uses the binocular horizontal center");
+        expect_near(center.v, .4F, .002F, "Mono gaze uses the binocular vertical center");
+        for (const auto& eye : gaze_diagnostics().views)
+            expect(eye.resource_mapped && eye.marker_mapping && eye.dlss_view_id == view,
+                "Both headset eyes must report the same verified mono source");
+        if (mode == FoveationCenterMode::simulated_gaze) {
+            auto preview = settings;
+            apply_next_jump_preview(preview, view);
+            expect(preview.next_jump_visible, "Mono simulation retains the next-jump preview");
+        }
+    }
+    expect(publish_stereo_calibration(view, view, generation, generation, 2, GetTickCount64(), nullptr, session, true, true),
+        "Shared-source vertical transform publishes");
+    frame(); frame();
+    expect_near(center.v, .6F, .002F, "Mono gaze applies the verified vertical flip after averaging");
+    settings.center_mode = FoveationCenterMode::fixed;
+    frame();
+    expect_near(center.u, .55F, .002F, "Mono fixed alignment uses the binocular forward center");
+    expect_near(center.v, .6F, .002F, "Mono fixed alignment applies the same vertical transform");
+    constexpr std::uint64_t other_view = 19903;
+    register_stereo_view(other_view);
+    expect(publish_stereo_calibration(view, other_view, generation, stereo_view_generation(other_view),
+        3, GetTickCount64(), nullptr, session), "Stereo proof replaces mono gaze mapping");
+    settings.center_mode = FoveationCenterMode::simulated_gaze;
+    frame(); frame(); frame();
+    expect_near(center.u, .2F, .002F, "Returning to stereo restores the individual eye's horizontal gaze");
+    expect_near(center.v, .3F, .002F, "Returning to stereo discards the shared flipped gaze history");
+    expect(publish_stereo_calibration(view, view, generation, generation, 4, GetTickCount64(), nullptr, session, false, true),
+        "New mono proof replaces stereo gaze mapping");
+    frame(); frame(); frame();
+    expect_near(center.u, .4F, .002F, "Returning to mono restores binocular gaze");
+    settings.center_mode = FoveationCenterMode::fixed;
+    snapshot.session_generation++;
+    frame(); frame();
+    expect(gaze_diagnostics().alignment_source == 0, "Foreign-session mono proof cannot route alignment");
+    unregister_stereo_view(view); register_stereo_view(view);
+    expect(!stereo_eye_assignment(view).calibrated, "Mono source recreation invalidates shared mapping");
+    unregister_stereo_view(view); unregister_stereo_view(other_view);
+    reset_gaze_foveation(); clear_stereo_calibration();
+}
 void test_auto_alignment_history(bool openvr) {
     using namespace cheeky::foveated_dlss;
     reset_gaze_foveation();
@@ -2162,6 +2252,8 @@ int main(int argc, char** argv) {
         return run_stereo_support_tests() + run_stereo_support12_tests();
     if (argc == 2 && std::strcmp(argv[1], "--alignment-history") == 0) {
         test_auto_alignment_history(false); test_auto_alignment_history(true); test_auto_alignment();
+        test_packed_alignment_coordinator(false); test_packed_alignment_coordinator(true);
+        test_mono_gaze_coordinator();
         if (!failures) std::cout << "Automatic alignment history tests passed\n";
         return failures ? 1 : 0;
     }
@@ -2201,6 +2293,7 @@ int main(int argc, char** argv) {
     test_packed_alignment_coordinator(true);
     test_openvr_geometry();
     test_auto_alignment();
+    test_mono_gaze_coordinator();
     test_auto_alignment_history(false);
     test_auto_alignment_history(true);
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {

@@ -36,6 +36,7 @@ struct CalibrationImageRequest {
     std::uint64_t sequence{}, session_generation{};
     std::array<std::uint32_t, 2> marker_codes{};
     bool claimed{}, closed{};
+    bool shared_source{};
     const char* status{"waiting_for_calibration_frame"};
     std::chrono::steady_clock::time_point deadline;
 };
@@ -153,6 +154,14 @@ inline void calibration_image_physical_eye(const CalibrationImageRequestPtr& req
     if (!request->closed) request->images[index].info.submitted_eye = int(eye);
 }
 struct CalibrationImageReport { std::string diagnostics; std::vector<SupportFile> files; };
+inline void calibration_image_shared_source(const CalibrationImageRequestPtr& request, unsigned candidate) noexcept {
+    if (!request || candidate >= 2) return;
+    std::lock_guard lock(request->mutex);
+    if (request->closed) return;
+    request->shared_source = true;
+    request->images[1 - candidate].status = "not_applicable_single_source";
+    request->changed.notify_all();
+}
 inline CalibrationImageReport collect_calibration_images(const CalibrationImageRequestPtr& request) {
     CalibrationImageReport result;
     std::unique_lock lock(request->mutex);
@@ -165,7 +174,7 @@ inline CalibrationImageReport collect_calibration_images(const CalibrationImageR
     if (!request->closed) {
         const auto captured = std::count_if(request->images.begin(), request->images.end(),
             [](const auto& image) { return !image.bitmap.empty(); });
-        request->status = captured == 4 ? "complete" : captured ? "partial" : "unavailable";
+        request->status = captured == (request->shared_source ? 3 : 4) ? "complete" : captured ? "partial" : "unavailable";
         request->closed = true;
     }
     for (auto& image : request->images) {
@@ -175,7 +184,8 @@ inline CalibrationImageReport collect_calibration_images(const CalibrationImageR
             image.status = "gpu_readback_timeout";
     }
     std::ostringstream out; out.imbue(std::locale::classic()); out << std::boolalpha;
-    out << "{\"status\":\"" << request->status << "\",\"sequence\":" << request->sequence
+    out << "{\"status\":\"" << request->status << "\",\"shared_source\":" << request->shared_source
+        << ",\"sequence\":" << request->sequence
         << ",\"session_generation\":" << request->session_generation
         << ",\"marker_codes\":[" << request->marker_codes[0] << ',' << request->marker_codes[1]
         << "],\"preview\":\"full texture; nearest-neighbor; RGB clamped to [0,1]; not a color-accurate HDR screenshot\","

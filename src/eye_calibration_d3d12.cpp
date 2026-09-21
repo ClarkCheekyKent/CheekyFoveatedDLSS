@@ -600,7 +600,7 @@ std::recursive_mutex& calibration12_execution_mutex() noexcept {
     static auto* mutex = new std::recursive_mutex;
     return *mutex;
 }
-Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only) noexcept {
+Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only, unsigned source_mask) noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(f.mutex);
     Calibration12Readback out;
@@ -625,6 +625,7 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
     out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason());
     out.failure = f.failure;
     for (unsigned i = 0; i < (source_only ? 4U : unsigned(f.patches.size())); ++i) {
+        if (source_only && !(source_mask & (1U << (i / 2)))) continue;
         auto& p = f.patches[i];
         if (!p.used) {
             out.valid = false;

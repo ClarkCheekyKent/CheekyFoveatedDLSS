@@ -557,8 +557,14 @@ void openxr11_pipeline(bool hardware, bool separate_device = false, bool support
     require(!eye_calibration_stats().valid && !stereo_eye_assignment(9101).calibrated,
         "Markers from a previous calibration epoch must not validate a new capture");
     for (unsigned i = 0; i < 100; ++i) render(false, false, true);
-    require(!eye_calibration_stats().valid && eye_calibration_stats().in_flight < 8,
-        "Mono must not invent a second source or exhaust the ring");
+    require(eye_calibration_stats().valid && eye_calibration_stats().in_flight < 8 &&
+        stereo_eye_assignment(9101).shared_source && !stereo_eye_assignment(9102).calibrated,
+        "Mono must map its one source to both eyes without inventing a second source or exhausting the ring");
+    eye_calibration_enable(false); render(false, false, true);
+    for (unsigned i = 0; i < 20; ++i) {
+        Sleep(2); xr([] { eye_calibration_tick(); }); eye_calibration_tick();
+    }
+    eye_calibration_reset_stats(); eye_calibration_enable(true);
     XRLayer::release_result = XR_ERROR_RUNTIME_FAILURE;
     for (unsigned i = 0; i < 40; ++i) render(false, false, false);
     require(!eye_calibration_stats().valid, "Failed releases must reject pipelined captures");
@@ -917,8 +923,11 @@ void continuous_marker_lifetime12() {
     cleanup();
     std::cout << "PASS continuous DX12 markers: no readbacks, queue/recording lifetime, bounded pool, disable\n";
 }
-void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false, bool delayed = false) {
+void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false, bool delayed = false, bool mono = false) {
     roles();
+    if (mono) unregister_stereo_view(9102);
+    unsigned mono_source = mono ? 0U : 2U;
+    bool missing_eye{};
     GPU12 gpu;
     CalibrationListAlias alias(gpu.list.Get(), gpu.device.Get());
     if (wrapped) { alias.device.distinct = true; alias.device.shared_private_data = true; }
@@ -989,13 +998,18 @@ void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false, bool dela
     std::vector<std::array<std::vector<unsigned char>, 2>> history;
     const auto frame = [&](bool swap, bool replay, bool alternating, unsigned n) {
         xr.invoke([&] { layer.begin(); });
-        if (!alternating || !(n & 1)) render_eye(0);
-        if (alternating && (n & 1)) render_eye(1);
-        if (delayed && !alternating) render_eye(1);
+        if (mono_source < 2) render_eye(mono_source);
+        else {
+            if (!alternating || !(n & 1)) render_eye(0);
+            if (alternating && (n & 1)) render_eye(1);
+            if (delayed && !alternating) render_eye(1);
+        }
         if (delayed) history.push_back(transported);
         xr.invoke([&] {
             if (!replay) for (unsigned eye = 0; eye < 2; ++eye) {
-                const auto& pixels = delayed ? (history.size() > 3 ? history.front()[eye] : blank) : transported[eye];
+                const unsigned source = mono_source < 2 ? mono_source : eye;
+                const auto& pixels = missing_eye && eye == 1 ? blank :
+                    delayed ? (history.size() > 3 ? history.front()[source] : blank) : transported[source];
                 context11->UpdateSubresource(submitted.Get(), eye, nullptr, pixels.data(), target_size * 4, 0);
             }
             layer.release();
@@ -1004,10 +1018,46 @@ void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false, bool dela
             context11->Flush();
         });
         if (delayed && history.size() > 3) history.erase(history.begin());
-        if (!alternating && !delayed) render_eye(1);
+        if (mono_source == 2 && !alternating && !delayed) render_eye(1);
         xr.invoke([&] { layer.end(swap); eye_calibration_tick(); });
         Sleep(2); eye_calibration_tick();
     };
+    if (mono) {
+        for (unsigned i = 0; i < 60; ++i) frame(false, false, false, i);
+        require(stereo_eye_assignment(9101).calibrated && eye_calibration_stats().left_view == 9101 &&
+            eye_calibration_stats().right_view == 9101,
+            "Cold mono must calibrate one source observed in both submitted eyes without prior stereo");
+        support = request_calibration_images(true);
+        for (unsigned i = 0; i < 20; ++i) frame(false, false, false, i);
+        const auto report = collect_calibration_images(support);
+        require(report.files.size() == 4 && report.diagnostics.find("\"status\":\"complete\"") != std::string::npos &&
+            report.diagnostics.find("not_applicable_single_source") != std::string::npos,
+            "Mono support report must contain one source and two submitted images without a missing-source timeout");
+        register_stereo_view(9102); mono_source = 2;
+        for (unsigned i = 0; i < 80; ++i) frame(false, false, false, i);
+        require(eye_calibration_stats().left_view == 9101 && eye_calibration_stats().right_view == 9102,
+            "Mono-to-stereo must replace the shared mapping with distinct sources");
+        mono_source = 1;
+        for (unsigned i = 0; i < 80; ++i) frame(false, false, false, i);
+        require(eye_calibration_stats().left_view == 9102 && eye_calibration_stats().right_view == 9102,
+            "Stereo-to-mono must calibrate candidate B even while candidate A remains registered");
+        eye_calibration_enable(false); frame(false, false, false, 0);
+        eye_calibration_enable(true); missing_eye = true;
+        for (unsigned i = 0; i < 60; ++i) frame(false, false, false, i);
+        require(!stereo_eye_assignment(9102).calibrated,
+            "One submitted eye containing a marker is insufficient proof of mono");
+        missing_eye = false;
+        for (unsigned i = 0; i < 60; ++i) frame(false, false, false, i);
+        require(stereo_eye_assignment(9102).calibrated, "Mono must recover with fresh evidence in both eyes");
+        unregister_stereo_view(9102); register_stereo_view(9102);
+        require(!stereo_eye_assignment(9102).calibrated, "Recreated mono source must invalidate its calibration");
+        eye_calibration_enable(false); frame(false, false, false, 0);
+        for (unsigned i = 0; i < 20; ++i) { xr.invoke([] { eye_calibration_tick(); }); eye_calibration_tick(); Sleep(1); }
+        cleanup();
+        std::cout << "PASS mono OpenXR: " << (wrapped ? "wrapped/flipped" : "native")
+            << ", cold start, three images, stereo transitions, missing-eye rejection and handle lifetime\n";
+        return;
+    }
     if (delayed) {
         // A host may submit an image rendered several intervals ago, including
         // intervals between calibration samples. Re-rendering clears old stamps.
@@ -1459,8 +1509,9 @@ int run_mixed_api_calibration_tests() {
     catch (const std::exception& e) { std::cerr << "FAIL device identity: " << e.what() << '\n'; ++failures; }
     try { refresh_recording_lifetime12(); }
     catch (const std::exception& e) { std::cerr << "FAIL marker refresh lifetime: " << e.what() << '\n'; ++failures; }
-    for (unsigned variant = 0; variant < 5; ++variant) {
-        try { mixed_api12to11(variant == 1 || variant == 4, variant == 1, variant == 2, variant >= 3); }
+    for (unsigned variant = 0; variant < 7; ++variant) {
+        try { mixed_api12to11(variant == 1 || variant == 4 || variant == 6, variant == 1 || variant == 6,
+            variant == 2, variant >= 3, variant >= 5); }
         catch (const std::exception& e) { std::cerr << "FAIL mixed API " << variant << ": " << e.what() << '\n'; ++failures; cleanup(); }
     }
     return failures;

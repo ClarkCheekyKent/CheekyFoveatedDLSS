@@ -195,6 +195,13 @@ Marker-only tests check that no readback/timestamp objects are allocated, upload
 survive replay and independent queue fences, and a saturated 16-slot pool skips
 without growing or blocking and resumes after retirement. Diagnostics expose
 `d3d12.continuous_stamps` and `d3d12.continuous_skipped` separately from captures.
+Mono variants start with one registered source, verify its marker in both XR
+eyes, then switch mono-to-stereo and back to the other source while both handles
+remain registered. Missing-eye evidence and recreated handles must not inherit
+a shared mapping. Verified mono reports contain three images, with the unused
+source marked `not_applicable_single_source`. `--alignment-history` also checks
+real/simulated mono gaze, binocular forward alignment, vertical flips, next-jump
+previews, and rejection of a different session's calibration.
 The production path only reads each API's own textures; it adds no interop
 transport and performs no GPU waits. Mixed API GPU timing is reported unavailable
 because the query timelines are separate. Original same-API tests remain in

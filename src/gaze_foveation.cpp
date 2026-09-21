@@ -39,6 +39,7 @@ struct ViewState {
     std::uint64_t last_snapshot_qpc{};
     bool has_crop{};
     bool calibrated_vertical_flip{};
+    bool shared_source{};
     bool next_jump_visible{};
     FoveationOffsets next_jump_offsets{};
     float next_jump_width{}, next_jump_height{};
@@ -494,6 +495,11 @@ bool calculate_coordinated_crop(
             auto& view = diagnostics.views[index];
             view.alignment_source = source;
             view.aligned_u = center.u; view.aligned_v = center.v;
+            if (xr_view && eye_assignment.shared_source) {
+                auto& other = diagnostics.views[1 - index];
+                other.alignment_source = source;
+                other.aligned_u = center.u; other.aligned_v = center.v;
+            }
         }
         return center;
     };
@@ -573,6 +579,20 @@ bool calculate_coordinated_crop(
         (openvr_snapshot ? eye_assignment.calibration_session == 0 :
             eye_assignment.calibration_session != 0 && eye_assignment.calibration_session == snapshot.session_generation);
     calibrated_vertical_flip = marker_match && eye_assignment.vertical_flip;
+    const bool shared_source = marker_match && eye_assignment.shared_source;
+    // Both submitted images were verified to contain the same source. That
+    // source gets one binocular center, not an arbitrary left/right role.
+    CheekyGazeViewV1 shared_view = snapshot.views[0];
+    if (shared_source) {
+        const auto& other = snapshot.views[1];
+        shared_view.flags &= other.flags;
+        shared_view.center_u = (shared_view.center_u + other.center_u) * .5F;
+        shared_view.center_v = (shared_view.center_v + other.center_v) * .5F;
+        shared_view.forward_u = (shared_view.forward_u + other.forward_u) * .5F;
+        shared_view.forward_v = (shared_view.forward_v + other.forward_v) * .5F;
+        shared_view.next_jump_u = (shared_view.next_jump_u + other.next_jump_u) * .5F;
+        shared_view.next_jump_v = (shared_view.next_jump_v + other.next_jump_v) * .5F;
+    }
     if (marker_match) { matched_index = eye_assignment.eye_index; match_count = 1U; }
     std::array<GazeProjection, 2> xr_projections{};
     for (unsigned i = 0; i < (std::min)(snapshot.view_count, CHEEKY_GAZE_MAX_VIEWS); ++i) {
@@ -660,9 +680,11 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
-    const bool calibration_changed = state.calibrated_vertical_flip != calibrated_vertical_flip;
+    const bool calibration_changed = state.calibrated_vertical_flip != calibrated_vertical_flip ||
+        state.shared_source != shared_source;
     if (calibration_changed) {
         state.calibrated_vertical_flip = calibrated_vertical_flip;
+        state.shared_source = shared_source;
         state.temporal = {};
     }
     const bool mapping_ready = (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U;
@@ -771,8 +793,9 @@ bool calculate_coordinated_crop(
         candidate.candidate_x = output_origin_x; candidate.candidate_y = output_origin_y;
         candidate.candidate_width = output_width; candidate.candidate_height = output_height;
     }
-    if (state.mapping.view_index < CHEEKY_GAZE_MAX_VIEWS) {
-        auto& view_diagnostics = diagnostics.views[state.mapping.view_index];
+    for (unsigned index = 0; index < CHEEKY_GAZE_MAX_VIEWS; ++index) {
+        if (index != state.mapping.view_index && !shared_source) continue;
+        auto& view_diagnostics = diagnostics.views[index];
         view_diagnostics.dlss_view_id = state.view_id;
         view_diagnostics.stable_matches = state.mapping.consecutive_matches;
         view_diagnostics.resource_mapped = mapping_result.stable;
@@ -780,7 +803,7 @@ bool calculate_coordinated_crop(
         view_diagnostics.copy_mapping = copy_match;
         view_diagnostics.projection_mapping = projection_match;
         view_diagnostics.marker_mapping = marker_match;
-        const auto& projected = snapshot.views[state.mapping.view_index];
+        const auto& projected = snapshot.views[index];
         view_diagnostics.submitted_projection = (projected.flags & CHEEKY_GAZE_VIEW_SUBMITTED_PROJECTION) != 0;
         view_diagnostics.fov_tangents = {std::tan(projected.fov_left), std::tan(projected.fov_right),
             std::tan(projected.fov_up), std::tan(projected.fov_down)};
@@ -803,8 +826,10 @@ bool calculate_coordinated_crop(
             now >= snapshot.publication_qpc &&
             seconds_between(now, snapshot.publication_qpc) <= gaze_stale_seconds &&
             sample_age_seconds <= gaze_stale_seconds;
+    const auto* alignment_view = alignment_usable ?
+        (shared_source ? &shared_view : &snapshot.views[state.mapping.view_index]) : nullptr;
     if (settings.center_mode == FoveationCenterMode::fixed)
-        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr,
+        return auto_crop(alignment_view,
             mapping_result.changed || mapping_result.invalidated || calibration_changed);
     const bool source_matches =
         ((snapshot.status_flags & CHEEKY_GAZE_STATUS_SIMULATED) != 0U) ==
@@ -814,11 +839,12 @@ bool calculate_coordinated_crop(
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED) != 0U &&
         sample_age_seconds <= gaze_stale_seconds;
-    const bool use_sample = mapping_stable && snapshot_valid;
+    const bool use_sample = mapping_stable && snapshot_valid && (!shared_source ||
+        (std::isfinite(shared_view.center_u) && std::isfinite(shared_view.center_v)));
     if (use_sample && settings.show_next_jump_target &&
         settings.center_mode == FoveationCenterMode::simulated_gaze &&
         (settings.simulation_pattern == 2U || settings.simulation_pattern == 3U)) {
-        const auto& target = snapshot.views[state.mapping.view_index];
+        const auto& target = shared_source ? shared_view : snapshot.views[state.mapping.view_index];
         CropGeometry next_crop{};
         if ((target.flags & CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID) != 0U &&
             calculate_foveation_geometry_at_center(foveation_parameters(fixed_settings),
@@ -830,11 +856,11 @@ bool calculate_coordinated_crop(
             state.next_jump_offsets = foveation_offsets_from_geometry(next_crop, render_width, render_height);
         }
     }
-    const auto fallback = aligned_center(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr);
+    const auto fallback = aligned_center(alignment_view);
     float raw_u = fallback.u;
     float raw_v = fallback.v;
     if (use_sample) {
-        const auto& source = snapshot.views[state.mapping.view_index];
+        const auto& source = shared_source ? shared_view : snapshot.views[state.mapping.view_index];
         raw_u = source.center_u;
         raw_v = calibrated_vertical_flip ? 1.F - source.center_v : source.center_v;
     }
@@ -855,7 +881,7 @@ bool calculate_coordinated_crop(
     );
     diagnostics.using_gaze = temporal_result.using_gaze;
     if (!state.temporal.has_filtered) {
-        return auto_crop(alignment_usable ? &snapshot.views[state.mapping.view_index] : nullptr,
+        return auto_crop(alignment_view,
             mapping_result.changed || mapping_result.invalidated || calibration_changed);
     }
 

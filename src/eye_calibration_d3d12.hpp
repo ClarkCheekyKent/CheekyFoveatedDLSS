@@ -37,7 +37,7 @@ bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resou
                            const CalibrationImageInfo& support_info = {}) noexcept;
 // Mixed API frames have only source proof in DX12; submitted patches arrive
 // independently from DX11 and must not be treated as missing DX12 readbacks.
-Calibration12Readback calibration12_poll(Calibration12Frame&, bool source_only = false) noexcept;
+Calibration12Readback calibration12_poll(Calibration12Frame&, bool source_only = false, unsigned source_mask = 3) noexcept;
 void calibration12_submitted(ID3D12CommandQueue*, ID3D12GraphicsCommandList*) noexcept;
 void calibration12_retired(ID3D12GraphicsCommandList*) noexcept;
 bool calibration12_internal_work() noexcept;
