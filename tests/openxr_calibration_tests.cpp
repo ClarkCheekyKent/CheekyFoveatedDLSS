@@ -843,10 +843,10 @@ void refresh_recording_lifetime12() {
     const auto first = calibration12_poll(*frame, true);
     gpu.begin();
     require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, nullptr, {}, {}, 0, true), "Marker refresh on a new recording");
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, nullptr, {}, {}, 0, Calibration12StampMode::refresh), "Marker refresh on a new recording");
     Calibration12Failure failure;
     require(!calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, &failure, {}, {}, 42, true) &&
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, &failure, {}, {}, 42, Calibration12StampMode::refresh) &&
         std::string(failure.stage) == "refresh_source_changed", "An in-flight upload must not change marker epochs");
     ComPtr<ID3D12Fence> gate;
     check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
@@ -863,7 +863,61 @@ void refresh_recording_lifetime12() {
     require(calibration12_begin(*frame), "Refresh resources must drain after its fence completes");
     std::cout << "PASS DX12 marker refresh lifetime: pending fence, immutable upload and original proof\n";
 }
-void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false) {
+void continuous_marker_lifetime12() {
+    GPU12 gpu;
+    auto texture = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    auto frame = calibration12_create(gpu.device.Get());
+    std::uint64_t allocations{};
+    require(calibration12_begin(*frame), "Fresh marker-only frame");
+    gpu.begin();
+    require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, nullptr, {}, {}, 12345,
+        Calibration12StampMode::marker_only), "Marker-only stamp");
+    require(allocations == 1, "Marker-only work must allocate just an upload, with no readback or timestamp objects");
+    gpu.execute(); gpu.wait(gpu.queue.Get());
+    require(!calibration12_begin(*frame), "Replayable marker-only recording must retain its upload");
+    ComPtr<ID3D12Fence> gate;
+    check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
+    check(gpu.submit_queue->Wait(gate.Get(), 1));
+    ID3D12CommandList* lists[]{gpu.list.Get()};
+    gpu.submit_queue->ExecuteCommandLists(1, lists);
+    calibration12_submitted(gpu.submit_queue.Get(), gpu.list.Get());
+    calibration12_retired(gpu.list.Get());
+    const bool reused = calibration12_begin(*frame);
+    check(gate->Signal(1)); // Release the owned test queue before asserting.
+    gpu.wait(gpu.submit_queue.Get());
+    require(!reused && calibration12_begin(*frame, &allocations),
+        "Marker-only upload must survive retirement until every queue finishes");
+    const auto warmed = allocations;
+    gpu.begin();
+    require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, nullptr, {}, {}, 12345,
+        Calibration12StampMode::marker_only) && allocations == warmed, "Marker-only upload must be reusable without allocations");
+    check(gpu.list->Close()); gpu.begin();
+    require(calibration12_begin(*frame), "Unsubmitted marker-only recording must drain after Reset");
+    check(gpu.list->Close());
+
+    roles();
+    // Move outside the sampled window, then keep every upload recording live.
+    for (unsigned i = 0; i < 6; ++i) eye_calibration_frame(EyeCalibrationBackend::openxr, 993, 11);
+    gpu.begin();
+    for (unsigned i = 0; i < 64; ++i)
+        eye_calibration_stamp12(gpu.list.Get(), texture.Get(), 9101, 0, 0, 128, 128);
+    const auto saturated = eye_calibration_stats();
+    require(saturated.d3d12_continuous_stamps == 16 && saturated.d3d12_continuous_skipped == 48 &&
+        saturated.allocations == 16, "A full marker pool must skip without blocking, growing, or overwriting live uploads");
+    gpu.execute(); gpu.wait(gpu.queue.Get()); gpu.begin();
+    eye_calibration_stamp12(gpu.list.Get(), texture.Get(), 9101, 0, 0, 128, 128);
+    require(eye_calibration_stats().d3d12_continuous_stamps == 17, "Continuous stamps must resume after pool retirement");
+    const auto enabled_stamps = eye_calibration_stats().d3d12_continuous_stamps;
+    eye_calibration_enable(false);
+    eye_calibration_stamp12(gpu.list.Get(), texture.Get(), 9101, 0, 0, 128, 128);
+    require(eye_calibration_stats().d3d12_continuous_stamps == enabled_stamps, "Disabling calibration must stop continuous stamps");
+    gpu.execute(); gpu.wait(gpu.queue.Get()); calibration12_retired(gpu.list.Get());
+    cleanup();
+    std::cout << "PASS continuous DX12 markers: no readbacks, queue/recording lifetime, bounded pool, disable\n";
+}
+void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false, bool delayed = false) {
     roles();
     GPU12 gpu;
     CalibrationListAlias alias(gpu.list.Get(), gpu.device.Get());
@@ -931,23 +985,48 @@ void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false) {
             }
         transfer->Unmap(0, nullptr);
     };
-    auto support = request_calibration_images(true);
+    CalibrationImageRequestPtr support;
+    std::vector<std::array<std::vector<unsigned char>, 2>> history;
     const auto frame = [&](bool swap, bool replay, bool alternating, unsigned n) {
         xr.invoke([&] { layer.begin(); });
         if (!alternating || !(n & 1)) render_eye(0);
         if (alternating && (n & 1)) render_eye(1);
+        if (delayed && !alternating) render_eye(1);
+        if (delayed) history.push_back(transported);
         xr.invoke([&] {
-            if (!replay) for (unsigned eye = 0; eye < 2; ++eye)
-                context11->UpdateSubresource(submitted.Get(), eye, nullptr, transported[eye].data(), target_size * 4, 0);
+            if (!replay) for (unsigned eye = 0; eye < 2; ++eye) {
+                const auto& pixels = delayed ? (history.size() > 3 ? history.front()[eye] : blank) : transported[eye];
+                context11->UpdateSubresource(submitted.Get(), eye, nullptr, pixels.data(), target_size * 4, 0);
+            }
             layer.release();
             if (!replay) for (unsigned eye = 0; eye < 2; ++eye)
                 context11->UpdateSubresource(submitted.Get(), eye, nullptr, blank.data(), target_size * 4, 0);
             context11->Flush();
         });
-        if (!alternating) render_eye(1);
+        if (delayed && history.size() > 3) history.erase(history.begin());
+        if (!alternating && !delayed) render_eye(1);
         xr.invoke([&] { layer.end(swap); eye_calibration_tick(); });
         Sleep(2); eye_calibration_tick();
     };
+    if (delayed) {
+        // A host may submit an image rendered several intervals ago, including
+        // intervals between calibration samples. Re-rendering clears old stamps.
+        for (unsigned i = 0; i < 40; ++i) frame(false, false, false, i);
+        require(stereo_eye_assignment(9101).calibrated,
+            "Delayed DX12-to-DX11 submissions from unsampled renders must establish eye mapping");
+        const auto capture_count = eye_calibration_stats().captures;
+        for (unsigned i = 0; i < 20; ++i) {
+            frame(false, false, false, i);
+            for (const auto& pixels : transported) {
+                bool marked{};
+                for (std::size_t p = 0; p < pixels.size(); p += 4) marked |= pixels[p] != 0;
+                require(marked, "Every DX12 source render must be stamped between readback samples");
+            }
+        }
+        require(eye_calibration_stats().captures - capture_count == 2,
+            "Continuous DX12 stamping must retain one-in-ten readback cadence");
+    }
+    support = request_calibration_images(true);
     for (unsigned i = 0; i < 100; ++i) frame(false, false, false, i);
     const auto report = collect_calibration_images(support);
     require(report.files.size() == 5, "DX12-to-DX11 support ZIP must contain both stamped and both submitted images");
@@ -1014,10 +1093,12 @@ void mixed_api12to11(bool wrapped, bool flipped, bool cropped = false) {
     }
     const auto root = std::filesystem::temp_directory_path() / "Cheeky-mixed-calibration-tests" / std::to_string(GetCurrentProcessId());
     std::filesystem::create_directories(root);
-    write_support_zip(root / (cropped ? "mixed-cropped.zip" : wrapped ? "mixed-wrapped-flipped.zip" : "mixed.zip"), report.files);
+    write_support_zip(root / (delayed ? (wrapped ? "mixed-delayed-wrapped.zip" : "mixed-delayed.zip") :
+        cropped ? "mixed-cropped.zip" : wrapped ? "mixed-wrapped-flipped.zip" : "mixed.zip"), report.files);
     cleanup();
     std::cout << "PASS DX12-to-DX11 OpenXR: " << (wrapped ? "wrapped source" : "native source")
-        << (flipped ? ", flipped" : "") << (cropped ? ", cropped markers rejected" : ", eye mapping") << ", four support images\n";
+        << (flipped ? ", flipped" : "") << (delayed ? ", delayed unsampled renders" : "")
+        << (cropped ? ", cropped markers rejected" : ", eye mapping") << ", four support images\n";
 }
 // A shader conversion/resize does not appear in the resource-copy graph.
 // Follow the markers through that path, including swapped array destinations.
@@ -1372,12 +1453,14 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
 } // namespace
 int run_mixed_api_calibration_tests() {
     int failures{};
+    try { continuous_marker_lifetime12(); }
+    catch (const std::exception& e) { std::cerr << "FAIL continuous marker lifetime: " << e.what() << '\n'; ++failures; cleanup(); }
     try { calibration_device_identity12(); }
     catch (const std::exception& e) { std::cerr << "FAIL device identity: " << e.what() << '\n'; ++failures; }
     try { refresh_recording_lifetime12(); }
     catch (const std::exception& e) { std::cerr << "FAIL marker refresh lifetime: " << e.what() << '\n'; ++failures; }
-    for (unsigned variant = 0; variant < 3; ++variant) {
-        try { mixed_api12to11(variant == 1, variant == 1, variant == 2); }
+    for (unsigned variant = 0; variant < 5; ++variant) {
+        try { mixed_api12to11(variant == 1 || variant == 4, variant == 1, variant == 2, variant >= 3); }
         catch (const std::exception& e) { std::cerr << "FAIL mixed API " << variant << ": " << e.what() << '\n'; ++failures; cleanup(); }
     }
     return failures;

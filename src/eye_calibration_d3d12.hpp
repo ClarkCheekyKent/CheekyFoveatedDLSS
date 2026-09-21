@@ -21,13 +21,15 @@ struct Calibration12Readback {
     Calibration12Failure failure{};
 };
 std::shared_ptr<Calibration12Frame> calibration12_create(ID3D12Device*);
-bool calibration12_begin(Calibration12Frame&) noexcept;
+bool calibration12_begin(Calibration12Frame&, std::uint64_t* allocations = nullptr) noexcept;
+enum class Calibration12StampMode { source_proof, refresh, marker_only };
 bool calibration12_stamp(Calibration12Frame&, ID3D12GraphicsCommandList*, ID3D12Resource*, unsigned candidate,
                          unsigned x, unsigned y, D3D12_RESOURCE_STATES, std::uint64_t& allocations,
                          Calibration12Failure* failure = nullptr,
                          const CalibrationImageRequestPtr& support = {},
                          const CalibrationImageInfo& support_info = {},
-                         std::uint32_t marker_code = 0, bool refresh = false) noexcept;
+                         std::uint32_t marker_code = 0,
+                         Calibration12StampMode mode = Calibration12StampMode::source_proof) noexcept;
 bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resource*, unsigned eye,
                            unsigned slice, D3D12_RESOURCE_STATES state, const std::array<D3D12_BOX, 4>& boxes,
                            std::uint64_t& allocations, Calibration12Failure* failure = nullptr,

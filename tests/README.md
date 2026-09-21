@@ -189,6 +189,12 @@ submission rendering run on different threads. Tests cover wrapped device
 identity, alternating eye rendering, projection-eye swaps, stale marker epochs,
 cropped-away markers, bounded/stable allocations, refresh-command lifetime, and
 all four support images. Examples are in `%TEMP%/Cheeky-mixed-calibration-tests/<pid>`.
+Delayed variants submit images rendered three intervals earlier, including
+unsampled renders, and assert continuous DX12 stamping with one-in-ten readbacks.
+Marker-only tests check that no readback/timestamp objects are allocated, uploads
+survive replay and independent queue fences, and a saturated 16-slot pool skips
+without growing or blocking and resumes after retirement. Diagnostics expose
+`d3d12.continuous_stamps` and `d3d12.continuous_skipped` separately from captures.
 The production path only reads each API's own textures; it adds no interop
 transport and performs no GPU waits. Mixed API GPU timing is reported unavailable
 because the query timelines are separate. Original same-API tests remain in

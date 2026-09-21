@@ -343,9 +343,13 @@ std::shared_ptr<Calibration12Frame> calibration12_create(ID3D12Device* device) {
     r.frames.push_back(f);
     return f;
 }
-bool calibration12_begin(Calibration12Frame& f) noexcept {
+bool calibration12_begin(Calibration12Frame& f, std::uint64_t* allocations) noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(f.mutex);
+    if (allocations) {
+        *allocations += f.asynchronous_allocations;
+        f.asynchronous_allocations = 0;
+    }
     if (!reusable(f))
         return false;
     f.invalid = false;
@@ -366,9 +370,10 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
                          unsigned candidate, unsigned x, unsigned y, D3D12_RESOURCE_STATES state,
                          std::uint64_t& allocations, Calibration12Failure* failure,
                          const CalibrationImageRequestPtr& support, const CalibrationImageInfo& support_info,
-                         std::uint32_t marker_code, bool refresh) noexcept {
+                         std::uint32_t marker_code, Calibration12StampMode mode) noexcept {
     if (failure) *failure = {};
-    const bool capture_image = begin_calibration_image(support, candidate, support_info);
+    const bool proof = mode == Calibration12StampMode::source_proof;
+    const bool capture_image = proof && begin_calibration_image(support, candidate, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
         if (failure) *failure = {stage, hr};
         if (capture_image) fail_calibration_image(support, candidate, stage);
@@ -395,7 +400,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (!texture_supported(d, 0)) return reject("stamp_texture_format_or_layout");
         if (UINT64(x) + marker_size > d.Width || UINT64(y) + marker_size > d.Height)
             return reject("stamp_bounds");
-        if (refresh) {
+        if (mode == Calibration12StampMode::refresh) {
             if (!f.segments[candidate].used || !f.markers[candidate] || f.marker_formats[candidate] != d.Format ||
                 f.marker_codes[candidate] != marker_code) return reject("refresh_source_changed");
             Segment* lifetime{};
@@ -415,10 +420,10 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
             return true; // Keep the first source proof and support image intact.
         }
         if (f.segments[candidate].used) return reject("stamp_already_recorded");
-        if (!initialize(f, allocations)) return reject("stamp_query_buffers");
+        if (proof && !initialize(f, allocations)) return reject("stamp_query_buffers");
         const D3D12_BOX box{x, y, 0, x + marker_size, y + marker_size, 1};
-        if (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
-            !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations))
+        if (proof && (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
+            !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations)))
             return reject("stamp_readback_buffers");
         if (f.marker_formats[candidate] != d.Format || f.marker_codes[candidate] != marker_code) {
             f.markers[candidate].Reset();
@@ -450,11 +455,16 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
                                               d.Format, candidate, xx, yy, marker_code);
             f.markers[candidate]->Unmap(0, nullptr);
         }
-        begin_segment(f, list, candidate);
+        // Marker-only recordings retain exactly the same queue/recording
+        // lifetime protection, but allocate no queries or readback buffers.
+        if (proof) begin_segment(f, list, candidate);
+        else f.segments[candidate].used = true;
         f.segments[candidate].recording = recording;
-        transition(list, texture, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        copy_patch(f, list, candidate * 2, texture, 0, box);
-        transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (proof) {
+            transition(list, texture, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy_patch(f, list, candidate * 2, texture, 0, box);
+        }
+        transition(list, texture, 0, proof ? D3D12_RESOURCE_STATE_COPY_SOURCE : state, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
         dst.pResource = texture;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -462,11 +472,13 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint = footprint;
         list->CopyTextureRegion(&dst, x, y, 0, &src, nullptr);
-        transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        copy_patch(f, list, candidate * 2 + 1, texture, 0, box);
-        if (capture_image) support_copy(f, list, texture, 0, candidate, support);
-        transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
-        end_segment(f, list, candidate);
+        if (proof) {
+            transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            copy_patch(f, list, candidate * 2 + 1, texture, 0, box);
+            if (capture_image) support_copy(f, list, texture, 0, candidate, support);
+            transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+            end_segment(f, list, candidate);
+        } else transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, state);
         return true;
     } catch (...) {
         return reject("stamp_exception", E_FAIL);

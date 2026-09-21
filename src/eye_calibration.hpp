@@ -34,6 +34,7 @@ struct EyeCalibrationStats {
     // Captured on the render thread; no repeated logging or GPU waits.
     std::array<unsigned, 2> d3d12_source_formats{}, d3d12_submitted_formats{};
     std::uint64_t d3d12_stamp_failures{}, d3d12_capture_failures{}, d3d12_readback_failures{};
+    std::uint64_t d3d12_continuous_stamps{}, d3d12_continuous_skipped{};
     const char* d3d12_last_stamp_failure{"none"};
     const char* d3d12_last_capture_failure{"none"};
     const char* d3d12_last_readback_failure{"none"};

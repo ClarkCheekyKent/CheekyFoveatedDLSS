@@ -127,6 +127,11 @@ struct State {
     DWORD frame_thread{}, stamp_thread{}, submit_thread{}, tick_thread{};
     std::uint64_t continuous_epoch{};
     std::array<View, 2> continuous_views;
+    // Separate from sampled proof: never extend a capture's lifetime just to
+    // mark an intervening render. Full pools skip without waiting on the GPU.
+    std::array<std::shared_ptr<Calibration12Frame>, ring_size * 2> continuous12;
+    ComPtr<ID3D12Device> continuous12_device;
+    unsigned continuous12_next{};
 };
 State& state() {
     // Match the process-resident hook lifetime. Explicit stop releases GPU
@@ -640,6 +645,41 @@ void continuous_stamp_only(State& s, ID3D11DeviceContext* context, ID3D11Resourc
     context->CopySubresourceRegion(texture.Get(), 0, x + (c ? width - inset - block : inset), y + inset,
         0, s.markers[c].Get(), 0, nullptr);
 }
+void continuous_stamp_only12(State& s, ID3D12GraphicsCommandList* list, ID3D12Resource* output,
+    unsigned c, unsigned x, unsigned y, unsigned width, unsigned height, D3D12_RESOURCE_STATES output_state) {
+    if (c >= 2 || width < 2 * inset + block || height < 2 * inset + block) return;
+    const auto desc = output->GetDesc();
+    if (std::uint64_t(x) + width > desc.Width || std::uint64_t(y) + height > desc.Height) return;
+    ComPtr<ID3D12Device> device;
+    if (FAILED(output->GetDevice(IID_PPV_ARGS(&device)))) return;
+    device = canonical_d3d12_device(device.Get());
+    if (!device) return;
+    if (!same_d3d12_device(device.Get(), s.continuous12_device.Get())) {
+        // The backend registry retains any recordings still in flight.
+        s.continuous12 = {};
+        s.continuous12_device = device;
+        s.continuous12_next = 0;
+    }
+    for (unsigned n = 0; n < s.continuous12.size(); ++n) {
+        const unsigned slot = (s.continuous12_next + n) % unsigned(s.continuous12.size());
+        auto& frame = s.continuous12[slot];
+        if (!frame) frame = calibration12_create(device.Get());
+        if (!frame || !calibration12_begin(*frame, &s.stats.allocations)) continue;
+        s.continuous12_next = (slot + 1) % unsigned(s.continuous12.size());
+        Calibration12Failure failure;
+        if (calibration12_stamp(*frame, list, output, c, x + (c ? width - inset - block : inset),
+            y + inset, output_state, s.stats.allocations, &failure, {}, {}, capture_codes(s.epoch)[c],
+            Calibration12StampMode::marker_only)) {
+            ++s.stats.d3d12_continuous_stamps;
+        } else {
+            ++s.stats.d3d12_stamp_failures;
+            s.stats.d3d12_last_stamp_failure = failure.stage;
+            s.stats.d3d12_stamp_error = failure.result;
+        }
+        return;
+    }
+    ++s.stats.d3d12_continuous_skipped;
+}
 } // namespace
 void eye_calibration_enable(bool value) noexcept {
     auto& s = state();
@@ -741,8 +781,8 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     poll(s);
     if (!on)
         return false;
-    // Drain readbacks every frame and sample one in ten. Native OpenXR
-    // D3D11 stamps every source render independently of this readback cadence.
+    // Drain readbacks every frame and sample one in ten. DX11 OpenXR
+    // submissions use continuously stamped sources, including DX12 sources.
     if (!capture_due) return false;
     s.frames_until_capture = 9;
     // Rotate through all slots so the warm-up is bounded and reproducible.
@@ -922,6 +962,13 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         auto& s = state();
         std::lock_guard lock(s.mutex);
         CpuScope cpu{s};
+        const bool continuous = s.backend == EyeCalibrationBackend::openxr && s.stats.submission_graphics_api == 11;
+        const unsigned continuous_c = continuous ? continuous_candidate(s, view) : 2;
+        if (continuous && (s.current < 0 || s.ring[s.current].epoch != s.epoch ||
+                s.ring[s.current].submits || s.ring[s.current].invalid)) {
+            continuous_stamp_only12(s, list, output, continuous_c, x, y, width, height, output_state);
+            return;
+        }
         if (s.current < 0)
             return;
         auto& f = s.ring[s.current];
@@ -929,7 +976,7 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         bool repeated{};
         if (f.pipelined) {
             if (f.submits || f.invalid || f.epoch != s.epoch) return;
-            c = continuous_candidate(s, view);
+            c = continuous_c;
             if (f.epoch != s.epoch) { f.invalid = true; return; }
             repeated = c < 2 && f.views[c].id == view;
         }
@@ -986,7 +1033,7 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         image.view = view; image.prior_eye = f.views[c].assigned;
         image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block};
         if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure,
-            f.support, image, f.codes[c], repeated)) {
+            f.support, image, f.codes[c], repeated ? Calibration12StampMode::refresh : Calibration12StampMode::source_proof)) {
             f.invalid = true;
             ++s.stats.d3d12_stamp_failures;
             s.stats.d3d12_last_stamp_failure = failure.stage;
@@ -1284,6 +1331,9 @@ void eye_calibration_stop() noexcept {
     s.frame_thread = s.stamp_thread = s.submit_thread = s.tick_thread = 0;
     s.continuous_epoch = 0;
     s.continuous_views = {};
+    s.continuous12 = {};
+    s.continuous12_device.Reset();
+    s.continuous12_next = 0;
 }
 
 const char* eye_calibration_status(const EyeCalibrationStats& stats) noexcept {
@@ -1366,6 +1416,8 @@ std::string eye_calibration_json() {
     out << "]},\"d3d12\":{\"source_formats\":[" << s.d3d12_source_formats[0] << ',' << s.d3d12_source_formats[1]
         << "],\"submitted_formats\":[" << s.d3d12_submitted_formats[0] << ',' << s.d3d12_submitted_formats[1]
         << "],\"stamp_failures\":" << s.d3d12_stamp_failures
+        << ",\"continuous_stamps\":" << s.d3d12_continuous_stamps
+        << ",\"continuous_skipped\":" << s.d3d12_continuous_skipped
         << ",\"capture_failures\":" << s.d3d12_capture_failures
         << ",\"readback_failures\":" << s.d3d12_readback_failures
         << ",\"last_stamp_failure\":\"" << s.d3d12_last_stamp_failure
