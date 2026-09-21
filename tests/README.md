@@ -1,3 +1,39 @@
+# Cropped stereo calibration
+
+`CheekyTests.exe --crop-calibration` exercises the production DX11, DX12 and
+DX12-to-DX11 stamp/read paths on WARP. It checks centered and edge-aligned crops,
+crop plus resizing, vertical flips, packed submission bounds, source origins,
+array slices, eye swaps, one-location locking, and loss/reacquisition when the
+crop changes without a resolution change. Geometry checks include the reported
+2000x1500 source with a centered 1500x1500 submission. These also run in the
+standard suite; CTest registers `CheekyCropCalibrationTests` separately.
+
+Calibration searches a bounded bank of 16 hypotheses: the full view, a crop to
+the submitted aspect ratio, a native-pixel crop, a square crop, centered zooms
+at 90/75/50% of the aspect crop, edge-aligned aspect/native crops, and a half-size
+source rectangle. Submitted dimensions are measured inside the actual UV bounds.
+Dimensions seed hypotheses; only readable marker evidence confirms them.
+Distinct source locations have distinct codes and non-overlapping stamps.
+Template orientation is checked against each hypothesis and the submitted bounds.
+Conflicting eye/orientation evidence is rejected. Among compatible matches the
+strongest two-eye score selects the placement.
+
+A successful sample caches a placement per source view/generation/dimensions and
+submitted sizes. Subsequent captures stamp only that source location and read its
+A/B and orientation probes (four small patches per submitted eye). Marker loss
+reopens the bank; source/session/dimension changes invalidate the relevant cache.
+The normal one-in-ten readback cadence remains; a lost lock requests one earlier
+retry. Continuous OpenXR stamps use the cached placement between captures, while
+readbacks remain asynchronous and retain their existing queue/recording lifetimes.
+
+Support JSON includes `placement_search`, inferred visible-source rectangles,
+marker positions/codes, and all sampled rectangles. The base `marker_codes` field
+is the epoch code; `marker_location_codes` lists the actual per-location codes.
+This is a finite crop/resize search, not a solver for arbitrary shader warps or
+arbitrary crop offsets. Synthetic tests do not establish REALVR/headset behavior;
+verify lock and recovery in game and inspect a support capture if no hypothesis
+matches.
+
 # Automatic fixed-alignment history
 
 `CheekyTests.exe --alignment-history` exercises the production crop coordinator

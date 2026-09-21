@@ -130,7 +130,11 @@ bool texture_supported(const D3D12_RESOURCE_DESC& d, unsigned slice) {
 struct Calibration12Frame {
     std::mutex mutex;
     ComPtr<ID3D12Device> device;
-    std::array<Patch, 12> patches;
+    std::array<Patch, calibration_patch_count> patches;
+    std::array<unsigned, 2> capture_counts{};
+    std::array<std::uint32_t, calibration_patch_count> patch_codes{};
+    std::array<unsigned, calibration_patch_count> patch_mirrors{};
+    std::array<std::array<std::uint32_t, calibration_placement_count>, 2> stamp_codes{};
     std::array<SupportReadback, 4> support;
     // Four timed segments plus bounded lifetime tracking for source refreshes
     // while an alternating-eye submission waits for its second source.
@@ -354,6 +358,7 @@ bool calibration12_begin(Calibration12Frame& f, std::uint64_t* allocations) noex
         return false;
     f.invalid = false;
     f.failure = {};
+    f.capture_counts = {};
     f.support = {}; // reusable() above includes retirement and all GPU fences.
     for (auto& p : f.patches)
         p.used = false;
@@ -370,7 +375,8 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
                          unsigned candidate, unsigned x, unsigned y, D3D12_RESOURCE_STATES state,
                          std::uint64_t& allocations, Calibration12Failure* failure,
                          const CalibrationImageRequestPtr& support, const CalibrationImageInfo& support_info,
-                         std::uint32_t marker_code, Calibration12StampMode mode) noexcept {
+                         std::uint32_t marker_code, Calibration12StampMode mode,
+                         std::span<const CalibrationMarkerPoint> extra_markers) noexcept {
     if (failure) *failure = {};
     const bool proof = mode == Calibration12StampMode::source_proof;
     const bool capture_image = proof && begin_calibration_image(support, candidate, support_info);
@@ -400,9 +406,16 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (!texture_supported(d, 0)) return reject("stamp_texture_format_or_layout");
         if (UINT64(x) + marker_size > d.Width || UINT64(y) + marker_size > d.Height)
             return reject("stamp_bounds");
+        for (const auto& p : extra_markers)
+            if (UINT64(p.x) + marker_size > d.Width || UINT64(p.y) + marker_size > d.Height)
+                return reject("stamp_bounds");
+        if (extra_markers.size() >= calibration_placement_count) return reject("stamp_marker_limit");
+        std::array<std::uint32_t, calibration_placement_count> stamp_codes{};
+        stamp_codes[0] = marker_code;
+        for (unsigned i = 0; i < extra_markers.size(); ++i) stamp_codes[i + 1] = extra_markers[i].code;
         if (mode == Calibration12StampMode::refresh) {
             if (!f.segments[candidate].used || !f.markers[candidate] || f.marker_formats[candidate] != d.Format ||
-                f.marker_codes[candidate] != marker_code) return reject("refresh_source_changed");
+                f.stamp_codes[candidate] != stamp_codes) return reject("refresh_source_changed");
             Segment* lifetime{};
             for (auto& segment : f.segments)
                 if (segment.used && !segment.retired && segment.recording == recording) { lifetime = &segment; break; }
@@ -415,7 +428,12 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
             src.pResource = f.markers[candidate].Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             src.PlacedFootprint = f.marker_footprints[candidate];
             transition(list, texture, 0, state, D3D12_RESOURCE_STATE_COPY_DEST);
-            list->CopyTextureRegion(&dst, x, y, 0, &src, nullptr);
+            D3D12_BOX marker_box{0, 0, 0, marker_size, marker_size, 1};
+            list->CopyTextureRegion(&dst, x, y, 0, &src, &marker_box);
+            for (unsigned i = 0; i < extra_markers.size(); ++i) {
+                marker_box.top = (i + 1) * marker_size; marker_box.bottom = (i + 2) * marker_size;
+                list->CopyTextureRegion(&dst, extra_markers[i].x, extra_markers[i].y, 0, &src, &marker_box);
+            }
             transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, state);
             return true; // Keep the first source proof and support image intact.
         }
@@ -425,15 +443,16 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         if (proof && (!prepare_patch(f, candidate * 2, d.Format, box, allocations) ||
             !prepare_patch(f, candidate * 2 + 1, d.Format, box, allocations)))
             return reject("stamp_readback_buffers");
-        if (f.marker_formats[candidate] != d.Format || f.marker_codes[candidate] != marker_code) {
+        if (f.marker_formats[candidate] != d.Format || f.stamp_codes[candidate] != stamp_codes) {
             f.markers[candidate].Reset();
             f.marker_formats[candidate] = d.Format;
             f.marker_codes[candidate] = marker_code;
+            f.stamp_codes[candidate] = stamp_codes;
         }
         auto& footprint = f.marker_footprints[candidate];
         if (!f.markers[candidate]) {
             auto marker_desc = d;
-            marker_desc.Width = marker_desc.Height = marker_size;
+            marker_desc.Width = marker_size; marker_desc.Height = marker_size * calibration_placement_count;
             marker_desc.DepthOrArraySize = marker_desc.MipLevels = 1;
             UINT64 bytes{};
             f.device->GetCopyableFootprints(&marker_desc, 0, 1, 0, &footprint, nullptr, nullptr, &bytes);
@@ -448,11 +467,11 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
                 return reject("marker_upload_map", hr);
             }
             const auto bpp = calibration_pixel_bytes(d.Format);
-            for (unsigned yy = 0; yy < marker_size; ++yy)
+            for (unsigned yy = 0; yy < marker_size * (1 + extra_markers.size()); ++yy)
                 for (unsigned xx = 0; xx < marker_size; ++xx)
                     calibration_encode_pattern(static_cast<unsigned char*>(data) +
                                                   yy * footprint.Footprint.RowPitch + xx * bpp,
-                                              d.Format, candidate, xx, yy, marker_code);
+                                              d.Format, candidate, xx, yy % marker_size, stamp_codes[yy / marker_size]);
             f.markers[candidate]->Unmap(0, nullptr);
         }
         // Marker-only recordings retain exactly the same queue/recording
@@ -471,7 +490,12 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         src.pResource = f.markers[candidate].Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint = footprint;
-        list->CopyTextureRegion(&dst, x, y, 0, &src, nullptr);
+        D3D12_BOX marker_box{0, 0, 0, marker_size, marker_size, 1};
+        list->CopyTextureRegion(&dst, x, y, 0, &src, &marker_box);
+        for (unsigned i = 0; i < extra_markers.size(); ++i) {
+            marker_box.top = (i + 1) * marker_size; marker_box.bottom = (i + 2) * marker_size;
+            list->CopyTextureRegion(&dst, extra_markers[i].x, extra_markers[i].y, 0, &src, &marker_box);
+        }
         if (proof) {
             transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
             copy_patch(f, list, candidate * 2 + 1, texture, 0, box);
@@ -486,9 +510,10 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
 }
 bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3D12Resource* texture,
                            unsigned eye, unsigned slice, D3D12_RESOURCE_STATES state,
-                           const std::array<D3D12_BOX, 4>& boxes, std::uint64_t& allocations,
+                           std::span<const D3D12_BOX> boxes, std::uint64_t& allocations,
                            Calibration12Failure* failure, const CalibrationImageRequestPtr& support,
-                           const CalibrationImageInfo& support_info) noexcept {
+                           const CalibrationImageInfo& support_info, std::span<const std::uint32_t> codes,
+                           std::span<const unsigned> mirrors) noexcept {
     if (failure) *failure = {};
     const bool capture_image = begin_calibration_image(support, 2 + eye, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
@@ -496,7 +521,9 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
         if (capture_image) fail_calibration_image(support, 2 + eye, stage);
         return false;
     };
-    if (!queue || !texture || eye > 1 || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+    if (!queue || !texture || eye > 1 || boxes.empty() || boxes.size() > calibration_box_count || boxes.size() % 4 ||
+        (!codes.empty() && codes.size() != boxes.size()) || (!mirrors.empty() && mirrors.size() != boxes.size()) ||
+        queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return reject("capture_arguments");
     std::lock_guard lock(f.mutex);
     const auto d = texture->GetDesc();
@@ -513,10 +540,13 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     for (unsigned c = 0; c < boxes.size(); ++c) {
         if (boxes[c].right > d.Width || boxes[c].bottom > d.Height)
             return reject("capture_bounds");
-        const auto index = (c < 2 ? 4U : 8U) + eye * 2 + c % 2;
+        const auto index = calibration_patch_index(c, eye);
+        f.patch_codes[index] = codes.empty() ? f.marker_codes[c % 2] : codes[c];
+        f.patch_mirrors[index] = mirrors.empty() ? 15U : mirrors[c];
         if (!prepare_patch(f, index, d.Format, boxes[c], allocations))
             return reject("capture_readback_buffers");
     }
+    f.capture_counts[eye] = unsigned(boxes.size());
     auto& allocator = f.allocators[eye];
     auto& list = f.lists[eye];
     if (!allocator) {
@@ -549,7 +579,7 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     begin_segment(f, list.Get(), 2 + eye);
     transition(list.Get(), texture, subresource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (unsigned c = 0; c < boxes.size(); ++c)
-        copy_patch(f, list.Get(), (c < 2 ? 4U : 8U) + eye * 2 + c % 2, texture, subresource, boxes[c]);
+        copy_patch(f, list.Get(), calibration_patch_index(c, eye), texture, subresource, boxes[c]);
     if (capture_image) support_copy(f, list.Get(), texture, subresource, 2 + eye, support);
     transition(list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     end_segment(f, list.Get(), 2 + eye);
@@ -622,10 +652,14 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
             return out;
     out.ready = true;
     support_poll(f); // Preserve evidence even when marker classification fails.
-    out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason());
+    out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason()) &&
+        (source_only || (f.capture_counts[0] && f.capture_counts[1]));
     out.failure = f.failure;
+    if (!source_only && (!f.capture_counts[0] || !f.capture_counts[1]) && !strcmp(out.failure.stage, "none"))
+        out.failure = {"readback_patch_not_recorded"};
     for (unsigned i = 0; i < (source_only ? 4U : unsigned(f.patches.size())); ++i) {
         if (source_only && !(source_mask & (1U << (i / 2)))) continue;
+        if (i >= 4 && (i - 4) / 8 >= f.capture_counts[((i - 4) % 4) / 2] / 4) continue;
         auto& p = f.patches[i];
         if (!p.used) {
             out.valid = false;
@@ -643,7 +677,7 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
         }
         const auto candidate = i < 4 ? i / 2 : (i - 4) % 2;
         out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4,
-            f.marker_codes[candidate]);
+            i < 4 ? f.marker_codes[candidate] : f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
         const D3D12_RANGE empty{0, 0};
         p.buffer->Unmap(0, &empty);
     }

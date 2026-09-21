@@ -14,8 +14,9 @@ struct Calibration12Failure {
 };
 struct Calibration12Readback {
     bool ready{}, reusable{}, valid{}, timing_valid{};
-    // Source before/after, submitted A/B per eye, then vertically flipped A/B per eye.
-    std::array<float, 12> scores{};
+    // Source before/after, then eight submitted scores per placement:
+    // A/B per eye, followed by vertically flipped A/B per eye.
+    std::array<float, calibration_patch_count> scores{};
     double gpu_us{};
     std::uint64_t allocations{};
     Calibration12Failure failure{};
@@ -29,12 +30,15 @@ bool calibration12_stamp(Calibration12Frame&, ID3D12GraphicsCommandList*, ID3D12
                          const CalibrationImageRequestPtr& support = {},
                          const CalibrationImageInfo& support_info = {},
                          std::uint32_t marker_code = 0,
-                         Calibration12StampMode mode = Calibration12StampMode::source_proof) noexcept;
+                         Calibration12StampMode mode = Calibration12StampMode::source_proof,
+                         std::span<const CalibrationMarkerPoint> extra_markers = {}) noexcept;
 bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resource*, unsigned eye,
-                           unsigned slice, D3D12_RESOURCE_STATES state, const std::array<D3D12_BOX, 4>& boxes,
+                           unsigned slice, D3D12_RESOURCE_STATES state, std::span<const D3D12_BOX> boxes,
                            std::uint64_t& allocations, Calibration12Failure* failure = nullptr,
                            const CalibrationImageRequestPtr& support = {},
-                           const CalibrationImageInfo& support_info = {}) noexcept;
+                           const CalibrationImageInfo& support_info = {},
+                           std::span<const std::uint32_t> codes = {},
+                           std::span<const unsigned> mirrors = {}) noexcept;
 // Mixed API frames have only source proof in DX12; submitted patches arrive
 // independently from DX11 and must not be treated as missing DX12 readbacks.
 Calibration12Readback calibration12_poll(Calibration12Frame&, bool source_only = false, unsigned source_mask = 3) noexcept;

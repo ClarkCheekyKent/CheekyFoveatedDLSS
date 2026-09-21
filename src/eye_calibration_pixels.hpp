@@ -109,11 +109,12 @@ inline void calibration_encode_pattern(unsigned char* p, DXGI_FORMAT format, uns
     }
 }
 // Normalize only the tiny readback, then search +/-8 source pixels in 2px steps.
-// Mirrored templates tolerate reversed bounds; the marker's corner determines
-// the submitted image orientation using the existing top/bottom checks.
+// Callers can restrict template orientation to the hypothesis plus reversed
+// submission bounds. Accepting every reflection during a crop search would
+// let a different visible source rectangle falsely imply a vertical flip.
 inline float calibration_pattern_score(const void* data, unsigned pitch, unsigned width,
                                         unsigned height, DXGI_FORMAT format, unsigned candidate,
-                                        bool submitted, std::uint32_t code = 0) {
+                                        bool submitted, std::uint32_t code = 0, unsigned mirror_mask = 15) {
     if (!data || !width || !height || candidate > 1 || !calibration_pixel_bytes(format)) return 0;
     const unsigned side = submitted ? calibration_sample_size : calibration_marker_size;
     std::array<float, calibration_sample_size * calibration_sample_size> luma{};
@@ -131,6 +132,7 @@ inline float calibration_pattern_score(const void* data, unsigned pitch, unsigne
     for (unsigned mirror = 0; mirror < (submitted ? 4U : 1U); ++mirror)
         for (int dy = -radius; dy <= radius; dy += 2)
             for (int dx = -radius; dx <= radius; dx += 2) {
+                if (!(mirror_mask & (1U << mirror))) continue;
                 std::array<float, 25> values{}, signs{};
                 float sum{}, square{}, dot{}, sign_sum{}, high{}, low{};
                 unsigned highs{}, lows{};

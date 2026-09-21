@@ -77,6 +77,115 @@ void test_deferred_capture_close() {
         "Cross-thread frames must keep sampling beyond ring capacity and drain after disable");
     eye_calibration_stop();
 }
+// Execute the production DX11 stamp/read paths. Test-only CPU transport models
+// a host crop/resize between those points, including packed bounds and origins.
+void crop_calibration11() {
+    for (unsigned c = 0; c < 2; ++c) {
+        const auto plan = calibration_placement_plan(2000, 1500, c, 1500, 1500);
+        require(plan.count == 16 && plan.at(1).x == 250 && plan.at(1).width == 1500,
+            "Reported 2000x1500-to-1500x1500 case must propose the centered 250px crop");
+        const auto points = calibration_marker_points(plan, 0, 0, 2000, c, 0);
+        for (unsigned i = 0; i < points.count; ++i) {
+            for (unsigned j = 0; j < i; ++j) {
+                const auto& a = points.points[i]; const auto& b = points.points[j];
+                require(a.x + 40 <= b.x || b.x + 40 <= a.x || a.y + 40 <= b.y || b.y + 40 <= a.y,
+                    "Candidate marker writes must never partially overlap");
+                require(a.code != b.code, "Different candidate locations must have distinguishable codes");
+            }
+        }
+        const auto normal = calibration_sample_rect(plan.at(1), false, 3000, 1500, 0, 0, .5F, 1);
+        const auto reversed = calibration_sample_rect(plan.at(1), false, 3000, 1500, .5F, 1, 0, 0);
+        require(std::abs(int(normal[2]) - int(reversed[2])) <= 1 && std::abs(int(normal[3]) - int(reversed[3])) <= 1 &&
+            std::abs(int(normal[0] + reversed[0] + normal[2]) - 1500) <= 1 &&
+            std::abs(int(normal[1] + reversed[1] + normal[3]) - 1500) <= 1,
+            "Reversed packed UV bounds must preserve the inferred sample footprint");
+    }
+    eye_calibration_stop(); eye_calibration_reset_stats();
+    register_stereo_view(7101); register_stereo_view(7102);
+    Settings settings{};
+    (void)settings_for_view(settings, 7101); (void)settings_for_view(settings, 7102);
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &device, nullptr, &context));
+    constexpr unsigned sw = 420, sh = 320, vw = 400, vh = 300, origin = 10;
+    D3D11_TEXTURE2D_DESC desc{sw, sh, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    std::array<ComPtr<ID3D11Texture2D>, 2> source;
+    for (auto& r : source) check(device->CreateTexture2D(&desc, nullptr, &r));
+    desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> readback;
+    check(device->CreateTexture2D(&desc, nullptr, &readback));
+    const std::vector<unsigned> background(sw * sh, 0xff404040);
+    eye_calibration_enable(true);
+    auto attempt = [&](double crop_x, double crop_y, double crop_w, double crop_h,
+                       unsigned size, bool flip = false, bool obscure = false, bool swapped = false) {
+        auto support = request_calibration_images(true);
+        for (unsigned n = 0; !eye_calibration_frame() && n < 20; ++n) {}
+        auto target_desc = desc;
+        target_desc.Width = size * 2; target_desc.Height = size;
+        target_desc.Usage = D3D11_USAGE_DEFAULT; target_desc.CPUAccessFlags = 0;
+        ComPtr<ID3D11Texture2D> target;
+        check(device->CreateTexture2D(&target_desc, nullptr, &target));
+        std::vector<unsigned> pixels(size * size * 2, 0xff404040);
+        for (unsigned c = 0; c < 2; ++c) {
+            context->UpdateSubresource(source[c].Get(), 0, nullptr, background.data(), sw * 4, 0);
+            eye_calibration_stamp(context.Get(), source[c].Get(), 7101 + c, origin, origin, vw, vh);
+            context->CopyResource(readback.Get(), source[c].Get());
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            check(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped)); // Test host only.
+            for (unsigned y = 0; y < size; ++y) for (unsigned x = 0; x < size; ++x) {
+                const auto sx = origin + unsigned(crop_x + (x + .5) * crop_w / size);
+                const auto sy = origin + unsigned(crop_y + ((flip ? size - 1 - y : y) + .5) * crop_h / size);
+                const auto* row = reinterpret_cast<const unsigned*>(static_cast<const unsigned char*>(mapped.pData) + sy * mapped.RowPitch);
+                pixels[y * size * 2 + (swapped ? 1 - c : c) * size + x] = obscure ? 0xff404040 : row[sx];
+            }
+            context->Unmap(readback.Get(), 0);
+        }
+        context->UpdateSubresource(target.Get(), 0, nullptr, pixels.data(), size * 8, 0);
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto ticket = eye_calibration_submit(target.Get(), eye, eye * .5F, 0, (eye + 1) * .5F, 1);
+            require(ticket != 0, "Cropped DX11 submission must enqueue readback");
+            eye_calibration_result(ticket, 0);
+        }
+        eye_calibration_frame(); context->Flush();
+        const auto deadline = GetTickCount64() + 5000;
+        while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) { Sleep(1); eye_calibration_tick(); }
+        require(!eye_calibration_stats().in_flight, "Cropped readbacks must drain without blocking production");
+        const auto report = collect_calibration_images(support);
+        require(report.files.size() == 5, "Search captures must include all production stamp/read evidence");
+        return support;
+    };
+    auto first = attempt(50, 0, 300, 300, 300);
+    require(eye_calibration_stats().valid == 1 && first->images[0].info.markers.count > 1,
+        "Centered 4:3-to-square crop must find an inner marker");
+    auto locked = attempt(50, 0, 300, 300, 300, false, false, true);
+    require(eye_calibration_stats().valid == 2 && eye_calibration_stats().left_view == 7102 &&
+        locked->images[0].info.markers.count == 1 && locked->images[2].info.sample_count == 4,
+        "A locked crop must stamp one marker and read only its two identity/orientation probes per eye");
+    const auto before = eye_calibration_stats().valid;
+    attempt(100, 0, 300, 300, 300);
+    require(eye_calibration_stats().valid == before && eye_calibration_json().find("\"locked\":true") == std::string::npos,
+        "Changed crop at the same resolution must unlock after the cached mapping fails");
+    auto recovered = attempt(100, 0, 300, 300, 300);
+    require(eye_calibration_stats().valid > before && recovered->images[0].info.markers.count > 1,
+        "Search must recover an edge-aligned crop");
+    // Changed scale, simultaneous horizontal/vertical crop and shader flip.
+    attempt(87.5, 37.5, 225, 225, 192, true);
+    attempt(87.5, 37.5, 225, 225, 192, true);
+    auto zoom = attempt(87.5, 37.5, 225, 225, 192, true);
+    require(eye_calibration_stats().vertical_flip && zoom->images[0].info.markers.count == 1,
+        "Crop-plus-resize and vertical flip must lock to one inner placement");
+    const auto visible = eye_calibration_stats().valid;
+    attempt(87.5, 37.5, 225, 225, 192, true, true);
+    require(eye_calibration_stats().valid == visible, "Missing markers must never authenticate a crop guess");
+    auto resumed = attempt(87.5, 37.5, 225, 225, 192, true);
+    require(eye_calibration_stats().valid == visible + 1 && resumed->images[0].info.markers.count > 1,
+        "Marker loss must reopen the bank and recover on fresh pixels");
+    eye_calibration_enable(false); eye_calibration_frame(); eye_calibration_stop();
+    unregister_stereo_view(7101); unregister_stereo_view(7102);
+    std::cout << "PASS DX11 crop search: centered/edge crop, packed bounds, source origin, resize/flip, lock/loss/recovery\n";
+}
 void test_support_archive_limits() {
     std::vector<SupportFile> report_files;
     for (unsigned i = 0; i < 194; ++i) report_files.push_back({"entry-" + std::to_string(i) + ".txt", "report"});
@@ -334,6 +443,10 @@ void run_calibration_policy() {
     unregister_stereo_view(8002);
 }
 } // namespace
+int run_crop_calibration_tests() {
+    try { crop_calibration11(); return 0; }
+    catch (const std::exception& e) { std::cerr << "Crop calibration: " << e.what() << '\n'; eye_calibration_stop(); return 1; }
+}
 int run_stereo_support_tests() {
     try {
         // A large noisy input proves the limit without depending on compression.
@@ -375,6 +488,7 @@ int run_stereo_support_tests() {
 }
 int run_eye_calibration_tests() {
     try {
+        crop_calibration11();
         run_calibration_policy();
         require(calibration_half(0x3c00) == 1 && calibration_half(0x3800) == 0.5F,
                 "Half-float decoding failed");

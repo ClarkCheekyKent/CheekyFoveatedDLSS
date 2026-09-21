@@ -1203,12 +1203,20 @@ RWTexture2DArray<float4> target : register(u0);
 cbuffer Options : register(b0) { uint options; }
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
     uint2 p = id.xy * 128 / 192;
-    if (options & 2) p.y = 127 - p.y;
+    if (options & 16) {
+        uint w, h; a.GetDimensions(w, h);
+        float side = min(w, h) * ((options & 64) ? .75 : 1.0);
+        float2 start = (float2(w, h) - side) * .5;
+        if (options & 32) start.x = w - side;
+        float2 uv = (float2(id.xy) + .5) / 192;
+        if (options & 2) uv.y = 1 - uv.y;
+        p = uint2(start + uv * side);
+    } else if (options & 2) p.y = 127 - p.y;
     if (options & 4) p.y = min(p.y, 127 - p.y);
     if (options & 8) p = uint2(clamp(int2(p) + int2(8, 8), int2(0, 0), int2(127, 127)));
     float4 color = ((id.z ^ (options & 1)) == 0) ? a.Load(int3(p, 0)) : b.Load(int3(p, 0));
     if (options & 8) color.rgb = float3(.75, .65, .8) + color.rgb * float3(.12, .2, .15);
-    target[id] = color;
+    target[id] = (options & 128) ? float4(.25, .25, .25, 1) : color;
 })";
         check(D3DCompile(source, sizeof(source) - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0,
                           &shader, &errors));
@@ -1219,7 +1227,7 @@ cbuffer Options : register(b0) { uint options; }
     }
     void record(GPU12& gpu, ID3D12Resource* a, ID3D12Resource* b, ID3D12Resource* target,
                   D3D12_RESOURCE_STATES state, bool swapped, bool flipped = false, bool ambiguous = false,
-                  bool shifted = false) {
+                  bool shifted = false, unsigned crop_options = 0) {
         for (auto* r : {a, b})
             gpu.barrier(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         gpu.barrier(target, state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1232,13 +1240,119 @@ cbuffer Options : register(b0) { uint options; }
         handle.ptr += 2ULL * increment;
         gpu.list->SetComputeRootDescriptorTable(1, handle);
         gpu.list->SetComputeRoot32BitConstant(2,
-            (swapped ? 1U : 0U) | (flipped ? 2U : 0U) | (ambiguous ? 4U : 0U) | (shifted ? 8U : 0U), 0);
+            (swapped ? 1U : 0U) | (flipped ? 2U : 0U) | (ambiguous ? 4U : 0U) | (shifted ? 8U : 0U) | crop_options, 0);
         gpu.list->Dispatch(24, 24, 2);
         gpu.barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, state);
         for (auto* r : {a, b})
             gpu.barrier(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 };
+void crop_calibration12(bool mixed) {
+    roles();
+    GPU12 gpu;
+    constexpr unsigned width = 400, height = 300, pitch = 1792, target_size = 192;
+    constexpr auto state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    auto a = gpu.texture(width, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM, height);
+    auto b = gpu.texture(width, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM, height);
+    auto target = gpu.texture(target_size, 2, state, DXGI_FORMAT_R8G8B8A8_UNORM, target_size);
+    ScaledSubmission12 shader(gpu, a.Get(), b.Get(), target.Get());
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = pitch * height;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    ComPtr<ID3D12Resource> background, readback;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&background)));
+    void* data{}; check(background->Map(0, nullptr, &data)); memset(data, 64, SIZE_T(bd.Width)); background->Unmap(0, nullptr);
+    heap.Type = D3D12_HEAP_TYPE_READBACK; bd.Width = target_size * target_size * 4 * 2;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
+    ComPtr<ID3D11Device> device11; ComPtr<ID3D11DeviceContext> context11;
+    ComPtr<ID3D11Texture2D> target11;
+    if (mixed) {
+        check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &device11, nullptr, &context11));
+        D3D11_TEXTURE2D_DESC td{target_size, target_size, 1, 2, DXGI_FORMAT_R8G8B8A8_UNORM,
+            {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+        check(device11->CreateTexture2D(&td, nullptr, &target11));
+    }
+    const auto attempt = [&](unsigned options, bool flip = false) {
+        auto support = request_calibration_images(true);
+        for (unsigned n = 0; !eye_calibration_frame(EyeCalibrationBackend::openxr, 901, mixed ? 11 : 12) && n < 20; ++n) {}
+        gpu.begin();
+        unsigned c{};
+        for (auto* source : {a.Get(), b.Get()}) {
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = source; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = background.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, pitch};
+            gpu.barrier(source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            gpu.barrier(source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            eye_calibration_stamp12(gpu.list.Get(), source, 9101 + c++, 0, 0, width, height);
+        }
+        shader.record(gpu, a.Get(), b.Get(), target.Get(), state, true, flip, false, false, options);
+        if (mixed) {
+            gpu.barrier(target.Get(), state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            for (unsigned eye = 0; eye < 2; ++eye) {
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                src.pResource = target.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = eye;
+                dst.pResource = readback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint.Offset = eye * target_size * target_size * 4;
+                dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, target_size, target_size, 1, target_size * 4};
+                gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
+            gpu.barrier(target.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+        }
+        gpu.execute(); gpu.wait(gpu.queue.Get()); calibration12_retired(gpu.list.Get());
+        if (mixed) {
+            check(readback->Map(0, nullptr, &data));
+            for (unsigned eye = 0; eye < 2; ++eye)
+                context11->UpdateSubresource(target11.Get(), eye, nullptr,
+                    static_cast<unsigned char*>(data) + eye * target_size * target_size * 4, target_size * 4, 0);
+            readback->Unmap(0, nullptr);
+        }
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto ticket = mixed ? eye_calibration_submit(target11.Get(), eye, 0, 0, 1, 1, eye, EyeCalibrationBackend::openxr, 901) :
+                eye_calibration_submit12(target.Get(), gpu.submit_queue.Get(), eye, 0, 0, 1, 1, eye, EyeCalibrationBackend::openxr, 901);
+            require(ticket != 0, "Crop capture must record before submission"); eye_calibration_result(ticket, 0);
+        }
+        eye_calibration_frame(EyeCalibrationBackend::openxr, 901, mixed ? 11 : 12);
+        gpu.wait(gpu.submit_queue.Get()); if (mixed) context11->Flush();
+        const auto deadline = GetTickCount64() + 5000;
+        while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) { Sleep(1); eye_calibration_tick(); }
+        require(!eye_calibration_stats().in_flight, "Crop frame must safely retire all GPU readbacks");
+        require(collect_calibration_images(support).files.size() == 5, "Crop capture must retain both APIs' image evidence");
+        return support;
+    };
+    auto first = attempt(16);
+    require(eye_calibration_stats().valid && first->images[0].info.markers.count > 1,
+        "DX12 inner markers must survive shader crop and resize");
+    auto locked = attempt(16);
+    require(locked->images[0].info.markers.count == 1 && locked->images[2].info.sample_count == 4 &&
+        eye_calibration_stats().left_view == 9102, "DX12 must lock to one authenticated location and swapped eye identity");
+    const auto before = eye_calibration_stats().valid;
+    attempt(16 | 32);
+    require(eye_calibration_stats().valid == before, "An old centered-crop lock must fail on an edge crop");
+    auto edge = attempt(16 | 32);
+    require(eye_calibration_stats().valid > before && edge->images[0].info.markers.count > 1, "DX12 must reacquire from the full bank");
+    attempt(16 | 64, true); attempt(16 | 64, true);
+    auto zoom = attempt(16 | 64, true);
+    require(eye_calibration_stats().vertical_flip && zoom->images[0].info.markers.count == 1,
+        "DX12 crop, resize and flip must keep the authenticated placement");
+    const auto visible = eye_calibration_stats().valid;
+    attempt(16 | 64 | 128, true);
+    require(eye_calibration_stats().valid == visible, "DX12 obscured codes must not authenticate any hypothesis");
+    attempt(16 | 64, true);
+    require(eye_calibration_stats().valid == visible + 1, "DX12 marker loss must reopen search and recover");
+    cleanup();
+    // Registry collection is deliberately lazy; release our retired support
+    // allocations before the next test exercises the process-wide budget.
+    const auto swept = calibration12_create(gpu.device.Get());
+    require(calibration_image_bytes.load() == 0, "Retired crop support readbacks must release their memory budget");
+    std::cout << "PASS " << (mixed ? "DX12-to-DX11" : "DX12") << " shader crop/resize: inner codes, one-location lock, changed crop, flip, loss/recovery\n";
+}
 void recording_lifetime12() {
     GPU12 gpu;
     auto texture = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1501,6 +1615,10 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     cleanup();
 }
 } // namespace
+int run_crop_calibration12_tests() {
+    try { crop_calibration12(false); crop_calibration12(true); return 0; }
+    catch (const std::exception& e) { std::cerr << "Crop calibration DX12: " << e.what() << '\n'; cleanup(); return 1; }
+}
 int run_mixed_api_calibration_tests() {
     int failures{};
     try { continuous_marker_lifetime12(); }

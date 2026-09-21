@@ -1,5 +1,5 @@
 #pragma once
-#include "eye_calibration_pixels.hpp"
+#include "eye_calibration_placement.hpp"
 #include "support_zip.hpp"
 #include <Windows.h>
 #include <atomic>
@@ -20,7 +20,8 @@ struct CalibrationImageInfo {
     int prior_eye{-1}, submitted_eye{-1};
     std::array<unsigned, 4> view_rect{}, marker_rect{};
     std::array<float, 4> bounds{0, 0, 1, 1};
-    std::array<std::array<unsigned, 4>, 4> sample_rects{};
+    std::array<std::array<unsigned, 4>, calibration_box_count> sample_rects{};
+    CalibrationMarkerPoints markers;
     unsigned sample_count{};
 };
 struct CalibrationImage {
@@ -207,6 +208,18 @@ inline CalibrationImageReport collect_calibration_images(const CalibrationImageR
             for (unsigned n = 0; n < values.size(); ++n) { if (n) out << ','; out << values[n]; } out << ']';
         };
         array("view_rect_xywh", info.view_rect); array("marker_rect_xywh", info.marker_rect);
+        out << ",\"marker_positions_xy\":[";
+        for (unsigned n = 0; n < info.markers.count; ++n) {
+            if (n) out << ',';
+            out << '[' << info.markers.points[n].x << ',' << info.markers.points[n].y << ']';
+        }
+        out << ']';
+        out << ",\"marker_location_codes\":[";
+        for (unsigned n = 0; n < info.markers.count; ++n) {
+            if (n) out << ',';
+            out << info.markers.points[n].code;
+        }
+        out << ']';
         array("submitted_uv_bounds", info.bounds);
         out << ",\"sample_rects_xywh\":[";
         for (unsigned n = 0; n < info.sample_count; ++n) {

@@ -22,8 +22,6 @@ namespace cheeky::foveated_dlss {
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr unsigned ring_size = 8, block = calibration_marker_size, inset = 12;
-constexpr unsigned sample = calibration_sample_size;
-constexpr int margin = calibration_sample_margin;
 constexpr std::uint64_t ticket_bit = 1ULL << 63;
 struct Patch {
     ComPtr<ID3D11Texture2D> staging;
@@ -62,10 +60,14 @@ struct Frame {
     ComPtr<ID3D11Query> done, disjoint;
     std::array<ComPtr<ID3D11Query>, 8> timestamp;
     // Source before/after for A and B, then A/B at each submitted eye.
-    std::array<Patch, 8> patches;
-    std::array<Patch, 4> flipped_patches11;
+    std::array<Patch, calibration_patch_count> patches;
+    std::array<CalibrationPlacementPlan, 2> placement_plans;
+    std::array<std::uint32_t, calibration_patch_count> patch_codes{};
+    std::array<unsigned, calibration_patch_count> patch_mirrors{};
+    std::array<std::array<double, 2>, 2> submitted_sizes{};
+    std::array<std::array<bool, calibration_placement_count>, 2> usable_placements{};
+    unsigned placement_count{1};
     std::array<Submitted11, 2> submitted11;
-    std::array<float, 4> flipped_scores{};
     std::array<View, 2> views;
     std::array<std::uint32_t, 2> codes{};
     bool pipelined{}, protected_context{};
@@ -102,8 +104,17 @@ struct SubmissionContext {
     HRESULT protection_query{E_PENDING};
     const char* rejection{"none"};
 };
+struct PlacementLock {
+    View view;
+    std::array<std::array<double, 2>, 2> submitted_sizes{};
+    CalibrationPlacement placement;
+    bool locked{};
+};
 struct State {
     std::mutex mutex;
+    std::array<PlacementLock, 2> placements;
+    std::array<std::array<double, 2>, 2> submitted_sizes{};
+    std::uint64_t placement_epoch{}, placement_sequence{}, placement_locks{}, placement_losses{};
     std::array<Frame, ring_size> ring;
     int current{-1};
     std::uint64_t sequence{};
@@ -113,7 +124,7 @@ struct State {
     ComPtr<ID3D11Device> device;
     std::array<ComPtr<ID3D11Texture2D>, 2> markers;
     DXGI_FORMAT marker_format{};
-    std::array<std::uint32_t, 2> marker_codes{};
+    std::array<CalibrationMarkerPoints, 2> marker_layouts;
     EyeCalibrationStats stats;
     Average gpu, latency;
     double cpu_us{};
@@ -140,6 +151,49 @@ State& state() {
     return *s;
 }
 std::atomic<bool> enabled{}, pending{};
+void placement_epoch(State& s) {
+    if (s.placement_epoch == s.epoch) return;
+    s.placement_epoch = s.epoch;
+    s.placements = {}; s.submitted_sizes = {}; s.placement_sequence = 0;
+}
+CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t view, unsigned width, unsigned height) {
+    placement_epoch(s);
+    auto& lock = s.placements[c];
+    if (lock.locked && lock.view.id == view && lock.view.generation == stereo_view_generation(view) &&
+        lock.view.width == width && lock.view.height == height && lock.submitted_sizes == s.submitted_sizes) {
+        CalibrationPlacementPlan plan; plan.placements[0] = lock.placement; return plan;
+    }
+    if (lock.locked) ++s.placement_losses;
+    lock.locked = false;
+    return calibration_placement_plan(width, height, c, s.submitted_sizes[0][0], s.submitted_sizes[0][1]);
+}
+void submitted_geometry(State& s, Frame& f, unsigned eye, unsigned width, unsigned height,
+                        float u0, float v0, float u1, float v1) {
+    placement_epoch(s);
+    f.submitted_sizes[eye] = {double(width) * std::abs(double(u1) - u0), double(height) * std::abs(double(v1) - v0)};
+    if (f.epoch == s.epoch) s.submitted_sizes[eye] = f.submitted_sizes[eye];
+    f.placement_count = (std::max)(f.placement_plans[0].count, f.placement_plans[1].count);
+}
+std::array<unsigned, 4> submitted_rect(Frame& f, unsigned eye, unsigned index, unsigned width, unsigned height,
+                                     float u0, float v0, float u1, float v1) {
+    const unsigned c = index % 2, h = index / 4;
+    const auto source = f.views[c].width ? c : (f.views[0].width ? 0U : 1U);
+    // Missing source in a single-source pipeline still probes the absent code,
+    // using the same geometry but its own left/right marker position.
+    auto plan = f.placement_plans[source];
+    if (source != c) {
+        for (unsigned i = 0; i < plan.count; ++i)
+            plan.placements[i].marker.x = f.views[source].width - block - plan.placements[i].marker.x;
+    }
+    f.patch_codes[calibration_patch_index(index, eye)] = calibration_location_code(plan.at(h).marker,
+        f.views[source].width, c, f.codes[c]);
+    const unsigned mirror = (u1 < u0 ? 1U : 0U) | ((v1 < v0) != (index % 4 >= 2) ? 2U : 0U);
+    f.patch_mirrors[calibration_patch_index(index, eye)] = 1U << mirror;
+    auto rect = calibration_sample_rect(plan.at(h), index % 4 >= 2, width, height, u0, v0, u1, v1);
+    if (!rect[2] || !rect[3]) { f.usable_placements[eye][h] = false; rect = {0, 0, 1, 1}; }
+    return rect;
+}
+
 // Codes remain stable for a calibration epoch so delayed submissions can
 // match. Candidate slots remain bound to view identities throughout that epoch.
 std::array<std::uint32_t, 2> capture_codes(std::uint64_t sequence) {
@@ -193,7 +247,7 @@ void record_rejection(State& s, const Frame& f, unsigned mask) {
     s.stats.last_rejection_mask = mask;
     s.stats.last_evaluations = f.evaluations;
     s.stats.last_submits = f.submits;
-    for (unsigned i = 0; i < f.patches.size(); ++i)
+    for (unsigned i = 0; i < s.stats.last_rejected_scores.size(); ++i)
         s.stats.last_rejected_scores[i] = f.patches[i].score;
 }
 double now_us() {
@@ -315,9 +369,9 @@ void poll_submitted(Frame& f) {
         if (hr == S_FALSE) continue;
         if (FAILED(hr)) { f.invalid = true; capture.ready = true; continue; }
         bool waiting = !poll_support11(f, capture.context.Get(), 2 + eye);
-        for (unsigned index = 0; index < (f.gpu12_used ? 4U : 2U); ++index) {
+        for (unsigned index = 0; index < f.placement_count * 4; ++index) {
             const unsigned c = index % 2;
-            auto& p = index < 2 ? f.patches[4 + eye * 2 + c] : f.flipped_patches11[eye * 2 + c];
+            auto& p = f.patches[calibration_patch_index(index, eye)];
             if (!p.used || p.ready) continue;
             D3D11_MAPPED_SUBRESOURCE mapped{};
             const auto result = capture.context->Map(p.staging.Get(), 0, D3D11_MAP_READ,
@@ -325,8 +379,8 @@ void poll_submitted(Frame& f) {
             if (result == DXGI_ERROR_WAS_STILL_DRAWING) { waiting = true; continue; }
             if (FAILED(result)) { f.invalid = true; p.ready = true; continue; }
             p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
-                p.format, c, true, f.codes[c]);
-            if (index >= 2) f.flipped_scores[eye * 2 + c] = p.score;
+                p.format, c, true, f.patch_codes[calibration_patch_index(index, eye)],
+                f.patch_mirrors[calibration_patch_index(index, eye)]);
             capture.context->Unmap(p.staging.Get(), 0);
             p.ready = true;
         }
@@ -372,12 +426,11 @@ void poll(State& s) {
                 s.stats.d3d12_last_readback_failure = result.failure.stage;
                 s.stats.d3d12_readback_error = result.failure.result;
             }
-            for (unsigned i = 0; i < (mixed ? 4U : 8U); ++i) {
+            for (unsigned i = 0; i < (mixed ? 4U : 4U + f.placement_count * 8); ++i) {
                 if (mixed && !(source_mask & (1U << (i / 2)))) continue;
                 f.patches[i].used = f.patches[i].ready = true;
                 f.patches[i].score = result.scores[i];
             }
-            if (!mixed) std::copy_n(result.scores.begin() + 8, 4, f.flipped_scores.begin());
             if (result.timing_valid) {
                 s.stats.gpu_timing_status = "Available";
                 s.gpu.add(result.gpu_us);
@@ -418,8 +471,8 @@ void poll(State& s) {
                 if (i >= 2 && f.submitted11[i - 2].active) continue;
                 if (!poll_support11(f, f.context.Get(), i)) waiting = true;
             }
-            for (unsigned i = 0; i < f.patches.size(); ++i) {
-                if (i >= 4 && f.submitted11[(i - 4) / 2].active) continue;
+            for (unsigned i = 0; i < 4 + f.placement_count * 8; ++i) {
+                if (i >= 4 && f.submitted11[((i - 4) % 4) / 2].active) continue;
                 auto& p = f.patches[i];
                 if (!p.used || p.ready)
                     continue;
@@ -437,7 +490,7 @@ void poll(State& s) {
                 }
                 const unsigned candidate = i < 4 ? i / 2 : (i - 4) % 2;
                 p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
-                                                    p.format, candidate, i >= 4, f.codes[candidate]);
+                                                    p.format, candidate, i >= 4, f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
                 f.context->Unmap(p.staging.Get(), 0);
                 p.ready = true;
             }
@@ -486,7 +539,7 @@ void poll(State& s) {
         if (f.evaluations != 2 && !mono) rejection |= 2U;
         if (f.submits != 2 || f.eye_submits[0] != 1 || f.eye_submits[1] != 1) rejection |= 4U;
         if (f.result[0] != 0 || f.result[1] != 0) rejection |= 8U;
-        for (unsigned i = 0; i < f.patches.size(); ++i) {
+        for (unsigned i = 0; i < 4 + f.placement_count * 8; ++i) {
             if (mono && i < 4 && !(source_mask & (1U << (i / 2)))) continue;
             if (!f.patches[i].used || !f.patches[i].ready) rejection |= 16U;
         }
@@ -504,23 +557,47 @@ void poll(State& s) {
         const auto right_slot = 1U - left_slot;
         if (f.physical_eyes[0] >= 2 || f.physical_eyes[1] >= 2 ||
                 f.physical_eyes[0] == f.physical_eyes[1]) rejection |= 4U;
-        int left =
-            calibration_pattern_classify(f.patches[4 + left_slot * 2].score, f.patches[5 + left_slot * 2].score);
-        int right =
-            calibration_pattern_classify(f.patches[4 + right_slot * 2].score, f.patches[5 + right_slot * 2].score);
-        const int flipped_left = f.gpu12_used ? calibration_pattern_classify(
-            f.flipped_scores[left_slot * 2], f.flipped_scores[left_slot * 2 + 1]) : -1;
-        const int flipped_right = f.gpu12_used ? calibration_pattern_classify(
-            f.flipped_scores[right_slot * 2], f.flipped_scores[right_slot * 2 + 1]) : -1;
-        const auto verified_pair = [&](int a, int b) {
-            return a >= 0 && b >= 0 && (mono ? a == b && (source_mask & (1U << a)) : a != b);
-        };
-        const bool normal_pair = verified_pair(left, right);
-        const bool flipped_pair = verified_pair(flipped_left, flipped_right);
-        // A post-DLSS shader may flip the image. Accept exactly one complete
-        // stereo pair; conflicting orientation evidence must never guess.
-        if (normal_pair == flipped_pair) rejection |= 128U;
-        if (flipped_pair) { left = flipped_left; right = flipped_right; }
+        int left = -1, right = -1, selected = -1;
+        bool flipped_pair{}, ambiguous{};
+        float selected_score{};
+        for (unsigned h = 0; h < f.placement_count; ++h) {
+            if (!f.usable_placements[0][h] || !f.usable_placements[1][h]) continue;
+            for (unsigned flip = 0; flip < 2; ++flip) {
+                const auto base = 4 + h * 8 + flip * 4;
+                const int a = calibration_pattern_classify(f.patches[base + left_slot * 2].score,
+                                                          f.patches[base + left_slot * 2 + 1].score);
+                const int b = calibration_pattern_classify(f.patches[base + right_slot * 2].score,
+                                                          f.patches[base + right_slot * 2 + 1].score);
+                if (a < 0 || b < 0 || (mono ? a != b || !(source_mask & (1U << a)) : a == b)) continue;
+                if (selected >= 0 && (left != a || right != b || flipped_pair != bool(flip))) ambiguous = true;
+                const auto score = (std::min)(f.patches[base + left_slot * 2 + unsigned(a)].score,
+                                              f.patches[base + right_slot * 2 + unsigned(b)].score);
+                if (selected < 0 || score > selected_score) {
+                    selected = int(h); left = a; right = b; flipped_pair = flip != 0; selected_score = score;
+                }
+            }
+        }
+        if (selected < 0 || ambiguous) rejection |= 128U;
+        // Do not let an old asynchronous completion undo a newer placement.
+        if (enabled && f.epoch == s.epoch && f.sequence > s.placement_sequence &&
+            GetTickCount64() - f.captured_ms < 1000) {
+            placement_epoch(s);
+            s.placement_sequence = f.sequence;
+            if (!rejection) {
+                for (unsigned c = 0; c < 2; ++c) {
+                    if (!(source_mask & (1U << c))) continue;
+                    if (!s.placements[c].locked) ++s.placement_locks;
+                    s.placements[c] = {f.views[c], f.submitted_sizes, f.placement_plans[c].at(unsigned(selected)), true};
+                }
+            } else if (rejection & 128U) {
+                bool lost{};
+                for (auto& lock : s.placements) {
+                    if (lock.locked) { ++s.placement_losses; lost = true; }
+                    lock.locked = false;
+                }
+                if (lost) s.frames_until_capture = 0;
+            }
+        }
         if (rejection) record_rejection(s, f, rejection);
         if (!rejection) {
             if (mono) calibration_image_shared_source(f.support, unsigned(left));
@@ -566,7 +643,7 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
         std::uint64_t(y) + height > desc.Height)
         return false;
     const auto subresource = D3D11CalcSubresource(0, slice, desc.MipLevels);
-    auto& p = index < 8 ? f.patches[index] : f.flipped_patches11[index - 8];
+    auto& p = f.patches[index];
     if (!p.staging || p.device != device || p.width != width || p.height != height || p.format != desc.Format) {
         p.staging.Reset();
         desc.Width = width;
@@ -591,7 +668,7 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
     return true;
 }
 bool prepare_marker(State& s, ID3D11DeviceContext* context, DXGI_FORMAT format,
-                    unsigned candidate, std::uint32_t code) {
+                    unsigned candidate, const CalibrationMarkerPoints& points) {
     ComPtr<ID3D11Device> device;
     context->GetDevice(&device);
     if (s.device.Get() != device.Get() || s.marker_format != format) {
@@ -599,19 +676,29 @@ bool prepare_marker(State& s, ID3D11DeviceContext* context, DXGI_FORMAT format,
         s.device = device;
         s.marker_format = format;
     }
-    if (s.markers[candidate] && s.marker_codes[candidate] == code) return true;
+    if (s.markers[candidate] && s.marker_layouts[candidate] == points) return true;
     const auto bytes = calibration_pixel_bytes(format);
-    std::vector<unsigned char> data(block * block * bytes);
-    for (unsigned i = 0; i < block * block; ++i)
-        calibration_encode_pattern(data.data() + i * bytes, format, candidate, i % block, i / block, code);
+    std::vector<unsigned char> data(block * block * calibration_placement_count * bytes);
+    for (unsigned n = 0; n < points.count; ++n)
+        for (unsigned i = 0; i < block * block; ++i)
+            calibration_encode_pattern(data.data() + (n * block * block + i) * bytes, format, candidate,
+                                       i % block, i / block, points.points[n].code);
     if (!s.markers[candidate]) {
-        const D3D11_TEXTURE2D_DESC desc{block, block, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+        const D3D11_TEXTURE2D_DESC desc{block, block * calibration_placement_count, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
         const D3D11_SUBRESOURCE_DATA initial{data.data(), block * bytes, 0};
         if (FAILED(device->CreateTexture2D(&desc, &initial, &s.markers[candidate]))) return false;
         ++s.stats.allocations;
     } else context->UpdateSubresource(s.markers[candidate].Get(), 0, nullptr, data.data(), block * bytes, 0);
-    s.marker_codes[candidate] = code;
+    s.marker_layouts[candidate] = points;
     return true;
+}
+void stamp_points11(State& s, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+                    unsigned c, const CalibrationMarkerPoints& points) {
+    for (unsigned i = 0; i < points.count; ++i) {
+        const D3D11_BOX box{0, i * block, 0, block, (i + 1) * block, 1};
+        context->CopySubresourceRegion(texture, 0, points.points[i].x, points.points[i].y,
+            0, s.markers[c].Get(), 0, &box);
+    }
 }
 unsigned continuous_candidate(State& s, std::uint64_t view) {
     if (s.continuous_epoch != s.epoch) {
@@ -642,7 +729,7 @@ unsigned continuous_candidate(State& s, std::uint64_t view) {
     return 2;
 }
 void continuous_stamp_only(State& s, ID3D11DeviceContext* context, ID3D11Resource* output,
-                           unsigned c, unsigned x, unsigned y, unsigned width, unsigned height) {
+                           unsigned c, std::uint64_t view, unsigned x, unsigned y, unsigned width, unsigned height) {
     if (c >= 2 || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
     ComPtr<ID3D11Texture2D> texture;
     if (FAILED(output->QueryInterface(IID_PPV_ARGS(&texture)))) return;
@@ -651,12 +738,12 @@ void continuous_stamp_only(State& s, ID3D11DeviceContext* context, ID3D11Resourc
     if (!calibration_pixel_bytes(desc.Format) || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
         width < 2 * inset + block || height < 2 * inset + block ||
         std::uint64_t(x) + width > desc.Width || std::uint64_t(y) + height > desc.Height) return;
-    if (!prepare_marker(s, context, desc.Format, c, capture_codes(s.epoch)[c])) return;
-    context->CopySubresourceRegion(texture.Get(), 0, x + (c ? width - inset - block : inset), y + inset,
-        0, s.markers[c].Get(), 0, nullptr);
+    const auto points = calibration_marker_points(source_placement(s, c, view, width, height), x, y, width, c, capture_codes(s.epoch)[c]);
+    if (!prepare_marker(s, context, desc.Format, c, points)) return;
+    stamp_points11(s, context, texture.Get(), c, points);
 }
 void continuous_stamp_only12(State& s, ID3D12GraphicsCommandList* list, ID3D12Resource* output,
-    unsigned c, unsigned x, unsigned y, unsigned width, unsigned height, D3D12_RESOURCE_STATES output_state) {
+    unsigned c, std::uint64_t view, unsigned x, unsigned y, unsigned width, unsigned height, D3D12_RESOURCE_STATES output_state) {
     if (c >= 2 || width < 2 * inset + block || height < 2 * inset + block) return;
     const auto desc = output->GetDesc();
     if (std::uint64_t(x) + width > desc.Width || std::uint64_t(y) + height > desc.Height) return;
@@ -677,9 +764,10 @@ void continuous_stamp_only12(State& s, ID3D12GraphicsCommandList* list, ID3D12Re
         if (!frame || !calibration12_begin(*frame, &s.stats.allocations)) continue;
         s.continuous12_next = (slot + 1) % unsigned(s.continuous12.size());
         Calibration12Failure failure;
-        if (calibration12_stamp(*frame, list, output, c, x + (c ? width - inset - block : inset),
-            y + inset, output_state, s.stats.allocations, &failure, {}, {}, capture_codes(s.epoch)[c],
-            Calibration12StampMode::marker_only)) {
+        const auto points = calibration_marker_points(source_placement(s, c, view, width, height), x, y, width, c, capture_codes(s.epoch)[c]);
+        if (calibration12_stamp(*frame, list, output, c, points.points[0].x,
+            points.points[0].y, output_state, s.stats.allocations, &failure, {}, {}, points.points[0].code,
+            Calibration12StampMode::marker_only, points.extra())) {
             ++s.stats.d3d12_continuous_stamps;
         } else {
             ++s.stats.d3d12_stamp_failures;
@@ -740,6 +828,7 @@ void eye_calibration_reset_stats() noexcept {
     s.cpu_us = 0;
     s.gpu = {};
     s.latency = {};
+    s.placement_locks = s.placement_losses = 0;
     s.measurement_start = s.sequence + 1;
 }
 bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_generation,
@@ -818,8 +907,8 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.captured_ms = GetTickCount64();
         f.evaluations = f.submits = 0;
         f.views = {};
-        f.flipped_scores = {};
-        for (auto& p : f.flipped_patches11) { p.used = p.ready = false; p.score = 0; }
+        f.placement_plans = {}; f.submitted_sizes = {}; f.placement_count = 1;
+        for (auto& usable : f.usable_placements) usable.fill(true);
         for (auto& capture : f.submitted11) capture.active = capture.ready = false;
         f.eye_submits = {};
         f.result = {{-1, -1}};
@@ -862,7 +951,7 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         const unsigned continuous_c = continuous ? continuous_candidate(s, view) : 2;
         if (continuous && (s.current < 0 || s.ring[s.current].epoch != s.epoch ||
                 s.ring[s.current].submits || s.ring[s.current].invalid)) {
-            continuous_stamp_only(s, context, output, continuous_c, x, y, width, height);
+            continuous_stamp_only(s, context, output, continuous_c, view, x, y, width, height);
             return;
         }
         if (s.current < 0)
@@ -923,10 +1012,6 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
             f.invalid = true;
             return;
         }
-        if (!prepare_marker(s, context, desc.Format, c, f.codes[c])) {
-            f.invalid = true;
-            return;
-        }
         if (repeated && (f.views[c].generation != stereo_view_generation(view) ||
             f.views[c].width != width || f.views[c].height != height)) {
             f.invalid = true;
@@ -935,22 +1020,26 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         const auto assignment = stereo_eye_assignment(view);
         f.views[c] = {view, width, height, assignment.assigned ? int(assignment.eye_index) : -1,
                       stereo_view_generation(view)};
-        const unsigned px = x + (c ? width - inset - block : inset), py = y + inset;
+        if (!repeated) f.placement_plans[c] = source_placement(s, c, view, width, height);
+        const auto points = calibration_marker_points(f.placement_plans[c], x, y, width, c, f.codes[c]);
+        f.patch_codes[c * 2] = f.patch_codes[c * 2 + 1] = points.points[0].code;
+        const auto px = points.points[0].x, py = points.points[0].y;
+        if (!prepare_marker(s, context, desc.Format, c, points)) { f.invalid = true; return; }
         if (repeated) {
             // Refresh new renders; retain the first before/after proof.
-            context->CopySubresourceRegion(texture.Get(), 0, px, py, 0, s.markers[c].Get(), 0, nullptr);
+            stamp_points11(s, context, texture.Get(), c, points);
             return;
         }
         context->End(f.timestamp[c * 2].Get());
         if (!copy_patch(s, f, c * 2, texture.Get(), px, py, block, block))
             f.invalid = true;
-        context->CopySubresourceRegion(texture.Get(), 0, px, py, 0, s.markers[c].Get(), 0, nullptr);
+        stamp_points11(s, context, texture.Get(), c, points);
         if (!copy_patch(s, f, c * 2 + 1, texture.Get(), px, py, block, block))
             f.invalid = true;
         CalibrationImageInfo image;
         image.width = desc.Width; image.height = desc.Height; image.format = desc.Format; image.graphics_api = 11;
         image.view = view; image.prior_eye = f.views[c].assigned;
-        image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block};
+        image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block}; image.markers = points;
         capture_support11(f, context, texture.Get(), c, image);
         context->End(f.timestamp[c * 2 + 1].Get());
         f.segments[c] = true;
@@ -976,7 +1065,7 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         const unsigned continuous_c = continuous ? continuous_candidate(s, view) : 2;
         if (continuous && (s.current < 0 || s.ring[s.current].epoch != s.epoch ||
                 s.ring[s.current].submits || s.ring[s.current].invalid)) {
-            continuous_stamp_only12(s, list, output, continuous_c, x, y, width, height, output_state);
+            continuous_stamp_only12(s, list, output, continuous_c, view, x, y, width, height, output_state);
             return;
         }
         if (s.current < 0)
@@ -1036,14 +1125,17 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         const auto assignment = stereo_eye_assignment(view);
         f.views[c] = {view, width, height, assignment.assigned ? int(assignment.eye_index) : -1,
                       stereo_view_generation(view)};
-        const auto px = x + (c ? width - inset - block : inset), py = y + inset;
+        if (!repeated) f.placement_plans[c] = source_placement(s, c, view, width, height);
+        const auto points = calibration_marker_points(f.placement_plans[c], x, y, width, c, f.codes[c]);
+        f.patch_codes[c * 2] = f.patch_codes[c * 2 + 1] = points.points[0].code;
+        const auto px = points.points[0].x, py = points.points[0].y;
         Calibration12Failure failure;
         CalibrationImageInfo image;
         image.width = unsigned(d.Width); image.height = d.Height; image.format = d.Format; image.graphics_api = 12;
         image.view = view; image.prior_eye = f.views[c].assigned;
-        image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block};
+        image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block}; image.markers = points;
         if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure,
-            f.support, image, f.codes[c], repeated ? Calibration12StampMode::refresh : Calibration12StampMode::source_proof)) {
+            f.support, image, points.points[0].code, repeated ? Calibration12StampMode::refresh : Calibration12StampMode::source_proof, points.extra())) {
             f.invalid = true;
             ++s.stats.d3d12_stamp_failures;
             s.stats.d3d12_last_stamp_failure = failure.stage;
@@ -1089,24 +1181,21 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         f.invalid = true;
         return 0;
     }
-    std::array<D3D12_BOX, 4> boxes;
-    for (unsigned index = 0; index < boxes.size(); ++index) {
+    submitted_geometry(s, f, eye, unsigned(d.Width), d.Height, u0, v0, u1, v1);
+    std::array<D3D12_BOX, calibration_box_count> boxes;
+    std::array<std::uint32_t, calibration_box_count> codes;
+    std::array<unsigned, calibration_box_count> mirrors;
+    const unsigned box_count = f.placement_count * 4;
+    for (unsigned index = 0; index < box_count; ++index) {
         const auto c = index % 2;
-        const auto& ref = f.views[c].width ? f.views[c] : f.views[0];
-        if (!ref.width || !ref.height) {
-            f.invalid = true;
-            return 0;
-        }
-        const float nx = (float(c ? ref.width - inset - block : inset) + margin) / ref.width,
-                    ny = (float(index < 2 ? inset : ref.height - inset - block) + margin) / ref.height;
-        const float ax = (u0 + nx * (u1 - u0)) * d.Width,
-                    bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * d.Width;
-        const float ay = (v0 + ny * (v1 - v0)) * d.Height,
-                    by = (v0 + (ny + float(sample) / ref.height) * (v1 - v0)) * d.Height;
-        boxes[index] = {unsigned(std::floor((std::min)(ax, bx))), unsigned(std::floor((std::min)(ay, by))), 0,
-                    unsigned(std::ceil((std::max)(ax, bx))),  unsigned(std::ceil((std::max)(ay, by))),  1};
-        f.patches[4 + eye * 2 + c].reference_width = ref.width;
-        f.patches[4 + eye * 2 + c].reference_height = ref.height;
+        const auto& ref = f.views[c].width ? f.views[c] : f.views[f.views[0].width ? 0 : 1];
+        if (!ref.width || !ref.height) { f.invalid = true; return 0; }
+        const auto r = submitted_rect(f, eye, index, unsigned(d.Width), d.Height, u0, v0, u1, v1);
+        codes[index] = f.patch_codes[calibration_patch_index(index, eye)];
+        mirrors[index] = f.patch_mirrors[calibration_patch_index(index, eye)];
+        boxes[index] = {r[0], r[1], 0, r[0] + r[2], r[1] + r[3], 1};
+        f.patches[calibration_patch_index(index, eye)].reference_width = ref.width;
+        f.patches[calibration_patch_index(index, eye)].reference_height = ref.height;
     }
     const auto expected_state = backend == EyeCalibrationBackend::openxr
                                     ? D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -1115,11 +1204,11 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     CalibrationImageInfo image;
     image.width = unsigned(d.Width); image.height = d.Height; image.format = d.Format; image.graphics_api = 12;
     image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1};
-    image.sample_count = unsigned(boxes.size());
-    for (unsigned i = 0; i < boxes.size(); ++i) image.sample_rects[i] =
+    image.sample_count = box_count;
+    for (unsigned i = 0; i < box_count; ++i) image.sample_rects[i] =
         {boxes[i].left, boxes[i].top, boxes[i].right - boxes[i].left, boxes[i].bottom - boxes[i].top};
-    if (!calibration12_capture(*f.gpu12, queue, texture, eye, slice, expected_state, boxes,
-                               s.stats.allocations, &failure, f.support, image)) {
+    if (!calibration12_capture(*f.gpu12, queue, texture, eye, slice, expected_state, {boxes.data(), box_count},
+                               s.stats.allocations, &failure, f.support, image, {codes.data(), box_count}, {mirrors.data(), box_count})) {
         f.invalid = true;
         ++s.stats.d3d12_capture_failures;
         s.stats.d3d12_last_capture_failure = failure.stage;
@@ -1262,7 +1351,9 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     } else context->End(f.timestamp[4 + eye * 2].Get());
     CalibrationImageInfo image;
     image.width = desc.Width; image.height = desc.Height; image.format = desc.Format; image.graphics_api = 11;
-    image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1}; image.sample_count = mixed ? 4U : 2U;
+    image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1};
+    submitted_geometry(s, f, eye, desc.Width, desc.Height, u0, v0, u1, v1);
+    image.sample_count = f.placement_count * 4;
     for (unsigned index = 0; index < image.sample_count; ++index) {
         const unsigned c = index % 2;
         const auto& ref = f.views[c].width ? f.views[c] : f.views[f.views[0].width ? 0 : 1];
@@ -1270,18 +1361,9 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
             f.invalid = true;
             continue;
         }
-        const float nx = (float(c ? ref.width - inset - block : inset) + margin) / ref.width,
-                    ny = (float(index < 2 ? inset : ref.height - inset - block) + margin) / ref.height;
-        const float ax = (u0 + nx * (u1 - u0)) * desc.Width,
-                    bx = (u0 + (nx + float(sample) / ref.width) * (u1 - u0)) * desc.Width;
-        const float ay = (v0 + ny * (v1 - v0)) * desc.Height,
-                    by = (v0 + (ny + float(sample) / ref.height) * (v1 - v0)) * desc.Height;
-        const unsigned x = unsigned(std::floor((std::min)(ax, bx))),
-                       y = unsigned(std::floor((std::min)(ay, by)));
-        const unsigned w = unsigned(std::ceil((std::max)(ax, bx))) - x,
-                       h = unsigned(std::ceil((std::max)(ay, by))) - y;
-        image.sample_rects[index] = {x, y, w, h};
-        if (!copy_patch(s, f, (index < 2 ? 4U : 8U) + eye * 2 + c, texture, x, y, w, h,
+        const auto r = submitted_rect(f, eye, index, desc.Width, desc.Height, u0, v0, u1, v1);
+        image.sample_rects[index] = r;
+        if (!copy_patch(s, f, calibration_patch_index(index, eye), texture, r[0], r[1], r[2], r[3],
             ref.width, ref.height, slice, context.Get()))
             f.invalid = true;
     }
@@ -1347,6 +1429,7 @@ void eye_calibration_stop() noexcept {
     s.continuous12 = {};
     s.continuous12_device.Reset();
     s.continuous12_next = 0;
+    placement_epoch(s);
 }
 
 const char* eye_calibration_status(const EyeCalibrationStats& stats) noexcept {
@@ -1443,6 +1526,18 @@ std::string eye_calibration_json() {
     {
         auto& live = state();
         std::lock_guard lock(live.mutex);
+        out << ",\"placement_search\":{\"hypotheses\":" << calibration_placement_count
+            << ",\"locks\":" << live.placement_locks << ",\"losses\":" << live.placement_losses
+            << ",\"sources\":[";
+        for (unsigned c = 0; c < 2; ++c) {
+            if (c) out << ',';
+            const auto& p = live.placements[c];
+            out << "{\"locked\":" << (p.locked && live.placement_epoch == live.epoch)
+                << ",\"visible_source_xywh\":[" << p.placement.x << ',' << p.placement.y << ','
+                << p.placement.width << ',' << p.placement.height << "],\"marker_xy\":["
+                << p.placement.marker.x << ',' << p.placement.marker.y << "]}";
+        }
+        out << "]}";
         out << ",\"d3d11_lifecycle\":{\"frame_thread\":" << live.frame_thread
             << ",\"stamp_thread\":" << live.stamp_thread << ",\"submit_thread\":" << live.submit_thread
             << ",\"tick_thread\":" << live.tick_thread << ",\"finish_wrong_thread\":" << live.finish_wrong_thread
