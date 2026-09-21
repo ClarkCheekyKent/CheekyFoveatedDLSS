@@ -2055,6 +2055,7 @@ void test_afw_gaze_pixel_coverage() {
 }
 
 int run_d3d12_history_tests();
+int run_d3d12_safety_tests();
 
 int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
@@ -2069,6 +2070,7 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-history") == 0) return run_d3d12_history_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--d3d12-safety") == 0) return run_d3d12_safety_tests();
     if (argc == 3 && std::strcmp(argv[1], "--afw-runtime-file") == 0) {
         const bool supported = cheeky::foveated_dlss::known_afw_warp_file(std::filesystem::path(argv[2]).c_str());
         std::cout << (supported ? "Verified AFW warp ABI file\n" : "Unknown AFW warp ABI file\n");
@@ -2137,6 +2139,7 @@ int main(int argc, char** argv) {
     test_afw_source_projection_coverage();
     test_afw_gaze_pixel_coverage();
     failures += run_d3d12_history_tests();
+    failures += run_d3d12_safety_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

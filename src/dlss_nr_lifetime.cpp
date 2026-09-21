@@ -102,6 +102,13 @@ bool NrLifetime::record(ID3D12GraphicsCommandList* list) noexcept {
     uses_.push_back(recording);
     return true;
 }
+bool NrLifetime::contains(ID3D12GraphicsCommandList* list) const noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    const auto tag = identity(list);
+    if (!tag || !tag->current) return false;
+    for (const auto& use : uses_) if (use == tag->current) return true;
+    return false;
+}
 void nr_recording_submitted(ID3D12CommandQueue* queue, ID3D12Object* list, NrSignal submit_signal) noexcept {
     if (!queue || !list) return;
     std::lock_guard execution_lock(calibration12_execution_mutex());

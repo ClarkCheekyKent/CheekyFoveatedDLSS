@@ -1609,6 +1609,7 @@ void note_d3d12_present_impl(
     collect_dlss_nr_submissions();
     collect_peripheral_dlaa_resources();
     collect_crop_motion12();
+    collect_d3d12_resources();
     std::uint64_t present_frequency{};
     if (present_queue != nullptr) {
         static_cast<void>(present_queue->GetTimestampFrequency(&present_frequency));
@@ -2387,7 +2388,9 @@ struct StreamlineEvaluation {
         streamline_view_id,
         backend_settings,
         verbose,
-        sequence
+        sequence,
+        static_cast<D3D12_RESOURCE_STATES>(color_tag.resource->state),
+        static_cast<D3D12_RESOURCE_STATES>(output_tag.resource->state)
     );
     }
     if (evaluation.backend == nullptr) {

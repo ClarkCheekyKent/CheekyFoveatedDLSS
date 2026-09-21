@@ -157,6 +157,7 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d11_backend.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/motion_resample_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_history_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_safety_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12_backend.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/crop_motion.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/support_summary_tests.cpp"

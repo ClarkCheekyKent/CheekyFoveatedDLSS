@@ -15,6 +15,7 @@ namespace cheeky::foveated_dlss {
 namespace {
 using Microsoft::WRL::ComPtr;
 std::mutex install_mutex;
+std::mutex probe_mutex;
 std::atomic<bool> ready{};
 std::atomic<std::uint64_t> submissions{}, copies{}, resets{}, destroyed{};
 thread_local bool observing{};
@@ -51,6 +52,36 @@ void* method(void* object, unsigned index) {
 }
 constexpr GUID observer_lifetime_key{
     0x11cd13ab, 0x47e8, 0x41cc, {0x9d, 0x3f, 0x53, 0x58, 0x9e, 0x2c, 0x17, 0x95}};
+constexpr GUID observer_probe_key{
+    0x8a682e9a, 0x73c8, 0x4460, {0x88, 0x56, 0xd2, 0xe1, 0xa4, 0xeb, 0x5d, 0x6c}};
+// Device-owned private data avoids stale pointer keys and retaining devices
+// indefinitely. Hooks stay resident; a successful factory probe remains valid.
+// Failures retry after a short cooldown, or immediately when hooks become ready.
+class ObserverProbe final : public IUnknown {
+    std::atomic<ULONG> references{1};
+public:
+    struct Factory {
+        std::array<void*, 3> methods{};
+        ULONGLONG attempted_at{}, used_at{};
+        bool attempted{}, succeeded{}, hooks_ready{};
+    };
+    // Wrappers can share private data with the native device while exposing
+    // different queue/list factories. Never transfer a successful probe across
+    // those families. Bound both storage and churn if many wrappers appear.
+    std::array<Factory, 8> factories{};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = this; AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = --references;
+        if (!left) delete this;
+        return left;
+    }
+};
 
 class Lifetime final : public IUnknown {
     std::atomic<ULONG> references{1};
@@ -317,11 +348,54 @@ bool initialize_native_observer(ID3D12Device* device, ID3D12CommandQueue* queue)
 }
 bool ensure_native_observer(ID3D12GraphicsCommandList* list) noexcept {
     ComPtr<ID3D12Device> device;
+    if (!list || FAILED(list->GetDevice(IID_PPV_ARGS(&device))) || !device) return false;
+    std::lock_guard lock(probe_mutex);
+    ComPtr<ObserverProbe> probe;
+    IUnknown* stored{};
+    UINT bytes = sizeof(stored);
+    if (SUCCEEDED(device->GetPrivateData(observer_probe_key, &bytes, &stored)) && stored) {
+        probe.Attach(static_cast<ObserverProbe*>(stored));
+    } else {
+        // Even a failed probe leaves a COM callback on the device.
+        HMODULE resident{};
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                reinterpret_cast<LPCWSTR>(&ensure_native_observer), &resident)) return false;
+        probe.Attach(new (std::nothrow) ObserverProbe);
+        if (!probe || FAILED(device->SetPrivateDataInterface(observer_probe_key, probe.Get()))) return false;
+        // A wrapper that discards private data cannot provide a stable cache.
+        bytes = sizeof(stored);
+        if (FAILED(device->GetPrivateData(observer_probe_key, &bytes, &stored)) || !stored) return false;
+        const bool matches = stored == probe.Get();
+        stored->Release();
+        if (!matches) return false;
+    }
+    const auto now = GetTickCount64();
+    const std::array<void*, 3> factories{method(device.Get(), 8), method(device.Get(), 9), method(device.Get(), 12)};
+    ObserverProbe::Factory* cached{};
+    ObserverProbe::Factory* oldest = &probe->factories.front();
+    for (auto& entry : probe->factories) {
+        if (entry.methods == factories) { cached = &entry; break; }
+        if (!cached && !entry.attempted) cached = &entry;
+        if (entry.used_at < oldest->used_at) oldest = &entry;
+    }
+    if (!cached) {
+        if (now - oldest->used_at < 1000U) return false;
+        cached = oldest;
+        *cached = {};
+    }
+    cached->methods = factories;
+    cached->used_at = now;
+    if (cached->succeeded) return true;
+    if (cached->attempted && cached->hooks_ready == ready.load() && now - cached->attempted_at < 1000U)
+        return false;
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC desc{};
-    return list && SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) &&
-        SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))) &&
+    cached->attempted = true;
+    cached->attempted_at = now;
+    cached->succeeded = SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))) &&
         initialize_native_observer(device.Get(), queue.Get());
+    cached->hooks_ready = ready.load();
+    return cached->succeeded;
 }
 NativeObserverStatus native_observer_status() noexcept {
     return {ready.load(), submissions.load(), copies.load(), resets.load(), destroyed.load()};

@@ -19,6 +19,7 @@ void nr_recording_reset(ID3D12Object*, HRESULT reset_result) noexcept;
 class NrLifetime {
 public:
     bool record(ID3D12GraphicsCommandList*) noexcept;
+    [[nodiscard]] bool contains(ID3D12GraphicsCommandList*) const noexcept;
     void collect(NrSignal = nullptr) noexcept;
     [[nodiscard]] bool empty() const noexcept { return uses_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return uses_.size(); }

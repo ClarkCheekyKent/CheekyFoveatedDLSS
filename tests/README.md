@@ -1,3 +1,35 @@
+# SR resource safety and NR observer retries
+
+`CheekyTests.exe --d3d12-safety` links the production SR backend and uses WARP.
+It checks tagged input/output transitions and restoration on mip 0/slice 0,
+unknown-state rejection, peripheral base replacement, 257 evaluations without
+descriptor overwrite, bounded cache exhaustion, replay, reset while a GPU queue
+is blocked, teardown during an active evaluation, resource retention behind
+descriptors, and reuse after safe retirement. These tests also run in the default
+`CheekyTests.exe` suite. Known-invalid baseline recordings are discarded before
+submission; valid recordings execute on WARP.
+
+`CheekyNrObserverTests.exe --probe` exercises the real observer with a device
+facade that fails queue creation or command-list private-data storage. It checks
+bounded retries, recovery after the one-second cooldown, and separate probe
+results for device wrappers with different factory methods. The default observer
+suite includes this regression plus its existing real-hook lifetime tests.
+
+Before the fixes, the regression runs reported:
+
+- SR dispatch used color/output in incompatible states.
+- Evaluation 257 reused a descriptor table still owned by an unsubmitted list.
+- The ninth distinct SR allocation evicted a resource in an executable list.
+- 512 failed NR attempts created 512 queues.
+
+The SR state test required adding state arguments to the backend interface before
+the baseline run; they were initially ignored. All behavioral fixes followed the
+failing runs. The tests reproduce the unsafe operations, not the tester's exact
+Cyberpunk/NVIDIA crash. They enable the D3D12 debug layer when installed and
+report when it is unavailable; the explicit state/lifetime assertions and WARP
+execution still run without it. Real NVIDIA DLSS and game/mod compatibility need
+an in-game retest.
+
 # Standalone and OptiScaler
 
 `CheekyStandaloneHostTests.exe <mode> <host>` uses the actual host DLL and GPU

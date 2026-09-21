@@ -51,6 +51,7 @@
     <ClCompile Include="src\d3d11_backend.cpp" />
     <ClCompile Include="tests\motion_resample_tests.cpp" />
     <ClCompile Include="tests\d3d12_history_tests.cpp" />
+    <ClCompile Include="tests\d3d12_safety_tests.cpp" />
     <ClCompile Include="src\d3d12_backend.cpp" />
     <ClCompile Include="src\crop_motion.cpp" />
     <ClCompile Include="tests\support_summary_tests.cpp" />

@@ -8,6 +8,8 @@
 #include "crop_motion.hpp"
 #include "motion_region.hpp"
 #include "runtime.hpp"
+#include "dlss_nr_lifetime.hpp"
+#include "eye_calibration_d3d12.hpp"
 
 #include <d3dcompiler.h>
 
@@ -18,6 +20,7 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <wrl/client.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -247,14 +250,21 @@ struct D3D12Resources {
     std::uint32_t output_height{};
     DXGI_FORMAT output_format{DXGI_FORMAT_UNKNOWN};
     std::uint32_t descriptor_size{};
-    std::atomic<std::uint32_t> next_descriptor_set{};
+    // Slots are immutable for the lifetime of their recording, including
+    // unsubmitted lists and replays. Scratch output is shared only within one
+    // recording, where successive evaluations execute in command order.
+    NrLifetime lifetime;
+    std::uint32_t next_descriptor_set{};
+    std::uint32_t active_evaluations{};
+    bool retired{};
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, descriptor_set_count> colors, outputs;
     std::uint64_t last_used{};
     D3D12Resources* next{};
 };
 
 
 
-SRWLOCK resources_lock = SRWLOCK_INIT;
+// Protected by calibration12_execution_mutex(), also used by queue/reset hooks.
 D3D12Resources* resource_list{};
 std::uint64_t resource_use_sequence{};
 constexpr std::size_t resource_cache_capacity = 8U;
@@ -546,24 +556,67 @@ void release_resources(D3D12Resources* const resources) noexcept {
     return resources;
 }
 
+void collect_resources() noexcept {
+    for (auto** link = &resource_list; *link;) {
+        auto* current = *link;
+        current->lifetime.collect();
+        if (current->lifetime.empty() && !current->active_evaluations) {
+            if (current->retired) {
+                *link = current->next;
+                release_resources(current);
+                continue;
+            }
+            current->next_descriptor_set = 0;
+            for (auto& resource : current->colors) resource.Reset();
+            for (auto& resource : current->outputs) resource.Reset();
+        }
+        link = &current->next;
+    }
+}
+
 [[nodiscard]] D3D12Resources* find_or_create_resources(
+    ID3D12GraphicsCommandList* const command_list,
     ID3D12Device* const device,
     ID3D12Resource* const game_output,
     const std::uint32_t output_width,
     const std::uint32_t output_height
 ) noexcept {
-    const auto format = game_output->GetDesc().Format;
-    AcquireSRWLockExclusive(&resources_lock);
+    // Fail closed before allocating or recording work without reliable tracking.
+    if (!ensure_dlss_nr_recording(command_list)) return nullptr;
+    const auto output_description = game_output->GetDesc();
+    if (!plan_d3d12_output(output_description, output_width, output_height).compatible) return nullptr;
+    const auto format = output_description.Format;
+    collect_resources();
     for (auto* current = resource_list; current != nullptr;
          current = current->next) {
-        if (current->device == device &&
+        if (!current->retired && !current->active_evaluations &&
+            current->next_descriptor_set < descriptor_set_count &&
+            (current->lifetime.empty() || current->lifetime.contains(command_list)) &&
+            current->device == device &&
             current->output_width == output_width &&
             current->output_height == output_height &&
             current->output_format == format) {
+            if (!current->lifetime.record(command_list)) return nullptr;
             current->last_used = ++resource_use_sequence;
-            ReleaseSRWLockExclusive(&resources_lock);
+            ++current->active_evaluations;
             return current;
         }
+    }
+    // Never block the render thread or evict a live GPU allocation. When all
+    // entries are pinned, leave this evaluation to the original DLSS path.
+    std::size_t count{};
+    D3D12Resources** oldest_link{};
+    for (auto** link = &resource_list; *link; link = &(*link)->next) {
+        ++count;
+        auto* current = *link;
+        if (current->lifetime.empty() && !current->active_evaluations &&
+            (!oldest_link || current->last_used < (*oldest_link)->last_used)) oldest_link = link;
+    }
+    if (count >= resource_cache_capacity) {
+        if (!oldest_link) return nullptr;
+        auto* oldest = *oldest_link;
+        *oldest_link = oldest->next;
+        release_resources(oldest);
     }
     auto* const created = create_resources(
         device,
@@ -572,34 +625,15 @@ void release_resources(D3D12Resources* const resources) noexcept {
         output_height
     );
     if (created != nullptr) {
+        if (!created->lifetime.record(command_list)) {
+            release_resources(created);
+            return nullptr;
+        }
+        ++created->active_evaluations;
         created->last_used = ++resource_use_sequence;
         created->next = resource_list;
         resource_list = created;
-
-        std::size_t count{};
-        D3D12Resources* oldest{};
-        D3D12Resources* oldest_previous{};
-        D3D12Resources* previous{};
-        for (auto* current = resource_list; current != nullptr;
-             current = current->next) {
-            ++count;
-            if (current != created &&
-                (oldest == nullptr || current->last_used < oldest->last_used)) {
-                oldest = current;
-                oldest_previous = previous;
-            }
-            previous = current;
-        }
-        if (count > resource_cache_capacity && oldest != nullptr) {
-            if (oldest_previous == nullptr) {
-                resource_list = oldest->next;
-            } else {
-                oldest_previous->next = oldest->next;
-            }
-            release_resources(oldest);
-        }
     }
-    ReleaseSRWLockExclusive(&resources_lock);
     return created;
 }
 
@@ -634,7 +668,8 @@ void transition_resource(
     ID3D12GraphicsCommandList* const command_list,
     ID3D12Resource* const resource,
     const D3D12_RESOURCE_STATES before,
-    const D3D12_RESOURCE_STATES after
+    const D3D12_RESOURCE_STATES after,
+    const UINT subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
 ) noexcept {
     if (command_list == nullptr || resource == nullptr || before == after) {
         return;
@@ -642,7 +677,7 @@ void transition_resource(
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = resource;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.Subresource = subresource;
     barrier.Transition.StateBefore = before;
     barrier.Transition.StateAfter = after;
     command_list->ResourceBarrier(1U, &barrier);
@@ -663,6 +698,10 @@ void insert_uav_barrier(
 struct D3D12Evaluation {
     D3D12Resources* resources{};
     ID3D12Resource* original_output{};
+    ID3D12Resource* composite_color{};
+    D3D12_RESOURCE_STATES color_state{D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    D3D12_RESOURCE_STATES output_state{D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    ~D3D12Evaluation() { if (resources) --resources->active_evaluations; }
     std::uint32_t original_width{};
     std::uint32_t original_height{};
     std::uint32_t original_out_width{};
@@ -906,8 +945,10 @@ D3D12Evaluation* prepare_d3d12(
         }
         return nullptr;
     }
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     const auto reconstruction = supersampled_crop(crop, settings.center_supersampling);
     auto* const resources = find_or_create_resources(
+        command_list,
         device,
         output,
         reconstruction.output_width,
@@ -940,6 +981,7 @@ D3D12Evaluation* prepare_d3d12(
 
     auto* const evaluation = new (std::nothrow) D3D12Evaluation{};
     if (evaluation == nullptr) {
+        --resources->active_evaluations;
         device->Release();
         diagnostic_note_state(
             DiagnosticApi::d3d12,
@@ -961,6 +1003,7 @@ D3D12Evaluation* prepare_d3d12(
     }
     evaluation->resources = resources;
     evaluation->original_output = output;
+    evaluation->composite_color = color;
     evaluation->original_width = render_width;
     evaluation->original_height = render_height;
     evaluation->original_out_width = output_width;
@@ -1016,10 +1059,9 @@ D3D12Evaluation* prepare_d3d12(
     evaluation->mask = effective_settings.afw_mask;
     evaluation->gaze_reset = gaze_reset;
 
-    const auto descriptor_set = resources->next_descriptor_set.fetch_add(
-        1U,
-        std::memory_order_relaxed
-    ) % descriptor_set_count;
+    const auto descriptor_set = resources->next_descriptor_set++;
+    resources->colors[descriptor_set] = color;
+    resources->outputs[descriptor_set] = output;
     evaluation->descriptor_offset =
         static_cast<std::uint64_t>(descriptor_set) * descriptors_per_set *
         resources->descriptor_size;
@@ -1112,11 +1154,15 @@ D3D12Evaluation* prepare_d3d12_streamline(
     const DlssViewId view_id,
     const Settings& settings,
     const bool diagnostic_trace,
-    const std::uint64_t diagnostic_sequence
+    const std::uint64_t diagnostic_sequence,
+    const D3D12_RESOURCE_STATES color_state,
+    const D3D12_RESOURCE_STATES output_state
 ) noexcept {
     if (!settings.enabled || command_list == nullptr || color == nullptr ||
         output == nullptr || color == output || render_width == 0U ||
-        render_height == 0U || output_width == 0U || output_height == 0U) {
+        render_height == 0U || output_width == 0U || output_height == 0U ||
+        static_cast<std::uint32_t>(color_state) == 0xFFFFFFFFU ||
+        static_cast<std::uint32_t>(output_state) == 0xFFFFFFFFU) {
         return nullptr;
     }
 
@@ -1157,8 +1203,10 @@ D3D12Evaluation* prepare_d3d12_streamline(
         device == nullptr) {
         return nullptr;
     }
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     const auto reconstruction = supersampled_crop(crop, settings.center_supersampling);
     auto* const resources = find_or_create_resources(
+        command_list,
         device,
         output,
         reconstruction.output_width,
@@ -1175,6 +1223,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
 
     auto* const evaluation = new (std::nothrow) D3D12Evaluation{};
     if (evaluation == nullptr) {
+        --resources->active_evaluations;
         device->Release();
         diagnostic_note_state(
             DiagnosticApi::d3d12,
@@ -1184,6 +1233,9 @@ D3D12Evaluation* prepare_d3d12_streamline(
     }
     evaluation->resources = resources;
     evaluation->original_output = output;
+    evaluation->composite_color = color;
+    evaluation->color_state = color_state;
+    evaluation->output_state = output_state;
     evaluation->render_width = render_width;
     evaluation->render_height = render_height;
     evaluation->composite_input_width = render_width;
@@ -1217,10 +1269,9 @@ D3D12Evaluation* prepare_d3d12_streamline(
     evaluation->diagnostic_trace = diagnostic_trace;
     evaluation->diagnostic_sequence = diagnostic_sequence;
 
-    const auto descriptor_set = resources->next_descriptor_set.fetch_add(
-        1U,
-        std::memory_order_relaxed
-    ) % descriptor_set_count;
+    const auto descriptor_set = resources->next_descriptor_set++;
+    resources->colors[descriptor_set] = color;
+    resources->outputs[descriptor_set] = output;
     evaluation->descriptor_offset =
         static_cast<std::uint64_t>(descriptor_set) * descriptors_per_set *
         resources->descriptor_size;
@@ -1266,6 +1317,7 @@ bool d3d12_set_composite_base(
     const std::uint32_t input_base_x,
     const std::uint32_t input_base_y
 ) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     if (evaluation == nullptr || evaluation->resources == nullptr ||
         low_resolution_color == nullptr) {
         return false;
@@ -1285,6 +1337,11 @@ bool d3d12_set_composite_base(
         &srv,
         cpu
     );
+    const auto slot = evaluation->descriptor_offset / (descriptors_per_set * resources->descriptor_size);
+    resources->colors[slot] = low_resolution_color;
+    evaluation->composite_color = low_resolution_color;
+    // Peripheral reconstruction leaves its private output shader-readable.
+    evaluation->color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     evaluation->color_x = input_base_x;
     evaluation->color_y = input_base_y;
     evaluation->composite_input_width = static_cast<std::uint32_t>(
@@ -1320,6 +1377,7 @@ void finish_d3d12(
     D3D12Evaluation* const evaluation,
     const NgxResult result
 ) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     if (evaluation == nullptr) {
         return;
     }
@@ -1403,6 +1461,12 @@ void finish_d3d12(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
         );
+        // The views address mip 0, array slice 0 only. Preserve the caller's
+        // declared states on that subresource and leave other slices untouched.
+        transition_resource(command_list, evaluation->composite_color,
+            evaluation->color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 0U);
+        transition_resource(command_list, evaluation->original_output,
+            evaluation->output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, 0U);
         if (evaluation->diagnostic_trace) {
             trace_event(
                 "SL eval=%llu composite descriptor/root binding begin",
@@ -1482,6 +1546,10 @@ void finish_d3d12(
             );
         }
         insert_uav_barrier(command_list, evaluation->original_output);
+        transition_resource(command_list, evaluation->original_output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, evaluation->output_state, 0U);
+        transition_resource(command_list, evaluation->composite_color,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, evaluation->color_state, 0U);
         transition_resource(
             command_list,
             resources->dlss_output,
@@ -1771,6 +1839,11 @@ void release_d3d12_view(const DlssViewId view_id) noexcept {
     release_dlss_nr_view(view_id);
 }
 
+void collect_d3d12_resources() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    collect_resources();
+}
+
 void release_d3d12_resources() noexcept {
     release_crop_motion12();
     for (;;) {
@@ -1785,16 +1858,11 @@ void release_d3d12_resources() noexcept {
 
     release_peripheral_dlaa_resources();
 
-    AcquireSRWLockExclusive(&resources_lock);
-    auto* current = resource_list;
-    resource_list = nullptr;
-    while (current != nullptr) {
-        auto* const next = current->next;
-        release_resources(current);
-        current = next;
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    for (auto* current = resource_list; current; current = current->next) {
+        current->retired = true;
     }
-    resource_use_sequence = 0U;
-    ReleaseSRWLockExclusive(&resources_lock);
+    collect_resources();
 
 }
 
