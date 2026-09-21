@@ -180,6 +180,32 @@ preservation of unrelated inputs, and rejection of ambiguous/stale viewport
 inputs. This models write-once constants; it does not execute Streamline itself.
 In a fresh game log, verify `motion constants applied`, `prepare complete`,
 and `original begin foveated=yes`. A failure now logs the constants result code.
+## Stereo images in support reports
+
+`CheekyTests.exe --stereo-support` checks DX11 and DX12 WARP captures at the
+production marker stamp/read points, including failed recognition, array slices,
+packed UV bounds and shader-resized/flipped HDR submissions. It verifies preview
+size limits with noisy pixels, missing-frame timeouts, and GPU resource retention
+when a report times out while command lists remain replayable or in flight.
+Small example archives are written to `%TEMP%/Cheeky-stereo-support-tests/<pid>`.
+
+Creating a support ZIP requests one calibration sample while VR and stereo
+calibration are active. Continue rendering gameplay for up to five seconds.
+The ZIP contains up to four images: `stereo-source-A.bmp`, `stereo-source-B.bmp`
+immediately after stamping, and `stereo-submitted-0.bmp`, `stereo-submitted-1.bmp`
+at readback. Source A/B are candidates, not confirmed physical eyes. The physical
+submitted eye (0 left, 1 right), original texture resolution, array slice, DLSS
+view rectangle, marker rectangle, submitted UV bounds and sampled rectangles
+are recorded in `stereo-capture.json` and the main report diagnostics.
+
+Previews preserve the full texture/aspect ratio, use nearest-neighbor resizing
+and clamp RGB to [0,1]; they are diagnostic images, not color-accurate HDR captures.
+Each is a 24-bit BMP below 1,000,000 bytes even without ZIP compression, with at
+most 300,000 pixels and a 1024-pixel longest side. There is no continuous image
+capture. Missing or failed readbacks leave an explicit status in the JSON and do
+not prevent the rest of the ZIP. Readback memory is capped at 128 MiB per image
+and 512 MiB across outstanding requests; larger textures report the limit.
+
 # D3D12 gaze copy mapping
 
 The normal test executable checks copy-chain translation, subresource isolation,

@@ -193,6 +193,8 @@ if(MSVC)
     target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
+add_test(NAME CheekyStereoSupportTests COMMAND CheekyTests --stereo-support)
+set_tests_properties(CheekyStereoSupportTests PROPERTIES TIMEOUT 60)
 add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
 add_test(NAME CheekyNrLifetimeTestsNoDebugLayer COMMAND CheekyTests --nr-lifetime)
 set_tests_properties(CheekyNrLifetimeTestsNoDebugLayer PROPERTIES

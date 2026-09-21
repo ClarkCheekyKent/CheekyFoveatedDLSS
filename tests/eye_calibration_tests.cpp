@@ -1,5 +1,6 @@
 #include "eye_calibration_pixels.hpp"
 #include "eye_calibration.hpp"
+#include "eye_calibration_capture.hpp"
 #include "settings.hpp"
 #include "support_zip.hpp"
 #include <wrl/client.h>
@@ -105,7 +106,7 @@ void test_support_archive_limits() {
     std::filesystem::remove(report_path);
 }
 void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
-                     bool obscure = false, bool duplicate_eye = false) {
+                     bool obscure = false, bool duplicate_eye = false, bool support_images = false) {
     register_stereo_view(101);
     register_stereo_view(202);
     Settings settings{};
@@ -125,6 +126,7 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     check(device->CreateTexture2D(&desc, nullptr, &packed));
     eye_calibration_reset_stats();
     eye_calibration_enable(true);
+    auto support = support_images ? request_calibration_images(true) : CalibrationImageRequestPtr{};
     auto frame = [&](bool swapped) {
         eye_calibration_frame();
         context->UpdateSubresource(a.Get(), 0, nullptr, black.data(), 128 * bytes, 0);
@@ -146,6 +148,33 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     for (unsigned i = 0; i < 320; ++i)
         frame(true);
     const auto warm = eye_calibration_stats();
+    if (support) {
+        const auto report = collect_calibration_images(support);
+        require(report.files.size() == 5, "DX11 support capture must retain both sources and submitted images even if recognition fails");
+        require(report.diagnostics.find("\"original_width\":256") != std::string::npos &&
+            report.diagnostics.find("\"submitted_uv_bounds\":[0.5,0,1,1]") != std::string::npos,
+            "DX11 support diagnostics must preserve full allocation size and packed eye bounds");
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto& bitmap = report.files[i].contents;
+            require(bitmap.size() < 1000000 && bitmap.starts_with("BM"), "Support image must be a bounded BMP");
+            const auto bright = std::count_if(bitmap.begin() + 54, bitmap.end(), [](char value) { return value != 0; });
+            require(i >= 2 ? (!obscure || bright == 0) : bright > 0,
+                "Capture must show source markers after stamping and actual obscured submitted pixels");
+        }
+        if (!obscure) {
+            require(report.files[2].contents == report.files[3].contents,
+                "Packed submissions must preserve the whole shared texture, with eye bounds in metadata");
+            for (unsigned y = 0; y < 128; ++y)
+                for (unsigned eye = 0; eye < 2; ++eye)
+                    require(report.files[2].contents.compare(54 + y * 256 * 3 + eye * 128 * 3, 128 * 3,
+                        report.files[1 - eye].contents, 54 + y * 128 * 3, 128 * 3) == 0,
+                        "Packed submitted pixels must match the swapped source captured after stamping");
+        }
+        const auto root = std::filesystem::temp_directory_path() / "Cheeky-stereo-support-tests" /
+            std::to_string(GetCurrentProcessId());
+        std::filesystem::create_directories(root);
+        write_support_zip(root / (obscure ? "dx11-obscured.zip" : "dx11-visible.zip"), report.files);
+    }
     if (obscure || duplicate_eye) {
         require(warm.rejected > 0 && warm.rejected + warm.valid == warm.completed,
                 "Rejected captures must be accounted for");
@@ -305,6 +334,45 @@ void run_calibration_policy() {
     unregister_stereo_view(8002);
 }
 } // namespace
+int run_stereo_support_tests() {
+    try {
+        // A large noisy input proves the limit without depending on compression.
+        auto request = request_calibration_images(true);
+        auto claimed = claim_calibration_images(123, 456, {7, 9});
+        require(claimed == request && !claim_calibration_images(124, 456, {}), "A request must select one interval only");
+        CalibrationImageInfo info; info.width = 2048; info.height = 1024; info.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        std::vector<unsigned char> pixels(std::size_t(info.width) * info.height * 4);
+        for (std::size_t i = 0; i < pixels.size(); ++i) pixels[i] = static_cast<unsigned char>((i * 73 + (i >> 11)) & 255);
+        for (unsigned i = 0; i < 4; ++i) {
+            require(begin_calibration_image(request, i, info), "Fresh capture slot available");
+            complete_calibration_image(request, i, pixels.data(), info.width * 4);
+        }
+        const auto report = collect_calibration_images(request);
+        require(report.files.size() == 5 && report.diagnostics.find("\"original_width\":2048") != std::string::npos,
+            "Full dimensions must survive preview resizing");
+        for (unsigned i = 0; i < 4; ++i) require(report.files[i].contents.size() < 1000000, "Noisy image exceeded 1 MB");
+        require(!begin_calibration_image(request, 0, info), "Finished reports must reject late GPU results");
+        require(collect_calibration_images(request_calibration_images(false)).files.size() == 1, "Disabled calibration exports its reason without images");
+        const auto timed_out = request_calibration_images(true, std::chrono::milliseconds(1));
+        require(collect_calibration_images(timed_out).diagnostics.find("unavailable") != std::string::npos,
+            "Missing frames must time out rather than block ZIP creation");
+        require(!reserve_calibration_image_memory(129ULL * 1024 * 1024), "Large readbacks must be bounded");
+        {
+            std::array<std::shared_ptr<CalibrationImageMemory>, 4> leases;
+            for (auto& lease : leases) {
+                lease = reserve_calibration_image_memory(128ULL * 1024 * 1024);
+                require(bool(lease), "Readback budget must allow four maximum-size images");
+            }
+            require(!reserve_calibration_image_memory(1), "Concurrent requests must share the total readback limit");
+        }
+        require(calibration_image_bytes.load() == 0, "Readback reservations must be released");
+        run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, false, false, true);
+        run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, true, false, true);
+        require(calibration_image_bytes.load() == 0, "DX11 capture buffers must drain");
+        std::cout << "PASS stereo support: bounded previews, timeout, DX11 stamped/submitted pixels and failed recognition\n";
+        return 0;
+    } catch (const std::exception& e) { std::cerr << "Stereo support: " << e.what() << '\n'; eye_calibration_stop(); return 1; }
+}
 int run_eye_calibration_tests() {
     try {
         run_calibration_policy();

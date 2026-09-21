@@ -3,6 +3,7 @@
 #include "settings_io.hpp"
 #include "frame_cadence.hpp"
 #include "support_bundle.hpp"
+#include "eye_calibration_capture.hpp"
 #include <shellapi.h>
 #pragma comment(lib, "shell32.lib")
 #include "graphics_observer.hpp"
@@ -243,6 +244,10 @@ DWORD WINAPI persistence_worker(void*) {
                 else { s.message = error; log_error(error.c_str()); }
             }
             if (s.report_requested.exchange(false)) {
+                const auto calibration = eye_calibration_stats();
+                const auto capture = request_calibration_images(calibration.enabled && calibration.runtime_active,
+                    std::chrono::seconds(5), calibration.enabled ? "vr_not_active" : "calibration_disabled");
+                auto images = collect_calibration_images(capture);
                 std::string text, settings, summary;
                 { std::lock_guard lock(s.mutex);
                     text = snapshot_locked(s); settings = serialize_settings(configured_settings());
@@ -257,10 +262,12 @@ DWORD WINAPI persistence_worker(void*) {
                         << "\n\nSettings:\n" << settings << "\nFull diagnostic snapshot and logs are in the attached ZIP.";
                     summary = details.str();
                 }
+                text.pop_back();
+                text += ",\"stereo_capture\":" + images.diagnostics + '}';
                 std::ofstream report(s.directory / L"CheekyFoveatedDLSS-diagnostics.json", std::ios::binary);
                 report << text; report.close();
                 if (!report) throw std::runtime_error("Could not write diagnostics JSON");
-                const auto zip = create_runtime_support_bundle(s.directory, text, settings, summary, s.host);
+                const auto zip = create_runtime_support_bundle(s.directory, text, settings, summary, s.host, std::move(images.files));
                 { std::lock_guard lock(s.mutex);
                     s.report_zip = zip; s.report_summary = summary;
                     s.message = "Support ZIP ready. Review the files, describe the problem on GitHub and attach the ZIP.";
@@ -514,7 +521,7 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
         if (action == "report" || action == "report_issue") {
             if (s.report_busy.exchange(true)) return true;
             s.report_browser = action == "report_issue"; s.report_requested = true;
-            SetEvent(s.save_event); s.message = "Preparing support ZIP"; return true;
+            SetEvent(s.save_event); s.message = "Capturing stereo diagnostics and preparing support ZIP (up to 5 seconds)"; return true;
         }
         if (action == "show_report" || action == "open_issue") {
             if (s.report_zip.empty()) { s.message = "Create a support ZIP first"; return false; }

@@ -1503,6 +1503,8 @@ void test_gaze_copy_routes() {
 
 int run_d3d12_composite_tests();
 int run_eye_calibration_tests();
+int run_stereo_support_tests();
+int run_stereo_support12_tests();
 int run_openxr_calibration_tests();
 int run_support_summary_tests();
 int run_nr_processing_tests();
@@ -2154,6 +2156,8 @@ int run_d3d12_safety_tests();
 int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--stereo-support") == 0)
+        return run_stereo_support_tests() + run_stereo_support12_tests();
     if (argc == 2 && std::strcmp(argv[1], "--alignment-history") == 0) {
         test_auto_alignment_history(false); test_auto_alignment_history(true); test_auto_alignment();
         if (!failures) std::cout << "Automatic alignment history tests passed\n";
@@ -2231,6 +2235,8 @@ int main(int argc, char** argv) {
     test_openxr_layer_is_retained_while_snapshot_export_is_cached();
     failures += run_support_summary_tests();
     failures += run_eye_calibration_tests();
+    failures += run_stereo_support_tests();
+    failures += run_stereo_support12_tests();
     failures += run_openxr_calibration_tests();
     failures += run_openxr_calibration_format_tests();
     failures += run_nr_processing_tests();

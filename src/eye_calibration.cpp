@@ -44,7 +44,14 @@ struct Submitted11 {
     DWORD thread{};
     bool active{}, ready{};
 };
+struct SupportReadback11 {
+    std::shared_ptr<CalibrationImageMemory> memory;
+    ComPtr<ID3D11Texture2D> staging;
+    bool published{};
+};
 struct Frame {
+    CalibrationImageRequestPtr support;
+    std::array<SupportReadback11, 4> support11;
     std::shared_ptr<Calibration12Frame> gpu12;
     ComPtr<ID3D12Device> device12;
     bool gpu12_used{}, classified{};
@@ -257,6 +264,42 @@ void finish(State& s, Frame& f) {
     }
     f.closed = true;
 }
+void capture_support11(Frame& f, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+    unsigned index, CalibrationImageInfo info) noexcept {
+    if (!begin_calibration_image(f.support, index, info)) return;
+    try {
+        auto& capture = f.support11[index];
+        D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
+        const auto bytes = calibration_pixel_bytes(desc.Format);
+        if (!bytes || desc.SampleDesc.Count != 1 || info.slice >= desc.ArraySize) {
+            fail_calibration_image(f.support, index, "unsupported_texture_layout"); return;
+        }
+        const auto source_subresource = info.slice * desc.MipLevels;
+        capture.memory = reserve_calibration_image_memory(std::uint64_t((desc.Width * bytes + 255) & ~255U) * desc.Height);
+        if (!capture.memory) { fail_calibration_image(f.support, index, "readback_memory_limit"); return; }
+        desc.MipLevels = desc.ArraySize = 1; desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = desc.MiscFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Device> device; texture->GetDevice(&device);
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &capture.staging))) {
+            capture.memory.reset(); fail_calibration_image(f.support, index, "readback_allocation_failed"); return;
+        }
+        context->CopySubresourceRegion(capture.staging.Get(), 0, 0, 0, 0, texture, source_subresource, nullptr);
+    } catch (...) { fail_calibration_image(f.support, index, "readback_allocation_failed"); }
+}
+bool poll_support11(Frame& f, ID3D11DeviceContext* context, unsigned index) noexcept {
+    auto& capture = f.support11[index];
+    if (!capture.staging || capture.published) return true;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const auto hr = context->Map(capture.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    if (SUCCEEDED(hr)) {
+        complete_calibration_image(f.support, index, mapped.pData, mapped.RowPitch);
+        context->Unmap(capture.staging.Get(), 0);
+    } else fail_calibration_image(f.support, index, "readback_map_failed");
+    capture.published = true;
+    capture.staging.Reset(); capture.memory.reset();
+    return true;
+}
 void poll_submitted(Frame& f) {
     for (unsigned eye = 0; eye < 2; ++eye) {
         auto& capture = f.submitted11[eye];
@@ -264,7 +307,7 @@ void poll_submitted(Frame& f) {
         const auto hr = capture.context->GetData(capture.done.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
         if (hr == S_FALSE) continue;
         if (FAILED(hr)) { f.invalid = true; capture.ready = true; continue; }
-        bool waiting{};
+        bool waiting = !poll_support11(f, capture.context.Get(), 2 + eye);
         for (unsigned c = 0; c < 2; ++c) {
             const unsigned i = 4 + eye * 2 + c;
             auto& p = f.patches[i];
@@ -356,6 +399,10 @@ void poll(State& s) {
                 continue;
             }
             bool waiting{};
+            for (unsigned i = 0; i < 4; ++i) {
+                if (i >= 2 && f.submitted11[i - 2].active) continue;
+                if (!poll_support11(f, f.context.Get(), i)) waiting = true;
+            }
             for (unsigned i = 0; i < f.patches.size(); ++i) {
                 if (i >= 4 && f.submitted11[(i - 4) / 2].active) continue;
                 auto& p = f.patches[i];
@@ -701,6 +748,8 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.codes = f.pipelined ? capture_codes(s.epoch) :
             std::array<std::uint32_t, 2>{};
         f.sequence = s.sequence;
+        f.support = claim_calibration_images(f.sequence, session_generation, f.codes);
+        f.support11 = {};
         f.busy = true;
         f.closed = f.close_requested = f.invalid = f.queries_started = false;
         f.epoch = s.epoch;
@@ -834,6 +883,11 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         context->CopySubresourceRegion(texture.Get(), 0, px, py, 0, s.markers[c].Get(), 0, nullptr);
         if (!copy_patch(s, f, c * 2 + 1, texture.Get(), px, py, block, block))
             f.invalid = true;
+        CalibrationImageInfo image;
+        image.width = desc.Width; image.height = desc.Height; image.format = desc.Format; image.graphics_api = 11;
+        image.view = view; image.prior_eye = f.views[c].assigned;
+        image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block};
+        capture_support11(f, context, texture.Get(), c, image);
         context->End(f.timestamp[c * 2 + 1].Get());
         f.segments[c] = true;
     } catch (...) {
@@ -892,7 +946,11 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
                       stereo_view_generation(view)};
         const auto px = x + (c ? width - inset - block : inset), py = y + inset;
         Calibration12Failure failure;
-        if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure)) {
+        CalibrationImageInfo image;
+        image.width = unsigned(d.Width); image.height = d.Height; image.format = d.Format; image.graphics_api = 12;
+        image.view = view; image.prior_eye = f.views[c].assigned;
+        image.view_rect = {x, y, width, height}; image.marker_rect = {px, py, block, block};
+        if (!calibration12_stamp(*f.gpu12, list, output, c, px, py, output_state, s.stats.allocations, &failure, f.support, image)) {
             f.invalid = true;
             ++s.stats.d3d12_stamp_failures;
             s.stats.d3d12_last_stamp_failure = failure.stage;
@@ -960,8 +1018,14 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
                                     ? D3D12_RESOURCE_STATE_RENDER_TARGET
                                     : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     Calibration12Failure failure;
+    CalibrationImageInfo image;
+    image.width = unsigned(d.Width); image.height = d.Height; image.format = d.Format; image.graphics_api = 12;
+    image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1};
+    image.sample_count = unsigned(boxes.size());
+    for (unsigned i = 0; i < boxes.size(); ++i) image.sample_rects[i] =
+        {boxes[i].left, boxes[i].top, boxes[i].right - boxes[i].left, boxes[i].bottom - boxes[i].top};
     if (!calibration12_capture(*f.gpu12, queue, texture, eye, slice, expected_state, boxes,
-                               s.stats.allocations, &failure)) {
+                               s.stats.allocations, &failure, f.support, image)) {
         f.invalid = true;
         ++s.stats.d3d12_capture_failures;
         s.stats.d3d12_last_capture_failure = failure.stage;
@@ -1097,6 +1161,9 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
         }
         submitted.thread = GetCurrentThreadId();
     } else context->End(f.timestamp[4 + eye * 2].Get());
+    CalibrationImageInfo image;
+    image.width = desc.Width; image.height = desc.Height; image.format = desc.Format; image.graphics_api = 11;
+    image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1}; image.sample_count = 2;
     for (unsigned c = 0; c < 2; ++c) {
         const auto& ref = f.views[c].width ? f.views[c] : f.views[0];
         if (!ref.width || !ref.height) {
@@ -1113,9 +1180,11 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
                        y = unsigned(std::floor((std::min)(ay, by)));
         const unsigned w = unsigned(std::ceil((std::max)(ax, bx))) - x,
                        h = unsigned(std::ceil((std::max)(ay, by))) - y;
+        image.sample_rects[c] = {x, y, w, h};
         if (!copy_patch(s, f, 4 + eye * 2 + c, texture, x, y, w, h, ref.width, ref.height, slice, context.Get()))
             f.invalid = true;
     }
+    capture_support11(f, context.Get(), texture, 2 + eye, image);
     if (independent_capture) {
         context->End(submitted.done.Get());
         submitted.active = true;
@@ -1140,6 +1209,7 @@ void eye_calibration_result(std::uint64_t ticket, int result, unsigned physical_
             f.result[ticket & 1] = result;
             if (physical_eye != ~0U)
                 f.physical_eyes[ticket & 1] = physical_eye;
+            calibration_image_physical_eye(f.support, 2 + unsigned(ticket & 1), f.physical_eyes[ticket & 1]);
         }
 }
 void eye_calibration_unsupported_submit() noexcept {

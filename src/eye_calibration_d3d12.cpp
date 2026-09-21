@@ -73,6 +73,12 @@ struct Patch {
     UINT64 bytes{};
     bool used{};
 };
+struct SupportReadback {
+    std::shared_ptr<CalibrationImageMemory> memory;
+    Patch patch;
+    CalibrationImageRequestPtr request;
+    bool published{};
+};
 struct FencePoint {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
@@ -121,6 +127,7 @@ struct Calibration12Frame {
     std::mutex mutex;
     ComPtr<ID3D12Device> device;
     std::array<Patch, 12> patches;
+    std::array<SupportReadback, 4> support;
     std::array<Segment, 4> segments;
     std::array<ComPtr<ID3D12Resource>, 2> markers;
     std::array<DXGI_FORMAT, 2> marker_formats{};
@@ -134,6 +141,49 @@ struct Calibration12Frame {
     std::uint64_t asynchronous_allocations{};
 };
 namespace {
+// Called within the existing COPY_SOURCE interval; no compute state changes.
+void support_copy(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
+    unsigned subresource, unsigned index, const CalibrationImageRequestPtr& request) noexcept {
+    try {
+        auto desc = texture->GetDesc();
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        auto& capture = f.support[index];
+        capture.request = request;
+        f.device->GetCopyableFootprints(&desc, 0, 1, 0, &capture.patch.footprint, nullptr, nullptr, &capture.patch.bytes);
+        capture.memory = reserve_calibration_image_memory(capture.patch.bytes);
+        if (!capture.memory) { fail_calibration_image(request, index, "readback_memory_limit"); return; }
+        if (!buffer(f.device.Get(), D3D12_HEAP_TYPE_READBACK, capture.patch.bytes, capture.patch.buffer)) {
+            capture.memory.reset(); fail_calibration_image(request, index, "readback_allocation_failed"); return;
+        }
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        src.pResource = texture; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = subresource;
+        dst.pResource = capture.patch.buffer.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = capture.patch.footprint;
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        capture.patch.used = true;
+    } catch (...) { fail_calibration_image(request, index, "readback_allocation_failed"); }
+}
+void support_poll(Calibration12Frame& f) noexcept {
+    for (unsigned i = 0; i < f.support.size(); ++i) {
+        auto& capture = f.support[i];
+        if (!capture.patch.used || capture.published) continue;
+        // Never map data from a discarded or unobserved source recording.
+        const auto& segment = f.segments[i];
+        if (!segment.submitted) {
+            fail_calibration_image(capture.request, i, "recording_not_submitted");
+        } else {
+            void* data{};
+            const D3D12_RANGE range{0, SIZE_T(capture.patch.bytes)};
+            if (SUCCEEDED(capture.patch.buffer->Map(0, &range, &data))) {
+                complete_calibration_image(capture.request, i,
+                    static_cast<const unsigned char*>(data) + capture.patch.footprint.Offset,
+                    capture.patch.footprint.Footprint.RowPitch);
+                const D3D12_RANGE empty{0, 0}; capture.patch.buffer->Unmap(0, &empty);
+            } else fail_calibration_image(capture.request, i, "readback_map_failed");
+        }
+        capture.published = true;
+    }
+}
 bool completed(const Segment& s) {
     if (s.untracked)
         return false;
@@ -292,6 +342,7 @@ bool calibration12_begin(Calibration12Frame& f) noexcept {
         return false;
     f.invalid = false;
     f.failure = {};
+    f.support = {}; // reusable() above includes retirement and all GPU fences.
     for (auto& p : f.patches)
         p.used = false;
     for (auto& s : f.segments) {
@@ -305,10 +356,13 @@ bool calibration12_begin(Calibration12Frame& f) noexcept {
 }
 bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
                          unsigned candidate, unsigned x, unsigned y, D3D12_RESOURCE_STATES state,
-                         std::uint64_t& allocations, Calibration12Failure* failure) noexcept {
+                         std::uint64_t& allocations, Calibration12Failure* failure,
+                         const CalibrationImageRequestPtr& support, const CalibrationImageInfo& support_info) noexcept {
     if (failure) *failure = {};
+    const bool capture_image = begin_calibration_image(support, candidate, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
         if (failure) *failure = {stage, hr};
+        if (capture_image) fail_calibration_image(support, candidate, stage);
         return false;
     };
     try {
@@ -387,6 +441,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
         list->CopyTextureRegion(&dst, x, y, 0, &src, nullptr);
         transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
         copy_patch(f, list, candidate * 2 + 1, texture, 0, box);
+        if (capture_image) support_copy(f, list, texture, 0, candidate, support);
         transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
         end_segment(f, list, candidate);
         return true;
@@ -397,10 +452,13 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
 bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3D12Resource* texture,
                            unsigned eye, unsigned slice, D3D12_RESOURCE_STATES state,
                            const std::array<D3D12_BOX, 4>& boxes, std::uint64_t& allocations,
-                           Calibration12Failure* failure) noexcept {
+                           Calibration12Failure* failure, const CalibrationImageRequestPtr& support,
+                           const CalibrationImageInfo& support_info) noexcept {
     if (failure) *failure = {};
+    const bool capture_image = begin_calibration_image(support, 2 + eye, support_info);
     const auto reject = [&](const char* stage, HRESULT hr = S_OK) {
         if (failure) *failure = {stage, hr};
+        if (capture_image) fail_calibration_image(support, 2 + eye, stage);
         return false;
     };
     if (!queue || !texture || eye > 1 || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
@@ -457,6 +515,7 @@ bool calibration12_capture(Calibration12Frame& f, ID3D12CommandQueue* queue, ID3
     transition(list.Get(), texture, subresource, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (unsigned c = 0; c < boxes.size(); ++c)
         copy_patch(f, list.Get(), (c < 2 ? 4U : 8U) + eye * 2 + c % 2, texture, subresource, boxes[c]);
+    if (capture_image) support_copy(f, list.Get(), texture, subresource, 2 + eye, support);
     transition(list.Get(), texture, subresource, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     end_segment(f, list.Get(), 2 + eye);
     hr = list->Close();
@@ -527,6 +586,7 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f) noexcept {
         if (!completed(s))
             return out;
     out.ready = true;
+    support_poll(f); // Preserve evidence even when marker classification fails.
     out.valid = !f.invalid && SUCCEEDED(f.device->GetDeviceRemovedReason());
     out.failure = f.failure;
     for (unsigned i = 0; i < f.patches.size(); ++i) {

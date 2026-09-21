@@ -499,6 +499,8 @@ int main(int argc, char** argv) {
         require(report.filename().string().starts_with(optiscaler ? "Cheeky-OptiScaler-" : "Cheeky-Standalone-"), "Support filename uses host identity");
         std::ifstream zip(report, std::ios::binary);
         const std::string zip_contents((std::istreambuf_iterator<char>(zip)), std::istreambuf_iterator<char>());
+        require(contains(zip_contents, "stereo-capture.json") && contains(zip_contents, "\"stereo_capture\":"),
+            "Support ZIP must include capture diagnostics even when VR is unavailable");
         require(contains(zip_contents, optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"), "Support ZIP includes this host's log");
 
         const auto old_attachment = attachment;

@@ -43,12 +43,19 @@ inline std::wstring support_issue_url(const std::filesystem::path& zip, const st
         + L"&diagnostics=" + encode(summary) + L"&problem=Describe%20the%20problem%20here.&steps=Describe%20how%20to%20reproduce%20it.";
 }
 inline std::filesystem::path create_runtime_support_bundle(const std::filesystem::path& directory,
-    const std::string& snapshot, const std::string& settings, const std::string& summary, CheekyRuntimeHost host) {
+    const std::string& snapshot, const std::string& settings, const std::string& summary, CheekyRuntimeHost host,
+    std::vector<SupportFile> capture_files = {}) {
     const auto name = std::string(runtime_support_name(host));
     std::vector<SupportFile> files{{"diagnostics.json", snapshot}, {"settings.ini", settings},
         {"issue-report.md", "# Cheeky " + name + " support report\n\n" + summary + "\n\nFull diagnostics: diagnostics.json\nReview the files before sharing; logs may contain personal paths.\n"}};
     std::ostringstream manifest;
     manifest << "Cheeky " CHEEKY_VERSION " " << name << " support bundle\nLogs are limited to the latest 2 MiB per file.\n";
+    if (!capture_files.empty()) {
+        manifest << "Stereo capture: stereo-capture.json describes original resolutions, crops, sample regions and unavailable images.\n"
+            << "Source A/B are unconfirmed candidates. Submitted eye labels are in the JSON.\n"
+            << "Images show the full texture, downscaled below 1 MB each; HDR values are clamped for preview.\n";
+        for (auto& file : capture_files) files.push_back(std::move(file));
+    }
     std::vector<const char*> logs{runtime_log_filename(host)};
     if (host == CheekyRuntimeHost::uevr) { logs.push_back("log.txt"); logs.push_back("config.txt"); }
     else logs.push_back("CheekyFoveatedDLSS-Host.log");

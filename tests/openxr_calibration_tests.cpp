@@ -448,7 +448,7 @@ void openxr11() {
     require(!eye_calibration_stats().in_flight, "OpenXR D3D11 readbacks did not drain");
     cleanup();
 }
-void openxr11_pipeline(bool hardware, bool separate_device = false) {
+void openxr11_pipeline(bool hardware, bool separate_device = false, bool support_images = false) {
     roles();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -520,12 +520,21 @@ void openxr11_pipeline(bool hardware, bool separate_device = false) {
         Sleep(2);
         eye_calibration_tick();
     };
+    auto support = support_images ? request_calibration_images(true) : CalibrationImageRequestPtr{};
     // Matches the BG3 trace: A, XR release on another thread, B, XR end.
     for (unsigned i = 0; i < 100; ++i) render(false, false, false);
     const auto warm = eye_calibration_stats();
     require(warm.applied > 0 && stereo_eye_assignment(9101).calibrated &&
         stereo_eye_assignment(9101).eye_index == 0,
         "Cross-thread AER pipeline must map using both pre-release eye copies");
+    if (support) {
+        const auto report = collect_calibration_images(support);
+        require(report.files.size() == 5 && report.files[0].contents == report.files[2].contents &&
+                    report.files[1].contents == report.files[3].contents,
+                "AER support images must retain both source eyes and capture submitted pixels before XR reuses them");
+        require(report.diagnostics.find("\"array_slice\":1") != std::string::npos,
+                "AER diagnostics must identify each submitted array slice");
+    }
     ComPtr<ID3D11Multithread> protection;
     check(context.As(&protection));
     require(protection->GetMultithreadProtected(), "Cross-thread copies require D3D context protection");
@@ -830,14 +839,24 @@ void recording_lifetime12() {
     auto frame = calibration12_create(gpu.device.Get());
     std::uint64_t allocations{};
     require(calibration12_begin(*frame), "Fresh recording slot must be reusable");
+    const auto support = request_calibration_images(true);
+    CalibrationImageInfo image;
+    image.width = image.height = 128; image.format = DXGI_FORMAT_R8G8B8A8_UNORM; image.graphics_api = 12;
     gpu.begin();
     require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
-                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations),
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations, nullptr, support, image),
             "Lifetime test stamp failed");
     gpu.execute();
     gpu.wait(gpu.queue.Get());
     require(!calibration12_poll(*frame).ready && !calibration12_begin(*frame),
             "Completed but still resubmittable recordings must not be mapped or reused");
+    require(support->images[0].bitmap.empty() && calibration_image_bytes.load() > 0,
+            "Support image must wait for command-list retirement before mapping");
+    support->deadline = std::chrono::steady_clock::now(); // Deterministic timeout while the list remains replayable.
+    const auto timed_out = collect_calibration_images(support);
+    require(timed_out.files.size() == 1 && timed_out.diagnostics.find("gpu_readback_timeout") != std::string::npos &&
+                calibration_image_bytes.load() > 0,
+            "Support ZIP timeout must not release resources referenced by a replayable GPU recording");
     ComPtr<ID3D12Fence> gate;
     check(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate)));
     check(gpu.submit_queue->Wait(gate.Get(), 1));
@@ -854,6 +873,8 @@ void recording_lifetime12() {
     require(calibration12_poll(*frame).reusable,
             "Both queue timelines must drain after recording retirement");
     require(calibration12_begin(*frame), "Retired recording slot must be reusable");
+    require(calibration_image_bytes.load() == 0 && support->images[0].bitmap.empty(),
+            "Timed-out support images must drain only after retirement and ignore late results");
     gpu.begin();
     require(calibration12_stamp(*frame, gpu.list.Get(), texture.Get(), 0, 12, 12,
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, allocations),
@@ -904,7 +925,7 @@ void failure_diagnostics12() {
 void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
            DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, bool converted = false,
            bool flipped = false, bool ambiguous = false, bool shifted = false,
-           bool late_begin = false, bool fail_end = false) {
+           bool late_begin = false, bool fail_end = false, bool support_images = false) {
     roles();
     GPU12 gpu(hardware);
     const auto state = backend == EyeCalibrationBackend::openxr ? D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -943,6 +964,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     memset(mapped, 0, 128 * 128 * 4);
     black->Unmap(0, nullptr);
     std::uint64_t warm_allocations{};
+    auto support = support_images ? request_calibration_images(true) : CalibrationImageRequestPtr{};
     for (unsigned frame = 0; frame < (layer ? 641U : 640U); ++frame) {
         bool sampling{};
         if (layer) {
@@ -1008,6 +1030,40 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     else
         eye_calibration_frame(backend, generation, 12);
     const auto stats = eye_calibration_stats();
+    if (support) {
+        const auto report = collect_calibration_images(support);
+        require(report.files.size() == 5, "DX12 support capture must retain both sources and both submitted slices");
+        require(report.diagnostics.find("\"graphics_api\":12") != std::string::npos &&
+            report.diagnostics.find("\"original_width\":" + std::to_string(allocation_width)) != std::string::npos &&
+            report.diagnostics.find("\"original_height\":" + std::to_string(target_height)) != std::string::npos,
+            "DX12 capture must report original source/submitted dimensions");
+        if (array) require(report.diagnostics.find("\"array_slice\":1") != std::string::npos,
+            "DX12 support captures must identify the right array slice");
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto& bitmap = report.files[i].contents;
+            require(bitmap.size() < 1000000 && bitmap.starts_with("BM"), "DX12 image must be a bounded bitmap");
+            if (i < 2) require(std::any_of(bitmap.begin() + 54, bitmap.end(), [](char pixel) { return pixel != 0; }),
+                "DX12 source image must show the marker after stamping");
+        }
+        if (array) {
+            const auto source_stride = (allocation_width * 3 + 3) & ~3U;
+            const auto target_stride = (target_width * 3 + 3) & ~3U;
+            for (unsigned eye = 0; eye < 2; ++eye)
+                for (unsigned y = 0; y < target_height; ++y)
+                    for (unsigned x = 0; x < target_width; ++x) {
+                        const auto sx = x * 128 / target_width;
+                        const auto sy = flipped ? 127 - y * 128 / target_height : y * 128 / target_height;
+                        require(report.files[2 + eye].contents.compare(
+                            54 + (target_height - 1 - y) * target_stride + x * 3, 3,
+                            report.files[1 - eye].contents, 54 + (127 - sy) * source_stride + sx * 3, 3) == 0,
+                            "Submitted image must capture the correct swapped array slice, scaling and vertical orientation");
+                    }
+        }
+        const auto root = std::filesystem::temp_directory_path() / "Cheeky-stereo-support-tests" /
+            std::to_string(GetCurrentProcessId());
+        std::filesystem::create_directories(root);
+        write_support_zip(root / (converted ? "dx12-converted.zip" : "dx12-array.zip"), report.files);
+    }
     if (ambiguous) {
         require(stats.valid == 0 && !stereo_eye_assignment(9101).calibrated &&
                     stats.rejection_counts[7] >= 63,
@@ -1039,6 +1095,21 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     cleanup();
 }
 } // namespace
+int run_stereo_support12_tests() {
+    try {
+        openxr11_pipeline(false, false, true);
+        openxr11_pipeline(false, true, true);
+        recording_lifetime12();
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R8G8B8A8_UNORM,
+            false, false, false, false, false, false, true);
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT,
+            true, true, false, false, false, false, true);
+        require(calibration_image_bytes.load() == 0, "DX12 support readbacks must retire after GPU completion");
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "OpenXR stereo support: " << e.what() << '\n'; cleanup(); return 1;
+    }
+}
 int run_openxr_calibration_format_tests() {
     try {
         for (bool flipped : {false, true})
