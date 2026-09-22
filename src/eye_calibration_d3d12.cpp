@@ -160,9 +160,12 @@ namespace {
 void search_copy(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
     unsigned subresource, unsigned eye, const CalibrationSearchPtr& request, std::array<float, 4> bounds) noexcept {
     if (!request) return;
+    request->capture_started_ms=calibration_clock_ms();
     try {
         auto& capture = f.search_readbacks[eye];
         f.searches[eye] = request; f.search_bounds[eye] = bounds;
+        request->copy_issued_ms = GetTickCount64();
+        request->texture_identity = reinterpret_cast<std::uintptr_t>(texture);
         auto desc = texture->GetDesc(); desc.DepthOrArraySize = desc.MipLevels = 1;
         f.device->GetCopyableFootprints(&desc, 0, 1, 0, &capture.patch.footprint, nullptr, nullptr, &capture.patch.bytes);
         capture.memory = reserve_calibration_image_memory(capture.patch.bytes);
@@ -174,6 +177,8 @@ void search_copy(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12R
         dst.pResource = capture.patch.buffer.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint = capture.patch.footprint;
         list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        request->copy_recorded_ms=calibration_clock_ms();
+        request->setup_ms=request->copy_recorded_ms-request->capture_started_ms;
         capture.patch.used = true;
     } catch (...) { request->ready = true; }
 }
@@ -184,10 +189,17 @@ void search_poll(Calibration12Frame& f) noexcept {
         CalibrationSearchImage image;
         void* data{};
         const D3D12_RANGE range{0, SIZE_T(capture.patch.bytes)};
-        if (f.segments[2 + eye].submitted && SUCCEEDED(capture.patch.buffer->Map(0, &range, &data))) {
+        auto& request = f.searches[eye];
+        const auto map_start=calibration_clock_ms();
+        ++request->map_polls;
+        request->map_result = f.segments[2 + eye].submitted ? capture.patch.buffer->Map(0, &range, &data) : E_PENDING;
+        request->map_cpu_ms+=calibration_clock_ms()-map_start;
+        request->readback_ready_ms = GetTickCount64();
+        if (SUCCEEDED(request->map_result)) request->readback_wall_ms=calibration_clock_ms()-request->copy_recorded_ms;
+        if (SUCCEEDED(request->map_result)) {
             const auto& d = capture.patch.footprint.Footprint;
             try { image = calibration_search_image(static_cast<const unsigned char*>(data) + capture.patch.footprint.Offset,
-                d.RowPitch, d.Width, d.Height, d.Format, f.search_bounds[eye]); } catch (...) {}
+                d.RowPitch, d.Width, d.Height, d.Format, f.search_bounds[eye], true); } catch (...) {}
             const D3D12_RANGE empty{0, 0}; capture.patch.buffer->Unmap(0, &empty);
         }
         calibration_search_start(f.searches[eye], std::move(image));

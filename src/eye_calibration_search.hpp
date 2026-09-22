@@ -1,7 +1,9 @@
 #pragma once
 #include "eye_calibration_placement.hpp"
+#include "eye_calibration_capture.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <unordered_map>
@@ -21,22 +23,47 @@ struct CalibrationSearchResult {
     float score{};
     unsigned support_points{};
 };
+inline double calibration_clock_ms() {
+    return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 struct CalibrationSearch {
     std::vector<CalibrationSearchTarget> targets;
     std::atomic<bool> started{}, ready{}, canceled{};
     CalibrationSearchResult result;
     bool require_grid{};
     bool timed{};
-    double elapsed_ms{};
+    double capture_started_ms{}, copy_recorded_ms{}, setup_ms{-1}, map_cpu_ms{}, readback_wall_ms{-1}, capture_total_ms{-1};
+    double elapsed_ms{}, conversion_ms{}, sampled_min{}, sampled_max{}, sampled_mean{};
+    unsigned image_width{}, image_height{}, sample_count{}, sampled_black{};
+    unsigned initial_locator_factor{}, last_locator_factor{}, locator_passes{};
+    bool search_budget_exhausted{};
+    std::uint64_t copy_issued_ms{}, readback_ready_ms{};
+    unsigned map_polls{};
+    long map_result{};
+    std::uintptr_t texture_identity{};
 };
 using CalibrationSearchPtr = std::shared_ptr<CalibrationSearch>;
 struct CalibrationSearchImage {
     unsigned width{}, height{};
     double original_width{}, original_height{};
     std::vector<float> pixels;
+    double conversion_ms{};
+    std::shared_ptr<unsigned char[]> raw;
+    std::shared_ptr<CalibrationImageMemory> raw_memory;
+    unsigned raw_width{}, raw_height{}, raw_pitch{}, raw_bytes{};
+    DXGI_FORMAT raw_format{};
+    std::array<float,4> raw_bounds{};
+    float sample(unsigned x, unsigned y) const {
+        if (!raw) return pixels[std::size_t(y)*width+x];
+        const auto sx = unsigned(std::clamp((raw_bounds[0]+(x+.5)/width*(raw_bounds[2]-raw_bounds[0]))*raw_width,0.,double(raw_width-1)));
+        const auto sy = unsigned(std::clamp((raw_bounds[1]+(y+.5)/height*(raw_bounds[3]-raw_bounds[1]))*raw_height,0.,double(raw_height-1)));
+        const auto p=calibration_decode(raw.get()+std::size_t(sy)*raw_pitch+sx*raw_bytes,raw_format);
+        return std::isfinite(p.r+p.g+p.b) ? (p.r+p.g+p.b)/3 : 0;
+    }
 };
 inline CalibrationSearchImage calibration_search_image(const void* data, unsigned pitch,
-    unsigned width, unsigned height, DXGI_FORMAT format, std::array<float, 4> bounds) {
+    unsigned width, unsigned height, DXGI_FORMAT format, std::array<float, 4> bounds, bool sparse = false) {
+    const auto conversion_start = std::chrono::steady_clock::now();
     CalibrationSearchImage image;
     const unsigned bytes = calibration_pixel_bytes(format);
     if (!data || !bytes || !width || !height || std::uint64_t(width) * bytes > pitch) return image;
@@ -46,6 +73,20 @@ inline CalibrationSearchImage calibration_search_image(const void* data, unsigne
     const double scale = 1.;
     image.width = unsigned(image.original_width * scale);
     image.height = unsigned(image.original_height * scale);
+    if (sparse) {
+        // Own packed source bytes before Unmap. Decode only requested samples on the worker.
+        // This retains the full readback but avoids full-image float allocation/conversion.
+        image.raw_width=width; image.raw_height=height; image.raw_pitch=width*bytes;
+        image.raw_bytes=bytes; image.raw_format=format; image.raw_bounds=bounds;
+        image.raw_memory=reserve_calibration_image_memory(std::uint64_t(image.raw_pitch)*height);
+        if (!image.raw_memory) return {};
+        image.raw.reset(new unsigned char[std::size_t(image.raw_pitch)*height]);
+        for(unsigned y=0;y<height;++y)
+            std::memcpy(image.raw.get()+std::size_t(y)*image.raw_pitch,
+                static_cast<const unsigned char*>(data)+std::size_t(y)*pitch,image.raw_pitch);
+        image.conversion_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-conversion_start).count();
+        return image;
+    }
     image.pixels.resize(std::size_t(image.width) * image.height);
     for (unsigned y = 0; y < image.height; ++y) for (unsigned x = 0; x < image.width; ++x) {
         const auto sx = (std::min)(width - 1, unsigned((bounds[0] + (x + .5) / image.width * (bounds[2] - bounds[0])) * width));
@@ -53,21 +94,28 @@ inline CalibrationSearchImage calibration_search_image(const void* data, unsigne
         const auto p = calibration_decode(static_cast<const unsigned char*>(data) + std::size_t(sy) * pitch + sx * bytes, format);
         image.pixels[std::size_t(y) * image.width + x] = std::isfinite(p.r + p.g + p.b) ? (p.r + p.g + p.b) / 3 : 0;
     }
+    image.conversion_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-conversion_start).count();
     return image;
 }
 struct CalibrationLocatorBox { double x, y, width, height; };
 // A dark connected ring enclosed by a light ring supplies an approximate box.
 // No code templates or scale sweep are evaluated during this coarse pass.
 inline std::vector<CalibrationLocatorBox> calibration_locators(const CalibrationSearchImage& image,
-    unsigned factor, const std::atomic<bool>* canceled) {
+    unsigned factor, const std::atomic<bool>* canceled,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    const auto stop = [&] { return (canceled && canceled->load(std::memory_order_relaxed)) || std::chrono::steady_clock::now() >= deadline; };
     const unsigned w = image.width/factor, h = image.height/factor;
     if (!w || !h) return {};
     std::vector<float> gray(std::size_t(w)*h);
-    for (unsigned y=0; y<h; ++y) for (unsigned x=0; x<w; ++x) {
-        double sum{};
-        for (unsigned j=0; j<factor; ++j) for (unsigned i=0; i<factor; ++i)
-            sum += image.pixels[std::size_t(y*factor+j)*image.width+x*factor+i];
-        gray[std::size_t(y)*w+x] = float(sum/(factor*factor));
+    for (unsigned y=0; y<h; ++y) {
+        if (stop()) return {};
+        for (unsigned x=0; x<w; ++x) {
+            double sum{};
+            // Four stratified samples, independent of reduction factor.
+            for (double j : {.25,.75}) for (double i : {.25,.75})
+                sum += image.sample(x*factor+unsigned(i*factor),y*factor+unsigned(j*factor));
+            gray[std::size_t(y)*w+x] = float(sum*.25);
+        }
     }
     std::vector<CalibrationLocatorBox> boxes;
     std::vector<unsigned char> seen(gray.size());
@@ -75,11 +123,12 @@ inline std::vector<CalibrationLocatorBox> calibration_locators(const Calibration
     for (float threshold : {.25F, .5F, .75F}) {
         std::fill(seen.begin(), seen.end(), static_cast<unsigned char>(0));
         for (unsigned seed=0; seed<gray.size(); ++seed) {
-            if (canceled && seed%4096==0 && canceled->load(std::memory_order_relaxed)) return {};
+            if (seed%4096==0 && stop()) return {};
             if (seen[seed] || gray[seed] >= threshold) continue;
             queue.clear(); queue.push_back(seed); seen[seed]=1;
             unsigned x0=seed%w, x1=x0, y0=seed/w, y1=y0;
             for (std::size_t q=0; q<queue.size(); ++q) {
+                if (q%4096==0 && stop()) return {};
                 const unsigned pos=queue[q], x=pos%w, y=pos/w;
                 x0=(std::min)(x0,x); x1=(std::max)(x1,x);
                 y0=(std::min)(y0,y); y1=(std::max)(y1,y);
@@ -116,6 +165,7 @@ struct CalibrationSearchOptions {
     bool tracking{};
     bool require_grid{};
     unsigned locator_factor{4};
+    std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
 };
 inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& image,
     const std::vector<CalibrationSearchTarget>& targets, const std::atomic<bool>* canceled = nullptr,
@@ -139,8 +189,8 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
         for (unsigned bit = 0; bit < 25; ++bit) words[code ^ (1U << bit)].push_back(index);
     }
     auto sample = [&](double x, double y) {
-        return image.pixels[std::size_t(std::clamp(int(y), 0, int(image.height) - 1)) * image.width +
-            std::clamp(int(x), 0, int(image.width) - 1)];
+        return image.sample(unsigned(std::clamp(int(x),0,int(image.width)-1)),
+            unsigned(std::clamp(int(y),0,int(image.height)-1)));
     };
     auto score = [&](double x, double y, double cw, double ch, std::uint32_t code) {
         if (x < 0 || y < 0 || x + 5 * cw > image.width || y + 5 * ch > image.height) return 0.F;
@@ -171,7 +221,7 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     struct Window { double x0,y0,x1,y1,cell,cy; };
     std::vector<Window> windows;
     if (options.require_grid) {
-        for (const auto& b : calibration_locators(image, options.locator_factor, canceled)) {
+        for (const auto& b : calibration_locators(image, options.locator_factor, canceled, options.deadline)) {
             const double margin=2.*options.locator_factor;
             for(double scale : {.88,1.,1.12}) {
                 const double cell=b.width/7*scale, cy=b.height/7*scale;
@@ -188,7 +238,7 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
             }
     }
     for (const auto& window : windows) {
-        if (canceled && canceled->load(std::memory_order_relaxed)) return {};
+        if ((canceled && canceled->load(std::memory_order_relaxed)) || std::chrono::steady_clock::now() >= options.deadline) return {};
         const double cell=window.cell, cy=window.cy;
         const double step=(std::max)(1.,cell*.5);
         for(double y=window.y0;y<=window.y1 && y+5*cy<=image.height;y+=step)
@@ -222,6 +272,7 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     struct Observation { unsigned target; double u, v, x, y; };
     std::vector<Observation> observations;
     for (auto hit : hits) {
+        if ((canceled && canceled->load(std::memory_order_relaxed)) || std::chrono::steady_clock::now() >= options.deadline) return {};
         const auto& pattern = templates[hit.index];
         const auto& target = targets[pattern.target];
         // Refine independent X/Y scale and translation using the cell contrast.
@@ -310,6 +361,25 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
 }
 inline void calibration_search_start(const CalibrationSearchPtr& request, CalibrationSearchImage image) noexcept {
     if (!request || request->started.exchange(true)) return;
+    if (request->capture_started_ms && image.width && image.height)
+        request->capture_total_ms=calibration_clock_ms()-request->capture_started_ms;
+    request->conversion_ms = image.conversion_ms;
+    request->image_width = image.width; request->image_height = image.height;
+    // Sparse content probe, at most 256 values from pixels already converted.
+    // A black sample grid is evidence, not proof the entire texture is black.
+    if (image.width && image.height && (image.raw || !image.pixels.empty())) {
+        request->sampled_min = 1e30; request->sampled_max = -1e30;
+        double sum{};
+        for(unsigned y=0;y<16;++y) for(unsigned x=0;x<16;++x) {
+            const unsigned sx=(std::min)(image.width-1, unsigned((x+.5)*image.width/16));
+            const unsigned sy=(std::min)(image.height-1, unsigned((y+.5)*image.height/16));
+            const float v=image.sample(sx,sy);
+            request->sampled_min=(std::min)(request->sampled_min,double(v));
+            request->sampled_max=(std::max)(request->sampled_max,double(v));
+            sum+=v; ++request->sample_count; request->sampled_black += std::abs(v)<.001F;
+        }
+        request->sampled_mean=sum/request->sample_count;
+    }
     static std::atomic<unsigned> workers{};
     if (workers.fetch_add(1) >= 2) {
         --workers; request->ready.store(true, std::memory_order_release); return;
@@ -319,11 +389,23 @@ inline void calibration_search_start(const CalibrationSearchPtr& request, Calibr
             const auto start = std::chrono::steady_clock::now();
             try {
                 CalibrationSearchOptions options; options.require_grid = request->require_grid;
-                request->result = calibration_search(image, request->targets, &request->canceled, options);
-                if (options.require_grid && !request->result.valid && !request->canceled.load()) {
-                    options.locator_factor = 2;
-                    request->result = calibration_search(image, request->targets, &request->canceled, options);
-                }
+                if (options.require_grid) {
+                    // Start near 800 pixels on the longest side, then halve the factor.
+                    // A soft wall-time budget also covers flood fill on blank captures.
+                    options.locator_factor=4;
+                    while (options.locator_factor<32 && (std::max)(image.width,image.height)/options.locator_factor>800)
+                        options.locator_factor*=2;
+                    options.deadline=start+std::chrono::milliseconds(100);
+                    request->initial_locator_factor=options.locator_factor;
+                    for (;;) {
+                        request->last_locator_factor=options.locator_factor; ++request->locator_passes;
+                        request->result=calibration_search(image,request->targets,&request->canceled,options);
+                        request->search_budget_exhausted=std::chrono::steady_clock::now()>=options.deadline;
+                        if(request->result.valid || request->result.ambiguous || request->canceled.load() ||
+                            request->search_budget_exhausted || options.locator_factor==2) break;
+                        options.locator_factor/=2;
+                    }
+                } else request->result=calibration_search(image,request->targets,&request->canceled,options);
             } catch (...) { request->result = {}; }
             request->elapsed_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();

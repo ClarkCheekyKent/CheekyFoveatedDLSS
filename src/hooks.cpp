@@ -444,6 +444,9 @@ void initialize_hook_debug_crash_log_path() noexcept {
 }
 
 void hook_debug_emergency_logf(const char* const format, ...) noexcept {
+    // A hard per-process bound, including debugger output, even during fault storms.
+    static std::atomic<unsigned> lines{};
+    if (lines.fetch_add(1, std::memory_order_relaxed) >= 1024) return;
     char buffer[1024]{};
     va_list arguments;
     va_start(arguments, format);
@@ -478,6 +481,8 @@ void hook_debug_emergency_logf(const char* const format, ...) noexcept {
         nullptr
     );
     if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER existing{};
+    if (GetFileSizeEx(file, &existing) && existing.QuadPart >= 8LL*1024*1024) { CloseHandle(file); return; }
     DWORD written{};
     static_cast<void>(WriteFile(
         file,
@@ -519,6 +524,15 @@ LONG CALLBACK hook_debug_exception_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    static thread_local bool reporting{};
+    if (reporting) return EXCEPTION_CONTINUE_SEARCH;
+    static std::atomic<unsigned> exceptions{};
+    const unsigned exception_number = exceptions.fetch_add(1, std::memory_order_relaxed)+1;
+    if (exception_number > 1024 || (exception_number > 16 && (exception_number & (exception_number-1)) != 0)) return EXCEPTION_CONTINUE_SEARCH;
+    reporting = true;
+    struct ReportingReset { bool& flag; ~ReportingReset() { flag = false; } } reset{reporting};
+    hook_debug_emergency_logf("HOOKDBG EXCEPTION sampled_event=%u pid=%lu tick_ms=%llu (first16 then powers-of-two; capped)",
+        exception_number, GetCurrentProcessId(), GetTickCount64());
     const auto* const context = pointers->ContextRecord;
     void* instruction{};
     std::uintptr_t stack_pointer{};
@@ -3876,6 +3890,31 @@ void prepare_d3d11_direct_peripheral(
     ));
 }
 
+// Bound creation diagnostics per route and feature: first eight, then powers of two.
+// These report observed calls, not proof that a created feature was evaluated.
+template<class Fn, class Context>
+NgxResult traced_feature_create(Fn original, Context context, std::uint32_t feature,
+    NgxParameters* parameters, NgxHandle** handle, unsigned route) {
+    static std::array<std::array<std::atomic<std::uint64_t>, 16>, 4> counts{};
+    const auto count = ++counts[route][(std::min)(feature, 15U)];
+    const bool report = count <= 8 || (count & (count-1)) == 0;
+    const char* routes[]{"D3D11-public", "D3D11-core", "D3D12-public", "D3D12-core"};
+    const char* name = feature == 1 ? "SR" : feature == 11 ? "FrameGeneration" :
+        feature == 13 ? "RayReconstruction" : "Other";
+    const auto creation_started = GetTickCount64();
+    if (report) trace_event("FEATURE_CREATE begin route=%s feature=%u(%s) count=%llu input=%ux%u output=%ux%u flags=0x%08X original=%p context=%p",
+        routes[route], feature, name, count, parameters ? get_ui(parameters,"Width") : 0,
+        parameters ? get_ui(parameters,"Height") : 0, parameters ? get_ui(parameters,"OutWidth") : 0,
+        parameters ? get_ui(parameters,"OutHeight") : 0,
+        parameters && (feature == 1 || feature == 13) ? get_ngx_integer_bits(parameters,"DLSS.Feature.Create.Flags") : 0,
+        reinterpret_cast<void*>(original), context);
+    const auto result = original(context, feature, parameters, handle);
+    if (report) trace_event("FEATURE_CREATE end route=%s feature=%u(%s) count=%llu result=0x%08X handle=%p elapsed_ms=%llu",
+        routes[route], feature, name, count, unsigned(result),
+        ngx_succeeded(result) && handle ? *handle : nullptr, GetTickCount64()-creation_started);
+    return result;
+}
+
 NgxResult hook_create_d3d11(
     ID3D11DeviceContext* const context,
     const std::uint32_t feature,
@@ -3889,7 +3928,7 @@ NgxResult hook_create_d3d11(
     // Do not force output subrects on the game's feature. The foveated DX11
     // path uses a separate private feature whose creation-time output size is
     // the crop size, so the game feature can keep its original contract.
-    const auto result = original(context, feature, parameters, handle);
+    const auto result = traced_feature_create(original, context, feature, parameters, handle, 0);
     if (ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
         feature == 1U) {
         register_d3d11_game_feature(
@@ -3915,7 +3954,7 @@ NgxResult hook_core_create_d3d11(
     if (original == nullptr) return 0xBAD00007U;
     diagnostic_note_create(DiagnosticApi::d3d11);
 
-    const auto result = original(context, feature, parameters, handle);
+    const auto result = traced_feature_create(original, context, feature, parameters, handle, 1);
     if (ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
         feature == 1U) {
         register_d3d11_game_feature(
@@ -4282,7 +4321,7 @@ NgxResult hook_create_d3d12(
     detect_vr_dlss_runtime();
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
-        return original(command_list, feature, parameters, handle);
+        return traced_feature_create(original, command_list, feature, parameters, handle, 2);
     }
     if (feature == 1U && parameters && streamline_create_width && streamline_create_height) {
         trace_event("SL center NGX create input optimal=%ux%u actual=%ux%u output=%ux%u flags=0x%08X",
@@ -4303,7 +4342,7 @@ NgxResult hook_create_d3d12(
         captured_d3d12_create_flags_valid.store(true, std::memory_order_release);
     }
     const NgxOutputExtent output_extent{get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight")};
-    const auto result = original(command_list, feature, parameters, handle);
+    const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 2);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
     }
@@ -4322,11 +4361,11 @@ NgxResult hook_core_create_d3d12(
     if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
         // Let the lower create hook track its own handle and output contract.
-        return original(command_list, feature, parameters, handle);
+        return traced_feature_create(original, command_list, feature, parameters, handle, 3);
     }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
-        return original(command_list, feature, parameters, handle);
+        return traced_feature_create(original, command_list, feature, parameters, handle, 3);
     }
     if (feature == 1U && parameters && streamline_create_width && streamline_create_height) {
         trace_event("SL center NGX create input optimal=%ux%u actual=%ux%u output=%ux%u flags=0x%08X",
@@ -4347,7 +4386,7 @@ NgxResult hook_core_create_d3d12(
         captured_d3d12_create_flags_valid.store(true, std::memory_order_release);
     }
     const NgxOutputExtent output_extent{get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight")};
-    const auto result = original(command_list, feature, parameters, handle);
+    const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 3);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
     }

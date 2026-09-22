@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <sstream>
 #include <atomic>
+#include "support_external_settings.hpp"
 
 namespace cheeky::foveated_dlss {
 inline std::string path_utf8(const std::filesystem::path& path) {
@@ -76,6 +77,7 @@ inline std::filesystem::path create_runtime_support_bundle(const std::filesystem
         manifest << log_name << ": captured " << contents.size() << " of " << end.QuadPart << " bytes\n";
         files.push_back({log_name, std::move(contents)});
     }
+    append_external_support_files(files, manifest);
     files.push_back({"README.txt", manifest.str()});
     const auto folder = directory / L"support";
     std::filesystem::create_directories(folder);

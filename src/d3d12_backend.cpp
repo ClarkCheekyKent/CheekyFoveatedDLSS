@@ -514,9 +514,6 @@ void release_resources(D3D12Resources* const resources) noexcept {
         &shader,
         &shader_errors
     );
-    if (shader_errors != nullptr) {
-        shader_errors->Release();
-    }
     if (FAILED(result) || shader == nullptr) {
         if (should_trace_prepare_rejection(
                 D3D12PrepareProbe::compile_shader)) {
@@ -525,13 +522,18 @@ void release_resources(D3D12Resources* const resources) noexcept {
                 "hr=0x%08X shader=%p",
                 static_cast<unsigned>(result), shader
             );
+            if (shader_errors) trace_event("SHADER_COMPILE SR CompositeMain cs_5_1 error=%.*s",
+                static_cast<int>((std::min)(shader_errors->GetBufferSize(), SIZE_T{2048})),
+                static_cast<const char*>(shader_errors->GetBufferPointer()));
         }
+        if (shader_errors) shader_errors->Release();
         if (shader != nullptr) {
             shader->Release();
         }
         release_resources(resources);
         return nullptr;
     }
+    if (shader_errors) shader_errors->Release();
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_description{};
     pipeline_description.pRootSignature = resources->root_signature;

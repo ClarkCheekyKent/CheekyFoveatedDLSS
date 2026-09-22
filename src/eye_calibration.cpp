@@ -3,6 +3,7 @@
 #include "eye_calibration_d3d12.hpp"
 #include "d3d12_native.hpp"
 #include "settings.hpp"
+#include "runtime.hpp"
 #include "eye_calibration_bridge.h"
 #include <wrl/client.h>
 #include <array>
@@ -130,6 +131,8 @@ struct State {
     std::uint64_t wide_searches{}, last_wide_search_ms{};
     std::uint64_t last_verified_ms{}, motion_inconclusive{}, geometry_rejections{};
     std::array<CalibrationSearchResult, 2> last_search_results;
+    std::array<CalibrationSearchPtr, 2> last_search_diagnostics;
+    std::uint64_t next_diagnostic_ms{}, slow_calls{}, sampled_black_images{};
     std::array<Frame, ring_size> ring;
     int current{-1};
     std::uint64_t sequence{};
@@ -255,6 +258,7 @@ void capture_search11(Frame& f, unsigned eye, ID3D11DeviceContext* context, ID3D
     const CalibrationImageInfo& info) noexcept try {
     auto request = prepare_search(f, eye);
     if (!request) return;
+    request->capture_started_ms = calibration_clock_ms();
     f.search_info[eye] = info;
     auto& capture = f.search11[eye];
     D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
@@ -269,18 +273,27 @@ void capture_search11(Frame& f, unsigned eye, ID3D11DeviceContext* context, ID3D
     if (FAILED(device->CreateTexture2D(&desc, nullptr, &capture.staging))) {
         capture.memory.reset(); request->ready = true; return;
     }
+    request->copy_issued_ms = GetTickCount64();
+    request->texture_identity = reinterpret_cast<std::uintptr_t>(texture);
     context->CopySubresourceRegion(capture.staging.Get(), 0, 0, 0, 0, texture, subresource, nullptr);
+    request->copy_recorded_ms=calibration_clock_ms();
+    request->setup_ms=request->copy_recorded_ms-request->capture_started_ms;
 } catch (...) { if (f.search[eye]) f.search[eye]->ready = true; }
 bool poll_search11(Frame& f, unsigned eye, ID3D11DeviceContext* context) {
     auto& capture = f.search11[eye];
     if (!capture.staging) return true;
     D3D11_MAPPED_SUBRESOURCE mapped{};
+    const auto map_start=calibration_clock_ms();
     const auto hr = context->Map(capture.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    f.search[eye]->map_cpu_ms+=calibration_clock_ms()-map_start;
+    ++f.search[eye]->map_polls; f.search[eye]->map_result = hr;
     if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+    f.search[eye]->readback_ready_ms = GetTickCount64();
+    if (SUCCEEDED(hr)) f.search[eye]->readback_wall_ms=calibration_clock_ms()-f.search[eye]->copy_recorded_ms;
     CalibrationSearchImage image;
     if (SUCCEEDED(hr)) {
         const auto& info = f.search_info[eye];
-        try { image = calibration_search_image(mapped.pData, mapped.RowPitch, info.width, info.height, info.format, info.bounds); }
+        try { image = calibration_search_image(mapped.pData, mapped.RowPitch, info.width, info.height, info.format, info.bounds, true); }
         catch (...) {}
         context->Unmap(capture.staging.Get(), 0);
     }
@@ -362,6 +375,7 @@ struct CpuScope {
     ~CpuScope() {
         const double us = now_us() - start;
         s.cpu_us += us;
+        if (us > 20000) ++s.slow_calls;
         s.stats.max_cpu_call_us = (std::max)(s.stats.max_cpu_call_us, us);
     }
 };
@@ -487,6 +501,23 @@ void poll_submitted(Frame& f) {
         capture.ready = !waiting;
     }
 }
+void log_calibration_capture(State& s, const Frame& f, unsigned rejection) {
+    if (GetTickCount64() >= s.next_diagnostic_ms) {
+            s.next_diagnostic_ms = GetTickCount64()+5000;
+            trace_event("CALIB summary seq=%llu session=%llu source_api=%u submit_api=%u evals=%u submits=%u reject=0x%X captured_age_ms=%llu completed=%llu accepted=%llu black_sample_images=%llu slow_calls_over20ms=%llu max_call_ms=%.2f",
+                f.sequence, f.session_generation, s.stats.source_graphics_api, s.stats.submission_graphics_api,
+                f.evaluations, f.submits, rejection, GetTickCount64()-f.captured_ms, s.stats.completed+1,
+                s.stats.applied, s.sampled_black_images, s.slow_calls, s.stats.max_cpu_call_us/1000);
+            for(unsigned eye=0;eye<2;++eye) if(const auto& q=f.search[eye]; q && q->ready.load(std::memory_order_acquire)) {
+                trace_event("CALIB search seq=%llu eye=%u texture=%p size=%ux%u map_hr=0x%08X map_polls=%u copy_to_map_ms=%llu capture_total_ms=%.2f setup_ms=%.2f readback_wall_ms=%.2f map_cpu_ms=%.2f raw_copy_ms=%.2f worker_ms=%.2f locator_initial=%u locator_last=%u passes=%u budget_exhausted=%u samples=%u black=%u luma_min=%.4f max=%.4f mean=%.4f matched=%u points=%u",
+                    f.sequence,eye,reinterpret_cast<void*>(q->texture_identity),q->image_width,q->image_height,
+                    unsigned(q->map_result),q->map_polls,
+                    q->copy_issued_ms && q->readback_ready_ms >= q->copy_issued_ms ? q->readback_ready_ms-q->copy_issued_ms : 0,
+                    q->capture_total_ms,q->setup_ms,q->readback_wall_ms,q->map_cpu_ms,q->conversion_ms,q->elapsed_ms,q->initial_locator_factor,q->last_locator_factor,q->locator_passes,unsigned(q->search_budget_exhausted),q->sample_count,q->sampled_black,q->sampled_min,q->sampled_max,q->sampled_mean,
+                    unsigned(q->result.valid),q->result.support_points);
+            }
+        }
+}
 void poll(State& s) {
     for (auto& f : s.ring) {
         if (f.epoch != s.epoch || !enabled) for (auto& request : f.search)
@@ -547,6 +578,7 @@ void poll(State& s) {
             if (!f.queries_started) {
                 f.busy = false;
                 if (f.sequence >= s.measurement_start) {
+                    log_calibration_capture(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
                     ++s.stats.completed;
                     record_rejection(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
                 }
@@ -562,6 +594,7 @@ void poll(State& s) {
             if (FAILED(hr)) {
                 f.busy = false;
                 if (f.sequence >= s.measurement_start) {
+                    log_calibration_capture(s, f, 1U);
                     ++s.stats.completed;
                     record_rejection(s, f, 1U);
                 }
@@ -706,6 +739,17 @@ void poll(State& s) {
         if (f.wide_search) for (unsigned eye = 0; eye < 2; ++eye) {
             s.last_search_results[eye] = f.search[eye] ? f.search[eye]->result : CalibrationSearchResult{};
             const auto& search = f.search[eye];
+            s.last_search_diagnostics[eye] = search;
+            s.stats.capture_total_ms[eye]=search ? search->capture_total_ms : -1;
+            s.stats.capture_setup_ms[eye]=search ? search->setup_ms : -1;
+            s.stats.capture_wait_ms[eye]=search ? search->readback_wall_ms : -1;
+            s.stats.capture_map_ms[eye]=search ? search->map_cpu_ms : -1;
+            s.stats.capture_copy_ms[eye]=search && search->capture_total_ms>=0 ? search->conversion_ms : -1;
+            if (search && search->capture_total_ms>=0) {
+                ++s.stats.capture_timing_samples;
+                s.stats.max_capture_ms=(std::max)(s.stats.max_capture_ms,search->capture_total_ms);
+            }
+            if (search && search->sample_count && search->sampled_black == search->sample_count) ++s.sampled_black_images;
             s.stats.search_ms[eye] = search && search->timed ? search->elapsed_ms : -1.;
             if (search && search->timed) {
                 ++s.stats.search_timing_samples;
@@ -864,6 +908,7 @@ void poll(State& s) {
                 } else ++s.stats.publication_rejected;
             } else ++s.stats.publication_rejected;
         }
+        log_calibration_capture(s, f, rejection);
         ++s.stats.completed;
         s.latency.add(double(s.sequence - f.sequence));
         f.classified = true;
@@ -1761,6 +1806,12 @@ std::string eye_calibration_json() {
         << ",\"corrections\":" << s.corrections << ",\"applied\":" << s.applied
         << ",\"mismatches\":" << s.mismatches << ",\"allocations\":" << s.allocations
         << ",\"search_left_ms\":" << s.search_ms[0] << ",\"search_right_ms\":" << s.search_ms[1]
+        << ",\"capture_total_left_ms\":" << s.capture_total_ms[0] << ",\"capture_total_right_ms\":" << s.capture_total_ms[1]
+        << ",\"capture_setup_left_ms\":" << s.capture_setup_ms[0] << ",\"capture_setup_right_ms\":" << s.capture_setup_ms[1]
+        << ",\"capture_wait_left_ms\":" << s.capture_wait_ms[0] << ",\"capture_wait_right_ms\":" << s.capture_wait_ms[1]
+        << ",\"capture_map_left_ms\":" << s.capture_map_ms[0] << ",\"capture_map_right_ms\":" << s.capture_map_ms[1]
+        << ",\"capture_copy_left_ms\":" << s.capture_copy_ms[0] << ",\"capture_copy_right_ms\":" << s.capture_copy_ms[1]
+        << ",\"capture_timing_samples\":" << s.capture_timing_samples << ",\"max_capture_ms\":" << s.max_capture_ms
         << ",\"max_search_ms\":" << s.max_search_ms << ",\"search_timing_samples\":" << s.search_timing_samples
         << ",\"gpu_samples\":" << s.gpu_samples << ",\"cpu_us_per_frame\":" << s.cpu_us_per_frame
         << ",\"gpu_timing_status\":\"" << s.gpu_timing_status << '"'
@@ -1820,12 +1871,30 @@ std::string eye_calibration_json() {
                 << ",\"settling\":" << (now < motion.unstable_until)
                 << ",\"settle_ms\":350}";
         }
+        out << ",\"capture_diagnostics\":{\"slow_calls_over_20ms\":" << live.slow_calls
+            << ",\"sampled_black_images\":" << live.sampled_black_images << ",\"last_searches\":[";
+        for(unsigned eye=0;eye<2;++eye) {
+            if(eye) out << ',';
+            const auto& q=live.last_search_diagnostics[eye];
+            if(!q) { out << "null"; continue; }
+            out << "{\"width\":" << q->image_width << ",\"height\":" << q->image_height
+                << ",\"texture\":\"" << q->texture_identity << "\",\"map_hresult\":" << q->map_result
+                << ",\"map_polls\":" << q->map_polls
+                << ",\"copy_to_map_ms\":" << (q->copy_issued_ms && q->readback_ready_ms>=q->copy_issued_ms ? q->readback_ready_ms-q->copy_issued_ms : 0)
+                << ",\"raw_copy_ms\":" << q->conversion_ms << ",\"worker_ms\":" << q->elapsed_ms
+                << ",\"locator_initial_factor\":" << q->initial_locator_factor << ",\"locator_last_factor\":" << q->last_locator_factor
+                << ",\"locator_passes\":" << q->locator_passes << ",\"budget_exhausted\":" << q->search_budget_exhausted
+                << ",\"samples\":" << q->sample_count << ",\"black_samples\":" << q->sampled_black
+                << ",\"luma_min\":" << q->sampled_min << ",\"luma_max\":" << q->sampled_max
+                << ",\"luma_mean\":" << q->sampled_mean << '}';
+        }
+        out << "]}";
         out << ",\"placement_search\":{\"hypotheses\":" << calibration_placement_count
             << ",\"locks\":" << live.placement_locks << ",\"losses\":" << live.placement_losses
             << ",\"search_candidate\":" << live.search_candidate
             << ",\"tracking_misses\":" << live.tracking_misses
             << ",\"tracking_mode\":\"cached_crop_verification\",\"tracking_padding_px\":64,\"tracking_max_patch_px\":256"
-            << ",\"acquisition_marker_size_px\":72,\"locator_downsample\":4,\"locator_fallback_downsample\":2"
+            << ",\"acquisition_marker_size_px\":72,\"locator_target_long_side\":800,\"locator_min_factor\":4,\"locator_max_factor\":32,\"locator_fallback_downsample\":2,\"wide_search_budget_ms\":100"
             << ",\"verification_inset_px\":20,\"verification_tolerance_px\":32,\"verification_failure_limit\":10"
             << ",\"max_acquisition_markers_per_source\":16,\"grid_min_points\":3"
             << ",\"stamping\":\"bordered_grid_then_small_corner\""

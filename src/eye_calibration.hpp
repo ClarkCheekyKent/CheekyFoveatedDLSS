@@ -20,6 +20,10 @@ struct EyeCalibrationStats {
     unsigned in_flight{};
     double cpu_us_per_frame{}, max_cpu_call_us{}, gpu_us{}, max_gpu_us{}, latency_frames{};
     std::array<double, 2> search_ms{};
+    std::array<double,2> capture_total_ms{-1,-1}, capture_setup_ms{-1,-1}, capture_wait_ms{-1,-1},
+        capture_map_ms{-1,-1}, capture_copy_ms{-1,-1};
+    double max_capture_ms{};
+    std::uint64_t capture_timing_samples{};
     double max_search_ms{};
     std::uint64_t search_timing_samples{};
     const char* gpu_timing_status{"Waiting for a complete GPU timestamp sample"};
