@@ -743,8 +743,8 @@ Calibration12Readback calibration12_poll(Calibration12Frame& f, bool source_only
         }
         const auto candidate = i < 4 ? i / 2 : (i - 4) % 2;
         if (i >= 4 && f.tracking[i].enabled) {
-            out.tracked[i] = calibration_track(data, d.RowPitch, d.Format, f.tracking[i]);
-            out.scores[i] = out.tracked[i].valid ? out.tracked[i].score : 0;
+            out.tracking_inputs[i]=calibration_tracking_copy(data,d.RowPitch,d.Format,f.tracking[i]);
+            if (!out.tracking_inputs[i]) { out.valid=false; out.failure={"tracking_cpu_copy_failed"}; }
         } else out.scores[i] = calibration_pattern_score(data, d.RowPitch, d.Width, d.Height, d.Format, candidate, i >= 4,
             i < 4 ? f.marker_codes[candidate] : f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
         const D3D12_RANGE empty{0, 0};

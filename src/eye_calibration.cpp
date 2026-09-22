@@ -73,6 +73,9 @@ struct Frame {
     std::array<unsigned, calibration_patch_count> patch_mirrors{};
     std::array<CalibrationTrackingPatch, calibration_patch_count> tracking{};
     std::array<CalibrationSearchResult, calibration_patch_count> tracked{};
+    std::array<CalibrationTrackingInputPtr, calibration_patch_count> tracking_inputs{};
+    std::shared_ptr<CalibrationVerificationJob> verification;
+    bool verification_staged{};
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::array<std::array<bool, calibration_placement_count>, 2> usable_placements{};
     unsigned placement_count{1};
@@ -490,8 +493,8 @@ void poll_submitted(Frame& f) {
             if (FAILED(result)) { f.invalid = true; p.ready = true; continue; }
             const auto patch_index = calibration_patch_index(index, eye);
             if (f.tracking[patch_index].enabled) {
-                f.tracked[patch_index] = calibration_track(mapped.pData, mapped.RowPitch, p.format, f.tracking[patch_index]);
-                p.score = f.tracked[patch_index].valid ? f.tracked[patch_index].score : 0;
+                f.tracking_inputs[patch_index]=calibration_tracking_copy(mapped.pData,mapped.RowPitch,p.format,f.tracking[patch_index]);
+                if (!f.tracking_inputs[patch_index]) f.invalid=true;
             } else p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
                 p.format, c, true, f.patch_codes[calibration_patch_index(index, eye)],
                 f.patch_mirrors[calibration_patch_index(index, eye)]);
@@ -508,6 +511,16 @@ void log_calibration_capture(State& s, const Frame& f, unsigned rejection) {
                 f.sequence, f.session_generation, s.stats.source_graphics_api, s.stats.submission_graphics_api,
                 f.evaluations, f.submits, rejection, GetTickCount64()-f.captured_ms, s.stats.completed+1,
                 s.stats.applied, s.sampled_black_images, s.slow_calls, s.stats.max_cpu_call_us/1000);
+            trace_event("CALIB verification background=1 completed_patch_calls=%llu worker_us_per_frame=%.2f last_sample_ms=%.2f peak_sample_ms=%.2f exact=%llu nearby=%llu broad=%llu",
+                s.stats.verification_patch_calls,s.stats.frames ? s.stats.verification_cpu_ms*1000/s.stats.frames : 0,
+                s.stats.verification_last_ms,s.stats.verification_peak_ms,s.stats.verification_paths[0],s.stats.verification_paths[1],s.stats.verification_paths[2]);
+            if (s.stats.capture_timing_samples) {
+                const auto& p=s.stats;
+                trace_event("CALIB acquisition_peak seq=%llu eye=%u size=%ux%u total_ms=%.2f setup_ms=%.2f readback_wall_ms=%.2f map_cpu_ms=%.2f raw_copy_ms=%.2f other_ms=%.2f map_polls=%u",
+                    p.peak_capture_sequence,p.peak_capture_eye,p.peak_capture_width,p.peak_capture_height,
+                    p.max_capture_ms,p.peak_capture_setup_ms,p.peak_capture_wait_ms,p.peak_capture_map_ms,
+                    p.peak_capture_copy_ms,p.peak_capture_other_ms,p.peak_capture_map_polls);
+            }
             for(unsigned eye=0;eye<2;++eye) if(const auto& q=f.search[eye]; q && q->ready.load(std::memory_order_acquire)) {
                 trace_event("CALIB search seq=%llu eye=%u texture=%p size=%ux%u map_hr=0x%08X map_polls=%u copy_to_map_ms=%llu capture_total_ms=%.2f setup_ms=%.2f readback_wall_ms=%.2f map_cpu_ms=%.2f raw_copy_ms=%.2f worker_ms=%.2f locator_initial=%u locator_last=%u passes=%u budget_exhausted=%u samples=%u black=%u luma_min=%.4f max=%.4f mean=%.4f matched=%u points=%u",
                     f.sequence,eye,reinterpret_cast<void*>(q->texture_identity),q->image_width,q->image_height,
@@ -532,6 +545,13 @@ void poll(State& s) {
             f.thread == GetCurrentThreadId()) finish(s, f);
         if (!f.busy || !f.closed)
             continue;
+        // A staged job owns only CPU bytes; GPU retirement was already confirmed.
+        // Discard results across reset/toggle/session changes before classification.
+        if (f.verification_staged && (f.sequence<s.measurement_start || f.epoch!=s.epoch || !enabled)) {
+            if (f.verification) f.verification->canceled=true;
+            f.classified=true; f.busy=false;
+            continue;
+        }
         // A mixed frame owns two independent GPU timelines. Do not classify or
         // recycle either half until submission-thread DX11 queries also finish.
         if (std::any_of(f.submitted11.begin(), f.submitted11.end(),
@@ -541,147 +561,165 @@ void poll(State& s) {
         bool gpu12_reusable{};
         const unsigned source_mask = (f.views[0].id ? 1U : 0U) | (f.views[1].id ? 2U : 0U);
         const bool mono = f.pipelined && f.evaluations == 1 && (source_mask == 1 || source_mask == 2);
-        if (f.gpu12_used) {
-            const bool mixed = f.pipelined;
-            const auto result = calibration12_poll(*f.gpu12, mixed, mixed ? source_mask : 3U);
-            if (f.sequence >= s.measurement_start)
-                s.stats.allocations += result.allocations;
-            if (!result.ready)
-                continue;
-            gpu12_reusable = result.reusable;
-            if (f.classified || f.sequence < s.measurement_start) {
-                f.classified = true;
-                if (gpu12_reusable)
-                    f.busy = false;
-                continue;
-            }
-            f.invalid = f.invalid || !result.valid;
-            if (!result.valid) {
-                ++s.stats.d3d12_readback_failures;
-                s.stats.d3d12_last_readback_failure = result.failure.stage;
-                s.stats.d3d12_readback_error = result.failure.result;
-            }
-            for (unsigned i = 0; i < (mixed ? 4U : 4U + f.placement_count * 8); ++i) {
-                if (mixed && !(source_mask & (1U << (i / 2)))) continue;
-                f.patches[i].used = f.patches[i].ready = true;
-                f.patches[i].score = result.scores[i];
-                f.tracked[i] = result.tracked[i];
-            }
-            if (result.timing_valid) {
-                s.stats.gpu_timing_status = "Available";
-                s.gpu.add(result.gpu_us);
-                ++s.stats.gpu_samples;
-                s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, result.gpu_us);
-            } else s.stats.gpu_timing_status = mixed ? "Unavailable across D3D12 source and D3D11 submission" :
-                "D3D12 marker/copy timestamps unavailable for this capture";
-        } else {
-            if (!f.queries_started) {
-                f.busy = false;
-                if (f.sequence >= s.measurement_start) {
-                    log_calibration_capture(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
-                    ++s.stats.completed;
-                    record_rejection(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
-                }
-                continue;
-            }
-            if (f.thread != GetCurrentThreadId()) {
-                ++s.poll_wrong_thread;
-                continue;
-            }
-            const auto hr = f.context->GetData(f.done.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
-            if (hr == S_FALSE)
-                continue;
-            if (FAILED(hr)) {
-                f.busy = false;
-                if (f.sequence >= s.measurement_start) {
-                    log_calibration_capture(s, f, 1U);
-                    ++s.stats.completed;
-                    record_rejection(s, f, 1U);
-                }
-                continue;
-            }
-            if (f.sequence < s.measurement_start) {
-                f.busy = false;
-                continue;
-            }
-            bool waiting{};
-            for (unsigned i = 0; i < 4; ++i) {
-                if (i >= 2 && f.submitted11[i - 2].active) continue;
-                if (!poll_support11(f, f.context.Get(), i)) waiting = true;
-            }
-            for (unsigned i = 0; i < 4 + f.placement_count * 8; ++i) {
-                if (i >= 4 && f.submitted11[((i - 4) % 4) / 2].active) continue;
-                auto& p = f.patches[i];
-                if (!p.used || p.ready)
+        if (!f.verification_staged) {
+            if (f.gpu12_used) {
+                const bool mixed = f.pipelined;
+                const auto result = calibration12_poll(*f.gpu12, mixed, mixed ? source_mask : 3U);
+                if (f.sequence >= s.measurement_start)
+                    s.stats.allocations += result.allocations;
+                if (!result.ready)
                     continue;
-                D3D11_MAPPED_SUBRESOURCE mapped{};
-                const auto map_hr =
-                    f.context->Map(p.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-                if (map_hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-                    waiting = true;
+                gpu12_reusable = result.reusable;
+                if (f.classified || f.sequence < s.measurement_start) {
+                    f.classified = true;
+                    if (gpu12_reusable)
+                        f.busy = false;
                     continue;
                 }
-                if (FAILED(map_hr)) {
-                    f.invalid = true;
-                    p.ready = true;
-                    continue;
+                f.invalid = f.invalid || !result.valid;
+                if (!result.valid) {
+                    ++s.stats.d3d12_readback_failures;
+                    s.stats.d3d12_last_readback_failure = result.failure.stage;
+                    s.stats.d3d12_readback_error = result.failure.result;
                 }
-                const unsigned candidate = i < 4 ? i / 2 : (i - 4) % 2;
-                if (i >= 4 && f.tracking[i].enabled) {
-                    f.tracked[i] = calibration_track(mapped.pData, mapped.RowPitch, p.format, f.tracking[i]);
-                    p.score = f.tracked[i].valid ? f.tracked[i].score : 0;
-                } else p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
-                                                    p.format, candidate, i >= 4, f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
-                f.context->Unmap(p.staging.Get(), 0);
-                p.ready = true;
-            }
-            if (waiting)
-                continue;
-            for (unsigned eye = 0; eye < 2; ++eye)
-                waiting |= !poll_search11(f, eye, f.context.Get());
-            if (waiting) continue;
-            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
-            const auto timing_result = f.context->GetData(f.disjoint.Get(), &disjoint, sizeof(disjoint),
-                                   D3D11_ASYNC_GETDATA_DONOTFLUSH);
-            if (std::any_of(f.submitted11.begin(), f.submitted11.end(), [](const auto& capture) { return capture.active; }))
-                s.stats.gpu_timing_status = "Unavailable across separate D3D11 devices (submission copies have no timestamps)";
-            else if (!std::all_of(f.segments.begin(), f.segments.end(), [](bool segment) { return segment; }))
-                s.stats.gpu_timing_status = "Incomplete marker/copy timestamp coverage";
-            else if (timing_result == S_FALSE)
-                s.stats.gpu_timing_status = "D3D11 timestamp results were not ready when the capture completed";
-            else if (FAILED(timing_result))
-                s.stats.gpu_timing_status = "D3D11 timestamp query failed";
-            else if (disjoint.Disjoint || !disjoint.Frequency)
-                s.stats.gpu_timing_status = "D3D11 timestamps invalid (GPU clock disjoint or frequency unavailable)";
-            else s.stats.gpu_timing_status = "D3D11 marker/copy timestamps incomplete or not ready";
-            if (timing_result == S_OK &&
-                !disjoint.Disjoint && disjoint.Frequency) {
-                double us{};
-                bool valid_time =
-                    std::all_of(f.segments.begin(), f.segments.end(), [](bool segment) { return segment; });
-                for (unsigned i = 0; i < 4; ++i)
-                    if (f.segments[i]) {
-                        UINT64 first{}, last{};
-                        if (f.context->GetData(f.timestamp[i * 2].Get(), &first, sizeof(first),
-                                               D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
-                            f.context->GetData(f.timestamp[i * 2 + 1].Get(), &last, sizeof(last),
-                                               D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
-                            last < first)
-                            valid_time = false;
-                        else
-                            us += double(last - first) * 1e6 / double(disjoint.Frequency);
-                    }
-                if (valid_time) {
+                for (unsigned i = 0; i < (mixed ? 4U : 4U + f.placement_count * 8); ++i) {
+                    if (mixed && !(source_mask & (1U << (i / 2)))) continue;
+                    f.patches[i].used = f.patches[i].ready = true;
+                    f.patches[i].score = result.scores[i];
+                    f.tracked[i] = result.tracked[i];
+                    f.tracking_inputs[i]=result.tracking_inputs[i];
+                }
+                if (result.timing_valid) {
                     s.stats.gpu_timing_status = "Available";
-                    s.gpu.add(us);
-                    s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, us);
+                    s.gpu.add(result.gpu_us);
                     ++s.stats.gpu_samples;
+                    s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, result.gpu_us);
+                } else s.stats.gpu_timing_status = mixed ? "Unavailable across D3D12 source and D3D11 submission" :
+                    "D3D12 marker/copy timestamps unavailable for this capture";
+            } else {
+                if (!f.queries_started) {
+                    f.busy = false;
+                    if (f.sequence >= s.measurement_start) {
+                        log_calibration_capture(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
+                        ++s.stats.completed;
+                        record_rejection(s, f, 1U | (f.evaluations != 2 ? 2U : 0U));
+                    }
+                    continue;
                 }
+                if (f.thread != GetCurrentThreadId()) {
+                    ++s.poll_wrong_thread;
+                    continue;
+                }
+                const auto hr = f.context->GetData(f.done.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                if (hr == S_FALSE)
+                    continue;
+                if (FAILED(hr)) {
+                    f.busy = false;
+                    if (f.sequence >= s.measurement_start) {
+                        log_calibration_capture(s, f, 1U);
+                        ++s.stats.completed;
+                        record_rejection(s, f, 1U);
+                    }
+                    continue;
+                }
+                if (f.sequence < s.measurement_start) {
+                    f.busy = false;
+                    continue;
+                }
+                bool waiting{};
+                for (unsigned i = 0; i < 4; ++i) {
+                    if (i >= 2 && f.submitted11[i - 2].active) continue;
+                    if (!poll_support11(f, f.context.Get(), i)) waiting = true;
+                }
+                for (unsigned i = 0; i < 4 + f.placement_count * 8; ++i) {
+                    if (i >= 4 && f.submitted11[((i - 4) % 4) / 2].active) continue;
+                    auto& p = f.patches[i];
+                    if (!p.used || p.ready)
+                        continue;
+                    D3D11_MAPPED_SUBRESOURCE mapped{};
+                    const auto map_hr =
+                        f.context->Map(p.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+                    if (map_hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+                        waiting = true;
+                        continue;
+                    }
+                    if (FAILED(map_hr)) {
+                        f.invalid = true;
+                        p.ready = true;
+                        continue;
+                    }
+                    const unsigned candidate = i < 4 ? i / 2 : (i - 4) % 2;
+                    if (i >= 4 && f.tracking[i].enabled) {
+                        f.tracking_inputs[i]=calibration_tracking_copy(mapped.pData,mapped.RowPitch,p.format,f.tracking[i]);
+                        if (!f.tracking_inputs[i]) f.invalid=true;
+                    } else p.score = calibration_pattern_score(mapped.pData, mapped.RowPitch, p.width, p.height,
+                                                        p.format, candidate, i >= 4, f.patch_codes[i], i < 4 ? 1U : f.patch_mirrors[i]);
+                    f.context->Unmap(p.staging.Get(), 0);
+                    p.ready = true;
+                }
+                if (waiting)
+                    continue;
+                for (unsigned eye = 0; eye < 2; ++eye)
+                    waiting |= !poll_search11(f, eye, f.context.Get());
+                if (waiting) continue;
+                D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+                const auto timing_result = f.context->GetData(f.disjoint.Get(), &disjoint, sizeof(disjoint),
+                                       D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                if (std::any_of(f.submitted11.begin(), f.submitted11.end(), [](const auto& capture) { return capture.active; }))
+                    s.stats.gpu_timing_status = "Unavailable across separate D3D11 devices (submission copies have no timestamps)";
+                else if (!std::all_of(f.segments.begin(), f.segments.end(), [](bool segment) { return segment; }))
+                    s.stats.gpu_timing_status = "Incomplete marker/copy timestamp coverage";
+                else if (timing_result == S_FALSE)
+                    s.stats.gpu_timing_status = "D3D11 timestamp results were not ready when the capture completed";
+                else if (FAILED(timing_result))
+                    s.stats.gpu_timing_status = "D3D11 timestamp query failed";
+                else if (disjoint.Disjoint || !disjoint.Frequency)
+                    s.stats.gpu_timing_status = "D3D11 timestamps invalid (GPU clock disjoint or frequency unavailable)";
+                else s.stats.gpu_timing_status = "D3D11 marker/copy timestamps incomplete or not ready";
+                if (timing_result == S_OK &&
+                    !disjoint.Disjoint && disjoint.Frequency) {
+                    double us{};
+                    bool valid_time =
+                        std::all_of(f.segments.begin(), f.segments.end(), [](bool segment) { return segment; });
+                    for (unsigned i = 0; i < 4; ++i)
+                        if (f.segments[i]) {
+                            UINT64 first{}, last{};
+                            if (f.context->GetData(f.timestamp[i * 2].Get(), &first, sizeof(first),
+                                                   D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+                                f.context->GetData(f.timestamp[i * 2 + 1].Get(), &last, sizeof(last),
+                                                   D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+                                last < first)
+                                valid_time = false;
+                            else
+                                us += double(last - first) * 1e6 / double(disjoint.Frequency);
+                        }
+                    if (valid_time) {
+                        s.stats.gpu_timing_status = "Available";
+                        s.gpu.add(us);
+                        s.stats.max_gpu_us = (std::max)(s.stats.max_gpu_us, us);
+                        ++s.stats.gpu_samples;
+                    }
+                }
+            }
+            if (std::any_of(f.search.begin(), f.search.end(), [](const auto& search) {
+                return search && !search->ready.load(std::memory_order_acquire);
+            })) continue;
+            f.verification_staged=true;
+            if (std::any_of(f.tracking_inputs.begin(),f.tracking_inputs.end(),[](const auto& input){return bool(input);})) {
+                try {
+                    f.verification=std::make_shared<CalibrationVerificationJob>();
+                    f.verification->inputs=std::move(f.tracking_inputs);
+                } catch (...) { f.invalid=true; }
+            }
+        } else gpu12_reusable=f.gpu12_used; // GPU readbacks were already completed before staging.
+        if (f.verification) {
+            if (f.epoch!=s.epoch || !enabled) f.verification->canceled=true;
+            if (!calibration_verification_start(f.verification) || !f.verification->ready.load(std::memory_order_acquire)) continue;
+            for (unsigned i=0;i<f.tracked.size();++i) if (f.verification->inputs[i]) {
+                f.tracked[i]=f.verification->results[i];
+                f.patches[i].score=f.tracked[i].valid ? f.tracked[i].score : 0;
             }
         }
-        if (std::any_of(f.search.begin(), f.search.end(), [](const auto& search) {
-            return search && !search->ready.load(std::memory_order_acquire);
-        })) continue;
         unsigned rejection = f.invalid ? 1U : 0U;
         if (f.evaluations != 2 && !mono) rejection |= 2U;
         if (f.submits != 2 || f.eye_submits[0] != 1 || f.eye_submits[1] != 1) rejection |= 4U;
@@ -747,7 +785,20 @@ void poll(State& s) {
             s.stats.capture_copy_ms[eye]=search && search->capture_total_ms>=0 ? search->conversion_ms : -1;
             if (search && search->capture_total_ms>=0) {
                 ++s.stats.capture_timing_samples;
-                s.stats.max_capture_ms=(std::max)(s.stats.max_capture_ms,search->capture_total_ms);
+                if (search->capture_total_ms>s.stats.max_capture_ms) {
+                    s.stats.max_capture_ms=search->capture_total_ms;
+                    s.stats.peak_capture_setup_ms=search->setup_ms;
+                    s.stats.peak_capture_wait_ms=search->readback_wall_ms;
+                    s.stats.peak_capture_map_ms=search->map_cpu_ms;
+                    s.stats.peak_capture_copy_ms=search->conversion_ms;
+                    // Map time overlaps readback elapsed and must not be added twice.
+                    s.stats.peak_capture_other_ms=(std::max)(0.,search->capture_total_ms-search->setup_ms-search->readback_wall_ms-search->conversion_ms);
+                    s.stats.peak_capture_sequence=f.sequence;
+                    s.stats.peak_capture_eye=eye;
+                    s.stats.peak_capture_width=search->image_width;
+                    s.stats.peak_capture_height=search->image_height;
+                    s.stats.peak_capture_map_polls=search->map_polls;
+                }
             }
             if (search && search->sample_count && search->sampled_black == search->sample_count) ++s.sampled_black_images;
             s.stats.search_ms[eye] = search && search->timed ? search->elapsed_ms : -1.;
@@ -908,6 +959,15 @@ void poll(State& s) {
                 } else ++s.stats.publication_rejected;
             } else ++s.stats.publication_rejected;
         }
+        double verification_ms{};
+        for (const auto& tracked : f.tracked) if (tracked.tracking_cpu_ms>0) {
+            verification_ms+=tracked.tracking_cpu_ms;
+            ++s.stats.verification_patch_calls;
+            if (tracked.tracking_path>=1 && tracked.tracking_path<=3) ++s.stats.verification_paths[tracked.tracking_path-1];
+        }
+        s.stats.verification_cpu_ms+=verification_ms;
+        s.stats.verification_last_ms=verification_ms;
+        s.stats.verification_peak_ms=(std::max)(s.stats.verification_peak_ms,verification_ms);
         log_calibration_capture(s, f, rejection);
         ++s.stats.completed;
         s.latency.add(double(s.sequence - f.sequence));
@@ -1099,6 +1159,7 @@ EyeCalibrationStats eye_calibration_stats() noexcept {
     result.in_flight =
         unsigned(std::count_if(s.ring.begin(), s.ring.end(), [](const auto& f) { return f.busy; }));
     result.cpu_us_per_frame = result.frames ? s.cpu_us / result.frames : 0;
+    result.verification_cpu_us_per_frame=result.frames ? result.verification_cpu_ms*1000/result.frames : 0;
     result.gpu_us = s.gpu.get();
     result.latency_frames = s.latency.get();
     result.backend = s.backend;
@@ -1224,7 +1285,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.evaluations = f.submits = 0;
         f.views = {};
         f.placement_plans = {}; f.submitted_sizes = {}; f.placement_count = 1;
-        f.tracking = {}; f.tracked = {};
+        f.tracking = {}; f.tracked = {}; f.tracking_inputs={}; f.verification.reset(); f.verification_staged=false;
         for (auto& usable : f.usable_placements) usable.fill(true);
         for (auto& capture : f.submitted11) capture.active = capture.ready = false;
         f.eye_submits = {};
@@ -1806,11 +1867,29 @@ std::string eye_calibration_json() {
         << ",\"corrections\":" << s.corrections << ",\"applied\":" << s.applied
         << ",\"mismatches\":" << s.mismatches << ",\"allocations\":" << s.allocations
         << ",\"search_left_ms\":" << s.search_ms[0] << ",\"search_right_ms\":" << s.search_ms[1]
+        << ",\"verification_background\":true"
+        << ",\"verification_exact\":" << s.verification_paths[0]
+        << ",\"verification_nearby\":" << s.verification_paths[1]
+        << ",\"verification_broad\":" << s.verification_paths[2]
+        << ",\"verification_cpu_us_per_frame\":" << s.verification_cpu_us_per_frame
+        << ",\"verification_last_ms\":" << s.verification_last_ms
+        << ",\"verification_peak_ms\":" << s.verification_peak_ms
+        << ",\"verification_patch_calls\":" << s.verification_patch_calls
         << ",\"capture_total_left_ms\":" << s.capture_total_ms[0] << ",\"capture_total_right_ms\":" << s.capture_total_ms[1]
         << ",\"capture_setup_left_ms\":" << s.capture_setup_ms[0] << ",\"capture_setup_right_ms\":" << s.capture_setup_ms[1]
         << ",\"capture_wait_left_ms\":" << s.capture_wait_ms[0] << ",\"capture_wait_right_ms\":" << s.capture_wait_ms[1]
         << ",\"capture_map_left_ms\":" << s.capture_map_ms[0] << ",\"capture_map_right_ms\":" << s.capture_map_ms[1]
         << ",\"capture_copy_left_ms\":" << s.capture_copy_ms[0] << ",\"capture_copy_right_ms\":" << s.capture_copy_ms[1]
+        << ",\"peak_capture_setup_ms\":" << s.peak_capture_setup_ms
+        << ",\"peak_capture_wait_ms\":" << s.peak_capture_wait_ms
+        << ",\"peak_capture_map_ms\":" << s.peak_capture_map_ms
+        << ",\"peak_capture_copy_ms\":" << s.peak_capture_copy_ms
+        << ",\"peak_capture_other_ms\":" << s.peak_capture_other_ms
+        << ",\"peak_capture_sequence\":" << s.peak_capture_sequence
+        << ",\"peak_capture_eye\":" << s.peak_capture_eye
+        << ",\"peak_capture_width\":" << s.peak_capture_width
+        << ",\"peak_capture_height\":" << s.peak_capture_height
+        << ",\"peak_capture_map_polls\":" << s.peak_capture_map_polls
         << ",\"capture_timing_samples\":" << s.capture_timing_samples << ",\"max_capture_ms\":" << s.max_capture_ms
         << ",\"max_search_ms\":" << s.max_search_ms << ",\"search_timing_samples\":" << s.search_timing_samples
         << ",\"gpu_samples\":" << s.gpu_samples << ",\"cpu_us_per_frame\":" << s.cpu_us_per_frame

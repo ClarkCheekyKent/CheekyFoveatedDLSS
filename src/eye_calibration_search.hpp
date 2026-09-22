@@ -22,6 +22,8 @@ struct CalibrationSearchResult {
     CalibrationPlacement placement;
     float score{};
     unsigned support_points{};
+    double tracking_cpu_ms{};
+    unsigned tracking_path{};
 };
 inline double calibration_clock_ms() {
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -163,6 +165,8 @@ struct CalibrationSearchOptions {
     double min_cell{1.5}, max_cell{20.}, aspect{1.};
     unsigned flip_mask{3};
     bool tracking{};
+    bool fixed_geometry{};
+    double expected_x{}, expected_y{}, expected_cw{}, expected_ch{}, translation_radius{};
     bool require_grid{};
     unsigned locator_factor{4};
     std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
@@ -220,7 +224,11 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     std::vector<Hit> hits;
     struct Window { double x0,y0,x1,y1,cell,cy; };
     std::vector<Window> windows;
-    if (options.require_grid) {
+    if (options.fixed_geometry) {
+        const auto r=options.translation_radius;
+        windows.push_back({(std::max)(0.,options.expected_x-r),(std::max)(0.,options.expected_y-r),
+            options.expected_x+r,options.expected_y+r,options.expected_cw,options.expected_ch});
+    } else if (options.require_grid) {
         for (const auto& b : calibration_locators(image, options.locator_factor, canceled, options.deadline)) {
             const double margin=2.*options.locator_factor;
             for(double scale : {.88,1.,1.12}) {
@@ -278,7 +286,7 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
         // Refine independent X/Y scale and translation using the cell contrast.
         // Average the plateau of equally good fits to avoid biasing to the first
         // coarse position/scale that happens to put all samples inside cells.
-        for (double radius : {.18, .06}) {
+        if (!options.fixed_geometry) for (double radius : {.18, .06}) {
             double sx{}, sy{}, sw{}, sh{}; unsigned count{};
             float best = hit.score;
             for (int dy = -1; dy <= 1; ++dy) for (int dx = -1; dx <= 1; ++dx)

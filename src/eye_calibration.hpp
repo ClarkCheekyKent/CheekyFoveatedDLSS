@@ -23,7 +23,13 @@ struct EyeCalibrationStats {
     std::array<double,2> capture_total_ms{-1,-1}, capture_setup_ms{-1,-1}, capture_wait_ms{-1,-1},
         capture_map_ms{-1,-1}, capture_copy_ms{-1,-1};
     double max_capture_ms{};
+    double peak_capture_setup_ms{}, peak_capture_wait_ms{}, peak_capture_map_ms{}, peak_capture_copy_ms{}, peak_capture_other_ms{};
+    std::uint64_t peak_capture_sequence{};
+    unsigned peak_capture_eye{}, peak_capture_width{}, peak_capture_height{}, peak_capture_map_polls{};
     std::uint64_t capture_timing_samples{};
+    double verification_cpu_ms{}, verification_cpu_us_per_frame{}, verification_last_ms{}, verification_peak_ms{};
+    std::uint64_t verification_patch_calls{};
+    std::array<std::uint64_t,3> verification_paths{};
     double max_search_ms{};
     std::uint64_t search_timing_samples{};
     const char* gpu_timing_status{"Waiting for a complete GPU timestamp sample"};

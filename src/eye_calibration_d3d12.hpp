@@ -20,6 +20,7 @@ struct Calibration12Readback {
     // A/B per eye, followed by vertically flipped A/B per eye.
     std::array<float, calibration_patch_count> scores{};
     std::array<CalibrationSearchResult, calibration_patch_count> tracked{};
+    std::array<CalibrationTrackingInputPtr, calibration_patch_count> tracking_inputs{};
     double gpu_us{};
     std::uint64_t allocations{};
     Calibration12Failure failure{};

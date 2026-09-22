@@ -382,6 +382,12 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
     ImGui::Text("Valid / completed samples: %.0f / %.0f", number(data, "valid"), number(data, "completed"));
     ImGui::Text("Skipped / in flight: %.0f / %.0f", number(data, "skipped"), number(data, "in_flight"));
     ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
+    ImGui::Text("Verification worker: %.2f us/frame (background)",number(data,"verification_cpu_us_per_frame"));
+    ImGui::Text("Verification worker (last / peak sample): %.2f / %.2f ms",
+        number(data,"verification_last_ms"),number(data,"verification_peak_ms"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Worker elapsed time for completed local searches, including failures and patch conversion. Separate from graphics-thread CPU work; includes worker scheduling delays.");
+    ImGui::Text("Verification attempts (exact / nearby / broad): %.0f / %.0f / %.0f",
+        number(data,"verification_exact"),number(data,"verification_nearby"),number(data,"verification_broad"));
     if (number(data, "capture_timing_samples") > 0) {
         ImGui::Text("Image acquisition total (L / R): %.1f / %.1f ms", number(data,"capture_total_left_ms"),number(data,"capture_total_right_ms"));
         ImGui::Text("Capture allocation / record (L / R): %.1f / %.1f ms", number(data,"capture_setup_left_ms"),number(data,"capture_setup_right_ms"));
@@ -389,6 +395,13 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
         ImGui::Text("Map calls CPU (L / R): %.1f / %.1f ms", number(data,"capture_map_left_ms"),number(data,"capture_map_right_ms"));
         ImGui::Text("CPU image allocation / copy (L / R): %.1f / %.1f ms", number(data,"capture_copy_left_ms"),number(data,"capture_copy_right_ms"));
         ImGui::Text("Image acquisition peak: %.1f ms",number(data,"max_capture_ms"));
+        ImGui::Text("Peak capture: eye %s, %.0fx%.0f, sample %.0f, %.0f Map polls",
+            number(data,"peak_capture_eye")==0 ? "L" : "R", number(data,"peak_capture_width"),
+            number(data,"peak_capture_height"),number(data,"peak_capture_sequence"),number(data,"peak_capture_map_polls"));
+        ImGui::Text("At peak - allocation / record: %.1f ms; readback: %.1f ms",
+            number(data,"peak_capture_setup_ms"),number(data,"peak_capture_wait_ms"));
+        ImGui::Text("At peak - CPU copy: %.1f ms; other: %.1f ms; Map CPU: %.1f ms",
+            number(data,"peak_capture_copy_ms"),number(data,"peak_capture_other_ms"),number(data,"peak_capture_map_ms"));
         ImGui::TextWrapped("Readback elapsed includes GPU queue and polling delay; Map CPU overlaps it. -1 means unavailable.");
     }
     if (number(data, "search_timing_samples") > 0) {
