@@ -108,6 +108,16 @@ inline void calibration_encode_pattern(unsigned char* p, DXGI_FORMAT format, uns
         p[3] = 255;
     }
 }
+// Locator coordinates include a white 8px outer ring and black 8px inner ring.
+inline void calibration_encode_locator(unsigned char* p, DXGI_FORMAT format, unsigned candidate,
+    unsigned x, unsigned y, std::uint32_t code, bool locator) {
+    if (!locator) { calibration_encode_pattern(p, format, candidate, x, y, code); return; }
+    if (x >= 16 && x < 56 && y >= 16 && y < 56) {
+        calibration_encode_pattern(p, format, candidate, x-16, y-16, code); return;
+    }
+    const bool light = x < 8 || y < 8 || x >= 64 || y >= 64;
+    calibration_encode_pattern(p, format, candidate, 0, 0, light ? 0x1ffffffU : 2U);
+}
 // Normalize only the tiny readback, then search +/-8 source pixels in 2px steps.
 // Callers can restrict template orientation to the hypothesis plus reversed
 // submission bounds. Accepting every reflection during a crop search would

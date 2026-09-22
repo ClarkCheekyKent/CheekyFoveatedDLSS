@@ -619,6 +619,10 @@ void draw_eye_calibration_diagnostics() {
         diagnostic_row("Valid / completed samples", "%llu / %llu", s.valid, s.completed);
         diagnostic_row("Skipped / in flight", "%llu / %u", s.skipped, s.in_flight);
         diagnostic_row("CPU work", "%.2f us/frame", s.cpu_us_per_frame);
+        if (s.search_timing_samples) {
+            diagnostic_row("Full-image search (last L / R)", "%.1f / %.1f ms", s.search_ms[0], s.search_ms[1]);
+            diagnostic_row("Full-image search (peak per eye)", "%.1f ms", s.max_search_ms);
+        } else diagnostic_row("Full-image search", "%s", "No completed timing yet");
         if (s.gpu_samples) diagnostic_row("GPU marker / copy work", "%.2f us", s.gpu_us);
         else diagnostic_row("GPU marker / copy work", "%s", s.gpu_timing_status);
         diagnostic_row("Readback latency", "%.2f VR frames", s.latency_frames);

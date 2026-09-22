@@ -382,6 +382,12 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
     ImGui::Text("Valid / completed samples: %.0f / %.0f", number(data, "valid"), number(data, "completed"));
     ImGui::Text("Skipped / in flight: %.0f / %.0f", number(data, "skipped"), number(data, "in_flight"));
     ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
+    if (number(data, "search_timing_samples") > 0) {
+        ImGui::Text("Full-image search (last L / R): %.1f / %.1f ms",
+            number(data, "search_left_ms"), number(data, "search_right_ms"));
+        ImGui::Text("Full-image search (peak per eye): %.1f ms", number(data, "max_search_ms"));
+    } else ImGui::TextUnformatted("Full-image search: no completed timing yet");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Worker elapsed time per eye, including unsuccessful searches. Eyes run concurrently; do not add their times. Excludes image readback/conversion and final verification. -1 means unavailable.");
     if (number(data, "gpu_samples") > 0) ImGui::Text("GPU marker / copy work: %.2f us", number(data, "gpu_us"));
     else diagnostic_line(data, "GPU marker / copy work", "gpu_timing_status");
     ImGui::Text("Readback latency: %.2f VR frames", number(data, "latency_frames"));

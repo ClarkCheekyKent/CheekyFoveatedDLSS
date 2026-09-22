@@ -34,7 +34,7 @@ bool calibration12_stamp(Calibration12Frame&, ID3D12GraphicsCommandList*, ID3D12
                          const CalibrationImageInfo& support_info = {},
                          std::uint32_t marker_code = 0,
                          Calibration12StampMode mode = Calibration12StampMode::source_proof,
-                         std::span<const CalibrationMarkerPoint> extra_markers = {}) noexcept;
+                         std::span<const CalibrationMarkerPoint> extra_markers = {}, bool locator = false) noexcept;
 bool calibration12_capture(Calibration12Frame&, ID3D12CommandQueue*, ID3D12Resource*, unsigned eye,
                            unsigned slice, D3D12_RESOURCE_STATES state, std::span<const D3D12_BOX> boxes,
                            std::uint64_t& allocations, Calibration12Failure* failure = nullptr,

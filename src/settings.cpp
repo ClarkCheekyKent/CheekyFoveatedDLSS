@@ -95,6 +95,8 @@ std::uint64_t registration_generation{};
 struct Calibration {
     std::uint64_t left{}, right{}, sequence{}, session_generation{};
     bool vertical_flip{};
+    std::array<StereoSourceCrop, 2> source_crops{};
+    std::uint64_t verified_ms{};
 } calibration;
 bool calibration_live() {
     // Verified identity survives missing markers. View destruction, session
@@ -103,9 +105,13 @@ bool calibration_live() {
 }
 StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
+    auto crops = calibration.source_crops;
+    const auto now = GetTickCount64();
+    if (now < calibration.verified_ms || now - calibration.verified_ms > 2500)
+        for (auto& crop : crops) crop.valid = false;
     if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip,
-        calibration.left == calibration.right};
-    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip};
+        calibration.left == calibration.right, crops};
+    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip, false, crops};
     return {};
 }
 
@@ -435,7 +441,8 @@ std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept {
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected,
-    std::uint64_t session_generation, bool vertical_flip, bool shared_source) noexcept {
+    std::uint64_t session_generation, bool vertical_flip, bool shared_source,
+    const std::array<StereoSourceCrop, 2>* source_crops) noexcept {
     if (corrected) *corrected = false;
     if (!left || !right || (left == right) != shared_source || !left_generation || !right_generation) return false;
     std::lock_guard lock(stereo_views_mutex);
@@ -465,7 +472,12 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
             (previous_right >= 0 && previous_right != 1);
     }
     calibration = {left, right, sequence, session_generation, vertical_flip};
+    if (source_crops) { calibration.source_crops = *source_crops; calibration.verified_ms = captured_ms; }
     return true;
+}
+void invalidate_stereo_crop() noexcept {
+    std::lock_guard lock(stereo_views_mutex);
+    for (auto& crop : calibration.source_crops) crop.valid = false;
 }
 void clear_stereo_calibration() noexcept {
     std::lock_guard lock(stereo_views_mutex);

@@ -12,6 +12,7 @@ inline constexpr unsigned calibration_box_count = 4 * calibration_placement_coun
 struct CalibrationMarkerPoint {
     unsigned x{}, y{};
     std::uint32_t code{};
+    bool locator{};
     bool operator==(const CalibrationMarkerPoint&) const = default;
 };
 struct CalibrationPlacement {
@@ -35,6 +36,22 @@ struct CalibrationMarkerPoints {
     }
     bool operator==(const CalibrationMarkerPoints&) const = default;
 };
+// Spatially unique 5x5 codes distributed over the source. Acquisition requires
+// several decoded locations; a repeating checkerboard cannot identify a crop.
+inline CalibrationPlacementPlan calibration_grid_plan(unsigned width, unsigned height) {
+    CalibrationPlacementPlan plan;
+    plan.count = 0;
+    if (width < 328 || height < 328) {
+        plan.count = 1; plan.placements[0] = {0, 0, double(width), double(height), {12, 12}};
+        return plan; // Too small for a spatially verified crop; acquisition stays unknown.
+    }
+    for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 4; ++x) {
+        const unsigned px = 36 + unsigned((width - 112.) * x / 3.);
+        const unsigned py = 36 + unsigned((height - 112.) * y / 3.);
+        plan.placements[plan.count++] = {0, 0, double(width), double(height), {px, py, 0, true}};
+    }
+    return plan;
+}
 inline std::uint32_t calibration_location_code(CalibrationMarkerPoint p, unsigned width,
                                                unsigned candidate, std::uint32_t base) {
     if (p.x == (candidate ? width - 52 : 12) && p.y == 12) return base;
@@ -92,7 +109,7 @@ inline CalibrationPlacementPlan calibration_placement_plan(unsigned width, unsig
                                       : 12 + unsigned(std::ceil(x / 48)) * 48;
         const unsigned py = 12 + unsigned(std::ceil(y / 48)) * 48;
         if (px < x + 10 || px + 50 > x + rw || py < y + 10 || py + 50 > y + rh || py + 40 >= y + rh * .5) return;
-        plan.placements[i] = {x, y, rw, rh, {px, py}};
+        plan.placements[i] = {x, y, rw, rh, {px, py, 0, true}};
     };
     add(1, cw, ch); // Aspect-preserving crop followed by any uniform resize.
     add(2, nw, nh); // Native-pixel crop.
@@ -114,11 +131,12 @@ inline double calibration_corner_distance(double x, double y, double w, double h
 }
 inline CalibrationPlacement calibration_padded_corner(CalibrationPlacement p, unsigned width,
     unsigned height, unsigned candidate, double submitted_width, double submitted_height) {
+    p.marker.locator = false;
     // Padding is measured in the submitted eye, then mapped into source pixels.
     // Rebuild from the learned crop boundary, not from the last inset marker:
     // repeated reacquisition must not walk the marker farther into the view.
-    const double px = (std::max)(12., submitted_width > 0 ? 12. * p.width / submitted_width : 12.);
-    const double py = (std::max)(12., submitted_height > 0 ? 12. * p.height / submitted_height : 12.);
+    const double px = (std::max)(12., submitted_width > 0 ? 20. * p.width / submitted_width : 20.);
+    const double py = (std::max)(12., submitted_height > 0 ? 20. * p.height / submitted_height : 20.);
     p.marker.x = unsigned(std::clamp(candidate ? std::floor(p.x + p.width - 40 - px) :
         std::ceil(p.x + px), 0., double(width - 40)));
     p.marker.y = unsigned(std::clamp(std::ceil(p.y + py), 0., double(height - 40)));

@@ -41,6 +41,7 @@ struct ViewState {
     bool has_crop{};
     bool calibrated_vertical_flip{};
     bool shared_source{};
+    std::array<StereoSourceCrop, 2> source_crops{};
     bool next_jump_visible{};
     FoveationOffsets next_jump_offsets{};
     float next_jump_width{}, next_jump_height{};
@@ -579,7 +580,30 @@ bool calculate_coordinated_crop(
     const bool marker_match = eye_assignment.calibrated && snapshot.view_count == 2U &&
         (openvr_snapshot ? eye_assignment.calibration_session == 0 :
             eye_assignment.calibration_session != 0 && eye_assignment.calibration_session == snapshot.session_generation);
-    calibrated_vertical_flip = marker_match && eye_assignment.vertical_flip;
+    if (marker_match) {
+        const auto& crop_mapping = eye_assignment.source_crops[eye_assignment.eye_index];
+        if (!crop_mapping.valid || crop_mapping.source_width != output_width ||
+            crop_mapping.source_height != output_height ||
+            (eye_assignment.shared_source && !eye_assignment.source_crops[1].valid)) {
+            // Identity may outlive geometric verification. Never treat stale
+            // submitted UVs as source UVs while reacquiring the crop.
+            state_for_view(view_id).temporal = {};
+            return auto_crop(nullptr);
+        }
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto& p = eye_assignment.source_crops[eye];
+            auto& v = snapshot.views[eye];
+            const auto map = [&](float& u, float& y) {
+                u = p.x + u * p.width;
+                y = p.y + (eye_assignment.vertical_flip ? 1.F-y : y) * p.height;
+            };
+            map(v.center_u, v.center_v);
+            map(v.forward_u, v.forward_v);
+            map(v.next_jump_u, v.next_jump_v);
+        }
+    }
+    // The calibrated transform above already includes the vertical flip.
+    calibrated_vertical_flip = false;
     const bool shared_source = marker_match && eye_assignment.shared_source;
     // Both submitted images were verified to contain the same source. That
     // source gets one binocular center, not an arbitrary left/right role.
@@ -681,10 +705,12 @@ bool calculate_coordinated_crop(
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
-    const bool calibration_changed = state.calibrated_vertical_flip != calibrated_vertical_flip ||
-        state.shared_source != shared_source;
+    const auto current_crops = marker_match ? eye_assignment.source_crops : std::array<StereoSourceCrop, 2>{};
+    const bool calibration_changed = state.calibrated_vertical_flip != (marker_match && eye_assignment.vertical_flip) ||
+        state.shared_source != shared_source || state.source_crops != current_crops;
     if (calibration_changed) {
-        state.calibrated_vertical_flip = calibrated_vertical_flip;
+        state.calibrated_vertical_flip = marker_match && eye_assignment.vertical_flip;
+        state.source_crops = current_crops;
         state.shared_source = shared_source;
         state.temporal = {};
     }

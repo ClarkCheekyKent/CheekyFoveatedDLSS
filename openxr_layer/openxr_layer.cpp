@@ -69,6 +69,7 @@ struct Dispatch {
     PFN_xrSyncActions sync_actions{};
     PFN_xrGetActionStatePose get_action_state_pose{};
     PFN_xrCreateActionSpace create_action_space{};
+    PFN_xrCreateReferenceSpace create_reference_space{};
     PFN_xrDestroySpace destroy_space{};
     PFN_xrLocateSpace locate_space{};
     PFN_xrLocateViews locate_views{};
@@ -113,6 +114,7 @@ void populate_dispatch(
     CHEEKY_LOAD(sync_actions, SyncActions);
     CHEEKY_LOAD(get_action_state_pose, GetActionStatePose);
     CHEEKY_LOAD(create_action_space, CreateActionSpace);
+    CHEEKY_LOAD(create_reference_space, CreateReferenceSpace);
     CHEEKY_LOAD(destroy_space, DestroySpace);
     CHEEKY_LOAD(locate_space, LocateSpace);
     CHEEKY_LOAD(locate_views, LocateViews);
@@ -155,6 +157,7 @@ struct SessionState {
     XrInstance instance{XR_NULL_HANDLE};
     XrSystemId system_id{XR_NULL_SYSTEM_ID};
     XrSpace gaze_space{XR_NULL_HANDLE};
+    XrSpace calibration_local_space{XR_NULL_HANDLE};
     XrViewConfigurationType view_configuration{};
     XrSessionState state{XR_SESSION_STATE_UNKNOWN};
     std::uint64_t generation{};
@@ -962,6 +965,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     session_state.session = *session;
     session_state.instance = instance;
     session_state.system_id = info->systemId;
+    if (instance_state->dispatch.create_reference_space) {
+        XrReferenceSpaceCreateInfo local{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        local.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        local.poseInReferenceSpace.orientation.w = 1.F;
+        static_cast<void>(instance_state->dispatch.create_reference_space(
+            *session, &local, &session_state.calibration_local_space));
+    }
     for (auto* binding = static_cast<const XrBaseInStructure*>(info->next); binding; binding = binding->next) {
         if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) session_state.graphics_api = 11;
         if (binding->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) session_state.graphics_api = 100;
@@ -1011,6 +1021,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
 ) {
     Dispatch dispatch{};
     XrSpace gaze_space{XR_NULL_HANDLE};
+    XrSpace calibration_local_space{XR_NULL_HANDLE};
     {
         std::lock_guard lock(state_mutex);
         const auto session_it = sessions.find(session);
@@ -1019,6 +1030,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         if (instance_it == instances.end()) return XR_ERROR_HANDLE_INVALID;
         dispatch = instance_it->second.dispatch;
         gaze_space = session_it->second.gaze_space;
+        calibration_local_space = session_it->second.calibration_local_space;
         session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
         sessions.erase(session_it);
         for (auto iterator = swapchains.begin(); iterator != swapchains.end();) {
@@ -1034,6 +1046,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
     if (gaze_space != XR_NULL_HANDLE && dispatch.destroy_space != nullptr) {
         static_cast<void>(dispatch.destroy_space(gaze_space));
     }
+    if (calibration_local_space != XR_NULL_HANDLE && dispatch.destroy_space)
+        static_cast<void>(dispatch.destroy_space(calibration_local_space));
     return dispatch.destroy_session == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
         : dispatch.destroy_session(session);
@@ -1318,6 +1332,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
     PFN_xrLocateSpace locate_space{};
     XrAction gaze_action{XR_NULL_HANDLE};
     XrSpace gaze_space{XR_NULL_HANDLE};
+    XrSpace calibration_local_space{XR_NULL_HANDLE};
     bool action_attached{};
     {
         std::lock_guard lock(state_mutex);
@@ -1331,6 +1346,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         if (locate_info && locate_info->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
             poll_realvr_gaze_locked(*instance, session_state, locate_info->displayTime);
         gaze_space = session_state.gaze_space;
+        calibration_local_space = session_state.calibration_local_space;
         action_attached = session_state.running && session_state.action_attached &&
             session_state.state == XR_SESSION_STATE_FOCUSED &&
             session_state.input.sync_result == XR_SUCCESS;
@@ -1345,6 +1361,22 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         return result;
     }
 
+    // App views may be head-relative. Query a stationary space for motion,
+    // using the downstream entry point without changing the application's views.
+    XrViewState motion_state{XR_TYPE_VIEW_STATE};
+    std::array<XrView, 2> motion_views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    std::uint32_t motion_count{};
+    bool motion_valid{};
+    if (calibration_local_space != XR_NULL_HANDLE) {
+        XrViewLocateInfo motion_info{XR_TYPE_VIEW_LOCATE_INFO};
+        motion_info.viewConfigurationType = locate_info->viewConfigurationType;
+        motion_info.displayTime = locate_info->displayTime;
+        motion_info.space = calibration_local_space;
+        motion_valid = XR_SUCCEEDED(next(session, &motion_info, &motion_state,
+            2, &motion_count, motion_views.data())) && motion_count == 2 &&
+            (motion_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+    }
+
     // The runtime's recommended optics can differ from the application's
     // submitted projection. Apply the last submitted FOV and relative eye
     // rotation to the current tracked poses; never reuse an old absolute pose.
@@ -1356,6 +1388,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         if (it != sessions.end()) {
             auto& state = it->second;
             auto& located = state.located_history[state.located_cursor++ % state.located_history.size()];
+            if (cheeky::openxr_calibration::observe_pose) {
+                const auto& q = motion_views[0].pose.orientation;
+                const float xyzw[]{q.x, q.y, q.z, q.w};
+                cheeky::openxr_calibration::observe_pose(state.generation,
+                    reinterpret_cast<std::uint64_t>(calibration_local_space), locate_info->displayTime, xyzw,
+                    motion_valid);
+            }
             located.time = locate_info->displayTime;
             located.space = locate_info->space;
             located.poses = {views[0].pose, views[1].pose};

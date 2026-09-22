@@ -19,10 +19,14 @@ struct EyeCalibrationStats {
         gpu_samples{};
     unsigned in_flight{};
     double cpu_us_per_frame{}, max_cpu_call_us{}, gpu_us{}, max_gpu_us{}, latency_frames{};
+    std::array<double, 2> search_ms{};
+    double max_search_ms{};
+    std::uint64_t search_timing_samples{};
     const char* gpu_timing_status{"Waiting for a complete GPU timestamp sample"};
     std::uint64_t left_view{}, right_view{};
     std::uint64_t corrections{}, applied{};
     bool correction_active{};
+    bool crop_mapping_active{};
     bool vertical_flip{};
     bool openvr_active{}, unsupported_submission{};
     std::uint64_t unsupported_submissions{};

@@ -49,8 +49,8 @@ slots remain owned until GPU readback completes.
 
 Native OpenXR D3D11 source captures may span up to four XR intervals / 250 ms,
 so alternating eye rendering can supply distinct DLSS views on adjacent frames.
-Source renders retain the current corner pair or selected tracking marker between
-readback samples. This supports hosts that submit images rendered earlier.
+On the native OpenXR D3D11 submission path, source renders retain the acquisition
+grid between readbacks until locked, then retain selected tracking markers. This supports hosts that submit images rendered earlier.
 Codes and candidate slots stay bound to view identities for the calibration
 epoch, so a delayed submitted frame can still match. Toggling calibration,
 changing the backend/session or replacing a source view invalidates those codes.
@@ -80,40 +80,65 @@ poses for up to 250 ms. Runtime-provided optics remain the fallback before a
 valid submitted projection is available. Support snapshots identify the selected
 projection and its FOV tangents.
 
-Calibration tries one crop hypothesis at a time, stamping at most a nearby
-outer/inner corner pair per source (40px markers with an 8px gap). It never
-displays the full hypothesis bank. If small patches cannot locate the markers,
-it acquires full submitted images asynchronously and searches their
-codes across the submitted view. Each eye gets an independently estimated crop
-and horizontal/vertical scale. Successful acquisition locks the selected marker;
-subsequent samples stamp only the selected location(s) and read bounded tracking
-patches. Each patch has 64 submitted pixels of movement allowance around the
-predicted marker, clipped to its own eye viewport and capped at 256 by 256 pixels.
-Local recognition fits translation and scale with the same code/contrast thresholds
-and recenters the next patch from the new observation, independently for each eye.
-Three consecutive complete samples with missing submitted markers, or changed
-source/submission geometry, unlock placement and permit acquisition again. A
-single failed sample retains the tracking layout but cannot refresh eye identity. Wide acquisitions are limited to one stereo pair in
-flight, with at least one second between attempts; they stop while tracking is
-locked. Image conversion is bounded to a 2048-pixel maximum dimension, and up to
-two CPU workers search owned pixels without accessing graphics contexts.
+Calibration starts with a 4x4 grid of distinct 40px light/dark codes across each
+DLSS output. Acquisition codes have an 8px black ring and 8px white outer ring,
+for a 72x72 footprint. Their outer edges start 20 source pixels inside the image.
+Corner verification codes remain 40x40 without rings. Full submitted images are acquired asynchronously. Each eye must
+contain at least three separated, noncollinear codes from one source with a
+consistent orientation. Their centers fit an axis-aligned source crop and scale;
+fits with more than six submitted pixels of residual error are rejected. One
+valid stereo pair establishes both eye identity and crop geometry. Sources below
+328 pixels in either dimension cannot supply the full grid and remain uncalibrated.
 
-Among authenticated markers, prefer the one nearest a submitted-image corner that
-still leaves room for the complete tracking patch. This reduces visibility but
-does not prove the marker is outside the headset's visible area: no hidden-area
-mask is used. Acquisition still requires a surviving complete code. Severe
-distortion, clipping, or very small markers can prevent recognition. The search
-covers axis-aligned crop/resize and vertical flips, not arbitrary reprojection.
-The learned crop locates tracking patches; existing camera/XR projection logic
-continues to place gaze. After acquisition, a stereo source stamps only its one
-selected marker. A shared mono source may need one marker
-per eye. Reacquisition first tries the learned crop corner with 12 submitted-pixel
-padding mapped back into the source (at least 12 source pixels), plus its nearby
-inset fallback. This is computed from the crop boundary, not from the previous
-inset marker, to avoid drifting inward after repeated losses. These stamps are
-not erased from submitted frames. Keeping one marker at a usable crop corner
-reduces their footprint but does not guarantee that the marker is outside the
-headset lens view.
+The learned normalized source rectangle maps submitted-eye gaze back into the
+original DLSS output: source U = crop X + eye U * crop width, with the analogous
+V transform and any detected vertical flip. This applies to current, forward and
+predicted gaze positions. A shared source maps both eyes before averaging.
+
+After acquisition, each source stamps a small marker near its learned crop corner
+(a shared source may need one per eye), inset 20 submitted-image pixels from the
+crop boundary. Verification runs every ten VR frames,
+using bounded patches with 64 submitted pixels of movement allowance, capped at
+256x256. It checks the cached geometry without letting single-marker noise move
+the learned crop. Decoded marker endpoint errors exceeding 32 submitted pixels count toward
+reacquisition after ten consecutive settled failed samples. Ambiguous identity invalidates
+immediately. The endpoint check uses the marker footprint, not
+a single-marker scale estimate extrapolated to distant crop edges. Small global
+scale changes around that marker can remain undetected by this local check. Ten consecutive ordinary missing-marker
+samples also trigger reacquisition.
+
+The updated native OpenXR layer queries views in its own LOCAL reference space
+for motion, independently of the application's potentially head-relative space.
+The extra downstream query leaves application view results unchanged.
+Head rotation above 90 degrees/second marks verification as motion-sensitive for
+350 ms; a fresh invalid orientation also makes it inconclusive. Missing or shifted
+markers during that interval reset the ten-miss streak and do not refresh crop
+validity. Once settled, ten consecutive failed samples trigger reacquisition. Ambiguous
+identity still invalidates immediately. This is a confidence heuristic,
+not detection of compositor reprojection. OpenVR uses the ordinary miss policy.
+A crop expires after 2.5 seconds without accepted verification even during motion;
+gaze falls back to the existing camera/fixed-center behavior until verified again.
+Expiry retains corner probes instead of restarting the grid during motion.
+Diagnostics include motion callback count, session, age, orientation validity,
+angular speed, peak speed, fast-sample count and settling state.
+Eye identity can survive crop expiry. Diagnostics distinguish those states.
+
+Wide acquisitions are limited to one stereo pair in flight, with at least 
+200 ms between attempts. Submitted pixels are retained at full resolution. Each CPU worker first averages
+them into a 4x smaller image in both dimensions and detects dark connected rings
+with a contrasting light surround. Candidate boxes map back to original pixels;
+only those neighborhoods undergo code matching and geometric refinement. If the
+4x pass cannot establish a crop, the worker retries at 2x. Up to two CPU workers
+search owned pixels without graphics-context access. This uses more CPU image
+storage for large submissions than the previous 2048px conversion cap. On the native OpenXR D3D11 submission path (including D3D12 sources),
+intervening source renders also receive the grid until a crop is locked. This
+keeps markers present when the host submits a delayed image. After lock, those
+renders receive corner markers. Stamps are not erased and can be visible in the
+headset.
+
+The mapping supports axis-aligned crop/resize and vertical flips, not arbitrary
+reprojection. Severe clipping, distortion, or too few surviving grid points can
+prevent acquisition. No hidden-area mask or REALVR-specific integration is used.
 
 Open **Stereo and gaze > Eye calibration** in UEVR for the runtime, status and
 session enable switch. Detailed calibration data is included in support ZIPs.
@@ -124,6 +149,11 @@ ReShade's **Diagnostics > Eye calibration** panel shows:
   pair counts once; subsequent confirmations do not increment this counter.
 - **Confirmed mapping updates:** all accepted results, including refreshes.
 - Valid/completed samples, skipped/in-flight captures, CPU/GPU work and latency.
+- Full-image search: last left/right worker elapsed milliseconds and peak per eye,
+  including unsuccessful searches. The two eye searches run concurrently; their
+  times should not be added. These timings exclude readback, image conversion and
+  final verification, and reset with the calibration counters. They are also
+  shown in the standalone UI and included in support JSON.
 - Last recognized left/right DLSS views, retained as history when inactive.
 
 Resetting counters preserves the mapping. CPU work measures the core capture and
@@ -150,8 +180,8 @@ Calibration does not automatically write images, ZIPs or logs.
 ## Markers and asynchronous readback
 
 After a successful outer DLSS evaluation and final composition, candidates A/B
-get distinct 40x40 light/dark patterns near their top-left/top-right corners.
-Each pattern has 5x5 cells of 8x8 pixels. Both remain inset 12 pixels.
+get distinct 40x40 light/dark patterns at grid locations during acquisition and
+learned crop corners during verification. Each pattern has 5x5 cells of 8x8 pixels.
 Native OpenXR D3D11 patterns vary per calibration epoch to reject old-session images.
 The other paths use fixed A/B patterns.
 Source before/after readbacks cover the full 40x40 stamp. Submitted readbacks
@@ -169,18 +199,16 @@ the light/dark structure can still prevent recognition. Scores in diagnostic
 exports now measure pattern correlation, not the previous color contrast.
 
 Wide acquisition uses the same 0.90 correlation, 0.15 separation, 24/25 cell and
-0.04 contrast requirements. It searches positions and scales, then refines each
-axis separately. Conflicting source identities or orientations are rejected.
+0.04 contrast requirements. It searches small neighborhoods around locator borders, then refines each
+axis separately at full resolution. Conflicting source identities or orientations are rejected.
 The existing source before/after proof, physical-eye pair checks, epoch,
 generation and submission-result checks still apply. An acquisition older than
 the one-second publication limit may seed tracking for up to ten seconds, but
 must pass a fresh small-patch capture before it can publish an eye mapping.
 This seeding allowance also applies when a small patch already matched in a
 wide-search frame: waiting for the worker must not discard the successful seed.
-Failed wide searches may advance to the next corner even after the one-second
-tracking limit; otherwise a slow search can keep retrying markers clipped by a
-changed resolution or crop. This only updates acquisition, never publishes eye
-identity, and still rejects old epochs and out-of-order completions.
+Failed wide searches retry grid acquisition without publishing eye identity.
+Old epochs and out-of-order completions remain rejected.
 The support JSON's `placement_search` includes `wide_searches`,
 `wide_search_pending`, `last_wide_results`, and per-eye learned placements.
 
@@ -234,10 +262,17 @@ generations. Incoming results older than one second are rejected, but an accepte
 mapping remains authoritative through missing or invalid marker captures. It is
 replaced by fresh valid evidence or cleared by view/session destruction, backend
 or session changes, or disabling calibration. Disabling calibration invalidates
-pending results. Eye changes reset the crop's temporal filter. Asynchronous
+pending results. Eye or learned-crop changes reset the crop's temporal filter. Crop geometry has
+the separate 2.5-second verification lifetime described above. Asynchronous
 readback adds several frames of latency; same-frame correction is not promised.
 
 ## Validation
+
+The coded-grid and motion-aware verification changes have been compiled in Release.
+Tests were intentionally left unchanged and not run for this revision; the coverage
+below describes the earlier implementation. In particular, existing two-marker
+acquisition assertions need revision before they can validate the new grid. Actual
+headset behavior and performance still require manual testing.
 
 `scripts/build.ps1 -Configuration Release` exercises WARP and hardware GPU
 readbacks, changing destinations, supported formats, packed/array submissions,

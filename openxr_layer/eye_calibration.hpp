@@ -5,6 +5,7 @@
 #include <cstdint>
 
 namespace cheeky::openxr_calibration {
+inline CheekyCalibrationObservePoseFn observe_pose{};
 // Called under the layer's state mutex. Retain the exporting module: a cached
 // callback must survive a host adapter unload. Disabled cores do no GPU work.
 inline const CheekyEyeCalibrationBridgeV1* bridge() noexcept {
@@ -27,6 +28,8 @@ inline const CheekyEyeCalibrationBridgeV1* bridge() noexcept {
                                 &retained))
             continue;
         api = candidate;
+        observe_pose = reinterpret_cast<CheekyCalibrationObservePoseFn>(
+            GetProcAddress(retained, "CheekyEyeCalibration_ObservePoseV1"));
         return &api;
     }
     return nullptr;
