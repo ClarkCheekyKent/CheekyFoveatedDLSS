@@ -51,6 +51,9 @@ struct SupportReadback11 {
     bool published{};
 };
 struct Frame {
+    unsigned marker_failure{};
+    bool shared_source_assumed{};
+    double marker_error_x{}, marker_error_y{};
     bool motion_unreliable{};
     CalibrationImageRequestPtr support;
     std::array<SupportReadback11, 4> support11;
@@ -124,9 +127,15 @@ struct PlacementLock {
     bool per_eye{};
     std::array<CalibrationPlacement, 2> eye_placements{};
 };
+struct TrackingHint {
+    CalibrationTrackingPatch reference;
+    CalibrationPlacement observed;
+    std::uint64_t epoch{}, sequence{}, captured_ms{}, view{}, generation{};
+};
 struct State {
     std::mutex mutex;
     std::array<PlacementLock, 2> placements;
+    std::array<TrackingHint,calibration_patch_count> tracking_hints;
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::uint64_t placement_epoch{}, placement_sequence{}, placement_locks{}, placement_losses{};
     bool search_needed{};
@@ -190,10 +199,18 @@ bool motion_unreliable(std::uint64_t session) {
     return motion.session == session && now >= motion.observed_ms && now - motion.observed_ms < 250 &&
         (!motion.valid || now < motion.unstable_until);
 }
+void request_full_calibration(State& s, const char* reason) {
+    if (!s.search_needed) {
+        if (s.placements[0].locked || s.placements[1].locked) ++s.stats.recalibration_requests;
+        s.stats.full_calibration_reason=reason;
+    }
+    s.search_needed=true;
+}
 void placement_epoch(State& s) {
     if (s.placement_epoch == s.epoch) return;
     s.placement_epoch = s.epoch;
-    s.placements = {}; s.submitted_sizes = {}; s.placement_sequence = 0;
+    request_full_calibration(s,"session_or_calibration_reset");
+    s.placements = {}; s.tracking_hints={}; s.submitted_sizes = {}; s.placement_sequence = 0;
     s.search_needed = true; s.last_wide_search_ms = 0; s.last_verified_ms = 0;
     s.search_candidate = s.tracking_misses = 0;
 }
@@ -205,7 +222,7 @@ CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t vi
         CalibrationPlacementPlan plan; plan.placements[0] = lock.placement;
         plan.per_eye = lock.per_eye; plan.eye_placements = lock.eye_placements; return plan;
     }
-    if (lock.locked) { ++s.placement_losses; s.search_needed = true; invalidate_stereo_crop(); }
+    if (lock.locked) { ++s.placement_losses; request_full_calibration(s,"source_or_submitted_geometry_changed"); invalidate_stereo_crop(); }
     lock.locked = false;
     return calibration_grid_plan(width, height);
 }
@@ -217,7 +234,7 @@ void submitted_geometry(State& s, Frame& f, unsigned eye, unsigned width, unsign
     if (f.epoch == s.epoch) s.submitted_sizes[eye] = f.submitted_sizes[eye];
     f.placement_count = (std::max)(f.placement_plans[0].count, f.placement_plans[1].count);
 }
-std::array<unsigned, 4> submitted_rect(Frame& f, unsigned eye, unsigned index, unsigned width, unsigned height,
+std::array<unsigned, 4> submitted_rect(State& s, Frame& f, unsigned eye, unsigned index, unsigned width, unsigned height,
                                      float u0, float v0, float u1, float v1) {
     const unsigned c = index % 2, h = index / 4;
     const auto source = f.views[c].width ? c : (f.views[0].width ? 0U : 1U);
@@ -240,7 +257,21 @@ std::array<unsigned, 4> submitted_rect(Frame& f, unsigned eye, unsigned index, u
         auto coded = placement;
         coded.marker.code = f.patch_codes[calibration_patch_index(index, eye)];
         tracking = calibration_tracking_patch(coded, c, index % 4 >= 2, width, height, u0, v0, u1, v1);
-        if (tracking.enabled) rect = tracking.rect;
+        if (tracking.enabled) {
+            const auto& hint=s.tracking_hints[calibration_patch_index(index,eye)];
+            const auto& old=hint.reference;
+            const auto& a=old.placement; const auto& b=tracking.placement;
+            // Hints guide recognition only; the original crop still validates gaze geometry.
+            if (hint.sequence && hint.epoch==f.epoch && hint.view==f.views[c].id &&
+                hint.generation==f.views[c].generation && GetTickCount64()-hint.captured_ms<1000 &&
+                old.rect==tracking.rect && old.flip==tracking.flip && old.reverse_x==tracking.reverse_x &&
+                old.reverse_y==tracking.reverse_y && old.eye_width==tracking.eye_width && old.eye_height==tracking.eye_height &&
+                a.x==b.x && a.y==b.y && a.width==b.width && a.height==b.height &&
+                a.marker.x==b.marker.x && a.marker.y==b.marker.y) {
+                tracking.hint_valid=true; tracking.hint=hint.observed;
+            }
+            rect=tracking.rect;
+        }
     }
     if (!rect[2] || !rect[3]) { f.usable_placements[eye][h] = false; rect = {0, 0, 1, 1}; }
     return rect;
@@ -348,8 +379,11 @@ constexpr const char* rejection_names[] = {
     "capture_or_readback", "evaluation_count", "eye_submissions", "submission_result",
     "patches_incomplete", "source_marker", "dimensions", "submitted_markers"
 };
+constexpr const char* marker_failure_names[]{"none","no_consistent_eye_pair","ambiguous_eye_identity",
+    "wide_search_no_consistent_pair","tracking_result_missing","marker_shift_over_32px"};
 void record_rejection(State& s, const Frame& f, unsigned mask) {
     ++s.stats.rejected;
+    if (f.marker_failure && f.marker_failure<=5) ++s.stats.marker_failure_counts[f.marker_failure-1];
     for (unsigned i = 0; i < s.stats.rejection_counts.size(); ++i)
         if (mask & (1U << i)) ++s.stats.rejection_counts[i];
     // GPU completions need not arrive in sequence order.
@@ -358,8 +392,19 @@ void record_rejection(State& s, const Frame& f, unsigned mask) {
     s.stats.last_rejection_mask = mask;
     s.stats.last_evaluations = f.evaluations;
     s.stats.last_submits = f.submits;
-    for (unsigned i = 0; i < s.stats.last_rejected_scores.size(); ++i)
+    s.stats.last_marker_failure=marker_failure_names[f.marker_failure];
+    s.stats.last_source_mask=(f.views[0].id ? 1U : 0U) | (f.views[1].id ? 2U : 0U);
+    s.stats.last_shared_source_assumed=f.shared_source_assumed;
+    s.stats.last_motion_unreliable=f.motion_unreliable;
+    s.stats.last_marker_error_x=f.marker_error_x; s.stats.last_marker_error_y=f.marker_error_y;
+    for (unsigned i = 0; i < s.stats.last_rejected_scores.size(); ++i) {
         s.stats.last_rejected_scores[i] = f.patches[i].score;
+        const auto& d=f.tracked[i].match_diagnostics;
+        s.stats.last_best_scores[i]=d.best_score; s.stats.last_best_contrasts[i]=d.best_score_contrast;
+        s.stats.last_max_contrasts[i]=d.max_contrast; s.stats.last_best_bits[i]=d.best_coarse_bits;
+        s.stats.last_score_bits[i]=d.best_score_bits; s.stats.last_search_positions[i]=d.positions;
+        s.stats.last_score_probes[i]=d.scored_candidates; s.stats.last_low_contrast_positions[i]=d.low_contrast_positions;
+    }
 }
 double now_us() {
     static const double scale = [] {
@@ -514,6 +559,23 @@ void log_calibration_capture(State& s, const Frame& f, unsigned rejection) {
             trace_event("CALIB verification background=1 completed_patch_calls=%llu worker_us_per_frame=%.2f last_sample_ms=%.2f peak_sample_ms=%.2f exact=%llu nearby=%llu broad=%llu",
                 s.stats.verification_patch_calls,s.stats.frames ? s.stats.verification_cpu_ms*1000/s.stats.frames : 0,
                 s.stats.verification_last_ms,s.stats.verification_peak_ms,s.stats.verification_paths[0],s.stats.verification_paths[1],s.stats.verification_paths[2]);
+            trace_event("CALIB acquisition_counts attempts=%llu successes=%llu recalibration_requests=%llu failure_streak=%u/%u last_reason=%s",
+                s.wide_searches,s.stats.full_calibration_successes,s.stats.recalibration_requests,
+                s.tracking_misses,eye_calibration_failure_limit,s.stats.full_calibration_reason);
+            if (s.stats.last_rejected_sequence) {
+                const auto& d=s.stats;
+                trace_event("CALIB last_failure seq=%llu mask=0x%X detail=%s evals=%u source_mask=0x%X shared_assumed=%u motion_unreliable=%u error_xy=%.2f,%.2f scores=%.3f,%.3f,%.3f,%.3f;%.3f,%.3f,%.3f,%.3f;%.3f,%.3f,%.3f,%.3f",
+                    d.last_rejected_sequence,d.last_rejection_mask,d.last_marker_failure,d.last_evaluations,d.last_source_mask,
+                    unsigned(d.last_shared_source_assumed),unsigned(d.last_motion_unreliable),d.last_marker_error_x,d.last_marker_error_y,
+                    d.last_rejected_scores[0],d.last_rejected_scores[1],d.last_rejected_scores[2],d.last_rejected_scores[3],
+                    d.last_rejected_scores[4],d.last_rejected_scores[5],d.last_rejected_scores[6],d.last_rejected_scores[7],
+                    d.last_rejected_scores[8],d.last_rejected_scores[9],d.last_rejected_scores[10],d.last_rejected_scores[11]);
+                for(unsigned i=4;i<12;++i) if(d.last_search_positions[i])
+                    trace_event("CALIB last_failure_patch seq=%llu patch=%u accepted_score=%.3f best_sampled_score=%.3f bits_at_best=%u/25 contrast_at_best=%.4f best_coarse_bits=%u/25 max_contrast=%.4f positions=%u scored=%u low_contrast=%u",
+                        d.last_rejected_sequence,i,d.last_rejected_scores[i],d.last_best_scores[i],d.last_score_bits[i],
+                        d.last_best_contrasts[i],d.last_best_bits[i],d.last_max_contrasts[i],d.last_search_positions[i],
+                        d.last_score_probes[i],d.last_low_contrast_positions[i]);
+            }
             if (s.stats.capture_timing_samples) {
                 const auto& p=s.stats;
                 trace_event("CALIB acquisition_peak seq=%llu eye=%u size=%ux%u total_ms=%.2f setup_ms=%.2f readback_wall_ms=%.2f map_cpu_ms=%.2f raw_copy_ms=%.2f other_ms=%.2f map_polls=%u",
@@ -561,6 +623,7 @@ void poll(State& s) {
         bool gpu12_reusable{};
         const unsigned source_mask = (f.views[0].id ? 1U : 0U) | (f.views[1].id ? 2U : 0U);
         const bool mono = f.pipelined && f.evaluations == 1 && (source_mask == 1 || source_mask == 2);
+        f.shared_source_assumed=mono;
         if (!f.verification_staged) {
             if (f.gpu12_used) {
                 const bool mixed = f.pipelined;
@@ -818,7 +881,10 @@ void poll(State& s) {
         }
         // A grid cannot publish a crop from a single coincidental local match.
         if (grid && !acquired) selected = -1;
-        if ((selected < 0 && !acquired) || ambiguous) rejection |= 128U;
+        if ((selected < 0 && !acquired) || ambiguous) {
+            rejection |= 128U;
+            f.marker_failure=ambiguous ? 2 : f.wide_search ? 3 : 1;
+        }
         bool geometry_changed{};
         if (!rejection && !acquired) {
             for (unsigned eye = 0; eye < 2; ++eye) {
@@ -829,7 +895,7 @@ void poll(State& s) {
                 const auto& actual = f.tracked[patch];
                 const auto& expected = f.placement_plans[c].for_eye(slot, h);
                 // A raw template score alone supplies identity, not geometry.
-                if (!actual.valid) { rejection |= 128U; continue; }
+                if (!actual.valid) { rejection |= 128U; f.marker_failure=4; continue; }
                 const auto& p = actual.placement;
                 // Compare the observed marker endpoints in submitted pixels.
                 // Extrapolating a 40px marker's fitted scale to the far crop edge
@@ -840,16 +906,17 @@ void poll(State& s) {
                         (marker-expected_origin)/expected_extent) * pixels;
                 };
                 double dx{}, dy{};
-                if (p.width <= 0 || p.height <= 0) { rejection |= 128U; continue; }
+                if (p.width <= 0 || p.height <= 0) { rejection |= 128U; f.marker_failure=4; continue; }
                 for (const double offset : {0., 40.}) {
                     dx = (std::max)(dx, endpoint_error(expected.marker.x+offset, p.x, p.width,
                         expected.x, expected.width, f.submitted_sizes[slot][0]));
                     dy = (std::max)(dy, endpoint_error(expected.marker.y+offset, p.y, p.height,
                         expected.y, expected.height, f.submitted_sizes[slot][1]));
                 }
+                f.marker_error_x=(std::max)(f.marker_error_x,dx); f.marker_error_y=(std::max)(f.marker_error_y,dy);
                 geometry_changed |= dx > 32 || dy > 32;
             }
-            if (geometry_changed) rejection |= 128U;
+            if (geometry_changed) { rejection |= 128U; f.marker_failure=5; }
         }
         std::array<StereoSourceCrop, 2> crops{};
         if (!rejection) for (unsigned eye = 0; eye < 2; ++eye) {
@@ -871,6 +938,17 @@ void poll(State& s) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
             if (!rejection) {
+                if (f.wide_search && acquired) ++s.stats.full_calibration_successes;
+                if (!acquired) for (unsigned physical=0;physical<2;++physical) {
+                    const auto slot=physical ? right_slot : left_slot;
+                    const auto c=unsigned(physical ? right : left);
+                    const auto h=unsigned(physical ? selected_right : selected);
+                    const auto index=4+h*8+unsigned(flipped_pair)*4+slot*2+c;
+                    const auto& result=f.tracked[index];
+                    auto& hint=s.tracking_hints[index];
+                    if (result.valid && f.sequence>hint.sequence)
+                        hint={f.tracking[index],result.placement,f.epoch,f.sequence,f.captured_ms,f.views[c].id,f.views[c].generation};
+                }
                 s.tracking_misses = s.search_candidate = 0;
                 for (unsigned c = 0; c < 2; ++c) {
                     if (!(source_mask & (1U << c))) continue;
@@ -916,10 +994,10 @@ void poll(State& s) {
                     if (ambiguous) invalidate_stereo_crop();
                 }
                 // Motion-sensitive misses and shifts do not refresh crop validity.
-                // After settling, require ten bad samples before reacquiring.
+                // After settling, require twenty bad samples before reacquiring.
                 // Ambiguous identity still invalidates immediately.
-                if (!inconclusive && (!locked || ambiguous || ++s.tracking_misses >= 10)) {
-                    s.search_needed = true;
+                if (!inconclusive && (!locked || ambiguous || ++s.tracking_misses >= eye_calibration_failure_limit)) {
+                    request_full_calibration(s, ambiguous ? "ambiguous_identity" : locked ? "verification_failure_limit" : "no_locked_crop");
                     invalidate_stereo_crop();
                     if (locked) {
                         for (auto& lock : s.placements) {
@@ -1158,6 +1236,8 @@ EyeCalibrationStats eye_calibration_stats() noexcept {
     result.enabled = enabled;
     result.in_flight =
         unsigned(std::count_if(s.ring.begin(), s.ring.end(), [](const auto& f) { return f.busy; }));
+    result.full_calibration_attempts=s.wide_searches;
+    result.verification_failure_streak=s.tracking_misses;
     result.cpu_us_per_frame = result.frames ? s.cpu_us / result.frames : 0;
     result.verification_cpu_us_per_frame=result.frames ? result.verification_cpu_ms*1000/result.frames : 0;
     result.gpu_us = s.gpu.get();
@@ -1283,6 +1363,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.captured_ms = GetTickCount64();
         f.motion_unreliable = motion_unreliable(session_generation);
         f.evaluations = f.submits = 0;
+        f.marker_failure=0; f.shared_source_assumed=false; f.marker_error_x=f.marker_error_y=0;
         f.views = {};
         f.placement_plans = {}; f.submitted_sizes = {}; f.placement_count = 1;
         f.tracking = {}; f.tracked = {}; f.tracking_inputs={}; f.verification.reset(); f.verification_staged=false;
@@ -1569,7 +1650,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         const auto c = index % 2;
         const auto& ref = f.views[c].width ? f.views[c] : f.views[f.views[0].width ? 0 : 1];
         if (!ref.width || !ref.height) { f.invalid = true; return 0; }
-        const auto r = submitted_rect(f, eye, index, unsigned(d.Width), d.Height, u0, v0, u1, v1);
+        const auto r = submitted_rect(s, f, eye, index, unsigned(d.Width), d.Height, u0, v0, u1, v1);
         codes[index] = f.patch_codes[calibration_patch_index(index, eye)];
         mirrors[index] = f.patch_mirrors[calibration_patch_index(index, eye)];
         tracking[index] = f.tracking[calibration_patch_index(index, eye)];
@@ -1742,7 +1823,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
             f.invalid = true;
             continue;
         }
-        const auto r = submitted_rect(f, eye, index, desc.Width, desc.Height, u0, v0, u1, v1);
+        const auto r = submitted_rect(s, f, eye, index, desc.Width, desc.Height, u0, v0, u1, v1);
         image.sample_rects[index] = r;
         if (!copy_patch(s, f, calibration_patch_index(index, eye), texture, r[0], r[1], r[2], r[3],
             ref.width, ref.height, slice, context.Get()))
@@ -1867,6 +1948,11 @@ std::string eye_calibration_json() {
         << ",\"corrections\":" << s.corrections << ",\"applied\":" << s.applied
         << ",\"mismatches\":" << s.mismatches << ",\"allocations\":" << s.allocations
         << ",\"search_left_ms\":" << s.search_ms[0] << ",\"search_right_ms\":" << s.search_ms[1]
+        << ",\"full_calibration_attempts\":" << s.full_calibration_attempts
+        << ",\"full_calibration_successes\":" << s.full_calibration_successes
+        << ",\"recalibration_requests\":" << s.recalibration_requests
+        << ",\"verification_failure_streak\":" << s.verification_failure_streak
+        << ",\"full_calibration_reason\":\"" << s.full_calibration_reason << '"'
         << ",\"verification_background\":true"
         << ",\"verification_exact\":" << s.verification_paths[0]
         << ",\"verification_nearby\":" << s.verification_paths[1]
@@ -1904,8 +1990,18 @@ std::string eye_calibration_json() {
         if (i) out << ',';
         out << '\"' << rejection_names[i] << "\":" << s.rejection_counts[i];
     }
+    out << "},\"marker_failure_counts\":{";
+    for(unsigned i=0;i<s.marker_failure_counts.size();++i) {
+        if(i) out << ',';
+        out << '"' << marker_failure_names[i+1] << "\":" << s.marker_failure_counts[i];
+    }
     out << "},\"last_rejection\":{\"sequence\":" << s.last_rejected_sequence
         << ",\"mask\":" << s.last_rejection_mask
+        << ",\"marker_failure_detail\":\"" << s.last_marker_failure << '"'
+        << ",\"source_mask\":" << s.last_source_mask
+        << ",\"shared_source_assumed\":" << s.last_shared_source_assumed
+        << ",\"motion_unreliable\":" << s.last_motion_unreliable
+        << ",\"marker_error_x_px\":" << s.last_marker_error_x << ",\"marker_error_y_px\":" << s.last_marker_error_y
         << ",\"evaluations\":" << s.last_evaluations
         << ",\"submits\":" << s.last_submits << ",\"reasons\":[";
     bool separator = false;
@@ -1919,6 +2015,15 @@ std::string eye_calibration_json() {
     for (unsigned i = 0; i < s.last_rejected_scores.size(); ++i) {
         if (i) out << ',';
         out << s.last_rejected_scores[i];
+    }
+    out << "],\"patch_search_diagnostics\":[";
+    for(unsigned i=0;i<s.last_best_scores.size();++i) {
+        if(i) out << ',';
+        out << "{\"patch\":" << i << ",\"best_sampled_score\":" << s.last_best_scores[i]
+            << ",\"bits_at_best_score\":" << s.last_score_bits[i] << ",\"contrast_at_best_score\":" << s.last_best_contrasts[i]
+            << ",\"best_coarse_bits\":" << s.last_best_bits[i] << ",\"max_contrast\":" << s.last_max_contrasts[i]
+            << ",\"positions\":" << s.last_search_positions[i] << ",\"scored_candidates\":" << s.last_score_probes[i]
+            << ",\"low_contrast_positions\":" << s.last_low_contrast_positions[i] << '}';
     }
     out << "]},\"d3d12\":{\"source_formats\":[" << s.d3d12_source_formats[0] << ',' << s.d3d12_source_formats[1]
         << "],\"submitted_formats\":[" << s.d3d12_submitted_formats[0] << ',' << s.d3d12_submitted_formats[1]
@@ -1972,9 +2077,9 @@ std::string eye_calibration_json() {
             << ",\"locks\":" << live.placement_locks << ",\"losses\":" << live.placement_losses
             << ",\"search_candidate\":" << live.search_candidate
             << ",\"tracking_misses\":" << live.tracking_misses
-            << ",\"tracking_mode\":\"cached_crop_verification\",\"tracking_padding_px\":64,\"tracking_max_patch_px\":256"
+            << ",\"tracking_mode\":\"cached_crop_with_verified_position_hint\",\"hint_max_age_ms\":1000,\"nearby_search_radii_px\":[32,64],\"local_search_coarse_to_fine\":true,\"local_search_refine_peaks\":8,\"tracking_padding_px\":64,\"tracking_max_patch_px\":256"
             << ",\"acquisition_marker_size_px\":72,\"locator_target_long_side\":800,\"locator_min_factor\":4,\"locator_max_factor\":32,\"locator_fallback_downsample\":2,\"wide_search_budget_ms\":100"
-            << ",\"verification_inset_px\":20,\"verification_tolerance_px\":32,\"verification_failure_limit\":10"
+            << ",\"verification_inset_px\":20,\"verification_tolerance_px\":32,\"verification_failure_limit\":" << eye_calibration_failure_limit
             << ",\"max_acquisition_markers_per_source\":16,\"grid_min_points\":3"
             << ",\"stamping\":\"bordered_grid_then_small_corner\""
             << ",\"motion_inconclusive\":" << live.motion_inconclusive

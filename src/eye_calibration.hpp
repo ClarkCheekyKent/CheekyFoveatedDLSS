@@ -5,6 +5,7 @@
 #include <string>
 #include <array>
 namespace cheeky::foveated_dlss {
+inline constexpr unsigned eye_calibration_failure_limit = 20;
 enum class EyeCalibrationBackend { none, openvr, openxr };
 // Asynchronous D3D11/D3D12 calibration for OpenVR and OpenXR. D3D11 work
 // uses the render thread except protected native OpenXR pre-release copies;
@@ -32,6 +33,9 @@ struct EyeCalibrationStats {
     std::array<std::uint64_t,3> verification_paths{};
     double max_search_ms{};
     std::uint64_t search_timing_samples{};
+    std::uint64_t full_calibration_attempts{}, full_calibration_successes{}, recalibration_requests{};
+    unsigned verification_failure_streak{};
+    const char* full_calibration_reason{"none"};
     const char* gpu_timing_status{"Waiting for a complete GPU timestamp sample"};
     std::uint64_t left_view{}, right_view{};
     std::uint64_t corrections{}, applied{};
@@ -44,7 +48,14 @@ struct EyeCalibrationStats {
     std::array<std::uint64_t, 8> rejection_counts{};
     std::uint64_t rejected{}, publication_rejected{}, last_rejected_sequence{};
     unsigned last_rejection_mask{}, last_evaluations{}, last_submits{};
-    std::array<float, 8> last_rejected_scores{};
+    std::array<float, 12> last_rejected_scores{};
+    std::array<float,12> last_best_scores{}, last_best_contrasts{}, last_max_contrasts{};
+    std::array<unsigned,12> last_best_bits{}, last_score_bits{}, last_search_positions{}, last_score_probes{}, last_low_contrast_positions{};
+    const char* last_marker_failure{"none"};
+    unsigned last_source_mask{};
+    bool last_shared_source_assumed{}, last_motion_unreliable{};
+    double last_marker_error_x{}, last_marker_error_y{};
+    std::array<std::uint64_t,5> marker_failure_counts{};
     // Captured on the render thread; no repeated logging or GPU waits.
     std::array<unsigned, 2> d3d12_source_formats{}, d3d12_submitted_formats{};
     std::uint64_t d3d12_stamp_failures{}, d3d12_capture_failures{}, d3d12_readback_failures{};

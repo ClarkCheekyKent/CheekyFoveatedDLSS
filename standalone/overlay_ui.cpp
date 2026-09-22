@@ -381,6 +381,14 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
     diagnostic_line(data, "Confirmed mapping updates", "applied");
     ImGui::Text("Valid / completed samples: %.0f / %.0f", number(data, "valid"), number(data, "completed"));
     ImGui::Text("Skipped / in flight: %.0f / %.0f", number(data, "skipped"), number(data, "in_flight"));
+    ImGui::Text("Full calibration attempts / successes: %.0f / %.0f",
+        number(data,"full_calibration_attempts"),number(data,"full_calibration_successes"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Attempts count full stereo capture cycles, including retries; successes count accepted full crop acquisitions. Counts reset with calibration counters.");
+    ImGui::Text("Recalibration requests: %.0f; verification failures: %.0f / %.0f",
+        number(data,"recalibration_requests"),number(data,"verification_failure_streak"),number(data,"verification_failure_limit"));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Requests count transitions from a locked mapping back to full search. Verification failures are counted samples, normally one per 10 VR frames; motion-excused misses reset the streak. Ambiguity or source/geometry changes can trigger immediately.");
+    diagnostic_line(data,"Last full calibration reason","full_calibration_reason");
+    diagnostic_line(data,"Last marker failure","marker_failure_detail");
     ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
     ImGui::Text("Verification worker: %.2f us/frame (background)",number(data,"verification_cpu_us_per_frame"));
     ImGui::Text("Verification worker (last / peak sample): %.2f / %.2f ms",

@@ -16,6 +16,10 @@ struct CalibrationSearchTarget {
     CalibrationMarkerPoint marker;
     unsigned candidate{}, width{}, height{};
 };
+struct CalibrationMatchDiagnostics {
+    unsigned positions{}, low_contrast_positions{}, scored_candidates{}, extra_probes{}, best_coarse_bits{}, best_score_bits{};
+    float best_score{-1}, best_score_contrast{}, max_contrast{};
+};
 struct CalibrationSearchResult {
     bool valid{}, flipped{}, ambiguous{};
     unsigned candidate{};
@@ -24,6 +28,7 @@ struct CalibrationSearchResult {
     unsigned support_points{};
     double tracking_cpu_ms{};
     unsigned tracking_path{};
+    CalibrationMatchDiagnostics match_diagnostics;
 };
 inline double calibration_clock_ms() {
     return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -166,6 +171,7 @@ struct CalibrationSearchOptions {
     unsigned flip_mask{3};
     bool tracking{};
     bool fixed_geometry{};
+    CalibrationMatchDiagnostics* diagnostics{};
     double expected_x{}, expected_y{}, expected_cw{}, expected_ch{}, translation_radius{};
     bool require_grid{};
     unsigned locator_factor{4};
@@ -213,12 +219,19 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
         }
         if (!highs || highs == 25) return 0.F;
         high /= highs; low /= 25 - highs;
-        if (high - low < .04F) return 0.F;
         unsigned correct{};
         for (unsigned i = 0; i < 25; ++i) correct += (values[i] > (high + low) * .5F) == ((code & (1U << i)) != 0);
         const float variance = square - sum * sum / 25.F;
-        if (correct < 24 || variance <= 1e-6F) return 0.F;
-        return std::clamp((dot - sum * sign_sum / 25.F) / std::sqrt(variance * (25 - sign_sum * sign_sum / 25.F)), 0.F, 1.F);
+        const float correlation=variance>1e-6F ? std::clamp((dot-sum*sign_sum/25.F)/
+            std::sqrt(variance*(25-sign_sum*sign_sum/25.F)),0.F,1.F) : 0.F;
+        if (auto* d=options.diagnostics) {
+            ++d->scored_candidates;
+            if (correlation>d->best_score) {
+                d->best_score=correlation; d->best_score_bits=correct; d->best_score_contrast=high-low;
+            }
+        }
+        if (high-low<.04F || correct<24 || variance<=1e-6F) return 0.F;
+        return correlation;
     };
     struct Hit { unsigned index; double x, y, cw, ch; float score; };
     std::vector<Hit> hits;
@@ -226,8 +239,60 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     std::vector<Window> windows;
     if (options.fixed_geometry) {
         const auto r=options.translation_radius;
-        windows.push_back({(std::max)(0.,options.expected_x-r),(std::max)(0.,options.expected_y-r),
-            options.expected_x+r,options.expected_y+r,options.expected_cw,options.expected_ch});
+        const auto cw=options.expected_cw, ch=options.expected_ch;
+        if (r==0) windows.push_back({options.expected_x,options.expected_y,options.expected_x,options.expected_y,cw,ch});
+        else {
+            // Coarse translation-only correlation over the local patch. Keep a
+            // bounded set of peaks, then decode at one-pixel steps around them.
+            struct Peak { double x,y; float quality; };
+            std::vector<Peak> peaks;
+            const double step=(std::max)(1.,(std::min)(8.,(std::min)(cw,ch)*.5));
+            const double x0=(std::max)(0.,options.expected_x-r), y0=(std::max)(0.,options.expected_y-r);
+            const double x1=(std::min)(double(image.width)-5*cw,options.expected_x+r);
+            const double y1=(std::min)(double(image.height)-5*ch,options.expected_y+r);
+            for(double y=y0;y<=y1;y+=step) for(double x=x0;x<=x1;x+=step) {
+                float values[25],sum{},square{},low=1e30F,high=-1e30F;
+                for(unsigned yy=0;yy<5;++yy) for(unsigned xx=0;xx<5;++xx) {
+                    const auto v=sample(x+(xx+.5)*cw,y+(yy+.5)*ch);
+                    values[yy*5+xx]=v; sum+=v; square+=v*v;
+                    low=(std::min)(low,v); high=(std::max)(high,v);
+                }
+                if(auto* d=options.diagnostics) {
+                    ++d->positions; d->max_contrast=(std::max)(d->max_contrast,high-low);
+                    if(high-low<.04F) ++d->low_contrast_positions;
+                }
+                const float variance=square-sum*sum/25;
+                if(high-low<.04F || variance<=1e-6F) continue;
+                float quality{};
+                for(const auto& pattern:templates) {
+                    float dot{},sign_sum{}; unsigned bits{};
+                    for(unsigned i=0;i<25;++i) {
+                        const bool bit=(pattern.code&(1U<<i))!=0;
+                        const float sign=bit ? 1.F : -1.F;
+                        dot+=values[i]*sign; sign_sum+=sign;
+                        bits+=((values[i]>(high+low)*.5F)==bit);
+                    }
+                    if(auto* d=options.diagnostics) d->best_coarse_bits=(std::max)(d->best_coarse_bits,bits);
+                    quality=(std::max)(quality,(dot-sum*sign_sum/25)/std::sqrt(variance*(25-sign_sum*sign_sum/25)));
+                }
+                if(quality<.35F) continue; // Candidate ranking only; final acceptance is unchanged.
+                bool merged{};
+                for(auto& peak:peaks) if(std::abs(peak.x-x)<=step && std::abs(peak.y-y)<=step) {
+                    if(quality>peak.quality) peak={x,y,quality};
+                    merged=true; break;
+                }
+                if(!merged) peaks.push_back({x,y,quality});
+                std::sort(peaks.begin(),peaks.end(),[](const auto& a,const auto& b){return a.quality>b.quality;});
+                if(peaks.size()>8) peaks.resize(8);
+            }
+            for(const auto& peak:peaks) {
+                if(auto* d=options.diagnostics; d && d->extra_probes<16 && !templates.empty()) {
+                    ++d->extra_probes; (void)score(peak.x,peak.y,cw,ch,templates.front().code);
+                }
+                windows.push_back({(std::max)(x0,peak.x-step),(std::max)(y0,peak.y-step),
+                    (std::min)(x1,peak.x+step),(std::min)(y1,peak.y+step),cw,ch});
+            }
+        }
     } else if (options.require_grid) {
         for (const auto& b : calibration_locators(image, options.locator_factor, canceled, options.deadline)) {
             const double margin=2.*options.locator_factor;
@@ -248,7 +313,7 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
     for (const auto& window : windows) {
         if ((canceled && canceled->load(std::memory_order_relaxed)) || std::chrono::steady_clock::now() >= options.deadline) return {};
         const double cell=window.cell, cy=window.cy;
-        const double step=(std::max)(1.,cell*.5);
+        const double step=options.fixed_geometry && options.translation_radius>0 ? 1. : (std::max)(1.,cell*.5);
         for(double y=window.y0;y<=window.y1 && y+5*cy<=image.height;y+=step)
             for(double x=window.x0;x<=window.x1 && x+5*cell<=image.width;x+=step) {
                     float v[25], low = 1e30F, high = -1e30F;
@@ -256,9 +321,21 @@ inline CalibrationSearchResult calibration_search(const CalibrationSearchImage& 
                         auto& a = v[yy * 5 + xx]; a = sample(x + (xx + .5) * cell, y + (yy + .5) * cy);
                         low = (std::min)(low, a); high = (std::max)(high, a);
                     }
+                    if (auto* d=options.diagnostics) {
+                        ++d->positions; d->max_contrast=(std::max)(d->max_contrast,high-low);
+                        if(high-low<.04F) ++d->low_contrast_positions;
+                    }
                     if (high - low < .04F) continue;
                     std::uint32_t code{};
                     for (unsigned i = 0; i < 25; ++i) code |= unsigned(v[i] > (high + low) * .5F) << i;
+                    if (auto* d=options.diagnostics) for(const auto& pattern:templates) {
+                        const unsigned bits=25-std::popcount(code^pattern.code);
+                        if(bits>d->best_coarse_bits) {
+                            d->best_coarse_bits=bits;
+                            // Bounded probes retain near misses that fail the hash prefilter.
+                            if(d->extra_probes<16) { ++d->extra_probes; (void)score(x,y,cell,cy,pattern.code); }
+                        }
+                    }
                     const auto found = words.find(code);
                     if (found == words.end()) continue;
                     for (const unsigned index : found->second) {

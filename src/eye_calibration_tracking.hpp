@@ -8,6 +8,8 @@ struct CalibrationTrackingPatch {
     bool enabled{}, flip{}, reverse_x{}, reverse_y{};
     unsigned candidate{};
     CalibrationPlacement placement;
+    bool hint_valid{};
+    CalibrationPlacement hint;
     std::array<unsigned, 4> rect{};
     double eye_width{}, eye_height{}, offset_x{}, offset_y{}, cell_x{}, cell_y{};
 };
@@ -42,12 +44,13 @@ inline CalibrationTrackingPatch calibration_tracking_patch(CalibrationPlacement 
     return p;
 }
 inline CalibrationSearchResult calibration_track_impl(const void* data, unsigned pitch, DXGI_FORMAT format,
-    const CalibrationTrackingPatch& patch) {
+    const CalibrationTrackingPatch& patch, CalibrationMatchDiagnostics& diagnostics) {
     if (!patch.enabled) return {};
     const auto image = calibration_search_image(data, pitch, patch.rect[2], patch.rect[3], format,
         {patch.reverse_x ? 1.F : 0.F, patch.reverse_y ? 1.F : 0.F,
          patch.reverse_x ? 0.F : 1.F, patch.reverse_y ? 0.F : 1.F});
     CalibrationSearchOptions options;
+    options.diagnostics=&diagnostics;
     options.min_cell = (std::max)(1.5, patch.cell_x * .72);
     options.max_cell = patch.cell_x * 1.4;
     options.aspect = patch.cell_y / patch.cell_x;
@@ -55,17 +58,23 @@ inline CalibrationSearchResult calibration_track_impl(const void* data, unsigned
     options.tracking = true;
     const std::vector<CalibrationSearchTarget> targets{{patch.placement.marker,patch.candidate,0,0}};
     options.fixed_geometry=true;
-    options.expected_cw=patch.cell_x; options.expected_ch=patch.cell_y;
-    options.expected_x=(patch.placement.marker.x-patch.placement.x)*patch.eye_width/patch.placement.width-patch.offset_x;
+    const auto& predicted=patch.hint_valid ? patch.hint : patch.placement;
+    options.expected_cw=patch.eye_width*8/predicted.width;
+    options.expected_ch=patch.eye_height*8/predicted.height;
+    options.expected_x=(patch.placement.marker.x-predicted.x)*patch.eye_width/predicted.width-patch.offset_x;
     options.expected_y=patch.flip ?
-        (1-(patch.placement.marker.y+40-patch.placement.y)/patch.placement.height)*patch.eye_height-patch.offset_y :
-        (patch.placement.marker.y-patch.placement.y)*patch.eye_height/patch.placement.height-patch.offset_y;
+        (1-(patch.placement.marker.y+40-predicted.y)/predicted.height)*patch.eye_height-patch.offset_y :
+        (patch.placement.marker.y-predicted.y)*patch.eye_height/predicted.height-patch.offset_y;
     unsigned path=1;
     auto result=calibration_search(image,targets,nullptr,options);
     if (!result.valid && !result.ambiguous) {
         path=2;
         options.translation_radius=32;
         result=calibration_search(image,targets,nullptr,options);
+        if (!result.valid && !result.ambiguous) {
+            options.translation_radius=64;
+            result=calibration_search(image,targets,nullptr,options);
+        }
     }
     if (!result.valid && !result.ambiguous) {
         path=3;
@@ -85,7 +94,9 @@ inline CalibrationSearchResult calibration_track_impl(const void* data, unsigned
 inline CalibrationSearchResult calibration_track(const void* data, unsigned pitch, DXGI_FORMAT format,
     const CalibrationTrackingPatch& patch) {
     const auto start=calibration_clock_ms();
-    auto result=calibration_track_impl(data,pitch,format,patch);
+    CalibrationMatchDiagnostics diagnostics;
+    auto result=calibration_track_impl(data,pitch,format,patch,diagnostics);
+    result.match_diagnostics=diagnostics;
     result.tracking_cpu_ms=calibration_clock_ms()-start;
     return result;
 }
