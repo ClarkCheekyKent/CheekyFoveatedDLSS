@@ -385,10 +385,30 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
         number(data,"full_calibration_attempts"),number(data,"full_calibration_successes"));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Attempts count full stereo capture cycles, including retries; successes count accepted full crop acquisitions. Counts reset with calibration counters.");
     ImGui::Text("Recalibration requests: %.0f; verification failures: %.0f / %.0f",
-        number(data,"recalibration_requests"),number(data,"verification_failure_streak"),number(data,"verification_failure_limit"));
+        number(data,"recalibration_requests"),number(data,"verification_failure_streak"),number(member(data,"placement_search"),"verification_failure_limit"));
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Requests count transitions from a locked mapping back to full search. Verification failures are counted samples, normally one per 10 VR frames; motion-excused misses reset the streak. Ambiguity or source/geometry changes can trigger immediately.");
     diagnostic_line(data,"Last full calibration reason","full_calibration_reason");
-    diagnostic_line(data,"Last marker failure","marker_failure_detail");
+    const auto last_failure=member(data,"last_rejection");
+    diagnostic_line(last_failure,"Last marker failure","marker_failure_detail");
+    if (number(last_failure,"sequence")>0 && ImGui::TreeNode("Last failure details")) {
+        ImGui::Text("Sample %.0f; DLSS evaluations %.0f; source mask %.0f",
+            number(last_failure,"sequence"),number(last_failure,"evaluations"),number(last_failure,"source_mask"));
+        diagnostic_line(last_failure,"Shared source assumed","shared_source_assumed");
+        diagnostic_line(last_failure,"Motion unreliable","motion_unreliable");
+        ImGui::Text("Measured marker shift: %.1f / %.1f px (X / Y)",
+            number(last_failure,"marker_error_x_px"),number(last_failure,"marker_error_y_px"));
+        const auto patches=member(last_failure,"patch_search_diagnostics");
+        for(unsigned i=4;i<12;++i) {
+            const auto patch=array_object(patches,i);
+            if(number(patch,"positions")<=0) continue;
+            ImGui::Text("Patch %u: best sampled score %.3f; bits %.0f/25; contrast %.3f",i,
+                number(patch,"best_sampled_score"),number(patch,"bits_at_best_score"),number(patch,"contrast_at_best_score"));
+            ImGui::Text("  Positions %.0f; best coarse bits %.0f/25; low contrast %.0f",
+                number(patch,"positions"),number(patch,"best_coarse_bits"),number(patch,"low_contrast_positions"));
+        }
+        ImGui::TextWrapped("Scores are sampled candidates, not exhaustive maxima. -1 means no candidate was scored. A high score alone does not establish the correct eye pair or crop. Shift values stay zero when recognition failed before geometry could be checked.");
+        ImGui::TreePop();
+    }
     ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
     ImGui::Text("Verification worker: %.2f us/frame (background)",number(data,"verification_cpu_us_per_frame"));
     ImGui::Text("Verification worker (last / peak sample): %.2f / %.2f ms",
