@@ -2251,6 +2251,8 @@ int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int run_debug_exposure_tests();
 int main(int argc, char** argv) {
+    extern int run_retained_calibration_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--retained-calibration") == 0) return run_retained_calibration_tests();
     if (argc == 2 && std::strcmp(argv[1], "--debug-exposure") == 0) return run_debug_exposure_tests();
     if (argc == 2 && std::strcmp(argv[1], "--openxr-input") == 0) return run_openxr_input_tests();
     if (argc == 2 && std::strcmp(argv[1], "--crop-calibration") == 0) return run_crop_calibration_tests() + run_crop_calibration12_tests();
@@ -2338,6 +2340,7 @@ int main(int argc, char** argv) {
     failures += run_support_summary_tests();
     failures += run_debug_exposure_tests();
     failures += run_eye_calibration_tests();
+    failures += run_retained_calibration_tests();
     failures += run_crop_calibration12_tests();
     failures += run_stereo_support_tests();
     failures += run_stereo_support12_tests();

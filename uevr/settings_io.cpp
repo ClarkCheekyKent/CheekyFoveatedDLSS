@@ -47,7 +47,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
 std::string_view setting_group(std::string_view key) {
     if (key.starts_with("Nr")) return "nr";
     for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
-            "AutoStereoAlignment", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
+            "AutoStereoAlignment", "EyeCalibrationContinuous", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
             "GazeSmoothingMs", "GazeQuantizationPixels", "GazeJumpResetRatio",
             "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"})
         if (key == gaze) return "gaze";

@@ -63,6 +63,7 @@ struct Settings {
     float height_offset{-0.45F};
     bool invert_stereo_x_offset{false};
     bool auto_stereo_alignment{true};
+    bool eye_calibration_continuous{true};
     float aligned_height_offset{0.0F};
     float roundness{0.0F};
     float transition_width{0.04F};
@@ -158,6 +159,7 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t session_generation = 0, bool vertical_flip = false, bool shared_source = false,
     const std::array<StereoSourceCrop, 2>* source_crops = nullptr) noexcept;
 void invalidate_stereo_crop() noexcept;
+bool eye_calibration_continuous_validation() noexcept;
 void clear_stereo_calibration() noexcept;
 
 [[nodiscard]] Settings current_settings() noexcept;

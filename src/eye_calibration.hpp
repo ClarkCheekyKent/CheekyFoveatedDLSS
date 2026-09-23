@@ -70,6 +70,7 @@ const char* eye_calibration_backend_name(EyeCalibrationBackend) noexcept;
 std::string eye_calibration_json();
 // Session control. Disabling invalidates the pair and outstanding results.
 void eye_calibration_enable(bool) noexcept;
+void eye_calibration_recalibrate() noexcept;
 // Loader-lock safe: stop new captures/publications when the host detaches.
 // Resource draining remains on the render thread; enable() starts a new epoch.
 void eye_calibration_suspend() noexcept;

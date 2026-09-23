@@ -607,9 +607,6 @@ void draw_nr_performance() {
 void draw_eye_calibration_diagnostics() {
     if (!ImGui::TreeNode("Eye calibration")) return;
     const auto s = eye_calibration_stats();
-    bool enabled = s.enabled;
-    if (ImGui::Checkbox("Automatic eye calibration (this session)", &enabled))
-        eye_calibration_enable(enabled);
     if (DiagnosticTable table{"eye_calibration"}) {
         diagnostic_row("Backend", "%s", eye_calibration_backend_name(s.backend));
         diagnostic_row("Graphics API", "%s", s.graphics_api == 12 ? "D3D12" : s.graphics_api == 11 ? "D3D11" : "Waiting for DLSS");
@@ -813,6 +810,8 @@ void load_settings_from_reshade() noexcept {
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment));
     static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "EyeCalibrationContinuous", settings.eye_calibration_continuous));
+    static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset));
     settings.center_mode = center_mode <= 2U
         ? static_cast<FoveationCenterMode>(center_mode)
@@ -979,6 +978,7 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         settings.alignment_border_enabled
     );
     reshade::set_config_value(nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationContinuous", settings.eye_calibration_continuous);
     reshade::set_config_value(nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset);
     reshade::set_config_value(
         nullptr, config_section, "CenterMode",
@@ -1626,6 +1626,17 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
     }
 
     ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Stereo / Gaze")) {
+        bool calibration_enabled = eye_calibration_enabled();
+        if (ImGui::Checkbox("Automatic eye calibration (this session)", &calibration_enabled))
+            eye_calibration_enable(calibration_enabled);
+        ImGui::BeginDisabled(!calibration_enabled);
+        changed |= ImGui::Checkbox("Continuously validate eye calibration", &settings.eye_calibration_continuous);
+        if (!settings.eye_calibration_continuous)
+            ImGui::TextWrapped("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.");
+        if (ImGui::Button("Recalibrate now")) eye_calibration_recalibrate();
+        ImGui::EndDisabled();
+    }
     if (ImGui::CollapsingHeader("DLSS-SR", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::TreeNodeEx(
                 "Controls##dlss_sr",

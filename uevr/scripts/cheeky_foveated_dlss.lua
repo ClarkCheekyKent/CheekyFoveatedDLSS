@@ -38,7 +38,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"}) do
+    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -309,6 +309,13 @@ uevr.sdk.callbacks.on_draw_ui(function()
             local c = status.eye_calibration or {}
             local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
             if changed then send(enabled and "calibration_enable" or "calibration_disable") end
+            if status.settings.EyeCalibrationContinuous ~= nil then
+                check("Continuously validate eye calibration", "EyeCalibrationContinuous")
+                if draft.EyeCalibrationContinuous == false then
+                    text("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.")
+                end
+                if c.enabled and imgui.button("Recalibrate now") then send("calibration_recalibrate") end
+            end
             rows("eye_calibration", {{"Runtime", c.backend or "Waiting for VR"},
                 {"Status", c.status or "Unavailable in this runtime"}})
             imgui.tree_pop()

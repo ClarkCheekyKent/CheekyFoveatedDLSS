@@ -212,6 +212,8 @@ add_test(NAME CheekyMixedCalibrationTests COMMAND CheekyTests --mixed-calibratio
 set_tests_properties(CheekyMixedCalibrationTests PROPERTIES TIMEOUT 60)
 add_test(NAME CheekyCropCalibrationTests COMMAND CheekyTests --crop-calibration)
 set_tests_properties(CheekyCropCalibrationTests PROPERTIES TIMEOUT 60)
+add_test(NAME CheekyRetainedCalibrationTests COMMAND CheekyTests --retained-calibration)
+set_tests_properties(CheekyRetainedCalibrationTests PROPERTIES TIMEOUT 120)
 add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
 add_test(NAME CheekyNrLifetimeTestsNoDebugLayer COMMAND CheekyTests --nr-lifetime)
 set_tests_properties(CheekyNrLifetimeTestsNoDebugLayer PROPERTIES

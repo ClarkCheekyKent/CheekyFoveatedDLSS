@@ -10,6 +10,29 @@ readback latency to detect. It does not rewrite saved stereo or gaze preferences
 
 ## Supported paths and installation
 
+### Calibration controls
+
+In the standalone and OptiScaler overlay, **Stereo / Gaze > Eye calibration**
+contains the session enable switch, **Recalibration** mode and **Recalibrate now**.
+Detailed counters remain in Diagnostics. Continuous validation is the default.
+
+**Only on view or dimension changes** performs initial acquisition, then stops
+both verification readbacks and all calibration marker stamping once a fresh
+mapping is published. The learned eye identity and crop remain valid without the
+2.5-second verification timeout. Source view identity/generation or dimensions,
+submission texture dimensions/bounds/array slice, and VR session/backend changes
+restart acquisition. These checks inspect metadata without reading image pixels.
+Eye swaps and image-content crop changes within unchanged views/submissions are
+deliberately not detected; use **Recalibrate now** if alignment is wrong.
+
+The mode is saved per game as `EyeCalibrationContinuous=0`; `1` restores continuous
+validation. Resetting gaze defaults restores `1`. The automatic calibration
+enable switch remains session-only. Resetting diagnostic counters does not
+recalibrate. UEVR and ReShade expose the same policy as **Continuously validate
+eye calibration** in their Stereo / Gaze controls. A support ZIP requested while
+calibration is retained may have no new calibration images until acquisition is
+requested or a monitored change occurs.
+
 | Graphics API | OpenVR | Native OpenXR |
 | --- | --- | --- |
 | D3D11 | Separate, packed/flipped bounds, array slices | Separate, packed projection rectangles, array slices |
@@ -101,10 +124,10 @@ crop boundary. Verification runs every ten VR frames,
 using bounded patches with 64 submitted pixels of movement allowance, capped at
 256x256. It checks the cached geometry without letting single-marker noise move
 the learned crop. Decoded marker endpoint errors exceeding 32 submitted pixels count toward
-reacquisition after ten consecutive settled failed samples. Ambiguous identity invalidates
+reacquisition after twenty consecutive settled failed samples. Ambiguous identity invalidates
 immediately. The endpoint check uses the marker footprint, not
 a single-marker scale estimate extrapolated to distant crop edges. Small global
-scale changes around that marker can remain undetected by this local check. Ten consecutive ordinary missing-marker
+scale changes around that marker can remain undetected by this local check. Twenty consecutive ordinary missing-marker
 samples also trigger reacquisition.
 
 The updated native OpenXR layer queries views in its own LOCAL reference space
@@ -112,8 +135,8 @@ for motion, independently of the application's potentially head-relative space.
 The extra downstream query leaves application view results unchanged.
 Head rotation above 90 degrees/second marks verification as motion-sensitive for
 350 ms; a fresh invalid orientation also makes it inconclusive. Missing or shifted
-markers during that interval reset the ten-miss streak and do not refresh crop
-validity. Once settled, ten consecutive failed samples trigger reacquisition. Ambiguous
+markers during that interval reset the twenty-miss streak and do not refresh crop
+validity. Once settled, twenty consecutive failed samples trigger reacquisition. Ambiguous
 identity still invalidates immediately. This is a confidence heuristic,
 not detection of compositor reprojection. OpenVR uses the ordinary miss policy.
 A crop expires after 2.5 seconds without accepted verification even during motion;

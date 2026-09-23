@@ -100,6 +100,9 @@ void test_ui_diagnostics() {
     text = render("Stereo / Gaze");
     require(text.find("fixed fallback") == text.npos && text.find("manual fallback placement") == text.npos, "Healthy tracking reported as fallback");
     require(text.find("Eye Tracking Ready: Yes") != text.npos, "Visible eye tracking readiness missing");
+    require(text.find("Automatic eye calibration (this session)") != text.npos &&
+        text.find("Recalibrate now") != text.npos && text.find("Recalibration") != text.npos,
+        "Calibration controls belong in Stereo / Gaze");
     require(text.find("Eye tracking details") == text.npos && text.find("Corrections applied") == text.npos, "Tracking details belong in Diagnostics");
     render("DLSS-SR"); text = render("DLSS-SR");
     require(text.find("Full DLSS call: 2.000 ms") != text.npos, "GPU timing from the second API object");
@@ -119,6 +122,8 @@ void test_ui_diagnostics() {
     require(text.find("Corrections applied") == text.npos && text.find("Sample age") == text.npos, "Detailed diagnostics should start collapsed");
     render("Diagnostics"); text = render("Diagnostics");
     require(text.find("Corrections applied: 7") != text.npos, "Calibration counters missing");
+    require(text.find("Automatic eye calibration (this session)") == text.npos &&
+        text.find("Recalibrate now") == text.npos, "Diagnostics must not contain calibration controls");
     require(text.find("Ready, {mapped}") != text.npos, "Quoted diagnostic braces parsed as structure");
     require(text.find("18446744073709551614") != text.npos, "Calibration view identity lost integer precision");
     // Cover slower/equal modes and incomplete baselines without inventing a

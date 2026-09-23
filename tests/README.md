@@ -1,5 +1,12 @@
 # Cropped stereo calibration
 
+`CheekyTests.exe --retained-calibration` tests the optional change-only policy
+with actual WARP rendering on DX11/OpenVR, DX11/OpenXR, DX12/OpenVR, DX12/OpenXR,
+and DX12-to-DX11/OpenXR. It reads source pixels to verify all markers stop after
+acquisition, waits beyond the crop timeout, and checks manual reacquisition,
+same-view eye swaps, source dimensions, submission bounds, recreated/new views,
+session changes, diagnostic resets, and resuming continuous validation.
+
 `CheekyTests.exe --crop-calibration` exercises the production DX11, DX12 and
 DX12-to-DX11 stamp/read paths on WARP. It checks centered and edge-aligned crops,
 crop plus resizing, vertical flips, packed submission bounds, source origins,

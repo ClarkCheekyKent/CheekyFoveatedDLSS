@@ -139,6 +139,9 @@ struct State {
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::uint64_t placement_epoch{}, placement_sequence{}, placement_locks{}, placement_losses{};
     bool search_needed{};
+    bool published{};
+    // Metadata remains observable without stamping markers or copying pixels.
+    std::array<std::array<double, 7>, 2> observed_submissions{};
     unsigned search_candidate{}, tracking_misses{};
     std::uint64_t wide_searches{}, last_wide_search_ms{};
     std::uint64_t last_verified_ms{}, motion_inconclusive{}, geometry_rejections{};
@@ -205,6 +208,7 @@ void request_full_calibration(State& s, const char* reason) {
         s.stats.full_calibration_reason=reason;
     }
     s.search_needed=true;
+    s.published=false;
 }
 void placement_epoch(State& s) {
     if (s.placement_epoch == s.epoch) return;
@@ -213,6 +217,37 @@ void placement_epoch(State& s) {
     s.placements = {}; s.tracking_hints={}; s.submitted_sizes = {}; s.placement_sequence = 0;
     s.search_needed = true; s.last_wide_search_ms = 0; s.last_verified_ms = 0;
     s.search_candidate = s.tracking_misses = 0;
+    s.observed_submissions = {};
+}
+bool retaining_calibration(const State& s) {
+    return !eye_calibration_continuous_validation() && s.published && !s.search_needed;
+}
+void restart_calibration(State& s, const char* reason) {
+    request_full_calibration(s, reason);
+    ++s.epoch;
+    s.frames_until_capture = 0;
+    clear_stereo_calibration();
+    placement_epoch(s);
+}
+void observe_source(State& s, std::uint64_t view, unsigned width, unsigned height) {
+    if (!retaining_calibration(s)) return;
+    const auto generation = stereo_view_generation(view);
+    for (const auto& p : s.placements)
+        if (p.locked && p.view.id == view && p.view.generation == generation &&
+            p.view.width == width && p.view.height == height) return;
+    restart_calibration(s, "source_or_submitted_geometry_changed");
+}
+void observe_submission(State& s, unsigned eye, unsigned width, unsigned height,
+                        float u0, float v0, float u1, float v1, unsigned slice) {
+    for (const float v : {u0, v0, u1, v1})
+        if (!std::isfinite(v) || v < 0 || v > 1) return;
+    if (!width || !height || u0 == u1 || v0 == v1) return;
+    placement_epoch(s);
+    const std::array<double, 7> geometry{double(width), double(height), u0, v0, u1, v1, double(slice)};
+    if (retaining_calibration(s) && s.observed_submissions[eye][0] &&
+        s.observed_submissions[eye] != geometry)
+        restart_calibration(s, "source_or_submitted_geometry_changed");
+    s.observed_submissions[eye] = geometry;
 }
 CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t view, unsigned width, unsigned height) {
     placement_epoch(s);
@@ -933,7 +968,7 @@ void poll(State& s) {
         // Discarding that failure would retry the same clipped corner forever.
         const bool failed_wide_search = f.wide_search && rejection == 128U;
         // Do not let an old epoch or out-of-order completion undo a newer placement.
-        if (enabled && f.epoch == s.epoch && f.sequence > s.placement_sequence &&
+        if (enabled && !retaining_calibration(s) && f.epoch == s.epoch && f.sequence > s.placement_sequence &&
             (failed_wide_search || GetTickCount64() - f.captured_ms < (f.wide_search ? 10000U : 1000U))) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
@@ -1025,12 +1060,13 @@ void poll(State& s) {
                 ++s.stats.mismatches;
             // Readbacks may complete out of order or after a toggle. The settings
             // layer additionally verifies ordering, age and handle lifetimes.
-            if (enabled && f.epoch == s.epoch) {
+            if (enabled && !retaining_calibration(s) && f.epoch == s.epoch) {
                 bool corrected{};
                 if (publish_stereo_calibration(f.views[left].id, f.views[right].id, f.views[left].generation,
                                                f.views[right].generation, f.sequence, f.captured_ms,
                                                &corrected, f.session_generation, flipped_pair, mono, &crops)) {
                     s.last_verified_ms = f.captured_ms;
+                    s.published = true;
                     ++s.stats.applied;
                     if (corrected)
                         ++s.stats.corrections;
@@ -1226,6 +1262,11 @@ void eye_calibration_enable(bool value) noexcept {
 void eye_calibration_suspend() noexcept {
     enabled = false;
 }
+void eye_calibration_recalibrate() noexcept {
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    if (enabled) restart_calibration(s, "manual_recalibration");
+}
 bool eye_calibration_enabled() noexcept {
     return enabled.load();
 }
@@ -1322,10 +1363,20 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     if (!on)
         return false;
     placement_epoch(s);
-    if (s.last_verified_ms && now - s.last_verified_ms > 2500) {
+    if (retaining_calibration(s)) {
+        for (const auto& p : s.placements) {
+            if (p.locked && stereo_view_generation(p.view.id) != p.view.generation) {
+                restart_calibration(s, "source_or_submitted_geometry_changed");
+                break;
+            }
+        }
+        if (retaining_calibration(s)) return false;
+    }
+    if (eye_calibration_continuous_validation() && s.last_verified_ms && now - s.last_verified_ms > 2500) {
         // Stop using stale gaze geometry, but retain corner probes. Movement
         // alone must not flash the grid; settled verification decides reacquisition.
         invalidate_stereo_crop();
+        s.published = false;
     }
     // A single acquisition pair owns the wide readbacks and CPU workers.
     // Keep only one acquisition in flight; never queue more full-image searches.
@@ -1406,6 +1457,8 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         // Drain deferred closes even when this interval was not sampled or
         // all ring slots were occupied at the last XR frame boundary.
         poll(s);
+        observe_source(s, view, width, height);
+        if (retaining_calibration(s)) return;
         const bool continuous = s.backend == EyeCalibrationBackend::openxr;
         const unsigned continuous_c = continuous ? continuous_candidate(s, view) : 2;
         if (continuous && (s.current < 0 || s.ring[s.current].epoch != s.epoch ||
@@ -1520,6 +1573,8 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         auto& s = state();
         std::lock_guard lock(s.mutex);
         CpuScope cpu{s};
+        observe_source(s, view, width, height);
+        if (retaining_calibration(s)) return;
         const bool continuous = s.backend == EyeCalibrationBackend::openxr && s.stats.submission_graphics_api == 11;
         const unsigned continuous_c = continuous ? continuous_candidate(s, view) : 2;
         if (continuous && (s.current < 0 || s.ring[s.current].epoch != s.epoch ||
@@ -1615,8 +1670,12 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     auto& s = state();
     std::lock_guard lock(s.mutex);
     CpuScope cpu{s};
-    if (s.backend != backend || s.session_generation != generation || s.current < 0)
+    if (s.backend != backend || s.session_generation != generation)
         return 0;
+    const auto observed_desc = texture->GetDesc();
+    if (observed_desc.Width <= UINT32_MAX)
+        observe_submission(s, eye, unsigned(observed_desc.Width), observed_desc.Height, u0, v0, u1, v1, slice);
+    if (s.current < 0 || s.ring[s.current].epoch != s.epoch || retaining_calibration(s)) return 0;
     auto& f = s.ring[s.current];
     s.stats.submission_graphics_api = 12;
     ++f.submits;
@@ -1691,8 +1750,14 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     {
         std::unique_lock lock(s.mutex, std::try_to_lock);
         if (!lock.owns_lock()) return 0;
-        if (s.backend != backend || s.session_generation != session_generation || s.current < 0)
+        if (s.backend != backend || s.session_generation != session_generation)
             return 0;
+        if (s.current < 0) {
+            D3D11_TEXTURE2D_DESC desc{};
+            texture->GetDesc(&desc);
+            observe_submission(s, eye, desc.Width, desc.Height, u0, v0, u1, v1, slice);
+            return 0;
+        }
         auto& f = s.ring[s.current];
         if (f.invalid || f.epoch != s.epoch) return 0;
         capture_sequence = f.sequence;
@@ -1794,6 +1859,8 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     }
     D3D11_TEXTURE2D_DESC desc{};
     texture->GetDesc(&desc);
+    observe_submission(s, eye, desc.Width, desc.Height, u0, v0, u1, v1, slice);
+    if (f.epoch != s.epoch || retaining_calibration(s)) return 0;
     auto& submitted = f.submitted11[eye];
     if (independent_capture) {
         if (submitted.context.Get() != context.Get()) {
@@ -1940,6 +2007,7 @@ std::string eye_calibration_json() {
         << ",\"enabled\":" << s.enabled << ",\"status\":\"" << eye_calibration_status(s)
         << "\",\"active\":" << s.correction_active << ",\"openvr_active\":" << s.openvr_active
         << ",\"shared_source\":" << (s.correction_active && s.left_view == s.right_view)
+        << ",\"continuous_validation\":" << eye_calibration_continuous_validation()
         << ",\"vertical_flip\":" << s.vertical_flip << ",\"crop_mapping_active\":" << s.crop_mapping_active
         << ",\"unsupported_submission\":" << s.unsupported_submission
         << ",\"unsupported_submissions\":" << s.unsupported_submissions << ",\"frames\":" << s.frames
@@ -2084,7 +2152,8 @@ std::string eye_calibration_json() {
             << ",\"stamping\":\"bordered_grid_then_small_corner\""
             << ",\"motion_inconclusive\":" << live.motion_inconclusive
             << ",\"geometry_rejections\":" << live.geometry_rejections
-            << ",\"crop_max_age_ms\":2500,\"motion_threshold_degrees_per_second\":90"
+            << ",\"crop_max_age_ms\":" << (eye_calibration_continuous_validation() ? 2500 : 0)
+            << ",\"motion_threshold_degrees_per_second\":90"
             << ",\"verification_age_ms\":" << (live.last_verified_ms ? GetTickCount64()-live.last_verified_ms : 0)
             << ",\"wide_searches\":" << live.wide_searches
             << ",\"wide_search_pending\":" << std::any_of(live.ring.begin(), live.ring.end(), [](const auto& f) { return f.busy && f.wide_search; })

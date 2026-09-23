@@ -326,6 +326,7 @@ int main(int argc, char** argv) {
         require(received.find("\"status\":\"Disabled\"") != received.npos, "Calibration disable command");
         command("1\n81\ncalibration_enable");
         command("1\n82\ncalibration_reset");
+        command("1\n86\ncalibration_recalibrate");
         require(received.find("Waiting for OpenVR or OpenXR") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
             if (inactive_afw) {
@@ -401,7 +402,10 @@ int main(int argc, char** argv) {
         require(snapshot(get).find("\"processing\":false")!=std::string::npos,"Device reset pauses processing");
         present();
         require(snapshot(get).find("\"ready\":true")!=std::string::npos,"Renderer recovery");
-        command("1\n2\nset\nWidth=0.65\nHeight=0.45\nEnabled=false");
+        command("1\n2\nset\nWidth=0.65\nHeight=0.45\nEnabled=false\nEyeCalibrationContinuous=false");
+        require(received.find("\"EyeCalibrationContinuous\":false") != received.npos &&
+            received.find("\"continuous_validation\":false") != received.npos,
+            "Calibration policy must reach the shared runtime");
         require(std::abs(field(received,"Width")-0.65)<0.0001 && received.find("\"Enabled\":false") != received.npos, "Settings bridge transaction");
         const auto revision=field(received,"revision");
         command("1\n3\nset\nWidth=0.4\nHeight=nan");
@@ -431,6 +435,8 @@ int main(int argc, char** argv) {
         require(std::abs(field(received,"Width")-0.65)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001 && field(received,"GazeSmoothingMs")==20,
             "Gaze reset preserves SR and NR");
         require(field(received,"NrProcessingOrder")==1, "Gaze reset changed NR order");
+        require(received.find("\"EyeCalibrationContinuous\":true") != received.npos,
+            "Gaze defaults must restore continuous calibration validation");
         command("1\n44\ndefaults_sr");
         require(std::abs(field(received,"Width")-0.55)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001,
             "SR reset preserves NR");
@@ -438,7 +444,7 @@ int main(int argc, char** argv) {
         const auto reset_revision = field(received,"revision");
         command("1\n45\ndefaults_typo");
         require(field(received,"revision") == reset_revision, "Unknown reset group is atomic");
-        command("1\n46\nset\nWidth=0.65\nNrIntensity=1\nNrWorkingScale=0.37");
+        command("1\n46\nset\nWidth=0.65\nNrIntensity=1\nNrWorkingScale=0.37\nEyeCalibrationContinuous=false");
         require(received.find("\"setting_groups\":{") != received.npos && received.find("\"nr_details\":{") != received.npos &&
             received.find("\"frame\":{") != received.npos, "Expanded diagnostic snapshot bridge");
         for (unsigned i = 0; i < 35; ++i) { Sleep(10); present(); }
@@ -489,6 +495,7 @@ int main(int argc, char** argv) {
         for (int i=0;i<500 && field(snapshot(get),"saved_revision")<field(snapshot(get),"revision");++i) Sleep(10);
         Settings saved; std::string error; require(read_settings_file(root/"CheekyFoveatedDLSS.ini",saved,error),"Persisted runtime config");
         require(std::abs(saved.width-0.65f)<0.0001f && saved.enabled,"Persisted configured state");
+        require(!saved.eye_calibration_continuous, "Calibration policy must be saved per game");
         require(saved.nr_processing_order == NrProcessingOrder::before_upscaling && saved.nr_working_scale == 0.37f,
             "Asynchronous persistence lost NR rendering order or scale");
         // Reproduce UEVR clearing callbacks before FreeLibrary.
@@ -502,6 +509,8 @@ int main(int argc, char** argv) {
         init=reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin,"uevr_plugin_initialize"));
         require(init(&api),"Reconnect existing runtime"); command("1\n6\nget");
         require(received.find("\"attached\":true")!=received.npos && std::abs(field(received,"Width")-0.65)<0.0001,"Reload retains settings");
+        require(received.find("\"EyeCalibrationContinuous\":false") != received.npos,
+            "Reconnect must retain the saved calibration policy");
         require(field(received,"NrProcessingOrder")==1 && std::abs(field(received,"NrWorkingScale")-0.37)<0.0001,
             "Reconnect lost rendering order or scale");
         detach(1);

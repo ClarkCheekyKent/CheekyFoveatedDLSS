@@ -30,6 +30,7 @@ std::atomic<std::uint32_t> x_offset_bits{0U};
 std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
 std::atomic<bool> auto_stereo_alignment{true};
+std::atomic<bool> eye_calibration_continuous{true};
 std::atomic<std::uint32_t> aligned_height_offset_bits{};
 std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
@@ -107,7 +108,8 @@ StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
     auto crops = calibration.source_crops;
     const auto now = GetTickCount64();
-    if (now < calibration.verified_ms || now - calibration.verified_ms > 2500)
+    if (eye_calibration_continuous.load(std::memory_order_acquire) &&
+        (now < calibration.verified_ms || now - calibration.verified_ms > 2500))
         for (auto& crop : crops) crop.valid = false;
     if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip,
         calibration.left == calibration.right, crops};
@@ -160,6 +162,7 @@ Settings configured_settings() noexcept {
     settings.alignment_border_enabled =
         alignment_border_enabled.load(std::memory_order_acquire);
     settings.auto_stereo_alignment = auto_stereo_alignment.load(std::memory_order_acquire);
+    settings.eye_calibration_continuous = eye_calibration_continuous.load(std::memory_order_acquire);
     settings.aligned_height_offset = load_float(aligned_height_offset_bits);
     settings.center_mode = static_cast<FoveationCenterMode>(
         center_mode.load(std::memory_order_acquire)
@@ -269,6 +272,7 @@ void update_settings(const Settings& settings) noexcept {
         std::memory_order_release
     );
     auto_stereo_alignment.store(settings.auto_stereo_alignment, std::memory_order_release);
+    eye_calibration_continuous.store(settings.eye_calibration_continuous, std::memory_order_release);
     store_float(aligned_height_offset_bits, std::clamp(settings.aligned_height_offset, -1.0F, 1.0F));
     center_mode.store(
         static_cast<std::uint32_t>(settings.center_mode) <= 2U
@@ -478,6 +482,9 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
 void invalidate_stereo_crop() noexcept {
     std::lock_guard lock(stereo_views_mutex);
     for (auto& crop : calibration.source_crops) crop.valid = false;
+}
+bool eye_calibration_continuous_validation() noexcept {
+    return eye_calibration_continuous.load(std::memory_order_acquire);
 }
 void clear_stereo_calibration() noexcept {
     std::lock_guard lock(stereo_views_mutex);

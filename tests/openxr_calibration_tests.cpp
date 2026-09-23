@@ -1645,7 +1645,170 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
               << ": " << stats.valid << " valid, 2 corrections, stable allocations\n";
     cleanup();
 }
+// Real GPU stamps/readbacks: after acquisition, change-only mode must leave
+// freshly rendered source pixels untouched on every supported submission route.
+void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend backend) {
+    roles();
+    auto settings = configured_settings();
+    settings.eye_calibration_continuous = false;
+    update_settings(settings);
+    GPU12 gpu;
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &device, nullptr, &context));
+    constexpr unsigned size = 512;
+    const std::vector<unsigned> background(size * size, 0xff404040);
+    std::array<ComPtr<ID3D11Texture2D>, 2> textures11;
+    D3D11_TEXTURE2D_DESC desc{size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    for (auto& texture : textures11) check(device->CreateTexture2D(&desc, nullptr, &texture));
+    desc.Usage = D3D11_USAGE_STAGING; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging11;
+    check(device->CreateTexture2D(&desc, nullptr, &staging11));
+    std::array<ComPtr<ID3D12Resource>, 2> textures12;
+    for (auto& texture : textures12)
+        texture = gpu.texture(size, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM, size);
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; buffer.Width = size * size * 4;
+    buffer.Height = buffer.SampleDesc.Count = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    ComPtr<ID3D12Resource> upload, readback;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload)));
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback)));
+    void* data{}; check(upload->Map(0, nullptr, &data));
+    memcpy(data, background.data(), background.size() * 4); upload->Unmap(0, nullptr);
+    std::array<std::uint64_t, 2> views{9101, 9102};
+    std::uint64_t session = backend == EyeCalibrationBackend::openxr ? 9901 : 0;
+    unsigned source_width = size;
+    float right_bound = 1;
+    bool swapped = false;
+    const auto native_state = backend == EyeCalibrationBackend::openxr ?
+        D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    auto frame = [&](bool expect_clean = false) {
+        eye_calibration_frame(backend, session, submit11 ? 11 : 12);
+        for (unsigned c = 0; c < 2; ++c) {
+            if (source12) {
+                gpu.begin();
+                D3D12_TEXTURE_COPY_LOCATION texture{}, linear{};
+                texture.pResource = textures12[c].Get(); texture.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                linear.pResource = upload.Get(); linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                linear.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, size, size, 1, size * 4};
+                gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+                gpu.list->CopyTextureRegion(&texture, 0, 0, 0, &linear, nullptr);
+                gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                eye_calibration_stamp12(gpu.list.Get(), textures12[c].Get(), views[c], 0, 0, source_width, size);
+                gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                linear.pResource = readback.Get();
+                gpu.list->CopyTextureRegion(&linear, 0, 0, 0, &texture, nullptr);
+                gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, native_state);
+                gpu.execute(); gpu.wait(gpu.queue.Get());
+                check(readback->Map(0, nullptr, &data));
+                if (expect_clean) require(memcmp(data, background.data(), background.size() * 4) == 0,
+                    "Retained calibration must stop all DX12 marker stamping");
+                if (submit11) context->UpdateSubresource(textures11[c].Get(), 0, nullptr, data, size * 4, 0);
+                readback->Unmap(0, nullptr);
+            } else {
+                context->UpdateSubresource(textures11[c].Get(), 0, nullptr, background.data(), size * 4, 0);
+                eye_calibration_stamp(context.Get(), textures11[c].Get(), views[c], 0, 0, source_width, size);
+                if (expect_clean) {
+                    context->CopyResource(staging11.Get(), textures11[c].Get());
+                    D3D11_MAPPED_SUBRESOURCE mapped{}; check(context->Map(staging11.Get(), 0, D3D11_MAP_READ, 0, &mapped));
+                    for (unsigned y = 0; y < size; ++y)
+                        require(memcmp(static_cast<char*>(mapped.pData) + y * mapped.RowPitch,
+                            background.data() + y * size, size * 4) == 0,
+                            "Retained calibration must stop all DX11 marker stamping");
+                    context->Unmap(staging11.Get(), 0);
+                }
+            }
+        }
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto c = swapped ? 1 - eye : eye;
+            const auto ticket = submit11 ? eye_calibration_submit(textures11[c].Get(), eye, 0, 0, right_bound, 1, 0, backend, session) :
+                eye_calibration_submit12(textures12[c].Get(), gpu.queue.Get(), eye, 0, 0, right_bound, 1, 0, backend, session);
+            if (expect_clean) require(ticket == 0, "Retained calibration must not enqueue readbacks");
+            if (ticket) eye_calibration_result(ticket, 0);
+        }
+        context->Flush();
+        if (source12) {
+            gpu.wait(gpu.queue.Get()); gpu.begin();
+            for (auto& texture : textures12) gpu.barrier(texture.Get(), native_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            gpu.execute(); gpu.wait(gpu.queue.Get());
+        }
+        Sleep(2); eye_calibration_tick();
+    };
+    auto acquire = [&] {
+        const auto deadline = GetTickCount64() + 10000;
+        do { frame(); } while (!eye_calibration_stats().crop_mapping_active && GetTickCount64() < deadline);
+        require(eye_calibration_stats().crop_mapping_active, "Change-only calibration must acquire and publish a crop");
+        for (unsigned i = 0; i < 12; ++i) frame(true);
+    };
+    acquire();
+    const auto stable = eye_calibration_stats();
+    Sleep(2600);
+    swapped = true;
+    for (unsigned i = 0; i < 25; ++i) frame(true);
+    require(eye_calibration_stats().captures == stable.captures && eye_calibration_stats().applied == stable.applied &&
+        eye_calibration_stats().crop_mapping_active && stereo_eye_assignment(views[0]).eye_index == 0,
+        "Change-only mode must retain its crop past expiry and deliberately ignore same-view eye swaps");
+    eye_calibration_reset_stats(); frame(true);
+    require(eye_calibration_stats().captures == 0, "Counter reset must preserve retained calibration");
+    eye_calibration_recalibrate();
+    require(!stereo_eye_assignment(views[0]).calibrated, "Manual recalibration must invalidate the old pair");
+    acquire();
+    require(stereo_eye_assignment(views[0]).eye_index == 1, "Manual recalibration must learn the swapped eyes");
+    source_width -= 16; frame();
+    require(!eye_calibration_stats().crop_mapping_active, "Source dimension change must invalidate retained alignment");
+    acquire();
+    right_bound = .95F; frame();
+    require(!eye_calibration_stats().crop_mapping_active, "Submission bounds change must restart without marker validation");
+    acquire();
+    unregister_stereo_view(views[0]); register_stereo_view(views[0]); frame();
+    require(!eye_calibration_stats().crop_mapping_active, "Recreated view at the same address must invalidate retained alignment");
+    acquire();
+    register_stereo_view(9103); views[0] = 9103; frame();
+    require(!eye_calibration_stats().crop_mapping_active, "New view identity must restart calibration");
+    acquire();
+    if (session) {
+        eye_calibration_destroy_session(session); ++session; frame();
+        require(!eye_calibration_stats().crop_mapping_active, "New VR session must invalidate retained alignment");
+        acquire();
+    }
+    settings.eye_calibration_continuous = true; update_settings(settings);
+    const auto captures_before = eye_calibration_stats().captures;
+    for (unsigned i = 0; i < 25; ++i) frame();
+    require(eye_calibration_stats().captures > captures_before, "Continuous validation must resume when selected");
+    settings.eye_calibration_continuous = false; update_settings(settings);
+    const auto before_switch = eye_calibration_stats();
+    for (unsigned i = 0; i < 25; ++i) frame(true);
+    require(eye_calibration_stats().crop_mapping_active &&
+        eye_calibration_stats().captures == before_switch.captures &&
+        eye_calibration_stats().recalibration_requests == before_switch.recalibration_requests,
+        "Switching off validation must drain outstanding work without reopening acquisition");
+    settings.eye_calibration_continuous = true; update_settings(settings);
+    cleanup(); unregister_stereo_view(9103);
+    std::cout << "PASS retained calibration " << (source12 ? "DX12" : "DX11") << " -> " <<
+        (submit11 ? "DX11 " : "DX12 ") << eye_calibration_backend_name(backend) << '\n';
+}
 } // namespace
+int run_retained_calibration_tests() {
+    try {
+        for (const auto backend : {EyeCalibrationBackend::openvr, EyeCalibrationBackend::openxr}) {
+            retained_calibration(false, true, backend);
+            retained_calibration(true, false, backend);
+        }
+        retained_calibration(true, true, EyeCalibrationBackend::openxr);
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Retained calibration: " << e.what() << '\n'; cleanup();
+        auto settings = configured_settings(); settings.eye_calibration_continuous = true; update_settings(settings);
+        unregister_stereo_view(9103); return 1;
+    }
+}
 int run_crop_calibration12_tests() {
     try { crop_calibration12(false); crop_calibration12(true); return 0; }
     catch (const std::exception& e) { std::cerr << "Crop calibration DX12: " << e.what() << '\n'; cleanup(); return 1; }

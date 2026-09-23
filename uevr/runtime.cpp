@@ -519,6 +519,7 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
             eye_calibration_enable(action == "calibration_enable"); return true;
         }
         if (action == "calibration_reset") { eye_calibration_reset_stats(); return true; }
+        if (action == "calibration_recalibrate") { eye_calibration_recalibrate(); return true; }
         if (action == "report" || action == "report_issue") {
             if (s.report_busy.exchange(true)) return true;
             s.report_browser = action == "report_issue"; s.report_requested = true;

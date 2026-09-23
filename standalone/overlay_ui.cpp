@@ -367,12 +367,26 @@ void draw_gaze_details(std::string_view snapshot) {
     }
 }
 
+void draw_calibration_controls(OverlayUiState& r, const OverlayRuntime& runtime) {
+    ImGui::SeparatorText("Eye calibration");
+    bool enabled = flag(member(r.snapshot, "eye_calibration"), "enabled");
+    if (ImGui::Checkbox("Automatic eye calibration (this session)", &enabled))
+        command(r, runtime, enabled ? "calibration_enable" : "calibration_disable");
+    ImGui::BeginDisabled(!enabled);
+    int mode = r.draft.eye_calibration_continuous ? 0 : 1;
+    if (ImGui::Combo("Recalibration", &mode,
+            "Continuously validate\0Only on view or dimension changes\0"))
+        r.draft.eye_calibration_continuous = mode == 0;
+    if (!r.draft.eye_calibration_continuous)
+        ImGui::TextWrapped("Keeps the learned alignment without validation markers until views, dimensions, submission bounds, or the VR session change. Eye swaps or image crop changes within unchanged views are not detected.");
+    if (ImGui::Button("Recalibrate now")) command(r, runtime, "calibration_recalibrate");
+    ImGui::EndDisabled();
+}
+
 void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
     if (!ImGui::TreeNode("Eye calibration diagnostics")) return;
     // Commands refresh r.snapshot, so consume all views before sending one.
     const auto data = member(r.snapshot, "eye_calibration");
-    bool enabled = flag(data, "enabled");
-    const bool changed = ImGui::Checkbox("Automatic eye calibration (this session)", &enabled);
     diagnostic_line(data, "Backend", "backend");
     const auto api = number(data, "graphics_api");
     ImGui::Text("Graphics API: %s", api == 12 ? "D3D12" : api == 11 ? "D3D11" : "Waiting for DLSS");
@@ -443,8 +457,7 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
     ImGui::Text("Readback latency: %.2f VR frames", number(data, "latency_frames"));
     diagnostic_line(data, "Last recognized left view", "left_view");
     diagnostic_line(data, "Last recognized right view", "right_view");
-    ImGui::TextWrapped("Samples every 10 VR frames. Corrections count changes to an existing eye assignment. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
-    if (changed) command(r, runtime, enabled ? "calibration_enable" : "calibration_disable");
+    ImGui::TextWrapped("While acquiring or continuously validating, samples every 10 VR frames. Corrections count changes to an existing eye assignment. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
     if (ImGui::Button("Reset calibration counters")) command(r, runtime, "calibration_reset");
     ImGui::TreePop();
 }
@@ -655,6 +668,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
         if (ImGui::BeginTabBar("controls")) {
             if (begin_tab("Stereo / Gaze")) {
                 draw_gaze_status(r.draft, r.snapshot);
+                draw_calibration_controls(r, runtime);
                 ImGui::SeparatorText("Placement");
                 draw_gaze(r.draft);
                 if (ImGui::Button("Reset gaze defaults")) command(r, runtime, "defaults_gaze");
