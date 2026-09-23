@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <array>
+#include "eye_calibration_policy.hpp"
 namespace cheeky::foveated_dlss {
 inline constexpr unsigned eye_calibration_failure_limit = 20;
 enum class EyeCalibrationBackend { none, openvr, openxr };
@@ -12,6 +13,8 @@ enum class EyeCalibrationBackend { none, openvr, openxr };
 // UI only reads snapshots.
 struct EyeCalibrationStats {
     bool enabled{};
+    EyeCalibrationMethod active_method{EyeCalibrationMethod::standard};
+    unsigned acquisition_failure_streak{}, acquisition_confirmations{};
     EyeCalibrationBackend backend{};
     bool runtime_active{};
     unsigned graphics_api{};

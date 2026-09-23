@@ -390,6 +390,8 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
             // Retain the existing UEVR adapter's direct-DX11 default.
             if (input->renderer == 0 && s.host == CheekyRuntimeHost::uevr) settings.d3d11_use_d3d12_transport = false;
             update_settings(settings); s.revision = 1;
+            set_eye_calibration_learning(settings.eye_calibration_learned_method,
+                settings.eye_calibration_learned_signature, settings.eye_calibration_learned_sessions);
             s.save_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (!s.save_event) { s.failed = true; s.message = "Could not create persistence event"; return false; }
             HANDLE worker = CreateThread(nullptr, 0, persistence_worker, nullptr, 0, nullptr);
@@ -464,6 +466,11 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
             publish_afw_stereo_projection(empty, 0, 0, false);
         }
         eye_calibration_tick();
+        static std::uint64_t saved_learning_revision{};
+        const auto learning_revision = eye_calibration_learning_revision();
+        if (learning_revision != saved_learning_revision) {
+            saved_learning_revision = learning_revision; ++s.revision; request_save(s);
+        }
         set_processing_allowed(s.started && s.graphics_ready);
         if (s.graphics_ready) {
             const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -519,6 +526,10 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
             eye_calibration_enable(action == "calibration_enable"); return true;
         }
         if (action == "calibration_reset") { eye_calibration_reset_stats(); return true; }
+        if (action == "calibration_forget") {
+            set_eye_calibration_learning(0, 0, 0); eye_calibration_recalibrate();
+            ++s.revision; request_save(s); return true;
+        }
         if (action == "calibration_recalibrate") { eye_calibration_recalibrate(); return true; }
         if (action == "report" || action == "report_issue") {
             if (s.report_busy.exchange(true)) return true;
@@ -547,6 +558,9 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
             while (std::getline(in, line)) {
                 if (line.empty()) continue;
                 const auto eq = line.find('=');
+                if (line.starts_with("EyeCalibrationLearned")) {
+                    s.message = "Learned calibration is read-only; use Reset learned calibration method"; return false;
+                }
                 if (eq == std::string::npos || !set_named_setting(settings, std::string_view(line).substr(0,eq), std::string_view(line).substr(eq+1))) {
                     s.message = "Rejected invalid settings transaction"; return false;
                 }

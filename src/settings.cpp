@@ -30,7 +30,11 @@ std::atomic<std::uint32_t> x_offset_bits{0U};
 std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
 std::atomic<bool> auto_stereo_alignment{true};
-std::atomic<bool> eye_calibration_continuous{true};
+std::atomic<bool> eye_calibration_continuous{false};
+std::atomic<unsigned> calibration_method{};
+unsigned learned_method{}, learned_sessions{};
+std::uint64_t learned_signature{};
+std::atomic<std::uint64_t> learning_revision{};
 std::atomic<std::uint32_t> aligned_height_offset_bits{};
 std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
@@ -163,6 +167,10 @@ Settings configured_settings() noexcept {
         alignment_border_enabled.load(std::memory_order_acquire);
     settings.auto_stereo_alignment = auto_stereo_alignment.load(std::memory_order_acquire);
     settings.eye_calibration_continuous = eye_calibration_continuous.load(std::memory_order_acquire);
+    settings.eye_calibration_method = static_cast<EyeCalibrationMethod>(calibration_method.load());
+    settings.eye_calibration_learned_method = learned_method;
+    settings.eye_calibration_learned_signature = learned_signature;
+    settings.eye_calibration_learned_sessions = learned_sessions;
     settings.aligned_height_offset = load_float(aligned_height_offset_bits);
     settings.center_mode = static_cast<FoveationCenterMode>(
         center_mode.load(std::memory_order_acquire)
@@ -273,6 +281,7 @@ void update_settings(const Settings& settings) noexcept {
     );
     auto_stereo_alignment.store(settings.auto_stereo_alignment, std::memory_order_release);
     eye_calibration_continuous.store(settings.eye_calibration_continuous, std::memory_order_release);
+    calibration_method.store(unsigned(settings.eye_calibration_method) <= 3 ? unsigned(settings.eye_calibration_method) : 0);
     store_float(aligned_height_offset_bits, std::clamp(settings.aligned_height_offset, -1.0F, 1.0F));
     center_mode.store(
         static_cast<std::uint32_t>(settings.center_mode) <= 2U
@@ -482,6 +491,18 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
 void invalidate_stereo_crop() noexcept {
     std::lock_guard lock(stereo_views_mutex);
     for (auto& crop : calibration.source_crops) crop.valid = false;
+}
+void set_eye_calibration_learning(unsigned method, std::uint64_t signature, unsigned sessions) noexcept {
+    std::lock_guard lock(settings_mutex);
+    if (!method || method > 3 || !signature || !sessions) { method = 0; signature = 0; sessions = 0; }
+    sessions = (std::min)(sessions, 2U);
+    if (learned_method == method && learned_signature == signature && learned_sessions == sessions) return;
+    learned_method = method; learned_signature = signature; learned_sessions = sessions;
+    ++learning_revision;
+}
+std::uint64_t eye_calibration_learning_revision() noexcept { return learning_revision.load(); }
+EyeCalibrationMethod eye_calibration_selected_method() noexcept {
+    return static_cast<EyeCalibrationMethod>(calibration_method.load());
 }
 bool eye_calibration_continuous_validation() noexcept {
     return eye_calibration_continuous.load(std::memory_order_acquire);

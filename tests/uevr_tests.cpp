@@ -94,10 +94,18 @@ void settings_tests(const std::filesystem::path& root) {
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
         "Parse AFW manual coverage settings");
     require(set_named_setting(s, "AfwAutomaticCoverage", "true"), "Parse AFW automatic coverage setting");
+    require(!Settings{}.eye_calibration_continuous, "Default calibration must stop after acquisition");
+    require(set_named_setting(s, "EyeCalibrationMethod", "3") &&
+        !set_named_setting(s, "EyeCalibrationMethod", "4"), "Validate calibration override enum");
+    s.eye_calibration_learned_method = 2; s.eye_calibration_learned_sessions = 2;
+    s.eye_calibration_learned_signature = 0xfedcba9876543210ULL;
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
     require(serialize_settings(r) == serialize_settings(s), "Roundtrip all persisted fields");
+    require(r.eye_calibration_method == EyeCalibrationMethod::full && r.eye_calibration_learned_method == 2 &&
+        r.eye_calibration_learned_signature == 0xfedcba9876543210ULL && r.eye_calibration_learned_sessions == 2,
+        "Persist learned calibration without losing 64-bit signature precision");
     for (const auto order : {"0", "1"}) {
         require(set_named_setting(s, "NrProcessingOrder", order), "Parse NR rendering order");
         s.nr_working_scale = 0.37f;
@@ -435,7 +443,7 @@ int main(int argc, char** argv) {
         require(std::abs(field(received,"Width")-0.65)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001 && field(received,"GazeSmoothingMs")==20,
             "Gaze reset preserves SR and NR");
         require(field(received,"NrProcessingOrder")==1, "Gaze reset changed NR order");
-        require(received.find("\"EyeCalibrationContinuous\":true") != received.npos,
+        require(received.find("\"EyeCalibrationContinuous\":false") != received.npos,
             "Gaze defaults must restore continuous calibration validation");
         command("1\n44\ndefaults_sr");
         require(std::abs(field(received,"Width")-0.55)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001,

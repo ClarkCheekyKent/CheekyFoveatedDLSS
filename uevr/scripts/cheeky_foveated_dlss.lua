@@ -38,7 +38,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous"}) do
+    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -309,6 +309,17 @@ uevr.sdk.callbacks.on_draw_ui(function()
             local c = status.eye_calibration or {}
             local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
             if changed then send(enabled and "calibration_enable" or "calibration_disable") end
+            if status.settings.EyeCalibrationMethod ~= nil then
+                local methods = {[0]="Auto",[1]="Standard corners",[2]="Timing tolerant corners",[3]="Full crop search"}
+                combo("Calibration method", "EyeCalibrationMethod", methods)
+                local learned = status.settings.EyeCalibrationLearnedMethod or 0
+                text("Learned starting method: " .. (learned > 0 and methods[learned] or "Not learned yet"))
+                text("Active method: " .. (c.active_method or "Waiting"))
+                if status.settings.EyeCalibrationLearnedMethod == 2 and (status.settings.EyeCalibrationLearnedSessions or 0) < 2 then
+                    text("Timing preference needs confirmation on another launch.")
+                end
+                if imgui.button("Reset learned calibration method") then send("calibration_forget") end
+            end
             if status.settings.EyeCalibrationContinuous ~= nil then
                 check("Continuously validate eye calibration", "EyeCalibrationContinuous")
                 if draft.EyeCalibrationContinuous == false then

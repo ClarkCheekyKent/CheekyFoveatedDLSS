@@ -58,6 +58,8 @@ struct Frame {
     CalibrationImageRequestPtr support;
     std::array<SupportReadback11, 4> support11;
     bool wide_search{};
+    EyeCalibrationMethod method{EyeCalibrationMethod::standard};
+    std::array<std::array<double, 7>, 2> submitted_signature{};
     std::array<CalibrationSearchPtr, 2> search;
     std::array<SupportReadback11, 2> search11;
     std::array<CalibrationImageInfo, 2> search_info;
@@ -139,6 +141,9 @@ struct State {
     std::array<std::array<double, 2>, 2> submitted_sizes{};
     std::uint64_t placement_epoch{}, placement_sequence{}, placement_locks{}, placement_losses{};
     bool search_needed{};
+    EyeCalibrationPolicy policy;
+    std::uint64_t learned_this_launch_signature{};
+    unsigned learned_this_launch_method{};
     bool published{};
     // Metadata remains observable without stamping markers or copying pixels.
     std::array<std::array<double, 7>, 2> observed_submissions{};
@@ -208,6 +213,7 @@ void request_full_calibration(State& s, const char* reason) {
         s.stats.full_calibration_reason=reason;
     }
     s.search_needed=true;
+    s.policy.recover(GetTickCount64());
     s.published=false;
 }
 void placement_epoch(State& s) {
@@ -218,9 +224,10 @@ void placement_epoch(State& s) {
     s.search_needed = true; s.last_wide_search_ms = 0; s.last_verified_ms = 0;
     s.search_candidate = s.tracking_misses = 0;
     s.observed_submissions = {};
+    s.policy.begin(eye_calibration_selected_method(), GetTickCount64());
 }
 bool retaining_calibration(const State& s) {
-    return !eye_calibration_continuous_validation() && s.published && !s.search_needed;
+    return !eye_calibration_continuous_validation() && s.published && !s.search_needed && s.policy.confirmations >= 4;
 }
 void restart_calibration(State& s, const char* reason) {
     request_full_calibration(s, reason);
@@ -228,6 +235,7 @@ void restart_calibration(State& s, const char* reason) {
     s.frames_until_capture = 0;
     clear_stereo_calibration();
     placement_epoch(s);
+    if (std::string_view(reason) == "source_or_submitted_geometry_changed") s.policy.recover(GetTickCount64());
 }
 void observe_source(State& s, std::uint64_t view, unsigned width, unsigned height) {
     if (!retaining_calibration(s)) return;
@@ -259,13 +267,20 @@ CalibrationPlacementPlan source_placement(State& s, unsigned c, std::uint64_t vi
     }
     if (lock.locked) { ++s.placement_losses; request_full_calibration(s,"source_or_submitted_geometry_changed"); invalidate_stereo_crop(); }
     lock.locked = false;
-    return calibration_grid_plan(width, height);
+    if (s.policy.active == EyeCalibrationMethod::full) return calibration_grid_plan(width, height);
+    CalibrationPlacementPlan plan;
+    plan.placements[0] = {0, 0, double(width), double(height), {c ? width - 52 : 12, 12}};
+    // Use the same geometry validation as locked crops; no full-image readbacks.
+    plan.per_eye = true;
+    plan.eye_placements.fill(plan.placements[0]);
+    return plan;
 }
 void submitted_geometry(State& s, Frame& f, unsigned eye, unsigned width, unsigned height,
-                        float u0, float v0, float u1, float v1) {
+                        float u0, float v0, float u1, float v1, unsigned slice) {
     placement_epoch(s);
     f.submitted_sizes[eye] = {double(width) * std::abs(double(u1) - u0), double(height) * std::abs(double(v1) - v0)};
     f.motion_unreliable |= motion_unreliable(f.session_generation);
+    f.submitted_signature[eye] = {double(width), double(height), u0, v0, u1, v1, double(slice)};
     if (f.epoch == s.epoch) s.submitted_sizes[eye] = f.submitted_sizes[eye];
     f.placement_count = (std::max)(f.placement_plans[0].count, f.placement_plans[1].count);
 }
@@ -279,6 +294,7 @@ std::array<unsigned, 4> submitted_rect(State& s, Frame& f, unsigned eye, unsigne
     if (source != c) {
         for (unsigned i = 0; i < plan.count; ++i)
             plan.placements[i].marker.x = f.views[source].width - block - plan.placements[i].marker.x;
+        for (auto& p : plan.eye_placements) p.marker.x = f.views[source].width - block - p.marker.x;
     }
     const auto& placement = plan.for_eye(eye, h);
     f.patch_codes[calibration_patch_index(index, eye)] = calibration_location_code(placement.marker,
@@ -310,6 +326,22 @@ std::array<unsigned, 4> submitted_rect(State& s, Frame& f, unsigned eye, unsigne
     }
     if (!rect[2] || !rect[3]) { f.usable_placements[eye][h] = false; rect = {0, 0, 1, 1}; }
     return rect;
+}
+std::uint64_t calibration_signature(const State& s, const Frame& f) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto add = [&](std::uint64_t value) { hash = (hash ^ value) * 1099511628211ULL; };
+    static const auto executable = [] {
+        std::array<wchar_t, 32768> path{};
+        const auto n = GetModuleFileNameW(nullptr, path.data(), unsigned(path.size()));
+        std::uint64_t h = 14695981039346656037ULL;
+        for (unsigned i=0; i<n; ++i) h = (h ^ std::uint64_t(path[i])) * 1099511628211ULL;
+        return h;
+    }();
+    add(executable); add(1); // Signature schema version.
+    add(unsigned(s.backend)); add(s.stats.source_graphics_api); add(s.stats.submission_graphics_api);
+    for (const auto& v : f.views) { add(v.width); add(v.height); }
+    for (const auto& eye : f.submitted_signature) for (double value : eye) add(std::bit_cast<std::uint64_t>(value));
+    return hash;
 }
 CalibrationSearchPtr prepare_search(Frame& f, unsigned eye) noexcept try {
     if (!f.wide_search) return {};
@@ -967,8 +999,21 @@ void poll(State& s) {
         // pixels. Its CPU work can exceed the publication/tracking age limit.
         // Discarding that failure would retry the same clipped corner forever.
         const bool failed_wide_search = f.wide_search && rejection == 128U;
+        const auto signature = calibration_signature(s, f);
+        if (enabled && f.epoch == s.epoch && !s.policy.signature_checked && (rejection & ~128U) == 0) {
+            s.policy.signature_checked = true;
+            s.policy.started_ms = s.policy.stage_ms = GetTickCount64();
+            const auto settings = configured_settings();
+            const auto learned = settings.eye_calibration_learned_method;
+            if (s.policy.configured == EyeCalibrationMethod::automatic &&
+                signature == settings.eye_calibration_learned_signature && learned >= 1 && learned <= 3 &&
+                (learned != 2 || settings.eye_calibration_learned_sessions >= 2)) {
+                s.policy.select(static_cast<EyeCalibrationMethod>(learned), GetTickCount64());
+                s.frames_until_capture = 0;
+            }
+        }
         // Do not let an old epoch or out-of-order completion undo a newer placement.
-        if (enabled && !retaining_calibration(s) && f.epoch == s.epoch && f.sequence > s.placement_sequence &&
+        if (enabled && !retaining_calibration(s) && f.epoch == s.epoch && f.method == s.policy.active && f.sequence > s.placement_sequence &&
             (failed_wide_search || GetTickCount64() - f.captured_ms < (f.wide_search ? 10000U : 1000U))) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
@@ -1021,6 +1066,7 @@ void poll(State& s) {
                 // uses the normal age check; verify immediately on fresh pixels.
                 if (f.wide_search) s.frames_until_capture = 0;
             } else if (rejection == 128U) {
+                s.policy.confirmations = 0;
                 const bool locked = s.placements[0].locked || s.placements[1].locked;
                 const bool inconclusive = f.motion_unreliable && !ambiguous && locked;
                 if (inconclusive) { ++s.motion_inconclusive; s.tracking_misses = 0; }
@@ -1031,7 +1077,11 @@ void poll(State& s) {
                 // Motion-sensitive misses and shifts do not refresh crop validity.
                 // After settling, require twenty bad samples before reacquiring.
                 // Ambiguous identity still invalidates immediately.
-                if (!inconclusive && (!locked || ambiguous || ++s.tracking_misses >= eye_calibration_failure_limit)) {
+                if (!locked && !f.wide_search) {
+                    if (geometry_changed && !f.motion_unreliable && s.policy.configured == EyeCalibrationMethod::automatic) {
+                        s.policy.recover(GetTickCount64()); s.frames_until_capture = 0;
+                    } else if (s.policy.failed(GetTickCount64(), f.motion_unreliable)) s.frames_until_capture = 0;
+                } else if (!inconclusive && (!locked || ambiguous || ++s.tracking_misses >= eye_calibration_failure_limit)) {
                     request_full_calibration(s, ambiguous ? "ambiguous_identity" : locked ? "verification_failure_limit" : "no_locked_crop");
                     invalidate_stereo_crop();
                     if (locked) {
@@ -1060,13 +1110,24 @@ void poll(State& s) {
                 ++s.stats.mismatches;
             // Readbacks may complete out of order or after a toggle. The settings
             // layer additionally verifies ordering, age and handle lifetimes.
-            if (enabled && !retaining_calibration(s) && f.epoch == s.epoch) {
+            if (enabled && !retaining_calibration(s) && f.epoch == s.epoch && f.method == s.policy.active) {
                 bool corrected{};
                 if (publish_stereo_calibration(f.views[left].id, f.views[right].id, f.views[left].generation,
                                                f.views[right].generation, f.sequence, f.captured_ms,
                                                &corrected, f.session_generation, flipped_pair, mono, &crops)) {
                     s.last_verified_ms = f.captured_ms;
                     s.published = true;
+                    s.policy.failures = 0;
+                    if (++s.policy.confirmations == 4 && s.policy.configured == EyeCalibrationMethod::automatic) {
+                        const auto settings = configured_settings();
+                        const auto method = unsigned(s.policy.active);
+                        const bool same = settings.eye_calibration_learned_signature == signature &&
+                            settings.eye_calibration_learned_method == method;
+                        const bool already = s.learned_this_launch_signature == signature && s.learned_this_launch_method == method;
+                        const auto sessions = same ? settings.eye_calibration_learned_sessions + (already ? 0U : 1U) : 1U;
+                        set_eye_calibration_learning(method, signature, sessions);
+                        s.learned_this_launch_signature = signature; s.learned_this_launch_method = method;
+                    }
                     ++s.stats.applied;
                     if (corrected)
                         ++s.stats.corrections;
@@ -1279,6 +1340,9 @@ EyeCalibrationStats eye_calibration_stats() noexcept {
         unsigned(std::count_if(s.ring.begin(), s.ring.end(), [](const auto& f) { return f.busy; }));
     result.full_calibration_attempts=s.wide_searches;
     result.verification_failure_streak=s.tracking_misses;
+    result.active_method = s.policy.active;
+    result.acquisition_failure_streak = s.policy.failures;
+    result.acquisition_confirmations = s.policy.confirmations;
     result.cpu_us_per_frame = result.frames ? s.cpu_us / result.frames : 0;
     result.verification_cpu_us_per_frame=result.frames ? result.verification_cpu_ms*1000/result.frames : 0;
     result.gpu_us = s.gpu.get();
@@ -1344,6 +1408,8 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     ++s.sequence;
     s.frame_thread = GetCurrentThreadId();
     if (on) ++s.stats.frames;
+    if (s.policy.configured != eye_calibration_selected_method())
+        restart_calibration(s, "method_changed");
     const bool capture_due = s.frames_until_capture == 0;
     if (s.frames_until_capture) --s.frames_until_capture;
     if (s.current >= 0) {
@@ -1383,11 +1449,11 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     if (std::any_of(s.ring.begin(), s.ring.end(), [](const auto& frame) {
         return frame.busy && frame.wide_search;
     })) return false;
-    // Drain readbacks every frame and sample one in ten. DX11 OpenXR
+    // Drain every frame. Sample one in ten except during timing recovery. DX11 OpenXR
     // submissions use stable corner stamps on intervening renders, including DX12 sources.
     if (!capture_due) return false;
-    if (s.search_needed && s.last_wide_search_ms && now - s.last_wide_search_ms < 200) return false;
-    s.frames_until_capture = 9;
+    if (s.search_needed && s.policy.active == EyeCalibrationMethod::full && s.last_wide_search_ms && now - s.last_wide_search_ms < 200) return false;
+    s.frames_until_capture = s.search_needed && s.policy.active == EyeCalibrationMethod::timing ? 0 : 9;
     // Rotate through all slots so the warm-up is bounded and reproducible.
     for (unsigned n = 0; n < ring_size; ++n) {
         const unsigned i = unsigned((s.stats.captures + n) % ring_size);
@@ -1405,7 +1471,9 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         f.support = claim_calibration_images(f.sequence, session_generation, f.codes);
         f.support11 = {};
         f.search = {}; f.search11 = {};
-        f.wide_search = s.search_needed && (!s.last_wide_search_ms || now - s.last_wide_search_ms >= 200);
+        f.method = s.policy.active;
+        f.submitted_signature = {};
+        f.wide_search = s.search_needed && s.policy.active == EyeCalibrationMethod::full && (!s.last_wide_search_ms || now - s.last_wide_search_ms >= 200);
         if (f.wide_search) { ++s.wide_searches; s.last_wide_search_ms = now; }
         f.busy = true;
         f.closed = f.close_requested = f.invalid = f.queries_started = false;
@@ -1699,7 +1767,7 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
         f.invalid = true;
         return 0;
     }
-    submitted_geometry(s, f, eye, unsigned(d.Width), d.Height, u0, v0, u1, v1);
+    submitted_geometry(s, f, eye, unsigned(d.Width), d.Height, u0, v0, u1, v1, slice);
     std::array<D3D12_BOX, calibration_box_count> boxes;
     std::array<std::uint32_t, calibration_box_count> codes;
     std::array<unsigned, calibration_box_count> mirrors;
@@ -1881,7 +1949,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
     CalibrationImageInfo image;
     image.width = desc.Width; image.height = desc.Height; image.format = desc.Format; image.graphics_api = 11;
     image.slice = slice; image.submitted_eye = int(eye); image.bounds = {u0, v0, u1, v1};
-    submitted_geometry(s, f, eye, desc.Width, desc.Height, u0, v0, u1, v1);
+    submitted_geometry(s, f, eye, desc.Width, desc.Height, u0, v0, u1, v1, slice);
     image.sample_count = f.placement_count * 4;
     for (unsigned index = 0; index < image.sample_count; ++index) {
         const unsigned c = index % 2;
@@ -1973,7 +2041,7 @@ const char* eye_calibration_status(const EyeCalibrationStats& stats) noexcept {
     if (stats.correction_active)
         return !stats.crop_mapping_active ? "Eye identified; acquiring crop" :
             stats.left_view == stats.right_view ? "Active (shared mono source)" : "Active";
-    return "Acquiring coded grid and eye mapping";
+    return stats.active_method == EyeCalibrationMethod::full ? "Acquiring crop and eye mapping" : "Acquiring corner eye mapping";
 }
 
 const char* eye_calibration_backend_name(EyeCalibrationBackend backend) noexcept {
@@ -2008,6 +2076,9 @@ std::string eye_calibration_json() {
         << "\",\"active\":" << s.correction_active << ",\"openvr_active\":" << s.openvr_active
         << ",\"shared_source\":" << (s.correction_active && s.left_view == s.right_view)
         << ",\"continuous_validation\":" << eye_calibration_continuous_validation()
+        << ",\"active_method\":\"" << eye_calibration_method_name(s.active_method) << "\""
+        << ",\"acquisition_failure_streak\":" << s.acquisition_failure_streak
+        << ",\"acquisition_confirmations\":" << s.acquisition_confirmations
         << ",\"vertical_flip\":" << s.vertical_flip << ",\"crop_mapping_active\":" << s.crop_mapping_active
         << ",\"unsupported_submission\":" << s.unsupported_submission
         << ",\"unsupported_submissions\":" << s.unsupported_submissions << ",\"frames\":" << s.frames

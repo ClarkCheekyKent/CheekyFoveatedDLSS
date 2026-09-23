@@ -2252,6 +2252,8 @@ int run_d3d11_binding_tests();
 int run_debug_exposure_tests();
 int main(int argc, char** argv) {
     extern int run_retained_calibration_tests();
+    extern int run_calibration_modes_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--calibration-modes") == 0) return run_calibration_modes_tests();
     if (argc == 2 && std::strcmp(argv[1], "--retained-calibration") == 0) return run_retained_calibration_tests();
     if (argc == 2 && std::strcmp(argv[1], "--debug-exposure") == 0) return run_debug_exposure_tests();
     if (argc == 2 && std::strcmp(argv[1], "--openxr-input") == 0) return run_openxr_input_tests();

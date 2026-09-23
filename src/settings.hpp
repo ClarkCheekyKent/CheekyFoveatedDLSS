@@ -1,6 +1,7 @@
 #pragma once
 
 #include "foveation.hpp"
+#include "eye_calibration_policy.hpp"
 
 #include <cstdint>
 #include <array>
@@ -63,7 +64,11 @@ struct Settings {
     float height_offset{-0.45F};
     bool invert_stereo_x_offset{false};
     bool auto_stereo_alignment{true};
-    bool eye_calibration_continuous{true};
+    bool eye_calibration_continuous{false};
+    EyeCalibrationMethod eye_calibration_method{EyeCalibrationMethod::automatic};
+    // Learning is loaded explicitly and updated separately from editable UI drafts.
+    unsigned eye_calibration_learned_method{}, eye_calibration_learned_sessions{};
+    std::uint64_t eye_calibration_learned_signature{};
     float aligned_height_offset{0.0F};
     float roundness{0.0F};
     float transition_width{0.04F};
@@ -160,6 +165,9 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     const std::array<StereoSourceCrop, 2>* source_crops = nullptr) noexcept;
 void invalidate_stereo_crop() noexcept;
 bool eye_calibration_continuous_validation() noexcept;
+EyeCalibrationMethod eye_calibration_selected_method() noexcept;
+void set_eye_calibration_learning(unsigned method, std::uint64_t signature, unsigned sessions) noexcept;
+std::uint64_t eye_calibration_learning_revision() noexcept;
 void clear_stereo_calibration() noexcept;
 
 [[nodiscard]] Settings current_settings() noexcept;

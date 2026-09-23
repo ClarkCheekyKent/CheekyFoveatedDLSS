@@ -625,7 +625,7 @@ void draw_eye_calibration_diagnostics() {
         diagnostic_row("Readback latency", "%.2f VR frames", s.latency_frames);
         diagnostic_row("Last recognized left / right", "%llu / %llu", s.left_view, s.right_view);
     }
-    ImGui::TextWrapped("Samples every 10 VR frames. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
+    ImGui::TextWrapped("Corner verification samples every 10 VR frames; timing recovery captures every frame while acquiring. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
     if (ImGui::Button("Reset eye calibration counters")) eye_calibration_reset_stats();
     ImGui::TreePop();
 }
@@ -811,6 +811,14 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "EyeCalibrationContinuous", settings.eye_calibration_continuous));
+    unsigned calibration_method = 0;
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationMethod", calibration_method);
+    settings.eye_calibration_method = static_cast<EyeCalibrationMethod>(calibration_method <= 3 ? calibration_method : 0);
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationLearnedMethod", settings.eye_calibration_learned_method);
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationLearnedSignature", settings.eye_calibration_learned_signature);
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationLearnedSessions", settings.eye_calibration_learned_sessions);
+    set_eye_calibration_learning(settings.eye_calibration_learned_method, settings.eye_calibration_learned_signature,
+        settings.eye_calibration_learned_sessions);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset));
     settings.center_mode = center_mode <= 2U
@@ -979,6 +987,11 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     );
     reshade::set_config_value(nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment);
     reshade::set_config_value(nullptr, config_section, "EyeCalibrationContinuous", settings.eye_calibration_continuous);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationMethod", unsigned(settings.eye_calibration_method));
+    const auto learned = configured_settings();
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationLearnedMethod", learned.eye_calibration_learned_method);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationLearnedSignature", learned.eye_calibration_learned_signature);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationLearnedSessions", learned.eye_calibration_learned_sessions);
     reshade::set_config_value(nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset);
     reshade::set_config_value(
         nullptr, config_section, "CenterMode",
@@ -1631,6 +1644,18 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         if (ImGui::Checkbox("Automatic eye calibration (this session)", &calibration_enabled))
             eye_calibration_enable(calibration_enabled);
         ImGui::BeginDisabled(!calibration_enabled);
+        int method = int(settings.eye_calibration_method);
+        if (ImGui::Combo("Calibration method", &method, "Auto\0Standard corners\0Timing tolerant corners\0Full crop search\0")) {
+            settings.eye_calibration_method = static_cast<EyeCalibrationMethod>(method); changed = true;
+        }
+        ImGui::Text("Learned starting method: %s", settings.eye_calibration_learned_method ?
+            eye_calibration_method_name(static_cast<EyeCalibrationMethod>(settings.eye_calibration_learned_method)) : "Not learned yet");
+        if (settings.eye_calibration_learned_method == 2 && settings.eye_calibration_learned_sessions < 2)
+            ImGui::TextWrapped("Timing preference needs confirmation on another launch; Auto will start with standard corners.");
+        ImGui::Text("Active method: %s", eye_calibration_method_name(eye_calibration_stats().active_method));
+        if (ImGui::Button("Reset learned calibration method")) {
+            set_eye_calibration_learning(0, 0, 0); eye_calibration_recalibrate();
+        }
         changed |= ImGui::Checkbox("Continuously validate eye calibration", &settings.eye_calibration_continuous);
         if (!settings.eye_calibration_continuous)
             ImGui::TextWrapped("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.");
@@ -1723,6 +1748,12 @@ void on_present(
     const reshade::api::rect*
 ) {
     eye_calibration_tick();
+    static std::uint64_t saved_learning_revision{};
+    const auto learning_revision = eye_calibration_learning_revision();
+    if (saved_learning_revision != learning_revision) {
+        saved_learning_revision = learning_revision;
+        save_settings_to_reshade(configured_settings());
+    }
     if (queue != nullptr && queue->get_device() != nullptr &&
         queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
         note_d3d12_present(

@@ -808,3 +808,108 @@ int run_eye_calibration_tests() {
         return 1;
     }
 }
+
+
+int run_calibration_modes_tests() {
+    try {
+        require(!Settings{}.eye_calibration_continuous, "Default calibration must be one-shot");
+        EyeCalibrationPolicy policy;
+        policy.begin(EyeCalibrationMethod::automatic, 100);
+        for (unsigned i=0; i<19; ++i) require(!policy.failed(200+i*100, false), "Sparse stage must tolerate nineteen misses");
+        require(policy.failed(2200, false) && policy.active == EyeCalibrationMethod::timing, "Twentieth sparse failure must enter timing retry");
+        for (unsigned i=0; i<30; ++i) require(!policy.failed(2201+i, false), "Timing retry needs a full observation window");
+        require(policy.failed(3200, false) && policy.active == EyeCalibrationMethod::full, "Timing retry must escalate after twenty failures and one second");
+        policy.begin(EyeCalibrationMethod::automatic, 100);
+        require(!policy.failed(5200, false), "Budget expiry must not escalate a single miss");
+        require(policy.failed(5300, false), "Five-second budget must bound usable startup failures");
+        policy.begin(EyeCalibrationMethod::automatic, 100);
+        for (unsigned i=0; i<50; ++i) require(!policy.failed(10000+i, true), "Motion-inconclusive observations must not escalate");
+        for (const auto method : {EyeCalibrationMethod::standard, EyeCalibrationMethod::timing, EyeCalibrationMethod::full}) {
+            policy.begin(method, 100);
+            for (unsigned i=0; i<30; ++i) require(!policy.failed(10000+i, false), "Manual overrides must never escalate");
+            policy.recover(20000); require(policy.active == method, "Recovery must respect manual override");
+        }
+        // Exercise actual GPU stamping/readback, persistence evidence and one-shot quiescence.
+        set_eye_calibration_learning(0, 0, 0);
+        ComPtr<ID3D11Device> device; ComPtr<ID3D11DeviceContext> context;
+        check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &device, nullptr, &context));
+        constexpr unsigned width=640, height=480;
+        const std::vector<unsigned> background(width*height, 0xff404040);
+        D3D11_TEXTURE2D_DESC desc{width,height,1,1,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,0,0,0};
+        std::array<ComPtr<ID3D11Texture2D>,2> sources, targets;
+        for (auto& source : sources) check(device->CreateTexture2D(&desc,nullptr,&source));
+        auto run = [&](bool cropped, EyeCalibrationMethod method, bool expect_success, bool expect_wide) {
+            eye_calibration_stop(); eye_calibration_reset_stats();
+            register_stereo_view(8101); register_stereo_view(8102);
+            auto settings = configured_settings(); settings.eye_calibration_method=method;
+            settings.eye_calibration_continuous=false; update_settings(settings);
+            eye_calibration_enable(true);
+            desc.Width=cropped ? 440 : width; desc.Height=cropped ? 360 : height;
+            for (auto& target : targets) { target.Reset(); check(device->CreateTexture2D(&desc,nullptr,&target)); }
+            auto frame = [&] {
+                eye_calibration_frame();
+                for (unsigned c=0;c<2;++c) {
+                    context->UpdateSubresource(sources[c].Get(),0,nullptr,background.data(),width*4,0);
+                    eye_calibration_stamp(context.Get(),sources[c].Get(),8101+c,0,0,width,height);
+                    const D3D11_BOX box{cropped ? 100U : 0U,cropped ? 60U : 0U,0,
+                        cropped ? 540U : width,cropped ? 420U : height,1};
+                    context->CopySubresourceRegion(targets[c].Get(),0,0,0,0,sources[c].Get(),0,&box);
+                }
+                for (unsigned eye=0;eye<2;++eye) {
+                    const auto ticket=eye_calibration_submit(targets[1-eye].Get(),eye,0,0,1,1);
+                    if(ticket) eye_calibration_result(ticket,0);
+                }
+                context->Flush(); Sleep(10); eye_calibration_tick();
+            };
+            const auto deadline=GetTickCount64()+(expect_success ? 15000 : 3000);
+            unsigned frames{}, first_wide_frame{};
+            do {
+                frame(); ++frames;
+                if (!first_wide_frame && eye_calibration_stats().full_calibration_attempts) first_wide_frame=frames;
+            } while (GetTickCount64()<deadline && eye_calibration_stats().acquisition_confirmations<4);
+            const auto stats=eye_calibration_stats();
+            if(expect_success) {
+                if (!stats.crop_mapping_active || stats.acquisition_confirmations<4) std::cerr << eye_calibration_json() << '\n';
+                require(stats.crop_mapping_active && stats.acquisition_confirmations>=4,"GPU calibration must acquire and confirm");
+                require(stereo_eye_assignment(8101).eye_index==1,"GPU calibration must identify swapped eyes");
+                for(unsigned i=0;i<25;++i) frame();
+                require(eye_calibration_stats().captures==stats.captures,"One-shot mode must stop capture after confirmations");
+            } else require(!stats.crop_mapping_active,"Forced corners must not accept an invisible marker");
+            require((stats.full_calibration_attempts>0)==expect_wide,"Full-image search must be reserved for the selected route");
+            eye_calibration_stop(); unregister_stereo_view(8101); unregister_stereo_view(8102);
+            return std::pair{stats, first_wide_frame};
+        };
+        run(false,EyeCalibrationMethod::automatic,true,false);
+        auto learned=configured_settings();
+        require(learned.eye_calibration_learned_method==1 && learned.eye_calibration_learned_signature,"Ordinary calibration must learn standard route");
+        run(true,EyeCalibrationMethod::standard,false,false);
+        const auto discovery=run(true,EyeCalibrationMethod::automatic,true,true);
+        require(discovery.second>20,"Unlearned cropped output must get multiple corner attempts");
+        learned=configured_settings();
+        require(learned.eye_calibration_learned_method==3,"Cropped calibration must learn full route");
+        const auto saved=learned.eye_calibration_learned_signature;
+        const auto reuse=run(true,EyeCalibrationMethod::automatic,true,true);
+        require(reuse.second<=20,"Matching learned crop route must bypass repeated corner discovery");
+        require(configured_settings().eye_calibration_learned_signature==saved,"Matching launch geometry must reuse learned route");
+        run(false,EyeCalibrationMethod::automatic,true,false);
+        run(false,EyeCalibrationMethod::timing,true,false);
+        run(false,EyeCalibrationMethod::full,true,true);
+        const auto ordinary_signature=configured_settings().eye_calibration_learned_signature;
+        set_eye_calibration_learning(2,ordinary_signature,1);
+        require(run(false,EyeCalibrationMethod::automatic,true,false).first.active_method==EyeCalibrationMethod::standard,
+            "A single timing success must not select the timing route on restart");
+        set_eye_calibration_learning(2,ordinary_signature,2);
+        require(run(false,EyeCalibrationMethod::automatic,true,false).first.active_method==EyeCalibrationMethod::timing,
+            "Two timing successes must select the saved timing route");
+        // A stale UI draft cannot overwrite newly learned evidence.
+        const auto fresh=configured_settings(); update_settings(learned);
+        require(configured_settings().eye_calibration_learned_signature==fresh.eye_calibration_learned_signature,"Editable settings must preserve learned evidence");
+        set_eye_calibration_learning(0,0,0);
+        std::cout << "PASS calibration modes: thresholds, overrides, GPU corners/crop escalation, learning, geometry changes and one-shot capture\n";
+        return 0;
+    } catch(const std::exception& e) {
+        eye_calibration_stop(); unregister_stereo_view(8101); unregister_stereo_view(8102);
+        std::cerr << "Calibration modes: " << e.what() << '\n'; return 1;
+    }
+}

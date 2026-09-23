@@ -100,7 +100,7 @@ template<class T> auto scalar(T value) {
 
 void commit(OverlayUiState& r, const OverlayRuntime& runtime, const Settings& previous) {
     std::ostringstream out; out.imbue(std::locale::classic()); out.precision(9);
-#define CHEEKY_SETTING(name, field) if (previous.field != r.draft.field) out << name << '=' << scalar(r.draft.field) << '\n';
+#define CHEEKY_SETTING(name, field) if (!std::string_view(name).starts_with("EyeCalibrationLearned") && previous.field != r.draft.field) out << name << '=' << scalar(r.draft.field) << '\n';
 #include "settings_fields.inc"
 #undef CHEEKY_SETTING
     const auto payload = out.str();
@@ -373,6 +373,16 @@ void draw_calibration_controls(OverlayUiState& r, const OverlayRuntime& runtime)
     if (ImGui::Checkbox("Automatic eye calibration (this session)", &enabled))
         command(r, runtime, enabled ? "calibration_enable" : "calibration_disable");
     ImGui::BeginDisabled(!enabled);
+    int method = int(r.draft.eye_calibration_method);
+    if (ImGui::Combo("Calibration method", &method,
+            "Auto\0Standard corners\0Timing tolerant corners\0Full crop search\0"))
+        r.draft.eye_calibration_method = static_cast<EyeCalibrationMethod>(method);
+    const auto learned = unsigned(number(member(r.snapshot, "settings"), "EyeCalibrationLearnedMethod"));
+    ImGui::Text("Learned starting method: %s", learned ? eye_calibration_method_name(static_cast<EyeCalibrationMethod>(learned)) : "Not learned yet");
+    if (learned == 2 && number(member(r.snapshot, "settings"), "EyeCalibrationLearnedSessions") < 2)
+        ImGui::TextWrapped("Timing preference needs confirmation on another launch; Auto will start with standard corners.");
+    diagnostic_line(member(r.snapshot, "eye_calibration"), "Active method", "active_method");
+    if (ImGui::Button("Reset learned calibration method")) command(r, runtime, "calibration_forget");
     int mode = r.draft.eye_calibration_continuous ? 0 : 1;
     if (ImGui::Combo("Recalibration", &mode,
             "Continuously validate\0Only on view or dimension changes\0"))
@@ -457,7 +467,7 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
     ImGui::Text("Readback latency: %.2f VR frames", number(data, "latency_frames"));
     diagnostic_line(data, "Last recognized left view", "left_view");
     diagnostic_line(data, "Last recognized right view", "right_view");
-    ImGui::TextWrapped("While acquiring or continuously validating, samples every 10 VR frames. Corrections count changes to an existing eye assignment. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
+    ImGui::TextWrapped("Corner verification samples every 10 VR frames; timing recovery captures every frame while acquiring. Corrections count changes to an existing eye assignment. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
     if (ImGui::Button("Reset calibration counters")) command(r, runtime, "calibration_reset");
     ImGui::TreePop();
 }
@@ -730,7 +740,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
             }
             if (begin_tab("All settings")) {
                 ImGui::TextWrapped("Advanced values use the same keys as the configuration file. The runtime validates and clamps each transaction.");
-#define CHEEKY_SETTING(name, field) raw_setting(name, r.draft.field);
+#define CHEEKY_SETTING(name, field) if (!std::string_view(name).starts_with("EyeCalibrationLearned")) raw_setting(name, r.draft.field);
 #include "settings_fields.inc"
 #undef CHEEKY_SETTING
                 end_tab();

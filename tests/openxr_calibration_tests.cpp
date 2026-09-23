@@ -1743,7 +1743,7 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
     };
     auto acquire = [&] {
         const auto deadline = GetTickCount64() + 10000;
-        do { frame(); } while (!eye_calibration_stats().crop_mapping_active && GetTickCount64() < deadline);
+        do { frame(); } while ((!eye_calibration_stats().crop_mapping_active || eye_calibration_stats().acquisition_confirmations < 4) && GetTickCount64() < deadline);
         require(eye_calibration_stats().crop_mapping_active, "Change-only calibration must acquire and publish a crop");
         for (unsigned i = 0; i < 12; ++i) frame(true);
     };

@@ -2,23 +2,49 @@
 
 Cheeky follows marked DLSS outputs to the physical eyes submitted to OpenVR or
 OpenXR. The sharp region can then follow the correct eye when videos, menus or
-scenes change the order of the game's stereo views. Calibration samples immediately when enabled, then every 10 VR frames,
-and starts enabled when a host attaches, independently of DLSS-SR's
-foveation switch. Pending readbacks still drain between samples; the established
-eye mapping remains active. A changed mapping can take up to 10 frames plus
-readback latency to detect. It does not rewrite saved stereo or gaze preferences.
+scenes change the order of the game's stereo views. Calibration starts enabled
+when a host attaches, independently of DLSS-SR's foveation switch. By default it
+calibrates once, confirms the result, then stops stamping and capturing until a
+monitored change occurs. Pending readbacks drain asynchronously between samples.
+It does not rewrite saved stereo or gaze offsets.
 
 ## Supported paths and installation
 
 ### Calibration controls
 
 In the standalone and OptiScaler overlay, **Stereo / Gaze > Eye calibration**
-contains the session enable switch, **Recalibration** mode and **Recalibrate now**.
-Detailed counters remain in Diagnostics. Continuous validation is the default.
+contains the session enable switch, **Calibration method**, **Recalibration** and
+**Recalibrate now**. Detailed counters remain in Diagnostics. Auto acquisition
+and **Only on view or dimension changes** are the defaults. Previously saved
+continuous-validation preferences are preserved.
+
+**Auto** starts with small corner markers and captures every tenth VR frame.
+After 20 usable failures it tries every-frame corner captures, allowing at least
+one second and 20 failures before using distributed stamps and full-image crop
+search. A five-second budget bounds the cheap discovery stages when usable
+failures keep arriving; pending readbacks, missing submissions and motion judged
+inconclusive do not themselves trigger escalation. This is an escalation budget,
+not a guarantee that calibration will finish within five seconds. Known invalid
+geometry or a lost established mapping can go directly to crop acquisition.
+
+The other method choices force **Standard corners**, **Timing tolerant corners**,
+or **Full crop search**, without automatically escalating to a different method.
+After acquisition, all methods use sparse small-marker confirmation. Full search
+does not mean continuously searching full images.
+
+After acquisition and three follow-up confirmations, Auto saves the successful
+starting method per game, matched against executable identity, graphics/VR
+backend, source dimensions and submitted geometry. Timing tolerance must succeed
+on two launches before becoming the preferred starting method. On later launches,
+one small probe establishes the current signature; matching learned evidence then
+selects the starting route. A different signature starts normal discovery. Eye
+identity and crop coordinates are always calibrated afresh. The UI stays on
+**Auto**, displaying the learned and active methods separately. **Reset learned
+calibration method** clears the preference and restarts discovery.
 
 **Only on view or dimension changes** performs initial acquisition, then stops
 both verification readbacks and all calibration marker stamping once a fresh
-mapping is published. The learned eye identity and crop remain valid without the
+mapping has passed the follow-up confirmations. The learned eye identity and crop remain valid without the
 2.5-second verification timeout. Source view identity/generation or dimensions,
 submission texture dimensions/bounds/array slice, and VR session/backend changes
 restart acquisition. These checks inspect metadata without reading image pixels.
@@ -26,7 +52,7 @@ Eye swaps and image-content crop changes within unchanged views/submissions are
 deliberately not detected; use **Recalibrate now** if alignment is wrong.
 
 The mode is saved per game as `EyeCalibrationContinuous=0`; `1` restores continuous
-validation. Resetting gaze defaults restores `1`. The automatic calibration
+validation. Resetting gaze defaults restores `0`. The automatic calibration
 enable switch remains session-only. Resetting diagnostic counters does not
 recalibrate. UEVR and ReShade expose the same policy as **Continuously validate
 eye calibration** in their Stereo / Gaze controls. A support ZIP requested while
