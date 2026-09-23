@@ -80,6 +80,7 @@ struct Fixture {
     bool missing_sl_constants{}, ambiguous_sl_inputs{}, cache_other_view{};
     std::array<SlResource, 4> resources{};
     std::array<SlResourceTag, 4> tags{};
+    bool test_exposure_present{};
     void submit_metadata() {
         if (!complete_sl_metadata) return;
         const unsigned types[]{3U, 0U, 1U, 4U};
@@ -98,6 +99,13 @@ struct Fixture {
         constants.reset = static_cast<char>(get_ui(&params, "Reset"));
         require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
             &frame,&viewport,tags.data(),4,list.Get()) == 0, "Submit complete viewport tags");
+        if (test_exposure_present) {
+            auto exposure = resources[0];
+            auto tag = tags[0]; tag.type = 13; tag.resource = &exposure;
+            tag.extent = {0,0,1,1};
+            require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
+                &frame,&viewport,&tag,1,list.Get()) == 0, "Submit exposure tag");
+        }
         if (!missing_sl_constants)
             require(proc<unsigned(*)(const void*,const void*,const void*)>(sl,"slSetConstants")(
                 &constants,&frame,&viewport) == 0, "Submit current viewport constants");
@@ -1211,5 +1219,20 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
         puts("Inactive AFW: mode switches, stale-mode fallback and SR/NR history recovery passed");
     }
     require(ngx_succeeded(f.release(f.handle)),"Release recreated feature");
+    if (f.use_sl && !f.context) {
+        f.complete_sl_metadata = true; f.options.struct_version = 3;
+        require(f.sl_options(&f.viewport,&f.options)==0, "Exposure forwarding options");
+        command("1\n130\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=false");
+        const auto matches=proc<bool(*)(unsigned,const SlResourceTag*,unsigned)>(f.sl,"CheekyFakeTagsMatch");
+        for (bool supplied : {true,false}) {
+            f.test_exposure_present=supplied;
+            require(ngx_succeeded(f.evaluate()), "Exposure forwarding evaluation");f.finish_gpu();
+            auto exposure=f.resources[0]; if(!supplied) exposure.native=nullptr;
+            auto tag=f.tags[0];tag.type=13;tag.resource=&exposure;tag.extent=supplied?SlExtent{0,0,1,1}:SlExtent{};
+            require(matches(f.viewport.value|0x20000000U,&tag,1), "Center must forward/clear current exposure");
+            require(matches(f.viewport.value|0x40000000U,&tag,1), "Peripheral must forward/clear current exposure");
+        }
+        puts("PASS Streamline exposure forwarding and clearing on center/peripheral viewports");
+    }
     puts("Late attachment: cached exports, pre-existing feature, missing metadata, private reuse, release/recreation passed");
 }

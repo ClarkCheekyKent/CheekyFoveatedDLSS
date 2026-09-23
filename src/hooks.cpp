@@ -1,5 +1,7 @@
 #include "vulkan_observer.hpp"
 #include "ngx_frame_contract.hpp"
+#include "exposure_diagnostics.hpp"
+#include "debug_exposure.hpp"
 #include "eye_calibration.hpp"
 #include "dlss_nr_input.hpp"
 #include <optional>
@@ -144,6 +146,7 @@ constexpr std::uint32_t sl_tag_depth = 0U;
 constexpr std::uint32_t sl_tag_motion_vectors = 1U;
 constexpr std::uint32_t sl_tag_scaling_input = 3U;
 constexpr std::uint32_t sl_tag_scaling_output = 4U;
+constexpr std::uint32_t sl_tag_exposure = 13U;
 constexpr std::size_t sl_tag_capacity = 73U;
 constexpr std::uint32_t sl_dlss_mode_dlaa = 6U;
 constexpr std::uint32_t peripheral_streamline_view_mask = 0x40000000U;
@@ -1990,6 +1993,63 @@ struct StreamlineEvaluation {
         ? submit(&viewport, tags, count, command_list) : 0x18U;
 }
 
+// Use the source viewport's current tags, never a previous frame or private
+// viewport's absent ExposureTexture. A null exposure tag clears old bindings.
+CachedSlTag streamline_exposure_tag(const SlViewportHandle& viewport, const void* frame) {
+    CachedSlTag result{};
+    AcquireSRWLockShared(&streamline_lock);
+    for (const auto& cached : nr_viewports) {
+        if (cached.viewport.value != viewport.value) continue;
+        if (!cached.frame_tagging || cached.tags_frame == gaze_frame_key(frame))
+            result = cached.tags[sl_tag_exposure];
+        break;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    result.tag.resource = &result.resource;
+    return result;
+}
+std::uint32_t submit_streamline_private_tags(bool frame_tagging, const void* frame,
+    const SlViewportHandle& source, const SlViewportHandle& destination,
+    const SlResourceTag* tags, unsigned count, ID3D12GraphicsCommandList* list) {
+    if (count != 4) return 0x18U;
+    auto exposure = streamline_exposure_tag(source, frame);
+    if (!exposure.present) {
+        exposure.tag = tags[0];
+        exposure.tag.extent = {};
+        exposure.resource = *tags[0].resource;
+        exposure.resource.native = exposure.resource.memory = exposure.resource.view = nullptr;
+        exposure.resource.next = nullptr;
+    }
+    std::array<SlResourceTag, 5> complete{};
+    std::copy_n(tags, count, complete.begin());
+    complete[4] = exposure.tag;
+    complete[4].type = sl_tag_exposure;
+    complete[4].resource = &exposure.resource;
+    return submit_streamline_tags(frame_tagging, frame, destination, complete.data(), 5, list);
+}
+DebugExposure current_streamline_debug_exposure(const void* frame, const void* const* inputs, unsigned count) {
+    SlViewportHandle viewport{}; SlDlssOptions options{}; bool valid{};
+    AcquireSRWLockShared(&streamline_lock);
+    if (has_cached_sl_options && has_cached_sl_viewport &&
+        cached_sl_options_viewport.value == cached_sl_viewport.value) {
+        viewport = cached_sl_viewport; options = cached_sl_options;
+        valid = options.color_buffers_hdr == 1;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    SlViewportHandle redirected{}; std::array<const void*,16> redirected_inputs{};
+    if (!valid || !prepare_streamline_sr_inputs(inputs,count,viewport,redirected,redirected_inputs)) return {};
+    const auto exposure = streamline_exposure_tag(viewport, frame);
+    if (!exposure.present || !exposure.resource.native || exposure.resource.state == 0xFFFFFFFFU) return {};
+    DebugExposure e{static_cast<ID3D12Resource*>(exposure.resource.native),
+        static_cast<D3D12_RESOURCE_STATES>(exposure.resource.state), options.pre_exposure, options.exposure_scale};
+    if (exposure_log_due(13,viewport.value)) {
+        const auto d=e.texture->GetDesc();
+        trace_event("EXPOSURE v2 source=StreamlineGame viewport=%u pre=%.9g scale=%.9g texture=%p format=%u size=%llux%u state=0x%X gpu_normalization=%u",
+            viewport.value,e.pre,e.scale,e.texture,unsigned(d.Format),d.Width,d.Height,unsigned(e.state),unsigned(debug_exposure_supported(e)));
+    }
+    return debug_exposure_supported(e) ? e : DebugExposure{};
+}
+
 [[nodiscard]] bool evaluate_streamline_peripheral_dlaa(
     ID3D12GraphicsCommandList* const command_list,
     const void* const frame,
@@ -2167,8 +2227,8 @@ struct StreamlineEvaluation {
     tags[3U].resource = &resources[3U];
     tags[3U].extent = {0U, 0U, working_width, working_height};
 
-    const auto tag_result = submit_streamline_tags(
-        evaluation.frame_tagging, frame, peripheral_viewport, tags.data(),
+    const auto tag_result = submit_streamline_private_tags(
+        evaluation.frame_tagging, frame, evaluation.viewport, peripheral_viewport, tags.data(),
         static_cast<std::uint32_t>(tags.size()), command_list
     );
     if (tag_result != 0U) {
@@ -2678,8 +2738,8 @@ struct StreamlineEvaluation {
         } else motion_reset = true;
     }
 
-    const auto tag_result = submit_streamline_tags(
-        evaluation.frame_tagging, frame, evaluation.cropped_viewport, evaluation.tags.data(),
+    const auto tag_result = submit_streamline_private_tags(
+        evaluation.frame_tagging, frame, evaluation.viewport, evaluation.cropped_viewport, evaluation.tags.data(),
         static_cast<std::uint32_t>(evaluation.tags.size()), command_list
     );
     if (tag_result != 0U) {
@@ -3028,6 +3088,12 @@ std::uint32_t hook_sl_dlss_set_options(
     ReleaseSRWLockExclusive(&streamline_lock);
     if (!supported) return result;
 
+    if (exposure_log_due(1, view->value)) {
+        trace_event("EXPOSURE v1 tick=%llu api=Streamline viewport=%u options_version=%u pre=%.9g scale=%.9g hdr=%u auto_exposure=%u (game options; metadata_only; support_capture; 5s/view)",
+            GetTickCount64(), view->value, options->struct_version, options->pre_exposure,
+            options->exposure_scale, unsigned(options->color_buffers_hdr), unsigned(options->use_auto_exposure));
+    }
+
     static std::atomic<bool> logged_state_initialized{};
     static std::atomic<std::uint32_t> logged_state_mode{0xFFFFFFFFU};
     static std::atomic<std::uint32_t> logged_state_width{};
@@ -3344,6 +3410,7 @@ std::uint32_t hook_sl_evaluate_feature(
             current_settings().enabled ? "yes" : "no"
         );
     }
+    const DebugExposureScope exposure_scope(current_streamline_debug_exposure(frame, inputs, input_count));
     const auto live_settings = current_settings();
     NrPipelineTimingScope pipeline_timing{static_cast<ID3D12GraphicsCommandList*>(command_buffer), live_settings};
     StreamlineNrInputScope nr_input{static_cast<ID3D12GraphicsCommandList*>(command_buffer),
@@ -4257,6 +4324,8 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
         bool outer = calibration_evaluation_depth++ == 0;
         ~Depth() { --calibration_evaluation_depth; }
     } depth;
+    if (depth.outer && !is_d3d11_private_handle(handle))
+        log_ngx_exposure<ID3D11Resource>(11, handle, parameters);
     const auto result = invoke();
     // All temporary NGX parameters and private composites have been restored
     // before this point. Tag only the outer game evaluation's final output.
@@ -4792,6 +4861,7 @@ NgxResult process_d3d12_evaluation_impl(
     const D3D12NgxEvaluateFn original,
     void*
 ) {
+    log_ngx_exposure<ID3D12Resource>(12, call.handle, call.parameters);
     if (!has_d3d12_game_view(call.handle)) {
         if (!recognizable_d3d12_dlss_evaluation(call)) {
             return original(

@@ -2,6 +2,7 @@
 #include "d3d12_output_contract.hpp"
 #include "d3d12_composite_shader.hpp"
 #include "composite_constants.hpp"
+#include "debug_exposure.hpp"
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
@@ -237,7 +238,7 @@ void restore_parameters(
     parameters->Set("Reset", state.reset);
 }
 
-constexpr std::uint32_t descriptors_per_set = 3U;
+constexpr std::uint32_t descriptors_per_set = 4U;
 constexpr std::uint32_t descriptor_set_count = 256U;
 
 struct D3D12Resources {
@@ -257,7 +258,7 @@ struct D3D12Resources {
     std::uint32_t next_descriptor_set{};
     std::uint32_t active_evaluations{};
     bool retired{};
-    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, descriptor_set_count> colors, outputs;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, descriptor_set_count> colors, outputs, exposures;
     std::uint64_t last_used{};
     D3D12Resources* next{};
 };
@@ -428,7 +429,7 @@ void release_resources(D3D12Resources* const resources) noexcept {
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
     );
 
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    D3D12_DESCRIPTOR_RANGE ranges[3]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 2U;
     ranges[0].BaseShaderRegister = 0U;
@@ -437,11 +438,13 @@ void release_resources(D3D12Resources* const resources) noexcept {
     ranges[1].NumDescriptors = 1U;
     ranges[1].BaseShaderRegister = 0U;
     ranges[1].OffsetInDescriptorsFromTableStart = 0U;
+    ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1U, 2U, 0U, 3U};
 
     D3D12_ROOT_PARAMETER root_parameters[3]{};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    root_parameters[0].DescriptorTable.NumDescriptorRanges = 1U;
-    root_parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
+    const D3D12_DESCRIPTOR_RANGE srv_ranges[]{ranges[0], ranges[2]};
+    root_parameters[0].DescriptorTable.NumDescriptorRanges = 2U;
+    root_parameters[0].DescriptorTable.pDescriptorRanges = srv_ranges;
     root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     root_parameters[1].DescriptorTable.NumDescriptorRanges = 1U;
     root_parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
@@ -571,6 +574,7 @@ void collect_resources() noexcept {
             current->next_descriptor_set = 0;
             for (auto& resource : current->colors) resource.Reset();
             for (auto& resource : current->outputs) resource.Reset();
+            for (auto& resource : current->exposures) resource.Reset();
         }
         link = &current->next;
     }
@@ -737,6 +741,7 @@ struct D3D12Evaluation {
     float roundness{};
     float feather{};
     bool alignment_border{};
+    DebugExposure exposure{};
     bool next_jump_visible{};
     float next_jump_offset_x{}, next_jump_offset_y{};
     float next_jump_width{}, next_jump_height{};
@@ -1081,6 +1086,18 @@ D3D12Evaluation* prepare_d3d12(
 
     const auto output_uav = d3d12_composite_uav(resources->output_format);
     device->CreateUnorderedAccessView(output, nullptr, &output_uav, cpu);
+    cpu.ptr += resources->descriptor_size;
+    const bool hdr_output = resources->output_format == DXGI_FORMAT_R11G11B10_FLOAT ||
+        resources->output_format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        resources->output_format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    evaluation->exposure = hdr_output && debug_exposure_supported(debug_exposure) ? debug_exposure : DebugExposure{};
+    resources->exposures[descriptor_set] = evaluation->exposure.texture;
+    D3D12_SHADER_RESOURCE_VIEW_DESC exposure_srv{};
+    exposure_srv.Format = evaluation->exposure.texture ? evaluation->exposure.texture->GetDesc().Format : DXGI_FORMAT_R32_FLOAT;
+    exposure_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    exposure_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    exposure_srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(evaluation->exposure.texture, &exposure_srv, cpu);
     device->Release();
 
     auto* const mutable_parameters = const_cast<NgxParameters*>(parameters);
@@ -1291,6 +1308,18 @@ D3D12Evaluation* prepare_d3d12_streamline(
 
     const auto output_uav = d3d12_composite_uav(resources->output_format);
     device->CreateUnorderedAccessView(output, nullptr, &output_uav, cpu);
+    cpu.ptr += resources->descriptor_size;
+    const bool hdr_output = resources->output_format == DXGI_FORMAT_R11G11B10_FLOAT ||
+        resources->output_format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        resources->output_format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+    evaluation->exposure = hdr_output && debug_exposure_supported(debug_exposure) ? debug_exposure : DebugExposure{};
+    resources->exposures[descriptor_set] = evaluation->exposure.texture;
+    D3D12_SHADER_RESOURCE_VIEW_DESC exposure_srv{};
+    exposure_srv.Format = evaluation->exposure.texture ? evaluation->exposure.texture->GetDesc().Format : DXGI_FORMAT_R32_FLOAT;
+    exposure_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    exposure_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    exposure_srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(evaluation->exposure.texture, &exposure_srv, cpu);
     device->Release();
 
     diagnostic_note_activation(DiagnosticApi::d3d12, crop);
@@ -1505,7 +1534,7 @@ void finish_d3d12(
             evaluation->next_jump_offset_x, evaluation->next_jump_offset_y,
             evaluation->next_jump_visible ? 1U : 0U,
             evaluation->next_jump_width, evaluation->next_jump_height,
-            evaluation->mask.count, 0U, {},
+            evaluation->mask.count, evaluation->exposure.texture ? evaluation->exposure.pre / evaluation->exposure.scale : 0.F, {},
         };
         std::memcpy(constants.mask_bounds, evaluation->mask.bounds, sizeof(constants.mask_bounds));
 
@@ -1534,6 +1563,7 @@ void finish_d3d12(
                 (evaluation->output_height + 15U) / 16U
             );
         }
+        if (evaluation->exposure.texture) transition_resource(command_list, evaluation->exposure.texture, evaluation->exposure.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         command_list->Dispatch(
             (evaluation->output_width + 15U) / 16U,
             (evaluation->output_height + 15U) / 16U,
@@ -1548,6 +1578,8 @@ void finish_d3d12(
             );
         }
         insert_uav_barrier(command_list, evaluation->original_output);
+        if (evaluation->exposure.texture) transition_resource(command_list, evaluation->exposure.texture,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, evaluation->exposure.state);
         transition_resource(command_list, evaluation->original_output,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, evaluation->output_state, 0U);
         transition_resource(command_list, evaluation->composite_color,

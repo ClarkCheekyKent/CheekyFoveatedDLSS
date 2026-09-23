@@ -43,6 +43,7 @@ foreach ($packageMode in $modes) {
         $files[$prefix + "CheekyFoveatedDLSS\" + $dll] = Join-Path $BinaryRoot ("CheekyFoveatedDLSS\" + $dll)
     }
     $files["Cheeky-Standalone-README.md"] = Join-Path $projectRoot "standalone\README.md"
+    $files["Cheeky-Exposure-Diagnostics.md"] = Join-Path $projectRoot "standalone\EXPOSURE-DIAGNOSTICS.md"
     $files["licenses\Cheeky-GPLv3.txt"] = Join-Path $projectRoot "LICENSE"
     $files["licenses\MinHook.txt"] = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     $files["licenses\OpenVR.txt"] = Join-Path $projectRoot "third_party\openvr\LICENSE"

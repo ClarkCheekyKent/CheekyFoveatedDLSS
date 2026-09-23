@@ -5,6 +5,7 @@ namespace cheeky::foveated_dlss {
 inline constexpr char composite_shader_source[] = R"(
 Texture2DArray<float4> LowResolutionColor : register(t0);
 Texture2DArray<float4> DlssColor : register(t1);
+Texture2D<float4> GameExposure : register(t2);
 RWTexture2DArray<float4> GameOutput : register(u0);
 
 cbuffer Constants : register(b0) {
@@ -28,7 +29,7 @@ cbuffer Constants : register(b0) {
     float NextJumpWidth;
     float NextJumpHeight;
     uint MaskCount;
-    uint MaskPadding;
+    float ExposureWhiteMultiplier;
     float4 MaskBounds[4];
 };
 
@@ -162,7 +163,13 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         distance_from_center <= 1.0 &&
         distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
     if (alignment_border) {
-        GameOutput[uint3(output_pixel, 0)] = float4(1.0, 0.0, 0.0, 1.0);
+        float white = 1.0;
+        if (ExposureWhiteMultiplier > 0.0) {
+            float exposure = GameExposure.Load(int3(0, 0, 0)).r;
+            if (isfinite(exposure) && exposure > 0.0)
+                white = clamp(ExposureWhiteMultiplier / exposure, 0.0001, 1024.0);
+        }
+        GameOutput[uint3(output_pixel, 0)] = float4(white, 0.0, 0.0, 1.0);
         return;
     }
     const float normalized_feather = Feather /

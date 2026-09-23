@@ -1,6 +1,7 @@
 #pragma once
 #include "eye_calibration_placement.hpp"
 #include "support_zip.hpp"
+#include "exposure_capture.hpp"
 #include <Windows.h>
 #include <atomic>
 #include <chrono>
@@ -35,6 +36,7 @@ struct CalibrationImageRequest {
     std::condition_variable changed;
     std::array<CalibrationImage, 4> images;
     std::uint64_t sequence{}, session_generation{};
+    std::uint64_t exposure_generation{};
     std::array<std::uint32_t, 2> marker_codes{};
     bool claimed{}, closed{};
     bool shared_source{};
@@ -50,6 +52,7 @@ inline CalibrationImageRequestPtr request_calibration_images(bool enabled,
     std::chrono::milliseconds timeout = std::chrono::seconds(5), const char* unavailable = "calibration_disabled") {
     auto request = std::make_shared<CalibrationImageRequest>();
     request->deadline = std::chrono::steady_clock::now() + timeout;
+    request->exposure_generation = begin_exposure_capture(unsigned(std::clamp<long long>(timeout.count(), 0, 5000)));
     if (!enabled) { request->closed = true; request->status = unavailable; }
     calibration_image_request_slot().store(request);
     return request;
@@ -172,6 +175,7 @@ inline CalibrationImageReport collect_calibration_images(const CalibrationImageR
         });
     };
     request->changed.wait_until(lock, request->deadline, done); // Support worker only; never wait on rendering.
+    end_exposure_capture(request->exposure_generation);
     if (!request->closed) {
         const auto captured = std::count_if(request->images.begin(), request->images.end(),
             [](const auto& image) { return !image.bitmap.empty(); });

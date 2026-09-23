@@ -20,7 +20,8 @@ struct CompositeConstants {
     float next_jump_offset_y;
     std::uint32_t show_next_jump;
     float next_jump_width, next_jump_height;
-    std::uint32_t mask_count, padding;
+    std::uint32_t mask_count;
+    float exposure_white_multiplier;
     float mask_bounds[4][4];
 };
 

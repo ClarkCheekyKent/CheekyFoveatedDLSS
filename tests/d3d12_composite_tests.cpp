@@ -357,7 +357,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 3;
+    hd.NumDescriptors = 4;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ComPtr<ID3D12DescriptorHeap> heap;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
@@ -382,6 +382,13 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     }
     device->CreateUnorderedAccessView(output.resource.Get(), nullptr, &uav, cpu);
+    cpu.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC exposure_srv{};
+    exposure_srv.Format = DXGI_FORMAT_R32_FLOAT;
+    exposure_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    exposure_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    exposure_srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(nullptr, &exposure_srv, cpu);
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
@@ -391,6 +398,8 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[i].DescriptorTable = {1, &ranges[i]};
     }
+    const D3D12_DESCRIPTOR_RANGE srv_ranges[]{ranges[0], {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 3}};
+    params[0].DescriptorTable = {2, srv_ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[2].Constants = {0, 0, 44};
     D3D12_ROOT_SIGNATURE_DESC rd{};

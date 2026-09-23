@@ -1,5 +1,6 @@
 #include "eye_calibration_d3d12.hpp"
 #include "eye_calibration_pixels.hpp"
+#include "debug_marker12.hpp"
 #include "graphics_observer.hpp"
 #include "d3d12_native.hpp"
 #include <wrl/client.h>
@@ -137,6 +138,7 @@ struct Calibration12Frame {
     std::array<CalibrationTrackingPatch, calibration_patch_count> tracking{};
     std::array<std::array<std::uint32_t, calibration_placement_count>, 2> stamp_codes{};
     std::array<bool, 2> marker_locators{};
+    std::array<DebugMarker12, 2> debug_markers;
     std::array<SupportReadback, 4> support;
     std::array<SupportReadback, 2> search_readbacks;
     std::array<CalibrationSearchPtr, 2> searches;
@@ -416,6 +418,7 @@ bool calibration12_begin(Calibration12Frame& f, std::uint64_t* allocations) noex
     f.failure = {};
     f.capture_counts = {};
     f.support = {}; // reusable() above includes retirement and all GPU fences.
+    for (auto& marker : f.debug_markers) { marker.bound=false; marker.output.Reset(); marker.exposure.Reset(); }
     f.search_readbacks = {}; f.searches = {};
     for (auto& p : f.patches)
         p.used = false;
@@ -468,6 +471,16 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
             if (p.x < pad || p.y < pad || UINT64(p.x) + 40 + pad > d.Width || UINT64(p.y) + 40 + pad > d.Height)
                 return reject("stamp_bounds");
         if (extra_markers.size() >= calibration_placement_count) return reject("stamp_marker_limit");
+        auto normalize_markers = [&] {
+            auto& gpu = f.debug_markers[candidate];
+            if (!gpu.prepare(f.device.Get(), texture, allocations)) return;
+            transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transition(list, debug_exposure.texture, 0, debug_exposure.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            gpu.draw(list, candidate, x, y, marker_code, locator);
+            for (const auto& marker : extra_markers) gpu.draw(list, candidate, marker.x, marker.y, marker.code, locator);
+            transition(list, texture, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+            transition(list, debug_exposure.texture, 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, debug_exposure.state);
+        };
         std::array<std::uint32_t, calibration_placement_count> stamp_codes{};
         stamp_codes[0] = marker_code;
         for (unsigned i = 0; i < extra_markers.size(); ++i) stamp_codes[i + 1] = extra_markers[i].code;
@@ -492,6 +505,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
                 marker_box.top = (i + 1) * stamp_size; marker_box.bottom = (i + 2) * stamp_size;
                 list->CopyTextureRegion(&dst, extra_markers[i].x-pad, extra_markers[i].y-pad, 0, &src, &marker_box);
             }
+            normalize_markers();
             transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, state);
             return true; // Keep the first source proof and support image intact.
         }
@@ -555,6 +569,7 @@ bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list,
             marker_box.top = (i + 1) * stamp_size; marker_box.bottom = (i + 2) * stamp_size;
             list->CopyTextureRegion(&dst, extra_markers[i].x-pad, extra_markers[i].y-pad, 0, &src, &marker_box);
         }
+        normalize_markers();
         if (proof) {
             transition(list, texture, 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
             copy_patch(f, list, candidate * 2 + 1, texture, 0, box);
