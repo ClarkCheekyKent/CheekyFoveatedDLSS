@@ -1,8 +1,7 @@
 # NR-only gaze positioning regression
 
-For the feature-creation controls, preset cache, jitter/multiplier and SDR codec
-regressions, see [the NR comparison and validation notes](../NR-COMPARISON.md).
-They run through `CheekyUEVRTests.exe --late-dx12`, `--late-dx12-c`, and
+The feature-creation controls, preset cache, jitter/multiplier and SDR codec
+regressions run through `CheekyUEVRTests.exe --late-dx12`, `--late-dx12-c`, and
 `--late-streamline` as part of the normal build script.
 
 `CheekyTests.exe` exercises NR-only placement with supplied OpenXR snapshots and
@@ -246,8 +245,7 @@ cl /nologo /std:c++20 /EHsc /MT /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX tools/nr_mo
 The executable name is required by the model's NGX caller-module lookup.
 This uses private D3D12 resources and generated pixels, without attaching to a
 game. It needs compatible NVIDIA hardware, driver and NR DLL. It prints numeric
-differences rather than imposing version-specific visual assertions. See
-[the audit](../NR-COMPARISON.md) for measured results and their limits.
+differences rather than imposing version-specific visual assertions.
 `tools/nr_parameter_probe.cpp` is a smaller driver-only ABI probe; compile with
 the same flags and `d3d12.lib`, and pass only the `_nvngx.dll` path.
 
