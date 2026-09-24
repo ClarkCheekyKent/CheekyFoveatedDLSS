@@ -46,9 +46,13 @@ def run(engine):
         disabled = {false}
         slider_ranges = {}
         tree_stack, tree_order, tree_parents, closed_trees = {}, {}, {}, {}
-        uevr = {api = {}, sdk = {callbacks = {}}}
-        for _, name in ipairs({'on_lua_event', 'on_frame', 'on_draw_ui'}) do
+        uevr = {api = {}, lua = {}, sdk = {callbacks = {}}}
+        for _, name in ipairs({'on_lua_event', 'on_frame'}) do
             uevr.sdk.callbacks[name] = function(fn) callbacks[name] = fn end
+        end
+        function uevr.lua.add_script_panel(name, fn)
+            assert(name == "Cheeky Foveated DLSS", "Unexpected script panel name")
+            callbacks.script_panel = fn
         end
         function uevr.api:dispatch_custom_event(event, text)
             table.insert(sent, {event=event, text=text})
@@ -115,7 +119,7 @@ def run(engine):
             g.clicked[click] = True
         for key, value in (changes or {}).items():
             g.changes[key] = value
-        g.callbacks.on_draw_ui()
+        g.callbacks.script_panel()
         assert len(g.disabled) == 1, "Unbalanced disabled scope"
         assert len(g.tree_stack) == 0, "Unbalanced tree scope"
 

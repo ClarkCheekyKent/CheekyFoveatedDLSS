@@ -235,7 +235,7 @@ local function afw_controls()
     end
 end
 
-uevr.sdk.callbacks.on_draw_ui(function()
+uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     if not imgui.tree_node("Cheeky Foveated DLSS") then return end
     if error_text then text(error_text) end
     if not status then
