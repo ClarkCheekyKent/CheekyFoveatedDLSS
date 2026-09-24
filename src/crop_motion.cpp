@@ -1,4 +1,6 @@
 #include "crop_motion.hpp"
+#include "dlss_nr_lifetime.hpp"
+#include "eye_calibration_d3d12.hpp"
 #include "crop_motion_shader.hpp"
 #include "runtime.hpp"
 #include <d3dcompiler.h>
@@ -159,29 +161,11 @@ struct Pass12 {
     ComPtr<ID3D12DescriptorHeap> heap;
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
-    ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12Fence> fence;
+    NrLifetime lifetime;
     unsigned width{}, height{};
-    std::uint64_t list_token{};
 };
 std::mutex mutex12;
 std::deque<std::shared_ptr<Pass12>> pending12, available12;
-// Private data belongs to the underlying D3D12 object. Unlike interface pointer
-// equality, this also matches submissions seen through ReShade/Streamline proxies.
-constexpr GUID motion_list_token_guid =
-    {0x47d571bd, 0xda36, 0x4bfc, {0x9a, 0x07, 0x62, 0x85, 0x45, 0x19, 0x30, 0xe2}};
-std::uint64_t next_list_token{};
-std::uint64_t list_token(ID3D12CommandList* list, bool create) noexcept {
-    std::uint64_t token{};
-    UINT size = sizeof(token);
-    if (SUCCEEDED(list->GetPrivateData(motion_list_token_guid, &size, &token)) &&
-        size == sizeof(token) && token != 0) return token;
-    if (!create) return 0;
-    token = ++next_list_token;
-    return SUCCEEDED(list->SetPrivateData(motion_list_token_guid, sizeof(token), &token)) ? token : 0;
-}
-
 void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) noexcept {
     D3D12_RESOURCE_BARRIER barrier{};
@@ -260,6 +244,7 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
         !bounds(x, width, desc.Width) || !bounds(y, height, desc.Height)) return nullptr;
     ComPtr<ID3D12Device> device;
     if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(mutex12);
     std::shared_ptr<Pass12> pass;
     for (auto it = available12.begin(); it != available12.end(); ++it) {
@@ -272,18 +257,18 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     if (pending12.size() >= 64) {
         static unsigned exhausted_logs{};
         if (exhausted_logs++ % 300U == 0U) {
-            std::size_t unsubmitted{};
-            for (const auto& pending : pending12) if (!pending->queue) ++unsubmitted;
-            trace_event("D3D12 crop motion unavailable: pending=%zu unsubmitted=%zu",
-                pending12.size(), unsubmitted);
+            std::size_t retained{};
+            for (const auto& pending : pending12) if (!pending->lifetime.empty()) ++retained;
+            trace_event("D3D12 crop motion unavailable: pending=%zu retained_recordings=%zu",
+                pending12.size(), retained);
         }
         return nullptr;
     }
     if (!pass) pass = make_pass12(device.Get(), source, output_width, output_height, format);
     if (!pass) return nullptr;
-    pass->list = list;
-    pass->list_token = list_token(list, true);
-    pass->fence.Reset();
+    // The native observer accounts this recording under the same lock as Reset.
+    // Decline correction if recording identity/submission observation is unavailable.
+    if (!pass->lifetime.record(list)) return nullptr;
     pending12.push_back(pass);
     if (source_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         transition(list, source, source_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -302,46 +287,29 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return pass->output.Get();
 }
-void crop_motion12_submitted(ID3D12CommandQueue* queue, unsigned count,
-    ID3D12CommandList* const* lists) noexcept {
-    if (!queue || !lists) return;
-    std::lock_guard lock(mutex12);
-    for (auto& pass : pending12) {
-        if (pass->queue) continue;
-        bool found{};
-        for (unsigned i = 0; i < count; ++i) {
-            if (lists[i] && (pass->list.Get() == lists[i] ||
-                (pass->list_token != 0 && pass->list_token == list_token(lists[i], false)))) found = true;
-        }
-        if (!found) continue;
-        // ReShade can notify before execution. Signal only at present.
-        pass->queue = queue;
-        static unsigned submission_logs{};
-        if (submission_logs++ < 8U)
-            trace_event("D3D12 crop motion submission matched token=%llu queue=%p",
-                static_cast<unsigned long long>(pass->list_token), queue);
-        pass->list.Reset();
-    }
-}
 void collect_crop_motion12() noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(mutex12);
     for (auto it = pending12.begin(); it != pending12.end();) {
         auto& pass = *it;
-        if (pass->queue && !pass->fence) {
-            ComPtr<ID3D12Fence> fence;
-            if (SUCCEEDED(pass->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) &&
-                SUCCEEDED(pass->queue->Signal(fence.Get(), 1))) pass->fence = fence;
-        }
-        if (!pass->fence || pass->fence->GetCompletedValue() < 1) { ++it; continue; }
-        pass->list.Reset(); pass->fence.Reset(); pass->queue.Reset();
-        if (available12.size() < 16) available12.push_back(pass);
+        pass->lifetime.collect();
+        // GPU completion alone is insufficient: the recording may be replayed.
+        // Reset/destruction must retire it, and every executing queue must drain.
+        if (!pass->lifetime.empty()) { ++it; continue; }
+        // Do not destroy completed passes during a game/SteamVR overlay pause.
+        // SHf can still have D3D12/driver references in teardown even after the
+        // tracked fence reports complete. Retain the pass for process lifetime;
+        // dynamic-resolution changes add only a small number of cached sizes.
+        available12.push_back(pass);
         it = pending12.erase(it);
     }
 }
 void release_crop_motion12() noexcept {
     collect_crop_motion12();
+    std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(mutex12);
-    available12.clear();
-    // Pending work stays alive until its fence is complete.
+    // Keep completed passes alive for process lifetime. Clearing this cache
+    // during overlay/device teardown can release descriptor heaps while the
+    // game or driver still has an internal reference.
 }
 }

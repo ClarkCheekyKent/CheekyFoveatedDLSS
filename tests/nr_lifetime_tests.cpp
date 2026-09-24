@@ -226,3 +226,110 @@ int run_nr_lifetime_tests() {
         return 1;
     }
 }
+
+#ifdef CHEEKY_NR_NATIVE_OBSERVER
+#include "crop_motion.hpp"
+#include <atomic>
+namespace {
+// Attached to actual crop outputs; observes eviction without retaining resources.
+class MotionDestroyed final : public IUnknown {
+    std::atomic<ULONG> refs{1};
+    std::shared_ptr<std::atomic<unsigned>> count;
+public:
+    explicit MotionDestroyed(std::shared_ptr<std::atomic<unsigned>> value) : count(std::move(value)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = this; AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = --refs;
+        if (!left) { ++*count; delete this; }
+        return left;
+    }
+};
+constexpr GUID motion_destroyed_key{0x9a397da1,0x489c,0x420a,{0xab,0x71,0x86,0x36,0x42,0xb1,0xe5,0xa9}};
+}
+int run_crop_motion_lifetime_tests() {
+    try {
+        Gpu gpu;
+        release_crop_motion12();
+        ComPtr<ID3D12Resource> source;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = desc.Height = 16;
+        desc.DepthOrArraySize = desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Format = DXGI_FORMAT_R32G32_FLOAT;
+        check(gpu.device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&source)));
+        const auto old_destroyed = std::make_shared<std::atomic<unsigned>>(0);
+        const auto new_destroyed = std::make_shared<std::atomic<unsigned>>(0);
+        auto open_recording = [&] {
+            ComPtr<ID3D12CommandAllocator> next;
+            check(gpu.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&next)));
+            check(gpu.list->Reset(next.Get(), nullptr));
+            gpu.allocator = next;
+        };
+        auto record_passes = [&](unsigned count, const auto& destroyed) {
+            for (unsigned i = 0; i < count; ++i) {
+                auto* output = prepare_crop_motion12(gpu.list.Get(), source.Get(), 0, 0, 16, 16, {});
+                require(output != nullptr, "Crop-motion pass could not be recorded");
+                auto* sentinel = new MotionDestroyed(destroyed);
+                const auto hr = output->SetPrivateDataInterface(motion_destroyed_key, sentinel);
+                sentinel->Release(); check(hr);
+            }
+        };
+        open_recording();
+        // Exceed the 16-entry reusable cache: premature collection must really
+        // destroy resources, rather than hiding the defect in the cache.
+        record_passes(20, old_destroyed);
+        check(gpu.list->Close());
+        gpu.execute(); gpu.wait();
+        collect_crop_motion12(); release_crop_motion12();
+        require(*old_destroyed == 0, "First completion released replayable crop resources");
+        gpu.execute(); gpu.wait();
+        collect_crop_motion12(); release_crop_motion12();
+        require(*old_destroyed == 0, "Repeated submission released its recording");
+        ComPtr<ID3D12CommandQueue> second;
+        D3D12_COMMAND_QUEUE_DESC qdesc{};
+        check(gpu.device->CreateCommandQueue(&qdesc, IID_PPV_ARGS(&second)));
+        check(second->Wait(gpu.gate.Get(), 1));
+        gpu.execute(second.Get());
+        // Retire the old generation and immediately record new work on the
+        // same list object. Keep its old allocator alive while queue 2 waits.
+        auto old_allocator = gpu.allocator;
+        open_recording();
+        record_passes(1, new_destroyed);
+        check(gpu.list->Close());
+        gpu.execute(); gpu.wait();
+        collect_crop_motion12(); release_crop_motion12();
+        require(*old_destroyed == 0, "New generation/queue completion released blocked old work");
+        require(*new_destroyed == 0, "New recording was confused with retired generation");
+        check(gpu.gate->Signal(1));
+        check(second->Signal(gpu.done.Get(), ++gpu.value));
+        check(gpu.done->SetEventOnCompletion(gpu.value, gpu.event));
+        require(WaitForSingleObject(gpu.event, 10000) == WAIT_OBJECT_0, "Crop replay queue timed out");
+        collect_crop_motion12(); release_crop_motion12();
+        require(*old_destroyed == 0, "Retired crop resources were released during overlay-safe retention");
+        require(*new_destroyed == 0, "Old retirement released the new recording");
+        gpu.reset();
+        collect_crop_motion12(); release_crop_motion12();
+        require(*new_destroyed == 0, "New generation was released during overlay-safe retention");
+        // Abandoned recordings must drain too, without manufacturing a fence.
+        open_recording(); record_passes(1, new_destroyed); check(gpu.list->Close());
+        gpu.list.Reset(); collect_crop_motion12(); release_crop_motion12();
+        require(*new_destroyed == 0, "Destroyed unsubmitted list released crop resources during retention");
+        gpu.validate();
+        std::cout << "SR crop-motion lifetime: real resources, cache overflow, replay, blocked second queue, reset/re-record, destruction passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "SR crop-motion lifetime: " << error.what() << '\n';
+        return 1;
+    }
+}
+#endif

@@ -26,6 +26,9 @@ struct EyeCalibrationStats {
     // A rejected capture can fail multiple checks; counters overlap.
     std::array<std::uint64_t, 8> rejection_counts{};
     std::uint64_t rejected{}, publication_rejected{}, last_rejected_sequence{};
+    // Captures declined because DLSS was not evaluating (menu, loading screen,
+    // early startup). Each would have been rejected at full cost had it begun.
+    std::uint64_t idle_skipped{};
     unsigned last_rejection_mask{}, last_evaluations{}, last_submits{};
     std::array<float, 8> last_rejected_scores{};
     // Captured on the render thread; no repeated logging or GPU waits.

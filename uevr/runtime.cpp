@@ -400,6 +400,21 @@ extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, 
             trace_event("GPU timing recorded=%llu submitted=%llu completed=%llu valid=%llu discarded=%llu waiting_submit=%u waiting_gpu=%u failures=%llu hr=0x%08X queue_submissions=%llu",
                 gpu.recorded, gpu.submitted, gpu.completed, gpu.published, gpu.discarded,
                 gpu.waiting_submission, gpu.waiting_gpu, gpu.failures, gpu.last_error, native_observer_status().submissions);
+            // Calibration and observer costs are computed every frame but shown
+            // only in a menu several tree levels deep, which cannot be reached
+            // while a startup stall makes the title unresponsive. Report the
+            // same already-computed values so a stall can be attributed after
+            // the fact. Read-only: nothing here changes behaviour.
+            const auto cal = eye_calibration_stats();
+            const auto obs = native_observer_status();
+            trace_event("SUBSYS TIMING cal_on=%u cal_cpu_us=%.2f cal_gpu_us=%.2f cal_gpu_max_us=%.2f "
+                "cal_latency_frames=%.2f cal_captures=%llu cal_completed=%llu cal_valid=%llu "
+                "cal_skipped=%llu cal_inflight=%u cal_rejected=%llu cal_idle_skipped=%llu cal_allocations=%llu "
+                "obs_ready=%u obs_submissions=%llu obs_copies=%llu obs_resets=%llu",
+                unsigned(cal.enabled), cal.cpu_us_per_frame, cal.gpu_us, cal.max_gpu_us,
+                cal.latency_frames, cal.captures, cal.completed, cal.valid,
+                cal.skipped, cal.in_flight, cal.rejected, cal.idle_skipped, cal.allocations,
+                unsigned(obs.ready), obs.submissions, obs.copies, obs.resets);
         }
         static bool was_down{};
         const bool down = (GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_OEM_2) & 0x8000);

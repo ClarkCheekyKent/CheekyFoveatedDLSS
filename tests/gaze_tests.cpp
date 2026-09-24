@@ -499,6 +499,27 @@ void test_reset_policy() {
     );
     expect(result.reason == GazeResetReason::remapped,
         "view remapping resets history");
+
+    // A blink ends in reacquisition roughly fourteen times a minute. When the
+    // crop did not move, discarding temporal history costs image stability for
+    // nothing, so reacquisition alone must not reset.
+    result = evaluate_gaze_reset(
+        first, small_move, true, true, false, 0.125F
+    );
+    expect(result.reason == GazeResetReason::none,
+        "reacquisition without crop motion preserves history");
+    result = evaluate_gaze_reset(
+        first, first, true, true, false, 0.125F
+    );
+    expect(result.reason == GazeResetReason::none,
+        "reacquisition with an identical crop preserves history");
+    // Reacquisition that lands somewhere else still resets, and keeps its own
+    // reason so diagnostics can tell it from a mid-gaze saccade.
+    result = evaluate_gaze_reset(
+        first, large, true, true, false, 0.125F
+    );
+    expect(result.reason == GazeResetReason::reacquired,
+        "reacquisition far from the previous crop resets history");
 }
 
 void test_abi() {

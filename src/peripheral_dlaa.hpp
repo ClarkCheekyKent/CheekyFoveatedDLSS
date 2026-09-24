@@ -62,6 +62,10 @@ struct PeripheralDlaaResources {
     bool downsampled_color{};
     bool downsampled_depth{};
     bool converted_motion{};
+    // Set for the first evaluation after a peripheral output is allocated. A
+    // freshly created DLAA feature has no valid temporal history, and the
+    // game's own Reset flag cannot know Cheeky created one.
+    bool history_reset{};
     D3D12_RESOURCE_STATES output_restore_state{
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     };

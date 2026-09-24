@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -155,8 +156,45 @@ struct PeripheralViewState {
     DXGI_FORMAT motion_format{DXGI_FORMAT_UNKNOWN};
     std::uint32_t descriptor_size{};
     std::uint32_t next_descriptor_set{};
+    // A DLAA feature built against a freshly allocated output has no temporal
+    // history, and the game's own Reset flag cannot know Cheeky created one.
+    bool reset_pending{};
     std::deque<PeripheralGpuUse> gpu_uses;
 };
+
+// The native NGX peripheral route has no telemetry of its own; the only
+// peripheral record is the Streamline one in hooks.cpp, which titles on this
+// route never reach. Budgets are deliberately small: an earlier unbounded
+// diagnostic produced a 459 MB log.
+std::atomic<std::uint32_t> peripheral_alloc_trace_budget{48U};
+std::atomic<std::uint32_t> peripheral_eval_trace_budget{64U};
+std::atomic<std::uint32_t> peripheral_notable_trace_budget{192U};
+
+[[nodiscard]] bool spend_trace_budget(
+    std::atomic<std::uint32_t>& counter
+) noexcept {
+    auto budget = counter.load(std::memory_order_acquire);
+    while (budget != 0U && !counter.compare_exchange_weak(
+               budget, budget - 1U, std::memory_order_acq_rel)) {
+    }
+    return budget != 0U;
+}
+
+void trace_peripheral_alloc(
+    const char* const what,
+    const DlssViewId view_id,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const DXGI_FORMAT format
+) noexcept {
+    if (!spend_trace_budget(peripheral_alloc_trace_budget)) return;
+    trace_event(
+        "PERIPHERAL ALLOC %s view=%llu size=%ux%u format=%u",
+        what,
+        static_cast<unsigned long long>(view_id),
+        width, height, static_cast<unsigned>(format)
+    );
+}
 
 std::mutex state_mutex;
 std::deque<PeripheralViewState> states;
@@ -504,6 +542,11 @@ void release_state(PeripheralViewState& state) noexcept {
         return false;
     }
     state.output->SetName(L"Cheeky Peripheral DLAA output");
+    trace_peripheral_alloc(
+        "output", request.view_id,
+        state.working_width, state.working_height, state.output_format
+    );
+    state.reset_pending = true;
     return true;
 }
 
@@ -535,6 +578,10 @@ void release_state(PeripheralViewState& state) noexcept {
         state.downsampled_color->SetName(
             L"Cheeky Peripheral downsampled color"
         );
+        trace_peripheral_alloc(
+            "color", request.view_id,
+            state.working_width, state.working_height, state.color_format
+        );
     }
     return ensure_resampler(state);
 }
@@ -560,6 +607,10 @@ void release_state(PeripheralViewState& state) noexcept {
         state.downsampled_depth->SetName(
             L"Cheeky Peripheral downsampled depth"
         );
+        trace_peripheral_alloc(
+            "depth", request.view_id,
+            state.working_width, state.working_height, DXGI_FORMAT_R32_FLOAT
+        );
     }
     return ensure_resampler(state);
 }
@@ -584,6 +635,10 @@ void release_state(PeripheralViewState& state) noexcept {
         }
         state.converted_motion->SetName(
             L"Cheeky Peripheral working-resolution motion vectors"
+        );
+        trace_peripheral_alloc(
+            "motion", request.view_id,
+            state.working_width, state.working_height, state.motion_format
         );
     }
     return ensure_resampler(state);
@@ -892,6 +947,11 @@ bool prepare_peripheral_dlaa_resources(
         resources.mv_base_y = 0U;
         resources.converted_motion = true;
     }
+    // Consumed only once preparation has succeeded, so a failed evaluation
+    // does not swallow the pending reset and leave the new feature running on
+    // uninitialised history.
+    resources.history_reset = state->reset_pending;
+    state->reset_pending = false;
     return true;
 }
 
@@ -925,7 +985,7 @@ bool evaluate_peripheral_dlaa_ngx(
     contract.mv_base_y = resources.mv_base_y;
     contract.motion_vectors_low_res = true;
     contract.depth_inverted = request.depth_inverted;
-    contract.reset = request.reset;
+    contract.reset = request.reset || resources.history_reset;
     contract.create_flags = request.create_flags | dlss_feature_flag_mv_low_res;
     contract.perf_quality = perf_quality_dlaa;
 
@@ -1041,6 +1101,34 @@ bool evaluate_peripheral_dlaa_ngx(
     request.parameters->Set("MV.Scale.Y", saved_mv_scale_y);
     request.parameters->Set("Jitter.Offset.X", saved_jitter_x);
     request.parameters->Set("Jitter.Offset.Y", saved_jitter_y);
+
+    {
+        // Failures and post-allocation evaluations draw on their own larger
+        // budget rather than competing with steady-state records. Both are
+        // capped: if reallocation churn is ever the problem being chased, an
+        // uncapped "notable" record would itself become the runaway log.
+        const bool notable =
+            !ngx_succeeded(result) || resources.history_reset;
+        if (spend_trace_budget(notable
+                ? peripheral_notable_trace_budget
+                : peripheral_eval_trace_budget)) {
+            trace_event(
+                "PERIPHERAL EVAL view=%llu render=%ux%u working=%ux%u "
+                "scale=%.3f reset=%u historyReset=%u dsColor=%u dsDepth=%u "
+                "cvMotion=%u override=%u result=0x%08X",
+                static_cast<unsigned long long>(request.view_id),
+                request.render_width, request.render_height,
+                resources.working_width, resources.working_height,
+                static_cast<double>(request.scale),
+                unsigned(contract.reset), unsigned(resources.history_reset),
+                unsigned(resources.downsampled_color),
+                unsigned(resources.downsampled_depth),
+                unsigned(resources.converted_motion),
+                unsigned(request.output_override != nullptr),
+                result
+            );
+        }
+    }
 
     if (!ngx_succeeded(result)) {
         finish_peripheral_dlaa_motion_read(request.command_list, resources);

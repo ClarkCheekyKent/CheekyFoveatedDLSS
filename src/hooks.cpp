@@ -495,6 +495,22 @@ LONG CALLBACK hook_debug_exception_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // First-chance exceptions may be handled by the application's SEH probes.
+    // UEVR's guarded UObject candidate checks can generate these continuously.
+    // Never turn those probes into unbounded synchronous log/stack-walk work,
+    // even when the addon's rendering is disabled. Saturate rather than wrap.
+    static std::atomic<unsigned int> reports{0U};
+    constexpr unsigned int report_limit = 8U;
+    auto report_count = reports.load(std::memory_order_relaxed);
+    do {
+        if (report_count >= report_limit) return EXCEPTION_CONTINUE_SEARCH;
+    } while (!reports.compare_exchange_weak(
+        report_count, report_count + 1U, std::memory_order_relaxed));
+    if (report_count + 1U == report_limit) {
+        hook_debug_emergency_logf(
+            "HOOKDBG first-chance report limit reached; subsequent exceptions pass through without logging");
+    }
+
     const auto* const context = pointers->ContextRecord;
     void* instruction{};
     std::uintptr_t stack_pointer{};
@@ -1570,8 +1586,6 @@ void note_d3d12_command_list_submission_impl(
 ) noexcept {
     if (queue == nullptr || command_list == nullptr) return;
     note_peripheral_dlaa_submission(queue, command_list);
-    ID3D12CommandList* motion_lists[]{command_list};
-    crop_motion12_submitted(queue, 1U, motion_lists);
     std::uint64_t frequency{};
     std::lock_guard lock(d3d12_nr_timing_mutex);
     const auto identity = timing_list_identity(command_list, false);
