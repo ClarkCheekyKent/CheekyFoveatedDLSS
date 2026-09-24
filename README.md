@@ -1,6 +1,6 @@
 # Cheeky Foveated DLSS
 
-Reduce the cost of DLSS Super Resolution by concentrating it on the center of the image. Available as a **ReShade add-on**, **UEVR plugin**, or experimental **standalone / OptiScaler integration**, for Direct3D 11 and Direct3D 12 games, including VR. With DLSS Performance FPS gains of 20%+ are standard, even more with eye tracked headsets which can make the foveated region even smaller.
+Reduce the cost of DLSS Super Resolution by concentrating it on the center of the image. Available as a **UEVR plugin**, or **standalone integration**, for Vulkan, Direct3D 11 and Direct3D 12 games. With DLSS Performance FPS gains of 20%+ are standard, even more with eye tracked headsets which can make the foveated region even smaller.
 
 This also supports foveating DLSS Neural Resolution (DLSS5), including running it pre-upscale and at lower resolutions (improves performance at a cost of quality).
 
@@ -9,8 +9,7 @@ This also supports foveating DLSS Neural Resolution (DLSS5), including running i
 ## Requirements
 
 - Windows 10/11, 64-bit, and an NVIDIA RTX GPU.
-- A D3D11 or D3D12 game with DLSS Super Resolution.
-- Choose standalone, OptiScaler's ASI loader, ReShade **with full add-on support**, or UEVR with a compatible plugin API.
+- A Vulkan, D3D11 or D3D12 game with DLSS Super Resolution.
 
 ## Compatibility
 This should work with most games that have DLSS. Here is a non-exhaustive list of community reports whether a game is supported. 
@@ -30,32 +29,17 @@ Close the game and choose **one** Cheeky integration. Do not load multiple Cheek
 
 Use the **Standalone** ZIP for native DLSS games: extract `dxgi.dll` and the
 `CheekyFoveatedDLSS` folder beside the game executable. If `dxgi.dll` already
-exists, do not overwrite it. For an existing OptiScaler installation, use the
-**OptiScaler** ZIP and enable `LoadAsiPlugins=true` in its `[Plugins]` section.
-Select OptiScaler's DLSS output backend.
+exists, do not overwrite it.
 
-Press **F8** for Cheeky's in-game controls. These integrations share the SR/NR,
-gaze, calibration, settings and diagnostics runtime, with D3D11, D3D12 and
-Streamline routes. Their overlay supports SDR, scRGB and HDR10. Automated
-fixtures exercise these paths; actual game and headset compatibility still
-requires testing. [Installation, layout and limitations](standalone/README.md)
+Press **F8** for Cheeky's in-game controls.
 
 Complete the OpenXR setup below when using OpenXR. The F8 controls appear on
-the desktop; an in-headset settings menu is not included.
-
-### ReShade add-on
-
-1. Install 64-bit **ReShade with full add-on support** into the game, selecting D3D11 or D3D12 as appropriate.
-2. Copy `CheekyFoveatedDLSS.addon64` beside the game executable and ReShade DLL.
-3. Complete the **required VR setup below** if playing in VR. Open the controls under **ReShade → Add-ons → Cheeky Foveated DLSS**.
+the desktop screen; an in-headset settings menu is not included yet.
 
 ### UEVR plugin
 
-1. Use UEVR with plugin API **2.39.0 or compatible newer 2.x**. Remove ReShade and the Cheeky ReShade add-on from the game if previously installed.
-2. Extract the UEVR ZIP into the game's **UEVR configuration directory**, normally `%APPDATA%\UnrealVRMod\<game-executable-name>`. Keep the `plugins/` and `scripts/` folders intact. Do not extract it beside the game executable. [Folder layout](uevr/README.md#installation)
-3. Complete the **required VR setup below**, start the game and inject UEVR. Open the controls under **UEVR → LuaLoader → ScriptUI → Cheeky Foveated DLSS**. You may need to enable 'Show Advanced Options' in top left to see these menus.
-
-Remove ReShade from the game when using the UEVR plugin.
+1. Extract the UEVR ZIP into the game's **UEVR configuration directory**, normally `%APPDATA%\UnrealVRMod\<game-executable-name>`. Keep the `plugins/` and `scripts/` folders intact. Do not extract it beside the game executable. [Folder layout](uevr/README.md#installation)
+2. Complete the **required VR setup below**, start the game and inject UEVR. Open the controls under **UEVR → LuaLoader → Cheeky Foveated DLSS**. You may need to enable 'Show Advanced Options' in top left to see these menus.
 
 ![UEVR Menu](assets/UEVR_Menu.png)
 
