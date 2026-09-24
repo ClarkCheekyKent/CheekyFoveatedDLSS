@@ -50,10 +50,16 @@ GPU and host tests complement game/headset testing; they do not establish compat
 ## Packaging
 
 ```powershell
+./scripts/build-installer.ps1
 ./scripts/package-uevr.ps1 -Configuration Release
 ./scripts/package-standalone.ps1 -Configuration Release -Mode Both -Label local
-./scripts/build-installer.ps1
 ```
+
+Packages include `OpenXR/CheekyOpenXRSetup.exe` by default; build the matching
+installer before packaging. Standalone and OptiScaler packages also include
+the Vulkan layer and manifest by default. Release ZIPs contain runtime files,
+the installer and licenses, with no READMEs, diagnostic guides, build metadata
+or checksum files. Packaging still verifies the archived payload hashes.
 
 The OpenXR installer requires Inno Setup 6.3 or newer. Pass `-IsccPath` if its compiler is outside the standard locations. To package existing Release binaries, use `-SkipBuild`; for CMake output also supply `-ArtifactsDirectory`.
 

@@ -4,8 +4,8 @@ param(
     [ValidateSet("Standalone", "OptiScaler", "Both")][string]$Mode = "Both",
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build",
     [string]$BinaryRoot = "",
-    [switch]$IncludeOpenXRSetup,
-    [switch]$IncludeVulkan,
+    [switch]$IncludeOpenXRSetup = $true,
+    [switch]$IncludeVulkan = $true,
     [switch]$VulkanFixedSrTest
 )
 
@@ -18,9 +18,6 @@ $versionText = Get-Content -LiteralPath (Join-Path $projectRoot "shared\version.
 if ($versionText -notmatch '#define CHEEKY_VERSION "([0-9.]+)"') { throw "Version not found." }
 $version = $Matches[1]
 $modes = if ($Mode -eq "Both") { @("Standalone", "OptiScaler") } else { @($Mode) }
-$head = & git -C $projectRoot rev-parse HEAD
-if ($LASTEXITCODE -ne 0) { throw "Could not identify source commit." }
-$dirty = [bool](& git -C $projectRoot status --porcelain)
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 # Check all archives before staging any payload. Packaging never replaces an
@@ -42,8 +39,6 @@ foreach ($packageMode in $modes) {
     foreach ($dll in @("CheekyFoveatedDLSSHost.dll", "CheekyFoveatedDLSSRuntime.dll")) {
         $files[$prefix + "CheekyFoveatedDLSS\" + $dll] = Join-Path $BinaryRoot ("CheekyFoveatedDLSS\" + $dll)
     }
-    $files["Cheeky-Standalone-README.md"] = Join-Path $projectRoot "standalone\README.md"
-    $files["Cheeky-Exposure-Diagnostics.md"] = Join-Path $projectRoot "standalone\EXPOSURE-DIAGNOSTICS.md"
     $files["licenses\Cheeky-GPLv3.txt"] = Join-Path $projectRoot "LICENSE"
     $files["licenses\MinHook.txt"] = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     $files["licenses\OpenVR.txt"] = Join-Path $projectRoot "third_party\openvr\LICENSE"
@@ -66,18 +61,11 @@ foreach ($packageMode in $modes) {
 
     $stage = Join-Path $projectRoot ("build\standalone-package-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $stage | Out-Null
-    $manifest = @()
     foreach ($entry in $files.GetEnumerator()) {
         $destination = Join-Path $stage $entry.Key
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath $entry.Value -Destination $destination
-        $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
-        $manifest += "$hash  $($entry.Key.Replace('\', '/'))"
     }
-    $manifest | Set-Content -LiteralPath (Join-Path $stage "SHA256SUMS.txt") -Encoding ascii
-    @("Cheeky $version $packageMode $Label ($Configuration)", "Source commit: $head", "Working tree modified: $dirty",
-      "No NVIDIA or OptiScaler binaries included.", "Matching optional OpenXR installer included: $IncludeOpenXRSetup") |
-        Set-Content -LiteralPath (Join-Path $stage "BUILD.txt") -Encoding utf8
     $archive = Join-Path $BinaryRoot "CheekyFoveatedDLSS-$version-$packageMode-$Label.zip"
     # CreateFromDirectory refuses an existing destination, including a file that
     # appears after the earlier check. No overwrite flag is provided.
@@ -85,7 +73,7 @@ foreach ($packageMode in $modes) {
 
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)
     try {
-        $expected = @($files.Keys | ForEach-Object { $_.Replace('\', '/') }) + @("SHA256SUMS.txt", "BUILD.txt")
+        $expected = @($files.Keys | ForEach-Object { $_.Replace('\', '/') })
         $payload = @($zip.Entries | Where-Object { -not $_.FullName.EndsWith('/') })
         if ($payload.Count -ne $expected.Count) { throw "Unexpected ZIP payload count." }
         foreach ($entry in $payload) {
