@@ -1,9 +1,11 @@
+#include "depth_formats.hpp"
 #include "d3d11_peripheral_dlaa.hpp"
 
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
+#include "d3d11_write_bindings.hpp"
 
-#include <d3dcompiler.h>
+#include "d3d_shaders.hpp"
 
 #include <algorithm>
 #include <array>
@@ -178,28 +180,6 @@ void release(T*& object) noexcept {
     }
 }
 
-[[nodiscard]] DXGI_FORMAT depth_srv_format(
-    const DXGI_FORMAT format
-) noexcept {
-    switch (format) {
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case DXGI_FORMAT_R16_TYPELESS:
-    case DXGI_FORMAT_D16_UNORM:
-    case DXGI_FORMAT_R16_UNORM:
-        return DXGI_FORMAT_R16_UNORM;
-    default:
-        return DXGI_FORMAT_UNKNOWN;
-    }
-}
 
 [[nodiscard]] std::uint64_t dimension_distance(
     const std::uint32_t width_a,
@@ -394,41 +374,18 @@ void release_state(ViewState& state) noexcept {
     state = {};
 }
 
-[[nodiscard]] bool compile_shader(
+[[nodiscard]] bool create_shader(
     ID3D11Device* const device,
-    const char* const source,
-    const std::size_t source_size,
-    const char* const label,
+    const d3d_shaders::ShaderBytecode bytecode,
     ID3D11ComputeShader** const shader
 ) noexcept {
-    if (device == nullptr || source == nullptr || shader == nullptr) return false;
-    ID3DBlob* bytecode{};
-    ID3DBlob* errors{};
-    auto result = D3DCompile(
-        source,
-        source_size,
-        label,
-        nullptr,
-        nullptr,
-        "Main",
-        "cs_5_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0U,
-        &bytecode,
-        &errors
-    );
-    release(errors);
-    if (FAILED(result) || bytecode == nullptr) {
-        release(bytecode);
-        return false;
-    }
-    result = device->CreateComputeShader(
-        bytecode->GetBufferPointer(),
-        bytecode->GetBufferSize(),
+    if (device == nullptr || shader == nullptr) return false;
+    const auto result = device->CreateComputeShader(
+        bytecode.data,
+        bytecode.size,
         nullptr,
         shader
     );
-    release(bytecode);
     return SUCCEEDED(result);
 }
 
@@ -547,25 +504,19 @@ void release_state(ViewState& state) noexcept {
         );
 
     bool shaders_ready = resources_ready &&
-        compile_shader(
+        create_shader(
             device,
-            color_downsample_shader_source,
-            sizeof(color_downsample_shader_source) - 1U,
-            "Cheeky peripheral DX11 color",
+            d3d_shaders::peripheral11_color,
             &created.color_shader
         ) &&
-        compile_shader(
+        create_shader(
             device,
-            depth_downsample_shader_source,
-            sizeof(depth_downsample_shader_source) - 1U,
-            "Cheeky peripheral DX11 depth",
+            d3d_shaders::peripheral11_depth,
             &created.depth_shader
         ) &&
-        compile_shader(
+        create_shader(
             device,
-            motion_downsample_shader_source,
-            sizeof(motion_downsample_shader_source) - 1U,
-            "Cheeky peripheral DX11 motion",
+            d3d_shaders::peripheral11_motion,
             &created.motion_shader
         );
 
@@ -934,6 +885,7 @@ void restore_compute_state(
         if (motion_srv == nullptr) return false;
     }
 
+    D3D11WriteBindingsScope write_bindings(state.context);
     ComputeState previous{};
     capture_compute_state(state.context, previous);
 

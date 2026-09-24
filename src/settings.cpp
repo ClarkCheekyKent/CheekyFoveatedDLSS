@@ -15,10 +15,12 @@ std::mutex settings_mutex;
 std::atomic<bool> processing_allowed{true};
 
 std::atomic<bool> enabled{true};
+std::atomic<bool> d3d12_lower_hook{true};
 std::atomic<bool> d3d11_use_d3d12_transport{false};
 std::atomic<bool> peripheral_dlaa_enabled{true};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
+std::atomic<std::uint32_t> rr_center_preset{}, rr_peripheral_preset{};
 std::atomic<std::uint32_t> center_supersampling_bits{0x3F800000U};
 std::atomic<bool> afw_manual_coverage{false};
 std::atomic<bool> afw_automatic_coverage{false};
@@ -26,10 +28,15 @@ std::atomic<std::uint32_t> afw_warp_margin_bits{0x3D4CCCCDU};
 std::atomic<std::uint32_t> peripheral_dlaa_preset{5U};
 std::atomic<std::uint32_t> width_bits{0x3F0CCCCDU};
 std::atomic<std::uint32_t> height_bits{0x3EE66666U};
-std::atomic<std::uint32_t> x_offset_bits{0x3F19999AU};
+std::atomic<std::uint32_t> x_offset_bits{0U};
 std::atomic<std::uint32_t> height_offset_bits{0xBEE66666U};
 std::atomic<bool> invert_stereo_x_offset{false};
 std::atomic<bool> auto_stereo_alignment{true};
+std::atomic<bool> eye_calibration_continuous{false};
+std::atomic<unsigned> calibration_method{};
+unsigned learned_method{}, learned_sessions{};
+std::uint64_t learned_signature{};
+std::atomic<std::uint64_t> learning_revision{};
 std::atomic<std::uint32_t> aligned_height_offset_bits{};
 std::atomic<std::uint32_t> roundness_bits{};
 std::atomic<std::uint32_t> transition_bits{0x3D23D70AU};
@@ -95,6 +102,9 @@ std::uint64_t registration_generation{};
 struct Calibration {
     std::uint64_t left{}, right{}, sequence{}, session_generation{};
     bool vertical_flip{};
+    std::array<StereoSourceCrop, 2> source_crops{};
+    std::uint64_t verified_ms{};
+    EyeCalibrationMethod method{EyeCalibrationMethod::full};
 } calibration;
 bool calibration_live() {
     // Verified identity survives missing markers. View destruction, session
@@ -103,8 +113,14 @@ bool calibration_live() {
 }
 StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
-    if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip};
-    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip};
+    auto crops = calibration.source_crops;
+    const auto now = GetTickCount64();
+    if (eye_calibration_continuous_validation(calibration.method) &&
+        (now < calibration.verified_ms || now - calibration.verified_ms > 2500))
+        for (auto& crop : crops) crop.valid = false;
+    if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip,
+        calibration.left == calibration.right, crops};
+    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip, false, crops};
     return {};
 }
 
@@ -129,6 +145,7 @@ Settings configured_settings() noexcept {
     std::lock_guard lock(settings_mutex);
     Settings settings{};
     settings.enabled = enabled.load(std::memory_order_acquire);
+    settings.d3d12_lower_hook = d3d12_lower_hook.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
         d3d11_use_d3d12_transport.load(std::memory_order_acquire);
     settings.peripheral_dlaa_enabled =
@@ -138,6 +155,8 @@ Settings configured_settings() noexcept {
     settings.afw_manual_coverage = afw_manual_coverage.load(std::memory_order_acquire);
     settings.afw_automatic_coverage = afw_automatic_coverage.load(std::memory_order_acquire);
     settings.afw_warp_margin = load_float(afw_warp_margin_bits);
+    settings.rr_center_preset = rr_center_preset.load(std::memory_order_acquire);
+    settings.rr_peripheral_preset = rr_peripheral_preset.load(std::memory_order_acquire);
     settings.center_preset =
         center_preset.load(std::memory_order_acquire);
     settings.peripheral_dlaa_preset =
@@ -153,6 +172,11 @@ Settings configured_settings() noexcept {
     settings.alignment_border_enabled =
         alignment_border_enabled.load(std::memory_order_acquire);
     settings.auto_stereo_alignment = auto_stereo_alignment.load(std::memory_order_acquire);
+    settings.eye_calibration_continuous = eye_calibration_continuous.load(std::memory_order_acquire);
+    settings.eye_calibration_method = static_cast<EyeCalibrationMethod>(calibration_method.load());
+    settings.eye_calibration_learned_method = learned_method;
+    settings.eye_calibration_learned_signature = learned_signature;
+    settings.eye_calibration_learned_sessions = learned_sessions;
     settings.aligned_height_offset = load_float(aligned_height_offset_bits);
     settings.center_mode = static_cast<FoveationCenterMode>(
         center_mode.load(std::memory_order_acquire)
@@ -207,6 +231,7 @@ Settings current_settings() noexcept {
 
 void update_settings(const Settings& settings) noexcept {
     std::lock_guard lock(settings_mutex);
+    d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(
         settings.d3d11_use_d3d12_transport,
@@ -229,6 +254,9 @@ void update_settings(const Settings& settings) noexcept {
     afw_automatic_coverage.store(settings.afw_automatic_coverage, std::memory_order_release);
     store_float(afw_warp_margin_bits, std::isfinite(settings.afw_warp_margin)
         ? std::clamp(settings.afw_warp_margin, 0.F, 0.25F) : 0.05F);
+    const auto valid_rr = [](unsigned v) { return v == 0 || v == 4 || v == 5 || v == 6; };
+    rr_center_preset.store(valid_rr(settings.rr_center_preset) ? settings.rr_center_preset : 0);
+    rr_peripheral_preset.store(valid_rr(settings.rr_peripheral_preset) ? settings.rr_peripheral_preset : 0);
     center_preset.store(
         settings.center_preset == 0U || valid_preset(settings.center_preset)
             ? settings.center_preset
@@ -262,6 +290,8 @@ void update_settings(const Settings& settings) noexcept {
         std::memory_order_release
     );
     auto_stereo_alignment.store(settings.auto_stereo_alignment, std::memory_order_release);
+    eye_calibration_continuous.store(settings.eye_calibration_continuous, std::memory_order_release);
+    calibration_method.store(unsigned(settings.eye_calibration_method) <= 3 ? unsigned(settings.eye_calibration_method) : 0);
     store_float(aligned_height_offset_bits, std::clamp(settings.aligned_height_offset, -1.0F, 1.0F));
     center_mode.store(
         static_cast<std::uint32_t>(settings.center_mode) <= 2U
@@ -397,7 +427,7 @@ void unregister_stereo_view(const std::uint64_t view_id) noexcept {
 
 bool has_multiple_stereo_views() noexcept {
     std::lock_guard lock(stereo_views_mutex);
-    if (calibration_live()) return true;
+    if (calibration_live()) return calibration.left != calibration.right;
     return eye_roles[0].view_id != 0U && eye_roles[1].view_id != 0U;
 }
 
@@ -434,9 +464,10 @@ std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept {
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected,
-    std::uint64_t session_generation, bool vertical_flip) noexcept {
+    std::uint64_t session_generation, bool vertical_flip, bool shared_source,
+    const std::array<StereoSourceCrop, 2>* source_crops, EyeCalibrationMethod method) noexcept {
     if (corrected) *corrected = false;
-    if (!left || !right || left == right || !left_generation || !right_generation) return false;
+    if (!left || !right || (left == right) != shared_source || !left_generation || !right_generation) return false;
     std::lock_guard lock(stereo_views_mutex);
     const auto now = GetTickCount64();
     constexpr std::uint64_t lifetime_ms = 1000;
@@ -459,10 +490,33 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     };
     const int previous_left = previous_eye(left), previous_right = previous_eye(right);
     if (corrected) {
-        *corrected = (previous_left >= 0 && previous_left != 0) || (previous_right >= 0 && previous_right != 1);
+        *corrected = shared_source ? calibration.left != left || calibration.right != right :
+            (calibration.left && calibration.left == calibration.right) || (previous_left >= 0 && previous_left != 0) ||
+            (previous_right >= 0 && previous_right != 1);
     }
     calibration = {left, right, sequence, session_generation, vertical_flip};
+    calibration.method = method;
+    if (source_crops) { calibration.source_crops = *source_crops; calibration.verified_ms = captured_ms; }
     return true;
+}
+void invalidate_stereo_crop() noexcept {
+    std::lock_guard lock(stereo_views_mutex);
+    for (auto& crop : calibration.source_crops) crop.valid = false;
+}
+void set_eye_calibration_learning(unsigned method, std::uint64_t signature, unsigned sessions) noexcept {
+    std::lock_guard lock(settings_mutex);
+    if (!method || method > 3 || !signature || !sessions) { method = 0; signature = 0; sessions = 0; }
+    sessions = (std::min)(sessions, 2U);
+    if (learned_method == method && learned_signature == signature && learned_sessions == sessions) return;
+    learned_method = method; learned_signature = signature; learned_sessions = sessions;
+    ++learning_revision;
+}
+std::uint64_t eye_calibration_learning_revision() noexcept { return learning_revision.load(); }
+EyeCalibrationMethod eye_calibration_selected_method() noexcept {
+    return static_cast<EyeCalibrationMethod>(calibration_method.load());
+}
+bool eye_calibration_continuous_validation(EyeCalibrationMethod method) noexcept {
+    return method != EyeCalibrationMethod::full || eye_calibration_continuous.load(std::memory_order_acquire);
 }
 void clear_stereo_calibration() noexcept {
     std::lock_guard lock(stereo_views_mutex);
@@ -536,7 +590,7 @@ Settings settings_for_view(
         const auto corrected = calibrated_assignment(view_id);
         matched_view->has_eye_assignment = corrected.assigned;
         matched_view->second_eye = corrected.eye_index == 1;
-        result.x_offset = corrected.assigned
+        result.x_offset = corrected.assigned && !corrected.shared_source
             ? ((matched_view->second_eye != settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
             : 0.0F;
         return result;

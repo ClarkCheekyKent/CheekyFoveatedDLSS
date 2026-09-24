@@ -37,14 +37,23 @@
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="tests\gaze_tests.cpp" />
+    <ClCompile Include="tests\gaze_tests.cpp" /><ClCompile Include="tests\vulkan_tests.cpp" /><ClCompile Include="src\vulkan_api.cpp" /><ClCompile Include="src\vulkan_gpu.cpp" /><ClCompile Include="src\vulkan_observer.cpp" /><ClCompile Include="src\vulkan_backend.cpp" /><ClCompile Include="src\vulkan_calibration.cpp" />
+    <ClCompile Include="src\vulkan_peripheral.cpp" />
+    <ClCompile Include="src\vulkan_nr.cpp" />
+    <ClCompile Include="src\vulkan_nr_runtime.cpp" />
+    <ClCompile Include="src\nr_runtime_module.cpp" />
     <ClCompile Include="tests\eye_calibration_tests.cpp" />
     <ClCompile Include="tests\openxr_calibration_tests.cpp" />
+    <ClCompile Include="tests\openxr_input_tests.cpp" />
     <ClCompile Include="src\eye_calibration.cpp" />
     <ClCompile Include="src\eye_calibration_d3d12.cpp" />
     <ClCompile Include="tests\d3d12_composite_tests.cpp" />
+    <ClCompile Include="tests\debug_exposure_tests.cpp" />
+    <ClCompile Include="tests\d3d11_binding_tests.cpp" />
+    <ClCompile Include="src\d3d11_backend.cpp" />
     <ClCompile Include="tests\motion_resample_tests.cpp" />
     <ClCompile Include="tests\d3d12_history_tests.cpp" />
+    <ClCompile Include="tests\d3d12_safety_tests.cpp" />
     <ClCompile Include="src\d3d12_backend.cpp" />
     <ClCompile Include="src\crop_motion.cpp" />
     <ClCompile Include="tests\support_summary_tests.cpp" />
@@ -73,6 +82,11 @@
     <ClInclude Include="src\dlss_nr_contract.hpp" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="CheekyFakeRealVR.vcxproj">
+      <Project>{514AE60D-49DA-46DE-8541-4A8F45833213}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
     <ProjectReference Include="CheekyOpenXRLayer.vcxproj">
       <Project>{FD60ACB6-2F8A-4ED2-A210-A80D5970D166}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>

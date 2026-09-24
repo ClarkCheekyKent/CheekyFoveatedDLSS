@@ -1,5 +1,9 @@
+#include "depth_formats.hpp"
 #include "peripheral_dlaa.hpp"
+#include "peripheral_shaders.hpp"
+#include "d3d_shaders.hpp"
 #include "motion_region.hpp"
+#include "rr_contract.hpp"
 
 #include "runtime.hpp"
 
@@ -19,73 +23,6 @@ namespace {
 constexpr std::uint32_t dlss_feature_flag_mv_low_res = 1U << 1U;
 constexpr std::uint32_t perf_quality_dlaa = 5U;
 constexpr DlssViewId peripheral_view_mask = 0x8000000000000000ULL;
-
-constexpr char motion_convert_shader_source[] = R"(
-Texture2D<float2> SourceMotion : register(t0);
-RWTexture2D<float2> PackedMotion : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 SourceBase;
-    uint2 SourceSize;
-    uint2 DestSize;
-};
-[numthreads(16, 16, 1)]
-void Main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= DestSize)) return;
-    const uint2 numerator = (2U * id.xy + 1U) * SourceSize;
-    const uint2 denominator = 2U * DestSize;
-    const uint2 local = min(numerator / denominator, SourceSize - 1U);
-    PackedMotion[id.xy] = SourceMotion.Load(int3(SourceBase + local, 0));
-}
-)";
-
-constexpr char color_downsample_shader_source[] = R"(
-Texture2D<float4> SourceColor : register(t0);
-RWTexture2D<float4> PackedColor : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 SourceBase;
-    uint2 SourceSize;
-    uint2 DestSize;
-};
-float4 LoadClamped(int2 local) {
-    const int2 maximum = int2(SourceSize) - 1;
-    return SourceColor.Load(int3(int2(SourceBase) + clamp(local, int2(0, 0), maximum), 0));
-}
-[numthreads(16, 16, 1)]
-void Main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= DestSize)) return;
-    const float2 source =
-        (float2(id.xy) + 0.5) * float2(SourceSize) / float2(DestSize) - 0.5;
-    const int2 base = int2(floor(source));
-    const float2 fraction = source - floor(source);
-    const float4 p00 = LoadClamped(base);
-    const float4 p10 = LoadClamped(base + int2(1, 0));
-    const float4 p01 = LoadClamped(base + int2(0, 1));
-    const float4 p11 = LoadClamped(base + int2(1, 1));
-    PackedColor[id.xy] = lerp(
-        lerp(p00, p10, fraction.x),
-        lerp(p01, p11, fraction.x),
-        fraction.y
-    );
-}
-)";
-
-constexpr char depth_downsample_shader_source[] = R"(
-Texture2D<float> SourceDepth : register(t0);
-RWTexture2D<float> PackedDepth : register(u0);
-cbuffer Constants : register(b0) {
-    uint2 SourceBase;
-    uint2 SourceSize;
-    uint2 DestSize;
-};
-[numthreads(16, 16, 1)]
-void Main(uint3 id : SV_DispatchThreadID) {
-    if (any(id.xy >= DestSize)) return;
-    const uint2 numerator = (2U * id.xy + 1U) * SourceSize;
-    const uint2 denominator = 2U * DestSize;
-    const uint2 local = min(numerator / denominator, SourceSize - 1U);
-    PackedDepth[id.xy] = SourceDepth.Load(int3(SourceBase + local, 0));
-}
-)";
 
 template <typename T>
 void release(T*& object) noexcept {
@@ -140,6 +77,8 @@ struct PeripheralViewState {
     ID3D12Resource* downsampled_color{};
     ID3D12Resource* downsampled_depth{};
     ID3D12Resource* converted_motion{};
+    std::array<ID3D12Resource*, std::size(rr_guides)> rr_textures{};
+    ID3D12PipelineState* rr_pipeline{};
     ID3D12DescriptorHeap* converter_descriptors{};
     ID3D12RootSignature* converter_root{};
     ID3D12PipelineState* converter_pipeline{};
@@ -180,6 +119,8 @@ void record_gpu_use(
 
 void release_state(PeripheralViewState& state) noexcept {
     for (auto& use : state.gpu_uses) release_gpu_use(use);
+    for (auto& resource : state.rr_textures) release(resource);
+    release(state.rr_pipeline);
     release(state.depth_pipeline);
     release(state.color_pipeline);
     release(state.converter_pipeline);
@@ -231,6 +172,7 @@ void release_state(PeripheralViewState& state) noexcept {
 }
 
 [[nodiscard]] bool create_converter(PeripheralViewState& state) noexcept {
+    release(state.rr_pipeline);
     release(state.depth_pipeline);
     release(state.color_pipeline);
     release(state.converter_pipeline);
@@ -295,62 +237,32 @@ void release_state(PeripheralViewState& state) noexcept {
     release(serialized);
     if (FAILED(result)) return false;
 
-    const auto compile_pipeline = [&](
-        const char* const source,
-        const std::size_t source_size,
-        const char* const label,
+    const auto create_pipeline = [&](
+        const d3d_shaders::ShaderBytecode bytecode,
         ID3D12PipelineState** const pipeline
     ) noexcept {
-        ID3DBlob* bytecode{};
-        ID3DBlob* compile_errors{};
-        auto compile_result = D3DCompile(
-            source,
-            source_size,
-            label,
-            nullptr,
-            nullptr,
-            "Main",
-            "cs_5_1",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3,
-            0U,
-            &bytecode,
-            &compile_errors
-        );
-        release(compile_errors);
-        if (FAILED(compile_result) || bytecode == nullptr) {
-            release(bytecode);
-            return false;
-        }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
         pipeline_desc.pRootSignature = state.converter_root;
-        pipeline_desc.CS.pShaderBytecode = bytecode->GetBufferPointer();
-        pipeline_desc.CS.BytecodeLength = bytecode->GetBufferSize();
-        compile_result = state.device->CreateComputePipelineState(
+        pipeline_desc.CS = {bytecode.data, bytecode.size};
+        const auto result = state.device->CreateComputePipelineState(
             &pipeline_desc,
             IID_PPV_ARGS(pipeline)
         );
-        release(bytecode);
-        return SUCCEEDED(compile_result);
+        return SUCCEEDED(result);
     };
 
-    return compile_pipeline(
-            motion_convert_shader_source,
-            sizeof(motion_convert_shader_source) - 1U,
-            "Cheeky peripheral MV point conversion",
+    return create_pipeline(
+            d3d_shaders::peripheral12_motion,
             &state.converter_pipeline
         ) &&
-        compile_pipeline(
-            color_downsample_shader_source,
-            sizeof(color_downsample_shader_source) - 1U,
-            "Cheeky peripheral color bilinear downsample",
+        create_pipeline(
+            d3d_shaders::peripheral12_color,
             &state.color_pipeline
         ) &&
-        compile_pipeline(
-            depth_downsample_shader_source,
-            sizeof(depth_downsample_shader_source) - 1U,
-            "Cheeky peripheral depth point downsample",
+        create_pipeline(
+            d3d_shaders::peripheral12_depth,
             &state.depth_pipeline
-        );
+        ) && create_pipeline(d3d_shaders::peripheral12_rr, &state.rr_pipeline);
 }
 
 [[nodiscard]] DXGI_FORMAT typed_resource_format(
@@ -374,28 +286,6 @@ void release_state(PeripheralViewState& state) noexcept {
     }
 }
 
-[[nodiscard]] DXGI_FORMAT depth_srv_format(
-    const DXGI_FORMAT format
-) noexcept {
-    switch (format) {
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R24G8_TYPELESS:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case DXGI_FORMAT_R16_TYPELESS:
-    case DXGI_FORMAT_D16_UNORM:
-    case DXGI_FORMAT_R16_UNORM:
-        return DXGI_FORMAT_R16_UNORM;
-    default:
-        return DXGI_FORMAT_UNKNOWN;
-    }
-}
 
 [[nodiscard]] PeripheralViewState* find_or_create_state(
     const PeripheralDlaaRequest& request
@@ -508,7 +398,7 @@ void release_state(PeripheralViewState& state) noexcept {
 }
 
 [[nodiscard]] bool ensure_resampler(PeripheralViewState& state) noexcept {
-    return (state.converter_pipeline != nullptr &&
+    return (state.rr_pipeline != nullptr && state.converter_pipeline != nullptr &&
             state.color_pipeline != nullptr &&
             state.depth_pipeline != nullptr) ||
         create_converter(state);
@@ -770,22 +660,6 @@ void release_state(PeripheralViewState& state) noexcept {
 
 }  // namespace
 
-PeripheralDlaaDimensions peripheral_dlaa_dimensions(
-    const std::uint32_t render_width,
-    const std::uint32_t render_height,
-    const float scale
-) noexcept {
-    if (render_width == 0U || render_height == 0U) return {};
-    const auto clamped = std::clamp(scale, 0.20F, 1.0F);
-    const auto scale_dimension = [clamped](const std::uint32_t value) noexcept {
-        const auto scaled = static_cast<std::uint32_t>(
-            static_cast<float>(value) * clamped + 0.5F
-        );
-        return (std::min)(value, (std::max)(32U, scaled));
-    };
-    return {scale_dimension(render_width), scale_dimension(render_height)};
-}
-
 DlssViewId peripheral_dlaa_view_id(const DlssViewId view_id) noexcept {
     return view_id ^ peripheral_view_mask;
 }
@@ -892,6 +766,23 @@ bool prepare_peripheral_dlaa_resources(
         resources.mv_base_y = 0U;
         resources.converted_motion = true;
     }
+    if (request.feature_id == 13U && scaled) {
+        static_assert(std::tuple_size_v<decltype(resources.rr_guides)> == std::size(rr_guides));
+        for (unsigned i=0; i<std::size(rr_guides); ++i) {
+            ID3D12Resource* source{};
+            request.parameters->Get(rr_guides[i].resource, &source);
+            if (!source) continue;
+            auto& target = state->rr_textures[i];
+            const auto desc = source->GetDesc();
+            if (!target && !create_texture(state->device, desc, state->working_width, state->working_height,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &target, DXGI_FORMAT_R32G32B32A32_FLOAT)) return fail();
+            if (!dispatch_resample(*state, request, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    typed_resource_format(desc.Format), target, DXGI_FORMAT_R32G32B32A32_FLOAT, state->rr_pipeline,
+                    get_ui(request.parameters, rr_guides[i].x), get_ui(request.parameters, rr_guides[i].y),
+                    request.render_width, request.render_height)) return fail();
+            resources.rr_guides[i] = target;
+        }
+    }
     return true;
 }
 
@@ -912,7 +803,7 @@ bool evaluate_peripheral_dlaa_ngx(
 
     DlssFrameContract contract{};
     contract.view_id = peripheral_dlaa_view_id(request.view_id);
-    contract.feature_id = 1U;
+    contract.feature_id = request.feature_id;
     contract.render_width = resources.working_width;
     contract.render_height = resources.working_height;
     contract.output_width = resources.working_width;
@@ -956,10 +847,8 @@ bool evaluate_peripheral_dlaa_ngx(
         request.parameters,
         "PerfQualityValue"
     );
-    const auto saved_preset = get_ngx_integer_bits(
-        request.parameters,
-        "DLSS.Hint.Render.Preset.DLAA"
-    );
+    const auto* preset_name = request.feature_id == 13U ? rr_presets[0] : "DLSS.Hint.Render.Preset.DLAA";
+    const auto saved_preset = get_ngx_integer_bits(request.parameters, preset_name);
     const auto saved_flags = get_ngx_integer_bits(
         request.parameters,
         "DLSS.Feature.Create.Flags"
@@ -1014,7 +903,7 @@ bool evaluate_peripheral_dlaa_ngx(
         : 1.0F;
 
     request.parameters->Set("PerfQualityValue", perf_quality_dlaa);
-    request.parameters->Set("DLSS.Hint.Render.Preset.DLAA", request.preset);
+    if (request.preset) request.parameters->Set(preset_name, request.preset);
     request.parameters->Set(
         "DLSS.Feature.Create.Flags",
         contract.create_flags
@@ -1024,6 +913,15 @@ bool evaluate_peripheral_dlaa_ngx(
     request.parameters->Set("Jitter.Offset.X", saved_jitter_x * jitter_scale_x);
     request.parameters->Set("Jitter.Offset.Y", saved_jitter_y * jitter_scale_y);
 
+    std::array<ID3D12Resource*, std::size(rr_guides)> original_guides{};
+    std::array<std::array<unsigned,2>, std::size(rr_guides)> original_bases{};
+    for (unsigned i=0;i<std::size(rr_guides);++i) if (resources.rr_guides[i]) {
+        const auto& g=rr_guides[i];
+        request.parameters->Get(g.resource,&original_guides[i]);
+        original_bases[i]={get_ui(request.parameters,g.x),get_ui(request.parameters,g.y)};
+        request.parameters->Set(g.resource,resources.rr_guides[i]);
+        request.parameters->Set(g.x,0U); request.parameters->Set(g.y,0U);
+    }
     result = evaluate_d3d12_backend(
         request.command_list,
         contract,
@@ -1034,8 +932,13 @@ bool evaluate_peripheral_dlaa_ngx(
         timing
     );
 
+    for (unsigned i=0;i<std::size(rr_guides);++i) if (resources.rr_guides[i]) {
+        const auto& g=rr_guides[i];
+        request.parameters->Set(g.resource,original_guides[i]);
+        request.parameters->Set(g.x,original_bases[i][0]); request.parameters->Set(g.y,original_bases[i][1]);
+    }
     request.parameters->Set("PerfQualityValue", saved_quality);
-    request.parameters->Set("DLSS.Hint.Render.Preset.DLAA", saved_preset);
+    request.parameters->Set(preset_name, saved_preset);
     request.parameters->Set("DLSS.Feature.Create.Flags", saved_flags);
     request.parameters->Set("MV.Scale.X", saved_mv_scale_x);
     request.parameters->Set("MV.Scale.Y", saved_mv_scale_y);
@@ -1066,6 +969,9 @@ void finish_peripheral_dlaa_motion_read(
     ID3D12GraphicsCommandList* const command_list,
     const PeripheralDlaaResources& resources
 ) noexcept {
+    for (auto* guide : resources.rr_guides) if (guide)
+        transition(command_list, guide, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (command_list == nullptr) return;
     if (resources.downsampled_color && resources.color != nullptr) {
         transition(

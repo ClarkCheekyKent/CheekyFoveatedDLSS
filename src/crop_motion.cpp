@@ -1,5 +1,5 @@
 #include "crop_motion.hpp"
-#include "crop_motion_shader.hpp"
+#include "d3d_shaders.hpp"
 #include "runtime.hpp"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -31,16 +31,7 @@ DXGI_FORMAT srv_format(DXGI_FORMAT format) noexcept {
 bool bounds(unsigned base, unsigned extent, UINT64 size) noexcept {
     return extent != 0 && base <= size && extent <= size - base;
 }
-ComPtr<ID3DBlob> shader_bytecode() noexcept {
-    static const ComPtr<ID3DBlob> code = [] {
-        ComPtr<ID3DBlob> blob, errors;
-        D3DCompile(crop_motion_shader_source, sizeof(crop_motion_shader_source) - 1, "crop_motion",
-            nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
-            0, &blob, &errors);
-        return blob;
-    }();
-    return code;
-}
+constexpr auto shader_bytecode() noexcept { return d3d_shaders::crop_motion; }
 }
 
 struct CropMotion11 {
@@ -106,9 +97,9 @@ std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext* context,
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     const auto code = shader_bytecode();
-    if (!code || FAILED(device->CreateTexture2D(&desc, nullptr, &pass->output)) ||
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &pass->output)) ||
         FAILED(device->CreateUnorderedAccessView(pass->output.Get(), nullptr, &pass->uav)) ||
-        FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
+        FAILED(device->CreateComputeShader(code.data, code.size,
             nullptr, &pass->shader))) return {};
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = sizeof(data); bd.Usage = D3D11_USAGE_DEFAULT;
@@ -163,6 +154,7 @@ struct Pass12 {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
     unsigned width{}, height{};
+    bool copy_only{};
     std::uint64_t list_token{};
 };
 std::mutex mutex12;
@@ -234,12 +226,12 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
     rd.NumParameters = 2; rd.pParameters = params;
     ComPtr<ID3DBlob> root_blob, errors;
     const auto code = shader_bytecode();
-    if (!code || FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
         &root_blob, &errors)) || FAILED(device->CreateRootSignature(0,
             root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&pass->root)))) return {};
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = pass->root.Get();
-    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    pd.CS = {code.data, code.size};
     if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pass->pipeline)))) return {};
     return pass;
 }
@@ -263,7 +255,7 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     std::lock_guard lock(mutex12);
     std::shared_ptr<Pass12> pass;
     for (auto it = available12.begin(); it != available12.end(); ++it) {
-        if ((*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
+        if (!(*it)->copy_only && (*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
             pass = *it; available12.erase(it); break;
         }
     }
@@ -302,6 +294,47 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return pass->output.Get();
 }
+ID3D12Resource* prepare_crop_texture12(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+    unsigned x, unsigned y, unsigned width, unsigned height) noexcept {
+    if (!list || !source || !width || !height) return nullptr;
+    auto desc = source->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+        desc.SampleDesc.Count != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        !bounds(x,width,desc.Width) || !bounds(y,height,desc.Height)) return nullptr;
+    ComPtr<ID3D12Device> device;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+    std::lock_guard lock(mutex12);
+    if (pending12.size() >= 64) return nullptr;
+    std::shared_ptr<Pass12> pass;
+    for (auto it=available12.begin(); it!=available12.end(); ++it) {
+        if ((*it)->copy_only && (*it)->source.Get()==source && (*it)->width==width && (*it)->height==height) {
+            pass=*it; available12.erase(it); break;
+        }
+    }
+    if (!pass) {
+        pass=std::make_shared<Pass12>(); pass->device=device; pass->source=source;
+        pass->width=width; pass->height=height; pass->copy_only=true;
+        desc.Width=width; desc.Height=height; desc.MipLevels=1;
+        desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask=heap.VisibleNodeMask=1;
+        if (FAILED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&pass->output)))) return nullptr;
+    }
+    pass->list=list; pass->list_token=list_token(list,true); pass->fence.Reset();
+    pending12.push_back(pass);
+    transition(list,source,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION from{},to{};
+    from.pResource=source; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.pResource=pass->output.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX box{x,y,0,x+width,y+height,1};
+    list->CopyTextureRegion(&to,0,0,0,&from,&box);
+    transition(list,source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return pass->output.Get();
+}
+
 void crop_motion12_submitted(ID3D12CommandQueue* queue, unsigned count,
     ID3D12CommandList* const* lists) noexcept {
     if (!queue || !lists) return;

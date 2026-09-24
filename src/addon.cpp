@@ -7,6 +7,7 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 #include "support_report.hpp"
 #include "eye_calibration.hpp"
 #include "cheeky_gaze_abi.h"
@@ -607,9 +608,6 @@ void draw_nr_performance() {
 void draw_eye_calibration_diagnostics() {
     if (!ImGui::TreeNode("Eye calibration")) return;
     const auto s = eye_calibration_stats();
-    bool enabled = s.enabled;
-    if (ImGui::Checkbox("Automatic eye calibration (this session)", &enabled))
-        eye_calibration_enable(enabled);
     if (DiagnosticTable table{"eye_calibration"}) {
         diagnostic_row("Backend", "%s", eye_calibration_backend_name(s.backend));
         diagnostic_row("Graphics API", "%s", s.graphics_api == 12 ? "D3D12" : s.graphics_api == 11 ? "D3D11" : "Waiting for DLSS");
@@ -619,12 +617,16 @@ void draw_eye_calibration_diagnostics() {
         diagnostic_row("Valid / completed samples", "%llu / %llu", s.valid, s.completed);
         diagnostic_row("Skipped / in flight", "%llu / %u", s.skipped, s.in_flight);
         diagnostic_row("CPU work", "%.2f us/frame", s.cpu_us_per_frame);
+        if (s.search_timing_samples) {
+            diagnostic_row("Full-image search (last L / R)", "%.1f / %.1f ms", s.search_ms[0], s.search_ms[1]);
+            diagnostic_row("Full-image search (peak per eye)", "%.1f ms", s.max_search_ms);
+        } else diagnostic_row("Full-image search", "%s", "No completed timing yet");
         if (s.gpu_samples) diagnostic_row("GPU marker / copy work", "%.2f us", s.gpu_us);
-        else diagnostic_row("GPU marker / copy work", "%s", "Not sampled / unavailable");
+        else diagnostic_row("GPU marker / copy work", "%s", s.gpu_timing_status);
         diagnostic_row("Readback latency", "%.2f VR frames", s.latency_frames);
         diagnostic_row("Last recognized left / right", "%llu / %llu", s.left_view, s.right_view);
     }
-    ImGui::TextWrapped("Samples every 10 VR frames. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
+    ImGui::TextWrapped("Corner verification samples every 10 VR frames; timing recovery captures every frame while acquiring. Corrections count changes to an existing eye assignment; confirmations do not increment it. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
     if (ImGui::Button("Reset eye calibration counters")) eye_calibration_reset_stats();
     ImGui::TreePop();
 }
@@ -661,6 +663,11 @@ void draw_openxr_gaze_diagnostics() {
             (gaze.status_flags & CHEEKY_GAZE_STATUS_ACTION_ACTIVE) != 0U
         )
     );
+    if (gaze.input.version == CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION) {
+        diagnostic_row("Gaze action attached", "%s", yes_no(gaze.input.action_attached != 0));
+        diagnostic_row("RealVR independent gaze", "%s", gaze.input.fallback_sync_calls ? "Polling" :
+            gaze.input.realvr_detected ? "Waiting / host input" : "Not needed");
+    }
     diagnostic_row(
         "Tracking valid", "%s", yes_no(
             (gaze.status_flags & CHEEKY_GAZE_STATUS_GAZE_VALID) != 0U
@@ -739,6 +746,9 @@ void draw_openxr_gaze_diagnostics() {
 
 void load_settings_from_reshade() noexcept {
     auto settings = current_settings();
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "D3D12LowerHook", settings.d3d12_lower_hook
+    ));
     auto center_mode = static_cast<std::uint32_t>(settings.center_mode);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "Enabled", settings.enabled
@@ -755,6 +765,8 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "PeripheralDlaaScale",
         settings.peripheral_dlaa_scale
     ));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "RrCenterPreset", settings.rr_center_preset));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "RrPeripheralPreset", settings.rr_peripheral_preset));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "CenterPreset",
         settings.center_preset
@@ -803,6 +815,16 @@ void load_settings_from_reshade() noexcept {
     ));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "EyeCalibrationContinuous", settings.eye_calibration_continuous));
+    unsigned calibration_method = 0;
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationMethod", calibration_method);
+    settings.eye_calibration_method = static_cast<EyeCalibrationMethod>(calibration_method <= 3 ? calibration_method : 0);
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationLearnedMethod", settings.eye_calibration_learned_method);
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationLearnedSignature", settings.eye_calibration_learned_signature);
+    reshade::get_config_value(nullptr, config_section, "EyeCalibrationLearnedSessions", settings.eye_calibration_learned_sessions);
+    set_eye_calibration_learning(settings.eye_calibration_learned_method, settings.eye_calibration_learned_signature,
+        settings.eye_calibration_learned_sessions);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset));
     settings.center_mode = center_mode <= 2U
@@ -911,6 +933,7 @@ void load_settings_from_reshade() noexcept {
 }
 
 void save_settings_to_reshade(const Settings& settings) noexcept {
+    reshade::set_config_value(nullptr, config_section, "D3D12LowerHook", settings.d3d12_lower_hook);
     reshade::set_config_value(
         nullptr, config_section, "Enabled", settings.enabled
     );
@@ -926,6 +949,8 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "PeripheralDlaaScale",
         settings.peripheral_dlaa_scale
     );
+    reshade::set_config_value(nullptr, config_section, "RrCenterPreset", settings.rr_center_preset);
+    reshade::set_config_value(nullptr, config_section, "RrPeripheralPreset", settings.rr_peripheral_preset);
     reshade::set_config_value(
         nullptr, config_section, "CenterPreset",
         settings.center_preset
@@ -970,6 +995,12 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         settings.alignment_border_enabled
     );
     reshade::set_config_value(nullptr, config_section, "AutoStereoAlignment", settings.auto_stereo_alignment);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationContinuous", settings.eye_calibration_continuous);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationMethod", unsigned(settings.eye_calibration_method));
+    const auto learned = configured_settings();
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationLearnedMethod", learned.eye_calibration_learned_method);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationLearnedSignature", learned.eye_calibration_learned_signature);
+    reshade::set_config_value(nullptr, config_section, "EyeCalibrationLearnedSessions", learned.eye_calibration_learned_sessions);
     reshade::set_config_value(nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset);
     reshade::set_config_value(
         nullptr, config_section, "CenterMode",
@@ -1081,24 +1112,23 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         peripheral_scale_draft = settings.peripheral_dlaa_scale;
         size_drafts_initialized = true;
     }
-    const auto preset_combo = [&changed](
+    const bool rr = diagnostic_snapshot(DiagnosticApi::d3d12).reconstruction_feature == 13;
+    const auto preset_combo = [&changed, rr](
         const char* const label,
         std::uint32_t& value,
         const bool allow_game_default
     ) {
-        static constexpr std::uint32_t values[]{
-            0U, 5U, 11U, 12U, 13U
-        };
-        static constexpr const char* labels[]{
+        const std::uint32_t values[]{0U, rr ? 4U : 5U, rr ? 5U : 11U, rr ? 6U : 12U, 13U};
+        const char* labels[]{
             "Game/default",
-            "E (Fastest)",
-            "K",
-            "L",
+            rr ? "D" : "E (Fastest)",
+            rr ? "E" : "K",
+            rr ? "F" : "L",
             "M",
         };
-        const int first = allow_game_default ? 0 : 1;
+        const int first = (rr || allow_game_default) ? 0 : 1;
         int selected{};
-        const auto count = static_cast<int>(std::size(values));
+        const auto count = rr ? 4 : static_cast<int>(std::size(values));
         for (int index = first; index < count; ++index) {
             if (values[index] == value) {
                 selected = index - first;
@@ -1113,8 +1143,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     changed |= ImGui::Checkbox("Enable foveated DLSS-SR", &settings.enabled);
     ImGui::SameLine();
     ImGui::TextDisabled("(Alt+Shift+/)");
-    ImGui::BeginDisabled(!settings.enabled);
-    preset_combo("Center preset", settings.center_preset, true);
+    preset_combo(rr ? "Center RR preset" : "Center preset", rr ? settings.rr_center_preset : settings.center_preset, true);
     static float supersampling_draft = 1.0F;
     static bool editing_supersampling{};
     if (!editing_supersampling) supersampling_draft = settings.center_supersampling;
@@ -1141,31 +1170,31 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (!editing_peripheral_scale) {
         peripheral_scale_draft = settings.peripheral_dlaa_scale;
     }
-    ImGui::BeginDisabled(!settings.peripheral_dlaa_enabled);
-    preset_combo(
-        "Peripheral preset",
-        settings.peripheral_dlaa_preset,
-        false
-    );
-    if (ImGui::SliderFloat(
-        "Periphery scale",
-        &peripheral_scale_draft,
-        0.20F,
-        1.0F,
-        "%.2f",
-        ImGuiSliderFlags_AlwaysClamp
-    )) {
-        editing_peripheral_scale = true;
+    if (settings.peripheral_dlaa_enabled) {
+        preset_combo(
+            "Peripheral preset",
+            rr ? settings.rr_peripheral_preset : settings.peripheral_dlaa_preset,
+            false
+        );
+        if (ImGui::SliderFloat(
+            "Periphery scale",
+            &peripheral_scale_draft,
+            0.20F,
+            1.0F,
+            "%.2f",
+            ImGuiSliderFlags_AlwaysClamp
+        )) {
+            editing_peripheral_scale = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            settings.peripheral_dlaa_scale = peripheral_scale_draft;
+            editing_peripheral_scale = false;
+            changed = true;
+        }
+        ImGui::TextDisabled(
+            "Downscale periphery even more from original resolution"
+        );
     }
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        settings.peripheral_dlaa_scale = peripheral_scale_draft;
-        editing_peripheral_scale = false;
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::TextDisabled(
-        "Downscale periphery even more from original resolution"
-    );
     int center_mode = static_cast<int>(settings.center_mode);
     if (ImGui::Combo(
             "Foveation center",
@@ -1341,14 +1370,16 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         );
         ImGui::TreePop();
     }
-    ImGui::EndDisabled();
 
     ImGui::Spacing();
     if (ImGui::Button("Reset DLSS-SR defaults", ImVec2(0.0F, 0.0F))) {
+        settings.d3d12_lower_hook = Settings{}.d3d12_lower_hook;
         const Settings defaults{};
         settings.enabled = defaults.enabled;
         settings.peripheral_dlaa_enabled = defaults.peripheral_dlaa_enabled;
         settings.peripheral_dlaa_scale = defaults.peripheral_dlaa_scale;
+        settings.rr_center_preset = defaults.rr_center_preset;
+        settings.rr_peripheral_preset = defaults.rr_peripheral_preset;
         settings.center_preset = defaults.center_preset;
         settings.center_supersampling = defaults.center_supersampling;
         supersampling_draft = defaults.center_supersampling;
@@ -1467,10 +1498,12 @@ void draw_nr_controls(Settings& settings, bool& changed) {
             );
         }
     }
-    changed |= ImGui::Checkbox(
-        "Show 5 px green alignment border",
-        &settings.nr_alignment_border_enabled
-    );
+    if (settings.nr_foveated) {
+        changed |= ImGui::Checkbox(
+            "Show 5 px green alignment border",
+            &settings.nr_alignment_border_enabled
+        );
+    }
 
     ImGui::SeparatorText("Neural rendering");
     int order = static_cast<int>(settings.nr_processing_order);
@@ -1604,8 +1637,13 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
 
     ImGui::TextDisabled("Cheeky Foveated DLSS v" CHEEKY_VERSION);
     ImGui::Separator();
-    ImGui::TextUnformatted("Changes apply live to the next DLSS evaluation.");
+    ImGui::TextUnformatted("Changes apply live, except the DLSS hook path (restart required).");
     ImGui::TextDisabled("DX12 Transport enables DX12 features for DX11 games.");
+    changed |= ImGui::Checkbox("Use lower DLSS hook (DX12)", &settings.d3d12_lower_hook);
+    ImGui::TextDisabled("Off selects the higher call. Restart the game after changing this.");
+    ImGui::Text("Active DLSS hook: %s", d3d12_lower_hook_enabled() ? "Lower" : "Higher");
+    if (d3d12_hook_restart_required(settings.d3d12_lower_hook))
+        ImGui::TextUnformatted("DLSS hook change saved for next game restart.");
     int d3d11_path = settings.d3d11_use_d3d12_transport ? 1 : 0;
     if (ImGui::Combo(
             "DX11 game processing path",
@@ -1617,6 +1655,32 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
     }
 
     ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Stereo / Gaze")) {
+        bool calibration_enabled = eye_calibration_enabled();
+        if (ImGui::Checkbox("Automatic eye calibration (this session)", &calibration_enabled))
+            eye_calibration_enable(calibration_enabled);
+        ImGui::BeginDisabled(!calibration_enabled);
+        int method = int(settings.eye_calibration_method);
+        if (ImGui::Combo("Calibration method", &method, "Auto\0Standard corners\0Timing tolerant corners\0Full crop search\0")) {
+            settings.eye_calibration_method = static_cast<EyeCalibrationMethod>(method); changed = true;
+        }
+        ImGui::Text("Learned starting method: %s", settings.eye_calibration_learned_method ?
+            eye_calibration_method_name(static_cast<EyeCalibrationMethod>(settings.eye_calibration_learned_method)) : "Not learned yet");
+        if (settings.eye_calibration_learned_method == 2 && settings.eye_calibration_learned_sessions < 2)
+            ImGui::TextWrapped("Timing preference needs confirmation on another launch; Auto will start with standard corners.");
+        ImGui::Text("Active method: %s", eye_calibration_method_name(eye_calibration_stats().active_method));
+        if (ImGui::Button("Reset learned calibration method")) {
+            set_eye_calibration_learning(0, 0, 0); eye_calibration_recalibrate();
+        }
+        if (settings.eye_calibration_method == EyeCalibrationMethod::full ||
+            (settings.eye_calibration_method == EyeCalibrationMethod::automatic && eye_calibration_stats().active_method == EyeCalibrationMethod::full)) {
+            changed |= ImGui::Checkbox("Continuously validate eye calibration", &settings.eye_calibration_continuous);
+            if (!settings.eye_calibration_continuous)
+                ImGui::TextWrapped("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.");
+        }
+        if (ImGui::Button("Recalibrate now")) eye_calibration_recalibrate();
+        ImGui::EndDisabled();
+    }
     if (ImGui::CollapsingHeader("DLSS-SR", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::TreeNodeEx(
                 "Controls##dlss_sr",
@@ -1645,14 +1709,14 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         ImGui::TextDisabled(
             "Requires nvngx_dlssnr.dll beside this add-on and a DX12 processing path."
         );
+        if (ImGui::TreeNodeEx(
+                "Controls##dlss_nr",
+                ImGuiTreeNodeFlags_DefaultOpen
+            )) {
+            draw_nr_controls(settings, changed);
+            ImGui::TreePop();
+        }
         if (settings.nr_enabled) {
-            if (ImGui::TreeNodeEx(
-                    "Controls##dlss_nr",
-                    ImGuiTreeNodeFlags_DefaultOpen
-                )) {
-                draw_nr_controls(settings, changed);
-                ImGui::TreePop();
-            }
             if (ImGui::TreeNodeEx(
                     "Performance##dlss_nr",
                     ImGuiTreeNodeFlags_DefaultOpen
@@ -1703,6 +1767,12 @@ void on_present(
     const reshade::api::rect*
 ) {
     eye_calibration_tick();
+    static std::uint64_t saved_learning_revision{};
+    const auto learning_revision = eye_calibration_learning_revision();
+    if (saved_learning_revision != learning_revision) {
+        saved_learning_revision = learning_revision;
+        save_settings_to_reshade(configured_settings());
+    }
     if (queue != nullptr && queue->get_device() != nullptr &&
         queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
         note_d3d12_present(

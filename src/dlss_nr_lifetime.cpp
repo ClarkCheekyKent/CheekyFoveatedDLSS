@@ -1,6 +1,7 @@
 #include "dlss_nr_lifetime.hpp"
 #include "eye_calibration_d3d12.hpp"
 #include "graphics_observer.hpp"
+#include "d3d12_native.hpp"
 #include <atomic>
 #include <vector>
 #include <wrl/client.h>
@@ -46,6 +47,8 @@ public:
     }
 };
 ComPtr<RecordingIdentity> identity(ID3D12Object* list) {
+    const auto native = native_d3d12_interface(list);
+    list = native.Get();
     ComPtr<RecordingIdentity> result;
     IUnknown* tag{};
     UINT bytes = sizeof(tag);
@@ -79,6 +82,8 @@ void collect_recording(NrRecording& recording, NrSignal submit_signal) {
 }
 }
 bool ensure_dlss_nr_recording(ID3D12GraphicsCommandList* list) noexcept {
+    const auto native = native_d3d12_interface(list);
+    list = native.Get();
     if (!list) return false;
     std::lock_guard execution_lock(calibration12_execution_mutex());
     auto tag = identity(list);
@@ -101,6 +106,13 @@ bool NrLifetime::record(ID3D12GraphicsCommandList* list) noexcept {
     for (const auto& use : uses_) if (use == recording) return true;
     uses_.push_back(recording);
     return true;
+}
+bool NrLifetime::contains(ID3D12GraphicsCommandList* list) const noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    const auto tag = identity(list);
+    if (!tag || !tag->current) return false;
+    for (const auto& use : uses_) if (use == tag->current) return true;
+    return false;
 }
 void nr_recording_submitted(ID3D12CommandQueue* queue, ID3D12Object* list, NrSignal submit_signal) noexcept {
     if (!queue || !list) return;

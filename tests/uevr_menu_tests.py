@@ -46,9 +46,13 @@ def run(engine):
         disabled = {false}
         slider_ranges = {}
         tree_stack, tree_order, tree_parents, closed_trees = {}, {}, {}, {}
-        uevr = {api = {}, sdk = {callbacks = {}}}
-        for _, name in ipairs({'on_lua_event', 'on_frame', 'on_draw_ui'}) do
+        uevr = {api = {}, lua = {}, sdk = {callbacks = {}}}
+        for _, name in ipairs({'on_lua_event', 'on_frame'}) do
             uevr.sdk.callbacks[name] = function(fn) callbacks[name] = fn end
+        end
+        function uevr.lua.add_script_panel(name, fn)
+            assert(name == "Cheeky Foveated DLSS", "Unexpected script panel name")
+            callbacks.script_panel = fn
         end
         function uevr.api:dispatch_custom_event(event, text)
             table.insert(sent, {event=event, text=text})
@@ -115,7 +119,7 @@ def run(engine):
             g.clicked[click] = True
         for key, value in (changes or {}).items():
             g.changes[key] = value
-        g.callbacks.on_draw_ui()
+        g.callbacks.script_panel()
         assert len(g.disabled) == 1, "Unbalanced disabled scope"
         assert len(g.tree_stack) == 0, "Unbalanced tree scope"
 
@@ -131,6 +135,42 @@ def run(engine):
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
     state["settings"]["Enabled"] = True
+    state["settings"]["D3D12LowerHook"] = True
+    state["setting_groups"]["D3D12LowerHook"] = "sr"
+    state["d3d12_lower_hook_active"] = True
+    state["d3d12_hook_restart_required"] = False
+    receive(state)
+    draw()
+    assert g["values"]["Use lower DLSS hook (DX12)"] is True
+    draw(changes={"Use lower DLSS hook (DX12)": False})
+    assert "D3D12LowerHook=false" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["D3D12LowerHook"] = False
+    state["d3d12_hook_restart_required"] = True
+    receive(state)
+    draw()
+    assert g["values"]["Use lower DLSS hook (DX12)"] is False
+    assert any("Active DLSS hook: Lower" in t for t in g.drawn.values())
+    assert any("saved for next game restart" in t for t in g.drawn.values())
+    draw(changes={"Use lower DLSS hook (DX12)": True})
+    assert "D3D12LowerHook=true" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["D3D12LowerHook"] = True
+    state["d3d12_hook_restart_required"] = False
+    receive(state)
+    draw()
+    rr = copy.deepcopy(state)
+    rr["renderer"] = 1
+    rr["apis"] = [{}, {"reconstruction_feature": 13}]
+    rr["settings"].update(RrCenterPreset=6, RrPeripheralPreset=4, PeripheralDlaa=True)
+    receive(rr)
+    draw()
+    assert g["values"]["Center RR preset"] == 6 and g["values"]["Peripheral RR preset"] == 4
+    assert set(g.combos["Center RR preset"].keys()) == {0, 4, 5, 6}
+    assert g["values"]["Center preset"] is None, "RR exposed SR-only presets"
+    receive(state)
+    draw()
+    assert g["values"]["Center preset"] is not None and g["values"]["Center RR preset"] is None
     afw = copy.deepcopy(state)
     afw["renderer"] = 1  # AFW supports DX12; the newest ordinary host report may be DX11.
     afw["afw_experiment"] = {"enabled": True, "core_calls": 100, "lower_calls": 0,
@@ -141,11 +181,11 @@ def run(engine):
     draw()
     assert any(t == "Selected" for t in g.drawn.values())
     assert not g.trees["AFW details"] and g.trees["Support"] and g.trees["Performance"]
-    assert not g.trees["Eye calibration"] and not g.trees["Eye mapping details"]
+    assert g.trees["Eye calibration"] and not g.trees["Eye mapping details"]
     assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
     assert "Foveation center" in g["values"] and "Enable DLSS-NR" in g["values"]
-    assert "Automatic stereo alignment" not in g["values"] and "Invert stereo eye order" not in g["values"]
-    assert "Automatic eye calibration (this session)" not in g["values"]
+    assert "Automatic stereo alignment" in g["values"] and "Invert stereo eye order" in g["values"]
+    assert "Automatic eye calibration (this session)" in g["values"]
     assert "Center supersampling" in g["values"]
     afw["settings"].update(NrEnabled=True, NrFoveated=True, NrUseSrFoveation=False)
     receive(afw)
@@ -292,6 +332,23 @@ def run(engine):
     assert last().endswith("\ncalibration_disable")
     draw(changes={"Automatic eye calibration (this session)": True})
     assert last().endswith("\ncalibration_enable")
+    for method in (1, 2):
+        state["settings"]["EyeCalibrationMethod"] = method
+        receive(state)
+        count = len(g.sent)
+        draw(changes={"Continuously validate eye calibration": False})
+        g.callbacks.on_frame()
+        assert len(g.sent) == count, "Corner methods must hide the recalibration policy"
+    state["settings"]["EyeCalibrationMethod"] = 3
+    receive(state)
+    draw(changes={"Continuously validate eye calibration": False})
+    g.callbacks.on_frame()
+    assert "EyeCalibrationContinuous=false" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["EyeCalibrationContinuous"] = False
+    receive(state)
+    draw("Recalibrate now")
+    assert last().endswith("\ncalibration_recalibrate")
     older = copy.deepcopy(state)
     older.pop("eye_calibration")
     receive(older)

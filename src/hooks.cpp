@@ -1,3 +1,7 @@
+#include "vulkan_observer.hpp"
+#include "ngx_frame_contract.hpp"
+#include "exposure_diagnostics.hpp"
+#include "debug_exposure.hpp"
 #include "eye_calibration.hpp"
 #include "dlss_nr_input.hpp"
 #include <optional>
@@ -9,6 +13,8 @@
 #include "afw_compatibility.hpp"
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
+#include "rr_contract.hpp"
+#include "dlss_nr_lifetime.hpp"
 #include "ngx_runtime_discovery.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
@@ -21,6 +27,7 @@
 #include "settings.hpp"
 
 #include <Windows.h>
+#include <winver.h>
 #include <Psapi.h>
 #include <MinHook.h>
 
@@ -39,6 +46,7 @@
 #include <deque>
 #include <iterator>
 #include <mutex>
+#include <vector>
 
 namespace cheeky::foveated_dlss {
 
@@ -138,6 +146,7 @@ constexpr std::uint32_t sl_tag_depth = 0U;
 constexpr std::uint32_t sl_tag_motion_vectors = 1U;
 constexpr std::uint32_t sl_tag_scaling_input = 3U;
 constexpr std::uint32_t sl_tag_scaling_output = 4U;
+constexpr std::uint32_t sl_tag_exposure = 13U;
 constexpr std::size_t sl_tag_capacity = 73U;
 constexpr std::uint32_t sl_dlss_mode_dlaa = 6U;
 constexpr std::uint32_t peripheral_streamline_view_mask = 0x40000000U;
@@ -156,6 +165,17 @@ std::atomic<EvaluateD3D11CFn> real_evaluate_d3d11_c{};
 std::atomic<ReleaseD3D11Fn> real_release_d3d11{};
 std::atomic<ReleaseD3D11Fn> real_core_release_d3d11{};
 std::atomic<CreateD3D12Fn> real_create_d3d12{};
+std::atomic<CreateD3D12Fn> real_rr_create_d3d12{};
+std::atomic<EvaluateD3D12Fn> real_rr_evaluate_d3d12{};
+std::atomic<EvaluateD3D12CFn> real_rr_evaluate_d3d12_c{};
+std::atomic<ReleaseD3D12Fn> real_rr_release_d3d12{};
+thread_local bool inside_rr_runtime{};
+struct RrRuntimeScope {
+    bool previous{inside_rr_runtime};
+    explicit RrRuntimeScope(bool rr = true) { inside_rr_runtime = rr; }
+    ~RrRuntimeScope() { inside_rr_runtime = previous; }
+};
+
 std::atomic<CreateD3D12Fn> real_core_create_d3d12{};
 std::atomic<EvaluateD3D12Fn> real_evaluate_d3d12{};
 std::atomic<EvaluateD3D12Fn> real_core_evaluate_d3d12{};
@@ -257,14 +277,13 @@ void detect_afw_runtime() noexcept {
         !GetProcAddress(module, "InitDevice") || !GetProcAddress(module, "InitFrameWarp")) return;
     // Latch for this process. AFW's hooks also run during warmup and fallback.
     enable_afw_compatibility();
-    log_info("AFW compatibility: full-frame core passthrough, nested SR/NR processing with bilateral fixed/gaze coverage; marker calibration bypassed. Warp activity is reported separately from DLL detection.");
+    log_info("AFW detected: coverage follows the manual/automatic coverage settings; game-output marker calibration remains active. DLSS hook path follows the startup setting. Warp activity is reported separately from DLL detection.");
 }
 
 void afw_private_succeeded(const NgxHandle* handle) {
-    // Preserve ordinary Native Stereo/AFR fallback semantics when the AFW DLL
-    // is merely loaded. A pending reset from actual AFW work still survives
-    // a mode change and is consumed by the next successful native evaluation.
-    if (!afw_coverage_enabled()) return;
+    // Lower-hook private work leaves the native feature history stale. Reset
+    // it on the next successful full-frame fallback evaluation.
+    if (!d3d12_lower_hook_enabled()) return;
     std::lock_guard lock(d3d12_game_views_mutex);
     for (auto& view : d3d12_game_views)
         if (view.handle == handle) view.afw_native_history_stale = true;
@@ -275,7 +294,7 @@ struct AfwNativeResetScope {
     NgxParameters* parameters{};
     unsigned saved{};
     AfwNativeResetScope(const NgxHandle* h, const NgxParameters* p) : handle(h) {
-        if (!afw_compatibility_enabled() || !p) return;
+        if (!protected_ngx_core_enabled() || !p) return;
         std::lock_guard lock(d3d12_game_views_mutex);
         for (const auto& view : d3d12_game_views) {
             if (view.handle == h && view.afw_native_history_stale && ngx_succeeded(p->Get("Reset", &saved))) {
@@ -420,6 +439,9 @@ void initialize_hook_debug_crash_log_path() noexcept {
 }
 
 void hook_debug_emergency_logf(const char* const format, ...) noexcept {
+    // A hard per-process bound, including debugger output, even during fault storms.
+    static std::atomic<unsigned> lines{};
+    if (lines.fetch_add(1, std::memory_order_relaxed) >= 1024) return;
     char buffer[1024]{};
     va_list arguments;
     va_start(arguments, format);
@@ -454,6 +476,8 @@ void hook_debug_emergency_logf(const char* const format, ...) noexcept {
         nullptr
     );
     if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER existing{};
+    if (GetFileSizeEx(file, &existing) && existing.QuadPart >= 8LL*1024*1024) { CloseHandle(file); return; }
     DWORD written{};
     static_cast<void>(WriteFile(
         file,
@@ -495,6 +519,15 @@ LONG CALLBACK hook_debug_exception_handler(
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    static thread_local bool reporting{};
+    if (reporting) return EXCEPTION_CONTINUE_SEARCH;
+    static std::atomic<unsigned> exceptions{};
+    const unsigned exception_number = exceptions.fetch_add(1, std::memory_order_relaxed)+1;
+    if (exception_number > 1024 || (exception_number > 16 && (exception_number & (exception_number-1)) != 0)) return EXCEPTION_CONTINUE_SEARCH;
+    reporting = true;
+    struct ReportingReset { bool& flag; ~ReportingReset() { flag = false; } } reset{reporting};
+    hook_debug_emergency_logf("HOOKDBG EXCEPTION sampled_event=%u pid=%lu tick_ms=%llu (first16 then powers-of-two; capped)",
+        exception_number, GetCurrentProcessId(), GetTickCount64());
     const auto* const context = pointers->ContextRecord;
     void* instruction{};
     std::uintptr_t stack_pointer{};
@@ -1605,6 +1638,7 @@ void note_d3d12_present_impl(
     collect_dlss_nr_submissions();
     collect_peripheral_dlaa_resources();
     collect_crop_motion12();
+    collect_d3d12_resources();
     std::uint64_t present_frequency{};
     if (present_queue != nullptr) {
         static_cast<void>(present_queue->GetTimestampFrequency(&present_frequency));
@@ -1951,6 +1985,63 @@ struct StreamlineEvaluation {
         ? submit(&viewport, tags, count, command_list) : 0x18U;
 }
 
+// Use the source viewport's current tags, never a previous frame or private
+// viewport's absent ExposureTexture. A null exposure tag clears old bindings.
+CachedSlTag streamline_exposure_tag(const SlViewportHandle& viewport, const void* frame) {
+    CachedSlTag result{};
+    AcquireSRWLockShared(&streamline_lock);
+    for (const auto& cached : nr_viewports) {
+        if (cached.viewport.value != viewport.value) continue;
+        if (!cached.frame_tagging || cached.tags_frame == gaze_frame_key(frame))
+            result = cached.tags[sl_tag_exposure];
+        break;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    result.tag.resource = &result.resource;
+    return result;
+}
+std::uint32_t submit_streamline_private_tags(bool frame_tagging, const void* frame,
+    const SlViewportHandle& source, const SlViewportHandle& destination,
+    const SlResourceTag* tags, unsigned count, ID3D12GraphicsCommandList* list) {
+    if (count != 4) return 0x18U;
+    auto exposure = streamline_exposure_tag(source, frame);
+    if (!exposure.present) {
+        exposure.tag = tags[0];
+        exposure.tag.extent = {};
+        exposure.resource = *tags[0].resource;
+        exposure.resource.native = exposure.resource.memory = exposure.resource.view = nullptr;
+        exposure.resource.next = nullptr;
+    }
+    std::array<SlResourceTag, 5> complete{};
+    std::copy_n(tags, count, complete.begin());
+    complete[4] = exposure.tag;
+    complete[4].type = sl_tag_exposure;
+    complete[4].resource = &exposure.resource;
+    return submit_streamline_tags(frame_tagging, frame, destination, complete.data(), 5, list);
+}
+DebugExposure current_streamline_debug_exposure(const void* frame, const void* const* inputs, unsigned count) {
+    SlViewportHandle viewport{}; SlDlssOptions options{}; bool valid{};
+    AcquireSRWLockShared(&streamline_lock);
+    if (has_cached_sl_options && has_cached_sl_viewport &&
+        cached_sl_options_viewport.value == cached_sl_viewport.value) {
+        viewport = cached_sl_viewport; options = cached_sl_options;
+        valid = options.color_buffers_hdr == 1;
+    }
+    ReleaseSRWLockShared(&streamline_lock);
+    SlViewportHandle redirected{}; std::array<const void*,16> redirected_inputs{};
+    if (!valid || !prepare_streamline_sr_inputs(inputs,count,viewport,redirected,redirected_inputs)) return {};
+    const auto exposure = streamline_exposure_tag(viewport, frame);
+    if (!exposure.present || !exposure.resource.native || exposure.resource.state == 0xFFFFFFFFU) return {};
+    DebugExposure e{static_cast<ID3D12Resource*>(exposure.resource.native),
+        static_cast<D3D12_RESOURCE_STATES>(exposure.resource.state), options.pre_exposure, options.exposure_scale};
+    if (exposure_log_due(13,viewport.value)) {
+        const auto d=e.texture->GetDesc();
+        trace_event("EXPOSURE v2 source=StreamlineGame viewport=%u pre=%.9g scale=%.9g texture=%p format=%u size=%llux%u state=0x%X gpu_normalization=%u",
+            viewport.value,e.pre,e.scale,e.texture,unsigned(d.Format),d.Width,d.Height,unsigned(e.state),unsigned(debug_exposure_supported(e)));
+    }
+    return debug_exposure_supported(e) ? e : DebugExposure{};
+}
+
 [[nodiscard]] bool evaluate_streamline_peripheral_dlaa(
     ID3D12GraphicsCommandList* const command_list,
     const void* const frame,
@@ -2128,8 +2219,8 @@ struct StreamlineEvaluation {
     tags[3U].resource = &resources[3U];
     tags[3U].extent = {0U, 0U, working_width, working_height};
 
-    const auto tag_result = submit_streamline_tags(
-        evaluation.frame_tagging, frame, peripheral_viewport, tags.data(),
+    const auto tag_result = submit_streamline_private_tags(
+        evaluation.frame_tagging, frame, evaluation.viewport, peripheral_viewport, tags.data(),
         static_cast<std::uint32_t>(tags.size()), command_list
     );
     if (tag_result != 0U) {
@@ -2383,7 +2474,9 @@ struct StreamlineEvaluation {
         streamline_view_id,
         backend_settings,
         verbose,
-        sequence
+        sequence,
+        static_cast<D3D12_RESOURCE_STATES>(color_tag.resource->state),
+        static_cast<D3D12_RESOURCE_STATES>(output_tag.resource->state)
     );
     }
     if (evaluation.backend == nullptr) {
@@ -2637,8 +2730,8 @@ struct StreamlineEvaluation {
         } else motion_reset = true;
     }
 
-    const auto tag_result = submit_streamline_tags(
-        evaluation.frame_tagging, frame, evaluation.cropped_viewport, evaluation.tags.data(),
+    const auto tag_result = submit_streamline_private_tags(
+        evaluation.frame_tagging, frame, evaluation.viewport, evaluation.cropped_viewport, evaluation.tags.data(),
         static_cast<std::uint32_t>(evaluation.tags.size()), command_list
     );
     if (tag_result != 0U) {
@@ -2987,6 +3080,12 @@ std::uint32_t hook_sl_dlss_set_options(
     ReleaseSRWLockExclusive(&streamline_lock);
     if (!supported) return result;
 
+    if (exposure_log_due(1, view->value)) {
+        trace_event("EXPOSURE v1 tick=%llu api=Streamline viewport=%u options_version=%u pre=%.9g scale=%.9g hdr=%u auto_exposure=%u (game options; metadata_only; support_capture; 5s/view)",
+            GetTickCount64(), view->value, options->struct_version, options->pre_exposure,
+            options->exposure_scale, unsigned(options->color_buffers_hdr), unsigned(options->use_auto_exposure));
+    }
+
     static std::atomic<bool> logged_state_initialized{};
     static std::atomic<std::uint32_t> logged_state_mode{0xFFFFFFFFU};
     static std::atomic<std::uint32_t> logged_state_width{};
@@ -3210,9 +3309,14 @@ std::uint32_t hook_sl_evaluate_feature(
         );
     }
     if (original == nullptr) return 0x18U;
+    // A Vulkan command buffer is a dispatchable handle, never an IUnknown.
+    // Streamline's native NGX calls already carry the full Vulkan contract;
+    // use that same processing path without rewriting tags or options twice.
+    if(command_buffer && vulkan_command_device(static_cast<VkCommandBuffer>(command_buffer)))
+        return original(feature,frame,inputs,input_count,command_buffer);
     detect_afw_runtime();
-    if (afw_coverage_enabled() && feature == 0U) {
-        // Keep the game's viewport/tags/options intact through AFW. The nested
+    if (d3d12_lower_hook_enabled() && feature == 0U) {
+        // Keep the game's viewport/tags/options intact through upstream hooks. The nested
         // native DX12 path owns SR. DX11 still needs normal option discovery
         // and native-fallback handling even when the AFW DLL is loaded.
         ID3D12GraphicsCommandList* dx12{};
@@ -3298,6 +3402,7 @@ std::uint32_t hook_sl_evaluate_feature(
             current_settings().enabled ? "yes" : "no"
         );
     }
+    const DebugExposureScope exposure_scope(current_streamline_debug_exposure(frame, inputs, input_count));
     const auto live_settings = current_settings();
     NrPipelineTimingScope pipeline_timing{static_cast<ID3D12GraphicsCommandList*>(command_buffer), live_settings};
     StreamlineNrInputScope nr_input{static_cast<ID3D12GraphicsCommandList*>(command_buffer),
@@ -3636,40 +3741,123 @@ NgxResult hook_core_shutdown_d3d12_1(ID3D12Device* const device) {
     return original == nullptr ? 0xBAD00007U : original(device);
 }
 
+[[nodiscard]] HMODULE find_core_runtime() noexcept {
+    // Keep exactly one core callback family for the process. In particular,
+    // NVIDIA's nvngx.dll can later load _nvngx.dll internally; switching then
+    // would cross-wire its wrappers with the second DLL's feature handles.
+    static std::atomic<HMODULE> selected{};
+    if (const auto result = selected.load(std::memory_order_acquire)) return result;
+    static std::mutex discovery_mutex;
+    static HMODULE rejected_alias{};
+    try {
+        std::lock_guard lock(discovery_mutex);
+        if (const auto result = selected.load(std::memory_order_relaxed)) return result;
+        auto candidate = GetModuleHandleW(L"_nvngx.dll");
+        if (!candidate) {
+            candidate = GetModuleHandleW(L"nvngx.dll");
+            if (!candidate || candidate == rejected_alias) return nullptr;
+            std::array<wchar_t, 32768> path{};
+            const auto length = GetModuleFileNameW(candidate, path.data(), static_cast<DWORD>(path.size()));
+            if (!length || length >= path.size()) return nullptr;
+            const auto complete_api = [&](const char* create, const char* evaluate, const char* release) {
+                return GetProcAddress(candidate, create) && GetProcAddress(candidate, evaluate) &&
+                    GetProcAddress(candidate, release);
+            };
+            const bool complete_exports = complete_api("NVSDK_NGX_D3D11_CreateFeature",
+                "NVSDK_NGX_D3D11_EvaluateFeature", "NVSDK_NGX_D3D11_ReleaseFeature") ||
+                complete_api("NVSDK_NGX_D3D12_CreateFeature", "NVSDK_NGX_D3D12_EvaluateFeature",
+                    "NVSDK_NGX_D3D12_ReleaseFeature");
+            const bool proxy_exports = GetProcAddress(candidate, "InitializeASI") ||
+                GetProcAddress(candidate, "CreateDXGIFactory") || GetProcAddress(candidate, "NVSDK_NGX_GetSnippetVersion");
+            DWORD unused{};
+            const DWORD bytes = GetFileVersionInfoSizeW(path.data(), &unused);
+            bool accepted{};
+            if (bytes && bytes <= 1024U * 1024U && complete_exports && !proxy_exports) {
+                std::vector<std::byte> version(bytes);
+                if (GetFileVersionInfoW(path.data(), 0, bytes, version.data())) {
+                    struct Translation { WORD language, code_page; };
+                    Translation* translations{};
+                    UINT size{};
+                    if (VerQueryValueW(version.data(), L"\\VarFileInfo\\Translation",
+                            reinterpret_cast<void**>(&translations), &size)) {
+                        for (UINT i = 0; i < size / sizeof(Translation) && i < 32U && !accepted; ++i) {
+                            const auto field = [&](const wchar_t* key) -> std::wstring_view {
+                                wchar_t query[128]{};
+                                swprintf_s(query, L"\\StringFileInfo\\%04x%04x\\%ls",
+                                    translations[i].language, translations[i].code_page, key);
+                                wchar_t* value{}; UINT chars{};
+                                if (!VerQueryValueW(version.data(), query, reinterpret_cast<void**>(&value), &chars) ||
+                                    !value || !chars) return {};
+                                return {value, wcsnlen_s(value, chars)};
+                            };
+                            accepted = is_nvidia_ngx_core_alias_identity({path.data(), length}, field(L"CompanyName"),
+                                field(L"OriginalFilename"), field(L"ProductName"), complete_exports, proxy_exports);
+                        }
+                    }
+                }
+            }
+            if (!accepted) {
+                rejected_alias = candidate;
+                trace_event("NGX core alias ignored: nvngx.dll is not an identified NVIDIA core (%ls)", path.data());
+                return nullptr;
+            }
+        }
+        HMODULE retained{};
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                reinterpret_cast<LPCWSTR>(candidate), &retained) || retained != candidate) return nullptr;
+        selected.store(retained, std::memory_order_release);
+        trace_event("NGX core callback owner selected module=%p (retained until game exit)", retained);
+        return retained;
+    } catch (...) { return nullptr; }
+}
+
 [[nodiscard]] D3D11TransportNgx current_transport_ngx() noexcept {
-    D3D11TransportNgx ngx{};
-    ngx.runtime_module = GetModuleHandleW(L"_nvngx.dll");
-    if (ngx.runtime_module != nullptr) {
-        ngx.init_ext = reinterpret_cast<NgxD3D12InitExtFn>(GetProcAddress(
-            ngx.runtime_module, "NVSDK_NGX_D3D12_Init_Ext"
-        ));
-        ngx.allocate_parameters =
-            reinterpret_cast<NgxD3D12AllocateParametersFn>(GetProcAddress(
-                ngx.runtime_module, "NVSDK_NGX_D3D12_AllocateParameters"
-            ));
-        ngx.backend.create_feature = real_core_create_d3d12.load(
-            std::memory_order_acquire
-        );
-        ngx.backend.evaluate_feature = real_core_evaluate_d3d12.load(
-            std::memory_order_acquire
-        );
-        ngx.backend.release_feature = real_core_release_d3d12.load(
-            std::memory_order_acquire
-        );
-        ngx.shutdown = real_core_shutdown_d3d12_1.load(
-            std::memory_order_acquire
-        );
-    }
+    // Transport owns a private device and private feature handles. A core
+    // trampoline can still chain into a game's VR hook (RealVR hooks the core
+    // DX12 evaluator even in DX11 games). Its game-device state is not valid
+    // for this private device. Create/evaluate/release handles in the SR
+    // snippet; never mix a core handle with a snippet evaluator. Initialization
+    // still goes through core: SR's Init_Ext validates its caller as NGX.
+    static std::mutex selection_mutex;
+    static D3D11TransportNgx selected{};
+    std::lock_guard lock(selection_mutex);
+    if (selected.runtime_module) return selected;
+
+    const auto core_runtime = find_core_runtime();
     const auto public_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
-    if (public_runtime != nullptr) {
-        ngx.get_application_id = reinterpret_cast<NgxGetApplicationIdFn>(
-            GetProcAddress(public_runtime, "NVSDK_NGX_GetApplicationId")
-        );
-        ngx.get_api_version = reinterpret_cast<NgxGetApiVersionFn>(
-            GetProcAddress(public_runtime, "NVSDK_NGX_GetAPIVersion")
-        );
-    }
-    return ngx;
+    const auto get_proc = real_get_proc_address.load(std::memory_order_acquire);
+    if (!core_runtime || !public_runtime || !get_proc ||
+        !get_proc(public_runtime, "NVSDK_NGX_GetSnippetVersion")) return {};
+
+    D3D11TransportNgx ngx{};
+    ngx.init_ext = reinterpret_cast<NgxD3D12InitExtFn>(
+        get_proc(core_runtime, "NVSDK_NGX_D3D12_Init_Ext"));
+    // Core initializes the snippet on our device and supplies parameters.
+    // Feature handles and their evaluation remain entirely in the snippet.
+    ngx.allocate_parameters = reinterpret_cast<NgxD3D12AllocateParametersFn>(
+        get_proc(core_runtime, "NVSDK_NGX_D3D12_AllocateParameters"));
+    ngx.backend = {
+        real_create_d3d12.load(std::memory_order_acquire),
+        real_evaluate_d3d12.load(std::memory_order_acquire),
+        real_release_d3d12.load(std::memory_order_acquire),
+    };
+    ngx.shutdown = real_shutdown_d3d12_1.load(std::memory_order_acquire);
+    ngx.get_application_id = reinterpret_cast<NgxGetApplicationIdFn>(
+        get_proc(public_runtime, "NVSDK_NGX_GetApplicationId"));
+    ngx.get_api_version = reinterpret_cast<NgxGetApiVersionFn>(
+        get_proc(public_runtime, "NVSDK_NGX_GetAPIVersion"));
+    if (!ngx.init_ext || !ngx.allocate_parameters || !ngx.shutdown ||
+        !ngx.backend.create_feature || !ngx.backend.evaluate_feature ||
+        !ngx.backend.release_feature) return {};
+
+    // Keep one owner and callback family for every existing transport handle.
+    HMODULE retained{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(public_runtime), &retained) || retained != public_runtime) return {};
+    ngx.runtime_module = core_runtime;
+    selected = ngx;
+    trace_event("Private DX12 transport uses core initialization module=%p and SR snippet feature callbacks module=%p", core_runtime, retained);
+    return selected;
 }
 
 constexpr std::array<const char*, 6U> dlss_preset_parameter_names{
@@ -3685,25 +3873,27 @@ class NgxPresetOverrideScope {
 public:
     NgxPresetOverrideScope(
         const NgxParameters* const parameters,
-        const std::uint32_t preset
+        const std::uint32_t preset,
+        const bool rr = false
     ) noexcept {
+        names_ = rr ? rr_presets : dlss_preset_parameter_names.data();
         if (parameters == nullptr || preset == 0U) return;
         parameters_ = const_cast<NgxParameters*>(parameters);
         for (std::size_t index{}; index < saved_.size(); ++index) {
             int signed_value{};
             if (ngx_succeeded(parameters_->Get(
-                    dlss_preset_parameter_names[index],
+                    names_[index],
                     &signed_value
                 ))) {
                 saved_[index] = static_cast<std::uint32_t>(signed_value);
             } else {
                 saved_[index] = get_ui(
                     parameters_,
-                    dlss_preset_parameter_names[index]
+                    names_[index]
                 );
             }
             parameters_->Set(
-                dlss_preset_parameter_names[index],
+                names_[index],
                 preset
             );
         }
@@ -3714,7 +3904,7 @@ public:
         if (!active_ || parameters_ == nullptr) return;
         for (std::size_t index{}; index < saved_.size(); ++index) {
             parameters_->Set(
-                dlss_preset_parameter_names[index],
+                names_[index],
                 saved_[index]
             );
         }
@@ -3724,6 +3914,7 @@ public:
     ~NgxPresetOverrideScope() { restore(); }
 
 private:
+    const char* const* names_{};
     NgxParameters* parameters_{};
     std::array<std::uint32_t, 6U> saved_{};
     bool active_{};
@@ -3761,6 +3952,31 @@ void prepare_d3d11_direct_peripheral(
     ));
 }
 
+// Bound creation diagnostics per route and feature: first eight, then powers of two.
+// These report observed calls, not proof that a created feature was evaluated.
+template<class Fn, class Context>
+NgxResult traced_feature_create(Fn original, Context context, std::uint32_t feature,
+    NgxParameters* parameters, NgxHandle** handle, unsigned route) {
+    static std::array<std::array<std::atomic<std::uint64_t>, 16>, 4> counts{};
+    const auto count = ++counts[route][(std::min)(feature, 15U)];
+    const bool report = count <= 8 || (count & (count-1)) == 0;
+    const char* routes[]{"D3D11-public", "D3D11-core", "D3D12-public", "D3D12-core"};
+    const char* name = feature == 1 ? "SR" : feature == 11 ? "FrameGeneration" :
+        feature == 13 ? "RayReconstruction" : "Other";
+    const auto creation_started = GetTickCount64();
+    if (report) trace_event("FEATURE_CREATE begin route=%s feature=%u(%s) count=%llu input=%ux%u output=%ux%u flags=0x%08X original=%p context=%p",
+        routes[route], feature, name, count, parameters ? get_ui(parameters,"Width") : 0,
+        parameters ? get_ui(parameters,"Height") : 0, parameters ? get_ui(parameters,"OutWidth") : 0,
+        parameters ? get_ui(parameters,"OutHeight") : 0,
+        parameters && (feature == 1 || feature == 13) ? get_ngx_integer_bits(parameters,"DLSS.Feature.Create.Flags") : 0,
+        reinterpret_cast<void*>(original), context);
+    const auto result = original(context, feature, parameters, handle);
+    if (report) trace_event("FEATURE_CREATE end route=%s feature=%u(%s) count=%llu result=0x%08X handle=%p elapsed_ms=%llu",
+        routes[route], feature, name, count, unsigned(result),
+        ngx_succeeded(result) && handle ? *handle : nullptr, GetTickCount64()-creation_started);
+    return result;
+}
+
 NgxResult hook_create_d3d11(
     ID3D11DeviceContext* const context,
     const std::uint32_t feature,
@@ -3774,7 +3990,7 @@ NgxResult hook_create_d3d11(
     // Do not force output subrects on the game's feature. The foveated DX11
     // path uses a separate private feature whose creation-time output size is
     // the crop size, so the game feature can keep its original contract.
-    const auto result = original(context, feature, parameters, handle);
+    const auto result = traced_feature_create(original, context, feature, parameters, handle, 0);
     if (ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
         feature == 1U) {
         register_d3d11_game_feature(
@@ -3800,7 +4016,7 @@ NgxResult hook_core_create_d3d11(
     if (original == nullptr) return 0xBAD00007U;
     diagnostic_note_create(DiagnosticApi::d3d11);
 
-    const auto result = original(context, feature, parameters, handle);
+    const auto result = traced_feature_create(original, context, feature, parameters, handle, 1);
     if (ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
         feature == 1U) {
         register_d3d11_game_feature(
@@ -4103,6 +4319,8 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
         bool outer = calibration_evaluation_depth++ == 0;
         ~Depth() { --calibration_evaluation_depth; }
     } depth;
+    if (depth.outer && !is_d3d11_private_handle(handle))
+        log_ngx_exposure<ID3D11Resource>(11, handle, parameters);
     const auto result = invoke();
     // All temporary NGX parameters and private composites have been restored
     // before this point. Tag only the outer game evaluation's final output.
@@ -4156,18 +4374,18 @@ NgxResult hook_core_release_d3d11(NgxHandle* const handle) {
     return original == nullptr ? 0xBAD00007U : original(handle);
 }
 
-NgxResult hook_create_d3d12(
+NgxResult runtime_create_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const std::uint32_t feature,
     NgxParameters* const parameters,
     NgxHandle** const handle
 ) {
-    const auto original = real_create_d3d12.load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_create_d3d12 : real_create_d3d12).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
-        return original(command_list, feature, parameters, handle);
+        return traced_feature_create(original, command_list, feature, parameters, handle, 2);
     }
     if (feature == 1U && parameters && streamline_create_width && streamline_create_height) {
         trace_event("SL center NGX create input optimal=%ux%u actual=%ux%u output=%ux%u flags=0x%08X",
@@ -4188,7 +4406,7 @@ NgxResult hook_create_d3d12(
         captured_d3d12_create_flags_valid.store(true, std::memory_order_release);
     }
     const NgxOutputExtent output_extent{get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight")};
-    const auto result = original(command_list, feature, parameters, handle);
+    const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 2);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
     }
@@ -4204,14 +4422,14 @@ NgxResult hook_core_create_d3d12(
     const auto original = real_core_create_d3d12.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
-    if (afw_compatibility_enabled()) {
+    if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
         // Let the lower create hook track its own handle and output contract.
-        return original(command_list, feature, parameters, handle);
+        return traced_feature_create(original, command_list, feature, parameters, handle, 3);
     }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
-        return original(command_list, feature, parameters, handle);
+        return traced_feature_create(original, command_list, feature, parameters, handle, 3);
     }
     if (feature == 1U && parameters && streamline_create_width && streamline_create_height) {
         trace_event("SL center NGX create input optimal=%ux%u actual=%ux%u output=%ux%u flags=0x%08X",
@@ -4232,7 +4450,7 @@ NgxResult hook_core_create_d3d12(
         captured_d3d12_create_flags_valid.store(true, std::memory_order_release);
     }
     const NgxOutputExtent output_extent{get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight")};
-    const auto result = original(command_list, feature, parameters, handle);
+    const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 3);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
     }
@@ -4438,46 +4656,16 @@ void evaluate_nr_after_native_d3d12(
 
     AfwPrivateWorkScope afw_private_work;
     DlssFrameContract contract{};
-    contract.view_id = static_cast<DlssViewId>(
-        reinterpret_cast<std::uintptr_t>(handle)
-    );
-    contract.feature_id = d3d12_game_feature(handle);
-    contract.render_width = get_ui(parameters, "Width");
-    contract.render_height = get_ui(parameters, "Height");
-    const auto subrect_width = get_ui(
-        parameters, "DLSS.Render.Subrect.Dimensions.Width"
-    );
-    const auto subrect_height = get_ui(
-        parameters, "DLSS.Render.Subrect.Dimensions.Height"
-    );
-    if (subrect_width != 0U) contract.render_width = subrect_width;
-    if (subrect_height != 0U) contract.render_height = subrect_height;
-    contract.output_width = get_ui(parameters, "OutWidth");
-    contract.output_height = get_ui(parameters, "OutHeight");
-    if (!contract.render_width || !contract.render_height ||
-        !contract.output_width || !contract.output_height) return false;
-    contract.color_base_x = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.X");
-    contract.color_base_y = get_ui(parameters, "DLSS.Input.Color.Subrect.Base.Y");
-    contract.depth_base_x = get_ui(parameters, "DLSS.Input.Depth.Subrect.Base.X");
-    contract.depth_base_y = get_ui(parameters, "DLSS.Input.Depth.Subrect.Base.Y");
-    contract.mv_base_x = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.X");
-    contract.mv_base_y = get_ui(parameters, "DLSS.Input.MV.Subrect.Base.Y");
-    contract.output_base_x = get_ui(parameters, "DLSS.Output.Subrect.Base.X");
-    contract.output_base_y = get_ui(parameters, "DLSS.Output.Subrect.Base.Y");
-    if (!try_get_ngx_integer_bits(parameters, "DLSS.Feature.Create.Flags", contract.create_flags))
+    if (!read_ngx_frame_contract(parameters, reinterpret_cast<std::uintptr_t>(handle),
+            d3d12_game_feature(handle), contract)) return false;
+
+    const bool rr = contract.feature_id == 13U;
+    if (rr && !rr_crop_supported(parameters, contract)) {
+        static std::atomic<unsigned> unsupported_rr{};
+        if (unsupported_rr.fetch_add(1) < 8)
+            trace_event("RR crop unavailable: missing/invalid guides, output alpha, high-resolution motion or legacy research input; keeping native RR and optional NR");
         return false;
-    contract.motion_vectors_low_res =
-        (contract.create_flags & (1U << 1U)) != 0U;
-    contract.depth_inverted = (contract.create_flags & (1U << 3U)) != 0U;
-    contract.reset = get_ui(parameters, "Reset") != 0U;
-    if (!try_get_ngx_integer_bits(parameters, "PerfQualityValue", contract.perf_quality))
-        return false;
-    contract.motion_vector_scale_x = get_d3d12_parameter_float(
-        parameters, "MV.Scale.X", 1.0F
-    );
-    contract.motion_vector_scale_y = get_d3d12_parameter_float(
-        parameters, "MV.Scale.Y", 1.0F
-    );
+    }
 
     const auto effective_settings = settings_for_view(settings, contract.view_id);
 
@@ -4487,6 +4675,14 @@ void evaluate_nr_after_native_d3d12(
         get_d3d12_parameter_resource(parameters, "MotionVectors");
     auto* const full_output = get_d3d12_parameter_resource(parameters, "Output");
     if (!full_color || !full_depth || !full_motion || !full_output) return false;
+    // Check tracking before peripheral DLAA as well as center allocation. A
+    // rejected center must not leave private work recorded on an untracked list.
+    if (!ensure_dlss_nr_recording(command_list)) {
+        static std::atomic<unsigned> rejected{};
+        if (rejected.fetch_add(1) < 8)
+            trace_event("D3D12 SR preparation rejected: command-list recording/observer unavailable list=%p", command_list);
+        return false;
+    }
     const auto full_color_x = contract.color_base_x;
     const auto full_color_y = contract.color_base_y;
     const auto full_depth_x = contract.depth_base_x;
@@ -4498,12 +4694,13 @@ void evaluate_nr_after_native_d3d12(
 
     PeripheralDlaaResources peripheral{};
     bool peripheral_ready{};
-    if (effective_settings.peripheral_dlaa_enabled &&
-        contract.feature_id == 1U &&
+    if ((rr || effective_settings.peripheral_dlaa_enabled) &&
+        (contract.feature_id == 1U || rr) &&
         full_color != nullptr && full_depth != nullptr &&
         full_motion != nullptr && full_output != nullptr) {
         PeripheralDlaaRequest peripheral_request{};
         peripheral_request.view_id = contract.view_id;
+        peripheral_request.feature_id = contract.feature_id;
         peripheral_request.command_list = command_list;
         peripheral_request.color = full_color;
         peripheral_request.depth = full_depth;
@@ -4513,8 +4710,8 @@ void evaluate_nr_after_native_d3d12(
         peripheral_request.render_height = contract.render_height;
         peripheral_request.source_output_width = contract.output_width;
         peripheral_request.source_output_height = contract.output_height;
-        peripheral_request.scale = effective_settings.peripheral_dlaa_scale;
-        peripheral_request.preset = effective_settings.peripheral_dlaa_preset;
+        peripheral_request.scale = rr && !effective_settings.peripheral_dlaa_enabled ? 1.F : effective_settings.peripheral_dlaa_scale;
+        peripheral_request.preset = rr ? effective_settings.rr_peripheral_preset : effective_settings.peripheral_dlaa_preset;
         peripheral_request.color_base_x = full_color_x;
         peripheral_request.color_base_y = full_color_y;
         peripheral_request.depth_base_x = full_depth_x;
@@ -4544,12 +4741,15 @@ void evaluate_nr_after_native_d3d12(
         peripheral_timing.finish(peripheral_ready);
     }
 
+    // No raw noisy ray-traced color may become the RR composite background.
+    if (rr && !peripheral_ready) return false;
+
     // The periphery owns a separate temporal feature. Skipping it invalidates
     // that history even when the center continues to evaluate successfully.
     if (!peripheral_ready) skip_d3d12_history(peripheral_dlaa_view_id(contract.view_id));
 
     NgxPresetOverrideScope center_preset{
-        parameters, effective_settings.center_preset
+        parameters, rr ? effective_settings.rr_center_preset : effective_settings.center_preset, rr
     };
     auto* const evaluation = prepare_d3d12(
         command_list,
@@ -4565,8 +4765,11 @@ void evaluate_nr_after_native_d3d12(
     }
     contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
     contract.motion_vectors_low_res = d3d12_evaluation_low_res_motion(evaluation);
+    // RR also accumulates temporal history. Its cropped projection/guide bases
+    // and the backend's crop-relative vectors must describe the same movement.
+    // Resetting on every small movement prevents the denoiser from converging.
     contract.preserve_history_on_crop_move =
-        uses_coordinated_center(settings) || settings.eye_independent_coverage;
+        rr || uses_coordinated_center(settings) || settings.eye_independent_coverage;
     private_attempted = true;
 
     if (peripheral_ready && !d3d12_set_composite_base(
@@ -4577,6 +4780,10 @@ void evaluate_nr_after_native_d3d12(
         )) {
         restore_peripheral_dlaa_output(command_list, peripheral);
         peripheral_ready = false;
+        if (rr) {
+            finish_d3d12(command_list, parameters, evaluation, 0xBAD00005U);
+            return false;
+        }
     }
 
     D3D12DlssInputs inputs{};
@@ -4604,11 +4811,23 @@ void evaluate_nr_after_native_d3d12(
     D3D12PeripheralTimingScope sr_timing{
         command_list, D3D12TimingKind::foveated_dlss
     };
-    result = evaluate_d3d12_backend(
+    const auto evaluate_center = [&] { return evaluate_d3d12_backend(
         command_list, contract, inputs,
         const_cast<NgxParameters*>(parameters),
         d3d12_reconstruction_crop(evaluation), callbacks, sr_timing.backend(), &crop
-    );
+    ); };
+    if (rr) {
+        d3d12_align_reconstruction_grid(evaluation);
+        RrCropScope rr_crop{const_cast<NgxParameters*>(parameters), contract, crop};
+        RrInputCopiesScope copies{command_list,const_cast<NgxParameters*>(parameters),crop};
+        if (copies.ready()) {
+            inputs.color=get_d3d12_parameter_resource(parameters,"Color");
+            inputs.depth=get_d3d12_parameter_resource(parameters,"Depth");
+            inputs.motion_vectors=get_d3d12_parameter_resource(parameters,"MotionVectors");
+            inputs.color_base_x=inputs.color_base_y=inputs.depth_base_x=inputs.depth_base_y=inputs.mv_base_x=inputs.mv_base_y=0;
+            result = evaluate_center();
+        } else result=0xBAD00005U;
+    } else result = evaluate_center();
     sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
     const auto nr_center = d3d12_evaluation_center(evaluation);
@@ -4628,6 +4847,10 @@ void evaluate_nr_after_native_d3d12(
 [[nodiscard]] D3D12BackendCallbacks d3d12_backend_callbacks(
     const D3D12NgxRoute route
 ) noexcept {
+    if (inside_rr_runtime) return {
+        real_rr_create_d3d12.load(std::memory_order_acquire),
+        real_rr_evaluate_d3d12.load(std::memory_order_acquire),
+        real_rr_release_d3d12.load(std::memory_order_acquire)};
     if (route == D3D12NgxRoute::core_runtime) {
         return {
             real_core_create_d3d12.load(std::memory_order_acquire),
@@ -4668,6 +4891,7 @@ NgxResult process_d3d12_evaluation_impl(
     const D3D12NgxEvaluateFn original,
     void*
 ) {
+    log_ngx_exposure<ID3D12Resource>(12, call.handle, call.parameters);
     if (!has_d3d12_game_view(call.handle)) {
         if (!recognizable_d3d12_dlss_evaluation(call)) {
             return original(
@@ -4679,8 +4903,9 @@ NgxResult process_d3d12_evaluation_impl(
         }
         // Both public and core runtimes can predate injection. Track adopted
         // game handles so release also cleans up private views and GPU state.
-        remember_d3d12_game_view(call.handle, 1U);
+        remember_d3d12_game_view(call.handle, inside_rr_runtime ? 13U : 1U);
     }
+    diagnostic_note_reconstruction_feature(DiagnosticApi::d3d12, d3d12_game_feature(call.handle));
     note_evaluation_begin(DiagnosticApi::d3d12, call.parameters);
     diagnostic_note_d3d12_ngx_route(call.route);
     static std::atomic<std::uint32_t> route_logs{};
@@ -4716,7 +4941,6 @@ NgxResult process_d3d12_evaluation_impl(
             get_ui(call.parameters, "DLSS.Output.Subrect.Base.X"), get_ui(call.parameters, "DLSS.Output.Subrect.Base.Y"));
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
-        if (d3d12_game_feature(call.handle) != 1U) settings.enabled = false;
     }
     NrPipelineTimingScope pipeline_timing{call.command_list, settings};
     NativeNrInputScope nr_input{call.command_list, call.handle, call.parameters, settings};
@@ -4776,7 +5000,6 @@ NgxResult process_d3d12_evaluation_impl(
 
 void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxResult result) {
-    if (afw_coverage_enabled()) return;
     if (!eye_calibration_enabled() || calibration_evaluation_depth || inside_streamline_evaluation || !ngx_succeeded(result)) return;
     const D3D12NgxEvaluationCall call{D3D12NgxRoute::public_runtime, list, handle, parameters, nullptr};
     if (!recognizable_d3d12_dlss_evaluation(call) || !has_d3d12_game_view(handle)) return;
@@ -4803,13 +5026,13 @@ void skip_d3d12_evaluation(const D3D12NgxEvaluationCall& call) {
     skip_dlss_nr_history(view_id);
 }
 
-NgxResult hook_evaluate_d3d12(
+NgxResult runtime_evaluate_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxHandle* const handle,
     const NgxParameters* const parameters,
     const NgxProgressCallback callback
 ) {
-    const auto original = real_evaluate_d3d12.load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12 : real_evaluate_d3d12).load(std::memory_order_acquire);
     detect_afw_runtime();
     return dispatch_d3d12_ngx_evaluation(
         {
@@ -4855,7 +5078,7 @@ NgxResult evaluate_d3d12_c_impl(
     const NgxParameters* const parameters,
     const NgxProgressCallbackC callback
 ) {
-    const auto original = real_evaluate_d3d12_c.load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12_c : real_evaluate_d3d12_c).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
     if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
@@ -4871,8 +5094,9 @@ NgxResult evaluate_d3d12_c_impl(
             command_list, handle, parameters, nullptr};
         if (!recognizable_d3d12_dlss_evaluation(call))
             return original(command_list, handle, parameters, callback);
-        remember_d3d12_game_view(handle, 1U);
+        remember_d3d12_game_view(handle, inside_rr_runtime ? 13U : 1U);
     }
+    diagnostic_note_reconstruction_feature(DiagnosticApi::d3d12, d3d12_game_feature(handle));
     note_evaluation_begin(DiagnosticApi::d3d12, parameters);
     diagnostic_note_d3d12_ngx_route(D3D12NgxRoute::public_runtime);
     if (inside_streamline_evaluation) {
@@ -4898,7 +5122,6 @@ NgxResult evaluate_d3d12_c_impl(
             get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"));
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
-        if (d3d12_game_feature(handle) != 1U) settings.enabled = false;
     }
     NrPipelineTimingScope pipeline_timing{command_list, settings};
     NativeNrInputScope nr_input{command_list, handle, parameters, settings};
@@ -4946,7 +5169,7 @@ NgxResult evaluate_d3d12_c_impl(
     return result;
 }
 
-NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+NgxResult runtime_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallbackC callback) {
     const bool outer = !d3d12_ngx_interception_active();
     const auto result = evaluate_d3d12_c_impl(list, handle, parameters, callback);
@@ -4954,8 +5177,8 @@ NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle
     return result;
 }
 
-NgxResult hook_release_d3d12(NgxHandle* const handle) {
-    const auto original = real_release_d3d12.load(std::memory_order_acquire);
+NgxResult runtime_release_d3d12(NgxHandle* const handle) {
+    const auto original = (inside_rr_runtime ? real_rr_release_d3d12 : real_release_d3d12).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) return original(handle);
@@ -4969,7 +5192,7 @@ NgxResult hook_core_release_d3d12(NgxHandle* const handle) {
     );
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
-    if (afw_compatibility_enabled()) {
+    if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
         return original(handle);
     }
@@ -4977,6 +5200,46 @@ NgxResult hook_core_release_d3d12(NgxHandle* const handle) {
     if (!scope.outermost()) return original(handle);
     if (has_d3d12_game_view(handle)) forget_d3d12_game_view(handle);
     return original(handle);
+}
+
+NgxResult hook_create_d3d12(ID3D12GraphicsCommandList* list, unsigned feature,
+    NgxParameters* parameters, NgxHandle** handle) {
+    RrRuntimeScope scope{false};
+    return runtime_create_d3d12(list, feature, parameters, handle);
+}
+NgxResult hook_evaluate_d3d12(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallback callback) {
+    RrRuntimeScope scope{false};
+    return runtime_evaluate_d3d12(list, handle, parameters, callback);
+}
+NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    RrRuntimeScope scope{false};
+    return runtime_evaluate_d3d12_c(list, handle, parameters, callback);
+}
+NgxResult hook_release_d3d12(NgxHandle* handle) {
+    RrRuntimeScope scope{false};
+    return runtime_release_d3d12(handle);
+}
+
+NgxResult hook_rr_create_d3d12(ID3D12GraphicsCommandList* list, unsigned feature,
+    NgxParameters* parameters, NgxHandle** handle) {
+    RrRuntimeScope scope;
+    return runtime_create_d3d12(list, feature, parameters, handle);
+}
+NgxResult hook_rr_evaluate_d3d12(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallback callback) {
+    RrRuntimeScope scope;
+    return runtime_evaluate_d3d12(list, handle, parameters, callback);
+}
+NgxResult hook_rr_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    RrRuntimeScope scope;
+    return runtime_evaluate_d3d12_c(list, handle, parameters, callback);
+}
+NgxResult hook_rr_release_d3d12(NgxHandle* handle) {
+    RrRuntimeScope scope;
+    return runtime_release_d3d12(handle);
 }
 
 template <typename Function>
@@ -5360,7 +5623,7 @@ template <typename T>
     return true;
 }
 
-[[nodiscard]] HMODULE find_afw_sr_runtime() noexcept {
+[[nodiscard]] HMODULE find_sr_feature_runtime() noexcept {
     // One callback set owns one snippet for this process. Retain the selected
     // image so a later unload/reload cannot leave its detours or private feature
     // callbacks pointing into freed memory. Never switch them to another DLL.
@@ -5387,15 +5650,61 @@ template <typename T>
     }
     static unsigned previous_count = ~0U;
     if (count != previous_count) {
-        trace_event("AFW lower-runtime discovery candidates=%u; %s", count,
+        trace_event("DLSS lower-runtime discovery candidates=%u; %s", count,
             count == 1 ? "one SR snippet found" : count ? "ambiguous SR snippets; passing through" : "waiting for an SR snippet");
         previous_count = count;
     }
     if (count == 1 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
             reinterpret_cast<LPCWSTR>(candidate), &selected)) {
-        trace_event("AFW lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
+        trace_event("DLSS lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
     }
     afw_note_runtime_discovery(count, selected != nullptr);
+    return selected;
+}
+
+[[nodiscard]] HMODULE find_rr_runtime(const bool require_stability) noexcept {
+    // One callback set owns one snippet for this process. Retain the selected
+    // image so a later unload/reload cannot leave its detours or private feature
+    // callbacks pointing into freed memory. Never switch them to another DLL.
+    static HMODULE selected{};
+    if (selected) return selected;
+    std::array<HMODULE, 2048> modules{};
+    DWORD required{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &required) || required > sizeof(modules)) {
+        return nullptr;
+    }
+    HMODULE candidate{};
+    unsigned count{};
+    std::array<wchar_t, 2048> candidate_path{};
+    for (std::size_t i = 0; i < required / sizeof(HMODULE); ++i) {
+        std::array<wchar_t, 2048> path{};
+        const auto length = GetModuleFileNameW(modules[i], path.data(), static_cast<DWORD>(path.size()));
+        if (!length || length >= path.size() || !is_dlss_rr_runtime_path({path.data(), length})) continue;
+        if (!GetProcAddress(modules[i], "NVSDK_NGX_GetSnippetVersion") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_CreateFeature") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_EvaluateFeature") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_ReleaseFeature")) continue;
+        candidate = modules[i]; candidate_path = path; ++count;
+    }
+    static unsigned previous_count = ~0U;
+    if (count != previous_count) {
+        trace_event("RR lower-runtime discovery candidates=%u; %s", count,
+            count == 1 ? "one RR snippet found" : count ? "ambiguous RR snippets; passing through" : "waiting for an RR snippet");
+        previous_count = count;
+    }
+    // NGX briefly loads the shipped DLSSD DLL while selecting an OTA model.
+    // Pinning that probe would keep it resident and strand this callback set on
+    // an unused image. Stabilize the sole candidate before retaining it.
+    static HMODULE observed{};
+    static ULONGLONG observed_since{};
+    const auto current = count == 1 ? candidate : nullptr;
+    const auto now = GetTickCount64();
+    if (observed != current) { observed = current; observed_since = now; }
+    if (require_stability && (!current || now - observed_since < 1500U)) return nullptr;
+    if (count == 1 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(candidate), &selected)) {
+        trace_event("RR lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
+    }
     return selected;
 }
 
@@ -5430,8 +5739,8 @@ template <typename T>
         }
     }
 
-    const auto observed_public_runtime = afw_compatibility_enabled()
-        ? find_afw_sr_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto observed_public_runtime = protected_ngx_core_enabled()
+        ? find_sr_feature_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
     const auto public_runtime = runtime_ready_for_direct_hooks(
         observed_public_runtime,
         public_runtime_stability,
@@ -5450,7 +5759,7 @@ template <typename T>
         const auto get_proc = real_get_proc_address.load(std::memory_order_acquire);
         // Some older snippets share entry points. Reserve only actual aliases
         // for AFW's DX12 hooks; distinct DX11 entry points remain usable.
-        if (afw_compatibility_enabled() && public_d3d11_runtime && get_proc &&
+        if (protected_ngx_core_enabled() && public_d3d11_runtime && get_proc &&
             get_proc(public_d3d11_runtime, name) == get_proc(public_d3d11_runtime, dx12_name)) return false;
         return install_direct_hook(public_d3d11_runtime, name, detour, storage, DiagnosticApi::d3d11);
     };
@@ -5534,7 +5843,21 @@ template <typename T>
         );
     }
 
-    const auto observed_core_runtime = GetModuleHandleW(L"_nvngx.dll");
+    // SR and RR may coexist. Never overwrite SR trampolines with RR exports.
+    static RuntimeStability rr_stability{};
+    const auto rr = find_rr_runtime(require_runtime_stability);
+    if (runtime_ready_for_direct_hooks(rr, rr_stability, L"nvngx_dlssd.dll", require_runtime_stability)) {
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_CreateFeature",
+            reinterpret_cast<void*>(&hook_rr_create_d3d12), real_rr_create_d3d12, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_EvaluateFeature",
+            reinterpret_cast<void*>(&hook_rr_evaluate_d3d12), real_rr_evaluate_d3d12, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_EvaluateFeature_C",
+            reinterpret_cast<void*>(&hook_rr_evaluate_d3d12_c), real_rr_evaluate_d3d12_c, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_ReleaseFeature",
+            reinterpret_cast<void*>(&hook_rr_release_d3d12), real_rr_release_d3d12, DiagnosticApi::d3d12);
+    }
+
+    const auto observed_core_runtime = find_core_runtime();
     const auto core_runtime = runtime_ready_for_direct_hooks(
         observed_core_runtime,
         core_runtime_stability,
@@ -5603,6 +5926,8 @@ template <typename T>
             DiagnosticApi::d3d12
         );
     }
+    vulkan_install_ngx_hooks(public_runtime);
+    vulkan_install_ngx_hooks(core_runtime);
     return installed;
 }
 
@@ -5719,7 +6044,9 @@ void remember_original(
     }
 
     const bool public_runtime = _wcsicmp(target_name, L"nvngx_dlss.dll") == 0;
-    const bool core_runtime = _wcsicmp(target_name, L"_nvngx.dll") == 0;
+    const bool core_name = _wcsicmp(target_name, L"_nvngx.dll") == 0 || _wcsicmp(target_name, L"nvngx.dll") == 0;
+    const bool core_runtime = core_name && find_core_runtime() != nullptr &&
+        find_core_runtime() == GetModuleHandleW(target_name);
     if (!public_runtime && !core_runtime) return original;
 
 #define CHEEKY_REPLACE(export_name, storage, hook, api) \
@@ -5761,6 +6088,8 @@ void remember_original(
     const FARPROC original
 ) noexcept {
     std::array<wchar_t, MAX_PATH> name{};
+    if(function_name && std::strncmp(function_name,"NVSDK_NGX_VULKAN_",17)==0)
+        vulkan_install_ngx_hooks(target);
     return module_name(target, name.data(), name.size())
         ? replacement_for_name(name.data(), function_name, original)
         : original;
@@ -6084,6 +6413,8 @@ void restore_patched_slots() noexcept {
 
 }  // namespace
 
+HMODULE find_loaded_ngx_core_runtime() noexcept { return find_core_runtime(); }
+
 void note_d3d12_command_list_submission(
     ID3D12CommandQueue* const queue,
     ID3D12GraphicsCommandList* const command_list
@@ -6146,6 +6477,9 @@ LateAttachStatus late_attach_status() noexcept {
 
 bool start_interception() noexcept {
     if (started.exchange(true, std::memory_order_acq_rel)) return true;
+    configure_d3d12_hook_path(configured_settings().d3d12_lower_hook);
+    trace_event("D3D12 DLSS hook path: %s (changes require restart)",
+        d3d12_lower_hook_enabled() ? "Lower feature runtime" : "Higher call");
     detect_afw_runtime();
     real_get_proc_address.store(&GetProcAddress, std::memory_order_release);
     trace_event("Interception startup begin");

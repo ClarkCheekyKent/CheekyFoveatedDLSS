@@ -274,7 +274,7 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
 void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
     UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false, bool before_nr = false, bool nr_success = true,
-    bool afw_rounded = false, bool afw_rectangle = false) {
+    bool afw_rounded = false, bool afw_rectangle = false, bool phase_test = false) {
     ComPtr<ID3D12InfoQueue> messages;
     if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&messages)))) {
         messages->ClearStoredMessages();
@@ -357,7 +357,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 3;
+    hd.NumDescriptors = 4;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ComPtr<ID3D12DescriptorHeap> heap;
     check(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)));
@@ -382,6 +382,13 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     }
     device->CreateUnorderedAccessView(output.resource.Get(), nullptr, &uav, cpu);
+    cpu.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC exposure_srv{};
+    exposure_srv.Format = DXGI_FORMAT_R32_FLOAT;
+    exposure_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    exposure_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    exposure_srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(nullptr, &exposure_srv, cpu);
 
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
@@ -391,8 +398,10 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[i].DescriptorTable = {1, &ranges[i]};
     }
+    const D3D12_DESCRIPTOR_RANGE srv_ranges[]{ranges[0], {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0, 3}};
+    params[0].DescriptorTable = {2, srv_ranges};
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[2].Constants = {0, 0, 44};
+    params[2].Constants = {0, 0, 48};
     D3D12_ROOT_SIGNATURE_DESC rd{};
     rd.NumParameters = 3;
     rd.pParameters = params;
@@ -418,7 +427,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     list->SetComputeRootDescriptorTable(0, gpu);
     gpu.ptr += 2ULL * increment;
     list->SetComputeRootDescriptorTable(1, gpu);
-    std::array<UINT32, 44> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
+    std::array<UINT32, 48> constants{24, 20, 4, 2, 0, 0, 32, 24, 12, 8, 8, 8};
     if (before_nr) { constants[4] = 4U; constants[5] = 2U; constants[6] = 24U; constants[7] = 20U; }
     const float one = 1.0F;
     std::memcpy(&constants[12], &one, sizeof(one));
@@ -430,7 +439,8 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
             11.4F / 24, 8.4F / 20, 16.6F / 24, 13.6F / 20};
         std::memcpy(&constants[28], bounds, sizeof(bounds));
     }
-    list->SetComputeRoot32BitConstants(2, 44, constants.data(), 0);
+    if (phase_test) { const float grid[4]{1.01F, 1.02F, -.37F, -.21F}; std::memcpy(&constants[44],grid,sizeof(grid)); }
+    list->SetComputeRoot32BitConstants(2, 48, constants.data(), 0);
     list->Dispatch(2, 2, 1);
     transition(list.Get(), output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     auto readback = buffer(device, output.bytes, D3D12_HEAP_TYPE_READBACK);
@@ -523,6 +533,21 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
                             if ((sx + sy) % 2 != 0)
                                 expected_fraction += (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
                         }
+                    }
+                    if (phase_test) {
+                        // Independent reference integrates clamped source cells
+                        // over a shifted footprint, including negative edges.
+                        const double l=(x-12)*double(1.01F)+double(-.37F), r=l+double(1.01F);
+                        const double t=(y-8)*double(1.02F)+double(-.21F), b=t+double(1.02F);
+                        double area=0;
+                        for(int yy=int(std::floor(t));yy<int(std::ceil(b));++yy)
+                            for(int xx=int(std::floor(l));xx<int(std::ceil(r));++xx) {
+                                const auto cx=std::clamp(xx,0,int(source_width)-1), cy=std::clamp(yy,0,int(source_height)-1);
+                                if((cx+cy)%2) area+=(std::min)(r,double(xx+1))-(std::max)(l,double(xx)) > 0 ?
+                                    ((std::min)(r,double(xx+1))-(std::max)(l,double(xx))) *
+                                    ((std::min)(b,double(yy+1))-(std::max)(t,double(yy))) : 0;
+                            }
+                        expected_fraction=area/((r-l)*(b-t));
                     }
                     const int expected_green = int(std::lround(255.0 * expected_fraction));
                     const int actual_green = int((row[x] >> 8) & 255);
@@ -671,6 +696,7 @@ int run_d3d12_composite_tests() {
             run_nr_recycling(device.Get(), false, route);
         }
         run_case(device.Get(), 1, 1);
+        run_case(device.Get(), 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, true, false, true, false, false, true);
         run_case(device.Get(), 2, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, false, true, true);
         run_case(device.Get(), 2, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, false, true, false, true);
         run_case(device.Get(), 1, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, true, true);

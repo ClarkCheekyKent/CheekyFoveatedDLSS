@@ -14,3 +14,7 @@ struct CheekyEyeCalibrationBridgeV1 {
     void(__cdecl* destroy)(std::uint64_t session_generation) noexcept {};
 };
 using CheekyGetEyeCalibrationBridgeFn = bool(__cdecl*)(CheekyEyeCalibrationBridgeV1*) noexcept;
+// Optional export, independent of the existing capture ABI. Older layers/cores
+// still interoperate, but do not suppress misses based on motion.
+using CheekyCalibrationObservePoseFn = void(__cdecl*)(std::uint64_t session, std::uint64_t space,
+    std::int64_t display_time, const float* xyzw, bool valid) noexcept;

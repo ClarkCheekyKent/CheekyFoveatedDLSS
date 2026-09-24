@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833202}</ProjectGuid><RootNamespace>CheekyStandaloneProxy</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType><TargetName>dxgi</TargetName><CheekyOutputSubdir>standalone-loader\</CheekyOutputSubdir><CheekyLibraries></CheekyLibraries><CheekyMasm>true</CheekyMasm></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup>
+    <ClCompile Include="bootstrap\loader.cpp" />
+    <ClCompile Include="bootstrap\dxgi_proxy.cpp" />
+  </ItemGroup>
+  <ItemGroup><MASM Include="bootstrap\dxgi_exports.asm" /></ItemGroup>
+  <ItemDefinitionGroup><MASM><IncludePaths>$(MSBuildProjectDirectory)\bootstrap;%(IncludePaths)</IncludePaths></MASM><Link><ModuleDefinitionFile>bootstrap\dxgi.def</ModuleDefinitionFile><ImportLibrary>$(IntDir)CheekyStandaloneProxy.lib</ImportLibrary></Link></ItemDefinitionGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets"><Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" /></ImportGroup>
+</Project>

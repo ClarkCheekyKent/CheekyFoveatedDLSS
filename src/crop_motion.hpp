@@ -39,6 +39,11 @@ std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext*,
 ID3D11Resource* crop_motion_resource(const std::shared_ptr<CropMotion11>&) noexcept;
 void release_crop_motion11() noexcept;
 
+// Exact-format crop copy, retained by the same submission/fence tracking as
+// motion passes. Used to give RR consistently crop-sized, zero-origin inputs.
+ID3D12Resource* prepare_crop_texture12(ID3D12GraphicsCommandList*, ID3D12Resource*,
+    unsigned x, unsigned y, unsigned width, unsigned height) noexcept;
+
 // D3D12 passes are retained until the command list's submission fence completes.
 ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList*,
     ID3D12Resource*, unsigned x, unsigned y, unsigned width, unsigned height,

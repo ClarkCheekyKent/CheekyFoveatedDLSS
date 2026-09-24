@@ -17,7 +17,7 @@ template<class T> bool parse(std::string_view s, T& value) {
         return false;
     } else if constexpr (std::is_enum_v<T>) {
         std::uint32_t n{};
-        constexpr auto maximum = std::is_same_v<T, NrProcessingOrder> ? 1U : 2U;
+        constexpr auto maximum = std::is_same_v<T, EyeCalibrationMethod> ? 3U : std::is_same_v<T, NrProcessingOrder> ? 1U : 2U;
         if (!parse(s, n) || n > maximum) return false;
         value = static_cast<T>(n); return true;
     } else {
@@ -47,7 +47,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
 std::string_view setting_group(std::string_view key) {
     if (key.starts_with("Nr")) return "nr";
     for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
-            "AutoStereoAlignment", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
+            "AutoStereoAlignment", "EyeCalibrationContinuous", "EyeCalibrationMethod", "EyeCalibrationLearnedMethod", "EyeCalibrationLearnedSignature", "EyeCalibrationLearnedSessions", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
             "GazeSmoothingMs", "GazeQuantizationPixels", "GazeJumpResetRatio",
             "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"})
         if (key == gaze) return "gaze";
@@ -56,7 +56,7 @@ std::string_view setting_group(std::string_view key) {
 bool reset_settings_group(Settings& s, std::string_view group) {
     if (group != "sr" && group != "nr" && group != "gaze") return false;
     const Settings defaults;
-#define CHEEKY_SETTING(name, field) if (setting_group(name) == group) s.field = defaults.field;
+#define CHEEKY_SETTING(name, field) if (!std::string_view(name).starts_with("EyeCalibrationLearned") && setting_group(name) == group) s.field = defaults.field;
 #include "settings_fields.inc"
 #undef CHEEKY_SETTING
     return true;
@@ -97,6 +97,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     std::ifstream in(path);
     if (!in) { error = "Cannot read settings file"; return false; }
     auto candidate = s;
+    candidate.d3d12_lower_hook = true; // Older files use the new lower-hook default.
     // Older files predate this additive key and use After, even when loaded
     // over a currently configured Before setting. Commit only after validation.
     candidate.nr_processing_order = NrProcessingOrder::after_upscaling;

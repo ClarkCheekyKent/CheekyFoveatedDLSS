@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace cheeky::foveated_dlss {
 
@@ -32,11 +33,14 @@ struct GazeViewDiagnostics {
     bool copy_mapping{};
     bool projection_mapping{};
     bool marker_mapping{};
+    bool submitted_projection{};
+    std::array<float, 4> fov_tangents{};
     unsigned alignment_source{};
     float aligned_u{}, aligned_v{};
 };
 
 struct GazeDiagnostics {
+    CheekyGazeInputDiagnosticsV1 input{};
     std::uint64_t submitted_copies{};
     char runtime_name[128]{};
     std::uint32_t status_flags{};
@@ -79,7 +83,8 @@ struct ScopedCoordinatedCrop {
     CropGeometry& crop,
     bool& reset_history,
     const CheekyGazeSnapshotV1* supplied_snapshot = nullptr,
-    FoveationCenter* resolved_center = nullptr
+    FoveationCenter* resolved_center = nullptr,
+    std::uint64_t native_resource_identity = 0
 ) noexcept;
 
 void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
@@ -93,6 +98,7 @@ void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
     FoveationCenter& center, bool& reset_history,
     const CheekyGazeSnapshotV1* supplied_snapshot = nullptr) noexcept;
 [[nodiscard]] GazeDiagnostics gaze_diagnostics() noexcept;
+[[nodiscard]] std::string gaze_input_diagnostics_json(const CheekyGazeInputDiagnosticsV1& input);
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;
 void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept;

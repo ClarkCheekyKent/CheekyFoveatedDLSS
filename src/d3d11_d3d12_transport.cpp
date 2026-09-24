@@ -1,5 +1,8 @@
+#include "depth_formats.hpp"
+#include "d3d11_write_bindings.hpp"
 #include "dlss_nr_input.hpp"
 #include "d3d11_d3d12_transport.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
@@ -7,7 +10,7 @@
 #include "runtime.hpp"
 
 #include <d3d11_4.h>
-#include <d3dcompiler.h>
+#include "d3d_shaders.hpp"
 #include "crop_motion.hpp"
 #include <dxgi1_4.h>
 
@@ -18,6 +21,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -126,9 +130,52 @@ struct InitContract {
 std::mutex transport_mutex;
 InitContract init_contract;
 
+// Keep this storage independent of the captured game initialization contract:
+// a later game Init must not invalidate pointers retained by private NGX.
+struct TransportFeaturePaths {
+    std::array<std::wstring, 2> directories;
+    std::array<const wchar_t*, 2> pointers{};
+    NgxFeatureCommonInfo info{};
+    bool ready{};
+};
+TransportFeaturePaths transport_feature_paths;
+
+const void* private_feature_common_info() {
+    if (init_contract.feature_common_info) return init_contract.feature_common_info;
+    auto& paths = transport_feature_paths;
+    if (!paths.ready) {
+        // The processing DLL may live below the game directory. Explicitly
+        // register the already loaded SR library's directory, then the EXE
+        // directory, rather than relying on NGX's calling-module search path.
+        const HMODULE modules[]{GetModuleHandleW(L"nvngx_dlss.dll"), nullptr};
+        for (unsigned i = 0; i < 2; ++i) {
+            if (i == 0 && !modules[i]) continue;
+            std::array<wchar_t, 32768> buffer{};
+            const auto length = GetModuleFileNameW(modules[i], buffer.data(), static_cast<DWORD>(buffer.size()));
+            if (!length || length >= buffer.size()) continue;
+            std::wstring directory(buffer.data(), length);
+            const auto slash = directory.find_last_of(L"\\/");
+            if (slash == std::wstring::npos) continue;
+            directory.resize(slash);
+            auto& count = paths.info.path_list.count;
+            if (count && directory == paths.directories[0]) continue;
+            paths.directories[count] = std::move(directory);
+            paths.pointers[count] = paths.directories[count].c_str();
+            trace_event("Private D3D12 NGX feature search path=%ls", paths.pointers[count]);
+            ++count;
+        }
+        paths.info.path_list.paths = paths.pointers.data();
+        paths.ready = true;
+    }
+    return paths.info.path_list.count ? &paths.info : nullptr;
+}
+
 struct SharedTexture {
     ID3D12Resource* resource12{};
     ID3D11Texture2D* texture11{};
+    std::uint32_t width{}, height{};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    D3D12_RESOURCE_FLAGS flags{};
 };
 
 struct TransportSlot {
@@ -152,6 +199,7 @@ struct TransportSlot {
     bool timing_pending{};
     ID3D12QueryHeap* dlss_timing_heap{};
     ID3D12Resource* dlss_timing_readback{};
+    bool dlss_timing_initialized{};
     bool dlss_timing_pending{};
     std::uint32_t dlss_timing_query_count{};
     bool dlss_peripheral_timing_recorded{};
@@ -187,6 +235,12 @@ struct TransportView {
 };
 
 struct TransportDevice {
+    struct SharingPreference {
+        DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+        D3D12_RESOURCE_FLAGS flags{};
+        bool from_d3d11{};
+    };
+    std::array<SharingPreference, 16> sharing_preferences{};
     ID3D11Device* device11{};
     ID3D11Device1* device11_1{};
     ID3D11Device5* device11_5{};
@@ -195,6 +249,8 @@ struct TransportDevice {
     ID3D12GraphicsCommandList* command_list12{};
     ID3D11Fence* fence11{};
     ID3D12Fence* fence12{};
+    HANDLE slot_ready_event{};
+    std::uint64_t slot_waits{};
     ID3D11ComputeShader* depth_shader{};
     ID3D11Buffer* depth_constants{};
     NgxParameters* ngx_parameters{};
@@ -204,6 +260,7 @@ struct TransportDevice {
     NgxD3D12Shutdown1Fn shutdown{};
     bool ngx_initialized{};
     bool format_support_logged{};
+    ULONGLONG initialization_retry_after{};
 };
 
 std::deque<TransportDevice> transport_devices;
@@ -222,6 +279,7 @@ void Main(uint3 id : SV_DispatchThreadID) {
 void release_shared_texture(SharedTexture& texture) noexcept {
     release(texture.texture11);
     release(texture.resource12);
+    texture = {};
 }
 
 void release_slot(TransportSlot& slot) noexcept {
@@ -278,6 +336,8 @@ void release_device(TransportDevice& device) noexcept {
     }
     release(device.depth_constants);
     release(device.depth_shader);
+    if (device.slot_ready_event) CloseHandle(device.slot_ready_event);
+    device.slot_ready_event = nullptr;
     release(device.fence12);
     release(device.fence11);
     release(device.command_list12);
@@ -338,7 +398,7 @@ void release_device(TransportDevice& device) noexcept {
     }
 }
 
-[[nodiscard]] bool create_shared_texture(
+[[nodiscard]] bool try_create_shared_texture12(
     TransportDevice& device,
     const char* const label,
     const std::uint32_t width,
@@ -390,11 +450,18 @@ void release_device(TransportDevice& device) noexcept {
 
     if (should_trace_shared_texture_failure()) trace_event(
         "Transport texture %s D3D12->D3D11 failed hr=0x%08X; "
-        "trying D3D11->D3D12",
+        "sharing route unavailable",
         label, static_cast<unsigned int>(result)
     );
     release_shared_texture(texture);
+    return false;
+}
 
+[[nodiscard]] bool try_create_shared_texture11(
+    TransportDevice& device, const char* label,
+    std::uint32_t width, std::uint32_t height, DXGI_FORMAT format,
+    D3D12_RESOURCE_FLAGS flags, SharedTexture& texture
+) noexcept {
     D3D11_TEXTURE2D_DESC desc11{};
     desc11.Width = width;
     desc11.Height = height;
@@ -409,7 +476,7 @@ void release_device(TransportDevice& device) noexcept {
     }
     desc11.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
         D3D11_RESOURCE_MISC_SHARED;
-    result = device.device11->CreateTexture2D(
+    auto result = device.device11->CreateTexture2D(
         &desc11, nullptr, &texture.texture11
     );
     IDXGIResource1* shared_resource{};
@@ -418,7 +485,7 @@ void release_device(TransportDevice& device) noexcept {
             IID_PPV_ARGS(&shared_resource)
         );
     }
-    handle = nullptr;
+    HANDLE handle{};
     if (SUCCEEDED(result)) {
         result = shared_resource->CreateSharedHandle(
             nullptr,
@@ -456,24 +523,44 @@ void release_device(TransportDevice& device) noexcept {
     return true;
 }
 
-[[nodiscard]] bool create_depth_converter(TransportDevice& device) noexcept {
-    ID3DBlob* bytecode{};
-    ID3DBlob* errors{};
-    const auto result = D3DCompile(
-        depth_shader_source, sizeof(depth_shader_source) - 1U,
-        "Cheeky crop depth transport", nullptr, nullptr, "Main", "cs_5_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0U, &bytecode, &errors
-    );
-    release(errors);
-    if (FAILED(result)) {
-        release(bytecode);
-        return false;
+[[nodiscard]] bool create_shared_texture(
+    TransportDevice& device, const char* label,
+    std::uint32_t width, std::uint32_t height, DXGI_FORMAT format,
+    D3D12_RESOURCE_FLAGS flags, SharedTexture& texture
+) noexcept {
+    if (texture.resource12 && texture.texture11 && texture.width == width &&
+        texture.height == height && texture.format == format && texture.flags == flags) return true;
+
+    // Only called after the slot's completion fence has passed. Release the
+    // resized texture before allocating to avoid doubling its VRAM footprint.
+    release_shared_texture(texture);
+    TransportDevice::SharingPreference* preference{};
+    for (auto& entry : device.sharing_preferences) {
+        if (entry.format == format && entry.flags == flags) { preference = &entry; break; }
+        if (!preference && entry.format == DXGI_FORMAT_UNKNOWN) preference = &entry;
     }
+    const bool prefer11 = preference && preference->format == format && preference->from_d3d11;
+    const auto attempt = [&](bool from11) {
+        const bool succeeded = from11
+            ? try_create_shared_texture11(device, label, width, height, format, flags, texture)
+            : try_create_shared_texture12(device, label, width, height, format, flags, texture);
+        if (succeeded) {
+            texture.width = width; texture.height = height;
+            texture.format = format; texture.flags = flags;
+            if (preference) *preference = {format, flags, from11};
+        }
+        return succeeded;
+    };
+    // Preference is an optimization, never a permanent blacklist. A different
+    // size or driver condition can make the other direction necessary again.
+    return attempt(prefer11) || attempt(!prefer11);
+}
+
+[[nodiscard]] bool create_depth_converter(TransportDevice& device) noexcept {
     const auto shader_result = device.device11->CreateComputeShader(
-        bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr,
+        d3d_shaders::transport_depth11.data, d3d_shaders::transport_depth11.size, nullptr,
         &device.depth_shader
     );
-    release(bytecode);
     if (FAILED(shader_result)) return false;
 
     D3D11_BUFFER_DESC desc{};
@@ -635,7 +722,7 @@ void trace_format_support(
         init_contract.application_data_path.c_str(),
         device.device12,
         static_cast<int>(init_contract.sdk_version),
-        init_contract.feature_common_info,
+        private_feature_common_info(),
         init_exception
     );
     trace_event(
@@ -677,13 +764,33 @@ void trace_format_support(
     ID3D11Device* const device11,
     const D3D11TransportNgx& ngx
 ) noexcept {
+    TransportDevice* entry{};
     for (auto& device : transport_devices) {
-        if (device.device11 == device11) return &device;
+        if (device.device11 != device11) continue;
+        if (device.ngx_initialized) return &device;
+        if (GetTickCount64() < device.initialization_retry_after) return nullptr;
+        entry = &device;
+        break;
+    }
+    if (!entry) {
+        transport_devices.emplace_back();
+        entry = &transport_devices.back();
+        // Retain identity across failures so a recycled COM address cannot
+        // inherit another device's retry deadline.
+        entry->device11 = device11;
+        device11->AddRef();
     }
     TransportDevice created{};
-    if (!create_transport_device(device11, ngx, created)) return nullptr;
-    transport_devices.push_back(created);
-    return &transport_devices.back();
+    if (!create_transport_device(device11, ngx, created)) {
+        // Device/NGX initialization can take tens of milliseconds. Retrying
+        // every frame makes even the native DX11 fallback unusably slow.
+        entry->initialization_retry_after = GetTickCount64() + 5000ULL;
+        trace_event("Private DX12 transport initialization failed; retry deferred for 5 seconds");
+        return nullptr;
+    }
+    release(entry->device11);
+    *entry = std::move(created);
+    return entry;
 }
 
 [[nodiscard]] TransportView* find_or_create_view(
@@ -780,7 +887,8 @@ void trace_format_support(
     const DXGI_FORMAT output_format,
     const bool nr_before
 ) noexcept {
-    release_slot(slot);
+    // Slot is idle; preserve textures with matching descriptors and all
+    // size-independent allocator/query objects instead of tearing it all down.
     if (!device.format_support_logged) {
         trace_format_support(device.device11, "color", color_format);
         trace_format_support(device.device11, "depth", DXGI_FORMAT_R32_FLOAT);
@@ -792,10 +900,10 @@ void trace_format_support(
     }
     D3D11_QUERY_DESC disjoint_desc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0U};
     D3D11_QUERY_DESC timestamp_desc{D3D11_QUERY_TIMESTAMP, 0U};
-    const auto allocator_result = device.device12->CreateCommandAllocator(
+    const auto allocator_result = slot.allocator ? S_OK : device.device12->CreateCommandAllocator(
         D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.allocator)
     );
-    const auto nr_allocator_result = FAILED(allocator_result) || !nr_enabled
+    const auto nr_allocator_result = FAILED(allocator_result) || !nr_enabled || slot.nr_allocator
         ? allocator_result
         : device.device12->CreateCommandAllocator(
             D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -803,13 +911,13 @@ void trace_format_support(
         );
     const auto disjoint_result = FAILED(nr_allocator_result)
         ? nr_allocator_result
-        : device.device11->CreateQuery(&disjoint_desc, &slot.timing_disjoint);
+        : slot.timing_disjoint ? S_OK : device.device11->CreateQuery(&disjoint_desc, &slot.timing_disjoint);
     const auto begin_result = FAILED(disjoint_result)
         ? disjoint_result
-        : device.device11->CreateQuery(&timestamp_desc, &slot.timing_begin);
+        : slot.timing_begin ? S_OK : device.device11->CreateQuery(&timestamp_desc, &slot.timing_begin);
     const auto end_result = FAILED(begin_result)
         ? begin_result
-        : device.device11->CreateQuery(&timestamp_desc, &slot.timing_end);
+        : slot.timing_end ? S_OK : device.device11->CreateQuery(&timestamp_desc, &slot.timing_end);
     if (FAILED(end_result)) {
         trace_event(
             "Transport command allocator/query creation failed hr=0x%08X",
@@ -818,41 +926,57 @@ void trace_format_support(
         release_slot(slot);
         return false;
     }
-    D3D12_QUERY_HEAP_DESC query_desc{};
-    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    query_desc.Count = 6U;
-    D3D12_HEAP_PROPERTIES readback_heap{};
-    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
-    readback_heap.CreationNodeMask = 1U;
-    readback_heap.VisibleNodeMask = 1U;
-    D3D12_RESOURCE_DESC readback_desc{};
-    readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    readback_desc.Width = sizeof(std::uint64_t) * 6U;
-    readback_desc.Height = 1U;
-    readback_desc.DepthOrArraySize = 1U;
-    readback_desc.MipLevels = 1U;
-    readback_desc.SampleDesc.Count = 1U;
-    readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    const auto query_result = device.device12->CreateQueryHeap(
-        &query_desc, IID_PPV_ARGS(&slot.dlss_timing_heap)
-    );
-    const auto readback_result = FAILED(query_result)
-        ? query_result
-        : device.device12->CreateCommittedResource(
-            &readback_heap,
-            D3D12_HEAP_FLAG_NONE,
-            &readback_desc,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr,
-            IID_PPV_ARGS(&slot.dlss_timing_readback)
+    if (!slot.dlss_timing_initialized) {
+        slot.dlss_timing_initialized = true;
+        D3D12_QUERY_HEAP_DESC query_desc{};
+        query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        query_desc.Count = 6U;
+        D3D12_HEAP_PROPERTIES readback_heap{};
+        readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+        readback_heap.CreationNodeMask = 1U;
+        readback_heap.VisibleNodeMask = 1U;
+        D3D12_RESOURCE_DESC readback_desc{};
+        readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readback_desc.Width = sizeof(std::uint64_t) * 6U;
+        readback_desc.Height = 1U;
+        readback_desc.DepthOrArraySize = 1U;
+        readback_desc.MipLevels = 1U;
+        readback_desc.SampleDesc.Count = 1U;
+        readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto query_result = device.device12->CreateQueryHeap(
+            &query_desc, IID_PPV_ARGS(&slot.dlss_timing_heap)
         );
-    if (FAILED(readback_result)) {
-        release(slot.dlss_timing_readback);
-        release(slot.dlss_timing_heap);
-        trace_event(
-            "D3D12 DLSS timing resources unavailable hr=0x%08X",
-            static_cast<unsigned int>(readback_result)
-        );
+        const auto readback_result = FAILED(query_result)
+            ? query_result
+            : device.device12->CreateCommittedResource(
+                &readback_heap,
+                D3D12_HEAP_FLAG_NONE,
+                &readback_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&slot.dlss_timing_readback)
+            );
+        if (FAILED(readback_result)) {
+            release(slot.dlss_timing_readback);
+            release(slot.dlss_timing_heap);
+            trace_event(
+                "D3D12 DLSS timing resources unavailable hr=0x%08X",
+                static_cast<unsigned int>(readback_result)
+            );
+        }
+    }
+    // Disabled groups must not retain stale textures behind newly written
+    // geometry metadata; re-enabling must allocate for the current dimensions.
+    if (!nr_enabled) {
+        release_shared_texture(slot.nr_color);
+        release_shared_texture(slot.nr_depth);
+        release_shared_texture(slot.nr_motion_vectors);
+    }
+    if (!peripheral_enabled) {
+        release_shared_texture(slot.peripheral_color);
+        release_shared_texture(slot.peripheral_depth);
+        release_shared_texture(slot.peripheral_motion_vectors);
+        release_shared_texture(slot.peripheral_output);
     }
     if (!create_shared_texture(device, "color",
             crop.input_width, crop.input_height, color_format,
@@ -922,19 +1046,6 @@ void trace_format_support(
     return true;
 }
 
-[[nodiscard]] DXGI_FORMAT depth_srv_format(const DXGI_FORMAT format) noexcept {
-    switch (format) {
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R32_TYPELESS:
-    case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_R32_FLOAT:
-        return DXGI_FORMAT_R32_FLOAT;
-    default:
-        return DXGI_FORMAT_UNKNOWN;
-    }
-}
 
 [[nodiscard]] bool convert_depth_crop(
     TransportDevice& device,
@@ -948,7 +1059,18 @@ void trace_format_support(
     SharedTexture& destination
 ) noexcept {
     const auto srv_format = depth_srv_format(source_format);
-    if (srv_format == DXGI_FORMAT_UNKNOWN) return false;
+    const auto fail=[&](const char* stage,HRESULT hr) {
+        static std::uint64_t failures{};const auto n=++failures;
+        if(n<=8 || (n&(n-1))==0) {
+            D3D11_TEXTURE2D_DESC desc{};ID3D11Texture2D* texture{};
+            if(SUCCEEDED(depth->QueryInterface(IID_PPV_ARGS(&texture)))){texture->GetDesc(&desc);texture->Release();}
+            trace_event("DX11 depth conversion failed stage=%s hr=0x%08X sourceFormat=%u srvFormat=%u texture=%ux%u bind=0x%X misc=0x%X samples=%u array=%u crop=%u,%u %ux%u count=%llu",
+                stage,static_cast<unsigned>(hr),static_cast<unsigned>(source_format),static_cast<unsigned>(srv_format),
+                desc.Width,desc.Height,desc.BindFlags,desc.MiscFlags,desc.SampleDesc.Count,desc.ArraySize,source_x,source_y,width,height,n);
+        }
+        return false;
+    };
+    if (srv_format == DXGI_FORMAT_UNKNOWN) return fail("unsupported source format",E_INVALIDARG);
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
     srv_desc.Format = srv_format;
     srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -958,20 +1080,21 @@ void trace_format_support(
     uav_desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
     ID3D11ShaderResourceView* srv{};
     ID3D11UnorderedAccessView* uav{};
-    if (FAILED(device.device11->CreateShaderResourceView(depth, &srv_desc, &srv)) ||
-        FAILED(device.device11->CreateUnorderedAccessView(
-            destination.texture11, &uav_desc, &uav))) {
+    const auto srv_result=device.device11->CreateShaderResourceView(depth, &srv_desc, &srv);
+    if(FAILED(srv_result))return fail("create depth SRV",srv_result);
+    const auto uav_result=device.device11->CreateUnorderedAccessView(destination.texture11, &uav_desc, &uav);
+    if (FAILED(uav_result)) {
         release(uav);
         release(srv);
-        return false;
+        return fail("create shared depth UAV",uav_result);
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context->Map(device.depth_constants, 0U,
-            D3D11_MAP_WRITE_DISCARD, 0U, &mapped))) {
+    const auto map_result=context->Map(device.depth_constants, 0U,D3D11_MAP_WRITE_DISCARD, 0U, &mapped);
+    if (FAILED(map_result)) {
         release(uav);
         release(srv);
-        return false;
+        return fail("map depth constants",map_result);
     }
     const std::uint32_t constants[4]{
         source_x, source_y, width, height
@@ -979,6 +1102,7 @@ void trace_format_support(
     std::memcpy(mapped.pData, constants, sizeof(constants));
     context->Unmap(device.depth_constants, 0U);
 
+    D3D11WriteBindingsScope write_bindings(context);
     ID3D11ComputeShader* old_shader{};
     ID3D11ShaderResourceView* old_srv{};
     ID3D11UnorderedAccessView* old_uav{};
@@ -1147,7 +1271,48 @@ struct TimingScope {
     const D3D11TransportStatus status
 ) noexcept {
     diagnostic_note_d3d11_transport_status(status);
+    static std::array<std::atomic<std::uint64_t>,
+        static_cast<std::size_t>(D3D11TransportStatus::compositing_failed) + 1U> failures{};
+    const auto count = ++failures[static_cast<std::size_t>(status)];
+    if (count <= 8U || (count & (count - 1U)) == 0U)
+        trace_event("DX11 transport rejected: %s count=%llu", d3d11_transport_status_name(status), count);
     return false;
+}
+
+[[nodiscard]] bool wait_for_slot(TransportDevice& device,
+    ID3D11DeviceContext* context, const TransportSlot& slot) noexcept {
+    if (!slot.done_value) return true;
+    auto completed = device.fence12->GetCompletedValue();
+    if (completed == UINT64_MAX) return false; // Device removed.
+    if (completed >= slot.done_value) return true;
+
+    // The ring limits overlapping work, not which frames receive NR/SR.
+    // Flush the DX11 signals that the private DX12 queue is waiting on before
+    // waiting on the CPU, otherwise buffered DX11 commands can deadlock us.
+    context->Flush();
+    if (!device.slot_ready_event)
+        device.slot_ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!device.slot_ready_event || FAILED(device.fence12->SetEventOnCompletion(
+            slot.done_value, device.slot_ready_event))) return false;
+    const auto start = GetTickCount64();
+    constexpr DWORD timeout_ms = 1000U;
+    bool ready{};
+    for (;;) {
+        completed = device.fence12->GetCompletedValue();
+        if (completed == UINT64_MAX) break;
+        if (completed >= slot.done_value) { ready = true; break; }
+        const auto elapsed = GetTickCount64() - start;
+        if (elapsed >= timeout_ms) break;
+        // Check the fence after every wake: a previously timed-out registration
+        // may also signal this reusable event. Never reset an in-flight allocator.
+        if (WaitForSingleObject(device.slot_ready_event,
+                timeout_ms - static_cast<DWORD>(elapsed)) != WAIT_OBJECT_0) break;
+    }
+    const auto count = ++device.slot_waits;
+    if (!ready || count <= 8U || (count & (count - 1U)) == 0U)
+        trace_event("DX11 transport slot wait ready=%s elapsedMs=%llu target=%llu completed=%llu waits=%llu",
+            ready ? "yes" : "no", GetTickCount64() - start, slot.done_value, completed, count);
+    return ready;
 }
 
 [[nodiscard]] bool recover_init_contract(
@@ -1259,6 +1424,10 @@ bool evaluate_d3d11_via_d3d12(
     const D3D11TransportNgx& ngx,
     NgxResult& result
 ) noexcept {
+    // The core can forward private DX12 work into hooked public DLSS exports.
+    // Those calls are not new game frames: recursively processing one would
+    // re-enter the backend while its non-recursive view mutex is held.
+    D3D12NgxInterceptionScope private_dx12_scope;
     result = 0xBAD00005U;
     if ((!settings.enabled && !settings.nr_enabled) || context == nullptr ||
         game_handle == nullptr ||
@@ -1270,14 +1439,16 @@ bool evaluate_d3d11_via_d3d12(
     );
     struct NrTransportAttempt {
         const Settings& settings;
+        DlssViewId view_id;
         bool attempted{};
         ~NrTransportAttempt() {
-            if (!attempted && settings.nr_enabled &&
-                settings.nr_processing_order == NrProcessingOrder::before_upscaling)
+            if (!attempted && settings.nr_enabled) {
+                skip_dlss_nr_history(view_id);
                 note_dlss_nr_skipped(DlssNrRoute::d3d11_transport, settings,
                     "DX12 Transport preparation rejected; see transport status");
+            }
         }
-    } nr_attempt{settings};
+    } nr_attempt{settings, view_id};
     auto transport_settings = settings;
     if (!transport_settings.enabled && transport_settings.nr_enabled) {
         // NR-only mode still runs the game's SR feature through transport.
@@ -1577,8 +1748,7 @@ bool evaluate_d3d11_via_d3d12(
 
     auto* const view = find_or_create_view(*device, contract.view_id);
     auto& slot = view->slots[view->next_slot++ % transport_slot_count];
-    if (slot.done_value != 0U &&
-        device->fence12->GetCompletedValue() < slot.done_value) {
+    if (!wait_for_slot(*device, context, slot)) {
         release(context4);
         return reject_transport(D3D11TransportStatus::transport_slot_busy);
     }
@@ -2097,6 +2267,7 @@ bool evaluate_d3d11_via_d3d12(
             nr_frame.center = nr_center;
             nr_frame.has_center = has_nr_center;
             nr_frame.reset = nr_frame.reset || nr_gaze_reset;
+            nr_attempt.attempted = true;
             nr_succeeded = evaluate_dlss_nr(nr_frame, nr_settings);
             if (measure_dlss && nr_succeeded) {
                 device->command_list12->EndQuery(
@@ -2173,6 +2344,7 @@ bool evaluate_d3d11_via_d3d12(
 }
 
 void release_d3d11_transport_view(const NgxHandle* const game_handle) noexcept {
+    D3D12NgxInterceptionScope private_dx12_scope;
     if (game_handle == nullptr) return;
     const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(game_handle)
@@ -2192,10 +2364,12 @@ void release_d3d11_transport_view(const NgxHandle* const game_handle) noexcept {
 }
 
 void release_d3d11_d3d12_transport() noexcept {
+    D3D12NgxInterceptionScope private_dx12_scope;
     std::lock_guard lock(transport_mutex);
     for (auto& device : transport_devices) release_device(device);
     transport_devices.clear();
     init_contract = {};
+    transport_feature_paths = {};
 }
 
 }  // namespace cheeky::foveated_dlss

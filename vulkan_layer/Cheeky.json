@@ -1,0 +1,13 @@
+{
+  "file_format_version": "1.1.2",
+  "layer": {
+    "name": "VK_LAYER_CHEEKY_foveated_dlss",
+    "type": "GLOBAL",
+    "library_path": "..\\..\\CheekyVulkanLayer.dll",
+    "api_version": "1.2.0",
+    "implementation_version": "1",
+    "description": "Cheeky native Vulkan foveated DLSS",
+    "disable_environment": {"CHEEKY_DISABLE_VULKAN": "1"},
+    "functions": {"vkNegotiateLoaderLayerInterfaceVersion": "CheekyVulkanNegotiate"}
+  }
+}

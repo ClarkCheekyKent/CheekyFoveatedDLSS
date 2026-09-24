@@ -82,7 +82,10 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
     auto result = WaitForSingleObject(event, 10000); CloseHandle(event); require(result == WAIT_OBJECT_0, "GPU timeout");
 }
 void settings_tests(const std::filesystem::path& root) {
-    Settings s; require(set_named_setting(s, "Width", "0.2"), "Parse setting");
+    Settings s; require(s.d3d12_lower_hook, "Lower hook is the default");
+    require(set_named_setting(s, "D3D12LowerHook", "false") && !s.d3d12_lower_hook, "Select higher hook");
+    require(!set_named_setting(s, "D3D12LowerHook", "invalid"), "Reject invalid hook toggle");
+    require(set_named_setting(s, "Width", "0.2"), "Parse setting");
     require(!set_named_setting(s, "Width", "nan"), "Reject NaN");
     require(!set_named_setting(s, "Width", "0.7trailing"), "Reject trailing garbage");
     require(!set_named_setting(s, "Enabled", "maybe"), "Reject bad bool");
@@ -94,10 +97,18 @@ void settings_tests(const std::filesystem::path& root) {
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
         "Parse AFW manual coverage settings");
     require(set_named_setting(s, "AfwAutomaticCoverage", "true"), "Parse AFW automatic coverage setting");
+    require(!Settings{}.eye_calibration_continuous, "Default calibration must stop after acquisition");
+    require(set_named_setting(s, "EyeCalibrationMethod", "3") &&
+        !set_named_setting(s, "EyeCalibrationMethod", "4"), "Validate calibration override enum");
+    s.eye_calibration_learned_method = 2; s.eye_calibration_learned_sessions = 2;
+    s.eye_calibration_learned_signature = 0xfedcba9876543210ULL;
     std::string error; const auto path = root / "roundtrip.ini";
     require(write_settings_file(path, s, error), "Write settings");
     Settings r; require(read_settings_file(path, r, error), "Read settings");
     require(serialize_settings(r) == serialize_settings(s), "Roundtrip all persisted fields");
+    require(r.eye_calibration_method == EyeCalibrationMethod::full && r.eye_calibration_learned_method == 2 &&
+        r.eye_calibration_learned_signature == 0xfedcba9876543210ULL && r.eye_calibration_learned_sessions == 2,
+        "Persist learned calibration without losing 64-bit signature precision");
     for (const auto order : {"0", "1"}) {
         require(set_named_setting(s, "NrProcessingOrder", order), "Parse NR rendering order");
         s.nr_working_scale = 0.37f;
@@ -120,6 +131,7 @@ void settings_tests(const std::filesystem::path& root) {
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
     require(r.nr_style == 0U, "Legacy settings must restore Standard style");
+    require(r.d3d12_lower_hook, "Legacy settings default to lower hook even over a higher-hook draft");
     require(serialize_settings(r).find("AfwDepthCoverage") == std::string::npos,
         "Retired depth setting is ignored when loading older files and omitted on save");
     require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_warp_margin == .05F,
@@ -190,14 +202,16 @@ int main(int argc, char** argv) {
             require(cadence.average_ms == 0, "SR toggle starts a fresh cadence window");
         }
         const bool conflict_mode = argc > 1 && std::string(argv[1]) == "--conflict";
-        bool hardware{}, inactive_afw{};
+        bool hardware{}, inactive_afw{}, higher_hook{};
         for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--higher-hook") higher_hook = true;
             if (std::string(argv[i]) == "--hardware") hardware = true;
             if (std::string(argv[i]) == "--inactive-afw") inactive_afw = true;
         }
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
         const bool afw = mode.starts_with("--afw-");
+        const bool realvr = mode.starts_with("--realvr-") || mode.starts_with("--lower-");
         const bool openvr_late = mode.starts_with("--openvr-late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
@@ -244,7 +258,7 @@ int main(int argc, char** argv) {
             api.vr = &vr_api; api.openvr = &openvr_api;
         }
         auto plugin_path = bin / "CheekyFoveatedDLSS.dll";
-        if ((late && !dx11) || afw) {
+        if ((late && !dx11) || afw || realvr) {
             // Isolate the optional fake NR runtime from ordinary host fixtures
             // and from other concurrently running test processes.
             const auto isolated = root / "nr-hooks";
@@ -257,12 +271,16 @@ int main(int argc, char** argv) {
             plugin_path = isolated / plugin_path.filename();
         }
         if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
-        if (afw) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
+        if (afw || realvr) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
         if (inactive_afw) {
             require(late, "Inactive AFW fixture requires a late-attachment route");
             const auto afw_path = root / "PDAFWPlugin.dll";
             std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", afw_path);
             require(LoadLibraryW(afw_path.c_str()) != nullptr, "Load inactive AFW before Cheeky");
+        }
+        if (higher_hook) {
+            Settings initial; initial.d3d12_lower_hook = false; std::string error;
+            require(write_settings_file(root / "CheekyFoveatedDLSS.ini", initial, error), "Save higher-hook startup setting");
         }
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
@@ -315,14 +333,28 @@ int main(int argc, char** argv) {
             puts("UEVR ownership conflict test passed"); return 0;
         }
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
-        require(received.find("\"eye_calibration\":{\"backend\":\"Waiting for VR\",\"graphics_api\":0,\"enabled\":true") != received.npos,
+        const auto calibration_start = received.find("\"eye_calibration\":{");
+        require(calibration_start != received.npos, "Shared eye calibration diagnostics present");
+        const auto calibration = received.substr(calibration_start, received.find('}', calibration_start) - calibration_start);
+        require(calibration.find("\"backend\":\"Waiting for VR\"") != calibration.npos &&
+            field(calibration, "graphics_api") == 0 && calibration.find("\"enabled\":true") != calibration.npos,
             "Shared eye calibration diagnostics enabled on attachment");
         command("1\n80\ncalibration_disable");
         require(received.find("\"status\":\"Disabled\"") != received.npos, "Calibration disable command");
         command("1\n81\ncalibration_enable");
         command("1\n82\ncalibration_reset");
+        command("1\n86\ncalibration_recalibrate");
         require(received.find("Waiting for OpenVR or OpenXR") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
+            const auto active_hook = higher_hook ? "\"d3d12_lower_hook_active\":false" : "\"d3d12_lower_hook_active\":true";
+            require(snapshot(get).find(active_hook) != std::string::npos, "Saved hook path was not applied at startup");
+            command(higher_hook ? "1\n70\nset\nD3D12LowerHook=true" : "1\n70\nset\nD3D12LowerHook=false");
+            require(snapshot(get).find(active_hook) != std::string::npos &&
+                snapshot(get).find("\"d3d12_hook_restart_required\":true") != std::string::npos,
+                "Hook toggle must save a restart request without changing live ownership");
+            command(higher_hook ? "1\n71\nset\nD3D12LowerHook=false" : "1\n71\nset\nD3D12LowerHook=true");
+            require(snapshot(get).find("\"d3d12_hook_restart_required\":false") != std::string::npos,
+                "Restoring the active selection clears the restart request");
             if (inactive_afw) {
                 present();
                 require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos &&
@@ -336,6 +368,10 @@ int main(int argc, char** argv) {
             // Keep the host mode fresh just as real present callbacks do.
             verify_late_attach_test(get, command, inactive_afw ? present : nullptr,
                 inactive_afw && !dx11 ? +[](unsigned mode) { rendering_mode = std::to_string(mode); } : nullptr);
+            return 0;
+        }
+        if (realvr) {
+            verify_realvr_test(get,command);
             return 0;
         }
         if (afw) {
@@ -392,7 +428,10 @@ int main(int argc, char** argv) {
         require(snapshot(get).find("\"processing\":false")!=std::string::npos,"Device reset pauses processing");
         present();
         require(snapshot(get).find("\"ready\":true")!=std::string::npos,"Renderer recovery");
-        command("1\n2\nset\nWidth=0.65\nHeight=0.45\nEnabled=false");
+        command("1\n2\nset\nWidth=0.65\nHeight=0.45\nEnabled=false\nEyeCalibrationContinuous=false");
+        require(received.find("\"EyeCalibrationContinuous\":false") != received.npos &&
+            received.find("\"continuous_validation\":false") != received.npos,
+            "Calibration policy must reach the shared runtime");
         require(std::abs(field(received,"Width")-0.65)<0.0001 && received.find("\"Enabled\":false") != received.npos, "Settings bridge transaction");
         const auto revision=field(received,"revision");
         command("1\n3\nset\nWidth=0.4\nHeight=nan");
@@ -422,6 +461,8 @@ int main(int argc, char** argv) {
         require(std::abs(field(received,"Width")-0.65)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001 && field(received,"GazeSmoothingMs")==20,
             "Gaze reset preserves SR and NR");
         require(field(received,"NrProcessingOrder")==1, "Gaze reset changed NR order");
+        require(received.find("\"EyeCalibrationContinuous\":false") != received.npos,
+            "Gaze defaults must restore continuous calibration validation");
         command("1\n44\ndefaults_sr");
         require(std::abs(field(received,"Width")-0.55)<0.0001 && std::abs(field(received,"NrIntensity")-0.4)<0.0001,
             "SR reset preserves NR");
@@ -429,7 +470,7 @@ int main(int argc, char** argv) {
         const auto reset_revision = field(received,"revision");
         command("1\n45\ndefaults_typo");
         require(field(received,"revision") == reset_revision, "Unknown reset group is atomic");
-        command("1\n46\nset\nWidth=0.65\nNrIntensity=1\nNrWorkingScale=0.37");
+        command("1\n46\nset\nWidth=0.65\nNrIntensity=1\nNrWorkingScale=0.37\nEyeCalibrationContinuous=false");
         require(received.find("\"setting_groups\":{") != received.npos && received.find("\"nr_details\":{") != received.npos &&
             received.find("\"frame\":{") != received.npos, "Expanded diagnostic snapshot bridge");
         for (unsigned i = 0; i < 35; ++i) { Sleep(10); present(); }
@@ -480,6 +521,7 @@ int main(int argc, char** argv) {
         for (int i=0;i<500 && field(snapshot(get),"saved_revision")<field(snapshot(get),"revision");++i) Sleep(10);
         Settings saved; std::string error; require(read_settings_file(root/"CheekyFoveatedDLSS.ini",saved,error),"Persisted runtime config");
         require(std::abs(saved.width-0.65f)<0.0001f && saved.enabled,"Persisted configured state");
+        require(!saved.eye_calibration_continuous, "Calibration policy must be saved per game");
         require(saved.nr_processing_order == NrProcessingOrder::before_upscaling && saved.nr_working_scale == 0.37f,
             "Asynchronous persistence lost NR rendering order or scale");
         // Reproduce UEVR clearing callbacks before FreeLibrary.
@@ -493,6 +535,8 @@ int main(int argc, char** argv) {
         init=reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin,"uevr_plugin_initialize"));
         require(init(&api),"Reconnect existing runtime"); command("1\n6\nget");
         require(received.find("\"attached\":true")!=received.npos && std::abs(field(received,"Width")-0.65)<0.0001,"Reload retains settings");
+        require(received.find("\"EyeCalibrationContinuous\":false") != received.npos,
+            "Reconnect must retain the saved calibration policy");
         require(field(received,"NrProcessingOrder")==1 && std::abs(field(received,"NrWorkingScale")-0.37)<0.0001,
             "Reconnect lost rendering order or scale");
         detach(1);

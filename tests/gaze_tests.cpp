@@ -7,6 +7,7 @@
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
+#include "rr_contract.hpp"
 #include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr_contract.hpp"
@@ -44,7 +45,7 @@ void trace_event(const char*, ...) noexcept {}
 // Runtime discovery is excluded from deterministic coordinator tests. Live
 // OpenVR acquisition is tested separately, with snapshots exercising shared policy here.
 const CheekyGazeSnapshotV1* test_openvr_snapshot{};
-bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1& output) noexcept {
+bool read_openvr_gaze(const Settings&, IUnknown*, CheekyGazeSnapshotV1& output, std::uint64_t) noexcept {
     if (!test_openvr_snapshot) return false;
     output=*test_openvr_snapshot;
     return true;
@@ -482,6 +483,12 @@ void test_reset_policy() {
     );
     expect(result.reason == GazeResetReason::none,
         "small gaze motion preserves history");
+    const GazeCropPolicyState boundary{164U, 100U, 400U, 300U, true};
+    result = evaluate_gaze_reset(
+        first, boundary, true, false, false, 0.125F
+    );
+    expect(result.reason == GazeResetReason::large_jump,
+        "origin jump at the 64-pixel floor resets history");
     const GazeCropPolicyState large{180U, 100U, 400U, 300U, true};
     result = evaluate_gaze_reset(
         first, large, true, false, false, 0.125F
@@ -533,6 +540,50 @@ void test_core_d3d12_evaluation_is_intercepted() {
         "core D3D12 processing runs inside an interception scope");
     expect(harness.observed_route == D3D12NgxRoute::core_runtime,
         "core D3D12 processing retains its runtime route");
+    dispatch_harness = nullptr;
+}
+
+void test_selectable_d3d12_hook_path() {
+    using namespace cheeky::foveated_dlss;
+    expect(Settings{}.d3d12_lower_hook && d3d12_lower_hook_enabled(), "Lower hook is the startup default without VR detection");
+    D3D12DispatchHarness harness{};
+    dispatch_harness = &harness;
+    const auto lower = +[](ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+        const NgxParameters* params, NgxProgressCallback callback) -> NgxResult {
+        return dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime, list, handle, params, callback},
+            fake_d3d12_original, fake_d3d12_processor, dispatch_harness);
+    };
+    for (const bool use_lower : {true, false}) {
+        configure_d3d12_hook_path(use_lower); // Simulate startup in each configuration.
+        harness = {};
+        expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, lower,
+            fake_d3d12_processor, &harness) == 0x200U && harness.processor_calls == 1 &&
+            harness.observed_route == (use_lower ? D3D12NgxRoute::public_runtime : D3D12NgxRoute::core_runtime),
+            "Selected hook alone owns a core-to-feature evaluation");
+        auto settings = configured_settings(); settings.d3d12_lower_hook = !use_lower;
+        update_settings(settings);
+        expect(d3d12_lower_hook_enabled() == use_lower && d3d12_hook_restart_required(settings.d3d12_lower_hook),
+            "Saving a hook toggle cannot change live ownership");
+    }
+    configure_d3d12_hook_path(true);
+    harness = {};
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime}, fake_d3d12_original,
+        fake_d3d12_processor, &harness) == 0x200U && harness.processor_calls == 1,
+        "Standalone feature-runtime calls work without an outer core call");
+    harness = {};
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, fake_d3d12_original,
+        fake_d3d12_processor, &harness) == 0x100U && harness.processor_calls == 0 && harness.original_calls == 1,
+        "Missing lower hook passes through without secretly processing higher");
+    harness = {}; harness.nest_core_evaluation = true;
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime}, fake_d3d12_original,
+        fake_d3d12_processor, &harness) == 0xBAD00007U && harness.original_calls == 0,
+        "Lower private work cannot leak into an upstream core hook");
+    configure_d3d12_hook_path(false);
+    enable_afw_compatibility();
+    harness = {};
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, lower,
+        fake_d3d12_processor, &harness) == 0x200U && harness.observed_route == D3D12NgxRoute::core_runtime,
+        "Runtime detection does not override the user's higher hook choice");
     dispatch_harness = nullptr;
 }
 
@@ -908,8 +959,9 @@ void test_nr_only_center(bool openvr) {
     snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED |
         CHEEKY_GAZE_STATUS_GAZE_VALID;
     if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    const std::array<StereoSourceCrop, 2> source_crops{{{0, 0, 1, 1, 2400, 2000, true}, {0, 0, 1, 1, 2400, 2000, true}}};
     expect(publish_stereo_calibration(1901, 1902, stereo_view_generation(1901), stereo_view_generation(1902),
-        5000, GetTickCount64(), nullptr, openvr ? 0 : snapshot.session_generation), "NR-only eye mapping publishes");
+        5000, GetTickCount64(), nullptr, openvr ? 0 : snapshot.session_generation, false, false, &source_crops), "NR-only eye mapping publishes");
     for (unsigned eye = 0; eye < 2; ++eye) {
         auto& v = snapshot.views[eye];
         v.view_index = eye;
@@ -1112,13 +1164,14 @@ void test_packed_alignment_coordinator(bool openvr = false) {
         settings.invert_stereo_x_offset = true; // Old manual guess must not invert an observed XR eye.
         const auto a = stereo_view_generation(951), b = stereo_view_generation(952);
         const auto calibration_session = openvr ? 0ULL : snapshot.session_generation;
-        expect(publish_stereo_calibration(952, 951, b, a, 1000, GetTickCount64(), nullptr, calibration_session), "Marker calibration accepts swapped pair");
+        const std::array<StereoSourceCrop, 2> source_crops{{{0, 0, 1, 1, 3024, 2836, true}, {0, 0, 1, 1, 3024, 2836, true}}};
+        expect(publish_stereo_calibration(952, 951, b, a, 1000, GetTickCount64(), nullptr, calibration_session, false, false, &source_crops), "Marker calibration accepts swapped pair");
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i) {
             const float actual = (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F;
             expect_near(actual, snapshot.views[1 - i].forward_u, 0.001F, "Crop follows calibrated eye despite previous packed/manual role");
         }
-        expect(publish_stereo_calibration(951, 952, a, b, 1001, GetTickCount64(), nullptr, calibration_session), "Marker calibration accepts a later eye transition");
+        expect(publish_stereo_calibration(951, 952, a, b, 1001, GetTickCount64(), nullptr, calibration_session, false, false, &source_crops), "Marker calibration accepts a later eye transition");
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i)
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
@@ -1144,7 +1197,7 @@ void test_packed_alignment_coordinator(bool openvr = false) {
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
                         snapshot.views[i].center_u, 0.004F, "Array gaze must use the calibrated eye's center");
         expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr,
-            calibration_session, true), "Verified vertical transform publishes with eye pair");
+            calibration_session, true, false, &source_crops), "Verified vertical transform publishes with eye pair");
         snapshot.views[0].center_v = 0.25F; snapshot.views[1].center_v = 0.7F;
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i)
@@ -1162,7 +1215,7 @@ void test_packed_alignment_coordinator(bool openvr = false) {
         clear_stereo_calibration();
         frame(); frame();
         expect(gaze_diagnostics().alignment_source == 0U, "Ambiguous images require a live marker calibration");
-        expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr, calibration_session + 1),
+        expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr, calibration_session + 1, false, false, &source_crops),
             "Foreign-session test calibration publishes");
         frame(); frame();
         expect(gaze_diagnostics().alignment_source == 0U, "A calibration from another XR session cannot route crop coordinates");
@@ -1170,6 +1223,198 @@ void test_packed_alignment_coordinator(bool openvr = false) {
     }
     unregister_stereo_view(951U); unregister_stereo_view(952U);
     test_openvr_snapshot=nullptr;
+    reset_gaze_foveation();
+}
+
+void test_mono_gaze_coordinator() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation(); clear_stereo_calibration();
+    constexpr std::uint64_t view = 19901, session = 19902;
+    register_stereo_view(view);
+    const auto generation = stereo_view_generation(view);
+    const std::array<StereoSourceCrop, 2> source_crops{{{0, 0, 1, 1, 1000, 1000, true}, {0, 0, 1, 1, 1000, 1000, true}}};
+    expect(!publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session),
+        "Stereo publication must not silently accept duplicated source IDs");
+    expect(publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session, false, true, &source_crops),
+        "Explicitly verified shared-source calibration publishes");
+    expect(stereo_eye_assignment(view).shared_source && !has_multiple_stereo_views(),
+        "Shared mono identity must not invent a second stereo source");
+    Settings settings{};
+    settings.width = settings.height = .2F;
+    settings.x_offset = .6F;
+    settings.gaze_smoothing_ms = 0;
+    settings.gaze_quantization_pixels = 1;
+    settings.auto_stereo_alignment = true;
+    expect(settings_for_view(settings, view).x_offset == 0, "Mono fallback must not inherit a stereo horizontal offset");
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION; snapshot.structure_size = sizeof(snapshot);
+    snapshot.session_generation = session; snapshot.swapchain_generation = 1;
+    snapshot.view_count = 2;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED |
+        CHEEKY_GAZE_STATUS_GAZE_VALID;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& eye = snapshot.views[i];
+        eye.view_index = i;
+        eye.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID | CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID;
+        eye.resource_identity = 19000 + i; eye.swapchain_identity = 19100 + i;
+        eye.image_rect_width = eye.image_rect_height = 1000;
+        eye.center_u = i ? .6F : .2F; eye.center_v = i ? .5F : .3F;
+        eye.forward_u = i ? .65F : .45F; eye.forward_v = i ? .5F : .3F;
+        eye.next_jump_u = i ? .8F : .4F; eye.next_jump_v = i ? .4F : .2F;
+    }
+    CropGeometry crop{};
+    FoveationCenter center{};
+    const auto frame = [&] {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart; ++snapshot.predicted_display_time;
+        bool reset{};
+        expect(calculate_coordinated_crop(settings, view, nullptr, 1000, 1000, 1000, 1000, 0, 0,
+            crop, reset, &snapshot, &center), "Mono gaze resolves a crop");
+    };
+    for (const auto mode : {FoveationCenterMode::openxr_gaze, FoveationCenterMode::simulated_gaze}) {
+        settings.center_mode = mode;
+        if (mode == FoveationCenterMode::simulated_gaze) snapshot.status_flags |= CHEEKY_GAZE_STATUS_SIMULATED;
+        settings.simulation_pattern = 2;
+        frame(); frame(); frame();
+        expect(gaze_diagnostics().using_gaze, "Cold mono supports real and simulated gaze without prior stereo");
+        expect_near(center.u, .4F, .002F, "Mono gaze uses the binocular horizontal center");
+        expect_near(center.v, .4F, .002F, "Mono gaze uses the binocular vertical center");
+        for (const auto& eye : gaze_diagnostics().views)
+            expect(eye.resource_mapped && eye.marker_mapping && eye.dlss_view_id == view,
+                "Both headset eyes must report the same verified mono source");
+        if (mode == FoveationCenterMode::simulated_gaze) {
+            auto preview = settings;
+            apply_next_jump_preview(preview, view);
+            expect(preview.next_jump_visible, "Mono simulation retains the next-jump preview");
+        }
+    }
+    expect(publish_stereo_calibration(view, view, generation, generation, 2, GetTickCount64(), nullptr, session, true, true, &source_crops),
+        "Shared-source vertical transform publishes");
+    frame(); frame();
+    expect_near(center.v, .6F, .002F, "Mono gaze applies the verified vertical flip after averaging");
+    settings.center_mode = FoveationCenterMode::fixed;
+    frame();
+    expect_near(center.u, .55F, .002F, "Mono fixed alignment uses the binocular forward center");
+    expect_near(center.v, .6F, .002F, "Mono fixed alignment applies the same vertical transform");
+    constexpr std::uint64_t other_view = 19903;
+    register_stereo_view(other_view);
+    expect(publish_stereo_calibration(view, other_view, generation, stereo_view_generation(other_view),
+        3, GetTickCount64(), nullptr, session, false, false, &source_crops), "Stereo proof replaces mono gaze mapping");
+    settings.center_mode = FoveationCenterMode::simulated_gaze;
+    frame(); frame(); frame();
+    expect_near(center.u, .2F, .002F, "Returning to stereo restores the individual eye's horizontal gaze");
+    expect_near(center.v, .3F, .002F, "Returning to stereo discards the shared flipped gaze history");
+    expect(publish_stereo_calibration(view, view, generation, generation, 4, GetTickCount64(), nullptr, session, false, true, &source_crops),
+        "New mono proof replaces stereo gaze mapping");
+    frame(); frame(); frame();
+    expect_near(center.u, .4F, .002F, "Returning to mono restores binocular gaze");
+    invalidate_stereo_crop();
+    frame();
+    expect(!gaze_diagnostics().using_gaze, "Eye identity without verified crop geometry must reject gaze");
+    auto cropped = source_crops;
+    for (auto& eye : cropped) eye = {.1F, .2F, .8F, .6F, 1000, 1000, true};
+    expect(publish_stereo_calibration(view, view, generation, generation, 5, GetTickCount64(), nullptr,
+        session, false, true, &cropped), "Verified cropped mono geometry publishes");
+    frame(); frame(); frame();
+    expect_near(center.u, .42F, .002F, "Mono gaze maps the binocular center through the verified source crop");
+    expect_near(center.v, .44F, .002F, "Mono gaze preserves the verified vertical crop offset and scale");
+    cropped[1].valid = false;
+    expect(publish_stereo_calibration(view, view, generation, generation, 6, GetTickCount64(), nullptr,
+        session, false, true, &cropped), "Incomplete geometry fixture publishes eye identity only");
+    frame();
+    expect(!gaze_diagnostics().using_gaze, "Shared-source gaze requires verified geometry for both eyes");
+    cropped = source_crops; cropped[0].source_width = 999;
+    expect(publish_stereo_calibration(view, view, generation, generation, 7, GetTickCount64(), nullptr,
+        session, false, true, &cropped), "Stale source dimensions fixture publishes");
+    frame();
+    expect(!gaze_diagnostics().using_gaze, "Changed source dimensions must reject stale gaze geometry");
+    settings.center_mode = FoveationCenterMode::fixed;
+    snapshot.session_generation++;
+    frame(); frame();
+    expect(gaze_diagnostics().alignment_source == 0, "Foreign-session mono proof cannot route alignment");
+    unregister_stereo_view(view); register_stereo_view(view);
+    expect(!stereo_eye_assignment(view).calibrated, "Mono source recreation invalidates shared mapping");
+    unregister_stereo_view(view); unregister_stereo_view(other_view);
+    reset_gaze_foveation(); clear_stereo_calibration();
+}
+void test_auto_alignment_history(bool openvr) {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation();
+    register_stereo_view(1903U); register_stereo_view(1904U);
+    Settings settings{};
+    settings.center_mode = FoveationCenterMode::fixed;
+    settings.auto_stereo_alignment = true;
+    settings.width = .55F; settings.height = .45F;
+    settings.x_offset = settings.height_offset = 0.F;
+    settings.aligned_height_offset = -.11F;
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    snapshot.structure_size = sizeof(snapshot);
+    snapshot.view_count = 2U;
+    snapshot.session_generation = snapshot.swapchain_generation = 1U;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    // Avoid half-pixel ties from the support report's odd crop dimensions.
+    constexpr float forward_center = .5002F;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& view = snapshot.views[eye];
+        view.view_index = eye;
+        view.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID;
+        view.resource_identity = 1903U + eye;
+        view.image_rect_width = view.image_rect_height = 2928U;
+        view.forward_u = view.forward_v = forward_center;
+    }
+    CropGeometry crops[2]{};
+    bool resets[2]{};
+    const auto frame = [&]() {
+        ++snapshot.predicted_display_time;
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            expect(calculate_coordinated_crop(settings, 1903U + eye, nullptr,
+                1464U, 1464U, 2928U, 2928U, 0U, 0U, crops[eye], resets[eye],
+                &snapshot, nullptr, 1903U + eye), "Fixed alignment history fixture resolves both eyes");
+        }
+    };
+    frame(); frame(); frame();
+    expect(gaze_diagnostics().alignment_source == (openvr ? 3U : 2U),
+        "Fixed history regression exercises runtime alignment");
+    const auto initial = crops[0];
+    for (unsigned cycle = 0; cycle < 16; ++cycle) {
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const float delta = cycle % 2 == 0 ? (eye == 0 ? 1.F : -1.F) / 1464.F : 0.F;
+            snapshot.views[eye].forward_u = snapshot.views[eye].forward_v = forward_center + delta;
+        }
+        frame();
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const int delta = cycle % 2 == 0 ? (eye == 0 ? 1 : -1) : 0;
+            expect(crops[eye].input_base_x == initial.input_base_x + delta &&
+                crops[eye].input_base_y == initial.input_base_y + delta,
+                "Fixed alignment still follows one-pixel movement in both axes");
+            expect(!resets[eye], "One-pixel automatic alignment fluctuations must preserve DLSS history");
+        }
+    }
+    // A new mapping must reset even when its crop is numerically identical.
+    ++snapshot.swapchain_generation;
+    frame();
+    expect(resets[0] && resets[1] && crops[0].input_base_x == initial.input_base_x &&
+        crops[0].input_base_y == initial.input_base_y, "Fixed alignment remapping resets unchanged crop history");
+    frame(); frame();
+    expect(!resets[0] && !resets[1], "Stable fixed mapping does not repeatedly reset");
+    for (auto& view : snapshot.views) view.flags &= ~CHEEKY_GAZE_VIEW_RESOURCE_VALID;
+    frame();
+    expect(resets[0] && resets[1], "Losing a fixed eye mapping invalidates history");
+    for (auto& view : snapshot.views) view.flags |= CHEEKY_GAZE_VIEW_RESOURCE_VALID;
+    frame(); frame(); frame();
+    for (auto& view : snapshot.views) view.forward_u += .15F;
+    frame();
+    expect(resets[0] && resets[1], "Large automatic alignment jumps still reset history");
+    frame();
+    expect(!resets[0] && !resets[1], "History settles after a large alignment jump");
+    settings.width = .5F;
+    frame();
+    expect(resets[0] && resets[1], "Fixed aligned crop resizing still resets history");
+    frame();
+    expect(!resets[0] && !resets[1], "History settles after aligned crop resizing");
+    unregister_stereo_view(1903U); unregister_stereo_view(1904U);
     reset_gaze_foveation();
 }
 
@@ -1216,6 +1461,13 @@ void test_auto_alignment() {
         settings.invert_stereo_x_offset = true;
         expect(calculate() && crop.input_base_x == 150U && !reset,
             "manual eye inversion does not affect automatic alignment");
+        {
+            ScopedGazeProjection moved(901U, {-0.802F, 1.198F, 1.202F, -0.798F, true});
+            expect(calculate() && crop.input_base_x == 151U && crop.input_base_y == 351U && !reset,
+                "One-pixel camera-projection alignment movement preserves history");
+        }
+        expect(calculate() && crop.input_base_x == 150U && crop.input_base_y == 350U && !reset,
+            "Returning camera-projection alignment by one pixel preserves history");
         settings.width = 0.3F;
         expect(calculate() && crop.input_base_x == 250U && reset,
             "resizing preserves center and resets changed crop history");
@@ -1409,7 +1661,13 @@ void test_gaze_copy_routes() {
 
 int run_d3d12_composite_tests();
 int run_eye_calibration_tests();
+int run_crop_calibration_tests();
+int run_crop_calibration12_tests();
+int run_stereo_support_tests();
+int run_stereo_support12_tests();
+int run_mixed_api_calibration_tests();
 int run_openxr_calibration_tests();
+int run_openxr_input_tests();
 int run_support_summary_tests();
 int run_nr_processing_tests();
 
@@ -1530,8 +1788,56 @@ void test_native_dynamic_resolution_extent() {
     expect(absent.values.empty(), "Missing keys are not invented and cannot leak into the game");
 }
 
+void test_rr_contract() {
+    using namespace cheeky::foveated_dlss;
+    expect(is_dlss_rr_runtime_path(L"C:/game/NVNGX_DLSSD.DLL"),"RR packaged DLL recognized");
+    expect(is_dlss_rr_runtime_path(L"C:/NVIDIA/NGX/models/dlssd/versions/123/files/model.bin"),"RR OTA recognized");
+    expect(!is_dlss_rr_runtime_path(L"C:/NVIDIA/NGX/models/dlss/versions/123/files/model.bin"),"SR cannot own RR callbacks");
+    expect(!is_dlss_sr_runtime_path(L"C:/NVIDIA/NGX/models/dlssd/versions/123/files/model.bin"),"RR cannot own SR callbacks");
+    MockNgxParameters p;
+    for(const auto& g:rr_guides) {
+        p.Set(g.resource,reinterpret_cast<ID3D12Resource*>(1)); p.Set(g.x,7U); p.Set(g.y,9U);
+    }
+    float matrix[16]{1,0,0,0, 0,1,0,0, 0,0,1,1, 0,0,0,0};
+    p.Set("ViewToClipMatrix",static_cast<void*>(matrix));
+    const auto original=p.values;
+    DlssFrameContract contract{}; contract.render_width=800; contract.render_height=600;
+    CropGeometry crop{100,150,400,300,0,0,800,600};
+    {
+        RrCropScope scope{&p,contract,crop};
+        for(const auto& g:rr_guides) expect(get_ui(&p,g.x)==107 && get_ui(&p,g.y)==159,"Each guide retains its own source origin");
+        void* changed{}; p.Get("ViewToClipMatrix",&changed);
+        const auto* m=static_cast<float*>(changed);
+        // Original NDC x=-.75 is the left boundary of [100,500] on an 800-pixel image.
+        expect(std::abs(-.75F*m[0]+m[8]+1.F)<1e-6F,"RR crop maps left boundary to NDC -1");
+        expect(std::abs(.25F*m[0]+m[8]-1.F)<1e-6F,"RR crop maps right boundary to NDC +1");
+        expect(matrix[0]==1 && changed!=matrix,"RR uses a private projection matrix");
+    }
+    expect(p.values==original,"RR restores every guide offset and the game's projection pointer");
+    Settings settings; settings.rr_center_preset=6; settings.rr_peripheral_preset=4;
+    update_settings(settings);
+    expect(current_settings().rr_center_preset==6 && current_settings().rr_peripheral_preset==4,"RR D/F settings survive normalization");
+    settings.rr_center_preset=13; update_settings(settings);
+    expect(current_settings().rr_center_preset==0,"SR-only preset M cannot become an RR preset");
+}
+
 void test_afw_dispatch_and_settings() {
     using namespace cheeky::foveated_dlss;
+    expect(is_nvidia_ngx_core_alias_identity(L"C:/driver/NVNGX.DLL", L"NVIDIA Corporation",
+        L"nvngx.dll", L"NGX", true, false), "NVIDIA's documented nvngx core alias is recognized");
+    expect(is_nvidia_ngx_core_alias_identity(L"C:\\game\\nvngx.dll", L"NVIDIA Corporation",
+        L"_nvngx.dll", L"NGX", true, false), "Renamed original NVIDIA core retains its identity");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"OptiScaler",
+        L"OptiScaler.dll", L"OptiScaler", true, false), "OptiScaler renamed nvngx.dll is not a core runtime");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"NVIDIA Corporation",
+        L"nvngx.dll", L"NGX", true, true), "ASI or DXGI proxy exports reject a purported NVIDIA core");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"NVIDIA Corporation",
+        L"nvngx_dlss.dll", L"NGX", true, false), "A renamed feature snippet is not a core runtime");
+    expect(!is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"NVIDIA Corporation",
+        L"nvngx.dll", L"NGX", false, false) &&
+        !is_nvidia_ngx_core_alias_identity(L"C:/game/nvngx.dll", L"", L"", L"", true, false) &&
+        !is_nvidia_ngx_core_alias_identity(L"C:/game/dxgi.dll", L"NVIDIA Corporation",
+            L"nvngx.dll", L"NGX", true, false), "Missing core exports, unknown metadata and other aliases fail closed");
     expect(is_dlss_sr_runtime_path(L"C:/game/NVNGX_DLSS.DLL") &&
         is_dlss_sr_runtime_path(L"C:/ProgramData/NVIDIA/NGX/models//DLSS/versions/20318464/files/160_E658700.BIN"),
         "SR discovery accepts normal DLLs and generated OTA names with mixed separators and case");
@@ -1543,10 +1849,11 @@ void test_afw_dispatch_and_settings() {
     Settings saved;
     saved.width = .4F; saved.height = .9F; saved.nr_enabled = true;
     saved.center_supersampling = 2.F; saved.center_mode = FoveationCenterMode::simulated_gaze;
+    saved.x_offset = .02F; saved.height_offset = -.45F;
     const auto effective = afw_experiment_settings(saved);
-    expect(effective.width == .7F && effective.height == .9F && effective.x_offset == 0.F && effective.height_offset == 0.F &&
-        !effective.auto_stereo_alignment && effective.nr_enabled && effective.center_supersampling == 2.F &&
-        effective.center_mode == FoveationCenterMode::simulated_gaze, "AFW preserves the requested gaze source with a generous fixed fallback");
+    expect(effective.width == saved.width && effective.height == saved.height && effective.x_offset == saved.x_offset && effective.height_offset == saved.height_offset &&
+        effective.auto_stereo_alignment == saved.auto_stereo_alignment && !effective.eye_independent_coverage && effective.nr_enabled && effective.center_supersampling == 2.F &&
+        effective.center_mode == FoveationCenterMode::simulated_gaze, "AFW without an explicit coverage mode preserves per-eye size, offsets and calibration");
     expect(saved.width == .4F && saved.nr_enabled && saved.center_supersampling == 2.F, "AFW overrides leave saved settings intact");
     auto independent = saved;
     independent.afw_manual_coverage = true; independent.nr_use_sr_foveation = false;
@@ -1670,9 +1977,9 @@ void test_afw_dispatch_and_settings() {
             harness.processor_calls == processed + 1, "Known non-AFW modes retain standalone public processing");
         harness.nest_core_evaluation = true;
         const auto originals = harness.original_calls;
-        expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x100U &&
-            harness.processor_calls == processed + 2 && harness.original_calls == originals + 1 &&
-            !d3d12_ngx_interception_active(), "Non-AFW private public-to-core forwarding processes exactly once");
+        expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0xBAD00007U &&
+            harness.processor_calls == processed + 2 && harness.original_calls == originals &&
+            !d3d12_ngx_interception_active(), "Lower hook rejects private core reentry even when AFW is inactive");
     }
     publish_afw_rendering_mode(3);
     expect(afw_coverage_enabled(), "AFW can be re-enabled without restarting the process");
@@ -1779,6 +2086,7 @@ void test_afw_gaze_integration() {
     auto publish = [&] { publish_afw_stereo_projection(matrices, 2000, 1600, true); };
     publish();
     Settings requested;
+    requested.afw_automatic_coverage = true;
     requested.center_mode = FoveationCenterMode::openxr_gaze;
     requested.width = requested.height = .2F; requested.afw_warp_margin = .02F;
     requested.gaze_smoothing_ms = 0.F; requested.roundness = 1.F;
@@ -1904,6 +2212,7 @@ void test_afw_source_projection_coverage() {
     publish_afw_stereo_projection(matrices, 2000, 1600, true);
     const auto projection = afw_stereo_projection();
     Settings requested;
+    requested.afw_automatic_coverage = true;
     requested.center_mode = FoveationCenterMode::openxr_gaze;
     requested.width = requested.height = .2F; requested.afw_warp_margin = .13F;
     requested.gaze_smoothing_ms = 0; requested.roundness = 0;
@@ -2040,14 +2349,53 @@ void test_afw_gaze_pixel_coverage() {
 }
 
 int run_d3d12_history_tests();
+int run_d3d12_safety_tests();
 
+int run_vulkan_tests(bool real=false, bool integration=false);
+int run_d3d11_binding_tests();
+int run_debug_exposure_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--hook-path") == 0) {
+        test_selectable_d3d12_hook_path();
+        return failures ? 1 : 0;
+    }
+    extern int run_retained_calibration_tests();
+    extern int run_calibration_modes_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--calibration-modes") == 0) return run_calibration_modes_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--retained-calibration") == 0) return run_retained_calibration_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--debug-exposure") == 0) return run_debug_exposure_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--openxr-input") == 0) return run_openxr_input_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--crop-calibration-dx12") == 0) return run_crop_calibration12_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--crop-calibration") == 0) return run_crop_calibration_tests() + run_crop_calibration12_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--mixed-calibration") == 0) return run_mixed_api_calibration_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--stereo-support") == 0)
+        return run_stereo_support_tests() + run_stereo_support12_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--alignment-history") == 0) {
+        test_auto_alignment_history(false); test_auto_alignment_history(true); test_auto_alignment();
+        test_packed_alignment_coordinator(false); test_packed_alignment_coordinator(true);
+        test_mono_gaze_coordinator();
+        if (!failures) std::cout << "Automatic alignment history tests passed\n";
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--d3d11-bindings") == 0) return run_d3d11_binding_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan-layer-model") == 0) return run_vulkan_tests(true,true);
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan-model") == 0) return run_vulkan_tests(true);
+    if (argc == 2 && std::strcmp(argv[1], "--vulkan") == 0) return run_vulkan_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--afw-settings") == 0) {
+        test_afw_dispatch_and_settings(); test_afw_projection_and_metadata();
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--afw-gaze") == 0) {
         test_afw_gaze_integration(); test_afw_source_projection_coverage(); test_afw_gaze_pixel_coverage();
         if (!failures) std::cout << "AFW fixed allocation gaze tests passed\n";
         return failures ? 1 : 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--rr-contract") == 0) {
+        test_rr_contract();
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-history") == 0) return run_d3d12_history_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--d3d12-safety") == 0) return run_d3d12_safety_tests();
     if (argc == 3 && std::strcmp(argv[1], "--afw-runtime-file") == 0) {
         const bool supported = cheeky::foveated_dlss::known_afw_warp_file(std::filesystem::path(argv[2]).c_str());
         std::cout << (supported ? "Verified AFW warp ABI file\n" : "Unknown AFW warp ABI file\n");
@@ -2073,6 +2421,9 @@ int main(int argc, char** argv) {
     test_packed_alignment_coordinator(true);
     test_openvr_geometry();
     test_auto_alignment();
+    test_mono_gaze_coordinator();
+    test_auto_alignment_history(false);
+    test_auto_alignment_history(true);
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-composite") == 0) {
         failures += run_d3d12_composite_tests();
         return failures ? 1 : 0;
@@ -2089,11 +2440,13 @@ int main(int argc, char** argv) {
     test_temporal_policy();
     test_reset_policy();
     test_abi();
+    cheeky::foveated_dlss::configure_d3d12_hook_path(false);
     test_core_d3d12_evaluation_is_intercepted();
     test_nested_d3d12_evaluation_is_forwarded_once();
     test_d3d12_route_names();
     test_nested_d3d12_lifecycle_scope_is_passthrough();
     test_core_d3d12_route_is_published_to_diagnostics();
+    cheeky::foveated_dlss::configure_d3d12_hook_path(true);
     test_multimip_game_output_uses_single_mip_private_output();
     test_msfs_array_output_contract();
     test_streamline_private_sr_viewport();
@@ -2106,7 +2459,14 @@ int main(int argc, char** argv) {
     test_dlss_nr_independent_size_shares_sr_center();
     test_openxr_layer_is_retained_while_snapshot_export_is_cached();
     failures += run_support_summary_tests();
+    failures += run_debug_exposure_tests();
     failures += run_eye_calibration_tests();
+    failures += run_retained_calibration_tests();
+    failures += run_crop_calibration12_tests();
+    failures += run_stereo_support_tests();
+    failures += run_stereo_support12_tests();
+    failures += run_mixed_api_calibration_tests();
+    failures += run_openxr_input_tests();
     failures += run_openxr_calibration_tests();
     failures += run_openxr_calibration_format_tests();
     failures += run_nr_processing_tests();
@@ -2116,6 +2476,7 @@ int main(int argc, char** argv) {
     test_afw_source_projection_coverage();
     test_afw_gaze_pixel_coverage();
     failures += run_d3d12_history_tests();
+    failures += run_d3d12_safety_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

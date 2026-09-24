@@ -111,13 +111,16 @@ void finish_d3d12(
     DlssViewId view_id,
     const Settings& settings,
     bool diagnostic_trace,
-    std::uint64_t diagnostic_sequence
+    std::uint64_t diagnostic_sequence,
+    D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS
 ) noexcept;
 
 [[nodiscard]] ID3D12Resource* d3d12_private_output(
     const D3D12Evaluation* evaluation
 ) noexcept;
 
+void d3d12_align_reconstruction_grid(D3D12Evaluation*) noexcept;
 [[nodiscard]] bool d3d12_set_composite_base(
     D3D12Evaluation* evaluation,
     ID3D12Resource* low_resolution_color,
@@ -146,6 +149,7 @@ void finish_d3d12_streamline(
 ) noexcept;
 
 void release_d3d11_resources() noexcept;
+void collect_d3d12_resources() noexcept;
 void release_d3d12_resources() noexcept;
 
 }  // namespace cheeky::foveated_dlss

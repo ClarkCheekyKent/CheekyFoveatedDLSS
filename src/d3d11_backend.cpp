@@ -1,11 +1,10 @@
 #include "backend.hpp"
 #include "runtime.hpp"
-#include "d3d11_composite_shader.hpp"
+#include "d3d_shaders.hpp"
 #include "diagnostics.hpp"
 #include "gaze_foveation.hpp"
 #include "crop_motion.hpp"
-
-#include <d3dcompiler.h>
+#include "d3d11_write_bindings.hpp"
 
 #include <array>
 #include <cstddef>
@@ -174,8 +173,6 @@ void release_resource_set(ResourceSet& resources) noexcept {
     }
 
     ID3D11Device* device{};
-    ID3DBlob* shader_blob{};
-    ID3DBlob* errors{};
     ID3D11Texture2D* dlss_output{};
     ID3D11ShaderResourceView* dlss_srv{};
     ID3D11ComputeShader* composite_shader{};
@@ -186,8 +183,6 @@ void release_resource_set(ResourceSet& resources) noexcept {
         release(composite_shader);
         release(dlss_srv);
         release(dlss_output);
-        release(errors);
-        release(shader_blob);
         release(device);
     };
 
@@ -227,27 +222,9 @@ void release_resource_set(ResourceSet& resources) noexcept {
         return false;
     }
 
-    result = D3DCompile(
-        d3d11_composite_shader_source,
-        sizeof(d3d11_composite_shader_source) - 1U,
-        "Cheeky Foveated DLSS-SR",
-        nullptr,
-        nullptr,
-        "CompositeMain",
-        "cs_5_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0U,
-        &shader_blob,
-        &errors
-    );
-    if (FAILED(result)) {
-        clean_up();
-        return false;
-    }
-
     result = device->CreateComputeShader(
-        shader_blob->GetBufferPointer(),
-        shader_blob->GetBufferSize(),
+        d3d_shaders::composite11.data,
+        d3d_shaders::composite11.size,
         nullptr,
         &composite_shader
     );
@@ -1273,6 +1250,7 @@ void finish_d3d11(
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(evaluation->constant_buffer, 0U);
 
+    D3D11WriteBindingsScope write_bindings(context);
     ID3D11ComputeShader* previous_shader{};
     std::array<ID3D11ClassInstance*, 256U> previous_classes{};
     UINT previous_class_count = static_cast<UINT>(previous_classes.size());
@@ -1416,6 +1394,7 @@ bool composite_d3d11_crop(
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(resources->constant_buffer, 0U);
 
+    D3D11WriteBindingsScope write_bindings(context);
     ID3D11ComputeShader* previous_shader{};
     std::array<ID3D11ClassInstance*, 256U> previous_classes{};
     UINT previous_class_count = static_cast<UINT>(previous_classes.size());

@@ -5,6 +5,7 @@ namespace cheeky::foveated_dlss {
 inline constexpr char composite_shader_source[] = R"(
 Texture2DArray<float4> LowResolutionColor : register(t0);
 Texture2DArray<float4> DlssColor : register(t1);
+Texture2D<float4> GameExposure : register(t2);
 RWTexture2DArray<float4> GameOutput : register(u0);
 
 cbuffer Constants : register(b0) {
@@ -28,8 +29,9 @@ cbuffer Constants : register(b0) {
     float NextJumpWidth;
     float NextJumpHeight;
     uint MaskCount;
-    uint MaskPadding;
+    float ExposureWhiteMultiplier;
     float4 MaskBounds[4];
+    float4 ReconstructionGrid;
 };
 
 float ShapeDistance(float2 centered) {
@@ -87,13 +89,15 @@ float4 LoadDlssResampled(uint2 local_pixel) {
     uint width, height, layers;
     DlssColor.GetDimensions(width, height, layers);
     const uint2 source_size = uint2(width, height) - DlssOrigin;
-    if (all(source_size == RectSize)) {
+    const bool aligned_grid = all(ReconstructionGrid.xy > 0.0);
+    if (!aligned_grid && all(source_size == RectSize)) {
         const int2 pixel = int2(DlssOrigin + local_pixel);
         return DlssColor.Load(int4(pixel, 0, 0));
     }
-    const float2 ratio = float2(source_size) / float2(RectSize);
-    if (any(source_size < RectSize)) {
-        const float2 position = (float2(local_pixel) + 0.5) * ratio - 0.5;
+    const float2 ratio = aligned_grid ? ReconstructionGrid.xy : float2(source_size) / float2(RectSize);
+    const float2 phase = aligned_grid ? ReconstructionGrid.zw : float2(0.0, 0.0);
+    if (any(ratio < 1.0)) {
+        const float2 position = (float2(local_pixel) + 0.5) * ratio + phase - 0.5;
         const int2 base = int2(floor(position));
         const float2 fraction = frac(position);
         const int2 maximum = int2(source_size) - 1;
@@ -105,8 +109,8 @@ float4 LoadDlssResampled(uint2 local_pixel) {
             lerp(DlssColor.Load(int4(p01, 0, 0)), DlssColor.Load(int4(p11, 0, 0)), fraction.x), fraction.y);
     }
 
-    const float2 begin = float2(local_pixel) * ratio;
-    const float2 end = min(float2(local_pixel + 1U) * ratio, float2(source_size));
+    const float2 begin = float2(local_pixel) * ratio + phase;
+    const float2 end = float2(local_pixel + 1U) * ratio + phase;
     float4 sum = 0.0;
     float total = 0.0;
     [loop] for (int y = int(floor(begin.y)); y < int(ceil(end.y)); ++y) {
@@ -162,7 +166,13 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         distance_from_center <= 1.0 &&
         distance_from_center >= 1.0 - 5.0 * distance_per_pixel;
     if (alignment_border) {
-        GameOutput[uint3(output_pixel, 0)] = float4(1.0, 0.0, 0.0, 1.0);
+        float white = 1.0;
+        if (ExposureWhiteMultiplier > 0.0) {
+            float exposure = GameExposure.Load(int3(0, 0, 0)).r;
+            if (isfinite(exposure) && exposure > 0.0)
+                white = clamp(ExposureWhiteMultiplier / exposure, 0.0001, 1024.0);
+        }
+        GameOutput[uint3(output_pixel, 0)] = float4(white, 0.0, 0.0, 1.0);
         return;
     }
     const float normalized_feather = Feather /

@@ -1,11 +1,14 @@
 #pragma once
 
 #include "backend.hpp"
+#include "peripheral_contract.hpp"
+#include "rr_contract.hpp"
 
 namespace cheeky::foveated_dlss {
 
 struct PeripheralDlaaRequest {
     DlssViewId view_id{};
+    std::uint32_t feature_id{1U};
     ID3D12GraphicsCommandList* command_list{};
     ID3D12Resource* color{};
     ID3D12Resource* depth{};
@@ -59,6 +62,7 @@ struct PeripheralDlaaResources {
     std::uint32_t mv_base_y{};
     std::uint32_t working_width{};
     std::uint32_t working_height{};
+    std::array<ID3D12Resource*, rr_guide_count> rr_guides{};
     bool downsampled_color{};
     bool downsampled_depth{};
     bool converted_motion{};
@@ -66,17 +70,6 @@ struct PeripheralDlaaResources {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     };
 };
-
-struct PeripheralDlaaDimensions {
-    std::uint32_t width{};
-    std::uint32_t height{};
-};
-
-[[nodiscard]] PeripheralDlaaDimensions peripheral_dlaa_dimensions(
-    std::uint32_t render_width,
-    std::uint32_t render_height,
-    float scale
-) noexcept;
 
 [[nodiscard]] DlssViewId peripheral_dlaa_view_id(DlssViewId view_id) noexcept;
 

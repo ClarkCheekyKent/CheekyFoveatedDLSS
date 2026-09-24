@@ -2,7 +2,7 @@
 
 Start with the [installation guide](README.md#installation). This page contains the detailed control reference.
 
-For **UEVR AFW**, use the [AFW setup and validation guide](uevr/README.md#afw-routing-experiment). That DX12 path supports SR and NR with fixed or gaze-driven coverage of both possible source eyes and bypasses ordinary eye calibration. Effective coverage can exceed the stored fovea dimensions; the AFW banner reports SR coverage, while NR status reports its processing region and working resolution.
+For **UEVR AFW**, use the [AFW setup and validation guide](uevr/README.md#afw-routing-experiment). That DX12 path supports SR, RR and NR. With AFW coverage controls off, it uses the configured per-eye region and ordinary eye calibration. Optional manual/automatic AFW coverage includes both possible source eyes. Effective coverage can exceed the stored fovea dimensions; the AFW banner reports SR coverage, while NR status reports its processing region and working resolution.
 
 ## Controls
 
@@ -26,7 +26,7 @@ The main controls and their defaults are:
 | Periphery scale | `0.75` | Downscales the periphery further from the original render resolution. |
 | Fovea width / height | `0.55` / `0.45` | Sets the normalized size of the DLSS-processed region. |
 | Automatic stereo alignment | On | Uses OpenXR or usable Streamline projection data to align each eye without manual X adjustment. |
-| Stereo X offset | `0.60` | Manual horizontal placement; shown when two views are detected, Fixed is selected, and automatic alignment is off. |
+| Stereo X offset | `0.00` | Manual horizontal placement; shown when two views are detected, Fixed is selected, and automatic alignment is off. |
 | Invert stereo eye order | Off | Advanced override under Stereo mapping override for reversed packed eye order and manual stereo offsets. |
 | Height offset | `0.00` with automatic alignment; `-0.45` in manual placement | Moves fixed placement up (negative) or down (positive). With automatic alignment, zero preserves the detected center. In gaze modes this is Fallback height offset and does not shift valid gaze. |
 | Roundness | `0.00` | Blends the region shape from rectangular (`0`) to elliptical (`1`). This does not affect performance. |
@@ -201,3 +201,66 @@ peripheral DLAA on/off, live order switching, dynamic resolution/resizing, both
 eyes, and gaze movement. Record image quality, actual NR working dimensions,
 NR GPU time, and total pipeline GPU time for both orders. Support reports include
 the selected order, dimensions, skip state, and separate timing samples.
+
+### RealVR OpenXR gaze without game input actions
+
+The OpenXR layer enables `XR_EXT_eye_gaze_interaction` when available and creates
+its own gaze action. For an identified R.E.A.L. VR runtime, it can also attach that
+action and synchronize it independently when the game never initializes OpenXR
+input. Acquisition starts at a focused stereo `xrLocateViews` call in a running
+session; synchronization runs once per display time. Focus loss or a failed sync
+invalidates gaze, and focus recovery resumes polling without attaching again.
+
+Standalone attachment is attempted once per session and only if the host has not
+created action sets or attempted attachment. If the host has created actions,
+Cheeky waits and appends gaze to the host's attachment. Once the host calls
+`xrSyncActions`, Cheeky uses that merged synchronization path for the remainder of
+the session. It does not issue extra gaze-only syncs that could deactivate host
+controller actions. A host that starts creating and attaching input only after
+Cheeky's standalone attachment cannot attach additional sets to that session;
+OpenXR's already-attached error is preserved. Restart with a host-managed input
+path in that case.
+
+Support reports include `gaze.input` with the detected RealVR state, host and
+fallback call counts, binding/attachment state, and the runtime results for binding,
+attachment, synchronization, action-state queries, action-space creation and gaze
+location. A `null` result means the operation has not been called. Old layer builds
+without these diagnostics report `input: null`. Extension support alone does not
+mean the headset/runtime is providing gaze. Independent polling cannot override
+runtime focus or eye-tracking permissions.
+
+This change requires updating the installed **OpenXR layer**, as well as the game
+runtime. Close VR applications and run the matching OpenXR setup included in the
+RealVR gaze test package; replacing only the game's DLLs will not update the layer.
+
+### Direct3D 12 Ray Reconstruction
+
+Cheeky detects native NGX Ray Reconstruction separately from Super Resolution,
+including NVIDIA OTA runtimes and calls nested below R.E.A.L. VR. The center and
+periphery use separate RR features and histories. RR guide textures follow the
+center crop and peripheral scale, keeping the periphery denoised. Turning off
+Peripheral DLAA uses input-resolution RR there instead of raw ray-traced color.
+
+When RR is active, preset menus offer Game default, D, E and F. RR preferences
+are stored separately as `RrCenterPreset` and `RrPeripheralPreset`; SR preferences
+are retained when switching back. Preset availability depends on the installed
+NVIDIA runtime. SR-only periphery is not offered because SR cannot replace RR's
+denoising of noisy ray-traced input. NR remains available before or after RR.
+
+This path remains experimental; game/headset validation is limited. Cropped RR currently
+requires input-resolution motion and valid albedo/normal/roughness guides.
+Output alpha and legacy research inputs without independent crop coordinates
+use the game's native full-frame RR with optional NR. Moving the RR center
+preserves history using crop-relative motion vectors and a cropped projection;
+game resets, gaze jumps, geometry changes and discontinuities still invalidate it.
+
+The center uses crop-sized inputs and fractional composite alignment to preserve
+the full-frame sampling grid as it moves. Change-only eye calibration retains the
+first valid published mapping until a view, geometry, session or explicit
+calibration-setting change; continuous mode continues verifying markers.
+
+### DLSS hook path (D3D12)
+
+**Use lower DLSS hook (DX12)** is enabled by default. Cheeky processes DLSS at the feature runtime, leaving upstream core and Streamline calls intact. Turn it off to use the higher call (the previous outermost-interception path). The control is in the DLSS-SR panel for standalone/UEVR and beside the processing-path controls in ReShade.
+
+The saved setting is `D3D12LowerHook=true` (`false` selects higher). Restart the game after changing it; the active path remains unchanged until restart so existing feature handles and histories keep their owner. The runtime snapshot reports `d3d12_lower_hook_active` and `d3d12_hook_restart_required`. If the lower runtime cannot be identified or hooked, its path leaves game DLSS unchanged; it does not automatically switch to higher processing.

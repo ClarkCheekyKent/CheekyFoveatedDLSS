@@ -4,6 +4,7 @@
 #include "support_prompts.hpp"
 #include "diagnostics.hpp"
 #include "eye_calibration.hpp"
+#include "eye_calibration_capture.hpp"
 #include "dlss_nr.hpp"
 #include "gaze_foveation.hpp"
 #include "settings.hpp"
@@ -201,6 +202,7 @@ std::string diagnostics_text() {
     out << "\n[Eye calibration]\n" << eye_calibration_json() << '\n';
     const auto g = gaze_diagnostics();
     out << "\n[OpenXR]\n";
+    out << "input=" << gaze_input_diagnostics_json(g.input) << '\n';
     out << "runtime_name=" << g.runtime_name << '\n';
     out << "submitted_copies=" << g.submitted_copies << '\n';
     out << "alignment_source=" << g.alignment_source << '\n';
@@ -338,6 +340,10 @@ std::string issue_markdown(const std::vector<SupportFile>& files) {
 
 PreparedReport create_report(const fs::path& addon, const fs::path& game,
                        std::string settings, std::string diagnostics) {
+    const auto calibration = eye_calibration_stats();
+    auto images = collect_calibration_images(request_calibration_images(calibration.enabled && calibration.runtime_active,
+        std::chrono::seconds(5), calibration.enabled ? "vr_not_active" : "calibration_disabled"));
+    diagnostics += "\n[Stereo support capture]\n" + images.diagnostics + '\n';
     std::array<wchar_t, 32768> temp{};
     const auto size = GetTempPathW(static_cast<DWORD>(temp.size()), temp.data());
     if (!size || size >= temp.size()) throw std::runtime_error("Cannot locate temporary directory");
@@ -353,11 +359,15 @@ PreparedReport create_report(const fs::path& addon, const fs::path& game,
     if (!fs::create_directory(folder)) throw std::runtime_error("Report folder already exists; retry");
     std::vector<SupportFile> files{{"settings.ini", std::move(settings)},
                                  {"diagnostics.txt", std::move(diagnostics)}};
+    for (auto& file : images.files) files.push_back(std::move(file));
     std::ostringstream manifest;
     manifest << "Capture time (UTC): " << utf8(name) << "\n"
         << "Review before attaching: logs may contain personal paths or identifiers.\n"
         << "Only add-on settings are exported; ReShade.ini is not included.\n"
         << "The crash log is optional and may belong to an earlier game session.\n\n";
+    manifest << "Stereo images: one sampled calibration interval, full textures downscaled below 1 MB each.\n"
+        << "See stereo-capture.json for original resolutions, crop bounds, sample regions and missing-image reasons.\n"
+        << "Source A/B are unconfirmed candidates; submitted eye labels are in the JSON. HDR values are clamped for preview.\n\n";
     collect_log(files, manifest, addon.parent_path() / L"CheekyFoveatedDLSS.log", "CheekyFoveatedDLSS.log");
     collect_log(files, manifest, game.parent_path() / L"ReShade.log", "ReShade-game.log");
     if (addon.parent_path() != game.parent_path())
@@ -491,7 +501,7 @@ void draw_support_report(HMODULE addon) {
                 "\nDX12: " + diagnostic_state_name(diagnostic_snapshot(DiagnosticApi::d3d12).state);
             pending = std::async(std::launch::async, create_report, addon_file, game_file,
                                  std::move(settings), std::move(diagnostics));
-            status = "Preparing support ZIP...";
+            status = "Capturing stereo diagnostics and preparing support ZIP (up to 5 seconds)...";
         }
         if (!status.empty()) ImGui::TextWrapped("%s", status.c_str());
         if (!last_zip.empty()) {

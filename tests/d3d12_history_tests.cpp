@@ -69,7 +69,7 @@ void read_pixel(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
     transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
-void run_alternating(bool low_res_motion, float margin) {
+void run_alternating(bool low_res_motion, float margin, unsigned feature = 1U, float mv_scale = -128.F) {
     reset_gaze_foveation(); allow_afw_stereo_projection(true);
     creates = resets = 0;
     ComPtr<IDXGIFactory4> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
@@ -107,6 +107,9 @@ void run_alternating(bool low_res_motion, float margin) {
         auto* row = reinterpret_cast<float*>(data + footprint.Offset + y * footprint.Footprint.RowPitch);
         for (unsigned x = 0; x < motion_desc.Width; ++x) { row[x * 2] = .125F; row[x * 2 + 1] = -.25F; }
     }
+    // A unique pixel verifies that the exact crop copy honors its source origin.
+    auto* sentinel = reinterpret_cast<float*>(data + footprint.Offset + 9 * footprint.Footprint.RowPitch);
+    sentinel[7 * 2] = 1.25F; sentinel[7 * 2 + 1] = -2.5F;
     upload->Unmap(0, nullptr);
     transition(list.Get(), resources[2].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION from{}, to{};
@@ -114,13 +117,13 @@ void run_alternating(bool low_res_motion, float margin) {
     to.pResource = resources[2].Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
     transition(list.Get(), resources[2].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    auto readback = buffer(device.Get(), 1024, D3D12_HEAP_TYPE_READBACK);
+    auto readback = buffer(device.Get(), 1536, D3D12_HEAP_TYPE_READBACK);
     CropGeometry previous{}; CropMotionOffset expected_offset{};
     parameters.Set("Width", 128U); parameters.Set("Height", 128U);
     parameters.Set("OutWidth", 256U); parameters.Set("OutHeight", 256U);
     const unsigned flags = low_res_motion ? 0x4B : 0x49;
     parameters.Set("DLSS.Feature.Create.Flags", flags);
-    parameters.Set("MV.Scale.X", -128.F); parameters.Set("MV.Scale.Y", -128.F);
+    parameters.Set("MV.Scale.X", mv_scale); parameters.Set("MV.Scale.Y", mv_scale);
     parameters.Set("Reset", 0);
     Settings requested;
     requested.afw_automatic_coverage = true;
@@ -159,10 +162,11 @@ void run_alternating(bool low_res_motion, float margin) {
         require(prepared != nullptr, "Alternating-eye preparation failed");
         const auto crop = d3d12_evaluation_crop(prepared);
         DlssFrameContract contract{};
+        contract.feature_id = feature;
         contract.view_id = view; contract.create_flags = flags;
         contract.motion_vectors_low_res = low_res_motion;
         contract.preserve_history_on_crop_move = true;
-        contract.motion_vector_scale_x = contract.motion_vector_scale_y = -128;
+        contract.motion_vector_scale_x = contract.motion_vector_scale_y = mv_scale;
         contract.reset = game_reset || d3d12_evaluation_gaze_reset(prepared);
         D3D12DlssInputs inputs{};
         inputs.color = resources[0].Get(); inputs.depth = resources[1].Get();
@@ -183,7 +187,11 @@ void run_alternating(bool low_res_motion, float margin) {
         }
         if (frame >= 2 && frame < 10) corrected &= observed_motion != resources[2].Get();
         if (frame == 9) {
-            require(crop_motion_offset(previous, crop, low_res_motion, -128, -128, expected_offset), "Invalid expected crop correction");
+            auto* copied=prepare_crop_texture12(list.Get(),resources[2].Get(),7,9,16,12);
+            require(copied && copied->GetDesc().Width==16 && copied->GetDesc().Height==12 &&
+                copied->GetDesc().Format==motion_desc.Format,"Exact crop copy changed extent or format");
+            read_pixel(list.Get(),copied,readback.Get(),1024);
+            require(crop_motion_offset(previous, crop, low_res_motion, mv_scale, mv_scale, expected_offset), "Invalid expected crop correction");
             read_pixel(list.Get(), observed_motion, readback.Get(), 0);
             read_pixel(list.Get(), resources[2].Get(), readback.Get(), 512);
         }
@@ -211,18 +219,21 @@ void run_alternating(bool low_res_motion, float margin) {
     check(readback->Map(0, nullptr, reinterpret_cast<void**>(&data)));
     const auto* actual = reinterpret_cast<const float*>(data);
     const auto* original = reinterpret_cast<const float*>(data + 512);
+    const auto* copied = reinterpret_cast<const float*>(data + 1024);
+    const bool copy_correct = copied[0]==1.25F && copied[1]==-2.5F;
     const bool vectors_correct = std::abs(actual[0] - (.125F + expected_offset.x)) < 1e-6F &&
         std::abs(actual[1] - (-.25F + expected_offset.y)) < 1e-6F && original[0] == .125F && original[1] == -.25F;
     readback->Unmap(0, nullptr);
     list.Reset(); allocator.Reset();
     release_d3d12_resources(); reset_gaze_foveation(); allow_afw_stereo_projection(false);
-    std::cout << "AFW backend history: low_res_mv=" << low_res_motion << " margin=" << margin
+    std::cout << "AFW backend history: feature=" << feature << " mv_scale=" << mv_scale << " low_res_mv=" << low_res_motion << " margin=" << margin
         << " creates=" << creates << " resets=" << resets << '\n';
     require(creates == 3, "SR should create only for first use, pixel resize and a new view");
     require(stable, "Source-eye alternation reset private SR despite stable pixel dimensions");
     require(all_resets_correct, "SR failed to retain or invalidate history at the correct boundary");
     require(corrected, "Alternating source eyes did not receive privately corrected motion vectors");
     require(vectors_correct, "Inference received incorrect crop-relative vectors or game vectors were modified");
+    require(copy_correct, "Exact crop copy did not preserve source pixel values");
 }
 }
 
@@ -230,6 +241,9 @@ int run_d3d12_history_tests() {
     try {
         for (bool low_res_motion : {false, true})
             for (float margin : {0.F, 1.F / 32, 2.F / 32}) run_alternating(low_res_motion, margin);
+        // RR's supported low-resolution vectors include pixel-space vectors
+        // (the Hogwarts capture uses scale 1) and normalized signed vectors.
+        for (float scale : {1.F, -128.F}) run_alternating(true, 0.F, 13U, scale);
         return 0;
     }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

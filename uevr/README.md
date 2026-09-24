@@ -24,7 +24,7 @@ The OpenXR installation is shared across games. Install all plugin files and the
 
 ## First-use check
 
-For AFW, follow the dedicated instructions below; its coverage modes bypass the usual eye calibration setup.
+For AFW, follow the dedicated instructions below. Per-eye mode uses the usual eye calibration setup.
 
 Keep **Fixed**, **Automatic stereo alignment** and **Automatic eye calibration** enabled. Use the red alignment border to check both eyes, then open **Stereo and gaze → Eye calibration**. Check that calibration becomes **Active** and both regions stay aligned through loading/menu transitions.
 
@@ -71,7 +71,7 @@ The coverage selector offers:
 
 - **Automatic:** aligns the requested regions using both UEVR eye projections. Height offset adjusts their vertical position. Missing or mismatched projections use centered coverage.
 - **Manual:** uses mirrored horizontal offsets and a shared height offset.
-- **Centered (70% minimum):** uses at least 70% width and height. Larger requested sizes apply.
+- **Per-eye (calibrated):** preserves the requested width, height and offsets and uses the calibrated eye mapping. This is the default when both AFW coverage flags are off.
 
 **Advanced AFW → Extra margin per edge** adds a fixed allowance around the requested regions. It is a fraction of the full image, so 0.05 adds 5% on each edge. Stereo coverage and this margin can enlarge the visible region beyond the requested width and height. Automatic depth adjustment is removed. Existing coverage preferences and manual margin values are preserved.
 
@@ -83,7 +83,7 @@ Runtime gaze and simulated gaze use a fixed crop budget derived from the fovea d
 
 Gaze movement, smoothing and tracking loss change placement without resizing the allocation. Tracking loss moves the fixed gaze allocation toward the configured fallback position. Changing fovea dimensions or stereo projection can resize it. Small gaze movements retain temporal history. Jump simulations support **Show next jump target** without changing current coverage.
 
-Switching UEVR away from AFW restores ordinary stereo controls and marker calibration during the same session. AFW coverage returns when AFW is selected again. The resolution-protecting hooks remain installed while the AFW runtime is loaded.
+Marker calibration remains available with AFW. Switching UEVR away from AFW restores ordinary stereo controls; explicitly selected AFW coverage returns when AFW is selected again. The resolution-protecting hooks remain installed while the AFW runtime is loaded.
 
 ### Diagnostics and compatibility
 

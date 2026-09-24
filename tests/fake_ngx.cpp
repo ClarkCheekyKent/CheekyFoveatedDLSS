@@ -24,6 +24,9 @@ Evaluate12C forward_evaluate_c{};
 Release12 forward_release{};
 bool fail_evaluation{};
 bool copy_nr_color{};
+bool require_feature_path{};
+bool fail_initialization{};
+std::atomic<unsigned> initializations{};
 unsigned fail_next{};
 NgxResult evaluate(const NgxHandle* handle, const NgxParameters* params) {
     ++evaluates;
@@ -51,6 +54,9 @@ EXPORT void __cdecl CheekyOpenXR_SetSimulationPattern(unsigned) {}
 EXPORT void CheekyFakeObserveCreated(Observe callback) { observe_created = callback; }
 EXPORT void CheekyFakeFailEvaluations(bool fail) { fail_evaluation = fail; }
 EXPORT void CheekyFakeCopyNrColor(bool enabled) { copy_nr_color = enabled; }
+EXPORT void CheekyFakeRequireFeaturePath(bool enabled) { require_feature_path = enabled; }
+EXPORT void CheekyFakeFailInitialization(bool fail) { fail_initialization = fail; }
+EXPORT unsigned CheekyFakeInitializations() { return initializations.load(); }
 EXPORT void CheekyFakeFailNextEvaluations(unsigned count) { fail_next = count; }
 // A separately loaded copy acts as the core runtime and deliberately wraps the
 // lower handle. Cache these addresses before Cheeky installs its real detours.
@@ -67,12 +73,26 @@ EXPORT void __stdcall EvaluateFrameWarp(void* parameters) { last_warp_parameters
 EXPORT void* CheekyFakeLastWarpParameters() { return last_warp_parameters; }
 EXPORT unsigned CheekyFakeWarpCalls() { return warp_calls; }
 // The hook harness loads a second copy as its optional feature-18 runtime.
-EXPORT NgxResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID3D12Device*, unsigned, const NgxParameters*) {
+EXPORT NgxResult NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID3D12Device*, unsigned, const void* common) {
+    ++initializations;
+    if (fail_initialization) return 0xBAD00002U;
+    if (require_feature_path) {
+        const auto* info = static_cast<const NgxFeatureCommonInfo*>(common);
+        bool found{};
+        if (info && info->path_list.paths) {
+            for (unsigned i = 0; i < info->path_list.count; ++i) {
+                const std::wstring file = std::wstring(info->path_list.paths[i]) + L"\\nvngx_dlss.dll";
+                found = found || GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES;
+            }
+        }
+        if (!found) return 0xBAD0000BU;
+    }
     wchar_t path[MAX_PATH]{};
     return GetModuleFileNameW(nullptr, path, MAX_PATH) ? 1U : 0xBAD00007U;
 }
 EXPORT NgxResult NVSDK_NGX_D3D12_AllocateParameters(NgxParameters** out) { *out = new MockNgxParameters; return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D12_DestroyParameters(NgxParameters* params) { delete static_cast<MockNgxParameters*>(params); return 1U; }
+EXPORT NgxResult NVSDK_NGX_D3D12_Shutdown1(ID3D12Device*) { return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D11_Init(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned) { return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D12_Init(unsigned long long, const wchar_t*, ID3D12Device*, const void*, unsigned) { return 1U; }
 EXPORT NgxResult NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle** out) {

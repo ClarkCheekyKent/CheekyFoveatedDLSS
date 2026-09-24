@@ -12,10 +12,9 @@ enum class D3D12NgxRoute : std::uint32_t {
     core_runtime,
 };
 
-// Experimental AFW routing: the core observes the original game evaluation;
-// while AFW is selected (or mode is unknown), only a feature-runtime evaluation
-// nested inside it may own reconstruction. Known non-AFW modes also allow the
-// ordinary standalone public-runtime path.
+// Lower-hook routing also supplies AFW's original full-frame observation.
+// While AFW is selected (or mode is unknown), reconstruction requires a
+// nested feature-runtime call. Ordinary hosts allow standalone feature calls.
 struct AfwCompatibilityStatus {
     bool enabled{};
     std::uint64_t core_calls{}, lower_calls{}, missing_lower_calls{};
@@ -34,6 +33,11 @@ struct AfwCompatibilityStatus {
     std::uint64_t early_left_calls{}, early_right_calls{}, early_unknown_calls{};
 };
 void enable_afw_compatibility() noexcept;
+// Configure before installing hooks. Never change ownership of live feature handles.
+void configure_d3d12_hook_path(bool lower) noexcept;
+[[nodiscard]] bool d3d12_lower_hook_enabled() noexcept;
+[[nodiscard]] bool d3d12_hook_restart_required(bool requested_lower) noexcept;
+[[nodiscard]] bool protected_ngx_core_enabled() noexcept;
 [[nodiscard]] bool afw_compatibility_enabled() noexcept;
 [[nodiscard]] bool afw_coverage_enabled() noexcept;
 void publish_afw_rendering_mode(unsigned mode) noexcept;
@@ -52,7 +56,7 @@ void afw_note_warp_call(unsigned source_eye = UINT32_MAX, unsigned mode = UINT32
 [[nodiscard]] bool afw_reject_core_reentry() noexcept;
 
 // Separate private reconstruction from full-frame passthrough and lifecycle
-// hooks: an ordinary public call is allowed to forward to a core runtime.
+// hooks. The lower path rejects private work that re-enters an upstream core.
 class AfwPrivateWorkScope final {
 public:
     AfwPrivateWorkScope() noexcept;

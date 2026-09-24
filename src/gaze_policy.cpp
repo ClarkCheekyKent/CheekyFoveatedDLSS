@@ -212,7 +212,7 @@ GazeResetPolicyResult evaluate_gaze_reset(
             64U,
             static_cast<std::uint32_t>(std::lround(current.height * ratio))
         );
-        if (result.delta_x > threshold_x || result.delta_y > threshold_y) {
+        if (result.delta_x >= threshold_x || result.delta_y >= threshold_y) {
             result.reason = GazeResetReason::large_jump;
         }
     }

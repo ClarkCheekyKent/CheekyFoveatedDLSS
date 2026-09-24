@@ -1,8 +1,10 @@
 #pragma once
 
 #include "foveation.hpp"
+#include "eye_calibration_policy.hpp"
 
 #include <cstdint>
+#include <array>
 #include <vector>
 
 namespace cheeky::foveated_dlss {
@@ -37,13 +39,16 @@ inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
 
 struct Settings {
     bool enabled{true};
+    bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
     bool d3d11_use_d3d12_transport{false};
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
+    std::uint32_t rr_center_preset{};
+    std::uint32_t rr_peripheral_preset{};
     float center_supersampling{1.0F};
     // AFW needs donors for both eye regions even when the source eye is known.
-    // Manual mode covers both offsets; the centered fallback starts at 70%.
+    // Coverage is opt-in. With both modes off, use calibrated per-eye settings.
     bool afw_manual_coverage{false};
     bool afw_automatic_coverage{false};
     float afw_warp_margin{0.05F};
@@ -58,10 +63,15 @@ struct Settings {
     std::uint32_t peripheral_dlaa_preset{5U};
     float width{0.55F};
     float height{0.45F};
-    float x_offset{0.60F};
+    float x_offset{0.0F};
     float height_offset{-0.45F};
     bool invert_stereo_x_offset{false};
     bool auto_stereo_alignment{true};
+    bool eye_calibration_continuous{false};
+    EyeCalibrationMethod eye_calibration_method{EyeCalibrationMethod::automatic};
+    // Learning is loaded explicitly and updated separately from editable UI drafts.
+    unsigned eye_calibration_learned_method{}, eye_calibration_learned_sessions{};
+    std::uint64_t eye_calibration_learned_signature{};
     float aligned_height_offset{0.0F};
     float roundness{0.0F};
     float transition_width{0.04F};
@@ -131,12 +141,20 @@ struct StereoViewDetail {
     bool has_geometry{};
 };
 
+struct StereoSourceCrop {
+    float x{}, y{}, width{1}, height{1}; // Normalized to the original DLSS view.
+    unsigned source_width{}, source_height{};
+    bool valid{};
+    bool operator==(const StereoSourceCrop&) const = default;
+};
 struct StereoEyeAssignment {
     std::uint32_t eye_index{};
     bool assigned{};
     bool calibrated{};
     std::uint64_t calibration_session{}; // 0 = OpenVR; otherwise OpenXR generation.
     bool vertical_flip{}; // Verified source-to-submission transform, never a game heuristic.
+    bool shared_source{}; // One verified source supplies both submitted eyes.
+    std::array<StereoSourceCrop, 2> source_crops{}; // Indexed by physical eye.
 };
 
 // A registration generation distinguishes a released/recreated NGX handle at
@@ -146,7 +164,14 @@ std::uint64_t stereo_view_generation(std::uint64_t view_id) noexcept;
 bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected = nullptr,
-    std::uint64_t session_generation = 0, bool vertical_flip = false) noexcept;
+    std::uint64_t session_generation = 0, bool vertical_flip = false, bool shared_source = false,
+    const std::array<StereoSourceCrop, 2>* source_crops = nullptr,
+    EyeCalibrationMethod method = EyeCalibrationMethod::full) noexcept;
+void invalidate_stereo_crop() noexcept;
+bool eye_calibration_continuous_validation(EyeCalibrationMethod method) noexcept;
+EyeCalibrationMethod eye_calibration_selected_method() noexcept;
+void set_eye_calibration_learning(unsigned method, std::uint64_t signature, unsigned sessions) noexcept;
+std::uint64_t eye_calibration_learning_revision() noexcept;
 void clear_stereo_calibration() noexcept;
 
 [[nodiscard]] Settings current_settings() noexcept;

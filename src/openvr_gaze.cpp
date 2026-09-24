@@ -6,6 +6,7 @@
 #include "diagnostics.hpp"
 #include "runtime.hpp"
 #include <Windows.h>
+#include <Psapi.h>
 #include <d3d11.h>
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -23,6 +24,8 @@ namespace {
 using Microsoft::WRL::ComPtr;
 using GetInterface = void* (__cdecl*)(const char*,vr::EVRInitError*);
 using Shutdown = void (__cdecl*)();
+using InterfaceValid = bool (__cdecl*)(const char*);
+using InitToken = std::uint32_t (__cdecl*)();
 using Wait = vr::EVRCompositorError (*)(void*,vr::TrackedDevicePose_t*,std::uint32_t,vr::TrackedDevicePose_t*,std::uint32_t);
 using Submit = vr::EVRCompositorError (*)(void*,vr::EVREye,const vr::Texture_t*,const vr::VRTextureBounds_t*,vr::EVRSubmitFlags);
 using SubmitArray = vr::EVRCompositorError (*)(void*,vr::EVREye,const vr::Texture_t*,std::uint32_t,const vr::VRTextureBounds_t*,vr::EVRSubmitFlags);
@@ -35,6 +38,10 @@ std::mutex hook_mutex;
 std::vector<OpenVRVtableHook> vtable_hooks;
 std::vector<HMODULE> retained_modules;
 std::atomic<bool> stopping{};
+std::atomic<bool> late_recovery_enabled{};
+ULONGLONG next_recovery_check{}; // hook_mutex
+bool recovery_token_valid{}, recovery_reshade_reported{};
+std::uint32_t recovery_token{};
 bool runtime_stopping{}; // protected by state_mutex
 CheekyGazeSnapshotV1 snapshot{};
 std::uint64_t generation=0x8000000000000001ULL, frame{}, simulation_start{};
@@ -116,7 +123,7 @@ void observe_frame(bool focused) {
     for (unsigned eye=0;eye<2;++eye) {
         auto& history=submitted[eye];
         for (auto& entry:history) if (now-entry.observed>500) retired[eye].push_back(std::move(entry));
-        history.erase(std::remove_if(history.begin(),history.end(),[](const Submitted& s){return !s.identity;}),history.end());
+        history.erase(std::remove_if(history.begin(),history.end(),[](const Submitted& s){return !s.view.resource_identity;}),history.end());
         auto& view=snapshot.views[eye];
         if (!history.empty()) view=history.back().view;
         else mapped=false;
@@ -172,18 +179,22 @@ void observe_submit(vr::EVREye eye,const vr::Texture_t* texture,const vr::VRText
             width=static_cast<std::uint32_t>(desc.Width); height=desc.Height;
             data->m_pResource->QueryInterface(IID_PPV_ARGS(&entry.identity));
         }
+    } else if(valid && texture->eType==vr::TextureType_Vulkan) {
+        const auto* data=static_cast<const vr::VRVulkanTextureData_t*>(texture->handle);
+        valid=data->m_nImage!=0 && data->m_nSampleCount==1;
+        width=data->m_nWidth;height=data->m_nHeight;entry.view.resource_identity=data->m_nImage;
     } else valid=false;
     const vr::VRTextureBounds_t full{0,0,1,1};
     const auto& b=bounds ? *bounds : full;
     auto& view=entry.view;
-    valid=valid && entry.identity && openvr_bounds(b.uMin,b.uMax,width,view.image_rect_x,view.image_rect_width) &&
+    valid=valid && (entry.identity || entry.view.resource_identity) && openvr_bounds(b.uMin,b.uMax,width,view.image_rect_x,view.image_rect_width) &&
         openvr_bounds(b.vMin,b.vMax,height,view.image_rect_y,view.image_rect_height);
     std::lock_guard lock(state_mutex);
     if (runtime_stopping) return;
     auto& history=submitted[eye];
     if (!valid) { if (!history.empty()) { retired.swap(history); ++generation; } return; }
     view.structure_size=sizeof(view); view.view_index=eye;
-    view.resource_identity=reinterpret_cast<std::uint64_t>(entry.identity.Get());
+    if(entry.identity)view.resource_identity=reinterpret_cast<std::uint64_t>(entry.identity.Get());
     view.swapchain_identity=view.resource_identity;
     view.flags=CHEEKY_GAZE_VIEW_RESOURCE_VALID;
     entry.observed=GetTickCount64();
@@ -291,6 +302,63 @@ bool arm_compositor(const char* version,void* object) {
     if (!std::strcmp(version,"IVRCompositor_022")) return arm<3>(version,object);
     return false;
 }
+bool reshade_interface_owner_present() noexcept {
+    // ReShade can be renamed to dxgi/d3d11/etc.; identify its public API rather
+    // than a filename. If enumeration is incomplete, do not probe interfaces.
+    std::array<HMODULE, 2048> modules{};
+    DWORD bytes{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &bytes) || bytes > sizeof(modules)) return true;
+    for (std::size_t i = 0; i < bytes / sizeof(HMODULE); ++i)
+        if (GetProcAddress(modules[i], "ReShadeRegisterAddon") && GetProcAddress(modules[i], "ReShadeUnregisterAddon")) return true;
+    return false;
+}
+void recover_cached_compositors() {
+    if (!late_recovery_enabled.load() || !get_interface) return;
+    const auto now = GetTickCount64();
+    if (now < next_recovery_check) return;
+    next_recovery_check = now + 1000;
+    const auto valid = reinterpret_cast<InterfaceValid>(GetProcAddress(api_module, "VR_IsInterfaceVersionValid"));
+    if (!valid) return;
+    if (reshade_interface_owner_present()) {
+        if (!recovery_reshade_reported) {
+            log_info("OpenVR cached-interface recovery deferred to application requests while ReShade is loaded");
+            recovery_reshade_reported = true;
+        }
+        return;
+    }
+    std::lock_guard state_lock(state_mutex);
+    if (runtime_stopping || stopping.load()) return;
+    const auto token_fn = reinterpret_cast<InitToken>(GetProcAddress(api_module, "VR_GetInitToken"));
+    const auto token = token_fn ? token_fn() : 0;
+    if (token_fn && recovery_token_valid && token == recovery_token) return;
+    constexpr const char* versions[]{"IVRCompositor_029", "IVRCompositor_028", "IVRCompositor_027", "IVRCompositor_022"};
+    std::array<void*, std::size(versions)> objects{};
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        // Valve's validity query and generic getter return false/NotInitialized
+        // when no session exists. Neither loads or initializes OpenVR. An init
+        // token alone is insufficient: it also increments during shutdown.
+        if (!valid(versions[i])) continue;
+        vr::EVRInitError error{};
+        auto* object = get_interface(versions[i], &error);
+        if (object && error == vr::VRInitError_None) objects[i] = object;
+    }
+    bool found{}, complete{true};
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        if (!objects[i]) continue;
+        const auto table = *static_cast<void***>(objects[i]);
+        bool ambiguous{};
+        for (std::size_t j = 0; j < objects.size(); ++j)
+            if (i != j && objects[j] && table == *static_cast<void***>(objects[j]) &&
+                openvr_submit_slot(versions[i]) != openvr_submit_slot(versions[j])) ambiguous = true;
+        // A wrapper advertising incompatible layouts on the same table is not
+        // enough evidence to patch either layout. Future application requests
+        // can still provide the exact selected interface through interface_hook.
+        if (ambiguous) { complete = false; continue; }
+        const bool armed = arm_compositor(versions[i], objects[i]);
+        found |= armed; complete &= armed;
+    }
+    if (found && complete && token_fn) { recovery_token = token; recovery_token_valid = true; }
+}
 void* interface_hook(const char* version,vr::EVRInitError* error) {
     auto* object=get_interface(version,error);
     if (!object || stopping.load() || !openvr_submit_slot(version)) return object;
@@ -300,6 +368,7 @@ void* interface_hook(const char* version,vr::EVRInitError* error) {
     return object;
 }
 }
+void enable_openvr_late_recovery(bool enabled) noexcept { late_recovery_enabled.store(enabled, std::memory_order_release); }
 void poll_openvr_hooks() noexcept {
     if (stopping.load()) return;
     std::lock_guard lock(hook_mutex);
@@ -317,6 +386,9 @@ void poll_openvr_hooks() noexcept {
     }
     // Observe the interfaces requested by the application. Proactively querying
     // every version can also force ReShade to select the wrong first interface.
+    // Native hosts may recover a cached compositor only without that conflict.
+    try { recover_cached_compositors(); }
+    catch (...) { log_warning("OpenVR cached-interface recovery failed; waiting for an application request"); }
 }
 bool attach_openvr_compositor(void* compositor) noexcept {
     if (!compositor || stopping.load()) return false;
@@ -350,7 +422,7 @@ void stop_openvr_hooks() noexcept {
     // Trampolines are removed by the shared MinHook owner immediately after this.
     // Retain target modules through that teardown; process exit releases them.
 }
-bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnapshotV1& output) noexcept {
+bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnapshotV1& output,std::uint64_t native_identity) noexcept {
     std::lock_guard lock(state_mutex);
     const bool next_simulate=settings.center_mode==FoveationCenterMode::simulated_gaze;
     if (next_simulate!=simulate || pattern!=settings.simulation_pattern) simulation_start=0;
@@ -366,7 +438,7 @@ bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnap
         output.status_flags&=~(CHEEKY_GAZE_STATUS_GAZE_VALID|CHEEKY_GAZE_STATUS_SESSION_FOCUSED);
     ComPtr<IUnknown> identity;
     if (resource) resource->QueryInterface(IID_PPV_ARGS(&identity));
-    const auto id=reinterpret_cast<std::uint64_t>(identity.Get());
+    const auto id=native_identity?native_identity:reinterpret_cast<std::uint64_t>(identity.Get());
     const auto now=GetTickCount64();
     // Select an observed member of the game's rotating render-target set for
     // exact matching. Other-eye metadata remains available to existing routes.

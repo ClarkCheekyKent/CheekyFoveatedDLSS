@@ -1,3 +1,4 @@
+#include "rr_contract.hpp"
 #include "late_attach_tests.hpp"
 #include "mock_ngx_parameters.hpp"
 #include "streamline_abi.hpp"
@@ -80,6 +81,7 @@ struct Fixture {
     bool missing_sl_constants{}, ambiguous_sl_inputs{}, cache_other_view{};
     std::array<SlResource, 4> resources{};
     std::array<SlResourceTag, 4> tags{};
+    bool test_exposure_present{};
     void submit_metadata() {
         if (!complete_sl_metadata) return;
         const unsigned types[]{3U, 0U, 1U, 4U};
@@ -98,6 +100,13 @@ struct Fixture {
         constants.reset = static_cast<char>(get_ui(&params, "Reset"));
         require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
             &frame,&viewport,tags.data(),4,list.Get()) == 0, "Submit complete viewport tags");
+        if (test_exposure_present) {
+            auto exposure = resources[0];
+            auto tag = tags[0]; tag.type = 13; tag.resource = &exposure;
+            tag.extent = {0,0,1,1};
+            require(proc<unsigned(*)(const void*,const void*,const void*,unsigned,void*)>(sl,"slSetTagForFrame")(
+                &frame,&viewport,&tag,1,list.Get()) == 0, "Submit exposure tag");
+        }
         if (!missing_sl_constants)
             require(proc<unsigned(*)(const void*,const void*,const void*)>(sl,"slSetConstants")(
                 &constants,&frame,&viewport) == 0, "Submit current viewport constants");
@@ -135,7 +144,12 @@ void (__stdcall* afw_cached_warp)(void*){};
 unsigned afw_largest_output_width{};
 bool afw_missing_lower{};
 bool afw_public_first{};
-bool afw_ota{}, afw_ambiguous{};
+bool afw_ota{}, afw_ambiguous{}, rr_test{};
+unsigned rr_cropped_calls{}, rr_peripheral_calls{};
+unsigned rr_center_resets{}, rr_center_motion_corrections{};
+ComPtr<ID3D12Resource> rr_sample_guide;
+bool rr_guides_ok{true};
+float rr_projection[16]{1,0,0,0, 0,1,0,0, 0,0,1,1, 0,0,0.1F,0};
 unsigned afw_full_calls{}, afw_lower_calls{}, afw_reduced_depth_calls{}, afw_full_resets{};
 unsigned afw_expected_reset{};
 struct AfwHistorySample { const NgxHandle* handle{}; unsigned reset{}; };
@@ -161,6 +175,29 @@ void observe_afw_core(const NgxParameters* params) {
 void observe_afw_lower(const NgxParameters* params) {
     observe_sr(params);
     ++afw_lower_calls;
+    if (rr_test) {
+        const auto width=get_ui(params,"Width"), height=get_ui(params,"Height");
+        const bool peripheral=width==64 && get_ui(params,"OutWidth")==64;
+        const bool cropped=width<128 && !peripheral;
+        if (peripheral) { ID3D12Resource* resource{}; params->Get(rr_guides[0].resource,&resource); rr_sample_guide=resource; }
+        rr_peripheral_calls+=peripheral; rr_cropped_calls+=cropped;
+        if (cropped) {
+            rr_center_resets += get_ui(params,"Reset") != 0;
+            ID3D12Resource* motion{}; params->Get("MotionVectors", &motion);
+            rr_center_motion_corrections += motion != fixture().textures12[2].Get();
+        }
+        for (const auto& g : rr_guides) {
+            ID3D12Resource* guide{}; params->Get(g.resource,&guide);
+            if (!guide) { rr_guides_ok=false; continue; }
+            rr_guides_ok &= get_ui(params,g.x)+width<=guide->GetDesc().Width && get_ui(params,g.y)+height<=guide->GetDesc().Height;
+            if (peripheral) rr_guides_ok &= guide!=fixture().textures12[0].Get() && guide->GetDesc().Width==64;
+            if (cropped) rr_guides_ok &= get_ui(params,g.x)==0 && get_ui(params,g.y)==0 &&
+                guide->GetDesc().Width==width && guide->GetDesc().Height==height;
+        }
+        if (peripheral) rr_guides_ok &= get_ui(params,rr_presets[0])==4;
+        if (cropped) rr_guides_ok &= get_ui(params,rr_presets[2])==5;
+    }
+
     afw_order_ok &= get_ui(params, "CheekyFake.AfwCorrected") == afw_full_calls;
     ID3D12Resource* depth{}; params->Get("Depth", &depth);
     if (depth && depth->GetDesc().Width < 128) ++afw_reduced_depth_calls;
@@ -169,7 +206,7 @@ void observe_afw_lower(const NgxParameters* params) {
     if (output == fixture().textures12[3].Get()) afw_full_resets += get_ui(params, "Reset") != 0;
 }
 std::string snapshot(CheekyUEVRSnapshotFn get) { std::vector<char> text(32768); require(get(text.data(),32768),"Late snapshot"); return text.data(); }
-void verify_nr_reset_isolation(void (*command)(const char*)) {
+void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
     auto& f = fixture();
     if (f.context) return;
     f.params.Set("Jitter.Offset.X", 0.F); f.params.Set("Jitter.Offset.Y", 0.F);
@@ -231,8 +268,11 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     command("1\n94\nset\nEnabled=false\nNrEnabled=false\nNrProcessingOrder=1\nHeightOffset=-1");
     for (unsigned i = 0; i < 3; ++i) {
         evaluate(0);
-        require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get() && sr_inputs[0].reset == 0,
-            "Disabled Before NR changed raw SR input/reset");
+        // Lower processing skipped the native history during private SR. Its
+        // first full-frame fallback must reset once; later frames stay untouched.
+        const auto expected_reset = lower_hook && i == 0 ? 1U : 0U;
+        require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get() && sr_inputs[0].reset == expected_reset,
+            "Disabled Before NR must preserve raw input and reset stale lower-hook history only once");
     }
     command("1\n95\nset\nNrEnabled=true\nNrFoveated=false");
     const auto fail_nr = proc<void(*)(bool)>(nr,"CheekyFakeFailEvaluations");
@@ -268,11 +308,14 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     // Keep another eye's processed history while this eye returns to raw input.
     auto* first_handle = f.handle;
     const auto first_viewport = f.viewport.value;
-    if (f.use_sl) {
+    // Native processing keys histories by NGX handle; Streamline normally
+    // owns a distinct native feature for each viewport. Model that here.
+    if (f.use_sl && !lower_hook) {
         ++f.viewport.value;
         require(f.sl_options(&f.viewport,&f.options) == 0, "Second viewport options");
     } else {
         require(ngx_succeeded(f.create12(f.list.Get(),1,&f.params,&f.handle)), "Second native view");
+        if (f.use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
     }
     evaluate(0);
     expect_input(true, 1, "Second eye inherited first eye's processed history");
@@ -281,9 +324,10 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     expect_input(false, 1, "Processed Before to After did not reset this eye");
     evaluate(0);
     expect_input(false, 0, "Processed Before to After reset this eye twice");
-    if (!f.use_sl) require(ngx_succeeded(f.release(f.handle)), "Release second native view");
+    if (!f.use_sl || lower_hook) require(ngx_succeeded(f.release(f.handle)), "Release second native view");
     f.handle = first_handle; f.viewport.value = first_viewport;
-    if (f.use_sl) {
+    if (f.use_sl && lower_hook) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
+    if (f.use_sl && !lower_hook) {
         require(f.sl_options(&f.viewport,&f.options) == 0, "Restore first viewport options");
         f.ambiguous_sl_inputs = true;
         evaluate(0);
@@ -307,7 +351,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     fail_nr(false);
     evaluate(0);
     expect_input(true, 1, "Recovered preparation did not reset raw history");
-    if (f.use_sl) {
+    if (f.use_sl && !lower_hook) {
         f.missing_sl_constants = true;
         evaluate(0);
         expect_input(false, 1, "Missing current metadata discarded a processed transition");
@@ -389,8 +433,8 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         for (unsigned y = 0; y < motion_desc.Height; ++y) {
             auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + fp.Offset + y * fp.Footprint.RowPitch);
             for (unsigned x = 0; x < motion_desc.Width; ++x) {
-                row[2*x] = DirectX::PackedVector::XMConvertFloatToHalf(1.75F / (f.use_sl ? 128.F : 1.F));
-                row[2*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(0.375F / (f.use_sl ? 128.F : 1.F));
+                row[2*x] = DirectX::PackedVector::XMConvertFloatToHalf(1.75F / (f.use_sl && !lower_hook ? 128.F : 1.F));
+                row[2*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(0.375F / (f.use_sl && !lower_hook ? 128.F : 1.F));
             }
         }
         upload->Unmap(0,nullptr);
@@ -607,10 +651,13 @@ void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx1
 void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::path& root, ID3D12Device* device,
     ID3D12CommandQueue* queue, std::string_view mode) {
     const bool use_c = mode.ends_with("-c"), use_sl = mode.find("streamline") != mode.npos;
-    const bool missing_lower = mode == "--afw-missing-lower", public_first = mode.starts_with("--afw-public-first");
-    afw_ota = mode.starts_with("--afw-ota"); afw_ambiguous = mode == "--afw-ota-ambiguous";
+    const bool generic_lower = mode.starts_with("--lower-");
+    const bool realvr = mode.starts_with("--realvr-") || generic_lower;
+    rr_test = mode.find("-rr") != mode.npos;
+    const bool missing_lower = mode.ends_with("-missing-lower"), public_first = mode.find("-public-first") != mode.npos;
+    afw_ota = mode.find("-ota") != mode.npos; afw_ambiguous = mode.ends_with("-ota-ambiguous");
     std::filesystem::path ngx_path;
-    if (afw_ota) {
+    if (afw_ota && !rr_test) {
         ngx_path = root / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
         std::filesystem::create_directories(ngx_path.parent_path());
         std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", ngx_path);
@@ -624,17 +671,28 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
         }
         if (afw_ambiguous) require(LoadLibraryW((bin / "test-fixtures/nvngx_dlss.dll").c_str()) != nullptr, "Load a second SR runtime");
     }
+    if (rr_test) {
+        ngx_path = root / (afw_ota ? "NVIDIA/NGX/models/dlssd/versions/1/files/runtime.bin" : "rr/nvngx_dlssd.dll");
+        std::filesystem::create_directories(ngx_path.parent_path());
+        std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll",ngx_path);
+        // Keep an SR runtime loaded too: RR must not steal its callback owner.
+        require(LoadLibraryW((bin / "test-fixtures/nvngx_dlss.dll").c_str()) != nullptr,"Load concurrent SR runtime");
+    }
     prepare_late_attach_test(bin, nullptr, device, queue, false, use_sl, ngx_path);
     auto& f = fixture();
     require(ngx_succeeded(f.release(f.handle)), "Release initial public fixture handle");
     const auto dir = root / "afw-fixtures";
     std::filesystem::create_directories(dir);
-    for (const auto* name : {L"_nvngx.dll", L"PDAFWPlugin.dll"})
-        std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", dir / name);
+    std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", dir / "_nvngx.dll");
     afw_core = LoadLibraryW((dir / "_nvngx.dll").c_str());
-    afw_warp_module = LoadLibraryW((dir / "PDAFWPlugin.dll").c_str());
-    require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
-    afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
+    require(afw_core != nullptr, "Load upstream NGX core fixture");
+    if (!generic_lower) {
+        std::filesystem::copy_file(bin / "test-fixtures" / (realvr ? "CheekyFakeRealVR.dll" : "nvngx_dlss.dll"),
+            dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll"));
+        afw_warp_module = LoadLibraryW((dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll")).c_str());
+        require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
+        if (!realvr) afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
+    }
     afw_missing_lower = missing_lower || public_first || afw_ambiguous;
     afw_public_first = public_first;
     if (public_first) {
@@ -647,10 +705,196 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
         f.release = proc<Release>(afw_core, "NVSDK_NGX_D3D12_ReleaseFeature");
     }
     f.params.Set("Reset", 0U);
-    require(ngx_succeeded(f.create12(f.list.Get(), 1U, &f.params, &f.handle)), "Create wrapped game feature before injection");
+    if (rr_test) {
+        const auto desc=f.textures12[0]->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; UINT64 bytes{};
+        f.device->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC buffer{}; buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; buffer.Width=bytes;
+        buffer.Height=buffer.DepthOrArraySize=buffer.MipLevels=1; buffer.SampleDesc.Count=1; buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> upload;
+        check(f.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&upload)),"RR guide upload");
+        unsigned char* data{}; check(upload->Map(0,nullptr,reinterpret_cast<void**>(&data)),"Map RR guide upload");
+        for(unsigned y=0;y<128;++y) for(unsigned x=0;x<128;++x) {
+            auto* rgba=reinterpret_cast<unsigned short*>(data+fp.Offset+y*fp.Footprint.RowPitch+x*8);
+            rgba[0]=DirectX::PackedVector::XMConvertFloatToHalf(float(x));
+            rgba[1]=DirectX::PackedVector::XMConvertFloatToHalf(float(y));
+            rgba[2]=DirectX::PackedVector::XMConvertFloatToHalf(.25F); rgba[3]=DirectX::PackedVector::XMConvertFloatToHalf(.75F);
+        }
+        upload->Unmap(0,nullptr);
+        D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition={f.textures12[0].Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST};
+        f.list->ResourceBarrier(1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{}; src.pResource=upload.Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint=fp;
+        dst.pResource=f.textures12[0].Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        f.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter); f.list->ResourceBarrier(1,&barrier);
+        f.finish_gpu();
+    }
+    if (rr_test) {
+        f.params.Set("DLSS.Denoise.Mode",1U); f.params.Set("DLSS.Roughness.Mode",1U); f.params.Set("DLSS.Use.HW.Depth",1U);
+        for (const auto& guide : rr_guides) {
+            f.params.Set(guide.resource,f.textures12[0].Get());
+            f.params.Set(guide.x,0U); f.params.Set(guide.y,0U);
+        }
+        f.params.Set("ViewToClipMatrix",static_cast<void*>(rr_projection));
+        for (auto* preset : rr_presets) f.params.Set(preset,0U);
+    }
+    require(ngx_succeeded(f.create12(f.list.Get(), rr_test ? 13U : 1U, &f.params, &f.handle)), "Create wrapped game feature before injection");
     if (use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, f.handle, &f.params);
     proc<void(*)(void(*)(const NgxParameters*))>(afw_core, "CheekyFakeObserve")(&observe_afw_core);
     if (!public_first) proc<void(*)(void(*)(const NgxParameters*))>(f.ngx, "CheekyFakeObserve")(&observe_afw_lower);
+}
+
+void verify_realvr_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
+    auto& f = fixture();
+    require(snapshot(get).find("\"d3d12_lower_hook_active\":true")!=std::string::npos,
+        "Lower DLSS hook must be enabled by default");
+    command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=1\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false\nAlignmentBorder=true");
+    if (rr_test) command("1\n199\nset\nRrCenterPreset=5\nRrPeripheralPreset=4");
+    const auto creates_before = f.creates();
+    for (unsigned i=0; i<100; ++i) {
+        if (rr_test) command(i % 2 ? "1\n198\nset\nHeightOffset=0.02" : "1\n198\nset\nHeightOffset=-0.02");
+        require(ngx_succeeded(f.evaluate()),"R.E.A.L. VR game evaluation succeeds"); f.finish_gpu();
+        require(afw_contract_ok && afw_order_ok,"VR hook received private/cropped work instead of one full-frame game call");
+        require(get_ui(&f.params,"Width")==128 && get_ui(&f.params,"OutWidth")==256,"Game dimensions were not restored");
+    }
+    if (rr_test) {
+        require(rr_cropped_calls==100 && rr_peripheral_calls==100 && rr_guides_ok,
+            "RR center/periphery did not receive aligned guides and separate RR presets");
+        require(rr_center_resets==1 && rr_center_motion_corrections==100,
+            "Moving RR center must retain history and receive private crop-sized motion vectors");
+        require(rr_sample_guide!=nullptr,"RR downsampled guide not observed");
+        const auto guide_desc=rr_sample_guide->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT guide_fp{}; UINT64 guide_bytes{};
+        f.device->GetCopyableFootprints(&guide_desc,0,1,0,&guide_fp,nullptr,nullptr,&guide_bytes);
+        D3D12_HEAP_PROPERTIES read_heap{}; read_heap.Type=D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{}; buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; buffer.Width=guide_bytes;
+        buffer.Height=buffer.DepthOrArraySize=buffer.MipLevels=1; buffer.SampleDesc.Count=1; buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> readback;
+        check(f.device->CreateCommittedResource(&read_heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback)),"RR guide readback");
+        D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition={rr_sample_guide.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE};
+        f.list->ResourceBarrier(1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{}; src.pResource=rr_sample_guide.Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=readback.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=guide_fp;
+        f.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter); f.list->ResourceBarrier(1,&barrier);
+        f.finish_gpu();
+        unsigned char* data{}; check(readback->Map(0,nullptr,reinterpret_cast<void**>(&data)),"Map RR guide readback");
+        const auto* pixel=reinterpret_cast<const float*>(data+guide_fp.Offset+7*guide_fp.Footprint.RowPitch+9*16);
+        const bool correct=pixel[0]==19.F && pixel[1]==15.F && pixel[2]==.25F && pixel[3]==.75F;
+        readback->Unmap(0,nullptr);
+        require(correct,"RR guide downsampling lost channels or used different pixel centers from depth");
+        require(f.creates()==creates_before+2,"RR private histories were not reused");
+        require(snapshot(get).find("\"reconstruction_feature\":13")!=std::string::npos,"RR not exposed to preset menu");
+        for (const auto& g:rr_guides) {
+            ID3D12Resource* resource{}; f.params.Get(g.resource,&resource);
+            require(resource==f.textures12[0].Get() && !get_ui(&f.params,g.x) && !get_ui(&f.params,g.y),"RR guide overrides leaked");
+        }
+        void* matrix{}; f.params.Get("ViewToClipMatrix",&matrix);
+        require(matrix==rr_projection && rr_projection[0]==1,"RR projection override leaked");
+        const auto fail=proc<void(*)(unsigned)>(f.ngx,"CheekyFakeFailNextEvaluations");
+        fail(1); require(ngx_succeeded(f.evaluate()),"RR native fallback failed"); f.finish_gpu();
+        require(afw_contract_ok && afw_order_ok,"RR mutated the outer VR contract");
+        command("1\n201\nset\nEnabled=false");
+        require(ngx_succeeded(f.evaluate()),"RR disabled passthrough failed"); f.finish_gpu();
+        require(afw_full_calls==102,"RR must preserve one VR core call per frame");
+        wchar_t runtime_path[32768]{};
+        require(GetModuleFileNameW(GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"),runtime_path,32768),"Locate NR fixture");
+        const auto nr=LoadLibraryW((std::filesystem::path(runtime_path).parent_path()/"nvngx_dlssnr.dll").c_str());
+        require(nr!=nullptr,"Load NR for RR");
+        const auto nr_evals=proc<Counter>(nr,"CheekyFakeEvaluates");
+        proc<void(*)(bool)>(nr,"CheekyFakeCopyNrColor")(true);
+        command("1\n202\nset\nEnabled=true\nNrEnabled=true\nNrProcessingOrder=0");
+        const auto nr_before=nr_evals();
+        require(ngx_succeeded(f.evaluate()),"RR plus After NR failed"); f.finish_gpu();
+        require(nr_evals()>nr_before,"RR skipped After NR");
+        command("1\n203\nset\nNrProcessingOrder=1");
+        const auto nr_after=nr_evals();
+        require(ngx_succeeded(f.evaluate()),"RR plus Before NR failed"); f.finish_gpu();
+        require(nr_evals()>nr_after,"RR skipped Before NR");
+        command("1\n204\nset\nEnabled=false");
+        const auto nr_only=nr_evals();
+        require(ngx_succeeded(f.evaluate()),"Native RR with NR failed"); f.finish_gpu();
+        require(nr_evals()>nr_only,"Disabling foveation disabled NR with RR");
+        // SR and RR can stay loaded together and use different native handles.
+        command("1\n205\nset\nEnabled=true\nNrEnabled=false");
+        const auto original_rr_handle=f.handle;
+        const auto sr=GetModuleHandleW(L"nvngx_dlss.dll");
+        require(sr!=nullptr,"Concurrent SR disappeared");
+        const auto sr_evals=proc<Counter>(sr,"CheekyFakeEvaluates");
+        const auto rr_evals=f.evaluates();
+        const auto sr_before=sr_evals();
+        proc<void(*)(HMODULE,bool)>(afw_core,"CheekyFakeForwardTo")(sr,false);
+        require(ngx_succeeded(f.create12(f.list.Get(),1,&f.params,&f.handle)),"Switch from RR to SR");
+        require(ngx_succeeded(f.evaluate()),"SR beside RR failed"); f.finish_gpu();
+        require(sr_evals()==sr_before+2 && f.evaluates()==rr_evals,"SR used RR's callbacks");
+        require(snapshot(get).find("\"reconstruction_feature\":1")!=std::string::npos,"Menu failed to return to SR presets");
+        require(ngx_succeeded(f.release(f.handle)),"Release switched SR feature");
+        proc<void(*)(HMODULE,bool)>(afw_core,"CheekyFakeForwardTo")(f.ngx,false);
+        f.handle=original_rr_handle;
+        require(ngx_succeeded(f.evaluate()),"Return to RR failed"); f.finish_gpu();
+        require(f.evaluates()==rr_evals+2,"Returning to RR used SR's callbacks");
+        require(snapshot(get).find("\"reconstruction_feature\":13")!=std::string::npos,"Menu failed to return to RR presets");
+        // A contract we cannot crop must still run native RR and independent NR.
+        command("1\n206\nset\nNrEnabled=true\nNrProcessingOrder=0");
+        f.params.Set("DLSSD.OutputAlpha",f.textures12[3].Get());
+        const auto fallback_rr=f.evaluates(), fallback_nr=nr_evals();
+        require(ngx_succeeded(f.evaluate()),"Unsupported crop contract lost native RR"); f.finish_gpu();
+        require(f.evaluates()==fallback_rr+1 && nr_evals()>fallback_nr,"Unsupported RR crop should retain native RR plus NR");
+        puts("PASS: RR nested routing, center/periphery guides, presets, history reuse, failure and disabled fallback");
+        return;
+    }
+    require(afw_full_calls==100 && proc<Counter>(afw_core,"CheekyFakeCreates")()==1,
+        "VR core must receive exactly one original evaluation per frame and no private creates");
+    require(snapshot(get).find("\"afw_experiment\":{\"enabled\":false")!=std::string::npos,
+        "R.E.A.L. VR routing must not activate AFW coverage or warp metadata");
+    if (afw_missing_lower) {
+        require(f.creates()==creates_before,"Unavailable nested SR route must leave ordinary game DLSS intact");
+    } else {
+        require(f.creates()==creates_before+2 && afw_lower_calls==200 && afw_reduced_depth_calls==100,
+            "R.E.A.L. VR needs real center SR and reduced peripheral DLAA evaluations");
+        require(snapshot(get).find("\"active\":100")!=std::string::npos,"SR reported no active frames");
+        // Read the actual compositor output. Successful NGX return values alone
+        // previously hid the enabled-but-inactive SR failure.
+        const auto output_desc=f.textures12[3]->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{}; UINT64 bytes{};
+        f.device->GetCopyableFootprints(&output_desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width=bytes;
+        desc.Height=desc.DepthOrArraySize=desc.MipLevels=1; desc.SampleDesc.Count=1; desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> readback;
+        check(f.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,IID_PPV_ARGS(&readback)),"Create border readback");
+        D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition={f.textures12[3].Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE};
+        f.list->ResourceBarrier(1,&barrier);
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};
+        src.pResource=f.textures12[3].Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.pResource=readback.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=footprint;
+        f.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter); f.list->ResourceBarrier(1,&barrier);
+        f.finish_gpu();
+        unsigned char* pixels{}; check(readback->Map(0,nullptr,reinterpret_cast<void**>(&pixels)),"Read SR border pixels");
+        unsigned red{};
+        for(unsigned y=0;y<output_desc.Height;++y) for(unsigned x=0;x<output_desc.Width;++x) {
+            const auto* rgba=reinterpret_cast<const unsigned short*>(pixels+footprint.Offset+y*footprint.Footprint.RowPitch+x*8);
+            if(rgba[0]==0x3c00 && rgba[1]==0 && rgba[2]==0 && rgba[3]==0x3c00) ++red;
+        }
+        readback->Unmap(0,nullptr);
+        require(red>100 && red<5000,"SR did not write its red alignment border into the game output");
+        command("1\n201\nset\nPeripheralDlaa=false");
+        require(ngx_succeeded(f.evaluate()),"Center-only SR succeeds"); f.finish_gpu();
+        require(afw_full_calls==101 && afw_lower_calls==201,"Center-only SR executes below VR exactly once");
+        command("1\n202\nset\nEnabled=false");
+        require(ngx_succeeded(f.evaluate()),"Disabled SR passes through"); f.finish_gpu();
+        require(afw_full_calls==102 && afw_lower_calls==202,"Disabling SR keeps ordinary game DLSS running");
+        require(afw_full_resets==1 && get_ui(&f.params,"Reset")==0,
+            "Resuming original DLSS must reset its stale history once and restore the game's Reset parameter");
+    }
+    puts("PASS: R.E.A.L. VR full-frame core, nested SR/peripheral execution and passthrough");
 }
 
 void verify_afw_gaze_history(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
@@ -928,7 +1172,7 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
         if (f.creates() != creates_before + 2 || afw_lower_calls != 200) puts(status.c_str());
         require(f.creates() == creates_before + 2 && afw_lower_calls == 200 && afw_reduced_depth_calls == 100,
             "Center and reduced periphery run below AFW with stable private handles");
-        require(afw_largest_output_width > 256, "AFW center supersampling enlarges only the private output");
+        require(afw_largest_output_width > 128, "AFW center supersampling enlarges the private crop output");
         require(status.find("\"missing_lower_calls\":0") != std::string::npos && status.find("\"lower_calls\":100") != std::string::npos,
             "One nested game DLSS route per full-frame core call");
         const auto nr_begin = status.find("\"nr_details\":{");
@@ -1029,7 +1273,21 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
     require(ngx_succeeded(f.evaluate()),"Incomplete frame after adoption forwards");
     require(f.creates()==first_private,"Do not recreate with guessed flags after adoption");
     f.params.Set("DLSS.Feature.Create.Flags",2U);
-    if(f.use_sl) {
+    const bool lower_hook = snapshot(get).find("\"d3d12_lower_hook_active\":true") != std::string::npos;
+    if(f.use_sl && lower_hook && !f.context) {
+        const auto status = snapshot(get);
+        require(status.find("\"options_seen\":false") != status.npos, "Lower processing does not invent Streamline options");
+        require(f.sl_options(&f.viewport, &f.options) == 0 &&
+            proc<Counter>(f.sl, "CheekyFakeOptionWidth")() == 256 &&
+            proc<Counter>(f.sl, "CheekyFakeOptionHeight")() == 256,
+            "Lower hook leaves upstream Streamline options unchanged");
+        const auto evaluations = f.evaluates();
+        ++f.viewport.value;
+        require(ngx_succeeded(f.evaluate()), "Lower hook processes another Streamline viewport"); f.finish_gpu();
+        require(f.evaluates() == evaluations + 1, "Streamline and lower hooks must not double-process");
+        --f.viewport.value;
+    }
+    if(f.use_sl && (!lower_hook || f.context)) {
         const auto status=snapshot(get);
         require(status.find("\"options_hooked\":true")!=status.npos && status.find("\"options_seen\":false")!=status.npos,"Proactive SL setter hook without invented options");
         require(status.find("\"native_fallback\":true")!=status.npos,"Missing SL options permit native NGX processing");
@@ -1060,7 +1318,7 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
         else proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
     }
     require(ngx_succeeded(f.evaluate()),"Evaluate recreated game feature"); f.finish_gpu();
-    verify_nr_reset_isolation(command);
+    verify_nr_reset_isolation(command, snapshot(get).find("\"d3d12_lower_hook_active\":true") != std::string::npos);
     if (!f.context && !f.use_sl) {
         command("1\n70\nset\nEnabled=false");
         // UE can discard a recording after evaluation. Exhaust more than the
@@ -1147,5 +1405,20 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
         puts("Inactive AFW: mode switches, stale-mode fallback and SR/NR history recovery passed");
     }
     require(ngx_succeeded(f.release(f.handle)),"Release recreated feature");
+    if (f.use_sl && !f.context && !lower_hook) {
+        f.complete_sl_metadata = true; f.options.struct_version = 3;
+        require(f.sl_options(&f.viewport,&f.options)==0, "Exposure forwarding options");
+        command("1\n130\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=false");
+        const auto matches=proc<bool(*)(unsigned,const SlResourceTag*,unsigned)>(f.sl,"CheekyFakeTagsMatch");
+        for (bool supplied : {true,false}) {
+            f.test_exposure_present=supplied;
+            require(ngx_succeeded(f.evaluate()), "Exposure forwarding evaluation");f.finish_gpu();
+            auto exposure=f.resources[0]; if(!supplied) exposure.native=nullptr;
+            auto tag=f.tags[0];tag.type=13;tag.resource=&exposure;tag.extent=supplied?SlExtent{0,0,1,1}:SlExtent{};
+            require(matches(f.viewport.value|0x20000000U,&tag,1), "Center must forward/clear current exposure");
+            require(matches(f.viewport.value|0x40000000U,&tag,1), "Peripheral must forward/clear current exposure");
+        }
+        puts("PASS Streamline exposure forwarding and clearing on center/peripheral viewports");
+    }
     puts("Late attachment: cached exports, pre-existing feature, missing metadata, private reuse, release/recreation passed");
 }

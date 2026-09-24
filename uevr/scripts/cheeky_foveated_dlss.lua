@@ -38,7 +38,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"}) do
+    for _, key in ipairs({"NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -209,7 +209,7 @@ local function afw_controls()
     if draft.AfwManualCoverage == nil then return end
     local gaze = draft.CenterMode ~= 0
     local mode = draft.AfwAutomaticCoverage and 2 or draft.AfwManualCoverage and 1 or 0
-    local choices = {[0]="Centered (70% minimum)",[1]="Manual"}
+    local choices = {[0]="Per-eye (calibrated)",[1]="Manual"}
     if draft.AfwAutomaticCoverage ~= nil then choices[2] = "Automatic" end
     local changed, value = imgui.combo(gaze and "AFW tracking-loss fallback" or "AFW stereo coverage", mode, choices)
     if changed then
@@ -226,8 +226,8 @@ local function afw_controls()
         slider(gaze and "Fallback stereo X offset" or "Stereo X offset", "XOffset", -1, 1)
         slider(gaze and "Fallback height offset" or "Height offset", "HeightOffset", -1, 1)
     end
-    if gaze then text("Gaze follows both eyes. The fallback above applies when tracking is unavailable.")
-    elseif mode == 0 then text("Centered coverage uses at least 70% of the image width and height.") end
+    if mode == 0 then text("Uses the configured region and calibrated eye alignment.")
+    elseif gaze then text("Gaze follows both eyes. The fallback above applies when tracking is unavailable.") end
     if (gaze or mode ~= 0) and draft.AfwWarpMargin ~= nil and imgui.tree_node("Advanced AFW") then
         slider("Extra margin per edge", "AfwWarpMargin", 0, 0.25)
         text("Adds a fixed fraction of the full image around each eye's region. Larger margins cost more GPU time.")
@@ -235,7 +235,7 @@ local function afw_controls()
     end
 end
 
-uevr.sdk.callbacks.on_draw_ui(function()
+uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     if not imgui.tree_node("Cheeky Foveated DLSS") then return end
     if error_text then text(error_text) end
     if not status then
@@ -249,7 +249,8 @@ uevr.sdk.callbacks.on_draw_ui(function()
     text("Cheeky " .. tostring(status.version))
     text(status.message)
     local afw = status.afw_experiment or {}
-    local afw_active = afw.enabled and afw.coverage_enabled ~= false
+    local afw_available = afw.enabled and afw.coverage_enabled ~= false
+    local afw_active = afw_available and (draft.AfwAutomaticCoverage or draft.AfwManualCoverage)
     if not status.ready then text("Processing is paused.") end
     text("Sliders apply on release. Other controls apply immediately and save automatically.")
     text("Alt+Shift+/ toggles SR.")
@@ -265,8 +266,11 @@ uevr.sdk.callbacks.on_draw_ui(function()
 
     if imgui.tree_node("Stereo and gaze") then
         combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
-        if afw_active then
+        if afw_available then
             afw_controls()
+            afw_active = draft.AfwAutomaticCoverage or draft.AfwManualCoverage
+        end
+        if afw_active then
             if draft.AfwAutomaticCoverage and afw.coverage_mode ~= 2 and afw.coverage_mode ~= 3 then
                 text("Automatic coverage is waiting for matching UEVR projections; using centered fallback.")
             end
@@ -305,10 +309,30 @@ uevr.sdk.callbacks.on_draw_ui(function()
         if draft.CenterMode ~= 0 or not afw_active then
             text("OpenXR alignment/gaze uses the matching Cheeky layer. Fixed alignment needs no eye tracker.")
         end
-        if not afw_active and imgui.tree_node("Eye calibration") then
+        if imgui.tree_node("Eye calibration") then
             local c = status.eye_calibration or {}
             local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
             if changed then send(enabled and "calibration_enable" or "calibration_disable") end
+            if status.settings.EyeCalibrationMethod ~= nil then
+                local methods = {[0]="Auto",[1]="Standard corners",[2]="Timing tolerant corners",[3]="Full crop search"}
+                combo("Calibration method", "EyeCalibrationMethod", methods)
+                local learned = status.settings.EyeCalibrationLearnedMethod or 0
+                text("Learned starting method: " .. (learned > 0 and methods[learned] or "Not learned yet"))
+                text("Active method: " .. (c.active_method or "Waiting"))
+                if status.settings.EyeCalibrationLearnedMethod == 2 and (status.settings.EyeCalibrationLearnedSessions or 0) < 2 then
+                    text("Timing preference needs confirmation on another launch.")
+                end
+                if imgui.button("Reset learned calibration method") then send("calibration_forget") end
+            end
+            if status.settings.EyeCalibrationContinuous ~= nil then
+                if draft.EyeCalibrationMethod == 3 or (draft.EyeCalibrationMethod == 0 and c.active_method == "Full crop search") then
+                    check("Continuously validate eye calibration", "EyeCalibrationContinuous")
+                    if draft.EyeCalibrationContinuous == false then
+                        text("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.")
+                    end
+                end
+                if c.enabled and imgui.button("Recalibrate now") then send("calibration_recalibrate") end
+            end
             rows("eye_calibration", {{"Runtime", c.backend or "Waiting for VR"},
                 {"Status", c.status or "Unavailable in this runtime"}})
             imgui.tree_pop()
@@ -317,11 +341,19 @@ uevr.sdk.callbacks.on_draw_ui(function()
         imgui.tree_pop()
     end
 
-    if imgui.tree_node("DLSS-SR") then
+    local rr = d.reconstruction_feature == 13
+    if imgui.tree_node(rr and "DLSS-RR" or "DLSS-SR") then
+        if draft.D3D12LowerHook ~= nil then
+            check("Use lower DLSS hook (DX12)", "D3D12LowerHook")
+            text("Off selects the higher call. Restart the game after changing this.")
+            text("Active DLSS hook: " .. (status.d3d12_lower_hook_active and "Lower" or "Higher"))
+            if status.d3d12_hook_restart_required then text("DLSS hook change saved for next game restart.") end
+        end
         check("Enable foveated DLSS-SR", "Enabled")
         if draft.Enabled then
             section("Center")
-            combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
+            if rr then combo("Center RR preset", "RrCenterPreset", {[0]="Game/default",[4]="D",[5]="E",[6]="F"})
+            else combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"}) end
             slider("Center supersampling", "CenterSupersampling", 1, 2)
             slider("Fovea width", "Width", 0.2, 1)
             slider("Fovea height", "Height", 0.2, 1)
@@ -332,7 +364,8 @@ uevr.sdk.callbacks.on_draw_ui(function()
             section("Periphery")
             check("Peripheral DLAA", "PeripheralDlaa")
             if draft.PeripheralDlaa then
-                combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"})
+                if rr then combo("Peripheral RR preset", "RrPeripheralPreset", {[0]="Game/default",[4]="D",[5]="E",[6]="F"})
+                else combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"}) end
                 slider("Periphery scale", "PeripheralDlaaScale", 0.2, 1)
             end
         end

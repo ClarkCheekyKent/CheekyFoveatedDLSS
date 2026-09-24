@@ -110,7 +110,7 @@ target_compile_definitions(
     CheekyOpenXRLayer
     PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
 )
-target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 dxgi dxguid)
+target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 dxgi dxguid version)
 set_target_properties(
     CheekyOpenXRLayer
     PROPERTIES
@@ -138,13 +138,29 @@ enable_testing()
 add_executable(
     CheekyTests
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/gaze_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/vulkan_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_api.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_gpu.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_observer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_backend.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_calibration.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_peripheral.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_nr.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_nr_runtime.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/nr_runtime_module.cpp"
+
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/eye_calibration_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/openxr_calibration_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/openxr_input_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/eye_calibration_d3d12.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_composite_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/debug_exposure_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d11_binding_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d11_backend.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/motion_resample_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_history_tests.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/d3d12_safety_tests.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12_backend.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/crop_motion.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/support_summary_tests.cpp"
@@ -162,7 +178,17 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gaze_foveation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/settings.cpp"
 )
-add_dependencies(CheekyTests CheekyOpenXRLayer)
+add_library(CheekyFakeRealVR MODULE tests/fake_ngx_core.cpp tests/fake_ngx_core.rc)
+target_compile_features(CheekyFakeRealVR PRIVATE cxx_std_20)
+target_include_directories(CheekyFakeRealVR PRIVATE src)
+target_compile_definitions(CheekyFakeRealVR PRIVATE CHEEKY_FAKE_REALVR WIN32_LEAN_AND_MEAN NOMINMAX)
+set_target_properties(CheekyFakeRealVR PROPERTIES PREFIX "" MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/test-fixtures"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/test-fixtures")
+if(MSVC)
+    target_link_options(CheekyFakeRealVR PRIVATE /OPT:NOICF)
+endif()
+add_dependencies(CheekyTests CheekyOpenXRLayer CheekyFakeRealVR)
 target_link_libraries(CheekyTests PRIVATE d3d11 d3d12 dxgi d3dcompiler)
 target_compile_features(CheekyTests PRIVATE cxx_std_20)
 target_compile_definitions(CheekyTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -180,6 +206,18 @@ if(MSVC)
     target_compile_options(CheekyTests PRIVATE /W4 /permissive- /utf-8)
 endif()
 add_test(NAME CheekyGazeTests COMMAND CheekyTests)
+add_test(NAME CheekyHookPath COMMAND CheekyTests --hook-path)
+add_test(NAME CheekyOpenXRInputTests COMMAND CheekyTests --openxr-input)
+add_test(NAME CheekyStereoSupportTests COMMAND CheekyTests --stereo-support)
+set_tests_properties(CheekyStereoSupportTests PROPERTIES TIMEOUT 60)
+add_test(NAME CheekyMixedCalibrationTests COMMAND CheekyTests --mixed-calibration)
+set_tests_properties(CheekyMixedCalibrationTests PROPERTIES TIMEOUT 60)
+add_test(NAME CheekyCropCalibrationTests COMMAND CheekyTests --crop-calibration)
+set_tests_properties(CheekyCropCalibrationTests PROPERTIES TIMEOUT 60)
+add_test(NAME CheekyRetainedCalibrationTests COMMAND CheekyTests --retained-calibration)
+add_test(NAME CheekyCalibrationModesTests COMMAND CheekyTests --calibration-modes)
+set_tests_properties(CheekyCalibrationModesTests PROPERTIES TIMEOUT 120)
+set_tests_properties(CheekyRetainedCalibrationTests PROPERTIES TIMEOUT 120)
 add_test(NAME CheekyNrLifetimeTests COMMAND CheekyTests --nr-lifetime)
 add_test(NAME CheekyNrLifetimeTestsNoDebugLayer COMMAND CheekyTests --nr-lifetime)
 set_tests_properties(CheekyNrLifetimeTestsNoDebugLayer PROPERTIES
@@ -203,16 +241,35 @@ if(MSVC)
     target_compile_options(CheekyNrObserverTests PRIVATE /W4 /permissive- /utf-8 /EHsc)
 endif()
 add_test(NAME CheekyNrObserverTests COMMAND CheekyNrObserverTests)
+add_test(NAME CheekyNrObserverOpaqueVR COMMAND CheekyNrObserverTests --opaque-vr)
+foreach(proxy reshade streamline)
+    add_test(NAME CheekyNrObserver-${proxy} COMMAND CheekyNrObserverTests --wrapped-${proxy})
+endforeach()
 add_test(NAME CheekyNrObserverTestsNoDebugLayer COMMAND CheekyNrObserverTests)
 set_tests_properties(CheekyNrObserverTestsNoDebugLayer PROPERTIES
     ENVIRONMENT "CHEEKY_NR_TEST_NO_DEBUG_LAYER=1")
 
 option(CHEEKY_BUILD_UEVR "Build the UEVR plugin, resident runtime and host harness" ON)
-if(CHEEKY_BUILD_UEVR)
+option(CHEEKY_BUILD_STANDALONE "Build standalone DXGI and OptiScaler ASI integrations" ON)
+if(CHEEKY_BUILD_UEVR OR CHEEKY_BUILD_STANDALONE)
     set(CHEEKY_RUNTIME_SOURCES ${CHEEKY_FOVEATED_DLSS_SOURCES})
     list(FILTER CHEEKY_RUNTIME_SOURCES EXCLUDE REGEX "/(addon|support_report)\\.cpp$")
     add_library(CheekyFoveatedDLSSRuntime MODULE ${CHEEKY_RUNTIME_SOURCES}
         uevr/runtime.cpp uevr/settings_io.cpp)
+    target_compile_features(CheekyFoveatedDLSSRuntime PRIVATE cxx_std_20)
+    target_compile_definitions(CheekyFoveatedDLSSRuntime PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_include_directories(CheekyFoveatedDLSSRuntime PRIVATE src shared uevr
+        third_party/openvr/include third_party/reshade/deps/minhook/include)
+    target_link_libraries(CheekyFoveatedDLSSRuntime PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid version)
+    set_target_properties(CheekyFoveatedDLSSRuntime PROPERTIES CXX_EXTENSIONS OFF PREFIX ""
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/CheekyFoveatedDLSS"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/CheekyFoveatedDLSS")
+    if(MSVC)
+        target_compile_options(CheekyFoveatedDLSSRuntime PRIVATE /W4 /permissive- /utf-8)
+    endif()
+endif()
+if(CHEEKY_BUILD_UEVR)
     add_library(CheekyFoveatedDLSSUEVR MODULE uevr/plugin.cpp)
     add_executable(CheekyUEVRTests tests/uevr_tests.cpp tests/late_attach_tests.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp)
     add_library(CheekyFakeNGX MODULE tests/fake_ngx.cpp)
@@ -232,7 +289,7 @@ if(CHEEKY_BUILD_UEVR)
     set_target_properties(CheekyFakeNGX PROPERTIES OUTPUT_NAME "nvngx_dlss")
     set_target_properties(CheekyFakeStreamline PROPERTIES OUTPUT_NAME "sl.interposer")
     set_target_properties(CheekyFakeOpenVR PROPERTIES OUTPUT_NAME "openvr_api")
-    foreach(target CheekyFoveatedDLSSRuntime CheekyFoveatedDLSSUEVR CheekyUEVRTests)
+    foreach(target CheekyFoveatedDLSSUEVR CheekyUEVRTests)
         target_compile_features(${target} PRIVATE cxx_std_20)
         target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
         target_include_directories(${target} PRIVATE src shared uevr third_party/uevr/include
@@ -252,7 +309,7 @@ if(CHEEKY_BUILD_UEVR)
     set_target_properties(CheekyFoveatedDLSSUEVR PROPERTIES OUTPUT_NAME "CheekyFoveatedDLSS"
         ARCHIVE_OUTPUT_NAME "CheekyFoveatedDLSSUEVR" PDB_NAME "CheekyFoveatedDLSSUEVR")
     add_dependencies(CheekyFoveatedDLSSUEVR CheekyFoveatedDLSSRuntime)
-    add_dependencies(CheekyUEVRTests CheekyFoveatedDLSSUEVR CheekyFakeNGX CheekyFakeStreamline CheekyFakeOpenVR)
+    add_dependencies(CheekyUEVRTests CheekyFoveatedDLSSUEVR CheekyFakeNGX CheekyFakeStreamline CheekyFakeOpenVR CheekyFakeRealVR)
     add_test(NAME CheekyUEVRHost COMMAND CheekyUEVRTests)
     add_test(NAME CheekyUEVROwnership COMMAND CheekyUEVRTests --conflict)
     add_test(NAME CheekyUEVRDX11 COMMAND CheekyUEVRTests --dx11)
@@ -261,11 +318,25 @@ if(CHEEKY_BUILD_UEVR)
     endforeach()
     foreach(mode dx11 dx11-c dx12 dx12-c streamline streamline-dx11)
         add_test(NAME CheekyLateAttach-${mode} COMMAND CheekyUEVRTests --late-${mode})
+        add_test(NAME CheekyHigherHook-${mode} COMMAND CheekyUEVRTests --late-${mode} --higher-hook)
     endforeach()
     foreach(mode dx11 dx11-c streamline-dx11 dx12 dx12-c streamline)
         add_test(NAME CheekyInactiveAfw-${mode} COMMAND CheekyUEVRTests --late-${mode} --inactive-afw)
     endforeach()
     foreach(mode native native-c streamline missing-lower public-first public-first-c ota ota-c ota-streamline ota-ambiguous)
         add_test(NAME CheekyAfw-${mode} COMMAND CheekyUEVRTests --afw-${mode})
+        add_test(NAME CheekyRealVR-${mode} COMMAND CheekyUEVRTests --realvr-${mode})
     endforeach()
+    foreach(mode native native-c streamline missing-lower ota ota-c ota-streamline ota-ambiguous dx12-rr dx12-rr-c dx12-rr-ota)
+        add_test(NAME CheekyLowerHook-${mode} COMMAND CheekyUEVRTests --lower-${mode})
+    endforeach()
+    add_test(NAME CheekyRrContract COMMAND CheekyTests --rr-contract)
+    foreach(mode dx12-rr dx12-rr-c dx12-rr-ota)
+        add_test(NAME CheekyRealVR-${mode} COMMAND CheekyUEVRTests --realvr-${mode})
+    endforeach()
+
+endif()
+
+if(CHEEKY_BUILD_STANDALONE)
+    include(cmake/Standalone.cmake)
 endif()
