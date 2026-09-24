@@ -25,7 +25,7 @@ Please help maintain and expand this list by submitting if a game has worked for
 
 Close the game and choose **one** Cheeky integration. Do not load multiple Cheeky loaders together.
 
-### Standalone or OptiScaler (experimental)
+### Standalone
 
 Use the **Standalone** ZIP for native DLSS games: extract `dxgi.dll` and the
 `CheekyFoveatedDLSS` folder beside the game executable. If `dxgi.dll` already
