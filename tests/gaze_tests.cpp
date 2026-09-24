@@ -1826,10 +1826,11 @@ void test_afw_dispatch_and_settings() {
     Settings saved;
     saved.width = .4F; saved.height = .9F; saved.nr_enabled = true;
     saved.center_supersampling = 2.F; saved.center_mode = FoveationCenterMode::simulated_gaze;
+    saved.x_offset = .02F; saved.height_offset = -.45F;
     const auto effective = afw_experiment_settings(saved);
-    expect(effective.width == .7F && effective.height == .9F && effective.x_offset == 0.F && effective.height_offset == 0.F &&
-        !effective.auto_stereo_alignment && effective.nr_enabled && effective.center_supersampling == 2.F &&
-        effective.center_mode == FoveationCenterMode::simulated_gaze, "AFW preserves the requested gaze source with a generous fixed fallback");
+    expect(effective.width == saved.width && effective.height == saved.height && effective.x_offset == saved.x_offset && effective.height_offset == saved.height_offset &&
+        effective.auto_stereo_alignment == saved.auto_stereo_alignment && !effective.eye_independent_coverage && effective.nr_enabled && effective.center_supersampling == 2.F &&
+        effective.center_mode == FoveationCenterMode::simulated_gaze, "AFW without an explicit coverage mode preserves per-eye size, offsets and calibration");
     expect(saved.width == .4F && saved.nr_enabled && saved.center_supersampling == 2.F, "AFW overrides leave saved settings intact");
     auto independent = saved;
     independent.afw_manual_coverage = true; independent.nr_use_sr_foveation = false;
@@ -2062,6 +2063,7 @@ void test_afw_gaze_integration() {
     auto publish = [&] { publish_afw_stereo_projection(matrices, 2000, 1600, true); };
     publish();
     Settings requested;
+    requested.afw_automatic_coverage = true;
     requested.center_mode = FoveationCenterMode::openxr_gaze;
     requested.width = requested.height = .2F; requested.afw_warp_margin = .02F;
     requested.gaze_smoothing_ms = 0.F; requested.roundness = 1.F;
@@ -2187,6 +2189,7 @@ void test_afw_source_projection_coverage() {
     publish_afw_stereo_projection(matrices, 2000, 1600, true);
     const auto projection = afw_stereo_projection();
     Settings requested;
+    requested.afw_automatic_coverage = true;
     requested.center_mode = FoveationCenterMode::openxr_gaze;
     requested.width = requested.height = .2F; requested.afw_warp_margin = .13F;
     requested.gaze_smoothing_ms = 0; requested.roundness = 0;
@@ -2354,6 +2357,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--vulkan-layer-model") == 0) return run_vulkan_tests(true,true);
     if (argc == 2 && std::strcmp(argv[1], "--vulkan-model") == 0) return run_vulkan_tests(true);
     if (argc == 2 && std::strcmp(argv[1], "--vulkan") == 0) return run_vulkan_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--afw-settings") == 0) {
+        test_afw_dispatch_and_settings(); test_afw_projection_and_metadata();
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--afw-gaze") == 0) {
         test_afw_gaze_integration(); test_afw_source_projection_coverage(); test_afw_gaze_pixel_coverage();
         if (!failures) std::cout << "AFW fixed allocation gaze tests passed\n";

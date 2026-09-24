@@ -48,7 +48,7 @@ struct Settings {
     std::uint32_t rr_peripheral_preset{};
     float center_supersampling{1.0F};
     // AFW needs donors for both eye regions even when the source eye is known.
-    // Manual mode covers both offsets; the centered fallback starts at 70%.
+    // Coverage is opt-in. With both modes off, use calibrated per-eye settings.
     bool afw_manual_coverage{false};
     bool afw_automatic_coverage{false};
     float afw_warp_margin{0.05F};

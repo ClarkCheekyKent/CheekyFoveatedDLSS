@@ -224,7 +224,7 @@ std::string snapshot_locked(State& s) {
         const auto& v = details[i];
         if (i) out << ',';
         out << "{\"id\":\"" << v.view_id << "\",\"eye\":\""
-            << (afw.coverage_enabled ? "Unknown (AFW source eye)" : v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : "Unassigned")
+            << (v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : afw.coverage_enabled ? "Unknown (AFW source eye)" : "Unassigned")
             << "\",\"evaluations\":" << v.evaluations
             << ",\"input_width\":" << v.render_width << ",\"input_height\":" << v.render_height
             << ",\"output_width\":" << v.output_width << ",\"output_height\":" << v.output_height

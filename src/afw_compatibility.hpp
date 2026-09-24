@@ -174,6 +174,9 @@ inline Settings afw_coverage_settings(Settings settings, const AfwStereoProjecti
     return settings;
 }
 inline Settings afw_experiment_settings(Settings settings, const AfwStereoProjection* projection = nullptr) noexcept {
+    // Loading AFW does not opt into bilateral coverage. Ordinary per-eye
+    // settings retain calibrated alignment unless a coverage mode is selected.
+    if (!settings.afw_manual_coverage && !settings.afw_automatic_coverage) return settings;
     auto nr = settings;
     if (!settings.nr_use_sr_foveation) { nr.width = settings.nr_width; nr.height = settings.nr_height; }
     nr = afw_coverage_settings(nr, projection);

@@ -209,7 +209,7 @@ local function afw_controls()
     if draft.AfwManualCoverage == nil then return end
     local gaze = draft.CenterMode ~= 0
     local mode = draft.AfwAutomaticCoverage and 2 or draft.AfwManualCoverage and 1 or 0
-    local choices = {[0]="Centered (70% minimum)",[1]="Manual"}
+    local choices = {[0]="Per-eye (calibrated)",[1]="Manual"}
     if draft.AfwAutomaticCoverage ~= nil then choices[2] = "Automatic" end
     local changed, value = imgui.combo(gaze and "AFW tracking-loss fallback" or "AFW stereo coverage", mode, choices)
     if changed then
@@ -226,8 +226,8 @@ local function afw_controls()
         slider(gaze and "Fallback stereo X offset" or "Stereo X offset", "XOffset", -1, 1)
         slider(gaze and "Fallback height offset" or "Height offset", "HeightOffset", -1, 1)
     end
-    if gaze then text("Gaze follows both eyes. The fallback above applies when tracking is unavailable.")
-    elseif mode == 0 then text("Centered coverage uses at least 70% of the image width and height.") end
+    if mode == 0 then text("Uses the configured region and calibrated eye alignment.")
+    elseif gaze then text("Gaze follows both eyes. The fallback above applies when tracking is unavailable.") end
     if (gaze or mode ~= 0) and draft.AfwWarpMargin ~= nil and imgui.tree_node("Advanced AFW") then
         slider("Extra margin per edge", "AfwWarpMargin", 0, 0.25)
         text("Adds a fixed fraction of the full image around each eye's region. Larger margins cost more GPU time.")
@@ -249,7 +249,8 @@ uevr.sdk.callbacks.on_draw_ui(function()
     text("Cheeky " .. tostring(status.version))
     text(status.message)
     local afw = status.afw_experiment or {}
-    local afw_active = afw.enabled and afw.coverage_enabled ~= false
+    local afw_available = afw.enabled and afw.coverage_enabled ~= false
+    local afw_active = afw_available and (draft.AfwAutomaticCoverage or draft.AfwManualCoverage)
     if not status.ready then text("Processing is paused.") end
     text("Sliders apply on release. Other controls apply immediately and save automatically.")
     text("Alt+Shift+/ toggles SR.")
@@ -265,8 +266,11 @@ uevr.sdk.callbacks.on_draw_ui(function()
 
     if imgui.tree_node("Stereo and gaze") then
         combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
-        if afw_active then
+        if afw_available then
             afw_controls()
+            afw_active = draft.AfwAutomaticCoverage or draft.AfwManualCoverage
+        end
+        if afw_active then
             if draft.AfwAutomaticCoverage and afw.coverage_mode ~= 2 and afw.coverage_mode ~= 3 then
                 text("Automatic coverage is waiting for matching UEVR projections; using centered fallback.")
             end
@@ -305,7 +309,7 @@ uevr.sdk.callbacks.on_draw_ui(function()
         if draft.CenterMode ~= 0 or not afw_active then
             text("OpenXR alignment/gaze uses the matching Cheeky layer. Fixed alignment needs no eye tracker.")
         end
-        if not afw_active and imgui.tree_node("Eye calibration") then
+        if imgui.tree_node("Eye calibration") then
             local c = status.eye_calibration or {}
             local changed, enabled = imgui.checkbox("Automatic eye calibration (this session)", c.enabled == true)
             if changed then send(enabled and "calibration_enable" or "calibration_disable") end

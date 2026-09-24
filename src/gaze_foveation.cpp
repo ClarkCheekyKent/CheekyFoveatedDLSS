@@ -446,6 +446,11 @@ bool calculate_coordinated_crop(
         return calculate_afw_crop(settings, view_id, output_resource, render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop, reset_history, supplied_snapshot, resolved_center);
     }
+    {
+        std::lock_guard lock(coordinator_mutex);
+        diagnostics.afw_bilateral = false;
+        diagnostics.afw_fresh_sample = false;
+    }
     if (!uses_coordinated_center(settings)) {
         std::lock_guard lock(coordinator_mutex);
         diagnostics.alignment_source = 0U;

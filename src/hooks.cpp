@@ -277,7 +277,7 @@ void detect_afw_runtime() noexcept {
         !GetProcAddress(module, "InitDevice") || !GetProcAddress(module, "InitFrameWarp")) return;
     // Latch for this process. AFW's hooks also run during warmup and fallback.
     enable_afw_compatibility();
-    log_info("AFW detected: bilateral fixed/gaze coverage enabled; marker calibration bypassed. DLSS hook path follows the startup setting. Warp activity is reported separately from DLL detection.");
+    log_info("AFW detected: coverage follows the manual/automatic coverage settings; game-output marker calibration remains active. DLSS hook path follows the startup setting. Warp activity is reported separately from DLL detection.");
 }
 
 void afw_private_succeeded(const NgxHandle* handle) {
@@ -5000,7 +5000,6 @@ NgxResult process_d3d12_evaluation_impl(
 
 void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxResult result) {
-    if (afw_coverage_enabled()) return;
     if (!eye_calibration_enabled() || calibration_evaluation_depth || inside_streamline_evaluation || !ngx_succeeded(result)) return;
     const D3D12NgxEvaluationCall call{D3D12NgxRoute::public_runtime, list, handle, parameters, nullptr};
     if (!recognizable_d3d12_dlss_evaluation(call) || !has_d3d12_game_view(handle)) return;

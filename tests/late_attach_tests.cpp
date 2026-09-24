@@ -1172,7 +1172,7 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
         if (f.creates() != creates_before + 2 || afw_lower_calls != 200) puts(status.c_str());
         require(f.creates() == creates_before + 2 && afw_lower_calls == 200 && afw_reduced_depth_calls == 100,
             "Center and reduced periphery run below AFW with stable private handles");
-        require(afw_largest_output_width > 256, "AFW center supersampling enlarges only the private output");
+        require(afw_largest_output_width > 128, "AFW center supersampling enlarges the private crop output");
         require(status.find("\"missing_lower_calls\":0") != std::string::npos && status.find("\"lower_calls\":100") != std::string::npos,
             "One nested game DLSS route per full-frame core call");
         const auto nr_begin = status.find("\"nr_details\":{");

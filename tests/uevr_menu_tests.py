@@ -177,11 +177,11 @@ def run(engine):
     draw()
     assert any(t == "Selected" for t in g.drawn.values())
     assert not g.trees["AFW details"] and g.trees["Support"] and g.trees["Performance"]
-    assert not g.trees["Eye calibration"] and not g.trees["Eye mapping details"]
+    assert g.trees["Eye calibration"] and not g.trees["Eye mapping details"]
     assert len(g.sent) == count, "AFW effective overrides must not rewrite saved preferences"
     assert "Foveation center" in g["values"] and "Enable DLSS-NR" in g["values"]
-    assert "Automatic stereo alignment" not in g["values"] and "Invert stereo eye order" not in g["values"]
-    assert "Automatic eye calibration (this session)" not in g["values"]
+    assert "Automatic stereo alignment" in g["values"] and "Invert stereo eye order" in g["values"]
+    assert "Automatic eye calibration (this session)" in g["values"]
     assert "Center supersampling" in g["values"]
     afw["settings"].update(NrEnabled=True, NrFoveated=True, NrUseSrFoveation=False)
     receive(afw)
