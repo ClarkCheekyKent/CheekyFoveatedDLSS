@@ -131,6 +131,30 @@ def run(engine):
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
     state["settings"]["Enabled"] = True
+    state["settings"]["D3D12LowerHook"] = True
+    state["setting_groups"]["D3D12LowerHook"] = "sr"
+    state["d3d12_lower_hook_active"] = True
+    state["d3d12_hook_restart_required"] = False
+    receive(state)
+    draw()
+    assert g["values"]["Use lower DLSS hook (DX12)"] is True
+    draw(changes={"Use lower DLSS hook (DX12)": False})
+    assert "D3D12LowerHook=false" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["D3D12LowerHook"] = False
+    state["d3d12_hook_restart_required"] = True
+    receive(state)
+    draw()
+    assert g["values"]["Use lower DLSS hook (DX12)"] is False
+    assert any("Active DLSS hook: Lower" in t for t in g.drawn.values())
+    assert any("saved for next game restart" in t for t in g.drawn.values())
+    draw(changes={"Use lower DLSS hook (DX12)": True})
+    assert "D3D12LowerHook=true" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["D3D12LowerHook"] = True
+    state["d3d12_hook_restart_required"] = False
+    receive(state)
+    draw()
     rr = copy.deepcopy(state)
     rr["renderer"] = 1
     rr["apis"] = [{}, {"reconstruction_feature": 13}]

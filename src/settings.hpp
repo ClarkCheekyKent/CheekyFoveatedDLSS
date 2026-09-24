@@ -39,6 +39,7 @@ inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
 
 struct Settings {
     bool enabled{true};
+    bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
     bool d3d11_use_d3d12_transport{false};
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};

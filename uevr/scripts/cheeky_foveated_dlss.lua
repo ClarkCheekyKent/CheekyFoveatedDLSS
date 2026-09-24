@@ -337,6 +337,12 @@ uevr.sdk.callbacks.on_draw_ui(function()
 
     local rr = d.reconstruction_feature == 13
     if imgui.tree_node(rr and "DLSS-RR" or "DLSS-SR") then
+        if draft.D3D12LowerHook ~= nil then
+            check("Use lower DLSS hook (DX12)", "D3D12LowerHook")
+            text("Off selects the higher call. Restart the game after changing this.")
+            text("Active DLSS hook: " .. (status.d3d12_lower_hook_active and "Lower" or "Higher"))
+            if status.d3d12_hook_restart_required then text("DLSS hook change saved for next game restart.") end
+        end
         check("Enable foveated DLSS-SR", "Enabled")
         if draft.Enabled then
             section("Center")

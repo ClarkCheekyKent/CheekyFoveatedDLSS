@@ -1,5 +1,6 @@
 // Persisted settings shared with the ReShade key names.
 CHEEKY_SETTING("Enabled", enabled)
+CHEEKY_SETTING("D3D12LowerHook", d3d12_lower_hook)
 CHEEKY_SETTING("D3D11D3D12Transport", d3d11_use_d3d12_transport)
 CHEEKY_SETTING("PeripheralDlaa", peripheral_dlaa_enabled)
 CHEEKY_SETTING("PeripheralDlaaScale", peripheral_dlaa_scale)

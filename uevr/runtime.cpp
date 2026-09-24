@@ -99,7 +99,8 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json()
-        << ",\"realvr_compatibility\":" << realvr_compatibility_enabled()
+        << ",\"d3d12_lower_hook_active\":" << d3d12_lower_hook_enabled()
+        << ",\"d3d12_hook_restart_required\":" << d3d12_hook_restart_required(configured_settings().d3d12_lower_hook)
         << ",\"afw_experiment\":{\"enabled\":" << afw.enabled
         << ",\"core_calls\":" << afw.core_calls << ",\"lower_calls\":" << afw.lower_calls
         << ",\"missing_lower_calls\":" << afw.missing_lower_calls

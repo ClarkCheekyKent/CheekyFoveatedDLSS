@@ -695,6 +695,11 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
                 end_tab();
             }
             if (begin_tab("DLSS-SR")) {
+                ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
+                ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");
+                ImGui::Text("Active DLSS hook: %s", member(r.snapshot, "d3d12_lower_hook_active") == "true" ? "Lower" : "Higher");
+                if (member(r.snapshot, "d3d12_hook_restart_required") == "true")
+                    ImGui::TextUnformatted("DLSS hook change saved for next game restart.");
                 draw_sr(r.draft, member(array_object(member(r.snapshot,"apis"),1),"reconstruction_feature") == "13");
                 if (ImGui::Button("Reset SR defaults")) command(r, runtime, "defaults_sr");
                 if (ImGui::CollapsingHeader("Performance##sr", ImGuiTreeNodeFlags_DefaultOpen))

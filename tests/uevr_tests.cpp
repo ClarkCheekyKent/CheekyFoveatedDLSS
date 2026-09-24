@@ -82,7 +82,10 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
     auto result = WaitForSingleObject(event, 10000); CloseHandle(event); require(result == WAIT_OBJECT_0, "GPU timeout");
 }
 void settings_tests(const std::filesystem::path& root) {
-    Settings s; require(set_named_setting(s, "Width", "0.2"), "Parse setting");
+    Settings s; require(s.d3d12_lower_hook, "Lower hook is the default");
+    require(set_named_setting(s, "D3D12LowerHook", "false") && !s.d3d12_lower_hook, "Select higher hook");
+    require(!set_named_setting(s, "D3D12LowerHook", "invalid"), "Reject invalid hook toggle");
+    require(set_named_setting(s, "Width", "0.2"), "Parse setting");
     require(!set_named_setting(s, "Width", "nan"), "Reject NaN");
     require(!set_named_setting(s, "Width", "0.7trailing"), "Reject trailing garbage");
     require(!set_named_setting(s, "Enabled", "maybe"), "Reject bad bool");
@@ -128,6 +131,7 @@ void settings_tests(const std::filesystem::path& root) {
     require(read_settings_file(path, r, error) && r.nr_processing_order == NrProcessingOrder::after_upscaling &&
         r.nr_working_scale == 0.37f, "Missing NR order must default to After");
     require(r.nr_style == 0U, "Legacy settings must restore Standard style");
+    require(r.d3d12_lower_hook, "Legacy settings default to lower hook even over a higher-hook draft");
     require(serialize_settings(r).find("AfwDepthCoverage") == std::string::npos,
         "Retired depth setting is ignored when loading older files and omitted on save");
     require(!r.afw_manual_coverage && !r.afw_automatic_coverage && r.afw_warp_margin == .05F,
@@ -198,15 +202,16 @@ int main(int argc, char** argv) {
             require(cadence.average_ms == 0, "SR toggle starts a fresh cadence window");
         }
         const bool conflict_mode = argc > 1 && std::string(argv[1]) == "--conflict";
-        bool hardware{}, inactive_afw{};
+        bool hardware{}, inactive_afw{}, higher_hook{};
         for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--higher-hook") higher_hook = true;
             if (std::string(argv[i]) == "--hardware") hardware = true;
             if (std::string(argv[i]) == "--inactive-afw") inactive_afw = true;
         }
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool late = mode.starts_with("--late-");
         const bool afw = mode.starts_with("--afw-");
-        const bool realvr = mode.starts_with("--realvr-");
+        const bool realvr = mode.starts_with("--realvr-") || mode.starts_with("--lower-");
         const bool openvr_late = mode.starts_with("--openvr-late-");
         const bool dx11 = mode == "--dx11" || (late && mode.find("dx11")!=mode.npos);
         HANDLE conflict = conflict_mode ? claim_processing_owner() : nullptr;
@@ -273,6 +278,10 @@ int main(int argc, char** argv) {
             std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", afw_path);
             require(LoadLibraryW(afw_path.c_str()) != nullptr, "Load inactive AFW before Cheeky");
         }
+        if (higher_hook) {
+            Settings initial; initial.d3d12_lower_hook = false; std::string error;
+            require(write_settings_file(root / "CheekyFoveatedDLSS.ini", initial, error), "Save higher-hook startup setting");
+        }
         HMODULE plugin = LoadLibraryW(plugin_path.c_str()); require(plugin != nullptr, "Load actual UEVR plugin DLL");
         auto init = reinterpret_cast<UEVR_PluginInitializeFn>(GetProcAddress(plugin, "uevr_plugin_initialize"));
         require(init != nullptr, "Plugin entry export");
@@ -337,6 +346,15 @@ int main(int argc, char** argv) {
         command("1\n86\ncalibration_recalibrate");
         require(received.find("Waiting for OpenVR or OpenXR") != received.npos, "Unavailable backend must not claim active calibration");
         if (late) {
+            const auto active_hook = higher_hook ? "\"d3d12_lower_hook_active\":false" : "\"d3d12_lower_hook_active\":true";
+            require(snapshot(get).find(active_hook) != std::string::npos, "Saved hook path was not applied at startup");
+            command(higher_hook ? "1\n70\nset\nD3D12LowerHook=true" : "1\n70\nset\nD3D12LowerHook=false");
+            require(snapshot(get).find(active_hook) != std::string::npos &&
+                snapshot(get).find("\"d3d12_hook_restart_required\":true") != std::string::npos,
+                "Hook toggle must save a restart request without changing live ownership");
+            command(higher_hook ? "1\n71\nset\nD3D12LowerHook=false" : "1\n71\nset\nD3D12LowerHook=true");
+            require(snapshot(get).find("\"d3d12_hook_restart_required\":false") != std::string::npos,
+                "Restoring the active selection clears the restart request");
             if (inactive_afw) {
                 present();
                 require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos &&

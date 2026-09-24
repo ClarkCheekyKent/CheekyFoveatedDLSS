@@ -28,9 +28,17 @@ add_executable(CheekyOverlayTests tests/overlay_tests.cpp standalone/overlay.cpp
     ${CHEEKY_IMGUI}/imgui_tables.cpp ${CHEEKY_IMGUI}/imgui_widgets.cpp
     ${CHEEKY_IMGUI}/backends/imgui_impl_win32.cpp
     ${CHEEKY_IMGUI}/backends/imgui_impl_dx11.cpp ${CHEEKY_IMGUI}/backends/imgui_impl_dx12.cpp)
-target_include_directories(CheekyOverlayTests PRIVATE standalone shared src uevr ${CHEEKY_IMGUI})
+target_sources(CheekyOverlayTests PRIVATE
+    tests/vulkan_overlay_tests.cpp standalone/vulkan_overlay.cpp src/vulkan_api.cpp
+    ${CHEEKY_IMGUI}/backends/imgui_impl_vulkan.cpp
+    third_party/reshade/deps/minhook/src/buffer.c
+    third_party/reshade/deps/minhook/src/hook.c
+    third_party/reshade/deps/minhook/src/trampoline.c
+    third_party/reshade/deps/minhook/src/hde/hde64.c)
+target_include_directories(CheekyOverlayTests PRIVATE standalone shared src uevr ${CHEEKY_IMGUI}
+    third_party/reshade/deps/minhook/include third_party/vulkan/include)
 target_link_libraries(CheekyOverlayTests PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid user32 imm32 dwmapi)
-target_compile_definitions(CheekyOverlayTests PRIVATE CHEEKY_OVERLAY_TEST_DESKTOP)
+target_compile_definitions(CheekyOverlayTests PRIVATE CHEEKY_OVERLAY_TEST_DESKTOP IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 add_test(NAME CheekyOverlay-UI COMMAND CheekyOverlayTests --ui)
 foreach(target CheekyFoveatedDLSSHost CheekyStandaloneProxy CheekyOptiScaler CheekyOverlayTests)
     target_compile_features(${target} PRIVATE cxx_std_20)

@@ -15,6 +15,7 @@ std::mutex settings_mutex;
 std::atomic<bool> processing_allowed{true};
 
 std::atomic<bool> enabled{true};
+std::atomic<bool> d3d12_lower_hook{true};
 std::atomic<bool> d3d11_use_d3d12_transport{false};
 std::atomic<bool> peripheral_dlaa_enabled{true};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
@@ -143,6 +144,7 @@ Settings configured_settings() noexcept {
     std::lock_guard lock(settings_mutex);
     Settings settings{};
     settings.enabled = enabled.load(std::memory_order_acquire);
+    settings.d3d12_lower_hook = d3d12_lower_hook.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
         d3d11_use_d3d12_transport.load(std::memory_order_acquire);
     settings.peripheral_dlaa_enabled =
@@ -228,6 +230,7 @@ Settings current_settings() noexcept {
 
 void update_settings(const Settings& settings) noexcept {
     std::lock_guard lock(settings_mutex);
+    d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(
         settings.d3d11_use_d3d12_transport,

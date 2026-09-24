@@ -543,6 +543,50 @@ void test_core_d3d12_evaluation_is_intercepted() {
     dispatch_harness = nullptr;
 }
 
+void test_selectable_d3d12_hook_path() {
+    using namespace cheeky::foveated_dlss;
+    expect(Settings{}.d3d12_lower_hook && d3d12_lower_hook_enabled(), "Lower hook is the startup default without VR detection");
+    D3D12DispatchHarness harness{};
+    dispatch_harness = &harness;
+    const auto lower = +[](ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+        const NgxParameters* params, NgxProgressCallback callback) -> NgxResult {
+        return dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime, list, handle, params, callback},
+            fake_d3d12_original, fake_d3d12_processor, dispatch_harness);
+    };
+    for (const bool use_lower : {true, false}) {
+        configure_d3d12_hook_path(use_lower); // Simulate startup in each configuration.
+        harness = {};
+        expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, lower,
+            fake_d3d12_processor, &harness) == 0x200U && harness.processor_calls == 1 &&
+            harness.observed_route == (use_lower ? D3D12NgxRoute::public_runtime : D3D12NgxRoute::core_runtime),
+            "Selected hook alone owns a core-to-feature evaluation");
+        auto settings = configured_settings(); settings.d3d12_lower_hook = !use_lower;
+        update_settings(settings);
+        expect(d3d12_lower_hook_enabled() == use_lower && d3d12_hook_restart_required(settings.d3d12_lower_hook),
+            "Saving a hook toggle cannot change live ownership");
+    }
+    configure_d3d12_hook_path(true);
+    harness = {};
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime}, fake_d3d12_original,
+        fake_d3d12_processor, &harness) == 0x200U && harness.processor_calls == 1,
+        "Standalone feature-runtime calls work without an outer core call");
+    harness = {};
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, fake_d3d12_original,
+        fake_d3d12_processor, &harness) == 0x100U && harness.processor_calls == 0 && harness.original_calls == 1,
+        "Missing lower hook passes through without secretly processing higher");
+    harness = {}; harness.nest_core_evaluation = true;
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::public_runtime}, fake_d3d12_original,
+        fake_d3d12_processor, &harness) == 0xBAD00007U && harness.original_calls == 0,
+        "Lower private work cannot leak into an upstream core hook");
+    configure_d3d12_hook_path(false);
+    enable_afw_compatibility();
+    harness = {};
+    expect(dispatch_d3d12_ngx_evaluation({D3D12NgxRoute::core_runtime}, lower,
+        fake_d3d12_processor, &harness) == 0x200U && harness.observed_route == D3D12NgxRoute::core_runtime,
+        "Runtime detection does not override the user's higher hook choice");
+    dispatch_harness = nullptr;
+}
+
 void test_nested_d3d12_evaluation_is_forwarded_once() {
     using namespace cheeky::foveated_dlss;
     D3D12DispatchHarness harness{};
@@ -1909,9 +1953,9 @@ void test_afw_dispatch_and_settings() {
             harness.processor_calls == processed + 1, "Known non-AFW modes retain standalone public processing");
         harness.nest_core_evaluation = true;
         const auto originals = harness.original_calls;
-        expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0x100U &&
-            harness.processor_calls == processed + 2 && harness.original_calls == originals + 1 &&
-            !d3d12_ngx_interception_active(), "Non-AFW private public-to-core forwarding processes exactly once");
+        expect(dispatch_d3d12_ngx_evaluation(call, fake_d3d12_original, fake_d3d12_processor, &harness) == 0xBAD00007U &&
+            harness.processor_calls == processed + 2 && harness.original_calls == originals &&
+            !d3d12_ngx_interception_active(), "Lower hook rejects private core reentry even when AFW is inactive");
     }
     publish_afw_rendering_mode(3);
     expect(afw_coverage_enabled(), "AFW can be re-enabled without restarting the process");
@@ -2285,6 +2329,10 @@ int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int run_debug_exposure_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--hook-path") == 0) {
+        test_selectable_d3d12_hook_path();
+        return failures ? 1 : 0;
+    }
     extern int run_retained_calibration_tests();
     extern int run_calibration_modes_tests();
     if (argc == 2 && std::strcmp(argv[1], "--calibration-modes") == 0) return run_calibration_modes_tests();
@@ -2361,11 +2409,13 @@ int main(int argc, char** argv) {
     test_temporal_policy();
     test_reset_policy();
     test_abi();
+    cheeky::foveated_dlss::configure_d3d12_hook_path(false);
     test_core_d3d12_evaluation_is_intercepted();
     test_nested_d3d12_evaluation_is_forwarded_once();
     test_d3d12_route_names();
     test_nested_d3d12_lifecycle_scope_is_passthrough();
     test_core_d3d12_route_is_published_to_diagnostics();
+    cheeky::foveated_dlss::configure_d3d12_hook_path(true);
     test_multimip_game_output_uses_single_mip_private_output();
     test_msfs_array_output_contract();
     test_streamline_private_sr_viewport();

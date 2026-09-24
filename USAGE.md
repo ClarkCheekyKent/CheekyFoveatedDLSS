@@ -258,3 +258,9 @@ The center uses crop-sized inputs and fractional composite alignment to preserve
 the full-frame sampling grid as it moves. Change-only eye calibration retains the
 first valid published mapping until a view, geometry, session or explicit
 calibration-setting change; continuous mode continues verifying markers.
+
+### DLSS hook path (D3D12)
+
+**Use lower DLSS hook (DX12)** is enabled by default. Cheeky processes DLSS at the feature runtime, leaving upstream core and Streamline calls intact. Turn it off to use the higher call (the previous outermost-interception path). The control is in the DLSS-SR panel for standalone/UEVR and beside the processing-path controls in ReShade.
+
+The saved setting is `D3D12LowerHook=true` (`false` selects higher). Restart the game after changing it; the active path remains unchanged until restart so existing feature handles and histories keep their owner. The runtime snapshot reports `d3d12_lower_hook_active` and `d3d12_hook_restart_required`. If the lower runtime cannot be identified or hooked, its path leaves game DLSS unchanged; it does not automatically switch to higher processing.

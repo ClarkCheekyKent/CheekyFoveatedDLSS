@@ -7,6 +7,7 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "d3d12_ngx_dispatch.hpp"
 #include "support_report.hpp"
 #include "eye_calibration.hpp"
 #include "cheeky_gaze_abi.h"
@@ -745,6 +746,9 @@ void draw_openxr_gaze_diagnostics() {
 
 void load_settings_from_reshade() noexcept {
     auto settings = current_settings();
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "D3D12LowerHook", settings.d3d12_lower_hook
+    ));
     auto center_mode = static_cast<std::uint32_t>(settings.center_mode);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "Enabled", settings.enabled
@@ -929,6 +933,7 @@ void load_settings_from_reshade() noexcept {
 }
 
 void save_settings_to_reshade(const Settings& settings) noexcept {
+    reshade::set_config_value(nullptr, config_section, "D3D12LowerHook", settings.d3d12_lower_hook);
     reshade::set_config_value(
         nullptr, config_section, "Enabled", settings.enabled
     );
@@ -1368,6 +1373,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
 
     ImGui::Spacing();
     if (ImGui::Button("Reset DLSS-SR defaults", ImVec2(0.0F, 0.0F))) {
+        settings.d3d12_lower_hook = Settings{}.d3d12_lower_hook;
         const Settings defaults{};
         settings.enabled = defaults.enabled;
         settings.peripheral_dlaa_enabled = defaults.peripheral_dlaa_enabled;
@@ -1631,8 +1637,13 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
 
     ImGui::TextDisabled("Cheeky Foveated DLSS v" CHEEKY_VERSION);
     ImGui::Separator();
-    ImGui::TextUnformatted("Changes apply live to the next DLSS evaluation.");
+    ImGui::TextUnformatted("Changes apply live, except the DLSS hook path (restart required).");
     ImGui::TextDisabled("DX12 Transport enables DX12 features for DX11 games.");
+    changed |= ImGui::Checkbox("Use lower DLSS hook (DX12)", &settings.d3d12_lower_hook);
+    ImGui::TextDisabled("Off selects the higher call. Restart the game after changing this.");
+    ImGui::Text("Active DLSS hook: %s", d3d12_lower_hook_enabled() ? "Lower" : "Higher");
+    if (d3d12_hook_restart_required(settings.d3d12_lower_hook))
+        ImGui::TextUnformatted("DLSS hook change saved for next game restart.");
     int d3d11_path = settings.d3d11_use_d3d12_transport ? 1 : 0;
     if (ImGui::Combo(
             "DX11 game processing path",

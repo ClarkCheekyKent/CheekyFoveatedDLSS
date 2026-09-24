@@ -105,6 +105,8 @@ void test_ui_diagnostics() {
         "Calibration controls belong in Stereo / Gaze");
     require(text.find("Eye tracking details") == text.npos && text.find("Corrections applied") == text.npos, "Tracking details belong in Diagnostics");
     render("DLSS-SR"); text = render("DLSS-SR");
+    require(text.find("Use lower DLSS hook (DX12)") != text.npos &&
+        text.find("Restart the game") != text.npos, "SR tab exposes the hook selector and restart requirement");
     require(text.find("Full DLSS call: 2.000 ms") != text.npos, "GPU timing from the second API object");
     require(text.find("Foveated FPS gain: +16.7 FPS (+20.0%)") != text.npos, "FPS gain must use the non-foveated FPS baseline");
     require(text.find("Frame-time change: -2.00 ms (-16.7%)") != text.npos, "Frame-time change must use the non-foveated frame time baseline");

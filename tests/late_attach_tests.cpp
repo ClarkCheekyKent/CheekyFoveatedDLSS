@@ -206,7 +206,7 @@ void observe_afw_lower(const NgxParameters* params) {
     if (output == fixture().textures12[3].Get()) afw_full_resets += get_ui(params, "Reset") != 0;
 }
 std::string snapshot(CheekyUEVRSnapshotFn get) { std::vector<char> text(32768); require(get(text.data(),32768),"Late snapshot"); return text.data(); }
-void verify_nr_reset_isolation(void (*command)(const char*)) {
+void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
     auto& f = fixture();
     if (f.context) return;
     f.params.Set("Jitter.Offset.X", 0.F); f.params.Set("Jitter.Offset.Y", 0.F);
@@ -268,8 +268,11 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     command("1\n94\nset\nEnabled=false\nNrEnabled=false\nNrProcessingOrder=1\nHeightOffset=-1");
     for (unsigned i = 0; i < 3; ++i) {
         evaluate(0);
-        require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get() && sr_inputs[0].reset == 0,
-            "Disabled Before NR changed raw SR input/reset");
+        // Lower processing skipped the native history during private SR. Its
+        // first full-frame fallback must reset once; later frames stay untouched.
+        const auto expected_reset = lower_hook && i == 0 ? 1U : 0U;
+        require(sr_inputs.size() == 1 && sr_inputs[0].color == f.textures12[0].Get() && sr_inputs[0].reset == expected_reset,
+            "Disabled Before NR must preserve raw input and reset stale lower-hook history only once");
     }
     command("1\n95\nset\nNrEnabled=true\nNrFoveated=false");
     const auto fail_nr = proc<void(*)(bool)>(nr,"CheekyFakeFailEvaluations");
@@ -305,11 +308,14 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     // Keep another eye's processed history while this eye returns to raw input.
     auto* first_handle = f.handle;
     const auto first_viewport = f.viewport.value;
-    if (f.use_sl) {
+    // Native processing keys histories by NGX handle; Streamline normally
+    // owns a distinct native feature for each viewport. Model that here.
+    if (f.use_sl && !lower_hook) {
         ++f.viewport.value;
         require(f.sl_options(&f.viewport,&f.options) == 0, "Second viewport options");
     } else {
         require(ngx_succeeded(f.create12(f.list.Get(),1,&f.params,&f.handle)), "Second native view");
+        if (f.use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
     }
     evaluate(0);
     expect_input(true, 1, "Second eye inherited first eye's processed history");
@@ -318,9 +324,10 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     expect_input(false, 1, "Processed Before to After did not reset this eye");
     evaluate(0);
     expect_input(false, 0, "Processed Before to After reset this eye twice");
-    if (!f.use_sl) require(ngx_succeeded(f.release(f.handle)), "Release second native view");
+    if (!f.use_sl || lower_hook) require(ngx_succeeded(f.release(f.handle)), "Release second native view");
     f.handle = first_handle; f.viewport.value = first_viewport;
-    if (f.use_sl) {
+    if (f.use_sl && lower_hook) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
+    if (f.use_sl && !lower_hook) {
         require(f.sl_options(&f.viewport,&f.options) == 0, "Restore first viewport options");
         f.ambiguous_sl_inputs = true;
         evaluate(0);
@@ -344,7 +351,7 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
     fail_nr(false);
     evaluate(0);
     expect_input(true, 1, "Recovered preparation did not reset raw history");
-    if (f.use_sl) {
+    if (f.use_sl && !lower_hook) {
         f.missing_sl_constants = true;
         evaluate(0);
         expect_input(false, 1, "Missing current metadata discarded a processed transition");
@@ -426,8 +433,8 @@ void verify_nr_reset_isolation(void (*command)(const char*)) {
         for (unsigned y = 0; y < motion_desc.Height; ++y) {
             auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + fp.Offset + y * fp.Footprint.RowPitch);
             for (unsigned x = 0; x < motion_desc.Width; ++x) {
-                row[2*x] = DirectX::PackedVector::XMConvertFloatToHalf(1.75F / (f.use_sl ? 128.F : 1.F));
-                row[2*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(0.375F / (f.use_sl ? 128.F : 1.F));
+                row[2*x] = DirectX::PackedVector::XMConvertFloatToHalf(1.75F / (f.use_sl && !lower_hook ? 128.F : 1.F));
+                row[2*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(0.375F / (f.use_sl && !lower_hook ? 128.F : 1.F));
             }
         }
         upload->Unmap(0,nullptr);
@@ -644,7 +651,8 @@ void prepare_late_attach_test(const std::filesystem::path& bin,ID3D11Device* dx1
 void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::path& root, ID3D12Device* device,
     ID3D12CommandQueue* queue, std::string_view mode) {
     const bool use_c = mode.ends_with("-c"), use_sl = mode.find("streamline") != mode.npos;
-    const bool realvr = mode.starts_with("--realvr-");
+    const bool generic_lower = mode.starts_with("--lower-");
+    const bool realvr = mode.starts_with("--realvr-") || generic_lower;
     rr_test = mode.find("-rr") != mode.npos;
     const bool missing_lower = mode.ends_with("-missing-lower"), public_first = mode.find("-public-first") != mode.npos;
     afw_ota = mode.find("-ota") != mode.npos; afw_ambiguous = mode.ends_with("-ota-ambiguous");
@@ -676,12 +684,15 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
     const auto dir = root / "afw-fixtures";
     std::filesystem::create_directories(dir);
     std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", dir / "_nvngx.dll");
-    std::filesystem::copy_file(bin / "test-fixtures" / (realvr ? "CheekyFakeRealVR.dll" : "nvngx_dlss.dll"),
-        dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll"));
     afw_core = LoadLibraryW((dir / "_nvngx.dll").c_str());
-    afw_warp_module = LoadLibraryW((dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll")).c_str());
-    require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
-    if (!realvr) afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
+    require(afw_core != nullptr, "Load upstream NGX core fixture");
+    if (!generic_lower) {
+        std::filesystem::copy_file(bin / "test-fixtures" / (realvr ? "CheekyFakeRealVR.dll" : "nvngx_dlss.dll"),
+            dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll"));
+        afw_warp_module = LoadLibraryW((dir / (realvr ? "dxgi2.dll" : "PDAFWPlugin.dll")).c_str());
+        require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
+        if (!realvr) afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
+    }
     afw_missing_lower = missing_lower || public_first || afw_ambiguous;
     afw_public_first = public_first;
     if (public_first) {
@@ -737,8 +748,8 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
 
 void verify_realvr_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     auto& f = fixture();
-    require(snapshot(get).find("\"realvr_compatibility\":true")!=std::string::npos,
-        "Installed R.E.A.L. VR product identity was not detected");
+    require(snapshot(get).find("\"d3d12_lower_hook_active\":true")!=std::string::npos,
+        "Lower DLSS hook must be enabled by default");
     command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=1\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false\nAlignmentBorder=true");
     if (rr_test) command("1\n199\nset\nRrCenterPreset=5\nRrPeripheralPreset=4");
     const auto creates_before = f.creates();
@@ -1262,7 +1273,21 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
     require(ngx_succeeded(f.evaluate()),"Incomplete frame after adoption forwards");
     require(f.creates()==first_private,"Do not recreate with guessed flags after adoption");
     f.params.Set("DLSS.Feature.Create.Flags",2U);
-    if(f.use_sl) {
+    const bool lower_hook = snapshot(get).find("\"d3d12_lower_hook_active\":true") != std::string::npos;
+    if(f.use_sl && lower_hook && !f.context) {
+        const auto status = snapshot(get);
+        require(status.find("\"options_seen\":false") != status.npos, "Lower processing does not invent Streamline options");
+        require(f.sl_options(&f.viewport, &f.options) == 0 &&
+            proc<Counter>(f.sl, "CheekyFakeOptionWidth")() == 256 &&
+            proc<Counter>(f.sl, "CheekyFakeOptionHeight")() == 256,
+            "Lower hook leaves upstream Streamline options unchanged");
+        const auto evaluations = f.evaluates();
+        ++f.viewport.value;
+        require(ngx_succeeded(f.evaluate()), "Lower hook processes another Streamline viewport"); f.finish_gpu();
+        require(f.evaluates() == evaluations + 1, "Streamline and lower hooks must not double-process");
+        --f.viewport.value;
+    }
+    if(f.use_sl && (!lower_hook || f.context)) {
         const auto status=snapshot(get);
         require(status.find("\"options_hooked\":true")!=status.npos && status.find("\"options_seen\":false")!=status.npos,"Proactive SL setter hook without invented options");
         require(status.find("\"native_fallback\":true")!=status.npos,"Missing SL options permit native NGX processing");
@@ -1293,7 +1318,7 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
         else proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
     }
     require(ngx_succeeded(f.evaluate()),"Evaluate recreated game feature"); f.finish_gpu();
-    verify_nr_reset_isolation(command);
+    verify_nr_reset_isolation(command, snapshot(get).find("\"d3d12_lower_hook_active\":true") != std::string::npos);
     if (!f.context && !f.use_sl) {
         command("1\n70\nset\nEnabled=false");
         // UE can discard a recording after evaluation. Exhaust more than the
@@ -1380,7 +1405,7 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
         puts("Inactive AFW: mode switches, stale-mode fallback and SR/NR history recovery passed");
     }
     require(ngx_succeeded(f.release(f.handle)),"Release recreated feature");
-    if (f.use_sl && !f.context) {
+    if (f.use_sl && !f.context && !lower_hook) {
         f.complete_sl_metadata = true; f.options.struct_version = 3;
         require(f.sl_options(&f.viewport,&f.options)==0, "Exposure forwarding options");
         command("1\n130\nset\nEnabled=true\nPeripheralDlaa=true\nNrEnabled=false");
