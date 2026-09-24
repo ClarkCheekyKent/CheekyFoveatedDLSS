@@ -472,3 +472,13 @@ ctest --test-dir build/cmake -C Release -R 'CheekyNr.*NoDebugLayer' --output-on-
 
 Run all four lifetime configurations with `-R 'CheekyNr'`, or omit `-R` for the
 full suite. Each lifetime run must print the same assertion-success summary.
+
+## Vulkan source eye calibration
+
+`CheekyTests.exe --vulkan` also exercises Vulkan marker writes and source proof
+readback on the GPU, then transfers the captured pixels to D3D11 OpenXR
+submission textures. It covers RGBA8/16F/32F outputs, swapped separate eyes,
+shared mono output, cropped locator-grid acquisition, retained unstamped
+frames, missing submitted markers, and reset without submission. The test
+uses CPU transfer to emulate the host bridge; actual R.E.A.L. VR interop and
+headset alignment still require an in-game check.

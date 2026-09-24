@@ -44,8 +44,8 @@ void VulkanImage::destroy(const VulkanDeviceApi& a) noexcept {
     if (memory) a.FreeMemory(a.device,memory,nullptr);
     *this={};
 }
-bool VulkanBuffer::create(const VulkanDeviceApi& a,VkDeviceSize size) {
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; info.size=size; info.usage=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+bool VulkanBuffer::create(const VulkanDeviceApi& a,VkDeviceSize size,VkBufferUsageFlags usage) {
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; info.size=size; info.usage=usage;
     if (a.CreateBuffer(a.device,&info,nullptr,&buffer)!=VK_SUCCESS) return false;
     VkMemoryRequirements r{}; a.GetBufferMemoryRequirements(a.device,buffer,&r);
     if (!allocate(a,r,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,memory) ||
@@ -92,7 +92,7 @@ bool VulkanDispatch::create(const VulkanDeviceApi& a,const VulkanCompute& kernel
     if(pool) return true;
     const VkDescriptorPoolSize sizes[]={{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,kernel.inputs},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,kernel.outputs},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1}};
-    VkDescriptorPoolCreateInfo p{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; p.maxSets=1;p.poolSizeCount=3;p.pPoolSizes=sizes;
+    VkDescriptorPoolCreateInfo p{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; p.maxSets=1;p.poolSizeCount=kernel.inputs?3U:2U;p.pPoolSizes=sizes+(kernel.inputs?0:1);
     if(a.CreateDescriptorPool(a.device,&p,nullptr,&pool)!=VK_SUCCESS) return false;
     VkDescriptorSetAllocateInfo d{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};d.descriptorPool=pool;d.descriptorSetCount=1;d.pSetLayouts=&kernel.descriptors;
     if(a.AllocateDescriptorSets(a.device,&d,&descriptors)!=VK_SUCCESS || !constants.create(a,bytes)) { destroy(a);return false; }

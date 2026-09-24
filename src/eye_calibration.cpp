@@ -1,4 +1,5 @@
 #include "eye_calibration.hpp"
+#include "eye_calibration_source.hpp"
 #include "eye_calibration_pixels.hpp"
 #include "eye_calibration_d3d12.hpp"
 #include "d3d12_native.hpp"
@@ -66,6 +67,8 @@ struct Frame {
     std::shared_ptr<Calibration12Frame> gpu12;
     ComPtr<ID3D12Device> device12;
     bool gpu12_used{}, classified{};
+    std::array<CalibrationSourcePtr, 2> external_sources;
+    bool external_used{};
     ComPtr<ID3D11DeviceContext> context;
     std::uintptr_t device_identity{}, context_identity{};
     unsigned device_flags{};
@@ -695,7 +698,23 @@ void poll(State& s) {
         const bool mono = f.pipelined && f.evaluations == 1 && (source_mask == 1 || source_mask == 2);
         f.shared_source_assumed=mono;
         if (!f.verification_staged) {
-            if (f.gpu12_used) {
+            if (f.external_used) {
+                bool waiting{};
+                for (unsigned c = 0; c < 2; ++c) {
+                    if (!(source_mask & (1U << c))) continue;
+                    if (!f.external_sources[c]) { f.invalid = true; continue; }
+                    const auto result = f.external_sources[c]->poll();
+                    if (!result.ready) { waiting = true; continue; }
+                    f.invalid |= !result.valid;
+                    for (unsigned j = 0; j < 2; ++j) {
+                        auto& patch = f.patches[c * 2 + j];
+                        patch.used = patch.ready = true;
+                        patch.score = result.scores[j];
+                    }
+                }
+                if (waiting) continue;
+                s.stats.gpu_timing_status = "Unavailable across Vulkan source and D3D11 submission";
+            } else if (f.gpu12_used) {
                 const bool mixed = f.pipelined;
                 const auto result = calibration12_poll(*f.gpu12, mixed, mixed ? source_mask : 3U);
                 if (f.sequence >= s.measurement_start)
@@ -1467,6 +1486,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         if (f.gpu12 && !calibration12_begin(*f.gpu12))
             continue;
         f.gpu12_used = f.classified = false;
+        f.external_sources = {}; f.external_used = false;
         f.pipelined = backend == EyeCalibrationBackend::openxr && graphics_api == 11;
         // Native DX12 submissions can also reuse the previous eye under AFW.
         // Keep both source proofs, without selecting the mixed DX12/DX11 readback path.
@@ -1545,7 +1565,7 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
             return;
         s.stats.graphics_api = 11;
         s.stats.source_graphics_api = 11;
-        if (s.ring[s.current].gpu12_used) {
+        if (s.ring[s.current].gpu12_used || s.ring[s.current].external_used) {
             s.ring[s.current].invalid = true;
             return;
         }
@@ -1639,6 +1659,52 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
             s.ring[s.current].invalid = true;
     }
 }
+void eye_calibration_external_source(std::uint64_t view, unsigned x, unsigned y, unsigned width,
+    unsigned height, unsigned graphics_api, void* context, CalibrationSourceRecord record) noexcept {
+    if (!enabled || !record || !view || width < 2 * inset + block || height < 2 * inset + block) return;
+    try {
+        auto& s = state();
+        std::lock_guard lock(s.mutex);
+        CpuScope cpu{s};
+        observe_source(s, view, width, height);
+        // This bridge joins native Vulkan renders to the host's D3D11 XR
+        // transfer. Native Vulkan XR submissions need a separate capture path.
+        if (s.backend != EyeCalibrationBackend::openxr || s.stats.submission_graphics_api != 11 ||
+            retaining_calibration(s)) return;
+        s.stats.source_graphics_api = graphics_api;
+        const unsigned c = continuous_candidate(s, view);
+        if (c >= 2) return;
+        Frame* frame = s.current >= 0 ? &s.ring[s.current] : nullptr;
+        if (frame && (frame->epoch != s.epoch || frame->submits || frame->invalid)) frame = nullptr;
+        if (frame && (frame->queries_started || frame->gpu12_used)) { frame->invalid = true; return; }
+        const bool repeated = frame && frame->views[c].id == view;
+        if (repeated && (frame->views[c].generation != stereo_view_generation(view) ||
+            frame->views[c].width != width || frame->views[c].height != height)) {
+            frame->invalid = true; return;
+        }
+        const auto plan = repeated ? frame->placement_plans[c] : source_placement(s, c, view, width, height);
+        const auto points = calibration_marker_points(plan, x, y, width, c, capture_codes(s.epoch)[c]);
+        auto proof = record(context, points, c);
+        if (!proof) { if (frame) frame->invalid = true; return; }
+        if (!frame || repeated) return;
+        auto& f = *frame;
+        f.external_used = true;
+        f.external_sources[c] = std::move(proof);
+        f.thread = s.stamp_thread = GetCurrentThreadId();
+        f.device_identity = f.context_identity = 0;
+        const auto assignment = stereo_eye_assignment(view);
+        f.views[c] = {view, width, height, assignment.assigned ? int(assignment.eye_index) : -1,
+            stereo_view_generation(view)};
+        f.placement_plans[c] = plan;
+        f.patch_codes[c*2] = f.patch_codes[c*2+1] = points.points[0].code;
+        ++f.evaluations;
+        // Full source screenshots are not read back by this small proof path.
+        if (f.support) fail_calibration_image(f.support, c, "vulkan_source_preview_unavailable");
+    } catch (...) {
+        auto& s = state(); std::lock_guard lock(s.mutex);
+        if (s.current >= 0) s.ring[s.current].invalid = true;
+    }
+}
 void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* output, std::uint64_t view,
                              unsigned x, unsigned y, unsigned width, unsigned height,
                              D3D12_RESOURCE_STATES output_state) noexcept {
@@ -1675,7 +1741,7 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
             repeated = c < 2 && f.views[c].id == view;
         }
         if (!repeated) ++f.evaluations;
-        if (c >= 2 || f.queries_started || width < 2 * inset + block || height < 2 * inset + block) {
+        if (c >= 2 || f.queries_started || f.external_used || width < 2 * inset + block || height < 2 * inset + block) {
             f.invalid = true;
             return;
         }
@@ -1848,7 +1914,7 @@ std::uint64_t eye_calibration_submit(ID3D11Texture2D* texture, unsigned eye, flo
         capture_sequence = f.sequence;
         source_device_identity = f.device_identity;
         pipelined = f.pipelined;
-        mixed = f.gpu12_used && f.pipelined;
+        mixed = (f.gpu12_used || f.external_used) && f.pipelined;
         // Reject unprotected foreign-thread access before any D3D calls,
         // including GetDevice/QueryInterface on a SINGLETHREADED device.
         if (f.queries_started && f.thread != GetCurrentThreadId() && !f.protected_context) {

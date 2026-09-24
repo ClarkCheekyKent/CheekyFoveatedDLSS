@@ -8,7 +8,8 @@
 namespace cheeky::foveated_dlss {
 inline constexpr unsigned eye_calibration_failure_limit = 20;
 enum class EyeCalibrationBackend { none, openvr, openxr };
-// Asynchronous D3D11/D3D12 calibration for OpenVR and OpenXR. D3D11 work
+// Asynchronous D3D11/D3D12 calibration, plus Vulkan sources transferred to
+// D3D11 OpenXR submissions. D3D11 work
 // uses the render thread except protected native OpenXR pre-release copies;
 // UI only reads snapshots.
 struct EyeCalibrationStats {

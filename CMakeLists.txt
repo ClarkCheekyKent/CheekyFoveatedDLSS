@@ -143,6 +143,7 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_gpu.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_observer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_backend.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_calibration.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_peripheral.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_nr.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_nr_runtime.cpp"

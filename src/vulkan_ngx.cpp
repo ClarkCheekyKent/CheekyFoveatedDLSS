@@ -1,3 +1,4 @@
+#include "vulkan_calibration.hpp"
 #include "vulkan_observer.hpp"
 #include "vulkan_backend.hpp"
 #include "ngx_frame_contract.hpp"
@@ -54,8 +55,12 @@ template<unsigned I> NgxResult evaluate(VkCommandBuffer cmd,const NgxHandle* han
             if(!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",value))parameters.Set("DLSS.Feature.Create.Flags",feature.flags);
             if(!try_get_ngx_integer_bits(p,"PerfQualityValue",value))parameters.Set("PerfQualityValue",feature.quality);
             DlssFrameContract frame{};NgxResult result{};
-            if(read_ngx_frame_contract(&parameters,reinterpret_cast<std::uintptr_t>(handle),feature.type,frame) &&
-                evaluate_vulkan_backend(cmd,&parameters,frame,current_settings(),route.callbacks,result,handle,callback))return result;
+            if(read_ngx_frame_contract(&parameters,reinterpret_cast<std::uintptr_t>(handle),feature.type,frame)) {
+                if (!evaluate_vulkan_backend(cmd,&parameters,frame,current_settings(),route.callbacks,result,handle,callback))
+                    result=route.callbacks.evaluate(cmd,handle,p,callback);
+                if (ngx_succeeded(result)) vulkan_calibration_stamp(cmd,&parameters,frame);
+                return result;
+            }
         }
     }
     return route.callbacks.evaluate(cmd,handle,p,callback);

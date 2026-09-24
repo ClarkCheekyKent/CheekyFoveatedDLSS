@@ -77,7 +77,23 @@ calibration uses OpenVR and suppresses the inner OpenXR capture to avoid mixing
 two frame timelines. An OpenXR gaze runtime can therefore appear alongside an
 OpenVR calibration backend in diagnostics.
 
-This covers the project's D3D11/D3D12 paths, not Vulkan or OpenGL. Unsupported
+Vulkan DLSS sources also support calibration when the VR host transfers them
+into D3D11 OpenXR submissions, as in RDR2 with R.E.A.L. VR. The Vulkan path
+stamps the actual DLSS output after SR/NR (also when foveation is disabled),
+checks GPU pixels before and after stamping, and joins that source proof to
+D3D11 submission readbacks. Separate eyes and shared mono sources use the same
+corner, crop-search, retention and recalibration policy as D3D sources.
+RGBA8 UNORM, RGBA16 float and RGBA32 float outputs are supported.
+
+Vulkan proof resources belong to command recordings. The application must
+reset or free each recording before its proof is consumed: GPU completion alone
+does not prevent another submission of the same command buffer from rewriting
+its readback. Reset/free snapshots completed proof without waiting; unsubmitted
+recordings are rejected. Up to 128 recordings are retained, with no overwriting
+of executable commands. Full Vulkan source screenshots are currently unavailable
+in support ZIPs; D3D11 submitted-eye images remain available.
+
+Native Vulkan OpenXR/OpenVR submissions and OpenGL remain unsupported. Unsupported
 formats, multisampled images, non-stereo/ambiguous game projection layers, missing
 markers, or unrecognized submission flags do not force an eye assignment.
 D3D11 source stamping and readback stay on the original render thread.

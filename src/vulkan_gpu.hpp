@@ -16,7 +16,7 @@ struct VulkanBuffer {
     VkBuffer buffer{};
     VkDeviceMemory memory{};
     void* mapped{};
-    bool create(const VulkanDeviceApi&, VkDeviceSize);
+    bool create(const VulkanDeviceApi&, VkDeviceSize, VkBufferUsageFlags = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     void destroy(const VulkanDeviceApi&) noexcept;
 };
 struct VulkanCompute {

@@ -1,3 +1,8 @@
+#include "vulkan_calibration.hpp"
+#include "eye_calibration.hpp"
+#include "eye_calibration_pixels.hpp"
+#include <d3d11.h>
+#include <wrl/client.h>
 #include "vulkan_api.hpp"
 #include "vulkan_gpu.hpp"
 #include "vulkan_observer.hpp"
@@ -59,6 +64,98 @@ NgxResult evaluate(VkCommandBuffer cmd,const NgxHandle* handle,const NgxParamete
     load<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(cmd,image.image,VK_IMAGE_LAYOUT_GENERAL,&color,1,&image.range);
     if(nr)++nr_evaluations;else {++evaluations;if(peripheral)++peripheral_evaluations;}return 1;
 }
+void calibration_test(VkCommandBuffer cmd,VkQueue queue,PFN_vkGetDeviceProcAddr observed,
+    VkFormat format,bool mono,bool cropped) {
+    using Microsoft::WRL::ComPtr;
+    constexpr unsigned size=512;
+    const unsigned submitted_size=cropped?384:size,offset=cropped?64:0;
+    const auto saved=configured_settings();
+    auto settings=saved;settings.eye_calibration_method=cropped?EyeCalibrationMethod::full:EyeCalibrationMethod::standard;
+    settings.eye_calibration_continuous=!cropped;update_settings(settings);
+    set_eye_calibration_learning(0,0,0);
+    eye_calibration_stop();eye_calibration_reset_stats();eye_calibration_enable(true);
+    register_stereo_view(8901);if (!mono) register_stereo_view(8902);
+    ComPtr<ID3D11Device> device11;ComPtr<ID3D11DeviceContext> context11;
+    require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,
+        &device11,nullptr,&context11)),"calibration submission device");
+    std::array<ComPtr<ID3D11Texture2D>,2> submitted;
+    D3D11_TEXTURE2D_DESC td{};td.Width=td.Height=submitted_size;td.MipLevels=td.ArraySize=1;
+    td.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;td.SampleDesc.Count=1;td.Usage=D3D11_USAGE_DEFAULT;
+    for (auto& texture:submitted) require(SUCCEEDED(device11->CreateTexture2D(&td,nullptr,&texture)),"submission texture");
+    VulkanImage source;require(source.create(api,size,size,format),"calibration source");
+    const auto dxformat=format==VK_FORMAT_R16G16B16A16_SFLOAT?DXGI_FORMAT_R16G16B16A16_FLOAT:
+        format==VK_FORMAT_R8G8B8A8_UNORM?DXGI_FORMAT_R8G8B8A8_UNORM:DXGI_FORMAT_R32G32B32A32_FLOAT;
+    const unsigned bytes=calibration_pixel_bytes(dxformat);
+    VulkanBuffer readback;require(readback.create(api,size*size*bytes,VK_BUFFER_USAGE_TRANSFER_DST_BIT),"calibration transfer");
+    MockNgxParameters parameters;parameters.Set("Output",static_cast<void*>(&source.ngx));
+    DlssFrameContract contract{};contract.output_width=contract.output_height=size;
+    std::vector<CalibrationPixel> pixels(submitted_size*submitted_size);
+    bool blank=true;
+    const auto render=[&](unsigned candidate,bool execute=true) {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        require(reinterpret_cast<PFN_vkBeginCommandBuffer>(observed(api.device,"vkBeginCommandBuffer"))(cmd,&begin)==VK_SUCCESS,"begin calibration");
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.image=source.ngx.resource.image.image;barrier.subresourceRange=source.ngx.resource.image.range;
+        barrier.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;barrier.newLayout=VK_IMAGE_LAYOUT_GENERAL;
+        barrier.dstAccessMask=VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT;
+        barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+        reinterpret_cast<PFN_vkCmdPipelineBarrier>(observed(api.device,"vkCmdPipelineBarrier"))(cmd,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+        const VkClearColorValue gray{{.2F,.2F,.2F,1}};
+        load<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(cmd,barrier.image,VK_IMAGE_LAYOUT_GENERAL,&gray,1,&barrier.subresourceRange);
+        contract.view_id=8901+candidate;
+        vulkan_calibration_stamp(cmd,&parameters,contract);
+        vulkan_barrier(api,cmd,source.ngx.resource.image,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageExtent={size,size,1};
+        load<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(cmd,barrier.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,readback.buffer,1,&copy);
+        require(load<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(cmd)==VK_SUCCESS,"end calibration");
+        if (execute) {
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.commandBufferCount=1;submit.pCommandBuffers=&cmd;
+            require(reinterpret_cast<PFN_vkQueueSubmit>(observed(api.device,"vkQueueSubmit"))(queue,1,&submit,VK_NULL_HANDLE)==VK_SUCCESS,"submit calibration");
+            require(load<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(queue)==VK_SUCCESS,"calibration transfer completion");
+        }
+        require(reinterpret_cast<PFN_vkResetCommandBuffer>(observed(api.device,"vkResetCommandBuffer"))(cmd,0)==VK_SUCCESS,"retire calibration recording");
+        if (!execute) return;
+        const auto* data=static_cast<const unsigned char*>(readback.mapped);
+        for (unsigned y=0;y<submitted_size;++y) for (unsigned x=0;x<submitted_size;++x)
+            pixels[y*submitted_size+x]=blank?CalibrationPixel{.2F,.2F,.2F,1}:
+                calibration_decode(data+((y+offset)*size+x+offset)*bytes,dxformat);
+        context11->UpdateSubresource(submitted[mono?0:1-candidate].Get(),0,nullptr,pixels.data(),submitted_size*16,0);
+        if (mono) context11->UpdateSubresource(submitted[1].Get(),0,nullptr,pixels.data(),submitted_size*16,0);
+    };
+    const auto tick=[&] {
+        eye_calibration_frame(EyeCalibrationBackend::openxr,8900,11);
+        render(0);if (!mono) render(1);
+        for (unsigned eye=0;eye<2;++eye) eye_calibration_result(eye_calibration_submit(submitted[eye].Get(),eye,0,0,1,1,0,
+            EyeCalibrationBackend::openxr,8900),0,eye);
+        context11->Flush();eye_calibration_tick();Sleep(5);
+    };
+    for (unsigned n=0;n<12;++n) tick();
+    require(!eye_calibration_stats().valid,"absent submitted markers must never map Vulkan eyes");
+    blank=false;eye_calibration_recalibrate();
+    for (unsigned n=0;n<180 && !eye_calibration_stats().valid;++n) tick();
+    auto stats=eye_calibration_stats();
+    if (!stats.valid) std::puts(eye_calibration_json().c_str());
+    require(stats.valid && stats.source_graphics_api==13 && stats.submission_graphics_api==11,"Vulkan source must join D3D11 submissions");
+    require(stats.left_view==(mono?8901:8902) && stats.right_view==8901,"physical eye mapping from Vulkan marker pixels");
+    if (cropped) {
+        require(stats.crop_mapping_active,"Vulkan locator grid must recover cropped submissions");
+        const auto captures=eye_calibration_stats().captures;
+        for (unsigned n=0;n<12;++n) tick();
+        require(eye_calibration_stats().captures==captures,"retained Vulkan calibration stops capture");
+        require(std::abs(pixels[20*submitted_size+20].r-.2F)<.01F,"retained source must remain unstamped");
+    }
+    // A recording which was reset without submission must not provide source proof.
+    eye_calibration_recalibrate();
+    eye_calibration_frame(EyeCalibrationBackend::openxr,8900,11);render(0,false);if (!mono) render(1,false);
+    for (unsigned n=0;n<5;++n) eye_calibration_frame(EyeCalibrationBackend::openxr,8900,11);
+    require(!stereo_eye_assignment(8901).calibrated,"unsubmitted recording cannot establish calibration");
+    eye_calibration_stop();vulkan_calibration_forget_command(cmd);
+    source.destroy(api);readback.destroy(api);
+    unregister_stereo_view(8901);if (!mono) unregister_stereo_view(8902);update_settings(saved);
+    std::printf("PASS Vulkan calibration format=%u mono=%u crop=%u: GPU source proof, missing markers, eye mapping, retirement\n",format,mono,cropped);
+}
+
 }
 int run_vulkan_tests(bool real, bool integration) {
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
@@ -266,6 +363,11 @@ int run_vulkan_tests(bool real, bool integration) {
             vulkan_release_view(456);
             reinterpret_cast<PFN_vkFreeCommandBuffers>(observed(device,"vkFreeCommandBuffers"))(device,pool,static_cast<unsigned>(rotation.size()),rotation.data());
             std::puts("PASS mono view: border present across 32 frames using 16 command buffers; history reset after bypass");
+        }
+        if (!real) {
+            calibration_test(cmd,queue,observed,VK_FORMAT_R32G32B32A32_SFLOAT,false,false);
+            calibration_test(cmd,queue,observed,VK_FORMAT_R16G16B16A16_SFLOAT,true,false);
+            calibration_test(cmd,queue,observed,VK_FORMAT_R8G8B8A8_UNORM,false,true);
         }
         std::puts("Test releasing game feature");
         if(integrated_feature)real_sr.release(integrated_feature);

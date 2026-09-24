@@ -1,3 +1,4 @@
+#include "vulkan_calibration.hpp"
 #include "vulkan_observer.hpp"
 #include "../third_party/vulkan/include/vulkan/vk_layer.h"
 #include "runtime.hpp"
@@ -128,6 +129,7 @@ bool vulkan_image_layout(VkCommandBuffer cmd,const VulkanImageInfo& image,VkImag
     return false;
 }
 void vulkan_forget_command(VkCommandBuffer cmd) noexcept {
+    vulkan_calibration_forget_command(cmd);
     vulkan_backend_forget_command(cmd);
     reset_gaze_copies(reinterpret_cast<std::uint64_t>(cmd));
     std::lock_guard lock(registry_mutex); const auto it=commands.find(cmd);if(it!=commands.end()) {it->second.layouts.clear();it->second.copies.clear();}
@@ -213,6 +215,7 @@ VKAPI_ATTR VkResult VKAPI_CALL layer_create_device(VkPhysicalDevice physical,con
 VKAPI_ATTR void VKAPI_CALL layer_destroy_device(VkDevice device,const VkAllocationCallbacks* alloc) {
     const auto a=device_api(device);if(!a) return;
     destroy_overlay(device,VK_NULL_HANDLE);
+    vulkan_calibration_release_device(device);
     vulkan_backend_release_device(device);
     proc<PFN_vkDestroyDevice>(*a,"vkDestroyDevice")(device,alloc);
     std::lock_guard lock(registry_mutex);devices.erase(device);
