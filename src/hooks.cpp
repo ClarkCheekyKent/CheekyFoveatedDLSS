@@ -4941,7 +4941,6 @@ NgxResult process_d3d12_evaluation_impl(
             get_ui(call.parameters, "DLSS.Output.Subrect.Base.X"), get_ui(call.parameters, "DLSS.Output.Subrect.Base.Y"));
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
-        if (d3d12_game_feature(call.handle) != 1U) settings.enabled = false;
     }
     NrPipelineTimingScope pipeline_timing{call.command_list, settings};
     NativeNrInputScope nr_input{call.command_list, call.handle, call.parameters, settings};
@@ -5124,7 +5123,6 @@ NgxResult evaluate_d3d12_c_impl(
             get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"));
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
-        if (d3d12_game_feature(handle) != 1U) settings.enabled = false;
     }
     NrPipelineTimingScope pipeline_timing{command_list, settings};
     NativeNrInputScope nr_input{command_list, handle, parameters, settings};
