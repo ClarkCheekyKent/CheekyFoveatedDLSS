@@ -6,6 +6,8 @@ and DX12-to-DX11/OpenXR. It reads source pixels to verify all markers stop after
 acquisition, waits beyond the crop timeout, and checks manual reacquisition,
 same-view eye swaps, source dimensions, submission bounds, recreated/new views,
 session changes, diagnostic resets, and resuming continuous validation.
+Native DX12 manual reacquisition switches to alternating source-eye renders while
+submitting both eyes each interval, covering recalibration after AFW starts.
 
 `CheekyTests.exe --crop-calibration` exercises the production DX11, DX12 and
 DX12-to-DX11 stamp/read paths on WARP. It checks centered and edge-aligned crops,

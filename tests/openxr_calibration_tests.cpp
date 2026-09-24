@@ -1687,6 +1687,8 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
     unsigned source_width = size;
     float right_bound = 1;
     bool swapped = false;
+    bool alternating_sources = false;
+    unsigned rendered_eye = 0;
     const auto native_state = backend == EyeCalibrationBackend::openxr ?
         D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     auto frame = [&](bool expect_clean = false) {
@@ -1694,6 +1696,11 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
         for (unsigned c = 0; c < 2; ++c) {
             if (source12) {
                 gpu.begin();
+                if (alternating_sources && c != rendered_eye) {
+                    gpu.barrier(textures12[c].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, native_state);
+                    gpu.execute(); gpu.wait(gpu.queue.Get());
+                    continue;
+                }
                 D3D12_TEXTURE_COPY_LOCATION texture{}, linear{};
                 texture.pResource = textures12[c].Get(); texture.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 linear.pResource = upload.Get(); linear.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -1740,6 +1747,7 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
             gpu.execute(); gpu.wait(gpu.queue.Get());
         }
         Sleep(2); eye_calibration_tick();
+        rendered_eye = 1 - rendered_eye;
     };
     auto acquire = [&] {
         const auto deadline = GetTickCount64() + 10000;
@@ -1763,8 +1771,12 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
     require(eye_calibration_stats().captures == 0, "Counter reset must preserve retained calibration");
     eye_calibration_recalibrate();
     require(!stereo_eye_assignment(views[0]).calibrated, "Manual recalibration must invalidate the old pair");
+    // AFW may begin alternating source renders after the initial stereo calibration.
+    // Recalibration must collect the pair while each interval still submits both eyes.
+    alternating_sources = source12 && !submit11;
     acquire();
     require(stereo_eye_assignment(views[0]).eye_index == 1, "Manual recalibration must learn the swapped eyes");
+    alternating_sources = false;
     source_width -= 16; frame();
     require(!eye_calibration_stats().crop_mapping_active, "Source dimension change must invalidate retained alignment");
     acquire();

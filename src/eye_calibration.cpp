@@ -87,7 +87,7 @@ struct Frame {
     std::array<Submitted11, 2> submitted11;
     std::array<View, 2> views;
     std::array<std::uint32_t, 2> codes{};
-    bool pipelined{}, protected_context{};
+    bool pipelined{}, collect_source_pair{}, protected_context{};
     std::array<unsigned, 2> eye_submits{};
     std::array<int, 2> result{{-1, -1}};
     std::array<unsigned, 2> physical_eyes{{0, 1}};
@@ -1420,7 +1420,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         auto& f = s.ring[s.current];
         // AER can submit the previous eye pair between the two DLSS renders.
         // Keep sources across intervals, but never combine submission pairs.
-        if (on && f.pipelined && f.epoch == s.epoch && !f.invalid && !f.submits &&
+        if (on && (f.pipelined || f.collect_source_pair) && f.epoch == s.epoch && !f.invalid && !f.submits &&
             s.sequence - f.sequence < 4 && now - f.captured_ms < 250) {
             ++s.carried_frames;
             poll(s);
@@ -1468,8 +1468,11 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
             continue;
         f.gpu12_used = f.classified = false;
         f.pipelined = backend == EyeCalibrationBackend::openxr && graphics_api == 11;
+        // Native DX12 submissions can also reuse the previous eye under AFW.
+        // Keep both source proofs, without selecting the mixed DX12/DX11 readback path.
+        f.collect_source_pair = graphics_api == 12;
         f.protected_context = false;
-        f.codes = f.pipelined ? capture_codes(s.epoch) :
+        f.codes = (f.pipelined || f.collect_source_pair) ? capture_codes(s.epoch) :
             std::array<std::uint32_t, 2>{};
         f.sequence = s.sequence;
         f.support = claim_calibration_images(f.sequence, session_generation, f.codes);
@@ -1659,6 +1662,12 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         auto& f = s.ring[s.current];
         unsigned c = f.evaluations;
         bool repeated{};
+        if (f.collect_source_pair) {
+            if (f.submits || f.invalid || f.epoch != s.epoch) return;
+            for (unsigned i = 0; i < 2; ++i) {
+                if (f.views[i].id == view) { c = i; repeated = true; break; }
+            }
+        }
         if (f.pipelined) {
             if (f.submits || f.invalid || f.epoch != s.epoch) return;
             c = continuous_c;
@@ -1750,6 +1759,10 @@ std::uint64_t eye_calibration_submit12(ID3D12Resource* texture, ID3D12CommandQue
     if (s.current < 0 || s.ring[s.current].epoch != s.epoch || retaining_calibration(s)) return 0;
     auto& f = s.ring[s.current];
     s.stats.submission_graphics_api = 12;
+    if (f.collect_source_pair && f.evaluations < 2) {
+        ++s.waiting_for_sources;
+        return 0;
+    }
     ++f.submits;
     ++f.eye_submits[eye];
     if (!f.gpu12_used || f.submits > 2 || f.eye_submits[eye] > 1) {
