@@ -1,6 +1,7 @@
 #include "depth_formats.hpp"
 #include "peripheral_dlaa.hpp"
 #include "peripheral_shaders.hpp"
+#include "d3d_shaders.hpp"
 #include "motion_region.hpp"
 #include "rr_contract.hpp"
 
@@ -236,63 +237,32 @@ void release_state(PeripheralViewState& state) noexcept {
     release(serialized);
     if (FAILED(result)) return false;
 
-    const auto compile_pipeline = [&](
-        const char* const source,
-        const std::size_t source_size,
-        const char* const label,
+    const auto create_pipeline = [&](
+        const d3d_shaders::ShaderBytecode bytecode,
         ID3D12PipelineState** const pipeline
     ) noexcept {
-        ID3DBlob* bytecode{};
-        ID3DBlob* compile_errors{};
-        auto compile_result = D3DCompile(
-            source,
-            source_size,
-            label,
-            nullptr,
-            nullptr,
-            "Main",
-            "cs_5_1",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3,
-            0U,
-            &bytecode,
-            &compile_errors
-        );
-        release(compile_errors);
-        if (FAILED(compile_result) || bytecode == nullptr) {
-            release(bytecode);
-            return false;
-        }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc{};
         pipeline_desc.pRootSignature = state.converter_root;
-        pipeline_desc.CS.pShaderBytecode = bytecode->GetBufferPointer();
-        pipeline_desc.CS.BytecodeLength = bytecode->GetBufferSize();
-        compile_result = state.device->CreateComputePipelineState(
+        pipeline_desc.CS = {bytecode.data, bytecode.size};
+        const auto result = state.device->CreateComputePipelineState(
             &pipeline_desc,
             IID_PPV_ARGS(pipeline)
         );
-        release(bytecode);
-        return SUCCEEDED(compile_result);
+        return SUCCEEDED(result);
     };
 
-    return compile_pipeline(
-            motion_convert_shader_source,
-            sizeof(motion_convert_shader_source) - 1U,
-            "Cheeky peripheral MV point conversion",
+    return create_pipeline(
+            d3d_shaders::peripheral12_motion,
             &state.converter_pipeline
         ) &&
-        compile_pipeline(
-            color_downsample_shader_source,
-            sizeof(color_downsample_shader_source) - 1U,
-            "Cheeky peripheral color bilinear downsample",
+        create_pipeline(
+            d3d_shaders::peripheral12_color,
             &state.color_pipeline
         ) &&
-        compile_pipeline(
-            depth_downsample_shader_source,
-            sizeof(depth_downsample_shader_source) - 1U,
-            "Cheeky peripheral depth point downsample",
+        create_pipeline(
+            d3d_shaders::peripheral12_depth,
             &state.depth_pipeline
-        ) && compile_pipeline(rr_guide_downsample_shader_source,
-            sizeof(rr_guide_downsample_shader_source)-1, "Cheeky RR guide point downsample", &state.rr_pipeline);
+        ) && create_pipeline(d3d_shaders::peripheral12_rr, &state.rr_pipeline);
 }
 
 [[nodiscard]] DXGI_FORMAT typed_resource_format(

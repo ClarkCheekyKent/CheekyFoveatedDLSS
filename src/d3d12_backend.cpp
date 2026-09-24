@@ -1,7 +1,7 @@
 #include "backend.hpp"
 #include "rr_contract.hpp"
 #include "d3d12_output_contract.hpp"
-#include "d3d12_composite_shader.hpp"
+#include "d3d_shaders.hpp"
 #include "composite_constants.hpp"
 #include "debug_exposure.hpp"
 #include "diagnostics.hpp"
@@ -73,7 +73,6 @@ enum class D3D12PrepareProbe : std::size_t {
     descriptor_heap,
     serialize_root_signature,
     create_root_signature,
-    compile_shader,
     create_pipeline,
     resources_unavailable,
     evaluation_allocation,
@@ -508,51 +507,14 @@ void release_resources(D3D12Resources* const resources) noexcept {
         return nullptr;
     }
 
-    ID3DBlob* shader{};
-    ID3DBlob* shader_errors{};
-    result = D3DCompile(
-        composite_shader_source,
-        sizeof(composite_shader_source) - 1U,
-        "Cheeky Foveated DLSS-SR",
-        nullptr,
-        nullptr,
-        "CompositeMain",
-        "cs_5_1",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0U,
-        &shader,
-        &shader_errors
-    );
-    if (FAILED(result) || shader == nullptr) {
-        if (should_trace_prepare_rejection(
-                D3D12PrepareProbe::compile_shader)) {
-            trace_event(
-                "[DEBUG-D3D12-PREP] reason=compile_shader "
-                "hr=0x%08X shader=%p",
-                static_cast<unsigned>(result), shader
-            );
-            if (shader_errors) trace_event("SHADER_COMPILE SR CompositeMain cs_5_1 error=%.*s",
-                static_cast<int>((std::min)(shader_errors->GetBufferSize(), SIZE_T{2048})),
-                static_cast<const char*>(shader_errors->GetBufferPointer()));
-        }
-        if (shader_errors) shader_errors->Release();
-        if (shader != nullptr) {
-            shader->Release();
-        }
-        release_resources(resources);
-        return nullptr;
-    }
-    if (shader_errors) shader_errors->Release();
-
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_description{};
     pipeline_description.pRootSignature = resources->root_signature;
-    pipeline_description.CS.pShaderBytecode = shader->GetBufferPointer();
-    pipeline_description.CS.BytecodeLength = shader->GetBufferSize();
+    pipeline_description.CS.pShaderBytecode = d3d_shaders::composite12.data;
+    pipeline_description.CS.BytecodeLength = d3d_shaders::composite12.size;
     result = device->CreateComputePipelineState(
         &pipeline_description,
         IID_PPV_ARGS(&resources->composite_pipeline)
     );
-    shader->Release();
     if (FAILED(result)) {
         if (should_trace_prepare_rejection(
                 D3D12PrepareProbe::create_pipeline)) {

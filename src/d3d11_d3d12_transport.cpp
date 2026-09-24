@@ -10,7 +10,7 @@
 #include "runtime.hpp"
 
 #include <d3d11_4.h>
-#include <d3dcompiler.h>
+#include "d3d_shaders.hpp"
 #include "crop_motion.hpp"
 #include <dxgi1_4.h>
 
@@ -557,23 +557,10 @@ void release_device(TransportDevice& device) noexcept {
 }
 
 [[nodiscard]] bool create_depth_converter(TransportDevice& device) noexcept {
-    ID3DBlob* bytecode{};
-    ID3DBlob* errors{};
-    const auto result = D3DCompile(
-        depth_shader_source, sizeof(depth_shader_source) - 1U,
-        "Cheeky crop depth transport", nullptr, nullptr, "Main", "cs_5_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0U, &bytecode, &errors
-    );
-    release(errors);
-    if (FAILED(result)) {
-        release(bytecode);
-        return false;
-    }
     const auto shader_result = device.device11->CreateComputeShader(
-        bytecode->GetBufferPointer(), bytecode->GetBufferSize(), nullptr,
+        d3d_shaders::transport_depth11.data, d3d_shaders::transport_depth11.size, nullptr,
         &device.depth_shader
     );
-    release(bytecode);
     if (FAILED(shader_result)) return false;
 
     D3D11_BUFFER_DESC desc{};

@@ -1,6 +1,7 @@
 #pragma once
 #include "debug_exposure.hpp"
 #include "eye_calibration_pixels.hpp"
+#include "d3d_shaders.hpp"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 namespace cheeky::foveated_dlss {
@@ -43,13 +44,7 @@ cbuffer Params : register(b0) { uint2 Origin; uint Side; uint Code; uint Locator
  if(isfinite(e)&&e>0) white=clamp(Multiplier/e,0.0001,1024.0);
  Output[uint3(Origin+id.xy,0)]=float4(light?white.xxx:0.0.xxx,1.0);
 })";
-            static const auto code = [] {
-                Microsoft::WRL::ComPtr<ID3DBlob> result;
-                D3DCompile(source,sizeof(source)-1,nullptr,nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&result,nullptr);
-                return result;
-            }();
-            if (!code) return false;
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={d3d_shaders::debug_marker12.data,d3d_shaders::debug_marker12.size};
             if(FAILED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pipeline)))) return false;
             allocations+=2;
         }

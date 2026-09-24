@@ -1,5 +1,5 @@
 #pragma once
-#include "nr_shader_cache.hpp"
+#include "d3d_shaders.hpp"
 #include "nr_guide_shader.hpp"
 #include <initializer_list>
 #include <cstdio>
@@ -59,11 +59,10 @@ struct NrGuidePass {
         D3D12_ROOT_PARAMETER params[2]{}; params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; params[0].DescriptorTable={2,ranges};
         params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; params[1].Constants={0,0,sizeof(NrGuideConstants)/4};
         D3D12_ROOT_SIGNATURE_DESC rd{}; rd.NumParameters=2; rd.pParameters=params;
-        Ptr<ID3DBlob> blob,errors,code;
+        Ptr<ID3DBlob> blob,errors;
         if (FAILED(D3D12SerializeRootSignature(&rd,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&errors)) ||
-            FAILED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))) ||
-            FAILED(compile_nr_shader(nr_guide_shader,sizeof(nr_guide_shader),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,&errors))) { if(errors) std::fprintf(stderr,"%s\n",static_cast<const char*>(errors->GetBufferPointer())); return false; }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature=root.Get(); pd.CS={code->GetBufferPointer(),code->GetBufferSize()};
+            FAILED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)))) { if(errors) std::fprintf(stderr,"%s\n",static_cast<const char*>(errors->GetBufferPointer())); return false; }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{}; pd.pRootSignature=root.Get(); pd.CS={d3d_shaders::nr_guides.data,d3d_shaders::nr_guides.size};
         return SUCCEEDED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pipeline)));
     }
     // Caller must prove all recordings using this heap have completed.

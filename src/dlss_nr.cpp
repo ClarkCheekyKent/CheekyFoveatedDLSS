@@ -3,6 +3,7 @@
 #include "eye_calibration_d3d12.hpp"
 #include "dlss_nr.hpp"
 #include "nr_codec_shader.hpp"
+#include "d3d_shaders.hpp"
 #include "nr_parameters.hpp"
 #include "nr_runtime_module.hpp"
 
@@ -535,17 +536,11 @@ void evict_retired_features(ViewState& view) noexcept {
     const GpuResources* shared = nullptr
 ) noexcept {
     ID3D12Device* device{};
-    ID3DBlob* encoded{};
-    ID3DBlob* decoded{};
-    ID3DBlob* shader_errors{};
     ID3DBlob* serialized{};
     ID3DBlob* signature_errors{};
     const auto cleanup = [&]() noexcept {
         release(signature_errors);
         release(serialized);
-        release(shader_errors);
-        release(decoded);
-        release(encoded);
         release(device);
     };
     auto fail = [&](const char* const stage, const HRESULT result) noexcept {
@@ -719,54 +714,20 @@ void evict_retired_features(ViewState& view) noexcept {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature = gpu.root_signature;
     if (!gpu.border_only) {
-        result = compile_nr_shader(
-            nr_codec_shader,
-            sizeof(nr_codec_shader) - 1U,
-            "Cheeky DLSS-NR codec",
-            nullptr,
-            nullptr,
-            "EncodeMain",
-            "cs_5_1",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3,
-            0U,
-            &encoded,
-            &shader_errors
-        );
-        if (FAILED(result)) return fail("D3DCompile(encode)", result);
-        pipeline.CS = {encoded->GetBufferPointer(), encoded->GetBufferSize()};
+        pipeline.CS = {d3d_shaders::nr_encode.data, d3d_shaders::nr_encode.size};
         result = device->CreateComputePipelineState(
             &pipeline,
             IID_PPV_ARGS(&gpu.encode_pipeline)
         );
         if (FAILED(result)) return fail("CreateComputePipelineState(encode)", result);
-        release(shader_errors);
-        result = compile_nr_shader(
-            nr_codec_shader,
-            sizeof(nr_codec_shader) - 1U,
-            "Cheeky DLSS-NR codec",
-            nullptr,
-            nullptr,
-            "DecodeMain",
-            "cs_5_1",
-            D3DCOMPILE_OPTIMIZATION_LEVEL3,
-            0U,
-            &decoded,
-            &shader_errors
-        );
-        if (FAILED(result)) return fail("D3DCompile(decode)", result);
-        pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
+        pipeline.CS = {d3d_shaders::nr_decode.data, d3d_shaders::nr_decode.size};
         result = device->CreateComputePipelineState(
             &pipeline,
             IID_PPV_ARGS(&gpu.decode_pipeline)
         );
         if (FAILED(result)) return fail("CreateComputePipelineState(decode)", result);
-        release(decoded);
-        release(shader_errors);
     }
-    result = compile_nr_shader(nr_codec_shader, sizeof(nr_codec_shader), nullptr, nullptr, nullptr,
-        "BorderMain", "cs_5_0", 0U, 0U, &decoded, &shader_errors);
-    if (FAILED(result)) return fail("D3DCompile(border)", result);
-    pipeline.CS = {decoded->GetBufferPointer(), decoded->GetBufferSize()};
+    pipeline.CS = {d3d_shaders::nr_border.data, d3d_shaders::nr_border.size};
     result = device->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&gpu.border_pipeline));
     if (FAILED(result)) return fail("CreateComputePipelineState(border)", result);
     cleanup();

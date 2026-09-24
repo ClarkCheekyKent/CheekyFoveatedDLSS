@@ -5,7 +5,7 @@
 #include "peripheral_dlaa.hpp"
 #include "d3d11_write_bindings.hpp"
 
-#include <d3dcompiler.h>
+#include "d3d_shaders.hpp"
 
 #include <algorithm>
 #include <array>
@@ -374,41 +374,18 @@ void release_state(ViewState& state) noexcept {
     state = {};
 }
 
-[[nodiscard]] bool compile_shader(
+[[nodiscard]] bool create_shader(
     ID3D11Device* const device,
-    const char* const source,
-    const std::size_t source_size,
-    const char* const label,
+    const d3d_shaders::ShaderBytecode bytecode,
     ID3D11ComputeShader** const shader
 ) noexcept {
-    if (device == nullptr || source == nullptr || shader == nullptr) return false;
-    ID3DBlob* bytecode{};
-    ID3DBlob* errors{};
-    auto result = D3DCompile(
-        source,
-        source_size,
-        label,
-        nullptr,
-        nullptr,
-        "Main",
-        "cs_5_0",
-        D3DCOMPILE_OPTIMIZATION_LEVEL3,
-        0U,
-        &bytecode,
-        &errors
-    );
-    release(errors);
-    if (FAILED(result) || bytecode == nullptr) {
-        release(bytecode);
-        return false;
-    }
-    result = device->CreateComputeShader(
-        bytecode->GetBufferPointer(),
-        bytecode->GetBufferSize(),
+    if (device == nullptr || shader == nullptr) return false;
+    const auto result = device->CreateComputeShader(
+        bytecode.data,
+        bytecode.size,
         nullptr,
         shader
     );
-    release(bytecode);
     return SUCCEEDED(result);
 }
 
@@ -527,25 +504,19 @@ void release_state(ViewState& state) noexcept {
         );
 
     bool shaders_ready = resources_ready &&
-        compile_shader(
+        create_shader(
             device,
-            color_downsample_shader_source,
-            sizeof(color_downsample_shader_source) - 1U,
-            "Cheeky peripheral DX11 color",
+            d3d_shaders::peripheral11_color,
             &created.color_shader
         ) &&
-        compile_shader(
+        create_shader(
             device,
-            depth_downsample_shader_source,
-            sizeof(depth_downsample_shader_source) - 1U,
-            "Cheeky peripheral DX11 depth",
+            d3d_shaders::peripheral11_depth,
             &created.depth_shader
         ) &&
-        compile_shader(
+        create_shader(
             device,
-            motion_downsample_shader_source,
-            sizeof(motion_downsample_shader_source) - 1U,
-            "Cheeky peripheral DX11 motion",
+            d3d_shaders::peripheral11_motion,
             &created.motion_shader
         );
 

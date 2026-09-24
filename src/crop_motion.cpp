@@ -1,5 +1,5 @@
 #include "crop_motion.hpp"
-#include "crop_motion_shader.hpp"
+#include "d3d_shaders.hpp"
 #include "runtime.hpp"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -31,16 +31,7 @@ DXGI_FORMAT srv_format(DXGI_FORMAT format) noexcept {
 bool bounds(unsigned base, unsigned extent, UINT64 size) noexcept {
     return extent != 0 && base <= size && extent <= size - base;
 }
-ComPtr<ID3DBlob> shader_bytecode() noexcept {
-    static const ComPtr<ID3DBlob> code = [] {
-        ComPtr<ID3DBlob> blob, errors;
-        D3DCompile(crop_motion_shader_source, sizeof(crop_motion_shader_source) - 1, "crop_motion",
-            nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
-            0, &blob, &errors);
-        return blob;
-    }();
-    return code;
-}
+constexpr auto shader_bytecode() noexcept { return d3d_shaders::crop_motion; }
 }
 
 struct CropMotion11 {
@@ -106,9 +97,9 @@ std::shared_ptr<CropMotion11> create_crop_motion11(ID3D11DeviceContext* context,
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     const auto code = shader_bytecode();
-    if (!code || FAILED(device->CreateTexture2D(&desc, nullptr, &pass->output)) ||
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, &pass->output)) ||
         FAILED(device->CreateUnorderedAccessView(pass->output.Get(), nullptr, &pass->uav)) ||
-        FAILED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
+        FAILED(device->CreateComputeShader(code.data, code.size,
             nullptr, &pass->shader))) return {};
     D3D11_BUFFER_DESC bd{};
     bd.ByteWidth = sizeof(data); bd.Usage = D3D11_USAGE_DEFAULT;
@@ -235,12 +226,12 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
     rd.NumParameters = 2; rd.pParameters = params;
     ComPtr<ID3DBlob> root_blob, errors;
     const auto code = shader_bytecode();
-    if (!code || FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
         &root_blob, &errors)) || FAILED(device->CreateRootSignature(0,
             root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&pass->root)))) return {};
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = pass->root.Get();
-    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    pd.CS = {code.data, code.size};
     if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pass->pipeline)))) return {};
     return pass;
 }

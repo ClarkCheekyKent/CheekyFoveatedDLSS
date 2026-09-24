@@ -20,6 +20,16 @@ the x64 MASM tools included with the Visual C++ workload.
 Use `./scripts/build.ps1 -Configuration Release -SkipTests` to build without
 running the tests (test executables are still compiled).
 
+Direct3D shaders are checked in as bytecode in `src/d3d_shaders.hpp`, so normal
+builds do not require `fxc.exe` or compile shaders when a game runs. After
+editing their HLSL sources, regenerate the header with the Windows SDK compiler:
+
+```powershell
+python scripts/build-d3d-shaders.py --fxc 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'
+```
+
+Add `--check` to verify that the checked-in bytecode matches its sources.
+
 ## Tests
 
 The native suites exercise GPU processing, eye calibration, the OpenXR layer, UEVR host lifecycle and late NGX/Streamline attachment using local fixtures. They do not launch games or evaluate NVIDIA DLSS.
