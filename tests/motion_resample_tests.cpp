@@ -1,6 +1,7 @@
 #include "crop_motion.hpp"
 #include "nr_guides.hpp"
 #include <d3d11.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <array>
@@ -204,6 +205,90 @@ void run12() {
     }
     release_crop_motion12();
 }
+
+void run_depth_crop12() {
+    ComPtr<ID3D12Debug> debug;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
+    ComPtr<IDXGIFactory4> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+    ComPtr<IDXGIAdapter> adapter; check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)));
+    ComPtr<ID3D12Device> device; check(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+    ComPtr<ID3D12InfoQueue> messages; device.As(&messages);
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC q{}; check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
+    D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width=width; desc.Height=height; desc.DepthOrArraySize=desc.MipLevels=1; desc.SampleDesc.Count=1;
+    desc.Format=DXGI_FORMAT_R32_TYPELESS; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_CLEAR_VALUE clear{}; clear.Format=DXGI_FORMAT_D32_FLOAT;
+    ComPtr<ID3D12Resource> source;
+    check(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,&clear,IID_PPV_ARGS(&source)));
+    ComPtr<ID3D12DescriptorHeap> dsv;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors=1;
+    check(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&dsv)));
+    D3D12_DEPTH_STENCIL_VIEW_DESC vd{}; vd.Format=DXGI_FORMAT_D32_FLOAT; vd.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
+    device->CreateDepthStencilView(source.Get(),&vd,dsv->GetCPUDescriptorHandleForHeapStart());
+    // Reuse the same source/output sizes with a moving crop, including the edge.
+    for (unsigned iteration=0;iteration<3;++iteration) {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)));
+        ComPtr<ID3D12GraphicsCommandList> list;
+        check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)));
+        const auto barrier=[&](ID3D12Resource* resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
+            D3D12_RESOURCE_BARRIER b{}; b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after}; list->ResourceBarrier(1,&b);
+        };
+        if(iteration==0) {
+            for(unsigned y=0;y<height;++y) for(unsigned x=0;x<width;++x) {
+                const D3D12_RECT rect{LONG(x),LONG(y),LONG(x+1),LONG(y+1)};
+                list->ClearDepthStencilView(dsv->GetCPUDescriptorHandleForHeapStart(),D3D12_CLEAR_FLAG_DEPTH,
+                    float(y*width+x)/128.0F,0,1,&rect);
+            }
+            barrier(source.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        const unsigned bx=iteration*2,by=iteration;
+        auto* output=prepare_crop_texture12(list.Get(),source.Get(),bx,by,crop_width,crop_height);
+        require(output!=nullptr,"RR depth-stencil crop was rejected");
+        require(output->GetDesc().Format==DXGI_FORMAT_R32_FLOAT,"RR depth crop must use scalar float output");
+        require(!prepare_crop_texture12(list.Get(),source.Get(),width-1,0,crop_width,crop_height),
+            "RR out-of-bounds depth crop accepted");
+        const auto od=output->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}; UINT64 bytes{};
+        device->GetCopyableFootprints(&od,0,1,0,&fp,nullptr,nullptr,&bytes);
+        auto readback=buffer(device.Get(),bytes,D3D12_HEAP_TYPE_READBACK);
+        barrier(output,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};
+        from.pResource=output; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint=fp;
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        barrier(output,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        check(list->Close());
+        ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1,lists);
+        crop_motion12_submitted(queue.Get(),1,lists); collect_crop_motion12();
+        ComPtr<ID3D12Fence> fence; check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
+        check(queue->Signal(fence.Get(),1));
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr); require(event!=nullptr,"depth test event failed");
+        check(fence->SetEventOnCompletion(1,event));
+        const auto waited=WaitForSingleObject(event,10000); CloseHandle(event);
+        require(waited==WAIT_OBJECT_0,"depth crop GPU test timed out");
+        unsigned char* mapped{}; check(readback->Map(0,nullptr,reinterpret_cast<void**>(&mapped)));
+        for(unsigned y=0;y<crop_height;++y) for(unsigned x=0;x<crop_width;++x) {
+            const auto actual=reinterpret_cast<const float*>(mapped+fp.Offset+y*fp.Footprint.RowPitch)[x];
+            require(actual==float((by+y)*width+bx+x)/128.0F,"RR depth crop coordinates or values changed");
+        }
+        readback->Unmap(0,nullptr); collect_crop_motion12();
+    }
+    if(messages) for(UINT64 i=0;i<messages->GetNumStoredMessages();++i) {
+        SIZE_T bytes{}; messages->GetMessage(i,nullptr,&bytes);
+        std::vector<unsigned char> storage(bytes); auto* message=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        check(messages->GetMessage(i,message,&bytes));
+        if(message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR) {
+            std::cerr<<message->pDescription<<'\n'; throw std::runtime_error("depth crop D3D12 validation error");
+        }
+    }
+    release_crop_motion12();
+    std::cout<<"RR depth-stencil crop passed: raw depth, moving offsets, bounds, reuse"<<(debug ? " (debug layer enabled)" : "")<<'\n';
+}
 } // namespace
 int run_motion_resample_tests() {
     try {
@@ -216,7 +301,7 @@ int run_motion_resample_tests() {
         cheeky::foveated_dlss::CropMotionOffset offset{};
         require(cheeky::foveated_dlss::crop_motion_offset(previous, current, false, -2, 0.5F, offset) &&
             offset.x == -4 && offset.y == -8, "output-grid crop correction must use output-pixel units");
-        run11(); run12();
+        run_depth_crop12(); run11(); run12();
         std::cout << "DX11/DX12 motion resampling passed: scales, boundaries, gaze offsets, invalid vectors\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

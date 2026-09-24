@@ -22,4 +22,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         ? mv : (mv + Offset) * float2(Size) / float2(SourceSize);
 }
 )";
+// Depth must be loaded without filtering, linearization or motion scaling.
+inline constexpr char crop_depth_shader_source[] = R"(
+Texture2DArray<float> Source : register(t0);
+RWTexture2D<float> Destination : register(u0);
+cbuffer Constants : register(b0) {
+    uint2 Base; uint2 Size;
+    float2 Offset; uint2 SourceSize;
+};
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= Size)) return;
+    Destination[id.xy] = Source.Load(int4(Base + id.xy, 0, 0));
+}
+)";
 } // namespace cheeky::foveated_dlss

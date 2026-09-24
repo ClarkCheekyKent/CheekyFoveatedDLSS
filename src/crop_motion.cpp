@@ -4,6 +4,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
+#include <atomic>
 #include <deque>
 #include <mutex>
 
@@ -154,7 +155,7 @@ struct Pass12 {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
     unsigned width{}, height{};
-    bool copy_only{};
+    bool copy_only{}, depth_crop{};
     std::uint64_t list_token{};
 };
 std::mutex mutex12;
@@ -182,16 +183,17 @@ void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     list->ResourceBarrier(1, &barrier);
 }
 std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source,
-    unsigned width, unsigned height, DXGI_FORMAT format) noexcept {
+    unsigned width, unsigned height, DXGI_FORMAT format, bool depth_crop = false) noexcept {
     auto pass = std::make_shared<Pass12>();
     pass->device = device; pass->source = source;
     pass->width = width; pass->height = height;
+    pass->depth_crop = depth_crop;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width; desc.Height = height;
     desc.DepthOrArraySize = desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
-    desc.Format = DXGI_FORMAT_R32G32_FLOAT;
+    desc.Format = depth_crop ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R32G32_FLOAT;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -225,7 +227,7 @@ std::shared_ptr<Pass12> make_pass12(ID3D12Device* device, ID3D12Resource* source
     D3D12_ROOT_SIGNATURE_DESC rd{};
     rd.NumParameters = 2; rd.pParameters = params;
     ComPtr<ID3DBlob> root_blob, errors;
-    const auto code = shader_bytecode();
+    const auto code = depth_crop ? d3d_shaders::crop_depth : shader_bytecode();
     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1,
         &root_blob, &errors)) || FAILED(device->CreateRootSignature(0,
             root_blob->GetBufferPointer(), root_blob->GetBufferSize(), IID_PPV_ARGS(&pass->root)))) return {};
@@ -255,7 +257,7 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     std::lock_guard lock(mutex12);
     std::shared_ptr<Pass12> pass;
     for (auto it = available12.begin(); it != available12.end(); ++it) {
-        if (!(*it)->copy_only && (*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
+        if (!(*it)->copy_only && !(*it)->depth_crop && (*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
             pass = *it; available12.erase(it); break;
         }
     }
@@ -298,18 +300,57 @@ ID3D12Resource* prepare_crop_texture12(ID3D12GraphicsCommandList* list, ID3D12Re
     unsigned x, unsigned y, unsigned width, unsigned height) noexcept {
     if (!list || !source || !width || !height) return nullptr;
     auto desc = source->GetDesc();
+    const auto source_desc = desc;
+    const auto failed = [&](const char* reason, HRESULT hr = S_OK,
+            std::size_t pending = 0, std::size_t unsubmitted = 0) -> ID3D12Resource* {
+        static std::atomic<unsigned> failures{};
+        const auto sequence = failures.fetch_add(1, std::memory_order_relaxed);
+        if (sequence < 16 || sequence % 300 == 0)
+            trace_event("RR crop copy failed reason=%s source=%p format=%u flags=0x%X "
+                "texture=%llux%u array=%u mips=%u samples=%u crop=%ux%u@%u,%u "
+                "hresult=0x%08X pending=%zu unsubmitted=%zu",
+                reason, source, source_desc.Format, source_desc.Flags,
+                static_cast<unsigned long long>(source_desc.Width), source_desc.Height,
+                source_desc.DepthOrArraySize, source_desc.MipLevels, source_desc.SampleDesc.Count,
+                width, height, x, y, static_cast<unsigned>(hr), pending, unsubmitted);
+        return nullptr;
+    };
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
-        desc.SampleDesc.Count != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
-        !bounds(x,width,desc.Width) || !bounds(y,height,desc.Height)) return nullptr;
+        desc.SampleDesc.Count != 1) return failed("texture_shape");
+    if (!bounds(x,width,desc.Width) || !bounds(y,height,desc.Height)) return failed("crop_bounds");
+    const bool depth_crop = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;
+    if (depth_crop) {
+        // D3D12 forbids partial depth/stencil copies. Read the depth plane through
+        // a compatible SRV instead, preserving the game's raw (possibly reversed) Z.
+        switch (desc.Format) {
+        case DXGI_FORMAT_R32_TYPELESS: depth_format = DXGI_FORMAT_R32_FLOAT; break;
+        case DXGI_FORMAT_R16_TYPELESS: depth_format = DXGI_FORMAT_R16_UNORM; break;
+        case DXGI_FORMAT_R24G8_TYPELESS: depth_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+        case DXGI_FORMAT_R32G8X24_TYPELESS: depth_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+        default: return failed("depth_srv_format");
+        }
+        if (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return failed("depth_srv_denied");
+    }
     ComPtr<ID3D12Device> device;
-    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+    const auto device_result = list->GetDevice(IID_PPV_ARGS(&device));
+    if (FAILED(device_result)) return failed("get_device", device_result);
     std::lock_guard lock(mutex12);
-    if (pending12.size() >= 64) return nullptr;
+    if (pending12.size() >= 64) {
+        std::size_t unsubmitted{};
+        for (const auto& pending : pending12) if (!pending->queue) ++unsubmitted;
+        return failed("pending_limit", S_OK, pending12.size(), unsubmitted);
+    }
     std::shared_ptr<Pass12> pass;
     for (auto it=available12.begin(); it!=available12.end(); ++it) {
-        if ((*it)->copy_only && (*it)->source.Get()==source && (*it)->width==width && (*it)->height==height) {
+        if ((*it)->depth_crop==depth_crop && ((*it)->copy_only || depth_crop) &&
+            (*it)->source.Get()==source && (*it)->width==width && (*it)->height==height) {
             pass=*it; available12.erase(it); break;
         }
+    }
+    if (!pass && depth_crop) {
+        pass = make_pass12(device.Get(), source, width, height, depth_format, true);
+        if (!pass) return failed("depth_shader_setup");
     }
     if (!pass) {
         pass=std::make_shared<Pass12>(); pass->device=device; pass->source=source;
@@ -318,11 +359,24 @@ ID3D12Resource* prepare_crop_texture12(ID3D12GraphicsCommandList* list, ID3D12Re
         desc.Flags=D3D12_RESOURCE_FLAG_NONE;
         D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         heap.CreationNodeMask=heap.VisibleNodeMask=1;
-        if (FAILED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&pass->output)))) return nullptr;
+        const auto create_result = device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&pass->output));
+        if (FAILED(create_result)) return failed("create_texture", create_result);
     }
     pass->list=list; pass->list_token=list_token(list,true); pass->fence.Reset();
     pending12.push_back(pass);
+    if (depth_crop) {
+        transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        const Constants data{x,y,width,height,0,0,width,height};
+        list->SetDescriptorHeaps(1,pass->heap.GetAddressOf());
+        list->SetComputeRootSignature(pass->root.Get());
+        list->SetPipelineState(pass->pipeline.Get());
+        list->SetComputeRootDescriptorTable(0,pass->heap->GetGPUDescriptorHandleForHeapStart());
+        list->SetComputeRoot32BitConstants(1,sizeof(data)/4,&data,0);
+        list->Dispatch((width+7)/8,(height+7)/8,1);
+        transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        return pass->output.Get();
+    }
     transition(list,source,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION from{},to{};

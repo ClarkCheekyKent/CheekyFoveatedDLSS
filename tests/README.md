@@ -157,6 +157,13 @@ call must retain its full-frame inputs and execute only once per frame.
 NGX hook with feature creation observed after injection.
 These tests use fake NVIDIA runtimes and do not validate headset gaze input.
 
+Run `CheekyTests.exe --motion-resample` for the RR depth crop regression.
+It uses D3D12 WARP with an `R32_TYPELESS` depth-stencil texture, matching the
+resource type that blocked the Cyberpunk center pass. GPU readback verifies
+unchanged depth values, moving crop coordinates, bounds rejection and reuse
+after submission. The test checks D3D12 debug-layer errors when available.
+The same command also runs the existing DX11/DX12 motion resampling tests.
+
 # NR-only gaze positioning regression
 
 The feature-creation controls, preset cache, jitter/multiplier and SDR codec

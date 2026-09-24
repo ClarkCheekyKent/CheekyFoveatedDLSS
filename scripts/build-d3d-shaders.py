@@ -17,6 +17,7 @@ SHADERS = [
     ("composite11", "src/d3d11_composite_shader.hpp", "d3d11_composite_shader_source", "CompositeMain", "cs_5_0", 3),
     ("composite12", "src/d3d12_composite_shader.hpp", "composite_shader_source", "CompositeMain", "cs_5_1", 3),
     ("crop_motion", "src/crop_motion_shader.hpp", "crop_motion_shader_source", "main", "cs_5_0", 3),
+    ("crop_depth", "src/crop_motion_shader.hpp", "crop_depth_shader_source", "main", "cs_5_0", 3),
     ("peripheral11_color", "src/d3d11_peripheral_dlaa.cpp", "color_downsample_shader_source", "Main", "cs_5_0", 3),
     ("peripheral11_depth", "src/d3d11_peripheral_dlaa.cpp", "depth_downsample_shader_source", "Main", "cs_5_0", 3),
     ("peripheral11_motion", "src/d3d11_peripheral_dlaa.cpp", "motion_downsample_shader_source", "Main", "cs_5_0", 3),

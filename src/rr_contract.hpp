@@ -3,7 +3,9 @@
 #include "frame_contract.hpp"
 #include "settings.hpp"
 #include "crop_motion.hpp"
+#include "runtime.hpp"
 #include <array>
+#include <atomic>
 #include <cstring>
 
 namespace cheeky::foveated_dlss {
@@ -131,7 +133,16 @@ public:
             for(unsigned i=0;i<count_;++i) if(bindings_[i].source==source && bindings_[i].x==x && bindings_[i].y==y)
                 copy=bindings_[i].copy;
             if (!copy) copy=prepare_crop_texture12(list,source,x,y,crop.input_width,crop.input_height);
-            if (!copy) { ready_=false; return; }
+            if (!copy) {
+                static std::atomic<unsigned> failures{};
+                const auto sequence = failures.fetch_add(1, std::memory_order_relaxed);
+                if (sequence < 16 || sequence % 300 == 0)
+                    trace_event("RR center input unavailable parameter=%s source=%p "
+                        "crop=%ux%u@%u,%u prepared_inputs=%u; keeping native RR",
+                        guide.resource, source, crop.input_width, crop.input_height, x, y, count_);
+                ready_=false;
+                return;
+            }
             bindings_[count_++]={guide,source,copy,x,y};
             p->Set(guide.resource,copy); p->Set(guide.x,0U); p->Set(guide.y,0U);
         };
