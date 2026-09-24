@@ -170,6 +170,13 @@ GazeTemporalPolicyResult update_gaze_temporal_policy(
         state.return_start_v + amount *
             (input.fallback_v - state.return_start_v)
     );
+    // Track the drifting centre in the filter itself. Previously the return
+    // lerp moved only the reported centre and left filtered_* at the last
+    // gaze position, so reacquisition jumped straight back to a stale point
+    // instead of resuming from where the crop actually was. Smoothing then
+    // glides from the current position to the new sample.
+    state.filtered_u = result.center_u;
+    state.filtered_v = result.center_v;
     result.using_gaze = amount < 1.0;
     if (amount >= 1.0) state.was_using_valid_gaze = false;
     return result;
@@ -194,8 +201,6 @@ GazeResetPolicyResult evaluate_gaze_reset(
     }
     if (!previous.valid && using_valid_sample) {
         result.reason = GazeResetReason::first_valid;
-    } else if (reacquired) {
-        result.reason = GazeResetReason::reacquired;
     } else if (remapped) {
         result.reason = GazeResetReason::remapped;
     } else if (previous.valid &&
@@ -203,6 +208,12 @@ GazeResetPolicyResult evaluate_gaze_reset(
                 previous.height != current.height)) {
         result.reason = GazeResetReason::crop_size_changed;
     } else if (previous.valid) {
+        // Reacquisition alone is not a reason to discard temporal history.
+        // At a normal blink rate it fires around fourteen times a minute,
+        // almost always leaving the crop where it already was. Reset only
+        // when the crop actually moved far enough to invalidate history, and
+        // keep the distinct reacquired reason for that case so diagnostics
+        // still identify which event caused it.
         const auto ratio = std::max(jump_reset_ratio, 0.0F);
         const auto threshold_x = (std::max)(
             64U,
@@ -213,8 +224,12 @@ GazeResetPolicyResult evaluate_gaze_reset(
             static_cast<std::uint32_t>(std::lround(current.height * ratio))
         );
         if (result.delta_x > threshold_x || result.delta_y > threshold_y) {
-            result.reason = GazeResetReason::large_jump;
+            result.reason = reacquired
+                ? GazeResetReason::reacquired
+                : GazeResetReason::large_jump;
         }
+    } else if (reacquired) {
+        result.reason = GazeResetReason::reacquired;
     }
     return result;
 }

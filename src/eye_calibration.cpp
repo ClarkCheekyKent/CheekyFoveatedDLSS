@@ -21,6 +21,10 @@ constexpr unsigned ring_size = 8, block = calibration_marker_size, inset = 12;
 constexpr unsigned sample = calibration_sample_size;
 constexpr int margin = calibration_sample_margin;
 constexpr std::uint64_t ticket_bit = 1ULL << 63;
+// How long the pipeline may go without a DLSS evaluation before captures are
+// held. Generous enough that a genuinely slow frame never suppresses one; a
+// menu or loading screen stops evaluating for far longer than this.
+constexpr std::uint64_t evaluation_idle_ms = 1000;
 struct Patch {
     ComPtr<ID3D11Texture2D> staging;
     unsigned width{}, height{}, reference_width{}, reference_height{};
@@ -85,6 +89,9 @@ struct State {
     Average gpu, latency;
     double cpu_us{};
     std::uint64_t last_frame_ms{}, last_openvr_ms{}, session_generation{};
+    // Set on every DLSS evaluation, whether or not a capture is in flight, so
+    // capture scheduling can tell a live pipeline from an idle one.
+    std::uint64_t last_evaluation_ms{};
     EyeCalibrationBackend backend{};
     bool unsupported_submission{};
 };
@@ -387,8 +394,25 @@ bool copy_patch(State& s, Frame& f, unsigned index, ID3D11Texture2D* texture, un
     p.used = true;
     return true;
 }
+// Both hosts enable calibration automatically, and the only switch is a
+// checkbox several tree levels deep in the overlay. When calibration itself is
+// what makes a title unresponsive, that menu cannot be reached, so the switch
+// is unavailable exactly when it is needed. This override is read once and
+// forces calibration off for the process, which makes a launch-time A/B
+// possible without any in-game interaction.
+[[nodiscard]] bool calibration_forced_off() noexcept {
+    static const bool forced = [] {
+        char value[8]{};
+        const auto length = GetEnvironmentVariableA(
+            "CHEEKY_DISABLE_EYE_CALIBRATION", value, sizeof(value)
+        );
+        return length > 0U && length < sizeof(value) && value[0] != '0';
+    }();
+    return forced;
+}
 } // namespace
 void eye_calibration_enable(bool value) noexcept {
+    if (value && calibration_forced_off()) return;
     auto& s = state();
     std::lock_guard lock(s.mutex);
     if (enabled.exchange(value) != value) {
@@ -472,6 +496,24 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
     if (!on)
         return false;
     ++s.stats.frames;
+    // A capture is only answerable while DLSS is producing frames: the markers
+    // are stamped into a DLSS output and read back from the submitted eyes. In
+    // 2D menus, loading screens and early startup the game stops evaluating,
+    // and every capture begun there is guaranteed to be rejected -- measured at
+    // a 100% rejection rate the moment evaluations stopped, against a flat 1
+    // while they continued. Those captures still cost a marker stamp, a copy,
+    // a fence and a readback at six per second, so decline to begin one until
+    // the pipeline is observably live. Draining and publication below continue
+    // regardless, and the established mapping is untouched, so leaving a menu
+    // resumes without re-calibrating.
+    const auto since_evaluation = s.last_evaluation_ms
+        ? now - s.last_evaluation_ms
+        : evaluation_idle_ms + 1;
+    if (since_evaluation > evaluation_idle_ms) {
+        s.frames_until_capture = 0;
+        ++s.stats.idle_skipped;
+        return false;
+    }
     // Drain previous readbacks on every frame, but stamp/capture only one in ten.
     if (s.frames_until_capture) {
         --s.frames_until_capture;
@@ -527,6 +569,7 @@ void eye_calibration_stamp(ID3D11DeviceContext* context, ID3D11Resource* output,
         auto& s = state();
         std::lock_guard lock(s.mutex);
         CpuScope cpu{s};
+        s.last_evaluation_ms = GetTickCount64(); // See the D3D12 stamp.
         if (s.current < 0)
             return;
         s.stats.graphics_api = 11;
@@ -616,6 +659,10 @@ void eye_calibration_stamp12(ID3D12GraphicsCommandList* list, ID3D12Resource* ou
         auto& s = state();
         std::lock_guard lock(s.mutex);
         CpuScope cpu{s};
+        // Recorded before the early return: this runs on every evaluation, so
+        // it is the only place that observes a live pipeline independently of
+        // whether a capture happens to be in flight.
+        s.last_evaluation_ms = GetTickCount64();
         if (s.current < 0)
             return;
         auto& f = s.ring[s.current];
@@ -887,6 +934,7 @@ std::string eye_calibration_json() {
         << ",\"max_gpu_us\":" << s.max_gpu_us << ",\"latency_frames\":"
         << s.latency_frames
         << ",\"rejected\":" << s.rejected
+        << ",\"idle_skipped\":" << s.idle_skipped
         << ",\"publication_rejected\":" << s.publication_rejected
         << ",\"rejection_counts\":{";
     for (unsigned i = 0; i < s.rejection_counts.size(); ++i) {
