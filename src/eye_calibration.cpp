@@ -230,7 +230,7 @@ bool retaining_calibration(const State& s) {
     // Publication already passed identity, geometry, age and generation checks.
     // Change-only mode must not keep verifying a usable mapping while waiting
     // for consecutive marker hits: misses otherwise restart full acquisition.
-    return !eye_calibration_continuous_validation() && s.published && !s.search_needed;
+    return !eye_calibration_continuous_validation(s.policy.active) && s.published && !s.search_needed;
 }
 void restart_calibration(State& s, const char* reason) {
     request_full_calibration(s, reason);
@@ -1117,11 +1117,11 @@ void poll(State& s) {
                 bool corrected{};
                 if (publish_stereo_calibration(f.views[left].id, f.views[right].id, f.views[left].generation,
                                                f.views[right].generation, f.sequence, f.captured_ms,
-                                               &corrected, f.session_generation, flipped_pair, mono, &crops)) {
+                                               &corrected, f.session_generation, flipped_pair, mono, &crops, f.method)) {
                     s.last_verified_ms = f.captured_ms;
                     s.published = true;
                     s.policy.failures = 0;
-                    const unsigned learning_confirmations = eye_calibration_continuous_validation() ? 4U : 1U;
+                    const unsigned learning_confirmations = eye_calibration_continuous_validation(s.policy.active) ? 4U : 1U;
                     if (++s.policy.confirmations == learning_confirmations && s.policy.configured == EyeCalibrationMethod::automatic) {
                         const auto settings = configured_settings();
                         const auto method = unsigned(s.policy.active);
@@ -1442,7 +1442,7 @@ bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_
         }
         if (retaining_calibration(s)) return false;
     }
-    if (eye_calibration_continuous_validation() && s.last_verified_ms && now - s.last_verified_ms > 2500) {
+    if (eye_calibration_continuous_validation(s.policy.active) && s.last_verified_ms && now - s.last_verified_ms > 2500) {
         // Stop using stale gaze geometry, but retain corner probes. Movement
         // alone must not flash the grid; settled verification decides reacquisition.
         invalidate_stereo_crop();
@@ -2092,7 +2092,7 @@ std::string eye_calibration_json() {
         << ",\"enabled\":" << s.enabled << ",\"status\":\"" << eye_calibration_status(s)
         << "\",\"active\":" << s.correction_active << ",\"openvr_active\":" << s.openvr_active
         << ",\"shared_source\":" << (s.correction_active && s.left_view == s.right_view)
-        << ",\"continuous_validation\":" << eye_calibration_continuous_validation()
+        << ",\"continuous_validation\":" << eye_calibration_continuous_validation(s.active_method)
         << ",\"active_method\":\"" << eye_calibration_method_name(s.active_method) << "\""
         << ",\"acquisition_failure_streak\":" << s.acquisition_failure_streak
         << ",\"acquisition_confirmations\":" << s.acquisition_confirmations
@@ -2240,7 +2240,7 @@ std::string eye_calibration_json() {
             << ",\"stamping\":\"bordered_grid_then_small_corner\""
             << ",\"motion_inconclusive\":" << live.motion_inconclusive
             << ",\"geometry_rejections\":" << live.geometry_rejections
-            << ",\"crop_max_age_ms\":" << (eye_calibration_continuous_validation() ? 2500 : 0)
+            << ",\"crop_max_age_ms\":" << (eye_calibration_continuous_validation(live.policy.active) ? 2500 : 0)
             << ",\"motion_threshold_degrees_per_second\":90"
             << ",\"verification_age_ms\":" << (live.last_verified_ms ? GetTickCount64()-live.last_verified_ms : 0)
             << ",\"wide_searches\":" << live.wide_searches

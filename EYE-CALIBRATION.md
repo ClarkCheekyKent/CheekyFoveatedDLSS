@@ -42,7 +42,9 @@ identity and crop coordinates are always calibrated afresh. The UI stays on
 **Auto**, displaying the learned and active methods separately. **Reset learned
 calibration method** clears the preference and restarts discovery.
 
-**Only on view or dimension changes** performs initial acquisition, then stops
+**Only on view or dimension changes** applies only to **Full crop search**, including
+when Auto selects that route. The control is hidden for corner methods, which
+always validate continuously regardless of the saved setting. It performs initial acquisition, then stops
 both verification readbacks and all calibration marker stamping once a fresh
 mapping has passed the follow-up confirmations. The learned eye identity and crop remain valid without the
 2.5-second verification timeout. Source view identity/generation or dimensions,

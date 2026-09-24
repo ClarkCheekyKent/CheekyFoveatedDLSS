@@ -165,9 +165,10 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected = nullptr,
     std::uint64_t session_generation = 0, bool vertical_flip = false, bool shared_source = false,
-    const std::array<StereoSourceCrop, 2>* source_crops = nullptr) noexcept;
+    const std::array<StereoSourceCrop, 2>* source_crops = nullptr,
+    EyeCalibrationMethod method = EyeCalibrationMethod::full) noexcept;
 void invalidate_stereo_crop() noexcept;
-bool eye_calibration_continuous_validation() noexcept;
+bool eye_calibration_continuous_validation(EyeCalibrationMethod method) noexcept;
 EyeCalibrationMethod eye_calibration_selected_method() noexcept;
 void set_eye_calibration_learning(unsigned method, std::uint64_t signature, unsigned sessions) noexcept;
 std::uint64_t eye_calibration_learning_revision() noexcept;

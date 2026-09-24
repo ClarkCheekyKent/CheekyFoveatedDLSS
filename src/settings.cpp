@@ -104,6 +104,7 @@ struct Calibration {
     bool vertical_flip{};
     std::array<StereoSourceCrop, 2> source_crops{};
     std::uint64_t verified_ms{};
+    EyeCalibrationMethod method{EyeCalibrationMethod::full};
 } calibration;
 bool calibration_live() {
     // Verified identity survives missing markers. View destruction, session
@@ -114,7 +115,7 @@ StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
     if (!calibration_live()) return {};
     auto crops = calibration.source_crops;
     const auto now = GetTickCount64();
-    if (eye_calibration_continuous.load(std::memory_order_acquire) &&
+    if (eye_calibration_continuous_validation(calibration.method) &&
         (now < calibration.verified_ms || now - calibration.verified_ms > 2500))
         for (auto& crop : crops) crop.valid = false;
     if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip,
@@ -464,7 +465,7 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
     std::uint64_t left_generation, std::uint64_t right_generation,
     std::uint64_t sequence, std::uint64_t captured_ms, bool* corrected,
     std::uint64_t session_generation, bool vertical_flip, bool shared_source,
-    const std::array<StereoSourceCrop, 2>* source_crops) noexcept {
+    const std::array<StereoSourceCrop, 2>* source_crops, EyeCalibrationMethod method) noexcept {
     if (corrected) *corrected = false;
     if (!left || !right || (left == right) != shared_source || !left_generation || !right_generation) return false;
     std::lock_guard lock(stereo_views_mutex);
@@ -494,6 +495,7 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
             (previous_right >= 0 && previous_right != 1);
     }
     calibration = {left, right, sequence, session_generation, vertical_flip};
+    calibration.method = method;
     if (source_crops) { calibration.source_crops = *source_crops; calibration.verified_ms = captured_ms; }
     return true;
 }
@@ -513,8 +515,8 @@ std::uint64_t eye_calibration_learning_revision() noexcept { return learning_rev
 EyeCalibrationMethod eye_calibration_selected_method() noexcept {
     return static_cast<EyeCalibrationMethod>(calibration_method.load());
 }
-bool eye_calibration_continuous_validation() noexcept {
-    return eye_calibration_continuous.load(std::memory_order_acquire);
+bool eye_calibration_continuous_validation(EyeCalibrationMethod method) noexcept {
+    return method != EyeCalibrationMethod::full || eye_calibration_continuous.load(std::memory_order_acquire);
 }
 void clear_stereo_calibration() noexcept {
     std::lock_guard lock(stereo_views_mutex);

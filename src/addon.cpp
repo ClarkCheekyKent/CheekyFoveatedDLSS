@@ -1672,9 +1672,12 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         if (ImGui::Button("Reset learned calibration method")) {
             set_eye_calibration_learning(0, 0, 0); eye_calibration_recalibrate();
         }
-        changed |= ImGui::Checkbox("Continuously validate eye calibration", &settings.eye_calibration_continuous);
-        if (!settings.eye_calibration_continuous)
-            ImGui::TextWrapped("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.");
+        if (settings.eye_calibration_method == EyeCalibrationMethod::full ||
+            (settings.eye_calibration_method == EyeCalibrationMethod::automatic && eye_calibration_stats().active_method == EyeCalibrationMethod::full)) {
+            changed |= ImGui::Checkbox("Continuously validate eye calibration", &settings.eye_calibration_continuous);
+            if (!settings.eye_calibration_continuous)
+                ImGui::TextWrapped("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.");
+        }
         if (ImGui::Button("Recalibrate now")) eye_calibration_recalibrate();
         ImGui::EndDisabled();
     }

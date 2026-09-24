@@ -325,9 +325,11 @@ uevr.sdk.callbacks.on_draw_ui(function()
                 if imgui.button("Reset learned calibration method") then send("calibration_forget") end
             end
             if status.settings.EyeCalibrationContinuous ~= nil then
-                check("Continuously validate eye calibration", "EyeCalibrationContinuous")
-                if draft.EyeCalibrationContinuous == false then
-                    text("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.")
+                if draft.EyeCalibrationMethod == 3 or (draft.EyeCalibrationMethod == 0 and c.active_method == "Full crop search") then
+                    check("Continuously validate eye calibration", "EyeCalibrationContinuous")
+                    if draft.EyeCalibrationContinuous == false then
+                        text("Recalibrates only when views, dimensions, submission bounds, or the VR session change. Same-view eye swaps and image crop changes are not detected.")
+                    end
                 end
                 if c.enabled and imgui.button("Recalibrate now") then send("calibration_recalibrate") end
             end

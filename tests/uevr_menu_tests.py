@@ -328,6 +328,15 @@ def run(engine):
     assert last().endswith("\ncalibration_disable")
     draw(changes={"Automatic eye calibration (this session)": True})
     assert last().endswith("\ncalibration_enable")
+    for method in (1, 2):
+        state["settings"]["EyeCalibrationMethod"] = method
+        receive(state)
+        count = len(g.sent)
+        draw(changes={"Continuously validate eye calibration": False})
+        g.callbacks.on_frame()
+        assert len(g.sent) == count, "Corner methods must hide the recalibration policy"
+    state["settings"]["EyeCalibrationMethod"] = 3
+    receive(state)
     draw(changes={"Continuously validate eye calibration": False})
     g.callbacks.on_frame()
     assert "EyeCalibrationContinuous=false" in last()

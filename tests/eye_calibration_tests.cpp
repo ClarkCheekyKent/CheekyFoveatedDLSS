@@ -867,14 +867,17 @@ int run_calibration_modes_tests() {
             do {
                 frame(); ++frames;
                 if (!first_wide_frame && eye_calibration_stats().full_calibration_attempts) first_wide_frame=frames;
-            } while (GetTickCount64()<deadline && eye_calibration_stats().acquisition_confirmations<1);
+            } while (GetTickCount64()<deadline && eye_calibration_stats().acquisition_confirmations < (eye_calibration_stats().active_method == EyeCalibrationMethod::full ? 1U : 4U));
             const auto stats=eye_calibration_stats();
             if(expect_success) {
                 if (!stats.crop_mapping_active || stats.acquisition_confirmations<1) std::cerr << eye_calibration_json() << '\n';
                 require(stats.crop_mapping_active && stats.acquisition_confirmations>=1,"GPU calibration must acquire and confirm");
                 require(stereo_eye_assignment(8101).eye_index==1,"GPU calibration must identify swapped eyes");
                 for(unsigned i=0;i<25;++i) frame();
-                require(eye_calibration_stats().captures==stats.captures,"One-shot mode must stop capture after the first accepted publication");
+                if (stats.active_method == EyeCalibrationMethod::full)
+                    require(eye_calibration_stats().captures==stats.captures,"Full search one-shot mode must stop capture after publication");
+                else
+                    require(eye_calibration_stats().captures>stats.captures,"Corner methods must continue validating with the one-shot setting disabled");
             } else require(!stats.crop_mapping_active,"Forced corners must not accept an invisible marker");
             require((stats.full_calibration_attempts>0)==expect_wide,"Full-image search must be reserved for the selected route");
             eye_calibration_stop(); unregister_stereo_view(8101); unregister_stereo_view(8102);

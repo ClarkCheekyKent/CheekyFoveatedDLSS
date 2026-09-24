@@ -393,12 +393,16 @@ void draw_calibration_controls(OverlayUiState& r, const OverlayRuntime& runtime)
         ImGui::TextWrapped("Timing preference needs confirmation on another launch; Auto will start with standard corners.");
     diagnostic_line(member(r.snapshot, "eye_calibration"), "Active method", "active_method");
     if (ImGui::Button("Reset learned calibration method")) command(r, runtime, "calibration_forget");
-    int mode = r.draft.eye_calibration_continuous ? 0 : 1;
-    if (ImGui::Combo("Recalibration", &mode,
-            "Continuously validate\0Only on view or dimension changes\0"))
-        r.draft.eye_calibration_continuous = mode == 0;
-    if (!r.draft.eye_calibration_continuous)
-        ImGui::TextWrapped("Keeps the learned alignment without validation markers until views, dimensions, submission bounds, or the VR session change. Eye swaps or image crop changes within unchanged views are not detected.");
+    if (r.draft.eye_calibration_method == EyeCalibrationMethod::full ||
+        (r.draft.eye_calibration_method == EyeCalibrationMethod::automatic &&
+         plain(member(member(r.snapshot, "eye_calibration"), "active_method")) == "Full crop search")) {
+        int mode = r.draft.eye_calibration_continuous ? 0 : 1;
+        if (ImGui::Combo("Recalibration", &mode,
+                "Continuously validate\0Only on view or dimension changes\0"))
+            r.draft.eye_calibration_continuous = mode == 0;
+        if (!r.draft.eye_calibration_continuous)
+            ImGui::TextWrapped("Keeps the learned alignment without validation markers until views, dimensions, submission bounds, or the VR session change. Eye swaps or image crop changes within unchanged views are not detected.");
+    }
     if (ImGui::Button("Recalibrate now")) command(r, runtime, "calibration_recalibrate");
     ImGui::EndDisabled();
 }

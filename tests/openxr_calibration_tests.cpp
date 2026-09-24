@@ -1688,6 +1688,7 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
     roles();
     auto settings = configured_settings();
     settings.eye_calibration_continuous = false;
+    settings.eye_calibration_method = EyeCalibrationMethod::full;
     update_settings(settings);
     GPU12 gpu;
     ComPtr<ID3D11Device> device;
