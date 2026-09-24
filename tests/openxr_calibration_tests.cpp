@@ -65,6 +65,11 @@ void cleanup() {
 }
 void roles() {
     cleanup();
+    auto calibration_settings = configured_settings();
+    calibration_settings.eye_calibration_continuous = true;
+    calibration_settings.eye_calibration_method = EyeCalibrationMethod::standard;
+    update_settings(calibration_settings);
+    set_eye_calibration_learning(0, 0, 0);
     eye_calibration_reset_stats();
     eye_calibration_enable(true);
     register_stereo_view(9101);
@@ -1202,21 +1207,24 @@ Texture2D<float4> b : register(t1);
 RWTexture2DArray<float4> target : register(u0);
 cbuffer Options : register(b0) { uint options; }
 [numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID) {
-    uint2 p = id.xy * 128 / 192;
+    uint target_width, target_height, target_layers;
+    target.GetDimensions(target_width, target_height, target_layers);
+    if (id.x >= target_width || id.y >= target_height || id.z >= target_layers) return;
+    uint2 p = id.xy * 128 / uint2(target_width, target_height);
     if (options & 16) {
         uint w, h; a.GetDimensions(w, h);
         float side = min(w, h) * ((options & 64) ? .75 : 1.0);
         float2 start = (float2(w, h) - side) * .5;
         if (options & 32) start.x = w - side;
-        float2 uv = (float2(id.xy) + .5) / 192;
+        float2 uv = (float2(id.xy) + .5) / float2(target_width, target_height);
         if (options & 2) uv.y = 1 - uv.y;
         p = uint2(start + uv * side);
     } else if (options & 2) p.y = 127 - p.y;
     if (options & 256) {
-        float2 uv = (float2(id.xy) + .5) / 192;
+        float2 uv = (float2(id.xy) + .5) / float2(target_width, target_height);
         if (options & 2) uv.y = 1 - uv.y;
-        float2 start = id.z ? float2(34.3, 21.7) : float2(41.6, 24.9);
-        float2 extent = id.z ? float2(330, 250) : float2(316.9, 245.4);
+        float2 start = id.z ? float2(68.6, 43.4) : float2(83.2, 49.8);
+        float2 extent = id.z ? float2(660, 500) : float2(633.8, 490.8);
         p = uint2(start + uv * extent);
     }
     if (options & 4) p.y = min(p.y, 127 - p.y);
@@ -1248,7 +1256,8 @@ cbuffer Options : register(b0) { uint options; }
         gpu.list->SetComputeRootDescriptorTable(1, handle);
         gpu.list->SetComputeRoot32BitConstant(2,
             (swapped ? 1U : 0U) | (flipped ? 2U : 0U) | (ambiguous ? 4U : 0U) | (shifted ? 8U : 0U) | crop_options, 0);
-        gpu.list->Dispatch(24, 24, 2);
+        const auto target_desc = target->GetDesc();
+        gpu.list->Dispatch((unsigned(target_desc.Width) + 7) / 8, (target_desc.Height + 7) / 8, 2);
         gpu.barrier(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, state);
         for (auto* r : {a, b})
             gpu.barrier(r, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1256,8 +1265,10 @@ cbuffer Options : register(b0) { uint options; }
 };
 void crop_calibration12(bool mixed) {
     roles();
+    auto settings = configured_settings(); settings.eye_calibration_method = EyeCalibrationMethod::full; update_settings(settings);
     GPU12 gpu;
-    constexpr unsigned width = 400, height = 300, pitch = 1792, target_size = 192;
+    // Scale source and submission together: keep the resize ratio while fitting the locator grid.
+    constexpr unsigned width = 800, height = 600, pitch = 3328, target_size = 384;
     constexpr auto state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     auto a = gpu.texture(width, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM, height);
     auto b = gpu.texture(width, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R8G8B8A8_UNORM, height);
@@ -1286,7 +1297,11 @@ void crop_calibration12(bool mixed) {
     }
     const auto attempt = [&](unsigned options, bool flip = false) {
         auto support = request_calibration_images(true);
-        for (unsigned n = 0; !eye_calibration_frame(EyeCalibrationBackend::openxr, 901, mixed ? 11 : 12) && n < 20; ++n) {}
+        const auto capture_deadline = GetTickCount64() + 5000;
+        while (!eye_calibration_frame(EyeCalibrationBackend::openxr, 901, mixed ? 11 : 12)) {
+            require(GetTickCount64() < capture_deadline, "Crop capture must become eligible after the search throttle");
+            Sleep(1);
+        }
         gpu.begin();
         unsigned c{};
         for (auto* source : {a.Get(), b.Get()}) {
@@ -1325,37 +1340,52 @@ void crop_calibration12(bool mixed) {
                 eye_calibration_submit12(target.Get(), gpu.submit_queue.Get(), eye, 0, 0, 1, 1, eye, EyeCalibrationBackend::openxr, 901);
             require(ticket != 0, "Crop capture must record before submission"); eye_calibration_result(ticket, 0);
         }
+        const auto captured = eye_calibration_stats().captures;
         eye_calibration_frame(EyeCalibrationBackend::openxr, 901, mixed ? 11 : 12);
         gpu.wait(gpu.submit_queue.Get()); if (mixed) context11->Flush();
         const auto deadline = GetTickCount64() + 5000;
-        while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) { Sleep(1); eye_calibration_tick(); }
-        require(!eye_calibration_stats().in_flight, "Crop frame must safely retire all GPU readbacks");
+        while (eye_calibration_stats().completed < captured && GetTickCount64() < deadline) { Sleep(1); eye_calibration_tick(); }
+        require(eye_calibration_stats().completed >= captured, "Crop frame must safely retire all GPU readbacks");
         require(collect_calibration_images(support).files.size() == 5, "Crop capture must retain both APIs' image evidence");
         return support;
     };
     auto acquire = [&](auto render) {
         const auto before = eye_calibration_stats().valid;
         CalibrationImageRequestPtr support;
+        unsigned ambiguous_epochs{};
+        std::array<std::uint32_t, 2> rejected_codes{};
         for (unsigned i = 0; i < 40; ++i) {
             support = render();
-            require(support->images[0].info.markers.count <= 2, "Only a corner pair may be stamped during acquisition");
+            require(support->images[0].info.markers.count <= 16, "Acquisition must stay within the bounded marker grid");
+            if (ambiguous_epochs) require(support->marker_codes != rejected_codes,
+                "Manual recalibration must replace the ambiguous epoch's marker codes");
             if (eye_calibration_stats().valid > before) return support;
+            if (eye_calibration_json().find("\"ambiguous\":true") != std::string::npos) {
+                // Epoch-dependent codes can become ambiguous after shader resampling.
+                // Verify fail-closed behavior, then exercise the user's Recalibrate action.
+                require(!stereo_eye_assignment(9101).calibrated && !stereo_eye_assignment(9102).calibrated,
+                    "Ambiguous grid evidence must never publish either eye identity");
+                require(++ambiguous_epochs <= 3, "Fresh epochs must recover from ambiguous grid evidence");
+                rejected_codes = support->marker_codes;
+                eye_calibration_recalibrate();
+            }
             Sleep(100);
         }
-        throw std::runtime_error("Sequential DX12 corner acquisition did not converge");
+        std::cerr << "Failed grid codes: " << support->marker_codes[0] << ", " << support->marker_codes[1] << "\n";
+        std::cerr << eye_calibration_json() << "\n";
+        throw std::runtime_error("DX12 grid acquisition did not converge");
     };
     auto first = acquire([&] { return attempt(16); });
     require(eye_calibration_stats().valid && first->images[0].info.markers.count > 1,
-        "DX12 inner markers must survive shader crop and resize");
+        "DX12 locator grid must survive shader crop and resize");
     auto locked = attempt(16);
     require(locked->images[0].info.markers.count == 1 && locked->images[2].info.sample_count == 4 &&
         eye_calibration_stats().left_view == 9102, "DX12 must lock to one authenticated location and swapped eye identity");
     const auto before = eye_calibration_stats().valid;
-    const auto moved = attempt(16 | 32);
-    require(eye_calibration_stats().valid == before + 1 && moved->images[0].info.markers.count == 1,
-        "Local tracking must follow the displaced edge crop without reopening acquisition");
+    eye_calibration_recalibrate();
     auto edge = acquire([&] { return attempt(16 | 32); });
-    require(eye_calibration_stats().valid > before && edge->images[0].info.markers.count <= 2, "DX12 must reacquire from a local corner pair");
+    require(eye_calibration_stats().valid > before && edge->images[0].info.markers.count <= 16, "DX12 must reacquire the edge crop with a bounded grid");
+    eye_calibration_recalibrate();
     acquire([&] { return attempt(16 | 64, true); });
     auto zoom = attempt(16 | 64, true);
     require(eye_calibration_stats().vertical_flip && zoom->images[0].info.markers.count == 1,
@@ -1364,8 +1394,9 @@ void crop_calibration12(bool mixed) {
     attempt(16 | 64 | 128, true);
     require(eye_calibration_stats().valid == visible, "DX12 obscured codes must not authenticate any hypothesis");
     attempt(16 | 64, true);
-    require(eye_calibration_stats().valid == visible + 1, "DX12 marker loss must reopen search and recover");
+    require(eye_calibration_stats().valid == visible + 1, "A transient DX12 marker loss must recover with the cached crop");
     const auto before_wide = eye_calibration_stats().valid;
+    eye_calibration_recalibrate();
     acquire([&] { return attempt(256); });
     require(eye_calibration_stats().valid > before_wide && eye_calibration_json().find("\"per_eye\":true") != std::string::npos,
         "Wide acquisition must decode arbitrary per-eye shader crops across both D3D paths");
@@ -1382,7 +1413,7 @@ void crop_calibration12(bool mixed) {
     // allocations before the next test exercises the process-wide budget.
     const auto swept = calibration12_create(gpu.device.Get());
     require(calibration_image_bytes.load() == 0, "Retired crop support readbacks must release their memory budget");
-    std::cout << "PASS " << (mixed ? "DX12-to-DX11" : "DX12") << " shader crop/resize: inner codes, one-location lock, changed crop, flip, loss/recovery\n";
+    std::cout << "PASS " << (mixed ? "DX12-to-DX11" : "DX12") << " shader crop/resize: grid acquisition, one-location lock, changed crop, flip, loss/recovery\n";
 }
 void recording_lifetime12() {
     GPU12 gpu;
@@ -1443,6 +1474,7 @@ void failure_diagnostics12() {
     roles();
     GPU12 gpu;
     // A single-channel texture cannot carry the two chromatic markers.
+    // The first failed stamp invalidates the source pair; later stamps/submits must do no work.
     // Retain rejection and report its stage instead of inventing an eye role.
     auto source = gpu.texture(128, 1, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, DXGI_FORMAT_R32_FLOAT);
     auto target = gpu.texture(128, 2, D3D12_RESOURCE_STATE_RENDER_TARGET, DXGI_FORMAT_R32_FLOAT);
@@ -1460,12 +1492,12 @@ void failure_diagnostics12() {
     eye_calibration_frame(EyeCalibrationBackend::openxr, 902, 12);
     const auto stats = eye_calibration_stats();
     const auto json = eye_calibration_json();
-    require(stats.valid == 0 && stats.d3d12_stamp_failures == 2 && stats.d3d12_capture_failures == 2 &&
+    require(stats.valid == 0 && stats.d3d12_stamp_failures == 1 && stats.d3d12_capture_failures == 0 &&
                 stats.d3d12_readback_failures == 1 && !stereo_eye_assignment(9101).calibrated &&
-                json.find("\"source_formats\":[41,41]") != std::string::npos &&
-                json.find("\"submitted_formats\":[41,41]") != std::string::npos &&
+                json.find("\"source_formats\":[41,0]") != std::string::npos &&
+                json.find("\"submitted_formats\":[0,0]") != std::string::npos &&
                 json.find("stamp_texture_format_or_layout") != std::string::npos &&
-                json.find("capture_texture_format_or_layout") != std::string::npos,
+                json.find("readback_patch_not_recorded") != std::string::npos,
             "Rejected captures must report format/stage and never establish a mapping");
     eye_calibration_reset_stats();
     require(eye_calibration_stats().d3d12_stamp_failures == 0 &&
@@ -1580,6 +1612,11 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
         layer->begin();
     else
         eye_calibration_frame(backend, generation, 12);
+    // The boundary may reserve the next empty slot; only the 64 submitted captures must finish.
+    constexpr unsigned expected_completed = 64;
+    const auto completion_deadline = GetTickCount64() + 5000;
+    while (eye_calibration_stats().completed < expected_completed && GetTickCount64() < completion_deadline) { Sleep(1); eye_calibration_tick(); }
+    require(eye_calibration_stats().completed >= expected_completed, "All submitted D3D12 captures must finish verification");
     const auto stats = eye_calibration_stats();
     if (support) {
         const auto report = collect_calibration_images(support);

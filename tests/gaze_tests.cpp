@@ -959,8 +959,9 @@ void test_nr_only_center(bool openvr) {
     snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED |
         CHEEKY_GAZE_STATUS_GAZE_VALID;
     if (openvr) snapshot.status_flags |= CHEEKY_GAZE_STATUS_OPENVR;
+    const std::array<StereoSourceCrop, 2> source_crops{{{0, 0, 1, 1, 2400, 2000, true}, {0, 0, 1, 1, 2400, 2000, true}}};
     expect(publish_stereo_calibration(1901, 1902, stereo_view_generation(1901), stereo_view_generation(1902),
-        5000, GetTickCount64(), nullptr, openvr ? 0 : snapshot.session_generation), "NR-only eye mapping publishes");
+        5000, GetTickCount64(), nullptr, openvr ? 0 : snapshot.session_generation, false, false, &source_crops), "NR-only eye mapping publishes");
     for (unsigned eye = 0; eye < 2; ++eye) {
         auto& v = snapshot.views[eye];
         v.view_index = eye;
@@ -1163,13 +1164,14 @@ void test_packed_alignment_coordinator(bool openvr = false) {
         settings.invert_stereo_x_offset = true; // Old manual guess must not invert an observed XR eye.
         const auto a = stereo_view_generation(951), b = stereo_view_generation(952);
         const auto calibration_session = openvr ? 0ULL : snapshot.session_generation;
-        expect(publish_stereo_calibration(952, 951, b, a, 1000, GetTickCount64(), nullptr, calibration_session), "Marker calibration accepts swapped pair");
+        const std::array<StereoSourceCrop, 2> source_crops{{{0, 0, 1, 1, 3024, 2836, true}, {0, 0, 1, 1, 3024, 2836, true}}};
+        expect(publish_stereo_calibration(952, 951, b, a, 1000, GetTickCount64(), nullptr, calibration_session, false, false, &source_crops), "Marker calibration accepts swapped pair");
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i) {
             const float actual = (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F;
             expect_near(actual, snapshot.views[1 - i].forward_u, 0.001F, "Crop follows calibrated eye despite previous packed/manual role");
         }
-        expect(publish_stereo_calibration(951, 952, a, b, 1001, GetTickCount64(), nullptr, calibration_session), "Marker calibration accepts a later eye transition");
+        expect(publish_stereo_calibration(951, 952, a, b, 1001, GetTickCount64(), nullptr, calibration_session, false, false, &source_crops), "Marker calibration accepts a later eye transition");
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i)
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
@@ -1195,7 +1197,7 @@ void test_packed_alignment_coordinator(bool openvr = false) {
             expect_near((crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F,
                         snapshot.views[i].center_u, 0.004F, "Array gaze must use the calibrated eye's center");
         expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr,
-            calibration_session, true), "Verified vertical transform publishes with eye pair");
+            calibration_session, true, false, &source_crops), "Verified vertical transform publishes with eye pair");
         snapshot.views[0].center_v = 0.25F; snapshot.views[1].center_v = 0.7F;
         frame(); frame(); frame();
         for (unsigned i = 0; i < 2; ++i)
@@ -1213,7 +1215,7 @@ void test_packed_alignment_coordinator(bool openvr = false) {
         clear_stereo_calibration();
         frame(); frame();
         expect(gaze_diagnostics().alignment_source == 0U, "Ambiguous images require a live marker calibration");
-        expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr, calibration_session + 1),
+        expect(publish_stereo_calibration(951, 952, a, b, 1002, GetTickCount64(), nullptr, calibration_session + 1, false, false, &source_crops),
             "Foreign-session test calibration publishes");
         frame(); frame();
         expect(gaze_diagnostics().alignment_source == 0U, "A calibration from another XR session cannot route crop coordinates");
@@ -1230,9 +1232,10 @@ void test_mono_gaze_coordinator() {
     constexpr std::uint64_t view = 19901, session = 19902;
     register_stereo_view(view);
     const auto generation = stereo_view_generation(view);
+    const std::array<StereoSourceCrop, 2> source_crops{{{0, 0, 1, 1, 1000, 1000, true}, {0, 0, 1, 1, 1000, 1000, true}}};
     expect(!publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session),
         "Stereo publication must not silently accept duplicated source IDs");
-    expect(publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session, false, true),
+    expect(publish_stereo_calibration(view, view, generation, generation, 1, GetTickCount64(), nullptr, session, false, true, &source_crops),
         "Explicitly verified shared-source calibration publishes");
     expect(stereo_eye_assignment(view).shared_source && !has_multiple_stereo_views(),
         "Shared mono identity must not invent a second stereo source");
@@ -1285,7 +1288,7 @@ void test_mono_gaze_coordinator() {
             expect(preview.next_jump_visible, "Mono simulation retains the next-jump preview");
         }
     }
-    expect(publish_stereo_calibration(view, view, generation, generation, 2, GetTickCount64(), nullptr, session, true, true),
+    expect(publish_stereo_calibration(view, view, generation, generation, 2, GetTickCount64(), nullptr, session, true, true, &source_crops),
         "Shared-source vertical transform publishes");
     frame(); frame();
     expect_near(center.v, .6F, .002F, "Mono gaze applies the verified vertical flip after averaging");
@@ -1296,15 +1299,35 @@ void test_mono_gaze_coordinator() {
     constexpr std::uint64_t other_view = 19903;
     register_stereo_view(other_view);
     expect(publish_stereo_calibration(view, other_view, generation, stereo_view_generation(other_view),
-        3, GetTickCount64(), nullptr, session), "Stereo proof replaces mono gaze mapping");
+        3, GetTickCount64(), nullptr, session, false, false, &source_crops), "Stereo proof replaces mono gaze mapping");
     settings.center_mode = FoveationCenterMode::simulated_gaze;
     frame(); frame(); frame();
     expect_near(center.u, .2F, .002F, "Returning to stereo restores the individual eye's horizontal gaze");
     expect_near(center.v, .3F, .002F, "Returning to stereo discards the shared flipped gaze history");
-    expect(publish_stereo_calibration(view, view, generation, generation, 4, GetTickCount64(), nullptr, session, false, true),
+    expect(publish_stereo_calibration(view, view, generation, generation, 4, GetTickCount64(), nullptr, session, false, true, &source_crops),
         "New mono proof replaces stereo gaze mapping");
     frame(); frame(); frame();
     expect_near(center.u, .4F, .002F, "Returning to mono restores binocular gaze");
+    invalidate_stereo_crop();
+    frame();
+    expect(!gaze_diagnostics().using_gaze, "Eye identity without verified crop geometry must reject gaze");
+    auto cropped = source_crops;
+    for (auto& eye : cropped) eye = {.1F, .2F, .8F, .6F, 1000, 1000, true};
+    expect(publish_stereo_calibration(view, view, generation, generation, 5, GetTickCount64(), nullptr,
+        session, false, true, &cropped), "Verified cropped mono geometry publishes");
+    frame(); frame(); frame();
+    expect_near(center.u, .42F, .002F, "Mono gaze maps the binocular center through the verified source crop");
+    expect_near(center.v, .44F, .002F, "Mono gaze preserves the verified vertical crop offset and scale");
+    cropped[1].valid = false;
+    expect(publish_stereo_calibration(view, view, generation, generation, 6, GetTickCount64(), nullptr,
+        session, false, true, &cropped), "Incomplete geometry fixture publishes eye identity only");
+    frame();
+    expect(!gaze_diagnostics().using_gaze, "Shared-source gaze requires verified geometry for both eyes");
+    cropped = source_crops; cropped[0].source_width = 999;
+    expect(publish_stereo_calibration(view, view, generation, generation, 7, GetTickCount64(), nullptr,
+        session, false, true, &cropped), "Stale source dimensions fixture publishes");
+    frame();
+    expect(!gaze_diagnostics().using_gaze, "Changed source dimensions must reject stale gaze geometry");
     settings.center_mode = FoveationCenterMode::fixed;
     snapshot.session_generation++;
     frame(); frame();
@@ -2342,6 +2365,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--retained-calibration") == 0) return run_retained_calibration_tests();
     if (argc == 2 && std::strcmp(argv[1], "--debug-exposure") == 0) return run_debug_exposure_tests();
     if (argc == 2 && std::strcmp(argv[1], "--openxr-input") == 0) return run_openxr_input_tests();
+    if (argc == 2 && std::strcmp(argv[1], "--crop-calibration-dx12") == 0) return run_crop_calibration12_tests();
     if (argc == 2 && std::strcmp(argv[1], "--crop-calibration") == 0) return run_crop_calibration_tests() + run_crop_calibration12_tests();
     if (argc == 2 && std::strcmp(argv[1], "--mixed-calibration") == 0) return run_mixed_api_calibration_tests();
     if (argc == 2 && std::strcmp(argv[1], "--stereo-support") == 0)

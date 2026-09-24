@@ -10,38 +10,38 @@ Native DX12 manual reacquisition switches to alternating source-eye renders whil
 submitting both eyes each interval, covering recalibration after AFW starts.
 
 `CheekyTests.exe --crop-calibration` exercises the production DX11, DX12 and
-DX12-to-DX11 stamp/read paths on WARP. It checks centered and edge-aligned crops,
-crop plus resizing, vertical flips, packed submission bounds, source origins,
-array slices, eye swaps, one-location locking, and loss/reacquisition when the
-crop changes without a resolution change. Geometry checks include the reported
-2000x1500 source with a centered 1500x1500 submission. These also run in the
-standard suite; CTest registers `CheekyCropCalibrationTests` separately.
+DX12-to-DX11 stamp/read paths on WARP. `--crop-calibration-dx12` isolates the
+last two paths. The fixtures select full search and continuous validation
+explicitly, and use source images large enough for the 16-marker locator grid.
+They check centered and edge-aligned crops, resizing, vertical flips, packed
+submission bounds, source origins, array slices, eye swaps, single-marker
+tracking, manual recalibration and recovery after sustained marker loss.
+These also run in the standard suite; CTest registers
+`CheekyCropCalibrationTests` separately.
 
-Calibration searches a bounded bank of 16 hypotheses: the full view, a crop to
-the submitted aspect ratio, a native-pixel crop, a square crop, centered zooms
-at 90/75/50% of the aspect crop, edge-aligned aspect/native crops, and a half-size
-source rectangle. Submitted dimensions are measured inside the actual UV bounds.
-Dimensions seed hypotheses; only readable marker evidence confirms them.
-Distinct source locations have distinct codes and non-overlapping stamps.
-Template orientation is checked against each hypothesis and the submitted bounds.
-Conflicting eye/orientation evidence is rejected. Among compatible matches the
-strongest two-eye score selects the placement.
+Full search decodes spatially unique grid locations to infer each eye's visible
+source rectangle. Successful acquisition switches to a small corner marker,
+padded 20 submitted pixels inside that rectangle. Verification retains the
+cached crop rather than moving it with individual marker measurements. The
+DX11 test checks that 19 missing-marker observations retain the lock and the
+20th releases it, that stale acquisition cannot publish eye identity, and that
+a fresh sample resumes single-marker tracking after recovery.
 
-A successful sample caches a placement per source view/generation/dimensions and
-submitted sizes. Subsequent captures stamp only that source location and read its
-A/B and orientation probes (four small patches per submitted eye). Marker loss
-reopens the bank; source/session/dimension changes invalidate the relevant cache.
-The normal one-in-ten readback cadence remains; a lost lock requests one earlier
-retry. Continuous OpenXR stamps use the cached placement between captures, while
-readbacks remain asynchronous and retain their existing queue/recording lifetimes.
+D3D12 fixtures also verify that ambiguous resampled grid evidence publishes no
+eye mapping and that explicit recalibration replaces the epoch codes and recovers.
 
-Support JSON includes `placement_search`, inferred visible-source rectangles,
-marker positions/codes, and all sampled rectangles. The base `marker_codes` field
-is the epoch code; `marker_location_codes` lists the actual per-location codes.
-This is a finite crop/resize search, not a solver for arbitrary shader warps or
-arbitrary crop offsets. Synthetic tests do not establish REALVR/headset behavior;
-verify lock and recovery in game and inspect a support capture if no hypothesis
-matches.
+The fixtures wait for the submitted capture's completion, since the next frame
+boundary may already have reserved an empty slot. They respect the full-search
+throttle and verify all four support images and GPU readback retirement.
+The standalone support tests also exercise the shared memory budget and command
+recording lifetimes. GPU verification tests explicitly enable continuous
+validation; retained-calibration tests select change-only mode separately.
+
+`CheekyTests.exe --calibration-modes` covers automatic escalation, forced
+methods, learned routes and change-only acquisition using actual GPU captures.
+Support JSON records the inferred rectangles, marker locations, sampled
+rectangles and rejection details. Synthetic crop/resize tests do not establish
+compatibility with arbitrary shader warps or headset behavior.
 
 # Automatic fixed-alignment history
 
@@ -51,7 +51,10 @@ oscillations must move the crop without resetting DLSS history, allowing the
 backend's existing crop-motion correction to preserve accumulation. Mapping
 changes or loss, large jumps and crop resizing must still reset history. The
 snapshot cases use the BG3 report's 1464-to-2928 resolution and odd crop sizes.
-These checks also run in the default suite.
+These checks also run in the default suite. Marker-based gaze fixtures publish
+verified source dimensions and crop geometry as well as eye identity. Mono
+cases check crop offsets and scale, and reject missing geometry, an unverified
+second eye, and stale source dimensions.
 
 For an in-game retest, select Fixed with Automatic stereo alignment enabled,
 move the headset, and inspect fine detail for shimmer. This change preserves

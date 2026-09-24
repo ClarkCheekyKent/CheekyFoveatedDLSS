@@ -79,6 +79,9 @@ void check_debug_forward(HMODULE proxy, HMODULE system) {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    // Broken-chain fixtures intentionally load an invalid DLL. Report loader
+    // errors to the assertions instead of opening a blocking Windows dialog.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     try {
         require(argc == 5 || argc == 6, "Usage: bootstrap-tests proxy|version|asi|missing|chain|broken-chain|loop-chain <proxy.dll> <plugin.asi> <fake-host.dll> [external-chain.dll]");
         const bool asi = std::wstring(argv[1]) == L"asi";
