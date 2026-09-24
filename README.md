@@ -130,8 +130,8 @@ Use **Report an issue...** in Cheeky's panel to create a diagnostic ZIP and open
 
 [Build instructions](DEVELOPMENT.md)
 
-### Help me test eye tracking on real hardware
-If Cheeky Foveated DLSS has given you smoother VR, extra FPS, or room to turn up the resolution, please consider supporting its development.
+### Show your appreciation
+If Cheeky Foveated DLSS has given you smoother VR, extra FPS, or room to turn up the resolution, please consider donating.
 
 [![Donate](assets/donate-ko-fi.svg)](https://donate.stripe.com/fZufZg5am97b0b12IO8ww00)
 
