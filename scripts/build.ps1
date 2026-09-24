@@ -72,6 +72,8 @@ foreach ($proxy in @('reshade','streamline')) {
 }
 
 $testExecutable = Join-Path $projectRoot "bin\$Configuration\CheekyTests.exe"
+& $testExecutable --rr-contract
+if ($LASTEXITCODE -ne 0) { throw "RR contract tests failed." }
 & $testExecutable
 if ($LASTEXITCODE -ne 0) {
     throw "Tests failed with exit code $LASTEXITCODE."
@@ -144,6 +146,13 @@ $coreDiscoveryTest = Join-Path $projectRoot "bin\$Configuration\CheekyCoreDiscov
 foreach ($mode in @('accept','reject')) {
     & $coreDiscoveryTest $mode (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\CheekyFakeCore.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\CheekyFakeCoreProxy.dll")
     if ($LASTEXITCODE -ne 0) { throw "NGX core discovery tests failed: $mode" }
+}
+
+foreach ($rrMode in @('dx12-rr', 'dx12-rr-c', 'dx12-rr-ota')) {
+    & $uevrTest "--realvr-$rrMode"
+    if ($LASTEXITCODE -ne 0) { throw "RR runtime test failed: $rrMode" }
+    & $standaloneHostTest "realvr-$rrMode" standalone
+    if ($LASTEXITCODE -ne 0) { throw "Standalone RR runtime test failed: $rrMode" }
 }
 
 Write-Host "Built and tested:"

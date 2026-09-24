@@ -324,6 +324,11 @@ if(CHEEKY_BUILD_UEVR)
         add_test(NAME CheekyAfw-${mode} COMMAND CheekyUEVRTests --afw-${mode})
         add_test(NAME CheekyRealVR-${mode} COMMAND CheekyUEVRTests --realvr-${mode})
     endforeach()
+    add_test(NAME CheekyRrContract COMMAND CheekyTests --rr-contract)
+    foreach(mode dx12-rr dx12-rr-c dx12-rr-ota)
+        add_test(NAME CheekyRealVR-${mode} COMMAND CheekyUEVRTests --realvr-${mode})
+    endforeach()
+
 endif()
 
 if(CHEEKY_BUILD_STANDALONE)

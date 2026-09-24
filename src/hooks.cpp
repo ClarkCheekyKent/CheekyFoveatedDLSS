@@ -14,6 +14,7 @@
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "realvr_runtime.hpp"
+#include "rr_contract.hpp"
 #include "dlss_nr_lifetime.hpp"
 #include "ngx_runtime_discovery.hpp"
 #include "diagnostics.hpp"
@@ -165,6 +166,17 @@ std::atomic<EvaluateD3D11CFn> real_evaluate_d3d11_c{};
 std::atomic<ReleaseD3D11Fn> real_release_d3d11{};
 std::atomic<ReleaseD3D11Fn> real_core_release_d3d11{};
 std::atomic<CreateD3D12Fn> real_create_d3d12{};
+std::atomic<CreateD3D12Fn> real_rr_create_d3d12{};
+std::atomic<EvaluateD3D12Fn> real_rr_evaluate_d3d12{};
+std::atomic<EvaluateD3D12CFn> real_rr_evaluate_d3d12_c{};
+std::atomic<ReleaseD3D12Fn> real_rr_release_d3d12{};
+thread_local bool inside_rr_runtime{};
+struct RrRuntimeScope {
+    bool previous{inside_rr_runtime};
+    explicit RrRuntimeScope(bool rr = true) { inside_rr_runtime = rr; }
+    ~RrRuntimeScope() { inside_rr_runtime = previous; }
+};
+
 std::atomic<CreateD3D12Fn> real_core_create_d3d12{};
 std::atomic<EvaluateD3D12Fn> real_evaluate_d3d12{};
 std::atomic<EvaluateD3D12Fn> real_core_evaluate_d3d12{};
@@ -3881,25 +3893,27 @@ class NgxPresetOverrideScope {
 public:
     NgxPresetOverrideScope(
         const NgxParameters* const parameters,
-        const std::uint32_t preset
+        const std::uint32_t preset,
+        const bool rr = false
     ) noexcept {
+        names_ = rr ? rr_presets : dlss_preset_parameter_names.data();
         if (parameters == nullptr || preset == 0U) return;
         parameters_ = const_cast<NgxParameters*>(parameters);
         for (std::size_t index{}; index < saved_.size(); ++index) {
             int signed_value{};
             if (ngx_succeeded(parameters_->Get(
-                    dlss_preset_parameter_names[index],
+                    names_[index],
                     &signed_value
                 ))) {
                 saved_[index] = static_cast<std::uint32_t>(signed_value);
             } else {
                 saved_[index] = get_ui(
                     parameters_,
-                    dlss_preset_parameter_names[index]
+                    names_[index]
                 );
             }
             parameters_->Set(
-                dlss_preset_parameter_names[index],
+                names_[index],
                 preset
             );
         }
@@ -3910,7 +3924,7 @@ public:
         if (!active_ || parameters_ == nullptr) return;
         for (std::size_t index{}; index < saved_.size(); ++index) {
             parameters_->Set(
-                dlss_preset_parameter_names[index],
+                names_[index],
                 saved_[index]
             );
         }
@@ -3920,6 +3934,7 @@ public:
     ~NgxPresetOverrideScope() { restore(); }
 
 private:
+    const char* const* names_{};
     NgxParameters* parameters_{};
     std::array<std::uint32_t, 6U> saved_{};
     bool active_{};
@@ -4379,13 +4394,13 @@ NgxResult hook_core_release_d3d11(NgxHandle* const handle) {
     return original == nullptr ? 0xBAD00007U : original(handle);
 }
 
-NgxResult hook_create_d3d12(
+NgxResult runtime_create_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const std::uint32_t feature,
     NgxParameters* const parameters,
     NgxHandle** const handle
 ) {
-    const auto original = real_create_d3d12.load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_create_d3d12 : real_create_d3d12).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_vr_dlss_runtime();
     D3D12NgxInterceptionScope scope;
@@ -4664,6 +4679,14 @@ void evaluate_nr_after_native_d3d12(
     if (!read_ngx_frame_contract(parameters, reinterpret_cast<std::uintptr_t>(handle),
             d3d12_game_feature(handle), contract)) return false;
 
+    const bool rr = contract.feature_id == 13U;
+    if (rr && !rr_crop_supported(parameters, contract)) {
+        static std::atomic<unsigned> unsupported_rr{};
+        if (unsupported_rr.fetch_add(1) < 8)
+            trace_event("RR crop unavailable: missing/invalid guides, output alpha, high-resolution motion or legacy research input; keeping native RR and optional NR");
+        return false;
+    }
+
     const auto effective_settings = settings_for_view(settings, contract.view_id);
 
     auto* const full_color = get_d3d12_parameter_resource(parameters, "Color");
@@ -4691,12 +4714,13 @@ void evaluate_nr_after_native_d3d12(
 
     PeripheralDlaaResources peripheral{};
     bool peripheral_ready{};
-    if (effective_settings.peripheral_dlaa_enabled &&
-        contract.feature_id == 1U &&
+    if ((rr || effective_settings.peripheral_dlaa_enabled) &&
+        (contract.feature_id == 1U || rr) &&
         full_color != nullptr && full_depth != nullptr &&
         full_motion != nullptr && full_output != nullptr) {
         PeripheralDlaaRequest peripheral_request{};
         peripheral_request.view_id = contract.view_id;
+        peripheral_request.feature_id = contract.feature_id;
         peripheral_request.command_list = command_list;
         peripheral_request.color = full_color;
         peripheral_request.depth = full_depth;
@@ -4706,8 +4730,8 @@ void evaluate_nr_after_native_d3d12(
         peripheral_request.render_height = contract.render_height;
         peripheral_request.source_output_width = contract.output_width;
         peripheral_request.source_output_height = contract.output_height;
-        peripheral_request.scale = effective_settings.peripheral_dlaa_scale;
-        peripheral_request.preset = effective_settings.peripheral_dlaa_preset;
+        peripheral_request.scale = rr && !effective_settings.peripheral_dlaa_enabled ? 1.F : effective_settings.peripheral_dlaa_scale;
+        peripheral_request.preset = rr ? effective_settings.rr_peripheral_preset : effective_settings.peripheral_dlaa_preset;
         peripheral_request.color_base_x = full_color_x;
         peripheral_request.color_base_y = full_color_y;
         peripheral_request.depth_base_x = full_depth_x;
@@ -4737,12 +4761,15 @@ void evaluate_nr_after_native_d3d12(
         peripheral_timing.finish(peripheral_ready);
     }
 
+    // No raw noisy ray-traced color may become the RR composite background.
+    if (rr && !peripheral_ready) return false;
+
     // The periphery owns a separate temporal feature. Skipping it invalidates
     // that history even when the center continues to evaluate successfully.
     if (!peripheral_ready) skip_d3d12_history(peripheral_dlaa_view_id(contract.view_id));
 
     NgxPresetOverrideScope center_preset{
-        parameters, effective_settings.center_preset
+        parameters, rr ? effective_settings.rr_center_preset : effective_settings.center_preset, rr
     };
     auto* const evaluation = prepare_d3d12(
         command_list,
@@ -4758,8 +4785,11 @@ void evaluate_nr_after_native_d3d12(
     }
     contract.reset = contract.reset || d3d12_evaluation_gaze_reset(evaluation);
     contract.motion_vectors_low_res = d3d12_evaluation_low_res_motion(evaluation);
+    // RR also accumulates temporal history. Its cropped projection/guide bases
+    // and the backend's crop-relative vectors must describe the same movement.
+    // Resetting on every small movement prevents the denoiser from converging.
     contract.preserve_history_on_crop_move =
-        uses_coordinated_center(settings) || settings.eye_independent_coverage;
+        rr || uses_coordinated_center(settings) || settings.eye_independent_coverage;
     private_attempted = true;
 
     if (peripheral_ready && !d3d12_set_composite_base(
@@ -4770,6 +4800,10 @@ void evaluate_nr_after_native_d3d12(
         )) {
         restore_peripheral_dlaa_output(command_list, peripheral);
         peripheral_ready = false;
+        if (rr) {
+            finish_d3d12(command_list, parameters, evaluation, 0xBAD00005U);
+            return false;
+        }
     }
 
     D3D12DlssInputs inputs{};
@@ -4797,11 +4831,23 @@ void evaluate_nr_after_native_d3d12(
     D3D12PeripheralTimingScope sr_timing{
         command_list, D3D12TimingKind::foveated_dlss
     };
-    result = evaluate_d3d12_backend(
+    const auto evaluate_center = [&] { return evaluate_d3d12_backend(
         command_list, contract, inputs,
         const_cast<NgxParameters*>(parameters),
         d3d12_reconstruction_crop(evaluation), callbacks, sr_timing.backend(), &crop
-    );
+    ); };
+    if (rr) {
+        d3d12_align_reconstruction_grid(evaluation);
+        RrCropScope rr_crop{const_cast<NgxParameters*>(parameters), contract, crop};
+        RrInputCopiesScope copies{command_list,const_cast<NgxParameters*>(parameters),crop};
+        if (copies.ready()) {
+            inputs.color=get_d3d12_parameter_resource(parameters,"Color");
+            inputs.depth=get_d3d12_parameter_resource(parameters,"Depth");
+            inputs.motion_vectors=get_d3d12_parameter_resource(parameters,"MotionVectors");
+            inputs.color_base_x=inputs.color_base_y=inputs.depth_base_x=inputs.depth_base_y=inputs.mv_base_x=inputs.mv_base_y=0;
+            result = evaluate_center();
+        } else result=0xBAD00005U;
+    } else result = evaluate_center();
     sr_timing.finish(ngx_succeeded(result));
     diagnostic_note_private_result(DiagnosticApi::d3d12, result);
     const auto nr_center = d3d12_evaluation_center(evaluation);
@@ -4821,6 +4867,10 @@ void evaluate_nr_after_native_d3d12(
 [[nodiscard]] D3D12BackendCallbacks d3d12_backend_callbacks(
     const D3D12NgxRoute route
 ) noexcept {
+    if (inside_rr_runtime) return {
+        real_rr_create_d3d12.load(std::memory_order_acquire),
+        real_rr_evaluate_d3d12.load(std::memory_order_acquire),
+        real_rr_release_d3d12.load(std::memory_order_acquire)};
     if (route == D3D12NgxRoute::core_runtime) {
         return {
             real_core_create_d3d12.load(std::memory_order_acquire),
@@ -4873,8 +4923,9 @@ NgxResult process_d3d12_evaluation_impl(
         }
         // Both public and core runtimes can predate injection. Track adopted
         // game handles so release also cleans up private views and GPU state.
-        remember_d3d12_game_view(call.handle, 1U);
+        remember_d3d12_game_view(call.handle, inside_rr_runtime ? 13U : 1U);
     }
+    diagnostic_note_reconstruction_feature(DiagnosticApi::d3d12, d3d12_game_feature(call.handle));
     note_evaluation_begin(DiagnosticApi::d3d12, call.parameters);
     diagnostic_note_d3d12_ngx_route(call.route);
     static std::atomic<std::uint32_t> route_logs{};
@@ -4997,13 +5048,13 @@ void skip_d3d12_evaluation(const D3D12NgxEvaluationCall& call) {
     skip_dlss_nr_history(view_id);
 }
 
-NgxResult hook_evaluate_d3d12(
+NgxResult runtime_evaluate_d3d12(
     ID3D12GraphicsCommandList* const command_list,
     const NgxHandle* const handle,
     const NgxParameters* const parameters,
     const NgxProgressCallback callback
 ) {
-    const auto original = real_evaluate_d3d12.load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12 : real_evaluate_d3d12).load(std::memory_order_acquire);
     detect_vr_dlss_runtime();
     return dispatch_d3d12_ngx_evaluation(
         {
@@ -5049,7 +5100,7 @@ NgxResult evaluate_d3d12_c_impl(
     const NgxParameters* const parameters,
     const NgxProgressCallbackC callback
 ) {
-    const auto original = real_evaluate_d3d12_c.load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12_c : real_evaluate_d3d12_c).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_vr_dlss_runtime();
     if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
@@ -5065,8 +5116,9 @@ NgxResult evaluate_d3d12_c_impl(
             command_list, handle, parameters, nullptr};
         if (!recognizable_d3d12_dlss_evaluation(call))
             return original(command_list, handle, parameters, callback);
-        remember_d3d12_game_view(handle, 1U);
+        remember_d3d12_game_view(handle, inside_rr_runtime ? 13U : 1U);
     }
+    diagnostic_note_reconstruction_feature(DiagnosticApi::d3d12, d3d12_game_feature(handle));
     note_evaluation_begin(DiagnosticApi::d3d12, parameters);
     diagnostic_note_d3d12_ngx_route(D3D12NgxRoute::public_runtime);
     if (inside_streamline_evaluation) {
@@ -5140,7 +5192,7 @@ NgxResult evaluate_d3d12_c_impl(
     return result;
 }
 
-NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+NgxResult runtime_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallbackC callback) {
     const bool outer = !d3d12_ngx_interception_active();
     const auto result = evaluate_d3d12_c_impl(list, handle, parameters, callback);
@@ -5148,8 +5200,8 @@ NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle
     return result;
 }
 
-NgxResult hook_release_d3d12(NgxHandle* const handle) {
-    const auto original = real_release_d3d12.load(std::memory_order_acquire);
+NgxResult runtime_release_d3d12(NgxHandle* const handle) {
+    const auto original = (inside_rr_runtime ? real_rr_release_d3d12 : real_release_d3d12).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) return original(handle);
@@ -5171,6 +5223,46 @@ NgxResult hook_core_release_d3d12(NgxHandle* const handle) {
     if (!scope.outermost()) return original(handle);
     if (has_d3d12_game_view(handle)) forget_d3d12_game_view(handle);
     return original(handle);
+}
+
+NgxResult hook_create_d3d12(ID3D12GraphicsCommandList* list, unsigned feature,
+    NgxParameters* parameters, NgxHandle** handle) {
+    RrRuntimeScope scope{false};
+    return runtime_create_d3d12(list, feature, parameters, handle);
+}
+NgxResult hook_evaluate_d3d12(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallback callback) {
+    RrRuntimeScope scope{false};
+    return runtime_evaluate_d3d12(list, handle, parameters, callback);
+}
+NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    RrRuntimeScope scope{false};
+    return runtime_evaluate_d3d12_c(list, handle, parameters, callback);
+}
+NgxResult hook_release_d3d12(NgxHandle* handle) {
+    RrRuntimeScope scope{false};
+    return runtime_release_d3d12(handle);
+}
+
+NgxResult hook_rr_create_d3d12(ID3D12GraphicsCommandList* list, unsigned feature,
+    NgxParameters* parameters, NgxHandle** handle) {
+    RrRuntimeScope scope;
+    return runtime_create_d3d12(list, feature, parameters, handle);
+}
+NgxResult hook_rr_evaluate_d3d12(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallback callback) {
+    RrRuntimeScope scope;
+    return runtime_evaluate_d3d12(list, handle, parameters, callback);
+}
+NgxResult hook_rr_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
+    const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    RrRuntimeScope scope;
+    return runtime_evaluate_d3d12_c(list, handle, parameters, callback);
+}
+NgxResult hook_rr_release_d3d12(NgxHandle* handle) {
+    RrRuntimeScope scope;
+    return runtime_release_d3d12(handle);
 }
 
 template <typename Function>
@@ -5593,6 +5685,52 @@ template <typename T>
     return selected;
 }
 
+[[nodiscard]] HMODULE find_rr_runtime(const bool require_stability) noexcept {
+    // One callback set owns one snippet for this process. Retain the selected
+    // image so a later unload/reload cannot leave its detours or private feature
+    // callbacks pointing into freed memory. Never switch them to another DLL.
+    static HMODULE selected{};
+    if (selected) return selected;
+    std::array<HMODULE, 2048> modules{};
+    DWORD required{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &required) || required > sizeof(modules)) {
+        return nullptr;
+    }
+    HMODULE candidate{};
+    unsigned count{};
+    std::array<wchar_t, 2048> candidate_path{};
+    for (std::size_t i = 0; i < required / sizeof(HMODULE); ++i) {
+        std::array<wchar_t, 2048> path{};
+        const auto length = GetModuleFileNameW(modules[i], path.data(), static_cast<DWORD>(path.size()));
+        if (!length || length >= path.size() || !is_dlss_rr_runtime_path({path.data(), length})) continue;
+        if (!GetProcAddress(modules[i], "NVSDK_NGX_GetSnippetVersion") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_CreateFeature") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_EvaluateFeature") ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_ReleaseFeature")) continue;
+        candidate = modules[i]; candidate_path = path; ++count;
+    }
+    static unsigned previous_count = ~0U;
+    if (count != previous_count) {
+        trace_event("RR lower-runtime discovery candidates=%u; %s", count,
+            count == 1 ? "one RR snippet found" : count ? "ambiguous RR snippets; passing through" : "waiting for an RR snippet");
+        previous_count = count;
+    }
+    // NGX briefly loads the shipped DLSSD DLL while selecting an OTA model.
+    // Pinning that probe would keep it resident and strand this callback set on
+    // an unused image. Stabilize the sole candidate before retaining it.
+    static HMODULE observed{};
+    static ULONGLONG observed_since{};
+    const auto current = count == 1 ? candidate : nullptr;
+    const auto now = GetTickCount64();
+    if (observed != current) { observed = current; observed_since = now; }
+    if (require_stability && (!current || now - observed_since < 1500U)) return nullptr;
+    if (count == 1 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(candidate), &selected)) {
+        trace_event("RR lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
+    }
+    return selected;
+}
+
 [[nodiscard]] bool install_direct_export_hooks(
     const bool require_runtime_stability = false
 ) noexcept {
@@ -5726,6 +5864,20 @@ template <typename T>
             real_release_d3d12,
             DiagnosticApi::d3d12
         );
+    }
+
+    // SR and RR may coexist. Never overwrite SR trampolines with RR exports.
+    static RuntimeStability rr_stability{};
+    const auto rr = find_rr_runtime(require_runtime_stability);
+    if (runtime_ready_for_direct_hooks(rr, rr_stability, L"nvngx_dlssd.dll", require_runtime_stability)) {
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_CreateFeature",
+            reinterpret_cast<void*>(&hook_rr_create_d3d12), real_rr_create_d3d12, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_EvaluateFeature",
+            reinterpret_cast<void*>(&hook_rr_evaluate_d3d12), real_rr_evaluate_d3d12, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_EvaluateFeature_C",
+            reinterpret_cast<void*>(&hook_rr_evaluate_d3d12_c), real_rr_evaluate_d3d12_c, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(rr, "NVSDK_NGX_D3D12_ReleaseFeature",
+            reinterpret_cast<void*>(&hook_rr_release_d3d12), real_rr_release_d3d12, DiagnosticApi::d3d12);
     }
 
     const auto observed_core_runtime = find_core_runtime();

@@ -131,6 +131,18 @@ def run(engine):
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
     state["settings"]["Enabled"] = True
+    rr = copy.deepcopy(state)
+    rr["renderer"] = 1
+    rr["apis"] = [{}, {"reconstruction_feature": 13}]
+    rr["settings"].update(RrCenterPreset=6, RrPeripheralPreset=4, PeripheralDlaa=True)
+    receive(rr)
+    draw()
+    assert g["values"]["Center RR preset"] == 6 and g["values"]["Peripheral RR preset"] == 4
+    assert set(g.combos["Center RR preset"].keys()) == {0, 4, 5, 6}
+    assert g["values"]["Center preset"] is None, "RR exposed SR-only presets"
+    receive(state)
+    draw()
+    assert g["values"]["Center preset"] is not None and g["values"]["Center RR preset"] is None
     afw = copy.deepcopy(state)
     afw["renderer"] = 1  # AFW supports DX12; the newest ordinary host report may be DX11.
     afw["afw_experiment"] = {"enabled": True, "core_calls": 100, "lower_calls": 0,

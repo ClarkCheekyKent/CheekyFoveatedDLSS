@@ -16,6 +16,7 @@ struct RuntimeDiagnostics {
     std::atomic<std::uint64_t> create_calls{};
     std::atomic<std::uint64_t> evaluate_calls{};
     std::atomic<std::uint64_t> active_calls{};
+    std::atomic<std::uint32_t> reconstruction_feature{};
     std::atomic<std::uint32_t> received_input_width{};
     std::atomic<std::uint32_t> received_input_height{};
     std::atomic<std::uint32_t> received_output_width{};
@@ -173,6 +174,9 @@ void diagnostic_note_create(const DiagnosticApi api) noexcept {
     for_api(api).create_calls.fetch_add(1U, std::memory_order_relaxed);
 }
 
+void diagnostic_note_reconstruction_feature(DiagnosticApi api, std::uint32_t feature) noexcept {
+    for_api(api).reconstruction_feature.store(feature, std::memory_order_release);
+}
 void diagnostic_note_evaluate(
     const DiagnosticApi api,
     const std::uint32_t input_width,
@@ -455,6 +459,7 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         data.create_calls.load(std::memory_order_relaxed),
         data.evaluate_calls.load(std::memory_order_relaxed),
         data.active_calls.load(std::memory_order_relaxed),
+        data.reconstruction_feature.load(std::memory_order_acquire),
         data.received_input_width.load(std::memory_order_acquire),
         data.received_input_height.load(std::memory_order_acquire),
         data.received_output_width.load(std::memory_order_acquire),

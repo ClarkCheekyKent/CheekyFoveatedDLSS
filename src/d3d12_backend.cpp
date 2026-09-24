@@ -1,4 +1,5 @@
 #include "backend.hpp"
+#include "rr_contract.hpp"
 #include "d3d12_output_contract.hpp"
 #include "d3d12_composite_shader.hpp"
 #include "composite_constants.hpp"
@@ -38,6 +39,7 @@ struct CanonicalFeatureKey {
     std::uint32_t perf_quality{};
     std::uint32_t create_flags{};
     std::array<std::uint32_t, 6U> presets{};
+    std::array<std::uint32_t, 3U> rr_modes{};
 };
 
 struct CanonicalViewState {
@@ -104,7 +106,7 @@ std::array<
         left.output_height == right.output_height &&
         left.perf_quality == right.perf_quality &&
         left.create_flags == right.create_flags &&
-        left.presets == right.presets;
+        left.presets == right.presets && left.rr_modes == right.rr_modes;
 }
 
 [[nodiscard]] CanonicalViewState* find_view(const DlssViewId view_id) noexcept {
@@ -136,8 +138,12 @@ std::array<
         "DLSS.Hint.Render.Preset.UltraQuality",
     };
     for (std::size_t index{}; index < names.size(); ++index) {
-        key.presets[index] = get_ngx_integer_bits(parameters, names[index]);
+        key.presets[index] = get_ngx_integer_bits(parameters, contract.feature_id == 13U ? rr_presets[index] : names[index]);
     }
+    if (contract.feature_id == 13U) key.rr_modes = {
+        get_ngx_integer_bits(parameters,"DLSS.Denoise.Mode"),
+        get_ngx_integer_bits(parameters,"DLSS.Roughness.Mode"),
+        get_ngx_integer_bits(parameters,"DLSS.Use.HW.Depth")};
     return key;
 }
 
@@ -450,7 +456,7 @@ void release_resources(D3D12Resources* const resources) noexcept {
     root_parameters[1].DescriptorTable.pDescriptorRanges = &ranges[1];
     root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[2].Constants.ShaderRegister = 0U;
-    root_parameters[2].Constants.Num32BitValues = 44U;
+    root_parameters[2].Constants.Num32BitValues = 48U;
 
     D3D12_ROOT_SIGNATURE_DESC root_description{};
     root_description.NumParameters = 3U;
@@ -733,6 +739,7 @@ struct D3D12Evaluation {
     std::uint32_t dlss_source_y{};
     std::uint32_t reset{};
     CropGeometry crop{};
+    bool align_reconstruction_grid{};
     FoveationCenter center{};
     float shape_width{};
     float shape_height{};
@@ -1342,6 +1349,10 @@ ID3D12Resource* d3d12_private_output(
         : evaluation->resources->dlss_output;
 }
 
+void d3d12_align_reconstruction_grid(D3D12Evaluation* evaluation) noexcept {
+    if (evaluation) evaluation->align_reconstruction_grid=true;
+}
+
 bool d3d12_set_composite_base(
     D3D12Evaluation* const evaluation,
     ID3D12Resource* const low_resolution_color,
@@ -1537,6 +1548,20 @@ void finish_d3d12(
             evaluation->mask.count, evaluation->exposure.texture ? evaluation->exposure.pre / evaluation->exposure.scale : 0.F, {},
         };
         std::memcpy(constants.mask_bounds, evaluation->mask.bounds, sizeof(constants.mask_bounds));
+        if (evaluation->align_reconstruction_grid) {
+            // Map full-frame output pixel edges through the original render
+            // grid into the private reconstruction. Integer RectBase/RectSize
+            // bound the dispatch; they must not redefine the sampling phase.
+            const auto& c=evaluation->crop;
+            const double rx=double(evaluation->render_width)/evaluation->output_width;
+            const double ry=double(evaluation->render_height)/evaluation->output_height;
+            const double sx=double(resources->output_width)/c.input_width;
+            const double sy=double(resources->output_height)/c.input_height;
+            constants.reconstruction_grid[0]=float(rx*sx);
+            constants.reconstruction_grid[1]=float(ry*sy);
+            constants.reconstruction_grid[2]=float(((double(c.output_base_x)-evaluation->output_x)*rx-c.input_base_x)*sx);
+            constants.reconstruction_grid[3]=float(((double(c.output_base_y)-evaluation->output_y)*ry-c.input_base_y)*sy);
+        }
 
         ID3D12DescriptorHeap* heaps[] = {resources->descriptors};
         command_list->SetDescriptorHeaps(1U, heaps);
@@ -1549,7 +1574,7 @@ void finish_d3d12(
         command_list->SetComputeRootDescriptorTable(1U, gpu);
         command_list->SetComputeRoot32BitConstants(
             2U,
-            44U,
+            48U,
             &constants,
             0U
         );

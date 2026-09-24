@@ -139,6 +139,16 @@ void test_ui_diagnostics() {
         render("DLSS-SR"); text = render("DLSS-SR");
         require(text.find(sample.second) != text.npos, "Incorrect SR on/off comparison for slower, equal or unsampled frames");
     }
+    state.snapshot = R"({"apis":[{}, {"reconstruction_feature":13}]})";
+    state.draft.rr_center_preset = 6; state.draft.rr_peripheral_preset = 4;
+    state.draft.peripheral_dlaa_enabled = true;
+    render("DLSS-SR"); text = render("DLSS-SR");
+    require(text.find("Center RR preset") != text.npos && text.find("Peripheral RR preset") != text.npos,
+        "Standalone preset menus did not switch to RR");
+    state.snapshot = R"({"apis":[{}, {"reconstruction_feature":1}]})";
+    render("DLSS-SR"); text = render("DLSS-SR");
+    require(text.find("Center RR preset") == text.npos && text.find("Center preset") != text.npos,
+        "Standalone preset menus did not return to SR");
     state.draft.enabled = false;
     state.draft.nr_enabled = false;
     state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":0}})";

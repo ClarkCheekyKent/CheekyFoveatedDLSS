@@ -761,6 +761,8 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "PeripheralDlaaScale",
         settings.peripheral_dlaa_scale
     ));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "RrCenterPreset", settings.rr_center_preset));
+    static_cast<void>(reshade::get_config_value(nullptr, config_section, "RrPeripheralPreset", settings.rr_peripheral_preset));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "CenterPreset",
         settings.center_preset
@@ -942,6 +944,8 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "PeripheralDlaaScale",
         settings.peripheral_dlaa_scale
     );
+    reshade::set_config_value(nullptr, config_section, "RrCenterPreset", settings.rr_center_preset);
+    reshade::set_config_value(nullptr, config_section, "RrPeripheralPreset", settings.rr_peripheral_preset);
     reshade::set_config_value(
         nullptr, config_section, "CenterPreset",
         settings.center_preset
@@ -1103,24 +1107,23 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         peripheral_scale_draft = settings.peripheral_dlaa_scale;
         size_drafts_initialized = true;
     }
-    const auto preset_combo = [&changed](
+    const bool rr = diagnostic_snapshot(DiagnosticApi::d3d12).reconstruction_feature == 13;
+    const auto preset_combo = [&changed, rr](
         const char* const label,
         std::uint32_t& value,
         const bool allow_game_default
     ) {
-        static constexpr std::uint32_t values[]{
-            0U, 5U, 11U, 12U, 13U
-        };
-        static constexpr const char* labels[]{
+        const std::uint32_t values[]{0U, rr ? 4U : 5U, rr ? 5U : 11U, rr ? 6U : 12U, 13U};
+        const char* labels[]{
             "Game/default",
-            "E (Fastest)",
-            "K",
-            "L",
+            rr ? "D" : "E (Fastest)",
+            rr ? "E" : "K",
+            rr ? "F" : "L",
             "M",
         };
-        const int first = allow_game_default ? 0 : 1;
+        const int first = (rr || allow_game_default) ? 0 : 1;
         int selected{};
-        const auto count = static_cast<int>(std::size(values));
+        const auto count = rr ? 4 : static_cast<int>(std::size(values));
         for (int index = first; index < count; ++index) {
             if (values[index] == value) {
                 selected = index - first;
@@ -1135,7 +1138,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     changed |= ImGui::Checkbox("Enable foveated DLSS-SR", &settings.enabled);
     ImGui::SameLine();
     ImGui::TextDisabled("(Alt+Shift+/)");
-    preset_combo("Center preset", settings.center_preset, true);
+    preset_combo(rr ? "Center RR preset" : "Center preset", rr ? settings.rr_center_preset : settings.center_preset, true);
     static float supersampling_draft = 1.0F;
     static bool editing_supersampling{};
     if (!editing_supersampling) supersampling_draft = settings.center_supersampling;
@@ -1165,7 +1168,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (settings.peripheral_dlaa_enabled) {
         preset_combo(
             "Peripheral preset",
-            settings.peripheral_dlaa_preset,
+            rr ? settings.rr_peripheral_preset : settings.peripheral_dlaa_preset,
             false
         );
         if (ImGui::SliderFloat(
@@ -1369,6 +1372,8 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         settings.enabled = defaults.enabled;
         settings.peripheral_dlaa_enabled = defaults.peripheral_dlaa_enabled;
         settings.peripheral_dlaa_scale = defaults.peripheral_dlaa_scale;
+        settings.rr_center_preset = defaults.rr_center_preset;
+        settings.rr_peripheral_preset = defaults.rr_peripheral_preset;
         settings.center_preset = defaults.center_preset;
         settings.center_supersampling = defaults.center_supersampling;
         supersampling_draft = defaults.center_supersampling;

@@ -1743,18 +1743,22 @@ void retained_calibration(bool source12, bool submit11, EyeCalibrationBackend ba
     };
     auto acquire = [&] {
         const auto deadline = GetTickCount64() + 10000;
-        do { frame(); } while ((!eye_calibration_stats().crop_mapping_active || eye_calibration_stats().acquisition_confirmations < 4) && GetTickCount64() < deadline);
+        do { frame(); } while ((!eye_calibration_stats().crop_mapping_active || eye_calibration_stats().acquisition_confirmations < 1) && GetTickCount64() < deadline);
         require(eye_calibration_stats().crop_mapping_active, "Change-only calibration must acquire and publish a crop");
         for (unsigned i = 0; i < 12; ++i) frame(true);
     };
     acquire();
     const auto stable = eye_calibration_stats();
+    require(stable.acquisition_confirmations == 1,
+        "Change-only mode must retain the first valid publication without continuing marker verification");
     Sleep(2600);
     swapped = true;
     for (unsigned i = 0; i < 25; ++i) frame(true);
     require(eye_calibration_stats().captures == stable.captures && eye_calibration_stats().applied == stable.applied &&
         eye_calibration_stats().crop_mapping_active && stereo_eye_assignment(views[0]).eye_index == 0,
         "Change-only mode must retain its crop past expiry and deliberately ignore same-view eye swaps");
+    require(eye_calibration_stats().recalibration_requests == stable.recalibration_requests,
+        "Missing or changed markers must not request recalibration after one-shot publication");
     eye_calibration_reset_stats(); frame(true);
     require(eye_calibration_stats().captures == 0, "Counter reset must preserve retained calibration");
     eye_calibration_recalibrate();

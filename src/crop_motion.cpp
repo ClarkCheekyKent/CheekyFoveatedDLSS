@@ -163,6 +163,7 @@ struct Pass12 {
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
     unsigned width{}, height{};
+    bool copy_only{};
     std::uint64_t list_token{};
 };
 std::mutex mutex12;
@@ -263,7 +264,7 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
     std::lock_guard lock(mutex12);
     std::shared_ptr<Pass12> pass;
     for (auto it = available12.begin(); it != available12.end(); ++it) {
-        if ((*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
+        if (!(*it)->copy_only && (*it)->source.Get() == source && (*it)->width == output_width && (*it)->height == output_height) {
             pass = *it; available12.erase(it); break;
         }
     }
@@ -302,6 +303,47 @@ ID3D12Resource* prepare_crop_motion12(ID3D12GraphicsCommandList* list,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     return pass->output.Get();
 }
+ID3D12Resource* prepare_crop_texture12(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+    unsigned x, unsigned y, unsigned width, unsigned height) noexcept {
+    if (!list || !source || !width || !height) return nullptr;
+    auto desc = source->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 ||
+        desc.SampleDesc.Count != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) ||
+        !bounds(x,width,desc.Width) || !bounds(y,height,desc.Height)) return nullptr;
+    ComPtr<ID3D12Device> device;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+    std::lock_guard lock(mutex12);
+    if (pending12.size() >= 64) return nullptr;
+    std::shared_ptr<Pass12> pass;
+    for (auto it=available12.begin(); it!=available12.end(); ++it) {
+        if ((*it)->copy_only && (*it)->source.Get()==source && (*it)->width==width && (*it)->height==height) {
+            pass=*it; available12.erase(it); break;
+        }
+    }
+    if (!pass) {
+        pass=std::make_shared<Pass12>(); pass->device=device; pass->source=source;
+        pass->width=width; pass->height=height; pass->copy_only=true;
+        desc.Width=width; desc.Height=height; desc.MipLevels=1;
+        desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask=heap.VisibleNodeMask=1;
+        if (FAILED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&pass->output)))) return nullptr;
+    }
+    pass->list=list; pass->list_token=list_token(list,true); pass->fence.Reset();
+    pending12.push_back(pass);
+    transition(list,source,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION from{},to{};
+    from.pResource=source; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.pResource=pass->output.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX box{x,y,0,x+width,y+height,1};
+    list->CopyTextureRegion(&to,0,0,0,&from,&box);
+    transition(list,source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    transition(list,pass->output.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return pass->output.Get();
+}
+
 void crop_motion12_submitted(ID3D12CommandQueue* queue, unsigned count,
     ID3D12CommandList* const* lists) noexcept {
     if (!queue || !lists) return;

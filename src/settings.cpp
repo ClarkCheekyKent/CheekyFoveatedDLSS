@@ -19,6 +19,7 @@ std::atomic<bool> d3d11_use_d3d12_transport{false};
 std::atomic<bool> peripheral_dlaa_enabled{true};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
+std::atomic<std::uint32_t> rr_center_preset{}, rr_peripheral_preset{};
 std::atomic<std::uint32_t> center_supersampling_bits{0x3F800000U};
 std::atomic<bool> afw_manual_coverage{false};
 std::atomic<bool> afw_automatic_coverage{false};
@@ -151,6 +152,8 @@ Settings configured_settings() noexcept {
     settings.afw_manual_coverage = afw_manual_coverage.load(std::memory_order_acquire);
     settings.afw_automatic_coverage = afw_automatic_coverage.load(std::memory_order_acquire);
     settings.afw_warp_margin = load_float(afw_warp_margin_bits);
+    settings.rr_center_preset = rr_center_preset.load(std::memory_order_acquire);
+    settings.rr_peripheral_preset = rr_peripheral_preset.load(std::memory_order_acquire);
     settings.center_preset =
         center_preset.load(std::memory_order_acquire);
     settings.peripheral_dlaa_preset =
@@ -247,6 +250,9 @@ void update_settings(const Settings& settings) noexcept {
     afw_automatic_coverage.store(settings.afw_automatic_coverage, std::memory_order_release);
     store_float(afw_warp_margin_bits, std::isfinite(settings.afw_warp_margin)
         ? std::clamp(settings.afw_warp_margin, 0.F, 0.25F) : 0.05F);
+    const auto valid_rr = [](unsigned v) { return v == 0 || v == 4 || v == 5 || v == 6; };
+    rr_center_preset.store(valid_rr(settings.rr_center_preset) ? settings.rr_center_preset : 0);
+    rr_peripheral_preset.store(valid_rr(settings.rr_peripheral_preset) ? settings.rr_peripheral_preset : 0);
     center_preset.store(
         settings.center_preset == 0U || valid_preset(settings.center_preset)
             ? settings.center_preset

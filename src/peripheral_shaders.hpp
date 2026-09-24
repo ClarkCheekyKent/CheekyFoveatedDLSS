@@ -67,4 +67,16 @@ void Main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+inline constexpr char rr_guide_downsample_shader_source[] = R"(
+Texture2D<float4> Source : register(t0);
+RWTexture2D<float4> Destination : register(u0);
+cbuffer Constants : register(b0) { uint2 SourceBase; uint2 SourceSize; uint2 DestSize; };
+[numthreads(16, 16, 1)]
+void Main(uint3 id : SV_DispatchThreadID) {
+    if (any(id.xy >= DestSize)) return;
+    const uint2 local = min(((2U * id.xy + 1U) * SourceSize) / (2U * DestSize), SourceSize - 1U);
+    Destination[id.xy] = Source.Load(int3(SourceBase + local, 0));
+}
+)";
+
 }

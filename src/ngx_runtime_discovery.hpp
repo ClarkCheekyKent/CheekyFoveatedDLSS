@@ -48,4 +48,17 @@ inline bool is_dlss_sr_runtime_path(std::wstring_view path) {
     return (name.ends_with(L".bin") || name.ends_with(L".dll")) &&
         normalized.find(L"\\ngx\\models\\dlss\\versions\\") != std::wstring::npos;
 }
+// RR owns a separate callback set even when both model DLLs are loaded.
+inline bool is_dlss_rr_runtime_path(std::wstring_view path) {
+    std::wstring normalized(path);
+    for (auto& c : normalized) {
+        if (c == L'/') c = L'\\';
+        else if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+    }
+    const auto name = std::wstring_view(normalized).substr(normalized.find_last_of(L'\\') + 1);
+    return name == L"nvngx_dlssd.dll" ||
+        ((name.ends_with(L".bin") || name.ends_with(L".dll")) &&
+         normalized.find(L"\\ngx\\models\\dlssd\\versions\\") != std::wstring::npos);
+}
+
 }

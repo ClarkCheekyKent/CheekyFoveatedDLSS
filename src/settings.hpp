@@ -43,6 +43,8 @@ struct Settings {
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
+    std::uint32_t rr_center_preset{};
+    std::uint32_t rr_peripheral_preset{};
     float center_supersampling{1.0F};
     // AFW needs donors for both eye regions even when the source eye is known.
     // Manual mode covers both offsets; the centered fallback starts at 70%.

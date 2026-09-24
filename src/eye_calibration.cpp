@@ -227,7 +227,10 @@ void placement_epoch(State& s) {
     s.policy.begin(eye_calibration_selected_method(), GetTickCount64());
 }
 bool retaining_calibration(const State& s) {
-    return !eye_calibration_continuous_validation() && s.published && !s.search_needed && s.policy.confirmations >= 4;
+    // Publication already passed identity, geometry, age and generation checks.
+    // Change-only mode must not keep verifying a usable mapping while waiting
+    // for consecutive marker hits: misses otherwise restart full acquisition.
+    return !eye_calibration_continuous_validation() && s.published && !s.search_needed;
 }
 void restart_calibration(State& s, const char* reason) {
     request_full_calibration(s, reason);
@@ -1118,7 +1121,8 @@ void poll(State& s) {
                     s.last_verified_ms = f.captured_ms;
                     s.published = true;
                     s.policy.failures = 0;
-                    if (++s.policy.confirmations == 4 && s.policy.configured == EyeCalibrationMethod::automatic) {
+                    const unsigned learning_confirmations = eye_calibration_continuous_validation() ? 4U : 1U;
+                    if (++s.policy.confirmations == learning_confirmations && s.policy.configured == EyeCalibrationMethod::automatic) {
                         const auto settings = configured_settings();
                         const auto method = unsigned(s.policy.active);
                         const bool same = settings.eye_calibration_learned_signature == signature &&

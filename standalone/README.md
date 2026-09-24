@@ -199,3 +199,11 @@ Packaging verifies each ZIP entry against its staged SHA-256 hash and refuses
 to overwrite an existing archive. `-BinaryRoot` can point to a CMake output
 directory. `-IncludeOpenXRSetup` includes the separately built matching OpenXR
 installer.
+
+## Experimental DX12 Ray Reconstruction
+
+Native NGX RR now has separate center/periphery processing and RR preset menus
+(Game default, D, E, F). SR preset selections are retained when switching modes.
+RR denoises the periphery; disabling Peripheral DLAA keeps RR at input resolution
+there. NR is available before and after RR. Unsupported guide contracts retain
+native full-frame RR and NR. Validation across games and headsets remains limited.

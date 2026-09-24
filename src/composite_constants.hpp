@@ -23,7 +23,10 @@ struct CompositeConstants {
     std::uint32_t mask_count;
     float exposure_white_multiplier;
     float mask_bounds[4][4];
+    // Private reconstruction pixels per full-output pixel, then phase offset.
+    // Zero scale retains the legacy rectangle-relative mapping.
+    float reconstruction_grid[4]{};
 };
 
-static_assert(sizeof(CompositeConstants) == 44U * sizeof(std::uint32_t));
+static_assert(sizeof(CompositeConstants) == 48U * sizeof(std::uint32_t));
 }

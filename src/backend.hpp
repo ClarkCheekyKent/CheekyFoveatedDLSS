@@ -120,6 +120,7 @@ void finish_d3d12(
     const D3D12Evaluation* evaluation
 ) noexcept;
 
+void d3d12_align_reconstruction_grid(D3D12Evaluation*) noexcept;
 [[nodiscard]] bool d3d12_set_composite_base(
     D3D12Evaluation* evaluation,
     ID3D12Resource* low_resolution_color,

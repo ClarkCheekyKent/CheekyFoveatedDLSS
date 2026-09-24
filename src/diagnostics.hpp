@@ -89,6 +89,7 @@ struct DiagnosticSnapshot {
     std::uint64_t create_calls{};
     std::uint64_t evaluate_calls{};
     std::uint64_t active_calls{};
+    std::uint32_t reconstruction_feature{};
     std::uint32_t received_input_width{};
     std::uint32_t received_input_height{};
     std::uint32_t received_output_width{};
@@ -124,6 +125,7 @@ void diagnostic_note_streamline_detected() noexcept;
 void diagnostic_note_direct_detour(DiagnosticApi api) noexcept;
 void diagnostic_note_d3d12_ngx_route(D3D12NgxRoute route) noexcept;
 void diagnostic_note_create(DiagnosticApi api) noexcept;
+void diagnostic_note_reconstruction_feature(DiagnosticApi api, std::uint32_t feature) noexcept;
 void diagnostic_note_evaluate(
     DiagnosticApi api,
     std::uint32_t input_width,

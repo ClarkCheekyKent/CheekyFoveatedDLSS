@@ -232,3 +232,29 @@ runtime focus or eye-tracking permissions.
 This change requires updating the installed **OpenXR layer**, as well as the game
 runtime. Close VR applications and run the matching OpenXR setup included in the
 RealVR gaze test package; replacing only the game's DLLs will not update the layer.
+
+### Direct3D 12 Ray Reconstruction
+
+Cheeky detects native NGX Ray Reconstruction separately from Super Resolution,
+including NVIDIA OTA runtimes and calls nested below R.E.A.L. VR. The center and
+periphery use separate RR features and histories. RR guide textures follow the
+center crop and peripheral scale, keeping the periphery denoised. Turning off
+Peripheral DLAA uses input-resolution RR there instead of raw ray-traced color.
+
+When RR is active, preset menus offer Game default, D, E and F. RR preferences
+are stored separately as `RrCenterPreset` and `RrPeripheralPreset`; SR preferences
+are retained when switching back. Preset availability depends on the installed
+NVIDIA runtime. SR-only periphery is not offered because SR cannot replace RR's
+denoising of noisy ray-traced input. NR remains available before or after RR.
+
+This path remains experimental; game/headset validation is limited. Cropped RR currently
+requires input-resolution motion and valid albedo/normal/roughness guides.
+Output alpha and legacy research inputs without independent crop coordinates
+use the game's native full-frame RR with optional NR. Moving the RR center
+preserves history using crop-relative motion vectors and a cropped projection;
+game resets, gaze jumps, geometry changes and discontinuities still invalidate it.
+
+The center uses crop-sized inputs and fractional composite alignment to preserve
+the full-frame sampling grid as it moves. Change-only eye calibration retains the
+first valid published mapping until a view, geometry, session or explicit
+calibration-setting change; continuous mode continues verifying markers.

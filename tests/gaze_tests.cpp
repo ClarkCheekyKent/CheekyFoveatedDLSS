@@ -7,6 +7,7 @@
 #include "afw_warp_abi.hpp"
 #include "afw_warp_runtime.hpp"
 #include "ngx_runtime_discovery.hpp"
+#include "rr_contract.hpp"
 #include "d3d12_output_contract.hpp"
 #include "diagnostics.hpp"
 #include "dlss_nr_contract.hpp"
@@ -1720,6 +1721,39 @@ void test_native_dynamic_resolution_extent() {
     expect(absent.values.empty(), "Missing keys are not invented and cannot leak into the game");
 }
 
+void test_rr_contract() {
+    using namespace cheeky::foveated_dlss;
+    expect(is_dlss_rr_runtime_path(L"C:/game/NVNGX_DLSSD.DLL"),"RR packaged DLL recognized");
+    expect(is_dlss_rr_runtime_path(L"C:/NVIDIA/NGX/models/dlssd/versions/123/files/model.bin"),"RR OTA recognized");
+    expect(!is_dlss_rr_runtime_path(L"C:/NVIDIA/NGX/models/dlss/versions/123/files/model.bin"),"SR cannot own RR callbacks");
+    expect(!is_dlss_sr_runtime_path(L"C:/NVIDIA/NGX/models/dlssd/versions/123/files/model.bin"),"RR cannot own SR callbacks");
+    MockNgxParameters p;
+    for(const auto& g:rr_guides) {
+        p.Set(g.resource,reinterpret_cast<ID3D12Resource*>(1)); p.Set(g.x,7U); p.Set(g.y,9U);
+    }
+    float matrix[16]{1,0,0,0, 0,1,0,0, 0,0,1,1, 0,0,0,0};
+    p.Set("ViewToClipMatrix",static_cast<void*>(matrix));
+    const auto original=p.values;
+    DlssFrameContract contract{}; contract.render_width=800; contract.render_height=600;
+    CropGeometry crop{100,150,400,300,0,0,800,600};
+    {
+        RrCropScope scope{&p,contract,crop};
+        for(const auto& g:rr_guides) expect(get_ui(&p,g.x)==107 && get_ui(&p,g.y)==159,"Each guide retains its own source origin");
+        void* changed{}; p.Get("ViewToClipMatrix",&changed);
+        const auto* m=static_cast<float*>(changed);
+        // Original NDC x=-.75 is the left boundary of [100,500] on an 800-pixel image.
+        expect(std::abs(-.75F*m[0]+m[8]+1.F)<1e-6F,"RR crop maps left boundary to NDC -1");
+        expect(std::abs(.25F*m[0]+m[8]-1.F)<1e-6F,"RR crop maps right boundary to NDC +1");
+        expect(matrix[0]==1 && changed!=matrix,"RR uses a private projection matrix");
+    }
+    expect(p.values==original,"RR restores every guide offset and the game's projection pointer");
+    Settings settings; settings.rr_center_preset=6; settings.rr_peripheral_preset=4;
+    update_settings(settings);
+    expect(current_settings().rr_center_preset==6 && current_settings().rr_peripheral_preset==4,"RR D/F settings survive normalization");
+    settings.rr_center_preset=13; update_settings(settings);
+    expect(current_settings().rr_center_preset==0,"SR-only preset M cannot become an RR preset");
+}
+
 void test_afw_dispatch_and_settings() {
     using namespace cheeky::foveated_dlss;
     expect(is_nvidia_ngx_core_alias_identity(L"C:/driver/NVNGX.DLL", L"NVIDIA Corporation",
@@ -2275,6 +2309,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--afw-gaze") == 0) {
         test_afw_gaze_integration(); test_afw_source_projection_coverage(); test_afw_gaze_pixel_coverage();
         if (!failures) std::cout << "AFW fixed allocation gaze tests passed\n";
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--rr-contract") == 0) {
+        test_rr_contract();
         return failures ? 1 : 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--d3d12-history") == 0) return run_d3d12_history_tests();

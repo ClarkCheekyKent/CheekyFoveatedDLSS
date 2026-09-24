@@ -184,6 +184,7 @@ std::string snapshot_locked(State& s) {
         if (index) out << ',';
         out << "{\"state\":\"" << json_escape(diagnostic_state_name(d.state)) << "\",\"hook\":" << d.hook_discovered
             << ",\"creates\":" << d.create_calls << ",\"evaluations\":" << d.evaluate_calls << ",\"active\":" << d.active_calls
+            << ",\"reconstruction_feature\":" << d.reconstruction_feature
             << ",\"input_width\":" << d.received_input_width << ",\"input_height\":" << d.received_input_height
             << ",\"output_width\":" << d.received_output_width << ",\"output_height\":" << d.received_output_height
             << ",\"foveated_ms\":" << d.foveated_dlss_gpu_ms << ",\"native_ms\":" << d.native_dlss_gpu_ms

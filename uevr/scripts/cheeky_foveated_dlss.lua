@@ -335,11 +335,13 @@ uevr.sdk.callbacks.on_draw_ui(function()
         imgui.tree_pop()
     end
 
-    if imgui.tree_node("DLSS-SR") then
+    local rr = d.reconstruction_feature == 13
+    if imgui.tree_node(rr and "DLSS-RR" or "DLSS-SR") then
         check("Enable foveated DLSS-SR", "Enabled")
         if draft.Enabled then
             section("Center")
-            combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"})
+            if rr then combo("Center RR preset", "RrCenterPreset", {[0]="Game/default",[4]="D",[5]="E",[6]="F"})
+            else combo("Center preset", "CenterPreset", {[0]="Game/default",[5]="E",[11]="K",[12]="L",[13]="M"}) end
             slider("Center supersampling", "CenterSupersampling", 1, 2)
             slider("Fovea width", "Width", 0.2, 1)
             slider("Fovea height", "Height", 0.2, 1)
@@ -350,7 +352,8 @@ uevr.sdk.callbacks.on_draw_ui(function()
             section("Periphery")
             check("Peripheral DLAA", "PeripheralDlaa")
             if draft.PeripheralDlaa then
-                combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"})
+                if rr then combo("Peripheral RR preset", "RrPeripheralPreset", {[0]="Game/default",[4]="D",[5]="E",[6]="F"})
+                else combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[11]="K",[12]="L",[13]="M"}) end
                 slider("Periphery scale", "PeripheralDlaaScale", 0.2, 1)
             end
         end

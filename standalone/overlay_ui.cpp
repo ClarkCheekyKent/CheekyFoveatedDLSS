@@ -137,16 +137,26 @@ void preset(const char* label, std::uint32_t& value, bool game_default) {
     ImGui::PopID();
 }
 
-void draw_sr(Settings& s) {
+void rr_preset(const char* label, std::uint32_t& value) {
+    constexpr unsigned values[]{0,4,5,6};
+    constexpr const char* names[]{"Game default", "D", "E", "F"};
+    int selected{};
+    for (int i=0;i<4;++i) if (value==values[i]) selected=i;
+    if (ImGui::Combo(label,&selected,names,4)) value=values[selected];
+}
+void draw_sr(Settings& s, bool rr) {
     ImGui::Checkbox("Enable foveated DLSS-SR", &s.enabled);
     ImGui::SeparatorText("Center quality");
-    preset("Center preset", s.center_preset, true);
+    if (rr) { ImGui::TextUnformatted("Ray Reconstruction active"); rr_preset("Center RR preset",s.rr_center_preset); }
+    else preset("Center preset", s.center_preset, true);
     slider("Center supersampling", s.center_supersampling, 1.0F, 2.0F, "%.2fx");
     ImGui::Checkbox("Peripheral DLAA", &s.peripheral_dlaa_enabled);
     if (s.peripheral_dlaa_enabled) {
-        preset("Peripheral preset", s.peripheral_dlaa_preset, false);
+        if (rr) rr_preset("Peripheral RR preset",s.rr_peripheral_preset);
+        else preset("Peripheral preset", s.peripheral_dlaa_preset, false);
         slider("Periphery scale", s.peripheral_dlaa_scale, .2F, 1.0F);
     }
+    if (rr) ImGui::TextWrapped("RR denoises both regions. Disabling peripheral DLAA uses input-resolution RR in the periphery.");
     ImGui::SeparatorText("Size and shape");
     slider("Fovea width", s.width, .2F, 1.0F);
     slider("Fovea height", s.height, .2F, 1.0F);
@@ -685,7 +695,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
                 end_tab();
             }
             if (begin_tab("DLSS-SR")) {
-                draw_sr(r.draft);
+                draw_sr(r.draft, member(array_object(member(r.snapshot,"apis"),1),"reconstruction_feature") == "13");
                 if (ImGui::Button("Reset SR defaults")) command(r, runtime, "defaults_sr");
                 if (ImGui::CollapsingHeader("Performance##sr", ImGuiTreeNodeFlags_DefaultOpen))
                     draw_sr_performance(r.snapshot, r.draft);
