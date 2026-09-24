@@ -155,6 +155,9 @@ struct Layer {
         info.displayTime = time; info.space = handle<XrSpace>(50);
         XrViewState state{XR_TYPE_VIEW_STATE}; XrView views[2]{{XR_TYPE_VIEW},{XR_TYPE_VIEW}}; uint32_t count{};
         require(fn<PFN_xrLocateViews>("xrLocateViews")(session, &info, &state, 2, &count, views) == XR_SUCCESS, "Locate views failed");
+        return snapshot();
+    }
+    CheekyGazeSnapshotV1 snapshot() {
         CheekyGazeSnapshotV1 result{};
         const auto read = reinterpret_cast<CheekyOpenXRGetGazeSnapshotFn>(GetProcAddress(module, "CheekyOpenXR_GetGazeSnapshot"));
         require(read(CHEEKY_GAZE_ABI_VERSION, &result, sizeof(result)) != 0, "Snapshot failed"); return result;
@@ -188,6 +191,29 @@ bool valid(const CheekyGazeSnapshotV1& s) { return (s.status_flags & CHEEKY_GAZE
 int run_openxr_input_tests() {
     HMODULE realvr{};
     try {
+        Runtime::reset();
+        {
+            Layer layer;
+            const auto host = layer.create_host_set();
+            require(layer.attach(host) == XR_SUCCESS, "Simulation host attachment");
+            const auto simulate = reinterpret_cast<void(__cdecl*)(std::uint32_t)>(GetProcAddress(layer.module, "CheekyOpenXR_SetSimulatedGaze"));
+            require(simulate != nullptr, "Simulation control export");
+            simulate(1);
+            Runtime::active = false;
+            layer.sync(host);
+            const auto before = layer.locate(1000000000);
+            require(valid(before), "Simulation must work without a physical gaze action");
+            for (unsigned i = 0; i < 8; ++i) {
+                layer.sync(host);
+                const auto after = layer.snapshot();
+                require(valid(after) && after.sample_time == before.sample_time &&
+                    after.views[0].center_u == before.views[0].center_u,
+                    "Controller sync must preserve the simulated gaze sample");
+            }
+            simulate(0);
+            layer.sync(host);
+            require(!valid(layer.snapshot()), "Disabling simulation restores physical gaze validity");
+        }
         Runtime::reset();
         { Layer layer; require(!valid(layer.locate(1)) && !Runtime::attaches && !Runtime::syncs,
             "Ordinary apps must not independently attach/sync"); }

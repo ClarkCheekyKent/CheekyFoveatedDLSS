@@ -1311,8 +1311,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         if (iterator != sessions.end()) {
             iterator->second.input.sync_result = result;
             iterator->second.input.pose_result = pose_result;
-            iterator->second.action_active = active;
-            if (!active) iterator->second.gaze_valid = false;
+            // Simulated samples come from LocateViews, independently of the
+            // physical gaze action. Controller sync must not erase them.
+            const bool preserve_simulation = result == XR_SUCCESS &&
+                iterator->second.simulated && simulated_gaze_enabled.load(std::memory_order_acquire);
+            if (!preserve_simulation) {
+                iterator->second.action_active = active;
+                if (!active) iterator->second.gaze_valid = false;
+            }
             publish_snapshot_locked(&iterator->second);
         }
     }
