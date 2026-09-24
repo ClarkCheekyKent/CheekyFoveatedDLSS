@@ -128,7 +128,7 @@ if(CHEEKY_BUILD_UEVR)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
     add_dependencies(CheekyStandaloneHostTests CheekyFoveatedDLSSHost CheekyFakeNGX CheekyFakeStreamline CheekyFakeRealVR)
-    foreach(mode native native-c streamline missing-lower public-first public-first-c ota ota-c ota-streamline ota-ambiguous)
+    foreach(mode native native-c streamline missing-lower public-first public-first-c ota ota-c ota-streamline ota-ambiguous dx12-rr dx12-rr-c dx12-rr-ota dx12-rr-streamline dx12-rr-streamline-c dx12-rr-ota-streamline)
         add_test(NAME CheekyStandaloneRealVR-${mode} COMMAND CheekyStandaloneHostTests realvr-${mode} standalone)
     endforeach()
     foreach(host standalone optiscaler)

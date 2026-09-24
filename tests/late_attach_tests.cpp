@@ -75,6 +75,7 @@ struct Fixture {
     Evaluate12 evaluate12{}; Evaluate12C evaluate12c{};
     Release release{}; Counter creates{},evaluates{},releases{};
     SlEvaluate sl_evaluate{}; SlOptions sl_options{};
+    unsigned sl_feature{};
     SlViewportHandle viewport{}; SlDlssOptions options{};
     FrameToken frame;
     bool complete_sl_metadata{};
@@ -122,7 +123,16 @@ struct Fixture {
     void (*before_frame)(){};
     NgxResult evaluate() {
         if (before_frame) before_frame();
-        if(use_sl) { ++frame.index; submit_metadata(); const void* inputs[]{&viewport, &viewport}; return sl_evaluate(0,complete_sl_metadata ? &frame : nullptr,inputs,ambiguous_sl_inputs ? 2U : 1U,context ? static_cast<void*>(context.Get()) : static_cast<void*>(list.Get())); }
+        if (use_sl) {
+            ++frame.index;
+            submit_metadata();
+            const void* inputs[]{&viewport, &viewport};
+            const auto result = sl_evaluate(sl_feature, complete_sl_metadata ? &frame : nullptr,
+                inputs, ambiguous_sl_inputs ? 2U : 1U,
+                context ? static_cast<void*>(context.Get()) : static_cast<void*>(list.Get()));
+            // Streamline succeeds with zero; its error codes are not NGX results.
+            return result == 0U ? 1U : 0xBAD00000U;
+        }
         if(context) return use_c ? evaluate11c(context.Get(),handle,&params,nullptr) : evaluate11(context.Get(),handle,&params,nullptr);
         return use_c ? evaluate12c(list.Get(),handle,&params,nullptr) : evaluate12(list.Get(),handle,&params,nullptr);
     }
@@ -741,6 +751,7 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
         for (auto* preset : rr_presets) f.params.Set(preset,0U);
     }
     require(ngx_succeeded(f.create12(f.list.Get(), rr_test ? 13U : 1U, &f.params, &f.handle)), "Create wrapped game feature before injection");
+    f.sl_feature = rr_test ? 1001U : 0U;
     if (use_sl) proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl, "CheekyFakeConfigure")(f.evaluate12, f.handle, &f.params);
     proc<void(*)(void(*)(const NgxParameters*))>(afw_core, "CheekyFakeObserve")(&observe_afw_core);
     if (!public_first) proc<void(*)(void(*)(const NgxParameters*))>(f.ngx, "CheekyFakeObserve")(&observe_afw_lower);
@@ -748,6 +759,32 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
 
 void verify_realvr_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     auto& f = fixture();
+    if (rr_test && f.use_sl && snapshot(get).find("\"d3d12_lower_hook_active\":false") != std::string::npos) {
+        // RR always delegates to NGX, including when the user selects the higher hook.
+        // Observe creation here: an opaque core handle created before injection
+        // does not expose its feature ID until it reaches the lower RR runtime.
+        require(ngx_succeeded(f.release(f.handle)), "Release pre-injection core RR handle");
+        require(ngx_succeeded(f.create12(f.list.Get(), 13U, &f.params, &f.handle)), "Observe core RR creation");
+        proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
+        command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=1\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false\nRrCenterPreset=5\nRrPeripheralPreset=4");
+        const auto creates_before = f.creates();
+        for (unsigned i = 0; i < 3; ++i) {
+            require(ngx_succeeded(f.evaluate()), "Higher-hook Streamline RR evaluation");
+            f.finish_gpu();
+        }
+        if (rr_cropped_calls != 3 || rr_peripheral_calls != 3 || !rr_guides_ok)
+            std::fprintf(stderr, "Higher RR counts center=%u peripheral=%u guides=%d; %s\n",
+                rr_cropped_calls, rr_peripheral_calls, rr_guides_ok, snapshot(get).c_str());
+        require(rr_cropped_calls == 3 && rr_peripheral_calls == 3 && rr_guides_ok,
+            "Higher-hook Streamline RR must process each center/periphery once with valid guides");
+        require(f.creates() == creates_before + 2, "Higher-hook RR must reuse private histories");
+        require(snapshot(get).find("\"reconstruction_feature\":13") != std::string::npos,
+            "Higher-hook Streamline RR must retain NGX feature 13");
+        require(get_ui(&f.params,"Width") == 128 && get_ui(&f.params,"OutWidth") == 256,
+            "Higher-hook RR must restore game dimensions");
+        require(ngx_succeeded(f.release(f.handle)), "Release higher-hook RR feature");
+        return;
+    }
     require(snapshot(get).find("\"d3d12_lower_hook_active\":true")!=std::string::npos,
         "Lower DLSS hook must be enabled by default");
     command("1\n200\nset\nEnabled=true\nPeripheralDlaa=true\nPeripheralDlaaScale=0.5\nWidth=0.35\nHeight=0.4\nCenterSupersampling=1\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false\nAlignmentBorder=true");
@@ -828,12 +865,20 @@ void verify_realvr_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) 
         const auto sr_before=sr_evals();
         proc<void(*)(HMODULE,bool)>(afw_core,"CheekyFakeForwardTo")(sr,false);
         require(ngx_succeeded(f.create12(f.list.Get(),1,&f.params,&f.handle)),"Switch from RR to SR");
+        if (f.use_sl) {
+            f.sl_feature = 0U;
+            proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
+        }
         require(ngx_succeeded(f.evaluate()),"SR beside RR failed"); f.finish_gpu();
         require(sr_evals()==sr_before+2 && f.evaluates()==rr_evals,"SR used RR's callbacks");
         require(snapshot(get).find("\"reconstruction_feature\":1")!=std::string::npos,"Menu failed to return to SR presets");
         require(ngx_succeeded(f.release(f.handle)),"Release switched SR feature");
         proc<void(*)(HMODULE,bool)>(afw_core,"CheekyFakeForwardTo")(f.ngx,false);
         f.handle=original_rr_handle;
+        if (f.use_sl) {
+            f.sl_feature = 1001U;
+            proc<void(*)(Evaluate12,const NgxHandle*,NgxParameters*)>(f.sl,"CheekyFakeConfigure")(f.evaluate12,f.handle,&f.params);
+        }
         require(ngx_succeeded(f.evaluate()),"Return to RR failed"); f.finish_gpu();
         require(f.evaluates()==rr_evals+2,"Returning to RR used SR's callbacks");
         require(snapshot(get).find("\"reconstruction_feature\":13")!=std::string::npos,"Menu failed to return to RR presets");

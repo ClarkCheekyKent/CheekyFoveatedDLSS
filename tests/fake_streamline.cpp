@@ -70,7 +70,7 @@ EXPORT unsigned slGetFeatureFunction(unsigned feature,const char* name,void** ou
 }
 EXPORT unsigned slEvaluateFeature(unsigned feature,const void*,const void* const* inputs,unsigned count,void* command) {
     ++evaluate_calls;
-    if(feature!=0U || (!cached_evaluate && !cached_evaluate11)) return 0x18U;
+    if((feature!=0U && feature!=1001U) || (!cached_evaluate && !cached_evaluate11)) return 0x18U;
     ID3D12Resource* original_color{};
     unsigned original_reset{};
     const View* view = count && inputs && inputs[0]

@@ -143,6 +143,20 @@ Core discovery fixtures verify a genuine-shaped NGX core
 alias is intercepted while an OptiScaler-shaped proxy is excluded. The fake
 DLLs are test fixtures only and must never be included in release packages.
 
+# Streamline Ray Reconstruction regression
+
+Run `CheekyUEVRTests.exe --lower-dx12-rr-streamline` or
+`CheekyStandaloneHostTests.exe realvr-dx12-rr-streamline standalone`.
+The `dx12-rr-streamline-c` and `dx12-rr-ota-streamline` variants cover the C
+callback and NVIDIA OTA runtime discovery. Streamline feature 1001 forwards to
+NGX feature 13 through the actual hooks with lower processing enabled.
+Checks cover separate center/periphery RR work, guide crops, moving-center
+history, native fallback, NR, and switching RR to SR and back. The outer VR
+call must retain its full-frame inputs and execute only once per frame.
+`--lower-dx12-rr-streamline --higher-hook` also checks delegation to the higher
+NGX hook with feature creation observed after injection.
+These tests use fake NVIDIA runtimes and do not validate headset gaze input.
+
 # NR-only gaze positioning regression
 
 The feature-creation controls, preset cache, jitter/multiplier and SDR codec

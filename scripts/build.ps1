@@ -148,12 +148,15 @@ foreach ($mode in @('accept','reject')) {
     if ($LASTEXITCODE -ne 0) { throw "NGX core discovery tests failed: $mode" }
 }
 
-foreach ($rrMode in @('dx12-rr', 'dx12-rr-c', 'dx12-rr-ota')) {
+foreach ($rrMode in @('dx12-rr', 'dx12-rr-c', 'dx12-rr-ota', 'dx12-rr-streamline', 'dx12-rr-streamline-c', 'dx12-rr-ota-streamline')) {
     & $uevrTest "--realvr-$rrMode"
     if ($LASTEXITCODE -ne 0) { throw "RR runtime test failed: $rrMode" }
     & $standaloneHostTest "realvr-$rrMode" standalone
     if ($LASTEXITCODE -ne 0) { throw "Standalone RR runtime test failed: $rrMode" }
 }
+
+& $uevrTest --lower-dx12-rr-streamline --higher-hook
+if ($LASTEXITCODE -ne 0) { throw "Higher-hook Streamline RR test failed." }
 
 Write-Host "Built and tested:"
 Write-Host (Join-Path $projectRoot "bin\$Configuration\standalone-loader\dxgi.dll")

@@ -149,6 +149,7 @@ constexpr std::uint32_t sl_tag_scaling_output = 4U;
 constexpr std::uint32_t sl_tag_exposure = 13U;
 constexpr std::size_t sl_tag_capacity = 73U;
 constexpr std::uint32_t sl_dlss_mode_dlaa = 6U;
+constexpr std::uint32_t sl_feature_dlss_rr = 1001U; // Streamline ID; NGX uses feature 13.
 constexpr std::uint32_t peripheral_streamline_view_mask = 0x40000000U;
 
 std::atomic<GetProcAddressFn> real_get_proc_address{};
@@ -3315,10 +3316,13 @@ std::uint32_t hook_sl_evaluate_feature(
     if(command_buffer && vulkan_command_device(static_cast<VkCommandBuffer>(command_buffer)))
         return original(feature,frame,inputs,input_count,command_buffer);
     detect_afw_runtime();
-    if (d3d12_lower_hook_enabled() && feature == 0U) {
+    if (feature == sl_feature_dlss_rr || (d3d12_lower_hook_enabled() && feature == 0U)) {
         // Keep the game's viewport/tags/options intact through upstream hooks. The nested
-        // native DX12 path owns SR. DX11 still needs normal option discovery
-        // and native-fallback handling even when the AFW DLL is loaded.
+        // native DX12 path owns lower-hook SR and all RR. RR must not enter
+        // StreamlineEvaluationScope: that would suppress its nested NGX feature 13
+        // before processing, gaze resolution, and calibration stamping can run.
+        // NGX dispatch still selects the configured higher or lower hook for RR.
+        // DX11 still needs normal option discovery and native-fallback handling.
         ID3D12GraphicsCommandList* dx12{};
         const bool dx12_call = command_buffer && SUCCEEDED(
             static_cast<IUnknown*>(command_buffer)->QueryInterface(IID_PPV_ARGS(&dx12)));
