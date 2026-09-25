@@ -1339,9 +1339,13 @@ bool realvr_present() noexcept {
 void poll_realvr_gaze_locked(InstanceState& instance, SessionState& state, XrTime time) {
     state.input.realvr_detected = realvr_present();
     if (!state.input.realvr_detected || !state.running ||
-        state.state != XR_SESSION_STATE_FOCUSED || !state.system_supported ||
-        instance.gaze_action == XR_NULL_HANDLE || state.gaze_space == XR_NULL_HANDLE ||
+        state.state != XR_SESSION_STATE_FOCUSED ||
         state.input.host_sync_calls || time <= 0) return;
+    const bool gaze_available = state.system_supported && instance.gaze_action != XR_NULL_HANDLE &&
+        state.gaze_space != XR_NULL_HANDLE;
+    const bool menu_available = instance.menu_graphics_enabled && instance.menu_action_set != XR_NULL_HANDLE &&
+        instance.menu_aim_action != XR_NULL_HANDLE && instance.menu_click_action != XR_NULL_HANDLE;
+    if (!gaze_available && !menu_available) return;
     const auto& d = instance.dispatch;
     if (!state.action_attached) {
         // Attachment is irreversible for this session. Leave hosts that created
@@ -1349,21 +1353,31 @@ void poll_realvr_gaze_locked(InstanceState& instance, SessionState& state, XrTim
         if (instance.host_action_sets_created || state.input.host_attach_calls ||
             state.fallback_setup_attempted || !d.attach_action_sets) return;
         state.fallback_setup_attempted = true;
-        const auto binding = ensure_gaze_binding_locked(instance);
-        if (XR_FAILED(binding) || !instance.gaze_binding_submitted) return;
+        if (gaze_available) static_cast<void>(ensure_gaze_binding_locked(instance));
+        if (menu_available) ensure_menu_bindings(instance);
+        std::array<XrActionSet, 2> sets{};
+        unsigned count{};
+        if (gaze_available && instance.gaze_binding_submitted) sets[count++] = instance.action_set;
+        if (menu_available) sets[count++] = instance.menu_action_set;
+        if (!count) return;
         XrSessionActionSetsAttachInfo info{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
-        info.countActionSets = 1;
-        info.actionSets = &instance.action_set;
+        info.countActionSets = count;
+        info.actionSets = sets.data();
         ++state.input.fallback_attach_calls;
         state.input.attach_result = d.attach_action_sets(state.session, &info);
         state.action_attached = XR_SUCCEEDED(state.input.attach_result);
+        if (menu_available) report_menu_diagnostic(state.action_attached ?
+            "OpenXR menu: RealVR controller actions attached" : "OpenXR menu: RealVR controller action attachment failed");
     }
     if (!state.action_attached || !d.sync_actions || state.last_fallback_sync_time == time) return;
     state.last_fallback_sync_time = time;
-    XrActiveActionSet active{instance.action_set, XR_NULL_PATH};
+    std::array<XrActiveActionSet, 2> active{};
+    unsigned count{};
+    if (gaze_available && instance.gaze_binding_submitted) active[count++] = {instance.action_set, XR_NULL_PATH};
+    if (menu_available) active[count++] = {instance.menu_action_set, XR_NULL_PATH};
     XrActionsSyncInfo info{XR_TYPE_ACTIONS_SYNC_INFO};
-    info.countActiveActionSets = 1;
-    info.activeActionSets = &active;
+    info.countActiveActionSets = count;
+    info.activeActionSets = active.data();
     ++state.input.fallback_sync_calls;
     state.input.sync_result = d.sync_actions(state.session, &info);
     if (state.input.sync_result != XR_SUCCESS) {

@@ -64,7 +64,8 @@ struct Runtime {
         });
         FN("xrSuggestInteractionProfileBindings", [](XrInstance, const XrInteractionProfileSuggestedBinding* info) {
             ++bindings;
-            require(info->countSuggestedBindings == 1 && info->suggestedBindings[0].action == handle<XrAction>(20), "Gaze binding missing");
+            require((info->countSuggestedBindings == 1 || info->countSuggestedBindings == 4) &&
+                info->suggestedBindings[0].action == handle<XrAction>(20), "Gaze/menu binding missing");
             return binding_result;
         });
         FN("xrCreateActionSpace", [](XrSession, const XrActionSpaceCreateInfo*, XrSpace* space) {
@@ -123,7 +124,7 @@ struct Layer {
         require(get(instance, name, &f) == XR_SUCCESS && f, "Missing layer function");
         return reinterpret_cast<T>(f);
     }
-    Layer() {
+    Layer(bool menu = false) {
         module = LoadLibraryW(L"CheekyOpenXRLayer.dll"); require(module != nullptr, "Missing layer DLL");
         const auto negotiate = reinterpret_cast<PFN_xrNegotiateLoaderApiLayerInterface>(GetProcAddress(module, "xrNegotiateLoaderApiLayerInterface"));
         XrNegotiateLoaderInfo loader{};
@@ -140,6 +141,9 @@ struct Layer {
         XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
         require(request.createApiLayerInstance(&info, &layer, &instance) == XR_SUCCESS, "Create instance failed");
         XrSessionCreateInfo create{XR_TYPE_SESSION_CREATE_INFO}; create.systemId = 1;
+        struct MockD3D11Binding { XrStructureType type; const void* next; void* device; };
+        const MockD3D11Binding graphics{XR_TYPE_GRAPHICS_BINDING_D3D11_KHR, nullptr, nullptr};
+        if (menu) create.next = &graphics;
         require(fn<PFN_xrCreateSession>("xrCreateSession")(instance, &create, &session) == XR_SUCCESS, "Create session failed");
         begin(); focus(true);
     }
@@ -262,6 +266,18 @@ int run_openxr_input_tests() {
         std::filesystem::create_directories(dir);
         std::filesystem::copy_file(bin / "test-fixtures" / "CheekyFakeRealVR.dll", dir / "RealVR64.dll", std::filesystem::copy_options::overwrite_existing);
         realvr = LoadLibraryW((dir / "RealVR64.dll").c_str()); require(realvr != nullptr, "RealVR fixture missing");
+        for (bool gaze : {true, false}) {
+            Runtime::reset();
+            Runtime::extension = gaze;
+            Layer layer(true);
+            layer.locate(1);
+            const auto expected = gaze ? 2U : 1U;
+            require(Runtime::attached_sets.size() == expected && Runtime::active_sets.size() == expected,
+                "RealVR must attach and synchronize menu controllers with or without eye tracking");
+            layer.locate(2);
+            require(Runtime::attaches == 1 && Runtime::syncs == 2,
+                "RealVR menu actions must attach once and update each frame");
+        }
         Runtime::reset();
         {
             Layer layer;
