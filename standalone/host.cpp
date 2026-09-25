@@ -313,6 +313,9 @@ bool start_host(std::uint32_t host,bool vulkan) {
     }
 }
 extern "C" __declspec(dllexport) bool CheekyHost_Start(std::uint32_t host) {return start_host(host,false);}
+extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuLogDiagnostic(const char* message) noexcept {
+    if (message) log_host(message);
+}
 extern "C" __declspec(dllexport) bool CheekyHost_StartVulkan(std::uint32_t host) {return start_host(host,true);}
 extern "C" __declspec(dllexport) VkResult CheekyHost_VulkanPresent(const CheekyVulkanPresent* present) {
     if(!present || present->size!=sizeof(*present) || !present->next || !present->present)return VK_ERROR_INITIALIZATION_FAILED;

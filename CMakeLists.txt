@@ -110,7 +110,7 @@ target_compile_definitions(
     CheekyOpenXRLayer
     PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
 )
-target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 dxgi dxguid version)
+target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid version)
 set_target_properties(
     CheekyOpenXRLayer
     PROPERTIES

@@ -6,6 +6,7 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #define VK_NO_PROTOTYPES
 #include "../third_party/vulkan/include/vulkan/vulkan_core.h"
 #include <openxr/openxr.h>
@@ -16,13 +17,17 @@
 #include "gaze_math.hpp"
 #include "eye_calibration.hpp"
 #include "projection_selection.hpp"
+#include "../shared/openxr_menu_bridge.hpp"
+#include "menu_geometry.hpp"
 #include "../src/realvr_runtime.hpp"
+#include <wrl/client.h>
 #include <deque>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <mutex>
@@ -68,12 +73,14 @@ struct Dispatch {
     PFN_xrAttachSessionActionSets attach_action_sets{};
     PFN_xrSyncActions sync_actions{};
     PFN_xrGetActionStatePose get_action_state_pose{};
+    PFN_xrGetActionStateBoolean get_action_state_boolean{};
     PFN_xrCreateActionSpace create_action_space{};
     PFN_xrCreateReferenceSpace create_reference_space{};
     PFN_xrDestroySpace destroy_space{};
     PFN_xrLocateSpace locate_space{};
     PFN_xrLocateViews locate_views{};
     PFN_xrCreateSwapchain create_swapchain{};
+    PFN_xrEnumerateSwapchainFormats enumerate_swapchain_formats{};
     PFN_xrDestroySwapchain destroy_swapchain{};
     PFN_xrEnumerateSwapchainImages enumerate_swapchain_images{};
     PFN_xrAcquireSwapchainImage acquire_swapchain_image{};
@@ -113,12 +120,14 @@ void populate_dispatch(
     );
     CHEEKY_LOAD(sync_actions, SyncActions);
     CHEEKY_LOAD(get_action_state_pose, GetActionStatePose);
+    CHEEKY_LOAD(get_action_state_boolean, GetActionStateBoolean);
     CHEEKY_LOAD(create_action_space, CreateActionSpace);
     CHEEKY_LOAD(create_reference_space, CreateReferenceSpace);
     CHEEKY_LOAD(destroy_space, DestroySpace);
     CHEEKY_LOAD(locate_space, LocateSpace);
     CHEEKY_LOAD(locate_views, LocateViews);
     CHEEKY_LOAD(create_swapchain, CreateSwapchain);
+    CHEEKY_LOAD(enumerate_swapchain_formats, EnumerateSwapchainFormats);
     CHEEKY_LOAD(destroy_swapchain, DestroySwapchain);
     CHEEKY_LOAD(enumerate_swapchain_images, EnumerateSwapchainImages);
     CHEEKY_LOAD(acquire_swapchain_image, AcquireSwapchainImage);
@@ -138,6 +147,37 @@ struct SubmittedView {
 };
 
 struct SessionState {
+    struct Menu {
+        XrSwapchain swapchain{XR_NULL_HANDLE};
+        std::vector<XrSwapchainImageD3D11KHR> images11;
+        std::vector<XrSwapchainImageD3D12KHR> images12;
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> convert_context11;
+        Microsoft::WRL::ComPtr<ID3D11VertexShader> convert_vertex11;
+        Microsoft::WRL::ComPtr<ID3D11PixelShader> convert_pixel11;
+        Microsoft::WRL::ComPtr<ID3D11SamplerState> convert_sampler11;
+        Microsoft::WRL::ComPtr<ID3D11RasterizerState> convert_raster11;
+        Microsoft::WRL::ComPtr<ID3D11DepthStencilState> convert_depth11;
+        Microsoft::WRL::ComPtr<ID3D11BlendState> convert_blend11;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> convert_source11;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> convert_source_view11;
+        std::vector<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>> convert_targets11;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>> allocators;
+        std::vector<std::uint64_t> fence_values;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> convert_root;
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> convert_pipeline;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> convert_rtv_heap;
+        std::vector<Microsoft::WRL::ComPtr<ID3D12DescriptorHeap>> convert_srv_heaps;
+        std::uint32_t convert_rtv_stride{};
+        std::uint64_t fence_value{};
+        std::uint32_t width{}, height{}, format{}, target_format{};
+        bool anchored{};
+        bool cylinder{};
+        unsigned strips{1};
+        XrPosef pose{};
+        XrExtent2Df size{};
+    } menu;
     struct LocatedProjection {
         XrTime time{};
         XrSpace space{XR_NULL_HANDLE};
@@ -152,11 +192,13 @@ struct SessionState {
     bool submitted_projection_valid{}, using_submitted_projection{};
     cheeky::openxr_calibration::Frame calibration;
     unsigned graphics_api{};
+    void* graphics_device{};
     void* graphics_queue{};
     XrSession session{XR_NULL_HANDLE};
     XrInstance instance{XR_NULL_HANDLE};
     XrSystemId system_id{XR_NULL_SYSTEM_ID};
     XrSpace gaze_space{XR_NULL_HANDLE};
+    std::array<XrSpace, 2> menu_aim_spaces{};
     XrSpace calibration_local_space{XR_NULL_HANDLE};
     XrViewConfigurationType view_configuration{};
     XrSessionState state{XR_SESSION_STATE_UNKNOWN};
@@ -164,6 +206,10 @@ struct SessionState {
     bool system_supported{};
     bool action_attached{};
     bool running{};
+    bool menu_submission_disabled{};
+    bool menu_cylinder_enabled{};
+    std::uint32_t max_layers{16};
+    XrTime menu_recenter_time{};
     bool fallback_setup_attempted{};
     XrTime last_fallback_sync_time{};
     CheekyGazeInputDiagnosticsV1 input{
@@ -211,7 +257,15 @@ struct InstanceState {
     Dispatch dispatch{};
     std::string runtime_name;
     bool extension_enabled{};
+    bool cylinder_enabled{};
     XrActionSet action_set{XR_NULL_HANDLE};
+    XrActionSet menu_action_set{XR_NULL_HANDLE};
+    XrAction menu_aim_action{XR_NULL_HANDLE};
+    XrAction menu_click_action{XR_NULL_HANDLE};
+    std::array<XrPath, 2> menu_hand_paths{};
+    std::array<XrPath, 5> menu_profiles{};
+    std::array<bool, 5> menu_bindings_submitted{};
+    bool menu_graphics_enabled{};
     XrAction gaze_action{XR_NULL_HANDLE};
     XrPath gaze_path{XR_NULL_PATH};
     XrPath gaze_profile{XR_NULL_PATH};
@@ -223,11 +277,665 @@ struct InstanceState {
 std::atomic<bool> simulated_gaze_enabled{};
 std::atomic<unsigned> simulation_pattern{};
 std::mutex state_mutex;
+std::mutex menu_mutex;
 std::unordered_map<XrInstance, InstanceState> instances;
 std::unordered_map<XrSession, SessionState> sessions;
 std::unordered_map<XrSwapchain, SwapchainState> swapchains;
 std::atomic<std::uint64_t> next_session_generation{1U};
 std::atomic<std::uint64_t> swapchain_generation{1U};
+
+void report_menu_status(const CheekyOpenXRMenuStatus status) noexcept {
+    const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
+    const auto report = host ? reinterpret_cast<CheekyOpenXRMenuReport>(
+        GetProcAddress(host, "CheekyOpenXRMenuReportStatus")) : nullptr;
+    if (report) report(status);
+}
+
+void report_menu_diagnostic(const char* const message) noexcept {
+    const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
+    const auto report = host ? reinterpret_cast<CheekyOpenXRMenuDiagnosticFn>(
+        GetProcAddress(host, "CheekyOpenXRMenuLogDiagnostic")) : nullptr;
+    if (report) report(message);
+}
+
+bool menu_copy_compatible(const DXGI_FORMAT source, const DXGI_FORMAT target) noexcept {
+    if (source == target) return true;
+    const auto in_group = [](const DXGI_FORMAT value, const DXGI_FORMAT a,
+        const DXGI_FORMAT b) { return value == a || value == b; };
+    return (in_group(source, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+        in_group(target, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) ||
+        (in_group(source, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+        in_group(target, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB));
+}
+
+bool initialize_menu_converter11(SessionState::Menu& menu, ID3D11Device* device) {
+    static constexpr char vertex_shader[] = R"(
+        struct Output { float4 position : SV_Position; float2 uv : TEXCOORD0; };
+        Output main(uint id : SV_VertexID) {
+            Output result;
+            result.uv = float2((id << 1) & 2, id & 2);
+            result.position = float4(result.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            return result;
+        })";
+    static constexpr char pixel_shader[] = R"(
+        Texture2D source_texture : register(t0);
+        SamplerState source_sampler : register(s0);
+        float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+            return source_texture.Sample(source_sampler, uv);
+        })";
+    Microsoft::WRL::ComPtr<ID3DBlob> vertex, pixel, errors;
+    if (FAILED(D3DCompile(vertex_shader, sizeof(vertex_shader) - 1, nullptr, nullptr, nullptr,
+            "main", "vs_5_0", 0, 0, &vertex, &errors)) ||
+        FAILED(D3DCompile(pixel_shader, sizeof(pixel_shader) - 1, nullptr, nullptr, nullptr,
+            "main", "ps_5_0", 0, 0, &pixel, &errors)) ||
+        FAILED(device->CreateDeferredContext(0, &menu.convert_context11)) ||
+        FAILED(device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(),
+            nullptr, &menu.convert_vertex11)) ||
+        FAILED(device->CreatePixelShader(pixel->GetBufferPointer(), pixel->GetBufferSize(),
+            nullptr, &menu.convert_pixel11))) return false;
+    D3D11_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D11_COMPARISON_ALWAYS;
+    sampler.MaxLOD = D3D11_FLOAT32_MAX;
+    D3D11_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D11_FILL_SOLID;
+    raster.CullMode = D3D11_CULL_NONE;
+    raster.DepthClipEnable = TRUE;
+    D3D11_DEPTH_STENCIL_DESC depth{};
+    depth.DepthEnable = FALSE;
+    depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    depth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    D3D11_BLEND_DESC blend{};
+    auto& blend_target = blend.RenderTarget[0];
+    blend_target.SrcBlend = D3D11_BLEND_ONE;
+    blend_target.DestBlend = D3D11_BLEND_ZERO;
+    blend_target.BlendOp = D3D11_BLEND_OP_ADD;
+    blend_target.SrcBlendAlpha = D3D11_BLEND_ONE;
+    blend_target.DestBlendAlpha = D3D11_BLEND_ZERO;
+    blend_target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    blend_target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(device->CreateSamplerState(&sampler, &menu.convert_sampler11)) ||
+        FAILED(device->CreateRasterizerState(&raster, &menu.convert_raster11)) ||
+        FAILED(device->CreateDepthStencilState(&depth, &menu.convert_depth11)) ||
+        FAILED(device->CreateBlendState(&blend, &menu.convert_blend11))) return false;
+    menu.convert_targets11.resize(menu.images11.size());
+    D3D11_RENDER_TARGET_VIEW_DESC target_view{};
+    target_view.Format = static_cast<DXGI_FORMAT>(menu.target_format);
+    target_view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    for (std::size_t index{}; index < menu.images11.size(); ++index)
+        if (FAILED(device->CreateRenderTargetView(menu.images11[index].texture,
+            &target_view, &menu.convert_targets11[index]))) return false;
+    return true;
+}
+
+bool render_menu_converter11(SessionState::Menu& menu, const CheekyOpenXRMenuFrame& frame,
+    const std::uint32_t index, const HMODULE host) {
+    if (index >= menu.convert_targets11.size() || !menu.convert_context11) return false;
+    auto* device = static_cast<ID3D11Device*>(frame.device);
+    auto* source = static_cast<ID3D11Texture2D*>(frame.texture);
+    if (menu.convert_source11.Get() != source) {
+        menu.convert_source_view11.Reset();
+        menu.convert_source11 = source;
+        if (FAILED(device->CreateShaderResourceView(source, nullptr,
+            &menu.convert_source_view11))) return false;
+    }
+    auto* context = menu.convert_context11.Get();
+    context->ClearState();
+    auto* target = menu.convert_targets11[index].Get();
+    auto* view = menu.convert_source_view11.Get();
+    auto* sampler = menu.convert_sampler11.Get();
+    const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(menu.width),
+        static_cast<float>(menu.height), 0, 1};
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->OMSetBlendState(menu.convert_blend11.Get(), nullptr, 0xFFFFFFFFU);
+    context->OMSetDepthStencilState(menu.convert_depth11.Get(), 0);
+    context->RSSetState(menu.convert_raster11.Get());
+    context->RSSetViewports(1, &viewport);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(menu.convert_vertex11.Get(), nullptr, 0);
+    context->PSSetShader(menu.convert_pixel11.Get(), nullptr, 0);
+    context->PSSetShaderResources(0, 1, &view);
+    context->PSSetSamplers(0, 1, &sampler);
+    context->Draw(3, 0);
+    Microsoft::WRL::ComPtr<ID3D11CommandList> list;
+    if (FAILED(context->FinishCommandList(FALSE, &list))) return false;
+    const auto execute = reinterpret_cast<CheekyOpenXRMenuExecute11>(
+        GetProcAddress(host, "CheekyOpenXRMenuExecute11"));
+    return execute && execute(list.Get(), source);
+}
+
+bool initialize_menu_converter12(SessionState::Menu& menu, ID3D12Device* device) {
+    const auto fail = [](const char* stage, HRESULT result) {
+        char message[160]{};
+        std::snprintf(message, sizeof(message), "OpenXR menu: D3D12 converter %s failed (0x%08lX)",
+            stage, static_cast<unsigned long>(result));
+        report_menu_diagnostic(message);
+        return false;
+    };
+    static constexpr char vertex_shader[] = R"(
+        struct Output { float4 position : SV_Position; float2 uv : TEXCOORD0; };
+        Output main(uint id : SV_VertexID) {
+            Output result;
+            result.uv = float2((id << 1) & 2, id & 2);
+            result.position = float4(result.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            return result;
+        })";
+    static constexpr char pixel_shader[] = R"(
+        Texture2D source_texture : register(t0);
+        SamplerState source_sampler : register(s0);
+        float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+            return source_texture.Sample(source_sampler, uv);
+        })";
+    Microsoft::WRL::ComPtr<ID3DBlob> vertex, pixel, errors, root_blob;
+    auto result = D3DCompile(vertex_shader, sizeof(vertex_shader) - 1, nullptr, nullptr, nullptr,
+        "main", "vs_5_1", 0, 0, &vertex, &errors);
+    if (FAILED(result)) return fail("vertex shader", result);
+    result = D3DCompile(pixel_shader, sizeof(pixel_shader) - 1, nullptr, nullptr, nullptr,
+        "main", "ps_5_1", 0, 0, &pixel, &errors);
+    if (FAILED(result)) return fail("pixel shader", result);
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable.NumDescriptorRanges = 1;
+    parameter.DescriptorTable.pDescriptorRanges = &range;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxAnisotropy = 1;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC root{};
+    root.NumParameters = 1;
+    root.pParameters = &parameter;
+    root.NumStaticSamplers = 1;
+    root.pStaticSamplers = &sampler;
+    root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    result = D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1, &root_blob, &errors);
+    if (FAILED(result)) return fail("root serialization", result);
+    result = device->CreateRootSignature(0, root_blob->GetBufferPointer(), root_blob->GetBufferSize(),
+        IID_PPV_ARGS(&menu.convert_root));
+    if (FAILED(result)) return fail("root signature", result);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline{};
+    pipeline.pRootSignature = menu.convert_root.Get();
+    pipeline.VS = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+    pipeline.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+    auto& blend_target = pipeline.BlendState.RenderTarget[0];
+    blend_target.SrcBlend = D3D12_BLEND_ONE;
+    blend_target.DestBlend = D3D12_BLEND_ZERO;
+    blend_target.BlendOp = D3D12_BLEND_OP_ADD;
+    blend_target.SrcBlendAlpha = D3D12_BLEND_ONE;
+    blend_target.DestBlendAlpha = D3D12_BLEND_ZERO;
+    blend_target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    blend_target.LogicOp = D3D12_LOGIC_OP_NOOP;
+    blend_target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pipeline.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipeline.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipeline.RasterizerState.DepthClipEnable = TRUE;
+    pipeline.DepthStencilState.DepthEnable = FALSE;
+    pipeline.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pipeline.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipeline.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    pipeline.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    pipeline.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    pipeline.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipeline.DepthStencilState.BackFace = pipeline.DepthStencilState.FrontFace;
+    pipeline.SampleMask = UINT_MAX;
+    pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline.NumRenderTargets = 1;
+    pipeline.RTVFormats[0] = static_cast<DXGI_FORMAT>(menu.target_format);
+    pipeline.SampleDesc.Count = 1;
+    result = device->CreateGraphicsPipelineState(&pipeline, IID_PPV_ARGS(&menu.convert_pipeline));
+    if (FAILED(result)) return fail("pipeline", result);
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap.NumDescriptors = static_cast<UINT>(menu.images12.size());
+    result = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&menu.convert_rtv_heap));
+    if (FAILED(result)) return fail("RTV heap", result);
+    menu.convert_rtv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto rtv = menu.convert_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    menu.convert_srv_heaps.resize(menu.images12.size());
+    // OpenXR images can use typeless backing resources. A default RTV would
+    // inherit that typeless format and can remove the D3D12 device.
+    D3D12_RENDER_TARGET_VIEW_DESC target_view{};
+    target_view.Format = static_cast<DXGI_FORMAT>(menu.target_format);
+    target_view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    for (std::size_t index{}; index < menu.images12.size(); ++index) {
+        if (!menu.images12[index].texture) return fail("missing runtime texture", E_POINTER);
+        if (index == 0) {
+            char message[160]{};
+            std::snprintf(message, sizeof(message), "OpenXR menu: D3D12 backing format %u, explicit RTV format %u",
+                static_cast<unsigned>(menu.images12[index].texture->GetDesc().Format), menu.target_format);
+            report_menu_diagnostic(message);
+        }
+        device->CreateRenderTargetView(menu.images12[index].texture, &target_view, rtv);
+        result = device->GetDeviceRemovedReason();
+        if (FAILED(result)) return fail("render-target view", result);
+        rtv.ptr += menu.convert_rtv_stride;
+        heap = {};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heap.NumDescriptors = 1;
+        heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        result = device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&menu.convert_srv_heaps[index]));
+        if (FAILED(result)) return fail("SRV heap", result);
+    }
+    return true;
+}
+
+void destroy_menu(SessionState::Menu& menu, const Dispatch& dispatch) noexcept {
+    if (menu.swapchain != XR_NULL_HANDLE && dispatch.destroy_swapchain)
+        static_cast<void>(dispatch.destroy_swapchain(menu.swapchain));
+    menu = {};
+}
+
+XrVector3f rotate_menu_vector(const XrQuaternionf& q, const XrVector3f v) noexcept {
+    const XrVector3f t{
+        2.F * (q.y * v.z - q.z * v.y),
+        2.F * (q.z * v.x - q.x * v.z),
+        2.F * (q.x * v.y - q.y * v.x)};
+    return {v.x + q.w * t.x + q.y * t.z - q.z * t.y,
+        v.y + q.w * t.y + q.z * t.x - q.x * t.z,
+        v.z + q.w * t.z + q.x * t.y - q.y * t.x};
+}
+
+bool anchor_menu(SessionState& session, const Dispatch& dispatch,
+    const CheekyOpenXRMenuFrame& frame, const XrTime time) {
+    auto& menu = session.menu;
+    XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
+    locate.viewConfigurationType = session.view_configuration;
+    locate.displayTime = time;
+    locate.space = session.calibration_local_space;
+    XrViewState view_state{XR_TYPE_VIEW_STATE};
+    std::array<XrView, 2> views{{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}}};
+    std::uint32_t view_count{};
+    if (XR_FAILED(dispatch.locate_views(session.session, &locate, &view_state,
+        static_cast<std::uint32_t>(views.size()), &view_count, views.data())) ||
+        view_count < 2 || !(view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) ||
+        !(view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT)) {
+        report_menu_status(cheeky_xr_menu_tracking_unavailable);
+        return false;
+    }
+    const auto& head = views[0].pose;
+    const auto head_forward = rotate_menu_vector(head.orientation, {0, 0, -1});
+    const float yaw = std::atan2(-head_forward.x, -head_forward.z);
+    menu.pose.orientation = {0, std::sin(yaw * .5F), 0, std::cos(yaw * .5F)};
+    const auto forward = rotate_menu_vector(menu.pose.orientation, {0, 0, -1});
+    menu.pose.position = {(views[0].pose.position.x + views[1].pose.position.x) * .5F + 1.5F * forward.x,
+        (views[0].pose.position.y + views[1].pose.position.y) * .5F + 1.5F * forward.y,
+        (views[0].pose.position.z + views[1].pose.position.z) * .5F + 1.5F * forward.z};
+    const float meters_per_pixel = (std::min)(1.2F / 620.F,
+        (cheeky::xr_menu::radius * cheeky::xr_menu::max_angle) / frame.display_width);
+    menu.size = {frame.display_width * meters_per_pixel, frame.display_height * meters_per_pixel};
+    menu.anchored = true;
+    return true;
+}
+
+bool initialize_menu(SessionState& session, const Dispatch& dispatch,
+    const CheekyOpenXRMenuFrame& frame, const XrTime time) {
+    auto& menu = session.menu;
+    if (menu.swapchain != XR_NULL_HANDLE && (menu.width != frame.width ||
+        menu.height != frame.height || menu.format != frame.format)) destroy_menu(menu, dispatch);
+    if (menu.swapchain != XR_NULL_HANDLE) return menu.anchored || anchor_menu(session, dispatch, frame, time);
+    if (!dispatch.enumerate_swapchain_formats || !dispatch.create_swapchain ||
+        !dispatch.enumerate_swapchain_images || !dispatch.locate_views ||
+        session.calibration_local_space == XR_NULL_HANDLE ||
+        frame.width < 160 || frame.height < 100 ||
+        frame.display_width <= 0 || frame.display_height <= 0) {
+        report_menu_status(cheeky_xr_menu_tracking_unavailable); return false;
+    }
+    std::uint32_t format_count{};
+    if (XR_FAILED(dispatch.enumerate_swapchain_formats(session.session, 0, &format_count, nullptr)) ||
+        !format_count || format_count > 1024) {
+        report_menu_status(cheeky_xr_menu_format_unavailable); return false;
+    }
+    std::vector<std::int64_t> formats(format_count);
+    if (XR_FAILED(dispatch.enumerate_swapchain_formats(session.session, format_count, &format_count, formats.data()))) {
+        report_menu_status(cheeky_xr_menu_format_unavailable); return false;
+    }
+    XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    create.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    create.sampleCount = 1;
+    create.width = frame.width;
+    create.height = frame.height;
+    create.faceCount = 1;
+    create.arraySize = 1;
+    create.mipCount = 1;
+    const DXGI_FORMAT candidates[]{static_cast<DXGI_FORMAT>(frame.format),
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM};
+    // Prefer an exact copy, then a format in the same DXGI typeless family,
+    // then a format that can receive the menu through a shader conversion.
+    for (unsigned pass{}; pass < 3 && menu.swapchain == XR_NULL_HANDLE; ++pass)
+        for (const auto candidate : candidates) {
+            if ((pass == 0 && candidate != frame.format) ||
+                (pass == 1 && (candidate == frame.format ||
+                    !menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format), candidate))) ||
+                (pass == 2 && menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format), candidate)) ||
+                std::find(formats.begin(), formats.end(), static_cast<std::int64_t>(candidate)) == formats.end()) continue;
+            create.format = static_cast<std::int64_t>(candidate);
+            XrSwapchain created{XR_NULL_HANDLE};
+            if (XR_SUCCEEDED(dispatch.create_swapchain(session.session, &create, &created))) {
+                menu.swapchain = created;
+                menu.target_format = static_cast<std::uint32_t>(candidate);
+                break;
+            }
+        }
+    if (menu.swapchain == XR_NULL_HANDLE) {
+        report_menu_status(cheeky_xr_menu_swapchain_failed); return false;
+    }
+    menu.width = frame.width;
+    menu.height = frame.height;
+    menu.format = frame.format;
+    {
+        char message[160]{};
+        std::snprintf(message, sizeof(message),
+            "OpenXR menu: swapchain source format %u, target format %u, API D3D%u",
+            frame.format, menu.target_format, session.graphics_api);
+        report_menu_diagnostic(message);
+    }
+    std::uint32_t count{};
+    if (XR_FAILED(dispatch.enumerate_swapchain_images(menu.swapchain, 0, &count, nullptr)) || !count || count > 16) {
+        report_menu_status(cheeky_xr_menu_image_failed);
+        destroy_menu(menu, dispatch); return false;
+    }
+    if (session.graphics_api == 11) {
+        menu.images11.resize(count);
+        for (auto& image : menu.images11) image.type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+        if (XR_FAILED(dispatch.enumerate_swapchain_images(menu.swapchain, count, &count,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(menu.images11.data())))) {
+            report_menu_status(cheeky_xr_menu_image_failed);
+            destroy_menu(menu, dispatch); return false;
+        }
+        if (!menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format),
+            static_cast<DXGI_FORMAT>(menu.target_format)) &&
+            !initialize_menu_converter11(menu, static_cast<ID3D11Device*>(frame.device))) {
+            report_menu_status(cheeky_xr_menu_copy_failed);
+            destroy_menu(menu, dispatch); return false;
+        }
+    } else if (session.graphics_api == 12) {
+        menu.images12.resize(count);
+        for (auto& image : menu.images12) image.type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+        if (XR_FAILED(dispatch.enumerate_swapchain_images(menu.swapchain, count, &count,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(menu.images12.data())))) {
+            report_menu_status(cheeky_xr_menu_image_failed);
+            destroy_menu(menu, dispatch); return false;
+        }
+        auto* device = static_cast<ID3D12Device*>(frame.device);
+        menu.allocators.resize(count);
+        menu.fence_values.resize(count);
+        for (auto& allocator : menu.allocators) if (FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)))) {
+            report_menu_diagnostic("OpenXR menu: D3D12 command allocator creation failed");
+            session.menu_submission_disabled = true;
+            report_menu_status(cheeky_xr_menu_copy_failed);
+            destroy_menu(menu, dispatch); return false;
+        }
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            menu.allocators[0].Get(), nullptr, IID_PPV_ARGS(&menu.command_list))) ||
+            FAILED(menu.command_list->Close()) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&menu.fence)))) {
+            report_menu_diagnostic("OpenXR menu: D3D12 command list or fence creation failed");
+            session.menu_submission_disabled = true;
+            report_menu_status(cheeky_xr_menu_copy_failed);
+            destroy_menu(menu, dispatch); return false;
+        }
+        if (!menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format),
+            static_cast<DXGI_FORMAT>(menu.target_format)) &&
+            !initialize_menu_converter12(menu, device)) {
+            session.menu_submission_disabled = true;
+            report_menu_status(cheeky_xr_menu_copy_failed);
+            destroy_menu(menu, dispatch); return false;
+        }
+    } else { destroy_menu(menu, dispatch); return false; }
+
+    return anchor_menu(session, dispatch, frame, time);
+}
+
+void send_menu_pointer(const SessionState& session, const Dispatch& dispatch,
+    const XrTime time, const CheekyOpenXRMenuFrame& frame) {
+    const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
+    const auto send = host ? reinterpret_cast<CheekyOpenXRMenuPointer>(
+        GetProcAddress(host, "CheekyOpenXRMenuSetPointer")) : nullptr;
+    if (!send || !dispatch.locate_space || !dispatch.get_action_state_boolean) return;
+    const auto instance = instances.find(session.instance);
+    if (instance == instances.end() || instance->second.menu_click_action == XR_NULL_HANDLE ||
+        !session.action_attached) { send(0, 0, false, false); return; }
+    const auto& menu = session.menu;
+    const auto& orientation = menu.pose.orientation;
+    const XrQuaternionf inverse{-orientation.x, -orientation.y, -orientation.z, orientation.w};
+    for (const unsigned hand : {1U, 0U}) {
+        if (session.menu_aim_spaces[hand] == XR_NULL_HANDLE) continue;
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        if (XR_FAILED(dispatch.locate_space(session.menu_aim_spaces[hand],
+            session.calibration_local_space, time, &location)) ||
+            !(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+            !(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) continue;
+        const XrVector3f position{
+            location.pose.position.x - menu.pose.position.x,
+            location.pose.position.y - menu.pose.position.y,
+            location.pose.position.z - menu.pose.position.z};
+        const auto origin = rotate_menu_vector(inverse, position);
+        const auto world_direction = rotate_menu_vector(location.pose.orientation, {0, 0, -1});
+        const auto direction = rotate_menu_vector(inverse, world_direction);
+        float u{}, v{};
+        if (!cheeky::xr_menu::hit(origin, direction, menu.size.width, menu.size.height,
+            menu.width, menu.strips, menu.cylinder, u, v)) continue;
+        XrActionStateGetInfo get_info{XR_TYPE_ACTION_STATE_GET_INFO};
+        get_info.action = instance->second.menu_click_action;
+        get_info.subactionPath = instance->second.menu_hand_paths[hand];
+        XrActionStateBoolean click{XR_TYPE_ACTION_STATE_BOOLEAN};
+        const bool down = XR_SUCCEEDED(dispatch.get_action_state_boolean(session.session, &get_info, &click)) &&
+            click.isActive == XR_TRUE && click.currentState == XR_TRUE;
+        send(u * frame.display_width, v * frame.display_height, down, true);
+        return;
+    }
+    send(0, 0, false, false);
+}
+
+XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
+    const Dispatch& dispatch, SessionState& state) {
+    if (!dispatch.end_frame || !info || !state.running ||
+        state.view_configuration != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO ||
+        (state.graphics_api != 11 && state.graphics_api != 12))
+        return dispatch.end_frame(session, info);
+    const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
+    const auto acquire = host ? reinterpret_cast<CheekyOpenXRMenuAcquire>(
+        GetProcAddress(host, "CheekyOpenXRMenuAcquireFrame")) : nullptr;
+    if (!acquire) return dispatch.end_frame(session, info);
+    CheekyOpenXRMenuFrame frame{};
+    if (!acquire(&frame)) {
+        state.menu_submission_disabled = false;
+        return dispatch.end_frame(session, info);
+    }
+    if (state.menu_submission_disabled) {
+        if (frame.texture) static_cast<IUnknown*>(frame.texture)->Release();
+        return dispatch.end_frame(session, info);
+    }
+    const auto release_source = [&frame] { static_cast<IUnknown*>(frame.texture)->Release(); };
+    if (!frame.texture || frame.graphics_api != state.graphics_api ||
+        frame.device != state.graphics_device ||
+        (state.graphics_api == 12 && (!frame.queue || !state.graphics_queue))) {
+        report_menu_status(frame.graphics_api != state.graphics_api ? cheeky_xr_menu_graphics_mismatch :
+            frame.device != state.graphics_device ? cheeky_xr_menu_device_mismatch : cheeky_xr_menu_copy_failed);
+        if (frame.texture) release_source();
+        return dispatch.end_frame(session, info);
+    }
+    if (state.menu_recenter_time && info->displayTime >= state.menu_recenter_time) {
+        state.menu.anchored = false;
+        state.menu_recenter_time = 0;
+        report_menu_diagnostic("OpenXR menu: reanchoring after runtime recenter");
+    }
+    if (!initialize_menu(state, dispatch, frame, info->displayTime)) {
+        release_source(); return dispatch.end_frame(session, info);
+    }
+    auto& menu = state.menu;
+    const auto available_layers = state.max_layers > info->layerCount ? state.max_layers - info->layerCount : 0U;
+    if (!available_layers) { release_source(); return dispatch.end_frame(session, info); }
+    menu.cylinder = state.menu_cylinder_enabled;
+    menu.strips = menu.cylinder ? 1U : (std::min)(12U, available_layers);
+    send_menu_pointer(state, dispatch, info->displayTime, frame);
+    std::uint32_t index{};
+    const XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!dispatch.acquire_swapchain_image || !dispatch.wait_swapchain_image || !dispatch.release_swapchain_image ||
+        XR_FAILED(dispatch.acquire_swapchain_image(menu.swapchain, &acquire_info, &index))) {
+        report_menu_status(cheeky_xr_menu_image_failed);
+        release_source(); return dispatch.end_frame(session, info);
+    }
+    const XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, XR_INFINITE_DURATION};
+    if (XR_FAILED(dispatch.wait_swapchain_image(menu.swapchain, &wait_info))) {
+        report_menu_status(cheeky_xr_menu_image_failed);
+        const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
+        release_source(); return dispatch.end_frame(session, info);
+    }
+    bool copied{};
+    const char* copy_failure_stage = "image, allocator or fence not ready";
+    if (state.graphics_api == 11 && index < menu.images11.size()) {
+        if (menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format),
+            static_cast<DXGI_FORMAT>(menu.target_format))) {
+            const auto copy = reinterpret_cast<CheekyOpenXRMenuCopy11>(
+                GetProcAddress(host, "CheekyOpenXRMenuCopy11"));
+            if (copy && menu.images11[index].texture)
+                copied = copy(menu.images11[index].texture, frame.texture);
+        } else copied = render_menu_converter11(menu, frame, index, host);
+    } else if (state.graphics_api == 12 && index < menu.images12.size() &&
+        index < menu.allocators.size() && menu.command_list && menu.fence &&
+        menu.fence->GetCompletedValue() >= menu.fence_values[index]) {
+        auto* target = menu.images12[index].texture;
+        auto* source = static_cast<ID3D12Resource*>(frame.texture);
+        auto* list = menu.command_list.Get();
+        copy_failure_stage = "command reset failed";
+        if (target && SUCCEEDED(menu.allocators[index]->Reset()) &&
+            SUCCEEDED(list->Reset(menu.allocators[index].Get(), nullptr))) {
+            const bool convert = !menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format),
+                static_cast<DXGI_FORMAT>(menu.target_format));
+            if (menu.fence_value == 0) {
+                char message[192]{};
+                std::snprintf(message, sizeof(message),
+                    "OpenXR menu: first D3D12 %s, image %u, queues %s",
+                    convert ? "conversion" : "copy", index,
+                    frame.queue == state.graphics_queue ? "shared" : "separate");
+                report_menu_diagnostic(message);
+            }
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = target;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            barrier.Transition.StateAfter = convert ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST;
+            list->ResourceBarrier(1, &barrier);
+            if (convert) {
+                D3D12_RESOURCE_BARRIER source_barrier{};
+                source_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                source_barrier.Transition.pResource = source;
+                source_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                source_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                source_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                list->ResourceBarrier(1, &source_barrier);
+                auto* device = static_cast<ID3D12Device*>(frame.device);
+                auto* heap = menu.convert_srv_heaps[index].Get();
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Format = static_cast<DXGI_FORMAT>(frame.format);
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Texture2D.MipLevels = 1;
+                device->CreateShaderResourceView(source, &srv, heap->GetCPUDescriptorHandleForHeapStart());
+                const D3D12_VIEWPORT viewport{0, 0, static_cast<float>(menu.width),
+                    static_cast<float>(menu.height), 0, 1};
+                const D3D12_RECT scissor{0, 0, static_cast<LONG>(menu.width), static_cast<LONG>(menu.height)};
+                auto rtv = menu.convert_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+                rtv.ptr += SIZE_T(index) * menu.convert_rtv_stride;
+                list->SetPipelineState(menu.convert_pipeline.Get());
+                list->SetGraphicsRootSignature(menu.convert_root.Get());
+                list->SetDescriptorHeaps(1, &heap);
+                list->SetGraphicsRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+                list->RSSetViewports(1, &viewport);
+                list->RSSetScissorRects(1, &scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->DrawInstanced(3, 1, 0, 0);
+                std::swap(source_barrier.Transition.StateBefore, source_barrier.Transition.StateAfter);
+                list->ResourceBarrier(1, &source_barrier);
+            } else list->CopyResource(target, source);
+            std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+            list->ResourceBarrier(1, &barrier);
+            copy_failure_stage = "command list close failed";
+            if (SUCCEEDED(list->Close())) {
+                const auto value = ++menu.fence_value;
+                const auto submit = reinterpret_cast<CheekyOpenXRMenuSubmit12>(
+                    GetProcAddress(host, "CheekyOpenXRMenuSubmit12"));
+                copy_failure_stage = submit ? "queue submission failed" : "host submission entry unavailable";
+                copied = submit && submit(frame.queue, state.graphics_queue, list, menu.fence.Get(), value);
+                if (copied) menu.fence_values[index] = value;
+            }
+        }
+    }
+    release_source();
+    const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    if (XR_FAILED(dispatch.release_swapchain_image(menu.swapchain, &release_info)) || !copied) {
+        if (!copied && state.graphics_api == 12) {
+            report_menu_diagnostic(copy_failure_stage);
+            state.menu_submission_disabled = true;
+        }
+        report_menu_status(copied ? cheeky_xr_menu_image_failed : cheeky_xr_menu_copy_failed);
+        return dispatch.end_frame(session, info);
+    }
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    if (info->layerCount && info->layers) layers.assign(info->layers, info->layers + info->layerCount);
+    XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+    std::vector<XrCompositionLayerQuad> strips(menu.cylinder ? 0U : menu.strips);
+    if (menu.cylinder) {
+        cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        cylinder.space = state.calibration_local_space;
+        cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        cylinder.subImage.swapchain = menu.swapchain;
+        cylinder.subImage.imageRect.extent = {static_cast<std::int32_t>(menu.width), static_cast<std::int32_t>(menu.height)};
+        cylinder.pose = menu.pose;
+        const auto offset = rotate_menu_vector(menu.pose.orientation, {0, 0, cheeky::xr_menu::radius});
+        cylinder.pose.position.x += offset.x;
+        cylinder.pose.position.z += offset.z;
+        cylinder.radius = cheeky::xr_menu::radius;
+        cylinder.centralAngle = menu.size.width / cylinder.radius;
+        cylinder.aspectRatio = menu.size.width / menu.size.height;
+        layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinder));
+    } else {
+        // Runtimes without cylinder layers receive adjacent chords of the same
+        // curve. Respect the runtime's layer budget and the game's own layers.
+        for (unsigned i{}; i < menu.strips; ++i) {
+            const auto geometry = cheeky::xr_menu::strip(menu.size.width, menu.width, i, menu.strips);
+            auto& quad = strips[i];
+            quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quad.space = state.calibration_local_space;
+            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage.swapchain = menu.swapchain;
+            quad.subImage.imageRect.offset.x = static_cast<std::int32_t>(geometry.left);
+            quad.subImage.imageRect.extent = {static_cast<std::int32_t>(geometry.right - geometry.left), static_cast<std::int32_t>(menu.height)};
+            quad.pose = menu.pose;
+            const auto offset = rotate_menu_vector(menu.pose.orientation, geometry.center);
+            quad.pose.position.x += offset.x;
+            quad.pose.position.z += offset.z;
+            const float sn = std::sin(-geometry.angle * .5F), cs = std::cos(-geometry.angle * .5F);
+            quad.pose.orientation.y = menu.pose.orientation.y * cs + menu.pose.orientation.w * sn;
+            quad.pose.orientation.w = menu.pose.orientation.w * cs - menu.pose.orientation.y * sn;
+            quad.size = {geometry.width, menu.size.height};
+            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
+        }
+    }
+    auto forwarded = *info;
+    forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
+    forwarded.layers = layers.data();
+    const auto result = dispatch.end_frame(session, &forwarded);
+    report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
+    return result;
+}
 
 struct SnapshotSlot {
     std::atomic<std::uint32_t> readers{};
@@ -384,7 +1092,8 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
 }
 
 [[nodiscard]] bool extension_available(
-    const PFN_xrGetInstanceProcAddr gipa
+    const PFN_xrGetInstanceProcAddr gipa,
+    const char* name = XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME
 ) noexcept {
     const auto enumerate = load_function<PFN_xrEnumerateInstanceExtensionProperties>(
         gipa, XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties"
@@ -401,10 +1110,10 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
         return false;
     }
     return std::any_of(
-        properties.begin(), properties.end(), [](const auto& property) {
+        properties.begin(), properties.end(), [name](const auto& property) {
             return std::strcmp(
                 property.extensionName,
-                XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME
+                name
             ) == 0;
         }
     );
@@ -461,6 +1170,72 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
         return false;
     }
     return true;
+}
+
+std::vector<XrActionSuggestedBinding> menu_bindings_for_profile(
+    const InstanceState& state, const std::size_t profile_index) {
+    std::vector<XrActionSuggestedBinding> bindings;
+    if (!state.menu_graphics_enabled || state.menu_aim_action == XR_NULL_HANDLE || state.menu_click_action == XR_NULL_HANDLE ||
+        profile_index >= state.menu_profiles.size()) return bindings;
+    const char* hands[]{"/user/hand/left", "/user/hand/right"};
+    const char* click = profile_index == 0 ? "/input/select/click" : "/input/trigger/value";
+    for (const auto* hand : hands) {
+        XrPath aim{}, select{};
+        if (XR_SUCCEEDED(state.dispatch.string_to_path(state.instance,
+            (std::string(hand) + "/input/aim/pose").c_str(), &aim)) &&
+            XR_SUCCEEDED(state.dispatch.string_to_path(state.instance,
+            (std::string(hand) + click).c_str(), &select))) {
+            bindings.push_back({state.menu_aim_action, aim});
+            bindings.push_back({state.menu_click_action, select});
+        }
+    }
+    return bindings;
+}
+
+bool create_menu_actions(InstanceState& state) noexcept {
+    const auto& dispatch = state.dispatch;
+    if (!dispatch.create_action_set || !dispatch.create_action || !dispatch.string_to_path ||
+        !dispatch.destroy_action || !dispatch.destroy_action_set) return false;
+    XrActionSetCreateInfo set_info{XR_TYPE_ACTION_SET_CREATE_INFO};
+    static_cast<void>(strcpy_s(set_info.actionSetName, "cheeky_menu"));
+    static_cast<void>(strcpy_s(set_info.localizedActionSetName, "Cheeky Menu"));
+    if (XR_FAILED(dispatch.create_action_set(state.instance, &set_info, &state.menu_action_set))) return false;
+    const char* hands[]{"/user/hand/left", "/user/hand/right"};
+    for (std::size_t i{}; i < 2; ++i) if (XR_FAILED(dispatch.string_to_path(
+        state.instance, hands[i], &state.menu_hand_paths[i]))) return false;
+    const char* profiles[]{"/interaction_profiles/khr/simple_controller",
+        "/interaction_profiles/oculus/touch_controller",
+        "/interaction_profiles/valve/index_controller",
+        "/interaction_profiles/htc/vive_controller",
+        "/interaction_profiles/microsoft/motion_controller"};
+    for (std::size_t i{}; i < state.menu_profiles.size(); ++i)
+        static_cast<void>(dispatch.string_to_path(state.instance, profiles[i], &state.menu_profiles[i]));
+    XrActionCreateInfo action_info{XR_TYPE_ACTION_CREATE_INFO};
+    action_info.countSubactionPaths = 2;
+    action_info.subactionPaths = state.menu_hand_paths.data();
+    action_info.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    static_cast<void>(strcpy_s(action_info.actionName, "cheeky_menu_aim"));
+    static_cast<void>(strcpy_s(action_info.localizedActionName, "Cheeky Menu Aim"));
+    if (XR_FAILED(dispatch.create_action(state.menu_action_set, &action_info, &state.menu_aim_action))) return false;
+    action_info.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+    static_cast<void>(strcpy_s(action_info.actionName, "cheeky_menu_select"));
+    static_cast<void>(strcpy_s(action_info.localizedActionName, "Cheeky Menu Select"));
+    return XR_SUCCEEDED(dispatch.create_action(state.menu_action_set, &action_info, &state.menu_click_action));
+}
+
+void ensure_menu_bindings(InstanceState& state) {
+    if (!state.menu_graphics_enabled || !state.dispatch.suggest_bindings ||
+        state.menu_action_set == XR_NULL_HANDLE) return;
+    for (std::size_t i{}; i < state.menu_profiles.size(); ++i) {
+        if (state.menu_bindings_submitted[i] || state.menu_profiles[i] == XR_NULL_PATH) continue;
+        const auto bindings = menu_bindings_for_profile(state, i);
+        if (bindings.empty()) continue;
+        const XrInteractionProfileSuggestedBinding suggestion{
+            XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, nullptr,
+            state.menu_profiles[i], static_cast<std::uint32_t>(bindings.size()), bindings.data()};
+        if (XR_SUCCEEDED(state.dispatch.suggest_bindings(state.instance, &suggestion)))
+            state.menu_bindings_submitted[i] = true;
+    }
 }
 
 [[nodiscard]] InstanceState* find_instance_for_session_locked(
@@ -818,9 +1593,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
         }
     }
     const bool inject_extension = !already_enabled && extension_available(next_gipa);
+    bool cylinder_enabled{};
+    for (std::uint32_t i{}; i < info->enabledExtensionCount; ++i)
+        cylinder_enabled |= std::strcmp(info->enabledExtensionNames[i], XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) == 0;
+    const bool inject_cylinder = !cylinder_enabled &&
+        extension_available(next_gipa, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     std::vector<const char*> extensions;
     XrInstanceCreateInfo forwarded_info = *info;
-    if (inject_extension) {
+    if (inject_extension || inject_cylinder) {
         if (info->enabledExtensionCount != 0U &&
             info->enabledExtensionNames != nullptr) {
             extensions.assign(
@@ -828,7 +1608,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
                 info->enabledExtensionNames + info->enabledExtensionCount
             );
         }
-        extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        if (inject_extension) extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        if (inject_cylinder) extensions.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
         forwarded_info.enabledExtensionCount = static_cast<std::uint32_t>(
             extensions.size()
         );
@@ -845,6 +1626,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
     InstanceState state{};
     state.instance = *instance;
     state.extension_enabled = already_enabled || inject_extension;
+    state.cylinder_enabled = cylinder_enabled || inject_cylinder;
     populate_dispatch(state.dispatch, *instance, next_gipa);
     if (state.dispatch.get_instance_properties != nullptr) {
         XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
@@ -855,6 +1637,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
         }
     }
     static_cast<void>(create_gaze_action(state));
+    static_cast<void>(create_menu_actions(state));
 
     {
         std::lock_guard lock(state_mutex);
@@ -867,9 +1650,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
     const XrInstance instance
 ) {
+    std::lock_guard menu_lock(menu_mutex);
     Dispatch dispatch{};
     XrAction action{XR_NULL_HANDLE};
     XrActionSet action_set{XR_NULL_HANDLE};
+    XrAction menu_aim_action{XR_NULL_HANDLE};
+    XrAction menu_click_action{XR_NULL_HANDLE};
+    XrActionSet menu_action_set{XR_NULL_HANDLE};
     {
         std::lock_guard lock(state_mutex);
         const auto iterator = instances.find(instance);
@@ -877,8 +1664,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
         dispatch = iterator->second.dispatch;
         action = iterator->second.gaze_action;
         action_set = iterator->second.action_set;
+        menu_aim_action = iterator->second.menu_aim_action;
+        menu_click_action = iterator->second.menu_click_action;
+        menu_action_set = iterator->second.menu_action_set;
         for (auto session_it = sessions.begin(); session_it != sessions.end();) {
             if (session_it->second.instance == instance) {
+                destroy_menu(session_it->second.menu, dispatch);
                 session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
                 session_it = sessions.erase(session_it);
             } else {
@@ -902,6 +1693,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
     if (action_set != XR_NULL_HANDLE && dispatch.destroy_action_set != nullptr) {
         static_cast<void>(dispatch.destroy_action_set(action_set));
     }
+    if (menu_aim_action != XR_NULL_HANDLE && dispatch.destroy_action)
+        static_cast<void>(dispatch.destroy_action(menu_aim_action));
+    if (menu_click_action != XR_NULL_HANDLE && dispatch.destroy_action)
+        static_cast<void>(dispatch.destroy_action(menu_click_action));
+    if (menu_action_set != XR_NULL_HANDLE && dispatch.destroy_action_set)
+        static_cast<void>(dispatch.destroy_action_set(menu_action_set));
     return dispatch.destroy_instance == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
         : dispatch.destroy_instance(instance);
@@ -965,6 +1762,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     session_state.session = *session;
     session_state.instance = instance;
     session_state.system_id = info->systemId;
+    session_state.menu_cylinder_enabled = instance_state->cylinder_enabled;
+    if (instance_state->dispatch.get_system_properties) {
+        XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(instance_state->dispatch.get_system_properties(instance, info->systemId, &properties)) &&
+            properties.graphicsProperties.maxLayerCount)
+            session_state.max_layers = properties.graphicsProperties.maxLayerCount;
+    }
     if (instance_state->dispatch.create_reference_space) {
         XrReferenceSpaceCreateInfo local{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
         local.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -973,10 +1777,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
             *session, &local, &session_state.calibration_local_space));
     }
     for (auto* binding = static_cast<const XrBaseInStructure*>(info->next); binding; binding = binding->next) {
-        if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) session_state.graphics_api = 11;
+        if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
+            session_state.graphics_api = 11;
+            session_state.graphics_device = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(binding)->device;
+        }
         if (binding->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) session_state.graphics_api = 100;
         if (binding->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
             session_state.graphics_api = 12;
+            session_state.graphics_device = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(binding)->device;
             session_state.graphics_queue = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(binding)->queue;
         }
     }
@@ -1007,6 +1815,22 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
             *session, &space_info, &session_state.gaze_space
         );
     }
+    if (session_state.graphics_api == 11 || session_state.graphics_api == 12) {
+        std::lock_guard lock(state_mutex);
+        const auto found = instances.find(instance);
+        if (found != instances.end()) found->second.menu_graphics_enabled = true;
+    }
+    if (instance_state->menu_aim_action != XR_NULL_HANDLE &&
+        instance_state->dispatch.create_action_space) {
+        for (std::size_t hand{}; hand < 2; ++hand) {
+            XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+            space_info.action = instance_state->menu_aim_action;
+            space_info.subactionPath = instance_state->menu_hand_paths[hand];
+            space_info.poseInActionSpace.orientation.w = 1.F;
+            static_cast<void>(instance_state->dispatch.create_action_space(
+                *session, &space_info, &session_state.menu_aim_spaces[hand]));
+        }
+    }
 
     {
         std::lock_guard lock(state_mutex);
@@ -1019,9 +1843,11 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
     const XrSession session
 ) {
+    std::lock_guard menu_lock(menu_mutex);
     Dispatch dispatch{};
     XrSpace gaze_space{XR_NULL_HANDLE};
     XrSpace calibration_local_space{XR_NULL_HANDLE};
+    std::array<XrSpace, 2> menu_aim_spaces{};
     {
         std::lock_guard lock(state_mutex);
         const auto session_it = sessions.find(session);
@@ -1029,8 +1855,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         const auto instance_it = instances.find(session_it->second.instance);
         if (instance_it == instances.end()) return XR_ERROR_HANDLE_INVALID;
         dispatch = instance_it->second.dispatch;
+        destroy_menu(session_it->second.menu, dispatch);
         gaze_space = session_it->second.gaze_space;
         calibration_local_space = session_it->second.calibration_local_space;
+        menu_aim_spaces = session_it->second.menu_aim_spaces;
         session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
         sessions.erase(session_it);
         for (auto iterator = swapchains.begin(); iterator != swapchains.end();) {
@@ -1048,6 +1876,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
     }
     if (calibration_local_space != XR_NULL_HANDLE && dispatch.destroy_space)
         static_cast<void>(dispatch.destroy_space(calibration_local_space));
+    if (dispatch.destroy_space) for (const auto space : menu_aim_spaces)
+        if (space != XR_NULL_HANDLE) static_cast<void>(dispatch.destroy_space(space));
     return dispatch.destroy_session == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
         : dispatch.destroy_session(session);
@@ -1066,6 +1896,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrPollEvent(
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const auto result = next(instance, event_data);
+    if (result == XR_SUCCESS && event_data &&
+        event_data->type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+        const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(event_data);
+        if (changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
+            std::lock_guard menu_lock(menu_mutex);
+            std::lock_guard state_lock(state_mutex);
+            const auto found = sessions.find(changed->session);
+            if (found != sessions.end()) found->second.menu_recenter_time = changed->changeTime;
+        }
+    }
     if (XR_SUCCEEDED(result) && event_data != nullptr &&
         event_data->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
         const auto* changed = reinterpret_cast<const XrEventDataSessionStateChanged*>(
@@ -1158,6 +1998,8 @@ cheeky_xrSuggestInteractionProfileBindings(
     XrAction gaze_action{XR_NULL_HANDLE};
     XrPath gaze_path{XR_NULL_PATH};
     XrPath gaze_profile{XR_NULL_PATH};
+    std::vector<XrActionSuggestedBinding> menu_bindings;
+    std::size_t menu_profile_index{5};
     {
         std::lock_guard lock(state_mutex);
         const auto iterator = instances.find(instance);
@@ -1166,10 +2008,17 @@ cheeky_xrSuggestInteractionProfileBindings(
         gaze_action = iterator->second.gaze_action;
         gaze_path = iterator->second.gaze_path;
         gaze_profile = iterator->second.gaze_profile;
+        for (std::size_t i{}; i < iterator->second.menu_profiles.size(); ++i)
+            if (suggested->interactionProfile == iterator->second.menu_profiles[i]) {
+                menu_bindings = menu_bindings_for_profile(iterator->second, i);
+                menu_profile_index = i;
+                break;
+            }
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
-    if (gaze_action == XR_NULL_HANDLE ||
-        suggested->interactionProfile != gaze_profile) {
+    const bool gaze_profile_match = gaze_action != XR_NULL_HANDLE &&
+        suggested->interactionProfile == gaze_profile;
+    if (!gaze_profile_match && menu_bindings.empty()) {
         return next(instance, suggested);
     }
 
@@ -1181,12 +2030,13 @@ cheeky_xrSuggestInteractionProfileBindings(
             suggested->suggestedBindings + suggested->countSuggestedBindings
         );
     }
-    const auto present = std::any_of(
-        bindings.begin(), bindings.end(), [&](const auto& binding) {
-            return binding.action == gaze_action && binding.binding == gaze_path;
-        }
-    );
-    if (!present) bindings.push_back({gaze_action, gaze_path});
+    if (gaze_profile_match) menu_bindings.push_back({gaze_action, gaze_path});
+    for (const auto& binding : menu_bindings) {
+        const auto present = std::any_of(bindings.begin(), bindings.end(), [&](const auto& existing) {
+            return existing.action == binding.action && existing.binding == binding.binding;
+        });
+        if (!present) bindings.push_back(binding);
+    }
     auto merged = *suggested;
     merged.countSuggestedBindings = static_cast<std::uint32_t>(bindings.size());
     merged.suggestedBindings = bindings.data();
@@ -1195,8 +2045,12 @@ cheeky_xrSuggestInteractionProfileBindings(
         std::lock_guard lock(state_mutex);
         const auto iterator = instances.find(instance);
         if (iterator != instances.end()) {
-            iterator->second.gaze_binding_submitted = true;
-            iterator->second.binding_result = result;
+            if (gaze_profile_match) {
+                iterator->second.gaze_binding_submitted = true;
+                iterator->second.binding_result = result;
+            }
+            if (menu_profile_index < iterator->second.menu_bindings_submitted.size())
+                iterator->second.menu_bindings_submitted[menu_profile_index] = true;
         }
     }
     return result;
@@ -1209,6 +2063,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
     if (attach_info == nullptr) return XR_ERROR_VALIDATION_FAILURE;
     PFN_xrAttachSessionActionSets next{};
     XrActionSet layer_action_set{XR_NULL_HANDLE};
+    XrActionSet menu_action_set{XR_NULL_HANDLE};
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
@@ -1216,10 +2071,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
         next = instance->dispatch.attach_action_sets;
         ++sessions.at(session).input.host_attach_calls;
         layer_action_set = instance->action_set;
+        menu_action_set = instance->menu_graphics_enabled ? instance->menu_action_set : XR_NULL_HANDLE;
         static_cast<void>(ensure_gaze_binding_locked(*instance));
+        ensure_menu_bindings(*instance);
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
-    if (layer_action_set == XR_NULL_HANDLE) return next(session, attach_info);
+    if (layer_action_set == XR_NULL_HANDLE && menu_action_set == XR_NULL_HANDLE) return next(session, attach_info);
 
     std::vector<XrActionSet> action_sets;
     if (attach_info->countActionSets != 0U &&
@@ -1229,10 +2086,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
             attach_info->actionSets + attach_info->countActionSets
         );
     }
-    if (std::find(action_sets.begin(), action_sets.end(), layer_action_set) ==
-        action_sets.end()) {
+    if (layer_action_set != XR_NULL_HANDLE &&
+        std::find(action_sets.begin(), action_sets.end(), layer_action_set) == action_sets.end()) {
         action_sets.push_back(layer_action_set);
     }
+    if (menu_action_set != XR_NULL_HANDLE &&
+        std::find(action_sets.begin(), action_sets.end(), menu_action_set) == action_sets.end())
+        action_sets.push_back(menu_action_set);
     auto merged = *attach_info;
     merged.countActionSets = static_cast<std::uint32_t>(action_sets.size());
     merged.actionSets = action_sets.data();
@@ -1257,6 +2117,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
     PFN_xrSyncActions next{};
     PFN_xrGetActionStatePose get_pose{};
     XrActionSet action_set{XR_NULL_HANDLE};
+    XrActionSet menu_action_set{XR_NULL_HANDLE};
     XrAction gaze_action{XR_NULL_HANDLE};
     bool attached{};
     {
@@ -1266,6 +2127,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         next = instance->dispatch.sync_actions;
         get_pose = instance->dispatch.get_action_state_pose;
         action_set = instance->action_set;
+        menu_action_set = instance->menu_graphics_enabled ? instance->menu_action_set : XR_NULL_HANDLE;
         gaze_action = instance->gaze_action;
         attached = sessions.at(session).action_attached;
         ++sessions.at(session).input.host_sync_calls;
@@ -1287,6 +2149,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
             }
         );
         if (!present) active_sets.push_back({action_set, XR_NULL_PATH});
+    }
+    if (attached && menu_action_set != XR_NULL_HANDLE) {
+        const auto present = std::any_of(active_sets.begin(), active_sets.end(), [&](const auto& active) {
+            return active.actionSet == menu_action_set;
+        });
+        if (!present) active_sets.push_back({menu_action_set, XR_NULL_PATH});
     }
     auto merged = *sync_info;
     merged.countActiveActionSets = static_cast<std::uint32_t>(active_sets.size());
@@ -1832,7 +2700,21 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
 
-    const auto result = next(session, frame_end_info);
+    std::unique_lock menu_lock(menu_mutex);
+    SessionState* menu_session{};
+    Dispatch menu_dispatch{};
+    {
+        std::lock_guard state_lock(state_mutex);
+        const auto found = sessions.find(session);
+        if (found != sessions.end()) {
+            menu_session = &found->second;
+            menu_dispatch = instances.at(found->second.instance).dispatch;
+        }
+    }
+    const auto result = menu_session
+        ? submit_menu_frame(session, frame_end_info, menu_dispatch, *menu_session)
+        : next(session, frame_end_info);
+    menu_lock.unlock();
     std::unique_lock lock(state_mutex);
     const auto selected = cheeky::openxr::select_projection(frame_end_info, [session](XrSwapchain handle) {
         const auto it = swapchains.find(handle);

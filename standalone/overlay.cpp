@@ -4,6 +4,13 @@
 #include "settings_io.hpp"
 #include "version.h"
 #include "openvr_menu.hpp"
+#include "../shared/openxr_menu_bridge.hpp"
+void report_openxr_menu_diagnostic(const char* message) noexcept {
+    const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
+    const auto report = host ? reinterpret_cast<CheekyOpenXRMenuDiagnosticFn>(
+        GetProcAddress(host, "CheekyOpenXRMenuLogDiagnostic")) : nullptr;
+    if (report) report(message);
+}
 #include <Windows.h>
 #include <d3d11_1.h>
 #include <d3d12.h>
@@ -107,6 +114,8 @@ struct Renderer : OverlayUiState {
     std::uint32_t vr_token{};
     ULONGLONG next_vr_probe{};
     unsigned vr_buttons{};
+    bool xr_pointer_active{}, xr_pointer_down{};
+    float xr_pointer_x{}, xr_pointer_y{};
     ImVec2 vr_pointer{};
     bool vr_pointer_valid{};
     float vr_mouse_height{};
@@ -125,6 +134,9 @@ struct Renderer : OverlayUiState {
 struct State {
     std::mutex mutex;
     std::unique_ptr<Renderer> renderer;
+    ULONGLONG xr_last_request{};
+    bool xr_input_pending{}, xr_input_active{}, xr_input_down{};
+    float xr_input_x{}, xr_input_y{};
 };
 State& state() { static auto* value = new State; return *value; }
 
@@ -290,56 +302,7 @@ bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queu
     return true;
 }
 
-// Join the game's existing OpenVR session. Never initialize a second session:
-// native games and bridge mods own the lifetime of openvr_api.dll.
-bool prepare_headset(Renderer& r) {
-    const auto now = GetTickCount64();
-    const auto module = GetModuleHandleW(L"openvr_api.dll");
-    if (!module) return false;
-    const auto token_fn = reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(module, "VR_GetInitToken"));
-    if (!token_fn || !token_fn()) return false;
-    if (r.vr_overlay && r.vr_system && r.vr_token == token_fn() && r.vr_handle != vr::k_ulOverlayHandleInvalid &&
-        (r.dx12 ? bool(r.headset_texture12) : bool(r.headset_texture11))) return true;
-    if (now < r.next_vr_probe) return false;
-    r.next_vr_probe = now + 1000;
-    const auto valid_fn = reinterpret_cast<bool (*)(const char*)>(GetProcAddress(module, "VR_IsInterfaceVersionValid"));
-    const auto get_fn = reinterpret_cast<void* (*)(const char*, vr::EVRInitError*)>(GetProcAddress(module, "VR_GetGenericInterface"));
-    if (!valid_fn || !get_fn) return false;
-    const auto token = token_fn();
-    if (r.vr_token != token) {
-        r.vr_overlay = nullptr;
-        r.vr_system = nullptr;
-        r.vr_canvas_anchored = false;
-        r.vr_geometry_configured = false;
-        r.vr_handle = vr::k_ulOverlayHandleInvalid;
-        r.vr_token = token;
-    }
-    if (!r.vr_overlay) {
-        if (!valid_fn(vr::IVROverlay_Version)) return false;
-        vr::EVRInitError error{};
-        r.vr_overlay = static_cast<vr::IVROverlay*>(get_fn(vr::IVROverlay_Version, &error));
-        if (!r.vr_overlay || error != vr::VRInitError_None) { r.vr_overlay = nullptr; return false; }
-    }
-    if (!r.vr_system) {
-        if (!valid_fn(vr::IVRSystem_Version)) return false;
-        vr::EVRInitError error{};
-        r.vr_system = static_cast<vr::IVRSystem*>(get_fn(vr::IVRSystem_Version, &error));
-        if (!r.vr_system || error != vr::VRInitError_None) { r.vr_system = nullptr; return false; }
-    }
-    if (r.vr_handle == vr::k_ulOverlayHandleInvalid) {
-        const auto key = cheeky::openvr_menu_key(GetCurrentProcessId());
-        if (r.vr_overlay->CreateOverlay(key.c_str(), "Cheeky Foveated DLSS", &r.vr_handle) != vr::VROverlayError_None) {
-            r.vr_handle = vr::k_ulOverlayHandleInvalid;
-            return false;
-        }
-        const vr::VRTextureBounds_t bounds{0, 0, 1, 1};
-        r.vr_overlay->SetOverlayTextureBounds(r.vr_handle, &bounds);
-        r.vr_overlay->SetOverlayInputMethod(r.vr_handle, vr::VROverlayInputMethod_Mouse);
-        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
-        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_SendVRDiscreteScrollEvents, true);
-        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_EnableClickStabilization, true);
-        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_IsPremultiplied, true);
-    }
+bool prepare_headset_texture(Renderer& r) {
     if (r.dx12 && !r.headset_texture12) {
         D3D12_RESOURCE_DESC texture{};
         texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -373,6 +336,61 @@ bool prepare_headset(Renderer& r) {
     return true;
 }
 
+// Join the game's existing OpenVR session. Never initialize a second session:
+// native games and bridge mods own the lifetime of openvr_api.dll.
+bool prepare_headset(Renderer& r) {
+    const auto now = GetTickCount64();
+    const auto module = GetModuleHandleW(L"openvr_api.dll");
+    const bool openxr = GetModuleHandleW(L"CheekyOpenXRLayer.dll") != nullptr;
+    if (!module && !openxr) return false;
+    if (!module) return prepare_headset_texture(r);
+    const auto token_fn = reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(module, "VR_GetInitToken"));
+    if (!token_fn || !token_fn()) return openxr && prepare_headset_texture(r);
+    if (r.vr_overlay && r.vr_system && r.vr_token == token_fn() && r.vr_handle != vr::k_ulOverlayHandleInvalid &&
+        (r.dx12 ? bool(r.headset_texture12) : bool(r.headset_texture11))) return true;
+    if (now < r.next_vr_probe) return openxr && prepare_headset_texture(r);
+    r.next_vr_probe = now + 1000;
+    const auto valid_fn = reinterpret_cast<bool (*)(const char*)>(GetProcAddress(module, "VR_IsInterfaceVersionValid"));
+    const auto get_fn = reinterpret_cast<void* (*)(const char*, vr::EVRInitError*)>(GetProcAddress(module, "VR_GetGenericInterface"));
+    if (!valid_fn || !get_fn) return openxr && prepare_headset_texture(r);
+    const auto token = token_fn();
+    if (r.vr_token != token) {
+        r.vr_overlay = nullptr;
+        r.vr_system = nullptr;
+        r.vr_canvas_anchored = false;
+        r.vr_geometry_configured = false;
+        r.vr_handle = vr::k_ulOverlayHandleInvalid;
+        r.vr_token = token;
+    }
+    if (!r.vr_overlay) {
+        if (!valid_fn(vr::IVROverlay_Version)) return openxr && prepare_headset_texture(r);
+        vr::EVRInitError error{};
+        r.vr_overlay = static_cast<vr::IVROverlay*>(get_fn(vr::IVROverlay_Version, &error));
+        if (!r.vr_overlay || error != vr::VRInitError_None) { r.vr_overlay = nullptr; return openxr && prepare_headset_texture(r); }
+    }
+    if (!r.vr_system) {
+        if (!valid_fn(vr::IVRSystem_Version)) return openxr && prepare_headset_texture(r);
+        vr::EVRInitError error{};
+        r.vr_system = static_cast<vr::IVRSystem*>(get_fn(vr::IVRSystem_Version, &error));
+        if (!r.vr_system || error != vr::VRInitError_None) { r.vr_system = nullptr; return openxr && prepare_headset_texture(r); }
+    }
+    if (r.vr_handle == vr::k_ulOverlayHandleInvalid) {
+        const auto key = cheeky::openvr_menu_key(GetCurrentProcessId());
+        if (r.vr_overlay->CreateOverlay(key.c_str(), "Cheeky Foveated DLSS", &r.vr_handle) != vr::VROverlayError_None) {
+            r.vr_handle = vr::k_ulOverlayHandleInvalid;
+            return openxr && prepare_headset_texture(r);
+        }
+        const vr::VRTextureBounds_t bounds{0, 0, 1, 1};
+        r.vr_overlay->SetOverlayTextureBounds(r.vr_handle, &bounds);
+        r.vr_overlay->SetOverlayInputMethod(r.vr_handle, vr::VROverlayInputMethod_Mouse);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_SendVRDiscreteScrollEvents, true);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_EnableClickStabilization, true);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_IsPremultiplied, true);
+    }
+    return prepare_headset_texture(r);
+}
+
 void release_headset_input(Renderer& r) {
     for (unsigned button = 0; button < 3; ++button)
         if (r.vr_buttons & (1U << button)) ImGui::GetIO().AddMouseButtonEvent(button, false);
@@ -381,7 +399,7 @@ void release_headset_input(Renderer& r) {
 }
 
 void poll_headset_input(Renderer& r, bool ready, int desktop_events_begin) {
-    if (!ready) { release_headset_input(r); return; }
+    if (!ready || !r.vr_overlay) { release_headset_input(r); return; }
     auto& io = ImGui::GetIO();
     // A click can already be queued even if SteamVR's current hover query no
     // longer targets us. Decide pointer ownership from the whole event batch.
@@ -638,8 +656,8 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         ContextScope scope(r.context);
         if (r.attachment != runtime.attachment) { r.attachment = runtime.attachment; r.next_snapshot = 0; }
         const int desktop_events_begin = ImGui::GetCurrentContext()->InputEventsQueue.Size;
-        process_overlay_input(*r.input, r.vr_buttons);
-        if (!r.input->open) { release_headset_input(r); hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
+        process_overlay_input(*r.input, r.vr_buttons | unsigned(r.xr_pointer_down));
+        if (!r.input->open) { release_headset_input(r); r.xr_pointer_down = false; r.xr_pointer_active = false; global.xr_input_pending = false; global.xr_input_active = false; global.xr_input_down = false; hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
         release_cursor(*r.input);
         ImGui::GetIO().MouseDrawCursor = true;
         if (r.dx12) ImGui_ImplDX12_NewFrame(); else ImGui_ImplDX11_NewFrame();
@@ -647,6 +665,23 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
         const bool headset_ready = prepare_headset(r);
         poll_headset_input(r, headset_ready, desktop_events_begin);
+        if (global.xr_input_pending) {
+            global.xr_input_pending = false;
+            const bool active = global.xr_input_active && headset_ready;
+            if (active) {
+                discard_desktop_pointer_events(desktop_events_begin);
+                r.xr_pointer_x = global.xr_input_x;
+                r.xr_pointer_y = global.xr_input_y;
+                ImGui::GetIO().AddMousePosEvent(r.xr_pointer_x, r.xr_pointer_y);
+            }
+            if (r.xr_pointer_down != (active && global.xr_input_down)) {
+                r.xr_pointer_down = active && global.xr_input_down;
+                ImGui::GetIO().AddMouseButtonEvent(0, r.xr_pointer_down);
+            }
+            r.xr_pointer_active = active;
+        }
+        if (r.xr_pointer_active && r.xr_pointer_down)
+            ImGui::GetIO().AddMousePosEvent(r.xr_pointer_x, r.xr_pointer_y);
         ImGui::NewFrame();
         bool open=r.input->open.load();
         draw_overlay_ui(r,runtime,*r.input,r.dx12?"D3D12":"D3D11",status.load(),open);
@@ -654,9 +689,120 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
         ImGui::Render();
         if (r.dx12) render12(r); else render11(r);
+        if (GetModuleHandleW(L"CheekyOpenXRLayer.dll") && !r.vr_overlay &&
+            GetTickCount64() - global.xr_last_request > 3000)
+            set_status("OpenXR layer loaded; no headset-menu frame requests");
         if (headset_ready && !r.poisoned && open) publish_headset(r);
         if (!open) { release_headset_input(r); hide_headset(r); }
     } catch (...) { set_status("Overlay exception contained; rendering skipped"); }
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuAcquireFrame(
+    CheekyOpenXRMenuFrame* frame) noexcept {
+    if (!frame || frame->size != sizeof(CheekyOpenXRMenuFrame)) return false;
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    global.xr_last_request = GetTickCount64();
+    auto* r = global.renderer.get();
+    if (!r || !r->input || !r->input->open || r->poisoned) return false;
+    auto* texture = r->dx12 ? static_cast<IUnknown*>(r->headset_texture12.Get())
+        : static_cast<IUnknown*>(r->headset_texture11.Get());
+    if (!texture) return false;
+    texture->AddRef();
+    frame->graphics_api = r->dx12 ? 12 : 11;
+    frame->width = r->framebuffer_width;
+    frame->height = r->framebuffer_height;
+    frame->format = static_cast<std::uint32_t>(r->format);
+    cheeky::standalone::ContextScope scope(r->context);
+    frame->display_width = ImGui::GetIO().DisplaySize.x;
+    frame->display_height = ImGui::GetIO().DisplaySize.y;
+    frame->device = r->dx12 ? static_cast<void*>(r->device12.Get()) : static_cast<void*>(r->device11.Get());
+    frame->queue = r->dx12 ? static_cast<void*>(r->queue.Get()) : nullptr;
+    frame->texture = texture;
+    return true;
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuCopy11(
+    void* target, void* source) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    auto* r = global.renderer.get();
+    if (!r || r->dx12 || !r->context11 || !target ||
+        source != r->headset_texture11.Get()) return false;
+    r->context11->CopyResource(static_cast<ID3D11Texture2D*>(target),
+        static_cast<ID3D11Texture2D*>(source));
+    r->context11->Flush();
+    return true;
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuExecute11(
+    void* command_list, void* source) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    auto* r = global.renderer.get();
+    if (!r || r->dx12 || !r->context11 || !command_list ||
+        source != r->headset_texture11.Get()) return false;
+    r->context11->ExecuteCommandList(static_cast<ID3D11CommandList*>(command_list), TRUE);
+    r->context11->Flush();
+    return true;
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuSubmit12(
+    void* host_queue, void* xr_queue, void* command_list, void* fence,
+    std::uint64_t fence_value) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    auto* r = global.renderer.get();
+    if (!r || !r->dx12 || r->queue.Get() != host_queue || !xr_queue || !command_list || !fence) return false;
+    auto* destination_queue = static_cast<ID3D12CommandQueue*>(xr_queue);
+    auto* completion = static_cast<ID3D12Fence*>(fence);
+    if (destination_queue != r->queue.Get() &&
+        FAILED(destination_queue->Wait(r->fence.Get(), r->fence_value))) {
+        report_openxr_menu_diagnostic("OpenXR menu: XR queue wait failed");
+        return false;
+    }
+    auto* list = static_cast<ID3D12CommandList*>(command_list);
+    if (fence_value == 1) report_openxr_menu_diagnostic("OpenXR menu: submitting first D3D12 menu command list");
+    destination_queue->ExecuteCommandLists(1, &list);
+    if (FAILED(destination_queue->Signal(completion, fence_value))) {
+        report_openxr_menu_diagnostic("OpenXR menu: XR queue signal failed");
+        return false;
+    }
+    // Keep the mirror's next menu render behind a copy on a separate XR queue.
+    if (destination_queue != r->queue.Get() &&
+        FAILED(r->queue->Wait(completion, fence_value))) {
+        report_openxr_menu_diagnostic("OpenXR menu: mirror queue wait failed");
+        return false;
+    }
+    if (fence_value == 1) report_openxr_menu_diagnostic("OpenXR menu: first D3D12 menu command list queued");
+    return true;
+}
+
+extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuSetPointer(
+    float x, float y, bool down, bool active) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    global.xr_input_pending = true;
+    global.xr_input_active = active;
+    global.xr_input_down = down;
+    global.xr_input_x = x;
+    global.xr_input_y = y;
+}
+
+extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuReportStatus(
+    std::uint32_t status) noexcept {
+    static const char* messages[]{
+        "OpenXR headset menu submitted",
+        "OpenXR menu: game and mirror use different graphics APIs",
+        "OpenXR menu: game and mirror use different graphics devices",
+        "OpenXR menu: mirror texture format unsupported by runtime",
+        "OpenXR menu: runtime could not create menu swap chain",
+        "OpenXR menu: headset pose unavailable",
+        "OpenXR menu: runtime image acquisition failed",
+        "OpenXR menu: GPU copy failed",
+        "OpenXR menu: runtime rejected submitted menu layer",
+    };
+    if (status < std::size(messages)) cheeky::standalone::set_status(messages[status]);
 }
 
 void overlay_before_resize(IDXGISwapChain* swapchain) noexcept {

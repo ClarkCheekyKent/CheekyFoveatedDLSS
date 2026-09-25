@@ -3,6 +3,7 @@
 #include "../third_party/openxr/include/openxr/openxr_loader_negotiation.h"
 #include "cheeky_gaze_abi.h"
 #include "gaze_foveation.hpp"
+#include "../openxr_layer/menu_geometry.hpp"
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -191,6 +192,33 @@ bool valid(const CheekyGazeSnapshotV1& s) { return (s.status_flags & CHEEKY_GAZE
 int run_openxr_input_tests() {
     HMODULE realvr{};
     try {
+        // Controller rays must resolve to the same pixels on native cylinders
+        // and on the quad-strip fallback, including non-divisible texture widths.
+        for (bool cylinder : {false, true}) {
+            for (unsigned i = 0; i < 12; ++i) {
+                constexpr float width = 6.F, height = 2.F;
+                constexpr unsigned pixels = 3443;
+                const auto strip = cheeky::xr_menu::strip(width, pixels, i, 12);
+                float expected = (strip.left + .3F * (strip.right - strip.left)) / pixels;
+                XrVector3f point;
+                if (cylinder) {
+                    const float a = (expected - .5F) * width / cheeky::xr_menu::radius;
+                    point = {3.F * std::sin(a), .2F, 3.F * (1.F - std::cos(a))};
+                } else {
+                    point = {strip.center.x - .2F * strip.width * std::cos(strip.angle),
+                        .2F, strip.center.z - .2F * strip.width * std::sin(strip.angle)};
+                }
+                XrVector3f direction{point.x, point.y, point.z - 1.5F};
+                const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z);
+                direction = {direction.x / length, direction.y / length, direction.z / length};
+                float u{}, v{};
+                require(cheeky::xr_menu::hit({0,0,1.5F}, direction, width, height, pixels, 12, cylinder, u, v) &&
+                    std::abs(u - expected) < 1e-4F && std::abs(v - .4F) < 1e-4F,
+                    "Curved menu controller hit must match displayed pixel");
+                require(!cheeky::xr_menu::hit({0,0,1.5F}, {0,0,1}, width, height, pixels, 12, cylinder, u, v),
+                    "Controller pointing away must not hit menu");
+            }
+        }
         Runtime::reset();
         {
             Layer layer;
