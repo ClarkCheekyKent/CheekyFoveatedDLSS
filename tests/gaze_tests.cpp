@@ -19,6 +19,7 @@
 #include "streamline_create_extent.hpp"
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
+#include "openvr_menu.hpp"
 #include "graphics_observer.hpp"
 #include "ngx_evaluation_extent.hpp"
 #include "motion_region.hpp"
@@ -171,6 +172,37 @@ void test_sr_crop_dimensions_during_gaze() {
             }
         }
     }
+}
+
+void test_openvr_menu_focus() {
+    struct Overlay {
+        bool dashboard{}, visible{true}, found{true};
+        std::uint32_t pid{123}, flags{vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible};
+        vr::VROverlayInputMethod input{vr::VROverlayInputMethod_Mouse};
+        bool IsDashboardVisible() { return dashboard; }
+        vr::EVROverlayError FindOverlay(const char* key, vr::VROverlayHandle_t* handle) {
+            if (!found || std::strcmp(key, "cheeky.foveated_dlss.menu.123") != 0) return vr::VROverlayError_UnknownOverlay;
+            *handle = 1; return vr::VROverlayError_None;
+        }
+        std::uint32_t GetOverlayRenderingPid(vr::VROverlayHandle_t) { return pid; }
+        bool IsOverlayVisible(vr::VROverlayHandle_t) { return visible; }
+        vr::EVROverlayError GetOverlayFlags(vr::VROverlayHandle_t, std::uint32_t* out) { *out = flags; return vr::VROverlayError_None; }
+        vr::EVROverlayError GetOverlayInputMethod(vr::VROverlayHandle_t, vr::VROverlayInputMethod* out) { *out = input; return vr::VROverlayError_None; }
+    } overlay;
+    auto allowed = [&] { return cheeky::openvr_menu_allows_gaze(overlay, 123); };
+    expect(allowed(), "Our interactive menu allows gaze during controller capture");
+    overlay.dashboard = true;
+    expect(!allowed(), "Dashboard blocks the own-menu gaze exception");
+    overlay.dashboard = false; overlay.visible = false;
+    expect(!allowed(), "Hidden menu cannot grant gaze focus");
+    overlay.visible = true; overlay.pid = 456;
+    expect(!allowed(), "Foreign overlay cannot grant gaze focus");
+    overlay.pid = 123; overlay.found = false;
+    expect(!allowed(), "Missing menu cannot grant gaze focus");
+    overlay.found = true; overlay.input = vr::VROverlayInputMethod_None;
+    expect(!allowed(), "Noninteractive menu cannot grant gaze focus");
+    overlay.input = vr::VROverlayInputMethod_Mouse; overlay.flags = 0;
+    expect(!allowed(), "Menu without laser capture cannot grant gaze focus");
 }
 
 void test_simulated_gaze() {
@@ -2355,6 +2387,11 @@ int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int run_debug_exposure_tests();
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--openvr-menu-focus") == 0) {
+        test_openvr_menu_focus();
+        if (!failures) std::cout << "OpenVR menu gaze focus checks passed\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--hook-path") == 0) {
         test_selectable_d3d12_hook_path();
         return failures ? 1 : 0;
@@ -2428,6 +2465,7 @@ int main(int argc, char** argv) {
         failures += run_d3d12_composite_tests();
         return failures ? 1 : 0;
     }
+    test_openvr_menu_focus();
     test_simulated_gaze();
     test_gaze_copy_routes();
     test_gaze_camera_projection();

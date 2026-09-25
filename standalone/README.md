@@ -167,7 +167,10 @@ the same left/right window placement as the desktop. Closing and reopening
 preserves its position; moving or resizing the menu does not recenter the canvas.
 Point away from the UI surface to use the desktop mouse again. F8 still opens the menu in this preview;
 the close button works with either input. This headset panel needs testing
-in real games; OpenXR and Vulkan headset menus are not supported yet. OpenXR
+in real games. Gaze and simulated gaze remain active while Cheeky's own menu
+captures controller input, provided scene frames and gaze samples remain valid;
+the SteamVR dashboard still blocks that exception. OpenXR and Vulkan headset
+menus are not supported yet. OpenXR
 gaze and calibration still use the separate Cheeky OpenXR layer; use its matching
 installer when needed. This package does not turn a flat game into VR.
 UEVR-specific AFW projection and rendering-mode callbacks remain available

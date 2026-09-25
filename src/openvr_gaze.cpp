@@ -1,6 +1,7 @@
 #include "eye_calibration.hpp"
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
+#include "openvr_menu.hpp"
 #include "openvr_vtable_hook.hpp"
 #include "gaze_math.hpp"
 #include "diagnostics.hpp"
@@ -73,6 +74,12 @@ void shutdown_hook() {
     std::lock_guard lock(state_mutex);
     runtime_stopping=false;
 }
+bool own_menu_allows_gaze() {
+    vr::EVRInitError error{};
+    auto* overlay = static_cast<vr::IVROverlay*>(get_interface(vr::IVROverlay_Version, &error));
+    return overlay && error == vr::VRInitError_None &&
+        cheeky::openvr_menu_allows_gaze(*overlay, GetCurrentProcessId());
+}
 void observe_frame(bool focused) {
     if (stopping.load()) return;
     Retired retired; // Release resources after state_mutex, outside coordinator lock order.
@@ -94,7 +101,10 @@ void observe_frame(bool focused) {
     snapshot.session_generation=generation;
     snapshot.swapchain_generation=generation;
     snapshot.status_flags=CHEEKY_GAZE_STATUS_LAYER_ACTIVE|CHEEKY_GAZE_STATUS_OPENVR;
-    if (focused && system->IsInputAvailable()) snapshot.status_flags|=CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    // Our menu's laser mode consumes controller input without invalidating
+    // eye tracking. Preserve scene-focus/head-pose and sample-validity checks.
+    if (focused && (system->IsInputAvailable() || own_menu_allows_gaze()))
+        snapshot.status_flags|=CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
     const char* runtime=system->GetRuntimeVersion();
     sprintf_s(snapshot.runtime_name,"SteamVR / OpenVR %s",runtime ? runtime : "");
     vr::HmdVector2_t ndc[2]{};

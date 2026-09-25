@@ -3,6 +3,7 @@
 #include "overlay_input.hpp"
 #include "settings_io.hpp"
 #include "version.h"
+#include "openvr_menu.hpp"
 #include <Windows.h>
 #include <d3d11_1.h>
 #include <d3d12.h>
@@ -326,7 +327,7 @@ bool prepare_headset(Renderer& r) {
         if (!r.vr_system || error != vr::VRInitError_None) { r.vr_system = nullptr; return false; }
     }
     if (r.vr_handle == vr::k_ulOverlayHandleInvalid) {
-        const auto key = "cheeky.foveated_dlss.menu." + std::to_string(GetCurrentProcessId());
+        const auto key = cheeky::openvr_menu_key(GetCurrentProcessId());
         if (r.vr_overlay->CreateOverlay(key.c_str(), "Cheeky Foveated DLSS", &r.vr_handle) != vr::VROverlayError_None) {
             r.vr_handle = vr::k_ulOverlayHandleInvalid;
             return false;
