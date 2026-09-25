@@ -256,8 +256,8 @@ bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queu
         set_status("Unable to create overlay GPU shaders/resources"); return false;
     }
     r.input = attach_input(r.window);
-    if (!r.input) { set_status("Unable to install the F8 window input handler"); return false; }
-    set_status("F8 menu ready (SDR, scRGB and HDR10)");
+    if (!r.input) { set_status("Unable to install the menu input handler"); return false; }
+    set_status("Menu ready (SDR, scRGB and HDR10)");
     return true;
 }
 
@@ -361,7 +361,7 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         const bool menu_open = r.input->open.load();
         if (menu_open != r.menu_was_open) {
             r.menu_was_open = menu_open;
-            set_status(menu_open ? "F8 menu opened" : "F8 menu closed");
+            set_status(menu_open ? "Menu opened" : "Menu closed");
         }
         cheeky_overlay_color_mode = shader_color_mode(color_space, r.format);
         ContextScope scope(r.context);
@@ -375,8 +375,8 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
         ImGui::NewFrame();
         bool open=r.input->open.load();
-        draw_overlay_ui(r,runtime,r.dx12?"D3D12":"D3D11",status.load(),open);
-        // Only the close button writes the atomic; concurrent F8 is preserved.
+        draw_overlay_ui(r,runtime,*r.input,r.dx12?"D3D12":"D3D11",status.load(),open);
+        // Only the close button writes the atomic; concurrent menu-key input is preserved.
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
         ImGui::Render();
         if (r.dx12) render12(r); else render11(r);

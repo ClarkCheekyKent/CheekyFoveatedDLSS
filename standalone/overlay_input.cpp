@@ -1,10 +1,11 @@
 #include "overlay_input.hpp"
 #include <imgui.h>
 #include <MinHook.h>
+#include <filesystem>
 extern IMGUI_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 #ifdef CHEEKY_OVERLAY_TEST_DESKTOP
 extern bool cheeky_overlay_test_foreground(HWND);
-extern bool cheeky_overlay_test_f8_down();
+extern bool cheeky_overlay_test_key_down(int);
 extern bool cheeky_overlay_test_mouse_down(unsigned);
 #endif
 namespace cheeky::standalone {
@@ -14,6 +15,24 @@ std::atomic<InputState*> capture_owner{};
 using AsyncKeyState = SHORT (WINAPI*)(int);
 AsyncKeyState original_async_key_state = GetAsyncKeyState;
 constexpr int mouse_keys[]{VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+bool valid_menu_key(unsigned key) {
+    return key >= VK_BACK && key <= 0xfe && key != VK_ESCAPE &&
+        key != VK_SHIFT && key != VK_CONTROL && key != VK_MENU &&
+        key != VK_LSHIFT && key != VK_RSHIFT &&
+        key != VK_LCONTROL && key != VK_RCONTROL &&
+        key != VK_LMENU && key != VK_RMENU &&
+        key != VK_LWIN && key != VK_RWIN;
+}
+std::wstring menu_config_path() {
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&attach_input), &module)) return {};
+    wchar_t path[32768]{};
+    const auto length = GetModuleFileNameW(module, path, 32768);
+    if (!length || length >= 32768) return {};
+    return (std::filesystem::path(path).parent_path() / L"CheekyOverlay.ini").wstring();
+}
 SHORT physical_key_state(int key) {
 #ifdef CHEEKY_OVERLAY_TEST_DESKTOP
     for (unsigned button = 0; button < 5; ++button)
@@ -193,18 +212,37 @@ void set_overlay_framebuffer_scale(unsigned width, unsigned height) {
 }
 
 void poll_overlay_hotkey(InputState& input) {
+    if (input.rebinding) return;
+    const auto key = input.menu_key.load();
 #ifdef CHEEKY_OVERLAY_TEST_DESKTOP
-    const bool down = cheeky_overlay_test_f8_down();
+    const bool down = cheeky_overlay_test_key_down(key);
 #else
-    const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    const bool down = (physical_key_state(key) & 0x8000) != 0;
 #endif
-    const bool was_down = input.f8_down.exchange(down);
+    const bool was_down = input.menu_key_down.exchange(down);
     if (down && !was_down && input.enabled && foreground(input.window)) {
         // Preserve window-thread ownership of input release and cursor handling.
         // Both polling and normal key messages claim the same press edge.
         const auto message = toggle_message();
-        if (!message || !PostMessageW(input.window, message, 0, 0)) input.f8_down = false;
+        if (!message || !PostMessageW(input.window, message, 0, 0)) input.menu_key_down = false;
     }
+}
+
+void begin_menu_key_rebind(InputState& input) {
+    input.rebound_key = 0;
+    input.rebinding = true;
+}
+
+unsigned consume_menu_key_rebind(InputState& input) { return input.rebound_key.exchange(0); }
+
+bool save_menu_key(InputState& input, unsigned key) {
+    if (!valid_menu_key(key) || input.config_path.empty()) return false;
+    const auto value = std::to_wstring(key);
+    if (!WritePrivateProfileStringW(L"Overlay", L"MenuKey", value.c_str(), input.config_path.c_str())) return false;
+    // A held binding must finish its current press before it can toggle.
+    input.menu_key_down = (physical_key_state(key) & 0x8000) != 0;
+    input.menu_key = key;
+    return true;
 }
 
 LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -216,14 +254,29 @@ LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam, LPARA
         return 0;
     }
     if (message == WM_KILLFOCUS || (message == WM_ACTIVATEAPP && !wparam)) {
-        input->open = false; input->f8_down = false; input->pointer_buttons = 0; restore_cursor(*input, false);
+        input->open = false; input->menu_key_down = false; input->rebinding = false;
+        input->pointer_buttons = 0; restore_cursor(*input, false);
     }
-    if (input->enabled && focused && wparam == VK_F8 &&
-        (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP)) {
-        if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && !(lparam & (LPARAM{1} << 30))) {
-            if (!input->f8_down.exchange(true)) toggle_on_window_thread(input, window);
+    const bool key_message = message == WM_KEYDOWN || message == WM_KEYUP ||
+        message == WM_SYSKEYDOWN || message == WM_SYSKEYUP;
+    const bool key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+    if (input->enabled && focused && input->rebinding && key_message) {
+        if (key_down && !(lparam & (LPARAM{1} << 30))) {
+            const auto key = static_cast<unsigned>(wparam);
+            if (key == VK_ESCAPE || valid_menu_key(key)) {
+                input->menu_key_down = true;
+                input->rebound_key = key;
+                input->rebinding = false;
+            }
         }
-        if (message == WM_KEYUP || message == WM_SYSKEYUP) input->f8_down = false;
+        return 0;
+    }
+    if (input->enabled && focused && wparam == input->menu_key.load() &&
+        (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP)) {
+        if (key_down && !(lparam & (LPARAM{1} << 30))) {
+            if (!input->menu_key_down.exchange(true)) toggle_on_window_thread(input, window);
+        }
+        if (message == WM_KEYUP || message == WM_SYSKEYUP) input->menu_key_down = false;
         return 0;
     }
     const bool capture = input->enabled && input->open && focused;
@@ -281,6 +334,11 @@ InputState* attach_input(HWND window) {
     // Releasing it would leave that overlay with a dangling WndProc reference.
     auto* input = new InputState;
     input->window = window;
+    input->config_path = menu_config_path();
+    if (!input->config_path.empty()) {
+        const auto saved = GetPrivateProfileIntW(L"Overlay", L"MenuKey", VK_F8, input->config_path.c_str());
+        if (valid_menu_key(saved)) input->menu_key = saved;
+    }
     input->previous = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC));
     if (!input->previous || !SetPropW(window, input_property, input)) { delete input; return nullptr; }
     SetLastError(ERROR_SUCCESS);

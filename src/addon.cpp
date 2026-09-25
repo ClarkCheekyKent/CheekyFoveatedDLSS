@@ -1318,6 +1318,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         "%.2f",
         ImGuiSliderFlags_AlwaysClamp
     );
+    ImGui::TextDisabled("Cosmetic only; no performance impact.");
     changed |= ImGui::SliderFloat(
         "Transition width",
         &settings.transition_width,
@@ -1492,6 +1493,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
                 "NR roundness", &settings.nr_roundness,
                 0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp
             );
+            ImGui::TextDisabled("Cosmetic only; no performance impact.");
             changed |= ImGui::SliderFloat(
                 "NR transition width", &settings.nr_transition_width,
                 0.0F, 0.30F, "%.3f", ImGuiSliderFlags_AlwaysClamp

@@ -143,7 +143,7 @@ VkResult overlay_vulkan_present(const CheekyVulkanPresent& p,const OverlayRuntim
         auto& target=r.targets[image];
         release_cursor(*r.input);ImGui::GetIO().MouseDrawCursor=true;
         ImGui_ImplVulkan_NewFrame();ImGui_ImplWin32_NewFrame();set_overlay_framebuffer_scale(r.extent.width,r.extent.height);ImGui::NewFrame();
-        bool open=r.input->open.load();draw_overlay_ui(r,runtime,"Vulkan","Native Vulkan F8 menu",open);
+        bool open=r.input->open.load();draw_overlay_ui(r,runtime,*r.input,"Vulkan","Native Vulkan menu",open);
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
         ImGui::Render();
         check(proc<PFN_vkResetCommandPool>(r,"vkResetCommandPool")(p.device,f.pool,0));

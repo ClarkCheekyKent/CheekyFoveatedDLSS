@@ -38,7 +38,7 @@ readback; actual NVIDIA inference and headset behavior still need game testing.
 4. Start the game with its D3D11, D3D12 or Vulkan renderer and enable DLSS.
 
 **Do not overwrite another mod's loader.** Both choices use the same shared
-folder and F8 controls. The game must load the selected local DLL for Cheeky to
+folder and desktop controls. The game must load the selected local DLL for Cheeky to
 start. For OptiScaler, use the ASI package below.
 
 ### Optional second DXGI mod
@@ -108,8 +108,11 @@ swap-chain creation.
 
 ## Settings and diagnostics
 
-Press **F8** to open or close Cheeky's desktop overlay. Its tabs provide DLSS-SR,
-gaze/stereo, DLSS-NR and diagnostics controls. Changes are saved automatically.
+Press **F8** by default to open or close Cheeky's desktop overlay. The **General** tab
+lets you change the menu key and shows compatibility controls and runtime status.
+Its other tabs provide DLSS-SR, gaze/stereo, DLSS-NR and diagnostics controls.
+Changes are saved automatically. The menu key is saved in `CheekyOverlay.ini`
+beside the host DLL; use **Reset to F8** in General to restore the default.
 Pause the game when changing settings if it continues to react to keys while
 the menu is open; some games poll input outside Windows message handling.
 

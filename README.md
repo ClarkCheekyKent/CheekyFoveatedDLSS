@@ -31,10 +31,11 @@ Use the **Standalone** ZIP for native DLSS games: extract `dxgi.dll` and the
 `CheekyFoveatedDLSS` folder beside the game executable. If `dxgi.dll` already
 exists, do not overwrite it.
 
-Press **F8** for Cheeky's in-game controls.
+Press **F8** by default for Cheeky's in-game controls. The standalone menu key
+can be changed in its General tab. [Installation, layout and limitations](standalone/README.md)
 
-Complete the OpenXR setup below when using OpenXR. The F8 controls appear on
-the desktop screen; an in-headset settings menu is not included yet.
+Complete the OpenXR setup below when using OpenXR. The overlay controls appear on
+the desktop; an in-headset settings menu is not included.
 
 ### UEVR plugin
 

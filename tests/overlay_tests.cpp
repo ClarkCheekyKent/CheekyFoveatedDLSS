@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -28,9 +29,11 @@ using namespace cheeky::foveated_dlss;
 // supplies an explicit foreground state for reproducible input tests.
 HWND test_foreground{};
 bool test_f8_down{};
+int test_extra_key{};
+bool test_extra_down{};
 bool test_mouse_down[5]{};
 bool cheeky_overlay_test_mouse_down(unsigned button) { return test_mouse_down[button]; }
-bool cheeky_overlay_test_f8_down() { return test_f8_down; }
+bool cheeky_overlay_test_key_down(int key) { return key == VK_F8 ? test_f8_down : key == test_extra_key && test_extra_down; }
 bool cheeky_overlay_test_foreground(HWND window) { return window && window == test_foreground; }
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
@@ -48,6 +51,7 @@ void test_ui_diagnostics() {
     unsigned char* pixels{}; int width{}, height{};
     io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
     OverlayUiState state;
+    InputState input;
     state.draft.center_mode = FoveationCenterMode::openxr_gaze;
     const OverlayRuntime runtime{};
     auto render = [&](const char* tab, bool expand_details = true) {
@@ -60,7 +64,7 @@ void test_ui_diagnostics() {
         ImGui::NewFrame();
         ImGui::Begin("Diagnostic capture");
         ImGui::LogToBuffer(expand_details ? 8 : 0);
-        draw_overlay_ui(state, runtime, "D3D12", "Ready", open);
+        draw_overlay_ui(state, runtime, input, "D3D12", "Ready", open);
         const std::string text = context->LogBuffer.c_str();
         ImGui::LogFinish();
         ImGui::End();
@@ -71,8 +75,8 @@ void test_ui_diagnostics() {
     render("Stereo / Gaze"); render("Stereo / Gaze");
     auto text = render("Stereo / Gaze");
     auto* bar = context->TabBars.GetByIndex(0);
-    require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "Stereo / Gaze") == 0, "Stereo / Gaze should be the first tab");
-    require(bar->Tabs.Size == 5, "Performance should live inside the SR and NR tabs");
+    require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "General") == 0, "General should be the first tab");
+    require(bar->Tabs.Size == 6, "General should join the existing five tabs");
     require(text.find("no active OpenXR layer") != text.npos, "Missing gaze adapter warning");
     require(text.find("manual fallback placement") != text.npos, "Missing stereo fallback warning");
     state.draft.center_mode = FoveationCenterMode::fixed;
@@ -88,14 +92,15 @@ void test_ui_diagnostics() {
     require(render("Stereo / Gaze").find("No valid eye-tracking signal") != std::string::npos, "Invalid gaze signal warning");
     state.snapshot = R"({"gaze":{"layer":true,"abi":true,"views":2,"alignment":2,"status_flags":108,"using_gaze":false,"ambiguous":true}})";
     require(render("Stereo / Gaze").find("Eye mapping is ambiguous") != std::string::npos, "Ambiguous eye mapping warning");
-    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"views":2,"alignment":3,"status_flags":108,"using_gaze":true},
+    state.snapshot = R"({"ready":true,"d3d12_lower_hook_active":true,"d3d12_hook_restart_required":true,
+        "gaze":{"layer":true,"abi":true,"views":2,"alignment":3,"status_flags":108,"using_gaze":true},
         "frame":{"present_ms":10,"sr_enabled_ms":10,"sr_disabled_ms":12},
         "apis":[{"evaluations":0},{"evaluations":10,"state":"Active","native_ms":2,"foveated_ms":1.25,"nr_full_ms":3,
             "motion_width":2000,"motion_height":1600,"motion_space":"Output-resolution",
             "crop":{"input_width":500,"input_height":400},"input_width":1000,"input_height":800}],
         "nr_details":{"result":1,"output_width":2000,"output_height":1600,"processing_width":2000,"processing_height":1600,
             "region_width":1000,"region_height":800,"region_x":100,"region_y":200},
-        "eye_calibration":{"enabled":true,"backend":"OpenVR","graphics_api":12,"status":"Ready, {mapped}",
+        "eye_calibration":{"enabled":true,"backend":"OpenVR","graphics_api":12,"status":"Ready, {mapped}","active_method":"Full crop search",
             "corrections":7,"applied":9,"gpu_samples":2,"gpu_us":12.5,"left_view":"18446744073709551614","right_view":"42"}})";
     text = render("Stereo / Gaze");
     require(text.find("fixed fallback") == text.npos && text.find("manual fallback placement") == text.npos, "Healthy tracking reported as fallback");
@@ -104,9 +109,13 @@ void test_ui_diagnostics() {
         text.find("Recalibrate now") != text.npos && text.find("Recalibration") != text.npos,
         "Calibration controls belong in Stereo / Gaze");
     require(text.find("Eye tracking details") == text.npos && text.find("Corrections applied") == text.npos, "Tracking details belong in Diagnostics");
+    render("General"); text = render("General");
+    require(text.find("Change menu key") != text.npos && text.find("DX11 -> DX12 transport") != text.npos &&
+        text.find("Use lower DLSS hook (DX12)") != text.npos && text.find("Runtime ready") != text.npos &&
+        text.find("DLSS hook change saved") != text.npos, "General controls and statuses missing");
     render("DLSS-SR"); text = render("DLSS-SR");
-    require(text.find("Use lower DLSS hook (DX12)") != text.npos &&
-        text.find("Restart the game") != text.npos, "SR tab exposes the hook selector and restart requirement");
+    require(text.find("Use lower DLSS hook (DX12)") == text.npos, "Hook selector should live in General");
+    require(text.find("Cosmetic only; no performance impact.") != text.npos, "SR roundness note missing");
     require(text.find("Full DLSS call: 2.000 ms") != text.npos, "GPU timing from the second API object");
     require(text.find("Foveated FPS gain: +16.7 FPS (+20.0%)") != text.npos, "FPS gain must use the non-foveated FPS baseline");
     require(text.find("Frame-time change: -2.00 ms (-16.7%)") != text.npos, "Frame-time change must use the non-foveated frame time baseline");
@@ -116,6 +125,7 @@ void test_ui_diagnostics() {
     require(text.find("Peripheral DLAA: Enabled (auto MV conversion)") != text.npos, "Motion-vector compatibility status missing");
     require(text.find("Full DLSS-NR call") == text.npos, "NR timings should not appear in SR");
     render("DLSS-NR"); text = render("DLSS-NR");
+    require(text.find("Cosmetic only; no performance impact.") != text.npos, "NR roundness note missing");
     require(text.find("Full DLSS-NR call: 3.000 ms") != text.npos, "NR timings belong in NR");
     require(text.find("DLSS-NR region: 1000 x 800 (25.0% of original) at 100,200") != text.npos, "NR region comparison missing");
     require(text.find("Last NGX result: 0x00000001") != text.npos, "NR result missing");
@@ -526,6 +536,46 @@ int main(int argc, char** argv) {
         if (test_clip) { RECT restored{}; require(GetClipCursor(&restored) && EqualRect(&actual_clip, &restored), "Closing overlay did not restore cursor confinement"); }
         SendMessageW(window.value, WM_KEYDOWN, 'W', 1); SendMessageW(window.value, WM_KEYUP, 'W', LPARAM{1} << 31);
         require(game_keys == 2, "Closed overlay did not pass keyboard input through");
+        // Rebinding must consume the captured press, persist the new key, and
+        // leave the former key unable to toggle the menu.
+        auto* input = attach_input(window.value);
+        require(input != nullptr, "Menu input state unavailable for rebind test");
+        const auto test_ini = std::filesystem::temp_directory_path() /
+            (std::wstring(L"CheekyOverlayTests-") + std::to_wstring(GetCurrentProcessId()) + L".ini");
+        input->config_path = test_ini.wstring();
+        toggle(window.value);
+        begin_menu_key_rebind(*input);
+        SendMessageW(window.value, WM_KEYDOWN, VK_F9, 1);
+        require(consume_menu_key_rebind(*input) == VK_F9, "Rebind did not capture F9");
+        require(save_menu_key(*input, VK_F9), "Rebind did not save F9");
+        SendMessageW(window.value, WM_KEYUP, VK_F9, LPARAM{1} << 31);
+        require(GetPrivateProfileIntW(L"Overlay", L"MenuKey", 0, test_ini.c_str()) == VK_F9,
+            "Rebind did not persist F9");
+        toggle(window.value);
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() != baseline, "Old F8 key toggled the rebound menu");
+        test_extra_key = VK_F9; test_extra_down = true;
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); pump();
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() == baseline, "Polled F9 did not close the rebound menu");
+        test_extra_down = false;
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
+        SendMessageW(window.value, WM_KEYDOWN, VK_F9, 1);
+        SendMessageW(window.value, WM_KEYUP, VK_F9, LPARAM{1} << 31);
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() != baseline, "F9 did not reopen the rebound menu");
+        begin_menu_key_rebind(*input);
+        SendMessageW(window.value, WM_KEYDOWN, VK_ESCAPE, 1);
+        require(consume_menu_key_rebind(*input) == VK_ESCAPE && input->menu_key == VK_F9,
+            "Escape did not cancel the key change");
+        SendMessageW(window.value, WM_KEYUP, VK_ESCAPE, LPARAM{1} << 31);
+        require(save_menu_key(*input, VK_F8), "Could not restore F8 after rebind test");
+        require(GetPrivateProfileIntW(L"Overlay", L"MenuKey", 0, test_ini.c_str()) == VK_F8,
+            "F8 reset did not persist");
+        DeleteFileW(test_ini.c_str());
+        toggle(window.value);
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() == baseline, "Reset F8 did not close the menu");
         test_foreground = nullptr; toggle(window.value);
         gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
         require(gpu.pixels() == baseline, "Unfocused F8 opened the overlay");

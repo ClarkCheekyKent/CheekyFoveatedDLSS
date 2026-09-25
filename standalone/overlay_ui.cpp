@@ -161,6 +161,7 @@ void draw_sr(Settings& s, bool rr) {
     slider("Fovea width", s.width, .2F, 1.0F);
     slider("Fovea height", s.height, .2F, 1.0F);
     slider("Roundness", s.roundness, 0.0F, 1.0F);
+    ImGui::TextDisabled("Cosmetic only; no performance impact.");
     slider("Transition width", s.transition_width, 0.0F, .3F, "%.3f");
     ImGui::Checkbox("Show red alignment border", &s.alignment_border_enabled);
 }
@@ -214,6 +215,7 @@ void draw_nr(Settings& s) {
             slider("NR fovea width", s.nr_width, .2F, 1.0F);
             slider("NR fovea height", s.nr_height, .2F, 1.0F);
             slider("NR roundness", s.nr_roundness, 0.0F, 1.0F);
+            ImGui::TextDisabled("Cosmetic only; no performance impact.");
             slider("NR transition width", s.nr_transition_width, 0.0F, .3F, "%.3f");
         }
         ImGui::Checkbox("Show green alignment border", &s.nr_alignment_border_enabled);
@@ -679,17 +681,72 @@ bool begin_tab(const char* label) {
 
 void end_tab() { ImGui::EndChild(); ImGui::EndTabItem(); }
 
-void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char* renderer,const char* status,bool& open) {
+std::string menu_key_name(unsigned key) {
+    wchar_t name[64]{};
+    const auto scan = MapVirtualKeyW(key, MAPVK_VK_TO_VSC);
+    const auto extended = key == VK_INSERT || key == VK_DELETE || key == VK_HOME || key == VK_END ||
+        key == VK_PRIOR || key == VK_NEXT || key == VK_LEFT || key == VK_RIGHT || key == VK_UP || key == VK_DOWN;
+    const auto length = scan ? GetKeyNameTextW(static_cast<LONG>((scan << 16) | (extended ? 1U << 24 : 0)), name, 64) : 0;
+    if (length) {
+        char utf8[192]{};
+        const auto bytes = WideCharToMultiByte(CP_UTF8, 0, name, length, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
+        if (bytes) return std::string(utf8, bytes);
+    }
+    return "Key " + std::to_string(key);
+}
+
+void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState& input,const char* renderer,const char* status,bool& open) {
     refresh(r, runtime);
+    if (const auto rebound = consume_menu_key_rebind(input)) {
+        if (rebound != VK_ESCAPE) {
+            r.menu_key_error = save_menu_key(input, rebound) ? "" : "Could not save the menu key.";
+        }
+    }
     ImGui::SetNextWindowSize(ImVec2(620, 650), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 300), ImVec2(FLT_MAX, FLT_MAX));
     if (ImGui::Begin("Cheeky Foveated DLSS###CheekyStandalone", &open, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextDisabled("v" CHEEKY_VERSION " | %s | %s | F8 to close", runtime.host_name ? runtime.host_name : "Standalone", renderer);
+        const auto key_name = menu_key_name(input.menu_key.load());
+        ImGui::TextDisabled("v" CHEEKY_VERSION " | %s | %s | %s to close",
+            runtime.host_name ? runtime.host_name : "Standalone", renderer, key_name.c_str());
         ImGui::TextWrapped("Changes apply when you release a control and are saved automatically.");
         if (!r.message.empty()) ImGui::TextWrapped("%s", r.message.c_str());
         ImGui::Separator();
         const auto previous = r.draft;
         if (ImGui::BeginTabBar("controls")) {
+            if (begin_tab("General")) {
+                ImGui::SeparatorText("Menu");
+                ImGui::Text("Toggle key: %s", key_name.c_str());
+                if (input.rebinding) {
+                    ImGui::TextUnformatted("Press one key. Escape cancels; modifier keys cannot be bound.");
+                    if (ImGui::Button("Cancel key change")) input.rebinding = false;
+                } else {
+                    if (ImGui::Button("Change menu key")) begin_menu_key_rebind(input);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset to F8"))
+                        r.menu_key_error = save_menu_key(input, VK_F8) ? "" : "Could not save the menu key.";
+                }
+                if (!r.menu_key_error.empty()) ImGui::TextWrapped("%s", r.menu_key_error.c_str());
+                if (std::string_view(renderer) != "Vulkan") {
+                    ImGui::SeparatorText("Compatibility");
+                    ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
+                    ImGui::TextWrapped("Required for DLSS-NR in DX11 games.");
+                    ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
+                    ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");
+                }
+                ImGui::SeparatorText("Status");
+                ImGui::Text("Host: %s", runtime.host_name ? runtime.host_name : "Standalone");
+                ImGui::Text("Renderer: %s", renderer);
+                diagnostic_line(r.snapshot, "Runtime ready", "ready");
+                if (std::string_view(renderer) != "Vulkan") {
+                    ImGui::Text("Configured DX11 path: %s", r.draft.d3d11_use_d3d12_transport ? "DX12 transport" : "DX11 direct");
+                    const auto active_hook = member(r.snapshot, "d3d12_lower_hook_active");
+                    ImGui::Text("Active DLSS hook: %s", active_hook.empty() ? "Waiting for runtime" : active_hook == "true" ? "Lower" : "Higher");
+                    if (member(r.snapshot, "d3d12_hook_restart_required") == "true")
+                        ImGui::TextUnformatted("DLSS hook change saved for next game restart.");
+                }
+                ImGui::TextWrapped("Overlay: %s", status);
+                end_tab();
+            }
             if (begin_tab("Stereo / Gaze")) {
                 draw_gaze_status(r.draft, r.snapshot);
                 draw_calibration_controls(r, runtime);
@@ -699,11 +756,6 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
                 end_tab();
             }
             if (begin_tab("DLSS-SR")) {
-                ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
-                ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");
-                ImGui::Text("Active DLSS hook: %s", member(r.snapshot, "d3d12_lower_hook_active") == "true" ? "Lower" : "Higher");
-                if (member(r.snapshot, "d3d12_hook_restart_required") == "true")
-                    ImGui::TextUnformatted("DLSS hook change saved for next game restart.");
                 draw_sr(r.draft, member(array_object(member(r.snapshot,"apis"),1),"reconstruction_feature") == "13");
                 if (ImGui::Button("Reset SR defaults")) command(r, runtime, "defaults_sr");
                 if (ImGui::CollapsingHeader("Performance##sr", ImGuiTreeNodeFlags_DefaultOpen))
@@ -711,10 +763,6 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
                 end_tab();
             }
             if (begin_tab("DLSS-NR")) {
-                if (member(r.snapshot, "renderer") == "0") {
-                    ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
-                    ImGui::TextWrapped("Required for DLSS-NR in DX11 games. Changing NR does not change this setting.");
-                }
                 diagnostic_line(r.snapshot, "Runtime state", "nr");
                 if (r.draft.nr_enabled) {
                     const auto reason = plain(member(member(r.snapshot, "nr_details"), "skip_reason"));
@@ -728,12 +776,10 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,const char*
                 end_tab();
             }
             if (begin_tab("Diagnostics")) {
-                diagnostic_line(r.snapshot, "Runtime ready", "ready");
                 diagnostic_line(r.snapshot, "NR state", "nr");
                 diagnostic_line(member(r.snapshot, "frame"), "Frame time (ms)", "present_ms");
                 diagnostic_line(member(r.snapshot, "observer"), "Native observer ready", "ready");
                 diagnostic_line(member(r.snapshot, "nr_details"), "NR skip reason", "skip_reason");
-                ImGui::TextWrapped("Overlay: %s", status);
                 draw_gaze_details(r.snapshot);
                 draw_calibration(r, runtime);
                 if (ImGui::Button("Report an issue...")) command(r, runtime, "report_issue");
