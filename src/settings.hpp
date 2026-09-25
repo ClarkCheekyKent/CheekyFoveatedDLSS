@@ -64,7 +64,7 @@ struct Settings {
     float width{0.55F};
     float height{0.45F};
     float x_offset{0.0F};
-    float height_offset{-0.45F};
+    float height_offset{0.0F};
     bool invert_stereo_x_offset{false};
     bool auto_stereo_alignment{true};
     bool eye_calibration_continuous{false};
