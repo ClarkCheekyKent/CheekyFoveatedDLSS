@@ -9,13 +9,16 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <backends/imgui_impl_dx11.h>
 #include <backends/imgui_impl_dx12.h>
 #include <backends/imgui_impl_win32.h>
+#include "../third_party/openvr/include/openvr.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <limits>
 #include <locale>
 #include <memory>
@@ -37,6 +40,9 @@ namespace {
 using Microsoft::WRL::ComPtr;
 using namespace cheeky::foveated_dlss;
 constexpr UINT descriptor_count = 64;
+constexpr float headset_distance = 1.5f;
+constexpr float headset_circumference = 6.28318530718f * 3.0f; // Gentle 3 m curve radius.
+constexpr float headset_max_curvature = 1.0f / 3.0f; // At most 120 degrees of curvature.
 constexpr GUID overlay_metadata_guid{0x9dbb7074, 0x42a8, 0x4bca, {0xb4, 0x4e, 0x3e, 0xc2, 0x55, 0xd5, 0x7a, 0x18}};
 struct ChainMetadata { std::uint64_t identity{}; DXGI_COLOR_SPACE_TYPE color_space{}; };
 std::atomic<std::uint64_t> chain_sequence{};
@@ -91,6 +97,23 @@ struct Renderer : OverlayUiState {
     ComPtr<ID3D12DescriptorHeap> rtv_heap, srv_heap;
     ComPtr<ID3D12GraphicsCommandList> command_list;
     ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D11Texture2D> headset_texture11;
+    ComPtr<ID3D11RenderTargetView> headset_rtv11;
+    ComPtr<ID3D12Resource> headset_texture12;
+    vr::IVROverlay* vr_overlay{};
+    vr::IVRSystem* vr_system{};
+    vr::VROverlayHandle_t vr_handle{vr::k_ulOverlayHandleInvalid};
+    std::uint32_t vr_token{};
+    ULONGLONG next_vr_probe{};
+    unsigned vr_buttons{};
+    ImVec2 vr_pointer{};
+    bool vr_pointer_valid{};
+    float vr_mouse_height{};
+    vr::HmdMatrix34_t vr_canvas_origin{};
+    float vr_meters_per_pixel{};
+    bool vr_canvas_anchored{};
+    bool vr_geometry_configured{};
+    ImVec2 vr_geometry_display{}, vr_geometry_scale{};
     std::vector<ComPtr<ID3D12Resource>> buffers;
     std::vector<Frame> frames;
     std::array<bool, descriptor_count> descriptors{};
@@ -130,6 +153,11 @@ bool destroy_renderer(std::unique_ptr<Renderer>& renderer) {
     auto& r = *renderer;
     if (r.input) { r.input->enabled = false; r.input->open = false; restore_cursor(*r.input, true); }
     if (!drain(r)) return false;
+    if (r.vr_overlay && r.vr_handle != vr::k_ulOverlayHandleInvalid &&
+        r.vr_token && GetModuleHandleW(L"openvr_api.dll")) {
+        auto token = reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(GetModuleHandleW(L"openvr_api.dll"), "VR_GetInitToken"));
+        if (token && token() == r.vr_token) r.vr_overlay->DestroyOverlay(r.vr_handle);
+    }
     const auto old = ImGui::GetCurrentContext();
     if (r.context) {
         ImGui::SetCurrentContext(r.context);
@@ -178,7 +206,7 @@ bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queu
         if (FAILED(swapchain->QueryInterface(IID_PPV_ARGS(&swapchain3))) || !desc.BufferCount || desc.BufferCount > 16) return false;
         r.queue = queue;
         D3D12_DESCRIPTOR_HEAP_DESC heap{};
-        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap.NumDescriptors = desc.BufferCount;
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap.NumDescriptors = desc.BufferCount + 1;
         if (FAILED(r.device12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&r.rtv_heap)))) return false;
         heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap.NumDescriptors = descriptor_count; heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(r.device12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&r.srv_heap)))) return false;
@@ -261,6 +289,224 @@ bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queu
     return true;
 }
 
+// Join the game's existing OpenVR session. Never initialize a second session:
+// native games and bridge mods own the lifetime of openvr_api.dll.
+bool prepare_headset(Renderer& r) {
+    const auto now = GetTickCount64();
+    const auto module = GetModuleHandleW(L"openvr_api.dll");
+    if (!module) return false;
+    const auto token_fn = reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(module, "VR_GetInitToken"));
+    if (!token_fn || !token_fn()) return false;
+    if (r.vr_overlay && r.vr_system && r.vr_token == token_fn() && r.vr_handle != vr::k_ulOverlayHandleInvalid &&
+        (r.dx12 ? bool(r.headset_texture12) : bool(r.headset_texture11))) return true;
+    if (now < r.next_vr_probe) return false;
+    r.next_vr_probe = now + 1000;
+    const auto valid_fn = reinterpret_cast<bool (*)(const char*)>(GetProcAddress(module, "VR_IsInterfaceVersionValid"));
+    const auto get_fn = reinterpret_cast<void* (*)(const char*, vr::EVRInitError*)>(GetProcAddress(module, "VR_GetGenericInterface"));
+    if (!valid_fn || !get_fn) return false;
+    const auto token = token_fn();
+    if (r.vr_token != token) {
+        r.vr_overlay = nullptr;
+        r.vr_system = nullptr;
+        r.vr_canvas_anchored = false;
+        r.vr_geometry_configured = false;
+        r.vr_handle = vr::k_ulOverlayHandleInvalid;
+        r.vr_token = token;
+    }
+    if (!r.vr_overlay) {
+        if (!valid_fn(vr::IVROverlay_Version)) return false;
+        vr::EVRInitError error{};
+        r.vr_overlay = static_cast<vr::IVROverlay*>(get_fn(vr::IVROverlay_Version, &error));
+        if (!r.vr_overlay || error != vr::VRInitError_None) { r.vr_overlay = nullptr; return false; }
+    }
+    if (!r.vr_system) {
+        if (!valid_fn(vr::IVRSystem_Version)) return false;
+        vr::EVRInitError error{};
+        r.vr_system = static_cast<vr::IVRSystem*>(get_fn(vr::IVRSystem_Version, &error));
+        if (!r.vr_system || error != vr::VRInitError_None) { r.vr_system = nullptr; return false; }
+    }
+    if (r.vr_handle == vr::k_ulOverlayHandleInvalid) {
+        const auto key = "cheeky.foveated_dlss.menu." + std::to_string(GetCurrentProcessId());
+        if (r.vr_overlay->CreateOverlay(key.c_str(), "Cheeky Foveated DLSS", &r.vr_handle) != vr::VROverlayError_None) {
+            r.vr_handle = vr::k_ulOverlayHandleInvalid;
+            return false;
+        }
+        const vr::VRTextureBounds_t bounds{0, 0, 1, 1};
+        r.vr_overlay->SetOverlayTextureBounds(r.vr_handle, &bounds);
+        r.vr_overlay->SetOverlayInputMethod(r.vr_handle, vr::VROverlayInputMethod_Mouse);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_MakeOverlaysInteractiveIfVisible, true);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_SendVRDiscreteScrollEvents, true);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_EnableClickStabilization, true);
+        r.vr_overlay->SetOverlayFlag(r.vr_handle, vr::VROverlayFlags_IsPremultiplied, true);
+    }
+    if (r.dx12 && !r.headset_texture12) {
+        D3D12_RESOURCE_DESC texture{};
+        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Width = r.framebuffer_width;
+        texture.Height = r.framebuffer_height;
+        texture.DepthOrArraySize = 1;
+        texture.MipLevels = 1;
+        texture.Format = r.format;
+        texture.SampleDesc.Count = 1;
+        texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(r.device12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r.headset_texture12)))) return false;
+        auto target = r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        target.ptr += SIZE_T(r.buffers.size()) * r.rtv_stride;
+        r.device12->CreateRenderTargetView(r.headset_texture12.Get(), nullptr, target);
+    } else if (!r.dx12 && !r.headset_texture11) {
+        D3D11_TEXTURE2D_DESC texture{};
+        texture.Width = r.framebuffer_width;
+        texture.Height = r.framebuffer_height;
+        texture.MipLevels = texture.ArraySize = 1;
+        texture.Format = r.format;
+        texture.SampleDesc.Count = 1;
+        texture.Usage = D3D11_USAGE_DEFAULT;
+        texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(r.device11->CreateTexture2D(&texture, nullptr, &r.headset_texture11)) ||
+            FAILED(r.device11->CreateRenderTargetView(r.headset_texture11.Get(), nullptr, &r.headset_rtv11))) return false;
+    }
+    return true;
+}
+
+void release_headset_input(Renderer& r) {
+    for (unsigned button = 0; button < 3; ++button)
+        if (r.vr_buttons & (1U << button)) ImGui::GetIO().AddMouseButtonEvent(button, false);
+    r.vr_buttons = 0;
+    r.vr_pointer_valid = false;
+}
+
+void poll_headset_input(Renderer& r, bool ready, int desktop_events_begin) {
+    if (!ready) { release_headset_input(r); return; }
+    auto& io = ImGui::GetIO();
+    // A click can already be queued even if SteamVR's current hover query no
+    // longer targets us. Decide pointer ownership from the whole event batch.
+    std::array<vr::VREvent_t, 128> batch{};
+    unsigned event_count{};
+    bool controller_input = r.vr_buttons || r.vr_overlay->IsHoverTargetOverlay(r.vr_handle);
+    while (event_count < batch.size() && r.vr_overlay->PollNextOverlayEvent(r.vr_handle, &batch[event_count], sizeof(vr::VREvent_t))) {
+        const auto type = batch[event_count++].eventType;
+        controller_input |= type == vr::VREvent_MouseMove || type == vr::VREvent_MouseButtonDown ||
+            type == vr::VREvent_MouseButtonUp || type == vr::VREvent_ScrollDiscrete;
+    }
+    if (controller_input) {
+        // Win32's queued/fallback cursor and the laser must not both move the
+        // same drag. Keep earlier pending VR events (ImGui may trickle them),
+        // and discard only desktop pointer events queued during this frame.
+        discard_desktop_pointer_events(desktop_events_begin);
+    }
+    // Poll only this overlay's queue, leaving the game's event queue untouched.
+    for (unsigned count = 0; count < event_count; ++count) {
+        const auto& event = batch[count];
+        switch (event.eventType) {
+        case vr::VREvent_MouseMove:
+            if (std::isfinite(event.data.mouse.x) && std::isfinite(event.data.mouse.y) && r.vr_mouse_height > 0) {
+                // The fixed canvas maps directly to desktop client coordinates.
+                // OpenVR's texture origin is bottom-left; ImGui's is top-left.
+                r.vr_pointer = ImVec2(event.data.mouse.x, r.vr_mouse_height - event.data.mouse.y);
+                r.vr_pointer_valid = true;
+                io.AddMousePosEvent(r.vr_pointer.x, r.vr_pointer.y);
+            }
+            break;
+        case vr::VREvent_MouseButtonDown:
+        case vr::VREvent_MouseButtonUp: {
+            const bool down = event.eventType == vr::VREvent_MouseButtonDown;
+            const unsigned masks[]{vr::VRMouseButton_Left, vr::VRMouseButton_Right, vr::VRMouseButton_Middle};
+            for (unsigned button = 0; button < 3; ++button) if (event.data.mouse.button & masks[button]) {
+                if (down) r.vr_buttons |= 1U << button;
+                else r.vr_buttons &= ~(1U << button);
+                if (r.vr_pointer_valid) io.AddMousePosEvent(r.vr_pointer.x, r.vr_pointer.y);
+                io.AddMouseButtonEvent(button, down);
+            }
+            break;
+        }
+        case vr::VREvent_ScrollDiscrete:
+            if (std::isfinite(event.data.scroll.xdelta) && std::isfinite(event.data.scroll.ydelta))
+                io.AddMouseWheelEvent(event.data.scroll.xdelta, event.data.scroll.ydelta);
+            break;
+        case vr::VREvent_FocusLeave:
+        case vr::VREvent_OverlayHidden:
+            release_headset_input(r);
+            break;
+        default: break;
+        }
+    }
+    // Win32 can enqueue the stationary desktop cursor each frame. Keep the
+    // VR cursor steady while pointing at the panel; pointing away restores mouse.
+    if (r.vr_pointer_valid && (r.vr_buttons || r.vr_overlay->IsHoverTargetOverlay(r.vr_handle)))
+        io.AddMousePosEvent(r.vr_pointer.x, r.vr_pointer.y);
+}
+
+void publish_headset(Renderer& r) {
+    if (!r.vr_overlay || !r.vr_system || r.vr_handle == vr::k_ulOverlayHandleInvalid) return;
+    const auto display = ImGui::GetIO().DisplaySize;
+    if (display.x <= 0 || display.y <= 0 || r.menu_width <= 0 || r.menu_height <= 0) return;
+    if (!r.vr_canvas_anchored) {
+        vr::TrackedDevicePose_t head{};
+        r.vr_system->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseStanding, 0, &head, 1);
+        if (!head.bPoseIsValid || !head.bDeviceIsConnected) return;
+        // Place the desktop canvas once, independently of the menu position or
+        // size. Its center is 1.5 m ahead, with a gentle curve toward the sides.
+        // Pixel coordinates still match the desktop canvas.
+        // Hiding/reopening the menu preserves this room-fixed placement.
+        r.vr_canvas_origin = head.mDeviceToAbsoluteTracking;
+        // Preserve the usual menu size until an ultrawide canvas would exceed
+        // the wrap limit, then scale the canvas down enough to avoid overlap.
+        r.vr_meters_per_pixel = (std::min)(1.2f / 620.0f,
+            headset_circumference * headset_max_curvature / display.x);
+        const float x = -display.x * 0.5f * r.vr_meters_per_pixel;
+        const float y = display.y * 0.5f * r.vr_meters_per_pixel;
+        for (unsigned row = 0; row < 3; ++row)
+            r.vr_canvas_origin.m[row][3] += head.mDeviceToAbsoluteTracking.m[row][0] * x +
+                head.mDeviceToAbsoluteTracking.m[row][1] * y - head.mDeviceToAbsoluteTracking.m[row][2] * headset_distance;
+        r.vr_canvas_anchored = true;
+        r.vr_geometry_configured = false;
+    }
+    const auto scale = ImGui::GetIO().DisplayFramebufferScale;
+    if (!r.vr_geometry_configured || display.x != r.vr_geometry_display.x || display.y != r.vr_geometry_display.y ||
+        scale.x != r.vr_geometry_scale.x || scale.y != r.vr_geometry_scale.y) {
+        auto position = r.vr_canvas_origin;
+        for (unsigned row = 0; row < 3; ++row)
+            position.m[row][3] += position.m[row][0] * display.x * 0.5f * r.vr_meters_per_pixel -
+                position.m[row][1] * display.y * 0.5f * r.vr_meters_per_pixel;
+        r.vr_overlay->SetOverlayTransformAbsolute(r.vr_handle, vr::TrackingUniverseStanding, &position);
+        const float canvas_width = display.x * r.vr_meters_per_pixel;
+        r.vr_overlay->SetOverlayWidthInMeters(r.vr_handle, canvas_width);
+        // OpenVR curvature is the fraction of a complete cylinder. The runtime
+        // handles laser intersections with the curved surface in the same UI pixels.
+        const float curvature = (std::min)(canvas_width / headset_circumference, headset_max_curvature);
+        if (r.vr_overlay->SetOverlayCurvature(r.vr_handle, curvature) != vr::VROverlayError_None) {
+            r.vr_overlay->SetOverlayCurvature(r.vr_handle, 0);
+            set_status("SteamVR curvature unavailable; using the flat menu surface");
+        }
+        // VR mirror textures can differ in aspect from the desktop client area.
+        if (scale.x > 0 && scale.y > 0) r.vr_overlay->SetOverlayTexelAspect(r.vr_handle, scale.y / scale.x);
+        const vr::HmdVector2_t mouse_scale{{display.x, display.y}};
+        r.vr_overlay->SetOverlayMouseScale(r.vr_handle, &mouse_scale);
+        r.vr_mouse_height = display.y;
+        // Geometry remains unchanged during normal frames/clicks/drags. Only the
+        // texture needs publishing every frame; repeated curvature setters are unnecessary.
+        r.vr_geometry_display = display;
+        r.vr_geometry_scale = scale;
+        r.vr_geometry_configured = true;
+    }
+    vr::D3D12TextureData_t texture12{r.headset_texture12.Get(), r.queue.Get(), 0};
+    vr::Texture_t texture{r.dx12 ? static_cast<void*>(&texture12) : static_cast<void*>(r.headset_texture11.Get()),
+        r.dx12 ? vr::TextureType_DirectX12 : vr::TextureType_DirectX, vr::ColorSpace_Auto};
+    if (r.vr_overlay->SetOverlayTexture(r.vr_handle, &texture) == vr::VROverlayError_None)
+        r.vr_overlay->ShowOverlay(r.vr_handle);
+}
+
+void hide_headset(Renderer& r) {
+    const auto module = GetModuleHandleW(L"openvr_api.dll");
+    const auto token = module ? reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(module, "VR_GetInitToken")) : nullptr;
+    if (token && token() == r.vr_token && r.vr_overlay && r.vr_handle != vr::k_ulOverlayHandleInvalid)
+        r.vr_overlay->HideOverlay(r.vr_handle);
+}
+
 void render11(Renderer& r) {
     ComPtr<ID3D11Texture2D> buffer;
     ComPtr<ID3D11RenderTargetView> target;
@@ -282,6 +528,13 @@ void render11(Renderer& r) {
     auto* view = target.Get();
     r.context11->OMSetRenderTargets(1, &view, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    if (r.headset_rtv11) {
+        const float clear[]{0, 0, 0, 0};
+        r.context11->ClearRenderTargetView(r.headset_rtv11.Get(), clear);
+        view = r.headset_rtv11.Get();
+        r.context11->OMSetRenderTargets(1, &view, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
 }
 
 void render12(Renderer& r) {
@@ -305,6 +558,23 @@ void render12(Renderer& r) {
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), r.command_list.Get());
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
     r.command_list->ResourceBarrier(1, &barrier);
+    if (r.headset_texture12) {
+        D3D12_RESOURCE_BARRIER headset{};
+        headset.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        headset.Transition.pResource = r.headset_texture12.Get();
+        headset.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        headset.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        headset.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        r.command_list->ResourceBarrier(1, &headset);
+        auto headset_target = r.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        headset_target.ptr += SIZE_T(r.buffers.size()) * r.rtv_stride;
+        const float clear[]{0, 0, 0, 0};
+        r.command_list->ClearRenderTargetView(headset_target, clear, 0, nullptr);
+        r.command_list->OMSetRenderTargets(1, &headset_target, FALSE, nullptr);
+        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), r.command_list.Get());
+        std::swap(headset.Transition.StateBefore, headset.Transition.StateAfter);
+        r.command_list->ResourceBarrier(1, &headset);
+    }
     if (FAILED(r.command_list->Close())) { r.poisoned = true; return; }
     ID3D12CommandList* list = r.command_list.Get();
     r.queue->ExecuteCommandLists(1, &list);
@@ -366,13 +636,16 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         cheeky_overlay_color_mode = shader_color_mode(color_space, r.format);
         ContextScope scope(r.context);
         if (r.attachment != runtime.attachment) { r.attachment = runtime.attachment; r.next_snapshot = 0; }
-        process_overlay_input(*r.input);
-        if (!r.input->open) { ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
+        const int desktop_events_begin = ImGui::GetCurrentContext()->InputEventsQueue.Size;
+        process_overlay_input(*r.input, r.vr_buttons);
+        if (!r.input->open) { release_headset_input(r); hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
         release_cursor(*r.input);
         ImGui::GetIO().MouseDrawCursor = true;
         if (r.dx12) ImGui_ImplDX12_NewFrame(); else ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
+        const bool headset_ready = prepare_headset(r);
+        poll_headset_input(r, headset_ready, desktop_events_begin);
         ImGui::NewFrame();
         bool open=r.input->open.load();
         draw_overlay_ui(r,runtime,*r.input,r.dx12?"D3D12":"D3D11",status.load(),open);
@@ -380,6 +653,8 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
         ImGui::Render();
         if (r.dx12) render12(r); else render11(r);
+        if (headset_ready && !r.poisoned && open) publish_headset(r);
+        if (!open) { release_headset_input(r); hide_headset(r); }
     } catch (...) { set_status("Overlay exception contained; rendering skipped"); }
 }
 

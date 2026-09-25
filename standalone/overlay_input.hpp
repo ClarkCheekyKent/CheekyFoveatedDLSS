@@ -34,6 +34,7 @@ void poll_overlay_hotkey(InputState&);
 void begin_menu_key_rebind(InputState&);
 unsigned consume_menu_key_rebind(InputState&);
 bool save_menu_key(InputState&, unsigned);
-void process_overlay_input(InputState&);
+void process_overlay_input(InputState&, unsigned controller_buttons = 0);
+void discard_desktop_pointer_events(int first_event);
 void set_overlay_framebuffer_scale(unsigned width, unsigned height);
 }

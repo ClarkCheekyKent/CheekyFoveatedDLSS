@@ -1,5 +1,6 @@
 #include "overlay_input.hpp"
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <MinHook.h>
 #include <filesystem>
 extern IMGUI_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -178,11 +179,16 @@ void toggle_on_window_thread(InputState* input, HWND window) {
 }
 }
 
-void process_overlay_input(InputState& input) {
+void process_overlay_input(InputState& input, unsigned controller_buttons) {
     std::vector<InputMessage> messages;
     { std::lock_guard lock(input.mutex); messages.swap(input.messages); }
     unsigned message_buttons{};
     for (const auto& message : messages) {
+        // A controller drag owns its button until release. A desktop key-state
+        // poll (or a physical mouse-up) must not terminate it between VR events.
+        if ((controller_buttons & 1U) && (message.message == WM_LBUTTONDOWN || message.message == WM_LBUTTONUP || message.message == WM_LBUTTONDBLCLK)) continue;
+        if ((controller_buttons & 2U) && (message.message == WM_RBUTTONDOWN || message.message == WM_RBUTTONUP || message.message == WM_RBUTTONDBLCLK)) continue;
+        if ((controller_buttons & 4U) && (message.message == WM_MBUTTONDOWN || message.message == WM_MBUTTONUP || message.message == WM_MBUTTONDBLCLK)) continue;
         switch (message.message) {
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK: message_buttons |= 1U; break;
         case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK: message_buttons |= 2U; break;
@@ -197,9 +203,18 @@ void process_overlay_input(InputState& input) {
     for (unsigned button = 0; button < 5; ++button) {
         // Preserve message ordering (including quick down/up pairs). Only fill
         // gaps from physical state, bypassing our game's polling suppression.
-        if (message_buttons & (1U << button)) continue;
+        if ((message_buttons | controller_buttons) & (1U << button)) continue;
         const auto key = mouse_keys[swapped && button < 2 ? 1 - button : button];
         ImGui::GetIO().AddMouseButtonEvent(button, (physical_key_state(key) & 0x8000) != 0);
+    }
+}
+
+void discard_desktop_pointer_events(int first_event) {
+    auto& events = ImGui::GetCurrentContext()->InputEventsQueue;
+    for (int i = events.Size - 1; i >= first_event && i >= 0; --i) {
+        const auto type = events[i].Type;
+        if (type == ImGuiInputEventType_MousePos || type == ImGuiInputEventType_MouseButton || type == ImGuiInputEventType_MouseWheel)
+            events.erase(events.Data + i);
     }
 }
 

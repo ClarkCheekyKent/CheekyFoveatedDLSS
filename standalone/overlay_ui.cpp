@@ -823,6 +823,10 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
             commit(r, runtime, configured);
         }
     }
+    const auto position = ImGui::GetWindowPos();
+    const auto size = ImGui::GetWindowSize();
+    r.menu_x = position.x; r.menu_y = position.y;
+    r.menu_width = size.x; r.menu_height = size.y;
     ImGui::End();
 }
 }

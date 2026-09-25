@@ -155,9 +155,21 @@ Cheeky loader for a game: standalone, OptiScaler ASI, UEVR plugin, or ReShade
 add-on. Restart the game after changing loaders or DLLs. The loader, host and
 runtime intentionally stay resident until game exit.
 
-The desktop overlay is not an in-headset VR menu. OpenXR gaze and calibration
-still use the separate Cheeky OpenXR layer; use its matching installer when
-needed. This package does not turn a flat game into VR.
+For native OpenVR/SteamVR games using D3D11 or D3D12, the F8 menu also appears
+as a floating panel in the headset, including the mouse cursor. Point a VR
+controller at it to use SteamVR's laser pointer, click/drag and scroll controls.
+The stage has a gentle curve and stays anchored in the room. Wide canvases use
+up to 120 degrees of curvature; larger canvases scale down to fit.
+Drag the title bar or empty window space
+with either input to move the same window in both views; resize from its border
+or corner. The desktop canvas is placed in front of you on first opening, with
+the same left/right window placement as the desktop. Closing and reopening
+preserves its position; moving or resizing the menu does not recenter the canvas.
+Point away from the UI surface to use the desktop mouse again. F8 still opens the menu in this preview;
+the close button works with either input. This headset panel needs testing
+in real games; OpenXR and Vulkan headset menus are not supported yet. OpenXR
+gaze and calibration still use the separate Cheeky OpenXR layer; use its matching
+installer when needed. This package does not turn a flat game into VR.
 UEVR-specific AFW projection and rendering-mode callbacks remain available
 through the Cheeky UEVR plugin. Use that integration for its AFW host controls.
 Native OpenVR uses the game's existing OpenVR session and the built-in adapter;

@@ -167,6 +167,33 @@ void test_ui_diagnostics() {
     require(render("Stereo / Gaze").find("no active OpenXR layer") == std::string::npos, "Inactive features should not report tracking failure");
     state.draft.nr_enabled = true;
     require(render("Stereo / Gaze").find("no active OpenXR layer") != std::string::npos, "NR-only foveation still requires tracking warnings");
+    // Physical polling must not release a VR trigger between controller events.
+    input.window = reinterpret_cast<HWND>(1);
+    input.enabled = true; input.open = true;
+    test_foreground = input.window;
+    io.AddMouseButtonEvent(0, true);
+    ImGui::NewFrame(); ImGui::EndFrame();
+    require(io.MouseDown[0], "Controller press was not applied");
+    input.messages.push_back({WM_LBUTTONUP, 0, 0});
+    process_overlay_input(input, 1U);
+    ImGui::NewFrame(); ImGui::EndFrame();
+    require(io.MouseDown[0], "Desktop input interrupted the controller drag");
+    // A pending VR motion must survive, while a new Win32 fallback cursor and
+    // mouse-up must not move/release the drag. Keyboard input still gets through.
+    io.AddMousePosEvent(120, 100);
+    const int desktop_begin = context->InputEventsQueue.Size;
+    io.AddMousePosEvent(700, 700);
+    io.AddMouseButtonEvent(0, false);
+    io.AddKeyEvent(ImGuiKey_F2, true);
+    discard_desktop_pointer_events(desktop_begin);
+    ImGui::NewFrame(); ImGui::EndFrame();
+    require(io.MouseDown[0] && io.MousePos.x == 120 && io.MousePos.y == 100,
+        "Desktop fallback cursor displaced the controller drag");
+    require(ImGui::IsKeyDown(ImGuiKey_F2), "Controller pointer arbitration swallowed keyboard input");
+    io.AddMouseButtonEvent(0, false);
+    ImGui::NewFrame(); ImGui::EndFrame();
+    require(!io.MouseDown[0], "Controller release was not applied");
+    test_foreground = nullptr;
     ImGui::DestroyContext(context);
     std::puts("PASS: overlay snapshot parsing, GPU diagnostics, calibration and gaze/alignment warnings");
 }

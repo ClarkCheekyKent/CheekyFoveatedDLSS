@@ -6,6 +6,7 @@
 namespace cheeky::standalone {
 struct OverlayUiState {
     ULONGLONG next_snapshot{};
+    float menu_x{}, menu_y{}, menu_width{}, menu_height{};
     cheeky::foveated_dlss::Settings draft{};
     std::string snapshot,message,menu_key_error;
     std::uint64_t attachment{},request{};
