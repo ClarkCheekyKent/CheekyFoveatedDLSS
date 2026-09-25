@@ -171,3 +171,34 @@ EXPORT NgxResult NVSDK_NGX_D3D12_ReleaseFeature(NgxHandle* handle) {
     if (forward_release && feature->lower) forward_release(feature->lower);
     ++releases; delete feature; return 1U;
 }
+
+// Dispatchable Vulkan handles are opaque in discovery-only tests; no GPU work.
+using CreateVk = NgxResult(*)(void*, unsigned, NgxParameters*, NgxHandle**);
+using EvaluateVk = NgxResult(*)(void*, const NgxHandle*, const NgxParameters*, NgxProgressCallback);
+CreateVk forward_create_vk{};
+EvaluateVk forward_evaluate_vk{};
+Release12 forward_release_vk{};
+EXPORT void CheekyFakeForwardVulkanTo(HMODULE lower) {
+    forward_create_vk = reinterpret_cast<CreateVk>(GetProcAddress(lower, "NVSDK_NGX_VULKAN_CreateFeature"));
+    forward_evaluate_vk = reinterpret_cast<EvaluateVk>(GetProcAddress(lower, "NVSDK_NGX_VULKAN_EvaluateFeature"));
+    forward_release_vk = reinterpret_cast<Release12>(GetProcAddress(lower, "NVSDK_NGX_VULKAN_ReleaseFeature"));
+}
+EXPORT NgxResult NVSDK_NGX_VULKAN_CreateFeature(void* cmd, unsigned type, NgxParameters* params, NgxHandle** out) {
+    NgxHandle* lower{};
+    if (forward_create_vk) {
+        const auto result = forward_create_vk(cmd, type, params, &lower);
+        if (!ngx_succeeded(result)) return result;
+    }
+    *out = reinterpret_cast<NgxHandle*>(new Feature{++creates, *static_cast<MockNgxParameters*>(params), lower}); return 1U;
+}
+EXPORT NgxResult NVSDK_NGX_VULKAN_EvaluateFeature(void* cmd, const NgxHandle* handle, const NgxParameters* params, NgxProgressCallback cb) {
+    const auto result = evaluate(handle, params);
+    if (ngx_succeeded(result) && forward_evaluate_vk)
+        return forward_evaluate_vk(cmd, reinterpret_cast<const Feature*>(handle)->lower, params, cb);
+    return result;
+}
+EXPORT NgxResult NVSDK_NGX_VULKAN_ReleaseFeature(NgxHandle* handle) {
+    auto* feature = reinterpret_cast<Feature*>(handle);
+    if (forward_release_vk && feature->lower) forward_release_vk(feature->lower);
+    ++releases; delete feature; return 1U;
+}

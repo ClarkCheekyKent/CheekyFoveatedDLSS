@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
         }
         std::filesystem::path late_ngx_path;
         for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--ota-runtime") {
-            require(late && dx11, "OTA runtime option requires a DX11 late-attachment test");
+            require(late, "OTA runtime option requires a late-attachment test");
             late_ngx_path = root / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
             std::filesystem::create_directories(late_ngx_path.parent_path());
             std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", late_ngx_path);
@@ -375,6 +375,8 @@ int main(int argc, char** argv) {
             // Keep the host mode fresh just as real present callbacks do.
             verify_late_attach_test(get, command, inactive_afw ? present : nullptr,
                 inactive_afw && !dx11 ? +[](unsigned mode) { rendering_mode = std::to_string(mode); } : nullptr);
+            if (!late_ngx_path.empty()) require(snapshot(get).find("Active (NVIDIA cached runtime)") != std::string::npos,
+                "Native and Streamline cached evaluations publish the override source");
             return 0;
         }
         if (realvr) {

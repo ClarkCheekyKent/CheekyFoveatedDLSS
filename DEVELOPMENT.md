@@ -102,3 +102,13 @@ for private DX12 SR/NR while the named DLL rejects DX12 evaluations.
 `--transport-ota-only` covers a cached snippet without a loaded named SR DLL,
 using explicit game feature paths. The General-tab status distinguishes cache
 discovery from observed evaluation through the cached runtime.
+
+Cached-runtime regression coverage also includes the `dx12-ota` and `vulkan-ota`
+modes of `CheekyCoreDiscoveryTests` with the same runtime/fixture arguments. These test
+late-loaded caches alongside the named DLL, module-owned callbacks, and observed
+source status. DX12 GPU/Streamline coverage uses `--late-dx12`, `--late-dx12-c`,
+`--late-streamline`, and `--late-streamline-c` with `--ota-runtime`. AFW/RealVR
+`ota-ambiguous` now verifies independent routing with both SR modules present;
+it no longer expects concurrent modules to disable the lower hook. Vulkan cache
+routing uses synthetic exports; real NVIDIA override coverage still needs a
+Vulkan game check.

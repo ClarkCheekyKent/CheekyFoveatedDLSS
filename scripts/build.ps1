@@ -90,9 +90,9 @@ foreach ($mode in @("dx11", "dx11-c", "dx12", "dx12-c", "streamline", "streamlin
     & $uevrTest "--late-$mode"
     if ($LASTEXITCODE -ne 0) { throw "UEVR late attachment ($mode) failed with exit code $LASTEXITCODE." }
 }
-foreach ($mode in @("dx11", "dx11-c")) {
+foreach ($mode in @("dx11", "dx11-c", "dx12", "dx12-c", "streamline", "streamline-c", "streamline-dx11")) {
     & $uevrTest "--late-$mode" --ota-runtime
-    if ($LASTEXITCODE -ne 0) { throw "DX11 OTA GPU test failed: $mode" }
+    if ($LASTEXITCODE -ne 0) { throw "Graphics OTA GPU test failed: $mode" }
 }
 foreach ($mode in @("dx11", "dx11-c", "streamline-dx11", "dx12", "dx12-c", "streamline")) {
     & $uevrTest "--late-$mode" --inactive-afw
@@ -157,8 +157,10 @@ foreach ($mode in @('accept','reject')) {
     if ($LASTEXITCODE -ne 0) { throw "NGX core discovery tests failed: $mode" }
 }
 
-& $coreDiscoveryTest dx11-ota (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\nvngx_dlss.dll") unused
-if ($LASTEXITCODE -ne 0) { throw "DX11 OTA runtime discovery tests failed." }
+foreach ($api in @('dx11','dx12','vulkan')) {
+    & $coreDiscoveryTest "$api-ota" (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\nvngx_dlss.dll") unused
+    if ($LASTEXITCODE -ne 0) { throw "OTA runtime discovery tests failed: $api" }
+}
 
 foreach ($rrMode in @('dx12-rr', 'dx12-rr-c', 'dx12-rr-ota', 'dx12-rr-streamline', 'dx12-rr-streamline-c', 'dx12-rr-ota-streamline')) {
     & $uevrTest "--realvr-$rrMode"

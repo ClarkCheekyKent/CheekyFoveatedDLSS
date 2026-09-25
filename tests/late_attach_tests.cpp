@@ -703,7 +703,7 @@ void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::p
         require(afw_core && afw_warp_module, "Load simulated AFW core before Cheeky");
         if (!realvr) afw_cached_warp = proc<void(__stdcall*)(void*)>(afw_warp_module, "EvaluateFrameWarp");
     }
-    afw_missing_lower = missing_lower || public_first || afw_ambiguous;
+    afw_missing_lower = missing_lower || public_first;
     afw_public_first = public_first;
     if (public_first) {
         proc<void(*)(HMODULE, bool)>(f.ngx, "CheekyFakeForwardTo")(afw_core, false);
@@ -1173,8 +1173,8 @@ void verify_afw_test(CheekyUEVRSnapshotFn get, void (*command)(const char*)) {
     require(snapshot(get).find("\"afw_experiment\":{\"enabled\":true") != std::string::npos, "AFW experiment visible in exported status");
     if (afw_ota) {
         const auto discovery = snapshot(get);
-        require(discovery.find(afw_ambiguous ? "\"runtime_candidates\":2,\"runtime_selected\":false" : "\"runtime_candidates\":1,\"runtime_selected\":true") != std::string::npos,
-            "OTA SR discovery excludes decoys and rejects ambiguous runtimes");
+        require(discovery.find(afw_ambiguous ? "\"runtime_candidates\":2,\"runtime_selected\":true" : "\"runtime_candidates\":1,\"runtime_selected\":true") != std::string::npos,
+            "OTA SR discovery excludes decoys and keeps concurrent runtimes independently hooked");
         if (!afw_ambiguous) require(GetModuleHandleW(L"nvngx_dlss.dll") == nullptr, "OTA test has no conventionally named SR module");
     }
     const auto creates_before = f.creates();

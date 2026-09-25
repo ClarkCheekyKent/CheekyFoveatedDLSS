@@ -4,6 +4,8 @@
 #include "ngx_frame_contract.hpp"
 #include "ngx_parameter_overlay.hpp"
 #include "runtime.hpp"
+#include "diagnostics.hpp"
+#include "ngx_runtime_discovery.hpp"
 #include <MinHook.h>
 #include <array>
 #include <atomic>
@@ -14,12 +16,14 @@ namespace cheeky::foveated_dlss {
 namespace {
 struct Route {
     HMODULE module{};
+    bool sr{}, cached{};
     VulkanNgxCallbacks callbacks{};
 
 };
 std::array<Route,8> routes{};
 std::mutex hooks_mutex,features_mutex;
 using Scope=VulkanNgxScope;
+thread_local bool inside_cached_sr{};
 struct GameFeature {unsigned type{},width{},height{},out_width{},out_height{},flags{},quality{};};
 std::unordered_map<const NgxHandle*,GameFeature> features;
 void created(const NgxHandle* handle,unsigned type,const NgxParameters* p) {
@@ -42,6 +46,13 @@ template<unsigned I> NgxResult create1(VkDevice device,VkCommandBuffer cmd,unsig
 template<unsigned I> NgxResult evaluate(VkCommandBuffer cmd,const NgxHandle* handle,const NgxParameters* p,NgxProgressCallback callback) {
     Scope scope;
     auto& route=routes[I];
+    struct SourceScope {
+        bool previous{inside_cached_sr};
+        explicit SourceScope(bool cached) { inside_cached_sr = previous || cached; }
+        ~SourceScope() { inside_cached_sr = previous; }
+    } source_scope(route.cached);
+    if (route.sr && (route.cached || !source_scope.previous))
+        diagnostic_note_vulkan_dlss_source(route.cached);
     if(vulkan_ngx_private_depth==1 && p && route.callbacks.create && route.callbacks.release) {
         GameFeature feature{};
         {std::lock_guard lock(features_mutex);const auto it=features.find(handle);if(it!=features.end())feature=it->second;}
@@ -72,6 +83,14 @@ template<unsigned I> NgxResult release(NgxHandle* handle) {
 }
 template<unsigned I> bool install(HMODULE module) {
     auto& route=routes[I];route.module=module;
+    std::array<wchar_t, 2048> path{};
+    const auto length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+    if (length && length < path.size()) {
+        const std::wstring_view full(path.data(), length);
+        route.sr = is_dlss_sr_runtime_path(full);
+        route.cached = route.sr && !ngx_identity_equal(full.substr(full.find_last_of(L"/\\") + 1), L"nvngx_dlss.dll");
+        if (route.cached) diagnostic_note_cached_dlss_loaded();
+    }
     const auto hook=[&](const char* name,auto replacement,auto& original) {
         const auto target=GetProcAddress(module,name);if(!target)return false;
         void* trampoline{};

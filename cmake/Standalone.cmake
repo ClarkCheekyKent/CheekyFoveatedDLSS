@@ -101,8 +101,10 @@ foreach(mode accept reject)
 endforeach()
 if(TARGET CheekyFakeNGX)
     add_dependencies(CheekyCoreDiscoveryTests CheekyFakeNGX)
-    add_test(NAME CheekyD3D11OtaDiscovery COMMAND CheekyCoreDiscoveryTests dx11-ota
-        $<TARGET_FILE:CheekyFoveatedDLSSRuntime> $<TARGET_FILE:CheekyFakeNGX> unused)
+    foreach(api dx11 dx12 vulkan)
+        add_test(NAME CheekyOtaDiscovery-${api} COMMAND CheekyCoreDiscoveryTests ${api}-ota
+            $<TARGET_FILE:CheekyFoveatedDLSSRuntime> $<TARGET_FILE:CheekyFakeNGX> unused)
+    endforeach()
 endif()
 add_dependencies(CheekyBootstrapTests CheekyStandaloneProxy CheekyOptiScaler CheekyBootstrapFakeHost)
 foreach(mode proxy asi missing)

@@ -197,6 +197,22 @@ std::atomic<EvaluateD3D12Fn> real_core_evaluate_d3d12{};
 std::atomic<EvaluateD3D12CFn> real_evaluate_d3d12_c{};
 std::atomic<ReleaseD3D12Fn> real_release_d3d12{};
 std::atomic<ReleaseD3D12Fn> real_core_release_d3d12{};
+// Each cached snippet owns its trampolines. A thread-local scope selects the
+// callback family for nested evaluation and private feature creation.
+struct D3D12RuntimeCallbacks {
+    std::atomic<CreateD3D12Fn> create{};
+    std::atomic<EvaluateD3D12Fn> evaluate{};
+    std::atomic<EvaluateD3D12CFn> evaluate_c{};
+    std::atomic<ReleaseD3D12Fn> release{};
+};
+std::array<D3D12RuntimeCallbacks, 8> cached_d3d12_runtimes{};
+thread_local const D3D12RuntimeCallbacks* current_d3d12_runtime{};
+struct D3D12RuntimeScope {
+    const D3D12RuntimeCallbacks* previous{current_d3d12_runtime};
+    explicit D3D12RuntimeScope(const D3D12RuntimeCallbacks* value) { current_d3d12_runtime = value; }
+    ~D3D12RuntimeScope() { current_d3d12_runtime = previous; }
+};
+
 std::atomic<SlEvaluateFeatureFn> real_sl_evaluate_feature{};
 std::atomic<SlSetTagFn> real_sl_set_tag{};
 std::atomic<SlSetTagForFrameFn> real_sl_set_tag_for_frame{};
@@ -1031,10 +1047,9 @@ std::atomic<HANDLE> worker_thread{};
 std::atomic<bool> started{};
 std::atomic<bool> minhook_initialized{};
 std::atomic<bool> early_loader_interception{};
-constexpr std::size_t maximum_direct_hooks = 32U;
+constexpr std::size_t maximum_direct_hooks = 160U;
 std::array<void*, maximum_direct_hooks> direct_hook_targets{};
 std::array<void*, maximum_direct_hooks> direct_hook_originals{};
-std::atomic<bool> dx12_sr_cached_runtime{};
 std::size_t direct_hook_count{};
 SRWLOCK direct_hook_lock = SRWLOCK_INIT;
 
@@ -4456,7 +4471,7 @@ NgxResult runtime_create_d3d12(
     NgxParameters* const parameters,
     NgxHandle** const handle
 ) {
-    const auto original = (inside_rr_runtime ? real_rr_create_d3d12 : real_create_d3d12).load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_create_d3d12 : current_d3d12_runtime ? current_d3d12_runtime->create : real_create_d3d12).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
     D3D12NgxInterceptionScope scope;
@@ -4935,9 +4950,9 @@ void evaluate_nr_after_native_d3d12(
         };
     }
     return {
-        real_create_d3d12.load(std::memory_order_acquire),
-        real_evaluate_d3d12.load(std::memory_order_acquire),
-        real_release_d3d12.load(std::memory_order_acquire),
+        (current_d3d12_runtime ? current_d3d12_runtime->create : real_create_d3d12).load(std::memory_order_acquire),
+        (current_d3d12_runtime ? current_d3d12_runtime->evaluate : real_evaluate_d3d12).load(std::memory_order_acquire),
+        (current_d3d12_runtime ? current_d3d12_runtime->release : real_release_d3d12).load(std::memory_order_acquire),
     };
 }
 
@@ -5108,7 +5123,7 @@ NgxResult runtime_evaluate_d3d12(
     const NgxParameters* const parameters,
     const NgxProgressCallback callback
 ) {
-    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12 : real_evaluate_d3d12).load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12 : current_d3d12_runtime ? current_d3d12_runtime->evaluate : real_evaluate_d3d12).load(std::memory_order_acquire);
     detect_afw_runtime();
     return dispatch_d3d12_ngx_evaluation(
         {
@@ -5154,7 +5169,7 @@ NgxResult evaluate_d3d12_c_impl(
     const NgxParameters* const parameters,
     const NgxProgressCallbackC callback
 ) {
-    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12_c : real_evaluate_d3d12_c).load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_evaluate_d3d12_c : current_d3d12_runtime ? current_d3d12_runtime->evaluate_c : real_evaluate_d3d12_c).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     detect_afw_runtime();
     if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
@@ -5254,7 +5269,7 @@ NgxResult runtime_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHan
 }
 
 NgxResult runtime_release_d3d12(NgxHandle* const handle) {
-    const auto original = (inside_rr_runtime ? real_rr_release_d3d12 : real_release_d3d12).load(std::memory_order_acquire);
+    const auto original = (inside_rr_runtime ? real_rr_release_d3d12 : current_d3d12_runtime ? current_d3d12_runtime->release : real_release_d3d12).load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) return original(handle);
@@ -5281,24 +5296,49 @@ NgxResult hook_core_release_d3d12(NgxHandle* const handle) {
 NgxResult hook_create_d3d12(ID3D12GraphicsCommandList* list, unsigned feature,
     NgxParameters* parameters, NgxHandle** handle) {
     RrRuntimeScope scope{false};
+    D3D12RuntimeScope runtime_scope{nullptr};
     return runtime_create_d3d12(list, feature, parameters, handle);
 }
 NgxResult hook_evaluate_d3d12(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallback callback) {
     RrRuntimeScope scope{false};
-    diagnostic_note_dlss_source(DiagnosticApi::d3d12, dx12_sr_cached_runtime.load(std::memory_order_acquire));
+    D3D12RuntimeScope runtime_scope{nullptr};
+    if (!runtime_scope.previous) diagnostic_note_dlss_source(DiagnosticApi::d3d12, false);
     return runtime_evaluate_d3d12(list, handle, parameters, callback);
 }
 NgxResult hook_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallbackC callback) {
     RrRuntimeScope scope{false};
-    diagnostic_note_dlss_source(DiagnosticApi::d3d12, dx12_sr_cached_runtime.load(std::memory_order_acquire));
+    D3D12RuntimeScope runtime_scope{nullptr};
+    if (!runtime_scope.previous) diagnostic_note_dlss_source(DiagnosticApi::d3d12, false);
     return runtime_evaluate_d3d12_c(list, handle, parameters, callback);
 }
 NgxResult hook_release_d3d12(NgxHandle* handle) {
     RrRuntimeScope scope{false};
+    D3D12RuntimeScope runtime_scope{nullptr};
     return runtime_release_d3d12(handle);
 }
+
+template<std::size_t Slot> struct CachedD3D12Hooks {
+    static NgxResult create(ID3D12GraphicsCommandList* list, unsigned feature, NgxParameters* p, NgxHandle** h) {
+        RrRuntimeScope rr{false}; D3D12RuntimeScope runtime{&cached_d3d12_runtimes[Slot]};
+        return runtime_create_d3d12(list, feature, p, h);
+    }
+    static NgxResult evaluate(ID3D12GraphicsCommandList* list, const NgxHandle* h, const NgxParameters* p, NgxProgressCallback cb) {
+        RrRuntimeScope rr{false}; D3D12RuntimeScope runtime{&cached_d3d12_runtimes[Slot]};
+        diagnostic_note_dlss_source(DiagnosticApi::d3d12, true);
+        return runtime_evaluate_d3d12(list, h, p, cb);
+    }
+    static NgxResult evaluate_c(ID3D12GraphicsCommandList* list, const NgxHandle* h, const NgxParameters* p, NgxProgressCallbackC cb) {
+        RrRuntimeScope rr{false}; D3D12RuntimeScope runtime{&cached_d3d12_runtimes[Slot]};
+        diagnostic_note_dlss_source(DiagnosticApi::d3d12, true);
+        return runtime_evaluate_d3d12_c(list, h, p, cb);
+    }
+    static NgxResult release(NgxHandle* h) {
+        RrRuntimeScope rr{false}; D3D12RuntimeScope runtime{&cached_d3d12_runtimes[Slot]};
+        return runtime_release_d3d12(h);
+    }
+};
 
 NgxResult hook_rr_create_d3d12(ID3D12GraphicsCommandList* list, unsigned feature,
     NgxParameters* parameters, NgxHandle** handle) {
@@ -5776,46 +5816,55 @@ template <typename T>
     return installed;
 }
 
-[[nodiscard]] HMODULE find_sr_feature_runtime() noexcept {
-    // One callback set owns one snippet for this process. Retain the selected
-    // image so a later unload/reload cannot leave its detours or private feature
-    // callbacks pointing into freed memory. Never switch them to another DLL.
-    static HMODULE selected{};
-    if (selected) return selected;
-    std::array<HMODULE, 2048> modules{};
-    DWORD required{};
-    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &required) || required > sizeof(modules)) {
-        afw_note_runtime_discovery(0U, false);
-        return nullptr;
-    }
-    HMODULE candidate{};
-    unsigned count{};
-    std::array<wchar_t, 2048> candidate_path{};
+// Discover late-loaded snippets even when the game cached its export pointers
+// before our GetProcAddress hook. Named SR remains on the existing slot.
+[[nodiscard]] bool install_cached_graphics_hooks(bool require_stability) noexcept {
+    struct Entry { HMODULE module{}; RuntimeStability stability{}; };
+    static std::array<Entry, 8> entries{};
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    struct Detours { CreateD3D12Fn create; EvaluateD3D12Fn evaluate; EvaluateD3D12CFn evaluate_c; ReleaseD3D12Fn release; };
+    static const auto detours = []<std::size_t... I>(std::index_sequence<I...>) {
+        return std::array<Detours, sizeof...(I)>{{{CachedD3D12Hooks<I>::create, CachedD3D12Hooks<I>::evaluate,
+            CachedD3D12Hooks<I>::evaluate_c, CachedD3D12Hooks<I>::release}...}};
+    }(std::make_index_sequence<8>{});
+    std::array<HMODULE, 2048> modules{}; DWORD required{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &required) || required > sizeof(modules)) return false;
+    bool installed{}; unsigned candidates{};
     for (std::size_t i = 0; i < required / sizeof(HMODULE); ++i) {
         std::array<wchar_t, 2048> path{};
         const auto length = GetModuleFileNameW(modules[i], path.data(), static_cast<DWORD>(path.size()));
-        if (!length || length >= path.size() || !is_dlss_sr_runtime_path({path.data(), length})) continue;
-        if (!GetProcAddress(modules[i], "NVSDK_NGX_GetSnippetVersion") ||
-            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_CreateFeature") ||
-            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_EvaluateFeature") ||
-            !GetProcAddress(modules[i], "NVSDK_NGX_D3D12_ReleaseFeature")) continue;
-        candidate = modules[i]; candidate_path = path; ++count;
+        if (!length || length >= path.size() || !is_dlss_sr_runtime_path({path.data(), length}) ||
+            !GetProcAddress(modules[i], "NVSDK_NGX_GetSnippetVersion")) continue;
+        const bool dx12 = GetProcAddress(modules[i], "NVSDK_NGX_D3D12_CreateFeature") &&
+            GetProcAddress(modules[i], "NVSDK_NGX_D3D12_EvaluateFeature") && GetProcAddress(modules[i], "NVSDK_NGX_D3D12_ReleaseFeature");
+        if (dx12) ++candidates;
+        const std::wstring_view full(path.data(), length);
+        if (ngx_identity_equal(full.substr(full.find_last_of(L"/\\") + 1), L"nvngx_dlss.dll")) continue;
+        if (!dx12 && !GetProcAddress(modules[i], "NVSDK_NGX_VULKAN_EvaluateFeature")) continue;
+        std::size_t slot{};
+        while (slot < entries.size() && entries[slot].module != modules[i]) ++slot;
+        if (slot == entries.size()) {
+            slot = 0; while (slot < entries.size() && entries[slot].module) ++slot;
+            if (slot == entries.size()) continue;
+            HMODULE retained{};
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                    reinterpret_cast<LPCWSTR>(modules[i]), &retained)) continue;
+            entries[slot].module = retained;
+            diagnostic_note_cached_dlss_loaded();
+            trace_event("Graphics OTA runtime discovered slot=%zu module=%p path=%ls", slot, retained, path.data());
+        }
+        if (!runtime_ready_for_direct_hooks(entries[slot].module, entries[slot].stability, path.data(), require_stability)) continue;
+        vulkan_install_ngx_hooks(entries[slot].module);
+        if (!dx12) continue;
+        auto& c = cached_d3d12_runtimes[slot]; const auto& h = detours[slot];
+        installed |= install_direct_hook(entries[slot].module, "NVSDK_NGX_D3D12_CreateFeature", reinterpret_cast<void*>(h.create), c.create, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(entries[slot].module, "NVSDK_NGX_D3D12_EvaluateFeature", reinterpret_cast<void*>(h.evaluate), c.evaluate, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(entries[slot].module, "NVSDK_NGX_D3D12_EvaluateFeature_C", reinterpret_cast<void*>(h.evaluate_c), c.evaluate_c, DiagnosticApi::d3d12);
+        installed |= install_direct_hook(entries[slot].module, "NVSDK_NGX_D3D12_ReleaseFeature", reinterpret_cast<void*>(h.release), c.release, DiagnosticApi::d3d12);
     }
-    static unsigned previous_count = ~0U;
-    if (count != previous_count) {
-        trace_event("DLSS lower-runtime discovery candidates=%u; %s", count,
-            count == 1 ? "one SR snippet found" : count ? "ambiguous SR snippets; passing through" : "waiting for an SR snippet");
-        previous_count = count;
-    }
-    if (count == 1 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            reinterpret_cast<LPCWSTR>(candidate), &selected)) {
-        const bool cached = selected != GetModuleHandleW(L"nvngx_dlss.dll");
-        dx12_sr_cached_runtime.store(cached, std::memory_order_release);
-        if (cached) diagnostic_note_cached_dlss_loaded();
-        trace_event("DLSS lower-runtime selected module=%p path=%ls (retained until game exit)", selected, candidate_path.data());
-    }
-    afw_note_runtime_discovery(count, selected != nullptr);
-    return selected;
+    afw_note_runtime_discovery(candidates, candidates != 0);
+    return installed;
 }
 
 [[nodiscard]] HMODULE find_rr_runtime(const bool require_stability) noexcept {
@@ -5895,8 +5944,7 @@ template <typename T>
         }
     }
 
-    const auto observed_public_runtime = protected_ngx_core_enabled()
-        ? find_sr_feature_runtime() : GetModuleHandleW(L"nvngx_dlss.dll");
+    const auto observed_public_runtime = GetModuleHandleW(L"nvngx_dlss.dll");
     const auto public_runtime = runtime_ready_for_direct_hooks(
         observed_public_runtime,
         public_runtime_stability,
@@ -6000,6 +6048,7 @@ template <typename T>
         );
     }
 
+    installed |= install_cached_graphics_hooks(require_runtime_stability);
     installed |= install_cached_d3d11_hooks(require_runtime_stability);
 
     // SR and RR may coexist. Never overwrite SR trampolines with RR exports.
