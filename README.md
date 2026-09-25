@@ -134,6 +134,6 @@ Use **Report an issue...** in Cheeky's panel to create a diagnostic ZIP and open
 ### Show your appreciation
 If Cheeky Foveated DLSS has given you smoother VR, extra FPS, or room to turn up the resolution, please consider donating.
 
-[![Donate](assets/donate-ko-fi.svg)](https://donate.stripe.com/fZufZg5am97b0b12IO8ww00)
+[![Donate](assets/donate.svg)](https://donate.stripe.com/fZufZg5am97b0b12IO8ww00)
 
 Any amount helps toward the goal of funding an eye tracked headset, donating is entirely optional. Cheeky Foveated DLSS is free and open source under the [GNU GPL v3](LICENSE); third-party components retain their own licenses. 
