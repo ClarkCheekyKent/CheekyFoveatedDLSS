@@ -1,6 +1,7 @@
 #include "overlay.hpp"
 #include "overlay_ui.hpp"
 #include "settings_io.hpp"
+#include "../shared/openxr_menu_shared11.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <Windows.h>
@@ -38,6 +39,58 @@ bool cheeky_overlay_test_foreground(HWND window) { return window && window == te
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 void check(HRESULT value, const char* message) { require(SUCCEEDED(value), message); }
+
+void test_shared_menu11() {
+    ComPtr<ID3D11Device> producer, consumer;
+    ComPtr<ID3D11DeviceContext> write, read;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &producer, nullptr, &write), "Producer device");
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &consumer, nullptr, &read), "Consumer device");
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = desc.Height = 16;
+    desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> source, staging;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    check(producer->CreateTexture2D(&desc, nullptr, &source), "Source texture");
+    check(producer->CreateRenderTargetView(source.Get(), nullptr, &rtv), "Source RTV");
+    desc.BindFlags = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    check(consumer->CreateTexture2D(&desc, nullptr, &staging), "Consumer readback");
+    cheeky::xr_menu::SharedTexture11 shared;
+    check(shared.initialize(producer.Get(), consumer.Get(), source.Get()), "Cross-device sharing setup");
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        const float color[]{float(pass), float(1 - pass), 0, 1};
+        write->ClearRenderTargetView(rtv.Get(), color);
+        HRESULT hr = S_FALSE;
+        for (unsigned retry = 0; retry < 100 && hr == S_FALSE; ++retry) {
+            hr = shared.publish(write.Get(), source.Get());
+            if (hr == S_FALSE) Sleep(1);
+        }
+        require(hr == S_OK, "Shared frame publication");
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<IDXGIKeyedMutex> mutex;
+        hr = S_FALSE;
+        for (unsigned retry = 0; retry < 100 && hr == S_FALSE; ++retry) {
+            hr = shared.acquire(&texture, &mutex);
+            if (hr == S_FALSE) Sleep(1);
+        }
+        require(hr == S_OK, "Shared frame acquisition");
+        require(shared.publish(write.Get(), source.Get()) == S_FALSE, "Producer must wait for consumer ownership");
+        read->CopyResource(staging.Get(), texture.Get());
+        check(mutex->ReleaseSync(0), "Return shared frame ownership");
+        read->Flush();
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        check(read->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Read shared pixels");
+        const auto pixel = *static_cast<const unsigned*>(mapped.pData);
+        read->Unmap(staging.Get(), 0);
+        require(pixel == (pass ? 0xFF0000FFU : 0xFF00FF00U), "Cross-device menu pixel mismatch");
+    }
+    std::puts("PASS: D3D11 menu sharing between two devices, pixels and ownership");
+}
 
 // Exercise the real tab renderer with snapshots, including nested API/eye
 // objects. This catches incorrect JSON-member selection and misleading status
@@ -441,6 +494,7 @@ int main(int argc, char** argv) {
     if(argc==2 && std::strcmp(argv[1],"--vulkan")==0)return run_vulkan_overlay_tests();
     try {
         if (argc == 2 && std::strcmp(argv[1], "--ui") == 0) { test_ui_diagnostics(); return 0; }
+        if (argc == 2 && std::strcmp(argv[1], "--shared11") == 0) { test_shared_menu11(); return 0; }
         bool dx11{}, hdr10{}, scrgb{}; std::string capture_path;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]); dx11 |= arg == "--dx11"; hdr10 |= arg == "--hdr10"; scrgb |= arg == "--scrgb";

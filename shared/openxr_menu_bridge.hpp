@@ -17,6 +17,9 @@ struct CheekyOpenXRMenuFrame {
 };
 
 using CheekyOpenXRMenuAcquire = bool(__cdecl*)(CheekyOpenXRMenuFrame*);
+// On success returns an AddRef'd D3D11 texture and a keyed mutex held at key 1.
+// The consumer releases key 0 after copying, then releases both COM references.
+using CheekyOpenXRMenuShared11 = std::int32_t(__cdecl*)(void*, void*, void**, void**);
 using CheekyOpenXRMenuPointer = void(__cdecl*)(float, float, bool, bool);
 using CheekyOpenXRMenuCopy11 = bool(__cdecl*)(void*, void*);
 using CheekyOpenXRMenuExecute11 = bool(__cdecl*)(void*, void*);

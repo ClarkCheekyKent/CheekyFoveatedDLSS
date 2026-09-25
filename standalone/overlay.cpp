@@ -5,6 +5,7 @@
 #include "version.h"
 #include "openvr_menu.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
+#include "../shared/openxr_menu_shared11.hpp"
 void report_openxr_menu_diagnostic(const char* message) noexcept {
     const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
     const auto report = host ? reinterpret_cast<CheekyOpenXRMenuDiagnosticFn>(
@@ -107,6 +108,7 @@ struct Renderer : OverlayUiState {
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D11Texture2D> headset_texture11;
     ComPtr<ID3D11RenderTargetView> headset_rtv11;
+    cheeky::xr_menu::SharedTexture11 xr_shared11;
     ComPtr<ID3D12Resource> headset_texture12;
     vr::IVROverlay* vr_overlay{};
     vr::IVRSystem* vr_system{};
@@ -553,6 +555,11 @@ void render11(Renderer& r) {
         view = r.headset_rtv11.Get();
         r.context11->OMSetRenderTargets(1, &view, nullptr);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        r.context11->OMSetRenderTargets(0, nullptr, nullptr);
+        // Publish on the mirror render thread; the OpenXR thread must never
+        // issue work through the game's immediate context.
+        if (FAILED(r.xr_shared11.publish(r.context11.Get(), r.headset_texture11.Get())))
+            set_status("OpenXR menu: shared D3D11 publish failed");
     }
 }
 
@@ -720,6 +727,30 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuAcquireFrame(
     frame->queue = r->dx12 ? static_cast<void*>(r->queue.Get()) : nullptr;
     frame->texture = texture;
     return true;
+}
+
+extern "C" __declspec(dllexport) std::int32_t __cdecl CheekyOpenXRMenuAcquireShared11(
+    void* source, void* device, void** texture, void** mutex) noexcept {
+    if (!texture || !mutex || !device) return E_INVALIDARG;
+    *texture = nullptr;
+    *mutex = nullptr;
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    auto* r = global.renderer.get();
+    if (!r || r->dx12 || source != r->headset_texture11.Get()) return S_FALSE;
+    auto* consumer = static_cast<ID3D11Device*>(device);
+    auto& shared = r->xr_shared11;
+    if (shared.reader_device.Get() != consumer) {
+        const auto hr = shared.initialize(r->device11.Get(), consumer, r->headset_texture11.Get());
+        if (FAILED(hr)) return hr;
+        report_openxr_menu_diagnostic("OpenXR menu: shared D3D11 texture opened on the VR device");
+    }
+    ID3D11Texture2D* acquired{};
+    IDXGIKeyedMutex* acquired_mutex{};
+    const auto hr = shared.acquire(&acquired, &acquired_mutex);
+    *texture = acquired;
+    *mutex = acquired_mutex;
+    return hr;
 }
 
 extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuCopy11(

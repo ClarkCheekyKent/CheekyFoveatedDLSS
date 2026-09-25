@@ -371,7 +371,7 @@ bool initialize_menu_converter11(SessionState::Menu& menu, ID3D11Device* device)
 }
 
 bool render_menu_converter11(SessionState::Menu& menu, const CheekyOpenXRMenuFrame& frame,
-    const std::uint32_t index, const HMODULE host) {
+    const std::uint32_t index, const HMODULE host, const bool shared_device) {
     if (index >= menu.convert_targets11.size() || !menu.convert_context11) return false;
     auto* device = static_cast<ID3D11Device*>(frame.device);
     auto* source = static_cast<ID3D11Texture2D*>(frame.texture);
@@ -402,6 +402,13 @@ bool render_menu_converter11(SessionState::Menu& menu, const CheekyOpenXRMenuFra
     context->Draw(3, 0);
     Microsoft::WRL::ComPtr<ID3D11CommandList> list;
     if (FAILED(context->FinishCommandList(FALSE, &list))) return false;
+    if (shared_device) {
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> immediate;
+        device->GetImmediateContext(&immediate);
+        immediate->ExecuteCommandList(list.Get(), TRUE);
+        immediate->Flush();
+        return SUCCEEDED(device->GetDeviceRemovedReason());
+    }
     const auto execute = reinterpret_cast<CheekyOpenXRMenuExecute11>(
         GetProcAddress(host, "CheekyOpenXRMenuExecute11"));
     return execute && execute(list.Get(), source);
@@ -758,7 +765,35 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
         if (frame.texture) static_cast<IUnknown*>(frame.texture)->Release();
         return dispatch.end_frame(session, info);
     }
-    const auto release_source = [&frame] { static_cast<IUnknown*>(frame.texture)->Release(); };
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> shared_mutex;
+    if (frame.texture && frame.graphics_api == 11 && state.graphics_api == 11 &&
+        frame.device != state.graphics_device) {
+        const auto share = reinterpret_cast<CheekyOpenXRMenuShared11>(
+            GetProcAddress(host, "CheekyOpenXRMenuAcquireShared11"));
+        void* texture{};
+        void* mutex{};
+        const auto hr = share ? share(frame.texture, state.graphics_device, &texture, &mutex) : E_NOINTERFACE;
+        if (hr != S_OK) {
+            if (hr != S_FALSE) {
+                char message[128]{};
+                std::snprintf(message, sizeof(message), "OpenXR menu: shared D3D11 handoff failed (0x%08lX)",
+                    static_cast<unsigned long>(hr));
+                report_menu_diagnostic(message);
+                state.menu_submission_disabled = true;
+                report_menu_status(cheeky_xr_menu_copy_failed);
+            }
+            static_cast<IUnknown*>(frame.texture)->Release();
+            return dispatch.end_frame(session, info);
+        }
+        static_cast<IUnknown*>(frame.texture)->Release();
+        frame.texture = texture;
+        frame.device = state.graphics_device;
+        shared_mutex.Attach(static_cast<IDXGIKeyedMutex*>(mutex));
+    }
+    const auto release_source = [&frame, &shared_mutex] {
+        if (shared_mutex) static_cast<void>(shared_mutex->ReleaseSync(0));
+        static_cast<IUnknown*>(frame.texture)->Release();
+    };
     if (!frame.texture || frame.graphics_api != state.graphics_api ||
         frame.device != state.graphics_device ||
         (state.graphics_api == 12 && (!frame.queue || !state.graphics_queue))) {
@@ -800,11 +835,20 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
     if (state.graphics_api == 11 && index < menu.images11.size()) {
         if (menu_copy_compatible(static_cast<DXGI_FORMAT>(frame.format),
             static_cast<DXGI_FORMAT>(menu.target_format))) {
-            const auto copy = reinterpret_cast<CheekyOpenXRMenuCopy11>(
-                GetProcAddress(host, "CheekyOpenXRMenuCopy11"));
-            if (copy && menu.images11[index].texture)
-                copied = copy(menu.images11[index].texture, frame.texture);
-        } else copied = render_menu_converter11(menu, frame, index, host);
+            if (shared_mutex && menu.images11[index].texture) {
+                Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+                auto* device = static_cast<ID3D11Device*>(frame.device);
+                device->GetImmediateContext(&context);
+                context->CopyResource(menu.images11[index].texture, static_cast<ID3D11Texture2D*>(frame.texture));
+                context->Flush();
+                copied = SUCCEEDED(device->GetDeviceRemovedReason());
+            } else {
+                const auto copy = reinterpret_cast<CheekyOpenXRMenuCopy11>(
+                    GetProcAddress(host, "CheekyOpenXRMenuCopy11"));
+                if (copy && menu.images11[index].texture)
+                    copied = copy(menu.images11[index].texture, frame.texture);
+            }
+        } else copied = render_menu_converter11(menu, frame, index, host, shared_mutex != nullptr);
     } else if (state.graphics_api == 12 && index < menu.images12.size() &&
         index < menu.allocators.size() && menu.command_list && menu.fence &&
         menu.fence->GetCompletedValue() >= menu.fence_values[index]) {
