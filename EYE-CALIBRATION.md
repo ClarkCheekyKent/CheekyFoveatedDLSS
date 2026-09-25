@@ -25,7 +25,9 @@ search. A five-second budget bounds the cheap discovery stages when usable
 failures keep arriving; pending readbacks, missing submissions and motion judged
 inconclusive do not themselves trigger escalation. This is an escalation budget,
 not a guarantee that calibration will finish within five seconds. Known invalid
-geometry or a lost established mapping can go directly to crop acquisition.
+geometry can go directly to crop acquisition. Losing an established mapping or
+changing views restarts corner discovery with a fresh budget; neither alone
+proves full crop search is needed.
 
 The other method choices force **Standard corners**, **Timing tolerant corners**,
 or **Full crop search**, without automatically escalating to a different method.
@@ -37,7 +39,8 @@ starting method per game, matched against executable identity, graphics/VR
 backend, source dimensions and submitted geometry. Timing tolerance must succeed
 on two launches before becoming the preferred starting method. On later launches,
 one small probe establishes the current signature; matching learned evidence then
-selects the starting route. A different signature starts normal discovery. Eye
+selects the starting route. A successful corner probe overrides a saved full-search
+preference. A different signature starts normal discovery. Eye
 identity and crop coordinates are always calibrated afresh. The UI stays on
 **Auto**, displaying the learned and active methods separately. **Reset learned
 calibration method** clears the preference and restarts discovery.

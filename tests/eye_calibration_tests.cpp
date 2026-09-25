@@ -822,6 +822,12 @@ int run_calibration_modes_tests() {
         policy.begin(EyeCalibrationMethod::automatic, 100);
         require(!policy.failed(5200, false), "Budget expiry must not escalate a single miss");
         require(policy.failed(5300, false), "Five-second budget must bound usable startup failures");
+        policy.recover(20000);
+        require(policy.active == EyeCalibrationMethod::standard && policy.started_ms == 20000 && policy.signature_checked,
+            "Mapping loss must restart corner discovery with a fresh budget without reusing stale learned evidence");
+        for (unsigned i=0; i<19; ++i) require(!policy.failed(20001+i, false), "Recovery must allow a fresh corner retry");
+        require(policy.failed(20020, false) && policy.active == EyeCalibrationMethod::timing,
+            "Failed recovery must still escalate through timing corners");
         policy.begin(EyeCalibrationMethod::automatic, 100);
         for (unsigned i=0; i<50; ++i) require(!policy.failed(10000+i, true), "Motion-inconclusive observations must not escalate");
         for (const auto method : {EyeCalibrationMethod::standard, EyeCalibrationMethod::timing, EyeCalibrationMethod::full}) {
@@ -839,7 +845,7 @@ int run_calibration_modes_tests() {
         D3D11_TEXTURE2D_DESC desc{width,height,1,1,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,0,0,0};
         std::array<ComPtr<ID3D11Texture2D>,2> sources, targets;
         for (auto& source : sources) check(device->CreateTexture2D(&desc,nullptr,&source));
-        auto run = [&](bool cropped, EyeCalibrationMethod method, bool expect_success, bool expect_wide) {
+        auto run = [&](bool cropped, EyeCalibrationMethod method, bool expect_success, bool expect_wide, unsigned recovery = 0) {
             eye_calibration_stop(); eye_calibration_reset_stats();
             register_stereo_view(8101); register_stereo_view(8102);
             auto settings = configured_settings(); settings.eye_calibration_method=method;
@@ -847,6 +853,7 @@ int run_calibration_modes_tests() {
             eye_calibration_enable(true);
             desc.Width=cropped ? 440 : width; desc.Height=cropped ? 360 : height;
             for (auto& target : targets) { target.Reset(); check(device->CreateTexture2D(&desc,nullptr,&target)); }
+            bool hide_markers = false;
             auto frame = [&] {
                 eye_calibration_frame();
                 for (unsigned c=0;c<2;++c) {
@@ -855,6 +862,7 @@ int run_calibration_modes_tests() {
                     const D3D11_BOX box{cropped ? 100U : 0U,cropped ? 60U : 0U,0,
                         cropped ? 540U : width,cropped ? 420U : height,1};
                     context->CopySubresourceRegion(targets[c].Get(),0,0,0,0,sources[c].Get(),0,&box);
+                    if (hide_markers) context->UpdateSubresource(targets[c].Get(),0,nullptr,background.data(),width*4,0);
                 }
                 for (unsigned eye=0;eye<2;++eye) {
                     const auto ticket=eye_calibration_submit(targets[1-eye].Get(),eye,0,0,1,1);
@@ -878,6 +886,22 @@ int run_calibration_modes_tests() {
                     require(eye_calibration_stats().captures==stats.captures,"Full search one-shot mode must stop capture after publication");
                 else
                     require(eye_calibration_stats().captures>stats.captures,"Corner methods must continue validating with the one-shot setting disabled");
+                if (recovery) {
+                    if (recovery == 1) {
+                        unregister_stereo_view(8101); register_stereo_view(8101);
+                    } else {
+                        hide_markers = true;
+                        const auto loss_deadline = GetTickCount64() + 10000;
+                        while (!eye_calibration_stats().recalibration_requests && GetTickCount64() < loss_deadline) frame();
+                        require(eye_calibration_stats().recalibration_requests > 0, "Missing markers must trigger recovery");
+                        hide_markers = false;
+                    }
+                    for (unsigned i=0; i<80; ++i) frame();
+                    const auto recovered = eye_calibration_stats();
+                    require(recovered.crop_mapping_active && recovered.active_method == EyeCalibrationMethod::standard &&
+                        recovered.full_calibration_attempts == 0 && recovered.acquisition_confirmations >= 4,
+                        "View changes and temporary marker loss must recover with corners without full search");
+                }
             } else require(!stats.crop_mapping_active,"Forced corners must not accept an invisible marker");
             require((stats.full_calibration_attempts>0)==expect_wide,"Full-image search must be reserved for the selected route");
             eye_calibration_stop(); unregister_stereo_view(8101); unregister_stereo_view(8102);
@@ -899,6 +923,10 @@ int run_calibration_modes_tests() {
         run(false,EyeCalibrationMethod::timing,true,false);
         run(false,EyeCalibrationMethod::full,true,true);
         const auto ordinary_signature=configured_settings().eye_calibration_learned_signature;
+        set_eye_calibration_learning(3,ordinary_signature,1);
+        require(run(false,EyeCalibrationMethod::automatic,true,false,1).first.active_method==EyeCalibrationMethod::standard,
+            "Successful corner probe must override a stale learned full-search preference");
+        run(false,EyeCalibrationMethod::automatic,true,false,2);
         set_eye_calibration_learning(2,ordinary_signature,1);
         require(run(false,EyeCalibrationMethod::automatic,true,false).first.active_method==EyeCalibrationMethod::standard,
             "A single timing success must not select the timing route on restart");

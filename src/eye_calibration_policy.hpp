@@ -27,7 +27,9 @@ struct EyeCalibrationPolicy {
         active = method; failures = confirmations = 0; stage_ms = now;
     }
     void recover(std::uint64_t now) {
-        select(configured == EyeCalibrationMethod::automatic ? EyeCalibrationMethod::full : configured, now);
+        // Losing a mapping is not evidence that corner stamps cannot work.
+        // Give the new scene a fresh discovery budget, just like a manual reset.
+        begin(configured, now);
         signature_checked = true;
     }
     bool failed(std::uint64_t now, bool inconclusive) {

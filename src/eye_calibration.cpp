@@ -214,9 +214,9 @@ void request_full_calibration(State& s, const char* reason) {
     if (!s.search_needed) {
         if (s.placements[0].locked || s.placements[1].locked) ++s.stats.recalibration_requests;
         s.stats.full_calibration_reason=reason;
+        s.policy.recover(GetTickCount64());
     }
     s.search_needed=true;
-    s.policy.recover(GetTickCount64());
     s.published=false;
 }
 void placement_epoch(State& s) {
@@ -241,7 +241,6 @@ void restart_calibration(State& s, const char* reason) {
     s.frames_until_capture = 0;
     clear_stereo_calibration();
     placement_epoch(s);
-    if (std::string_view(reason) == "source_or_submitted_geometry_changed") s.policy.recover(GetTickCount64());
 }
 void observe_source(State& s, std::uint64_t view, unsigned width, unsigned height) {
     if (!retaining_calibration(s)) return;
@@ -1029,6 +1028,8 @@ void poll(State& s) {
             const auto learned = settings.eye_calibration_learned_method;
             if (s.policy.configured == EyeCalibrationMethod::automatic &&
                 signature == settings.eye_calibration_learned_signature && learned >= 1 && learned <= 3 &&
+                // A successful fresh corner probe outweighs a saved full-search preference.
+                (learned != 3 || rejection != 0) &&
                 (learned != 2 || settings.eye_calibration_learned_sessions >= 2)) {
                 s.policy.select(static_cast<EyeCalibrationMethod>(learned), GetTickCount64());
                 s.frames_until_capture = 0;
@@ -1101,7 +1102,7 @@ void poll(State& s) {
                 // Ambiguous identity still invalidates immediately.
                 if (!locked && !f.wide_search) {
                     if (geometry_changed && !f.motion_unreliable && s.policy.configured == EyeCalibrationMethod::automatic) {
-                        s.policy.recover(GetTickCount64()); s.frames_until_capture = 0;
+                        s.policy.select(EyeCalibrationMethod::full, GetTickCount64()); s.frames_until_capture = 0;
                     } else if (s.policy.failed(GetTickCount64(), f.motion_unreliable)) s.frames_until_capture = 0;
                 } else if (!inconclusive && (!locked || ambiguous || ++s.tracking_misses >= eye_calibration_failure_limit)) {
                     request_full_calibration(s, ambiguous ? "ambiguous_identity" : locked ? "verification_failure_limit" : "no_locked_crop");
