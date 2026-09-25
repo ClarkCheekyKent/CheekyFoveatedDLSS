@@ -115,6 +115,9 @@ Changes are saved automatically. The menu key is saved in `CheekyOverlay.ini`
 beside the host DLL; use **Reset to F8** in General to restore the default.
 Pause the game when changing settings if it continues to react to keys while
 the menu is open; some games poll input outside Windows message handling.
+An open menu stays visible when the game loses desktop focus, as long as the
+game continues presenting frames. Desktop keyboard/mouse capture and the menu
+hotkey apply only while the game has focus; switching apps releases the cursor.
 
 Settings are saved to `CheekyFoveatedDLSS.ini` inside the nested
 `CheekyFoveatedDLSS` directory, alongside the host and runtime DLLs. This is also

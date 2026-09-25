@@ -203,6 +203,9 @@ bool supported_surface(DXGI_COLOR_SPACE_TYPE space, DXGI_FORMAT format) {
 }
 
 bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const DXGI_SWAP_CHAIN_DESC& desc, ChainMetadata metadata) {
+    // Every early failure must replace the startup message. Otherwise resource
+    // failures look indistinguishable from a window that never gained focus.
+    set_status("Overlay initialization failed while creating graphics resources");
     r.swapchain = swapchain; r.window = desc.OutputWindow;
     r.color_space = metadata.color_space; r.chain_identity = metadata.identity;
     cheeky_overlay_color_mode = shader_color_mode(r.color_space, desc.BufferDesc.Format);
@@ -617,9 +620,26 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         std::unique_lock lock(global.mutex, std::try_to_lock);
         if (!lock.owns_lock()) return;
         DXGI_SWAP_CHAIN_DESC desc{};
-        if (FAILED(swapchain->GetDesc(&desc)) || !IsWindow(desc.OutputWindow) ||
-            !IsWindowVisible(desc.OutputWindow) || !foreground(desc.OutputWindow) ||
-            desc.BufferDesc.Width < 160 || desc.BufferDesc.Height < 100) return;
+        // Do not let an auxiliary chain overwrite the selected menu's status.
+        const bool diagnose = !global.renderer || global.renderer->swapchain == swapchain;
+        const auto reject = [diagnose](const char* reason) { if (diagnose) set_status(reason); };
+        if (FAILED(swapchain->GetDesc(&desc))) {
+            reject("Overlay waiting: cannot read swap-chain description"); return;
+        }
+        if (!IsWindow(desc.OutputWindow)) {
+            reject("Overlay waiting: swap chain has no valid desktop window"); return;
+        }
+        if (!IsWindowVisible(desc.OutputWindow)) {
+            reject("Overlay waiting: swap-chain desktop window is hidden"); return;
+        }
+        // Focus selects the desktop surface, but an established menu stays
+        // visible (including its headset texture) while another app is active.
+        if (!foreground(desc.OutputWindow) && (!global.renderer || global.renderer->swapchain != swapchain)) {
+            reject("Overlay waiting: focus the game's swap-chain desktop window, then press the menu key (F8 by default)"); return;
+        }
+        if (desc.BufferDesc.Width < 160 || desc.BufferDesc.Height < 100) {
+            reject("Overlay waiting: swap-chain dimensions are smaller than 160x100"); return;
+        }
         const auto metadata = chain_metadata(swapchain, desc.BufferDesc.Format);
         const auto color_space = metadata.color_space;
         if (!supported_surface(color_space, desc.BufferDesc.Format)) {

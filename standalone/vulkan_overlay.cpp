@@ -114,8 +114,10 @@ VkResult overlay_vulkan_present(const CheekyVulkanPresent& p,const OverlayRuntim
     std::unique_lock lock(mutex,std::try_to_lock);
     if(!lock.owns_lock())return forward();
     try {
-        if(p.size!=sizeof(p) || !p.window || !foreground(p.window) || !IsWindowVisible(p.window) ||
+        if(p.size!=sizeof(p) || !p.window || !IsWindowVisible(p.window) ||
             p.image_count<2 || p.extent.width<160 || p.extent.height<100 || color_mode(p.format,p.color_space)<0)return forward();
+        if(!foreground(p.window) && (!renderer || renderer->swapchain!=p.swapchain ||
+            renderer->api.device!=p.device || renderer->queue!=p.queue))return forward();
         const auto now=GetTickCount64();
         if(renderer && (renderer->swapchain!=p.swapchain || renderer->api.device!=p.device || renderer->queue!=p.queue)) {
             if(now-renderer->last_present<1000)return forward();

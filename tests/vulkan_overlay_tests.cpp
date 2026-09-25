@@ -95,6 +95,8 @@ int run_vulkan_overlay_tests(bool layer) {
         }
         for(unsigned frame=0;frame<9;++frame) {
             std::printf("Overlay Vulkan frame %u\n",frame);
+            if(frame==4) {test_foreground=nullptr;SendMessageW(window,WM_KILLFOCUS,0,0);SendMessageW(window,WM_ACTIVATEAPP,FALSE,0);}
+            if(frame==6) {test_foreground=window;SendMessageW(window,WM_SETFOCUS,0,0);SendMessageW(window,WM_ACTIVATEAPP,TRUE,0);}
             if(frame==1 || frame==8)SendMessageW(window,WM_KEYDOWN,VK_F8,1);
             unsigned index{};require(proc<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(device,chain,UINT64_MAX,acquired,VK_NULL_HANDLE,&index)==VK_SUCCESS,"acquire");
             require(proc<PFN_vkResetCommandPool>("vkResetCommandPool")(device,pool,0)==VK_SUCCESS,"reset clear");VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};require(proc<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(cmd,&begin)==VK_SUCCESS,"begin clear");

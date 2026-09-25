@@ -77,6 +77,7 @@ bool foreground(HWND window) {
 }
 
 void release_cursor(InputState& input) {
+    if (!foreground(input.window)) return;
     capture_owner = &input;
     std::lock_guard lock(input.cursor_mutex);
     if (!input.cursor_released) input.cursor_released = GetClipCursor(&input.previous_clip) != FALSE;
@@ -269,8 +270,14 @@ LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam, LPARA
         return 0;
     }
     if (message == WM_KILLFOCUS || (message == WM_ACTIVATEAPP && !wparam)) {
-        input->open = false; input->menu_key_down = false; input->rebinding = false;
+        // Losing desktop focus releases input ownership, not menu visibility.
+        input->menu_key_down = false; input->rebinding = false;
         input->pointer_buttons = 0; restore_cursor(*input, false);
+        if (message == WM_ACTIVATEAPP) {
+            std::lock_guard lock(input->mutex);
+            input->messages.clear();
+            input->messages.push_back({WM_KILLFOCUS, 0, 0});
+        }
     }
     const bool key_message = message == WM_KEYDOWN || message == WM_KEYUP ||
         message == WM_SYSKEYDOWN || message == WM_SYSKEYUP;

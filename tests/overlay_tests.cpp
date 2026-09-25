@@ -506,12 +506,25 @@ int main(int argc, char** argv) {
         const auto space = hdr10 ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : scrgb ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         overlay_set_color_space(gpu.swapchain.Get(), space);
         gpu.clear(); const auto baseline = gpu.pixels();
+        test_foreground = nullptr;
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
+        require(std::string(overlay_status()).find("focus the game's") != std::string::npos,
+            "Unfocused startup did not explain why the menu is unavailable");
+        require(gpu.pixels() == baseline, "Unfocused startup modified the swap chain");
+        test_foreground = window.value;
+        ShowWindow(window.value, SW_HIDE);
+        overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
+        require(std::string(overlay_status()).find("window is hidden") != std::string::npos,
+            "Hidden startup did not explain why the menu is unavailable");
+        ShowWindow(window.value, SW_SHOW);
         if (!dx11) {
             overlay_present(gpu.swapchain.Get(), nullptr, runtime);
             require(std::string(overlay_status()).find("waiting") != std::string::npos, "Unknown queue was not refused");
             require(gpu.pixels() == baseline, "Unknown-queue path modified the swap chain");
         }
         overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
+        require(std::string(overlay_status()).find("Menu ready") != std::string::npos,
+            "Menu did not recover after restoring window visibility and focus");
         require(snapshots == 0, "Closed overlay should not poll diagnostic snapshots");
         require(gpu.pixels() == baseline, "Closed overlay modified the swap chain");
         RECT requested_clip{100, 100, 600, 500}, actual_clip{};
@@ -576,6 +589,26 @@ int main(int argc, char** argv) {
             "Menu viewport must match actual backbuffer, not window client size");
         require(ImGui::GetIO().MouseDrawCursor, "Menu cursor must remain visible at the hit-test position");
         ImGui::RemoveContextHook(imgui, hook_id);
+        auto* focus_input = attach_input(window.value);
+        test_foreground = nullptr;
+        SendMessageW(window.value, WM_KILLFOCUS, 0, 0);
+        SendMessageW(window.value, WM_ACTIVATEAPP, FALSE, 0);
+        require(focus_input->open && !focus_input->cursor_released,
+            "Focus loss must keep the menu open and release cursor ownership");
+        toggle(window.value);
+        const auto keys_before_blur = game_keys;
+        SendMessageW(window.value, WM_KEYDOWN, 'W', 1);
+        SendMessageW(window.value, WM_KEYUP, 'W', LPARAM{1} << 31);
+        require(game_keys == keys_before_blur + 2, "Unfocused menu captured desktop keyboard input");
+        gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
+        require(gpu.pixels() != baseline && focus_input->open,
+            "Unfocused menu must keep rendering and ignore background F8");
+        require(!focus_input->cursor_released, "Background rendering reclaimed the desktop cursor");
+        test_foreground = window.value;
+        SendMessageW(window.value, WM_SETFOCUS, 0, 0);
+        SendMessageW(window.value, WM_ACTIVATEAPP, TRUE, 0);
+        // Simulate the game restoring its own cursor confinement on activation.
+        if (test_clip) ClipCursor(&actual_clip);
         toggle(window.value, true); gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
         require(gpu.pixels() != baseline, "F8 autorepeat incorrectly closed the overlay");
         toggle(window.value); gpu.clear(); overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime); gpu.idle();
@@ -616,7 +649,7 @@ int main(int argc, char** argv) {
         overlay_present(gpu.swapchain.Get(), gpu.queue.Get(), runtime);
         if (test_clip) { RECT restored{}; require(GetClipCursor(&restored) && EqualRect(&actual_clip, &restored), "Closing overlay did not restore cursor confinement"); }
         SendMessageW(window.value, WM_KEYDOWN, 'W', 1); SendMessageW(window.value, WM_KEYUP, 'W', LPARAM{1} << 31);
-        require(game_keys == 2, "Closed overlay did not pass keyboard input through");
+        require(game_keys == keys_before_blur + 4, "Closed overlay did not pass keyboard input through");
         // Rebinding must consume the captured press, persist the new key, and
         // leave the former key unable to toggle the menu.
         auto* input = attach_input(window.value);
