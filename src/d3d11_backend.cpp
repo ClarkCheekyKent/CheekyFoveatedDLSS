@@ -627,7 +627,8 @@ extern "C" void register_d3d11_game_feature(
     const NgxHandle* const game_handle,
     const std::uint32_t feature,
     D3D11CreateFeatureFn const create_feature,
-    D3D11ReleaseFeatureFn const release_feature
+    D3D11ReleaseFeatureFn const release_feature,
+    const bool preserve_existing
 ) noexcept {
     if (game_handle == nullptr || create_feature == nullptr) {
         return;
@@ -636,6 +637,7 @@ extern "C" void register_d3d11_game_feature(
     std::lock_guard lock(features_mutex);
     if (auto* const existing = find_feature_state_locked(game_handle);
         existing != nullptr) {
+        if (preserve_existing) return;
         existing->feature = feature;
         existing->create_feature = create_feature;
         if (release_feature != nullptr) {

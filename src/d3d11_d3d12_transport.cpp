@@ -235,6 +235,7 @@ struct TransportView {
 };
 
 struct TransportDevice {
+    HMODULE feature_module{};
     struct SharingPreference {
         DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
         D3D12_RESOURCE_FLAGS flags{};
@@ -766,7 +767,7 @@ void trace_format_support(
 ) noexcept {
     TransportDevice* entry{};
     for (auto& device : transport_devices) {
-        if (device.device11 != device11) continue;
+        if (device.device11 != device11 || device.feature_module != ngx.feature_module) continue;
         if (device.ngx_initialized) return &device;
         if (GetTickCount64() < device.initialization_retry_after) return nullptr;
         entry = &device;
@@ -777,6 +778,7 @@ void trace_format_support(
         entry = &transport_devices.back();
         // Retain identity across failures so a recycled COM address cannot
         // inherit another device's retry deadline.
+        entry->feature_module = ngx.feature_module;
         entry->device11 = device11;
         device11->AddRef();
     }
@@ -789,6 +791,7 @@ void trace_format_support(
         return nullptr;
     }
     release(entry->device11);
+    created.feature_module = ngx.feature_module;
     *entry = std::move(created);
     return entry;
 }

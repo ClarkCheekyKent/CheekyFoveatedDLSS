@@ -90,6 +90,10 @@ foreach ($mode in @("dx11", "dx11-c", "dx12", "dx12-c", "streamline", "streamlin
     & $uevrTest "--late-$mode"
     if ($LASTEXITCODE -ne 0) { throw "UEVR late attachment ($mode) failed with exit code $LASTEXITCODE." }
 }
+foreach ($mode in @("dx11", "dx11-c")) {
+    & $uevrTest "--late-$mode" --ota-runtime
+    if ($LASTEXITCODE -ne 0) { throw "DX11 OTA GPU test failed: $mode" }
+}
 foreach ($mode in @("dx11", "dx11-c", "streamline-dx11", "dx12", "dx12-c", "streamline")) {
     & $uevrTest "--late-$mode" --inactive-afw
     if ($LASTEXITCODE -ne 0) { throw "UEVR inactive AFW ($mode) failed with exit code $LASTEXITCODE." }
@@ -142,11 +146,19 @@ foreach ($api in @('dx11','dx12')) {
         if ($LASTEXITCODE -ne 0) { throw "Overlay tests failed: $api $color" }
     }
 }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyRuntimeHostTests.exe") --transport-ota
+if ($LASTEXITCODE -ne 0) { throw "NVIDIA OTA DX11 transport regression failed." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyRuntimeHostTests.exe") --transport-ota-only
+if ($LASTEXITCODE -ne 0) { throw "NVIDIA OTA-only DX11 transport regression failed." }
+
 $coreDiscoveryTest = Join-Path $projectRoot "bin\$Configuration\CheekyCoreDiscoveryTests.exe"
 foreach ($mode in @('accept','reject')) {
     & $coreDiscoveryTest $mode (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\CheekyFakeCore.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\CheekyFakeCoreProxy.dll")
     if ($LASTEXITCODE -ne 0) { throw "NGX core discovery tests failed: $mode" }
 }
+
+& $coreDiscoveryTest dx11-ota (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS\CheekyFoveatedDLSSRuntime.dll") (Join-Path $projectRoot "bin\$Configuration\test-fixtures\nvngx_dlss.dll") unused
+if ($LASTEXITCODE -ne 0) { throw "DX11 OTA runtime discovery tests failed." }
 
 foreach ($rrMode in @('dx12-rr', 'dx12-rr-c', 'dx12-rr-ota', 'dx12-rr-streamline', 'dx12-rr-streamline-c', 'dx12-rr-ota-streamline')) {
     & $uevrTest "--realvr-$rrMode"

@@ -39,7 +39,7 @@ double field(const std::string& text, const char* name) {
 }
 void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn get,
     std::uint64_t attachment, ID3D11Device* device, ID3D11DeviceContext* context, HMODULE ngx,
-    const std::filesystem::path& log_path,bool depth24=false,bool backpressure=false,bool init_failure=false) {
+    const std::filesystem::path& log_path,bool depth24=false,bool backpressure=false,bool init_failure=false, const std::filesystem::path& game_feature_directory={}) {
     using namespace cheeky::foveated_dlss;
     using Init = NgxResult (*)(unsigned long long, const wchar_t*, ID3D11Device*, const void*, unsigned);
     using Create = NgxResult (*)(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle**);
@@ -47,7 +47,15 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
     using Release = NgxResult (*)(NgxHandle*);
     for (unsigned i = 0; i < 200 && !contains(snapshot(get), "\"direct_detour\":true"); ++i) Sleep(25);
     require(contains(snapshot(get), "\"direct_detour\":true"), "NGX detours installed for transport fixture");
-    require(ngx_succeeded(proc<Init>(ngx, "NVSDK_NGX_D3D11_Init")(42, L".", device, nullptr, 1)), "Record DX11 initialization for private transport");
+    // With only the cached snippet loaded, supply the game's explicit search
+    // path: this fixture's game DLL lives outside the test EXE directory.
+    const auto feature_directory = game_feature_directory.wstring();
+    const wchar_t* feature_path = feature_directory.c_str();
+    NgxFeatureCommonInfo feature_info{};
+    feature_info.path_list.paths = &feature_path;
+    feature_info.path_list.count = 1;
+    require(ngx_succeeded(proc<Init>(ngx, "NVSDK_NGX_D3D11_Init")(42, L".", device,
+        feature_directory.empty() ? nullptr : &feature_info, 1)), "Record DX11 initialization for private transport");
     // Standalone/ASI runtime DLLs are nested away from the game's DLSS DLL.
     // The core must receive an explicit feature path when Init was recovered
     // or the game's Init supplied no FeatureCommonInfo.
@@ -303,6 +311,7 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
 
 int main(int argc, char** argv) {
     try {
+        bool ota_transport{}, ota_only{};
         bool dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{},backpressure{},init_failure{};
         unsigned openvr_version{};
         for (int i = 1; i < argc; ++i) {
@@ -310,6 +319,8 @@ int main(int argc, char** argv) {
             if (arg == "--dx11") dx11 = true;
             else if (arg == "--conflict") conflict = true;
             else if (arg == "--optiscaler") optiscaler = true;
+            else if (arg == "--transport-ota-only") { ota_only = ota_transport = transport = dx11 = true; }
+            else if (arg == "--transport-ota") { ota_transport = transport = dx11 = true; }
             else if (arg == "--transport") { transport = true; dx11 = true; }
             else if (arg == "--transport-init-failure") { transport = dx11 = init_failure = true; }
             else if (arg == "--transport-depth24") { transport = dx11 = depth24 = true; }
@@ -368,7 +379,13 @@ int main(int argc, char** argv) {
             std::filesystem::copy_file(fixture, isolated / "nvngx_dlssnr.dll");
             std::filesystem::copy_file(fixture, isolated / "_nvngx.dll");
             std::filesystem::copy_file(fixture, isolated / "nvngx_dlss.dll");
-            fake_ngx = LoadLibraryW((isolated / "nvngx_dlss.dll").c_str());
+            auto sr_path = isolated / "nvngx_dlss.dll";
+            if (ota_only) {
+                sr_path = directory / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
+                std::filesystem::create_directories(sr_path.parent_path());
+                std::filesystem::copy_file(fixture, sr_path);
+            }
+            fake_ngx = LoadLibraryW(sr_path.c_str());
             require(fake_ngx && LoadLibraryW((isolated / "_nvngx.dll").c_str()), "Load fake public and private NGX runtimes");
             if (forwarded_transport) {
                 // Real NVIDIA core dispatches private DX12 calls into the
@@ -466,8 +483,33 @@ int main(int argc, char** argv) {
             require(command(attachment, "1\n2\nset\nD3D11D3D12Transport=true\nNrEnabled=true"), "Generic DX11 host exposes transport and NR");
             require(contains(snapshot(get), "\"D3D11D3D12Transport\":true"), "Transport preference retained");
         }
+        if (ota_transport && !ota_only) {
+            // The named DLL is loaded and selected first, but override frames
+            // arrive through a subsequently loaded cached snippet.
+            proc<void(*)(bool)>(fake_ngx, "CheekyFakeFailEvaluations")(true);
+            const auto ota_path = directory / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
+            std::filesystem::create_directories(ota_path.parent_path());
+            std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", ota_path);
+            fake_ngx = LoadLibraryW(ota_path.c_str()); require(fake_ngx != nullptr, "Load late transport OTA runtime");
+            bool hooked{};
+            for (unsigned i = 0; i < 400 && !hooked; ++i) {
+                std::ifstream log(directory / "CheekyFoveatedDLSS-Standalone.log");
+                const std::string value((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+                const auto found = value.find("DX11 OTA runtime discovered");
+                hooked = found != value.npos && value.find("Direct detour installed export=NVSDK_NGX_D3D11_ReleaseFeature", found) != value.npos;
+                if (!hooked) Sleep(25);
+            }
+            require(hooked, "OTA hooks ready before transport evaluation");
+            require(contains(snapshot(get), "Cached runtime loaded; use not observed"), "Loading alone does not claim override active");
+        }
         if (transport) verify_transport(command, get, attachment, device11.Get(), context11.Get(), fake_ngx,
-            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24,backpressure,init_failure);
+            directory / (optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"),depth24,backpressure,init_failure, ota_only ? directory / "runtime" : std::filesystem::path{});
+        if (ota_transport) {
+            require(contains(snapshot(get), "Active (NVIDIA cached runtime)"), "Override status follows actual OTA evaluations");
+            detach(attachment);
+            puts("PASS: late NVIDIA OTA transport selects matching DX12 callbacks and executes SR/NR");
+            return 0;
+        }
         if(depth24 || backpressure){detach(attachment);return 0;}
         CheekyUEVRStereoProjection projection;
         require(!publish_stereo(attachment, &projection) && !publish_mode(attachment, 3), "UEVR-only publications reject generic host attachments");

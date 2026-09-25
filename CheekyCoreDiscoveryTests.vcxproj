@@ -7,5 +7,6 @@
 
 
   <ItemGroup><ProjectReference Include="CheekyFakeCore.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833210}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference><ProjectReference Include="CheekyFakeCoreProxy.vcxproj"><Project>{514AE60D-49DA-46DE-8541-4A8F45833211}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference><ProjectReference Include="CheekyFoveatedDLSSRuntime.vcxproj"><Project>{83F33170-9A67-419F-96D2-B71F20FF4B91}</Project><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
+  <ItemGroup><ProjectReference Include="CheekyFakeNGX.vcxproj"><LinkLibraryDependencies>false</LinkLibraryDependencies></ProjectReference></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

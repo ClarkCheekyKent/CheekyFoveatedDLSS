@@ -270,7 +270,14 @@ int main(int argc, char** argv) {
             std::filesystem::copy_file(bin / "test-fixtures" / "nvngx_dlss.dll", runtime_dir / "nvngx_dlssnr.dll");
             plugin_path = isolated / plugin_path.filename();
         }
-        if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"));
+        std::filesystem::path late_ngx_path;
+        for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--ota-runtime") {
+            require(late && dx11, "OTA runtime option requires a DX11 late-attachment test");
+            late_ngx_path = root / "NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin";
+            std::filesystem::create_directories(late_ngx_path.parent_path());
+            std::filesystem::copy_file(bin / "test-fixtures/nvngx_dlss.dll", late_ngx_path);
+        }
+        if (late) prepare_late_attach_test(bin,device11.Get(),device.Get(),queue.Get(),mode.ends_with("-c"),mode.starts_with("--late-streamline"),late_ngx_path);
         if (afw || realvr) prepare_afw_test(bin,root,device.Get(),queue.Get(),mode);
         if (inactive_afw) {
             require(late, "Inactive AFW fixture requires a late-attachment route");

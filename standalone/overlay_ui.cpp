@@ -737,6 +737,8 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 ImGui::Text("Host: %s", runtime.host_name ? runtime.host_name : "Standalone");
                 ImGui::Text("Renderer: %s", renderer);
                 diagnostic_line(r.snapshot, "Runtime ready", "ready");
+                diagnostic_line(r.snapshot, "NVIDIA DLSS override", "nvidia_override_status");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shows observed NVIDIA cached DLSS runtime use, including overrides and automatic updates.");
                 if (std::string_view(renderer) != "Vulkan") {
                     ImGui::Text("Configured DX11 path: %s", r.draft.d3d11_use_d3d12_transport ? "DX12 transport" : "DX11 direct");
                     const auto active_hook = member(r.snapshot, "d3d12_lower_hook_active");

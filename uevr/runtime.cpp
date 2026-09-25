@@ -179,7 +179,8 @@ std::string snapshot_locked(State& s) {
         << ",\"codec_creations\":" << nr.codec_creations
         << ",\"border_creations\":" << nr.border_creations
         << ",\"resource_rebinds\":" << nr.resource_rebinds
-        << ",\"vram_bytes\":" << nr.intermediate_vram_bytes << "},\"apis\":[";
+        << ",\"vram_bytes\":" << nr.intermediate_vram_bytes << "}"
+        << ",\"nvidia_override_status\":\"" << diagnostic_dlss_override_status() << "\",\"apis\":[";
     for (unsigned index = 0; index < 2; ++index) {
         const auto d = diagnostic_snapshot(index ? DiagnosticApi::d3d12 : DiagnosticApi::d3d11);
         if (index) out << ',';

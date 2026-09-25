@@ -166,6 +166,16 @@ void test_ui_diagnostics() {
     require(text.find("Change menu key") != text.npos && text.find("DX11 -> DX12 transport") != text.npos &&
         text.find("Use lower DLSS hook (DX12)") != text.npos && text.find("Runtime ready") != text.npos &&
         text.find("DLSS hook change saved") != text.npos, "General controls and statuses missing");
+    const auto general_snapshot = state.snapshot;
+    for (const auto* status : {"Waiting for DLSS", "Not detected (game DLL)",
+            "Cached runtime loaded; use not observed", "Active (NVIDIA cached runtime)"}) {
+        state.snapshot = std::string("{\"nvidia_override_status\":\"") + status + "\"}";
+        render("General"); text = render("General");
+        require(text.find("NVIDIA DLSS override") != text.npos && text.find(status) != text.npos,
+            "General must show observed NVIDIA override status");
+    }
+    state.snapshot = general_snapshot;
+
     render("DLSS-SR"); text = render("DLSS-SR");
     require(text.find("Use lower DLSS hook (DX12)") == text.npos, "Hook selector should live in General");
     require(text.find("Cosmetic only; no performance impact.") != text.npos, "SR roundness note missing");

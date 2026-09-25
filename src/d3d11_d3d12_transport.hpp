@@ -25,6 +25,7 @@ using NgxGetApiVersionFn = std::uint32_t (*)();
 
 struct D3D11TransportNgx {
     HMODULE runtime_module{};
+    HMODULE feature_module{};
     NgxD3D12InitExtFn init_ext{};
     NgxD3D12AllocateParametersFn allocate_parameters{};
     NgxD3D12Shutdown1Fn shutdown{};

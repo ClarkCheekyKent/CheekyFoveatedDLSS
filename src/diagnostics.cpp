@@ -59,6 +59,9 @@ struct RuntimeDiagnostics {
 
 std::array<RuntimeDiagnostics, 2U> diagnostics{};
 std::atomic<bool> streamline_detected{};
+std::atomic<bool> cached_dlss_loaded{};
+std::array<std::atomic<unsigned>, 2> dlss_sources{}; // 0 waiting, 1 game DLL, 2 cache
+
 
 constexpr auto timing_sample_interval = std::chrono::milliseconds(125);
 constexpr auto timing_publish_interval = std::chrono::milliseconds(250);
@@ -148,6 +151,19 @@ void note_averaged_gpu_time(
 
 void diagnostic_note_hook(const DiagnosticApi api) noexcept {
     for_api(api).hook_discovered.store(true, std::memory_order_release);
+}
+
+void diagnostic_note_cached_dlss_loaded() noexcept { cached_dlss_loaded.store(true, std::memory_order_release); }
+void diagnostic_note_dlss_source(DiagnosticApi api, bool cached) noexcept {
+    if (cached) diagnostic_note_cached_dlss_loaded();
+    dlss_sources[static_cast<unsigned>(api)].store(cached ? 2U : 1U, std::memory_order_release);
+}
+const char* diagnostic_dlss_override_status() noexcept {
+    const auto dx11 = dlss_sources[0].load(std::memory_order_acquire);
+    const auto dx12 = dlss_sources[1].load(std::memory_order_acquire);
+    if (dx11 == 2 || dx12 == 2) return "Active (NVIDIA cached runtime)";
+    if (cached_dlss_loaded.load(std::memory_order_acquire)) return "Cached runtime loaded; use not observed";
+    return dx11 || dx12 ? "Not detected (game DLL)" : "Waiting for DLSS";
 }
 
 void diagnostic_note_runtime_loaded(const DiagnosticApi api) noexcept {

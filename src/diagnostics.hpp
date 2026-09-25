@@ -120,6 +120,11 @@ struct DiagnosticSnapshot {
 };
 
 void diagnostic_note_hook(DiagnosticApi api) noexcept;
+// Reports observed runtime use, not a guess at NVIDIA App profile settings.
+void diagnostic_note_cached_dlss_loaded() noexcept;
+void diagnostic_note_dlss_source(DiagnosticApi api, bool cached) noexcept;
+[[nodiscard]] const char* diagnostic_dlss_override_status() noexcept;
+
 void diagnostic_note_runtime_loaded(DiagnosticApi api) noexcept;
 void diagnostic_note_streamline_detected() noexcept;
 void diagnostic_note_direct_detour(DiagnosticApi api) noexcept;

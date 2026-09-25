@@ -99,6 +99,11 @@ foreach(mode accept reject)
     add_test(NAME CheekyCoreDiscovery-${mode} COMMAND CheekyCoreDiscoveryTests ${mode}
         $<TARGET_FILE:CheekyFoveatedDLSSRuntime> $<TARGET_FILE:CheekyFakeCore> $<TARGET_FILE:CheekyFakeCoreProxy>)
 endforeach()
+if(TARGET CheekyFakeNGX)
+    add_dependencies(CheekyCoreDiscoveryTests CheekyFakeNGX)
+    add_test(NAME CheekyD3D11OtaDiscovery COMMAND CheekyCoreDiscoveryTests dx11-ota
+        $<TARGET_FILE:CheekyFoveatedDLSSRuntime> $<TARGET_FILE:CheekyFakeNGX> unused)
+endif()
 add_dependencies(CheekyBootstrapTests CheekyStandaloneProxy CheekyOptiScaler CheekyBootstrapFakeHost)
 foreach(mode proxy asi missing)
     add_test(NAME CheekyBootstrap-${mode} COMMAND CheekyBootstrapTests ${mode}
@@ -111,6 +116,8 @@ add_test(NAME CheekyRuntimeOptiScaler-DX11 COMMAND CheekyRuntimeHostTests --opti
 add_test(NAME CheekyRuntimeOwnership COMMAND CheekyRuntimeHostTests --conflict)
 
 if(CHEEKY_BUILD_UEVR)
+    add_test(NAME CheekyRuntimeTransport-Ota COMMAND CheekyRuntimeHostTests --transport-ota)
+    add_test(NAME CheekyRuntimeTransport-OtaOnly COMMAND CheekyRuntimeHostTests --transport-ota-only)
     add_dependencies(CheekyRuntimeHostTests CheekyFakeNGX CheekyFakeOpenVR)
     add_test(NAME CheekyRuntimeStandalone-Transport COMMAND CheekyRuntimeHostTests --transport)
     add_test(NAME CheekyRuntimeStandalone-TransportInitFailure COMMAND CheekyRuntimeHostTests --transport-init-failure)

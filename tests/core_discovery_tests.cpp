@@ -51,11 +51,105 @@ struct Calls {
         require(ngx_succeeded(release(handle)), "cached core ReleaseFeature");
     }
 };
+unsigned dx11_evaluations(const std::string& text) {
+    const auto pos = text.find("\"evaluations\":", text.find("\"apis\":["));
+    require(pos != text.npos, "DX11 evaluations field");
+    return static_cast<unsigned>(std::stoul(text.substr(pos + 14)));
+}
+struct Calls11 {
+    using Create = NgxResult(*)(ID3D11DeviceContext*, unsigned, NgxParameters*, NgxHandle**);
+    using Evaluate = NgxResult(*)(ID3D11DeviceContext*, const NgxHandle*, const NgxParameters*, NgxProgressCallback);
+    using EvaluateC = NgxResult(*)(ID3D11DeviceContext*, const NgxHandle*, const NgxParameters*, NgxProgressCallbackC);
+    using Release = NgxResult(*)(NgxHandle*);
+    using Counter = unsigned(*)();
+    Create create; Evaluate evaluate; EvaluateC evaluate_c; Release release;
+    Counter creates, evaluates, releases;
+    explicit Calls11(HMODULE module) :
+        create(proc<Create>(module, "NVSDK_NGX_D3D11_CreateFeature")),
+        evaluate(proc<Evaluate>(module, "NVSDK_NGX_D3D11_EvaluateFeature")),
+        evaluate_c(proc<EvaluateC>(module, "NVSDK_NGX_D3D11_EvaluateFeature_C")),
+        release(proc<Release>(module, "NVSDK_NGX_D3D11_ReleaseFeature")),
+        creates(proc<Counter>(module, "CheekyFakeCreates")),
+        evaluates(proc<Counter>(module, "CheekyFakeEvaluates")),
+        releases(proc<Counter>(module, "CheekyFakeReleases")) {}
+    void run(bool c = false) const {
+        const auto before_create = creates(), before_eval = evaluates(), before_release = releases();
+        MockNgxParameters params;
+        params.Set("Width", 128U); params.Set("Height", 128U);
+        params.Set("OutWidth", 256U); params.Set("OutHeight", 256U);
+        NgxHandle* handle{};
+        require(ngx_succeeded(create(nullptr, 1, &params, &handle)), "DX11 runtime create");
+        require(ngx_succeeded(c ? evaluate_c(nullptr, handle, &params, nullptr) :
+            evaluate(nullptr, handle, &params, nullptr)), "DX11 runtime evaluate");
+        require(ngx_succeeded(release(handle)), "DX11 runtime release");
+        require(creates() == before_create + 1 && evaluates() == before_eval + 1 &&
+            releases() == before_release + 1, "DX11 callbacks must stay with their owning module");
+    }
+};
+void test_dx11_ota(const wchar_t* runtime_path, const wchar_t* fixture_path) {
+    const auto directory = fs::absolute(fs::path(runtime_path)).parent_path() /
+        (L"dx11-ota-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    fs::create_directories(directory);
+    std::ofstream(directory / "settings.ini") << "[CheekyFoveatedDLSS]\nEnabled=0\n";
+    const auto load = [&](const fs::path& relative) {
+        const auto path = directory / relative;
+        fs::create_directories(path.parent_path()); fs::copy_file(fixture_path, path);
+        const auto module = LoadLibraryW(path.c_str()); require(module != nullptr, "load DX11 fixture"); return module;
+    };
+    const auto named = load(L"nvngx_dlss.dll");
+    const Calls11 named_calls(named); // Cached before interception starts.
+    const auto runtime = LoadLibraryW(runtime_path); require(runtime != nullptr, "load runtime");
+    const auto start = proc<CheekyRuntimeStartFn>(runtime, "CheekyRuntime_Start");
+    const auto get = proc<CheekyRuntimeSnapshotFn>(runtime, "CheekyRuntime_Snapshot");
+    const auto detach = proc<CheekyRuntimeDetachFn>(runtime, "CheekyRuntime_Detach");
+    const auto directory_text = directory.wstring(); std::uint64_t attachment{};
+    CheekyRuntimeStart input; input.config_directory = directory_text.c_str(); input.renderer = 0;
+    input.host = CheekyRuntimeHost::standalone; input.attachment = &attachment;
+    require(start(&input), "start DX11 OTA discovery runtime");
+    const auto wait_hook = [&](const std::string& marker) {
+        for (unsigned i = 0; i < 400; ++i) {
+            std::ifstream log(directory / "CheekyFoveatedDLSS-Standalone.log");
+            const std::string text((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+            const auto found = text.rfind(marker);
+            if (found != text.npos && text.find("Direct detour installed export=NVSDK_NGX_D3D11_ReleaseFeature", found) != text.npos) return;
+            Sleep(25);
+        }
+        throw std::runtime_error("DX11 runtime detours were not installed");
+    };
+    wait_hook("NGX runtime");
+    named_calls.run(); require(dx11_evaluations(snapshot(get)) == 1, "named DLL intercepted");
+    // Reproduce the real reports: the named DLL is already hooked when OTA loads.
+    const auto ota = load(L"NVIDIA/NGX/models/dlss/versions/20318464/files/160_E658700.bin");
+    const Calls11 ota_calls(ota);
+    wait_hook("DX11 OTA runtime discovered slot=1");
+    ota_calls.run(); ota_calls.run(true); named_calls.run();
+    require(dx11_evaluations(snapshot(get)) == 4, "late OTA native/C and named routes all intercepted");
+    const auto ota2 = load(L"NVIDIA/NGX/models/dlss/versions/20318465/files/160_E658700.bin");
+    const Calls11 ota2_calls(ota2);
+    wait_hook("DX11 OTA runtime discovered slot=2");
+    ota2_calls.run(); ota_calls.run(); named_calls.run(true);
+    require(dx11_evaluations(snapshot(get)) == 7, "second OTA module does not replace first owner's callbacks");
+    const auto decoy = load(L"NVIDIA/NGX/models/dlssd/versions/20318464/files/160_E658700.bin");
+    const Calls11 decoy_calls(decoy);
+    Sleep(1000); decoy_calls.run();
+    require(dx11_evaluations(snapshot(get)) == 7, "RR cache must not be treated as DX11 SR");
+    // Forwarding through another intercepted runtime counts/processes once.
+    proc<void(*)(HMODULE)>(named, "CheekyFakeForwardDX11To")(ota);
+    named_calls.run(); named_calls.run(true);
+    require(dx11_evaluations(snapshot(get)) == 9, "nested native/C evaluation must not be double processed");
+    require(snapshot(get).find("Active (NVIDIA cached runtime)") != std::string::npos, "Forwarded OTA use is reported as active");
+    detach(attachment);
+    std::puts("PASS: DX11 late OTA modules, independent callbacks, native/C ABI, SR-only discovery and nested forwarding");
+}
+
 }
 
 int wmain(int argc, wchar_t** argv) {
     try {
         require(argc == 5, "Usage: core-tests accept|reject <runtime.dll> <nvidia-metadata-fixture.dll> <proxy-metadata-fixture.dll>");
+        if (std::wstring(argv[1]) == L"dx11-ota") {
+            test_dx11_ota(argv[2], argv[3]); return 0;
+        }
         const bool reject = std::wstring(argv[1]) == L"reject";
         wchar_t path[32768]{};
         require(GetModuleFileNameW(nullptr, path, ARRAYSIZE(path)) != 0, "executable path");

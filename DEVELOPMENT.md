@@ -88,3 +88,17 @@ transport, ownership conflicts, settings atomicity and support ZIPs. The overlay
 suite reads GPU pixels for SDR, scRGB and HDR10 on both APIs. Its test-only focus
 adapter substitutes desktop foreground state in headless CI; real game input
 and multi-overlay interaction still require manual testing.
+
+DX11 OTA regression coverage includes cached SR runtimes loaded after the game's
+DLL, separate callback ownership across multiple runtimes, native and `_C`
+evaluation exports, and nested forwarding without duplicate processing. Run
+`CheekyCoreDiscoveryTests dx11-ota <runtime.dll> <fake-ngx.dll> unused` for discovery
+and `CheekyUEVRTests --late-dx11 --ota-runtime` (also `--late-dx11-c`) for GPU-backed
+private-feature reuse and release/recreation. These use synthetic runtimes;
+BG3 DX11 with Luke Ross and NVIDIA App override was also verified in-game: cached SR transport active, with 3,422 NR evaluations and zero NR failures.
+
+`CheekyRuntimeHostTests --transport-ota` checks late cached-runtime selection
+for private DX12 SR/NR while the named DLL rejects DX12 evaluations.
+`--transport-ota-only` covers a cached snippet without a loaded named SR DLL,
+using explicit game feature paths. The General-tab status distinguishes cache
+discovery from observed evaluation through the cached runtime.
