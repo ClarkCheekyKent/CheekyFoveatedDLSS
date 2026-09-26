@@ -2397,7 +2397,8 @@ int main(int argc, char** argv) {
         return failures ? 1 : 0;
     }
     extern int run_retained_calibration_tests();
-    extern int run_calibration_modes_tests();
+    extern int run_calibration_modes_tests(bool incomplete_only = false);
+    if (argc == 2 && std::strcmp(argv[1], "--calibration-incomplete") == 0) return run_calibration_modes_tests(true);
     if (argc == 2 && std::strcmp(argv[1], "--calibration-modes") == 0) return run_calibration_modes_tests();
     if (argc == 2 && std::strcmp(argv[1], "--retained-calibration") == 0) return run_retained_calibration_tests();
     if (argc == 2 && std::strcmp(argv[1], "--debug-exposure") == 0) return run_debug_exposure_tests();

@@ -11,7 +11,8 @@ inline const char* eye_calibration_method_name(EyeCalibrationMethod method) {
     default: return "Auto";
     }
 }
-// Counts completed usable observations, never pending GPU work or missing eyes.
+// Counts completed acquisition failures, never pending GPU work. Incomplete
+// submitted pairs may advance Auto, but never authorize a mapping.
 struct EyeCalibrationPolicy {
     EyeCalibrationMethod configured{}, active{EyeCalibrationMethod::standard};
     unsigned failures{}, confirmations{};
@@ -31,6 +32,16 @@ struct EyeCalibrationPolicy {
         // Give the new scene a fresh discovery budget, just like a manual reset.
         begin(configured, now);
         signature_checked = true;
+    }
+    bool incomplete(std::uint64_t now, unsigned rejection, bool inconclusive) {
+        // The capture has retired: these are missing/failed eye submissions or
+        // missing submitted patches, possibly with dimension/marker failures.
+        // Invalid GPU readback, missing source evaluations, and failed source
+        // stamp proof remain excluded from this acquisition evidence.
+        constexpr unsigned missing_submission = 4U | 8U | 16U;
+        constexpr unsigned allowed = missing_submission | 64U | 128U;
+        if (!(rejection & missing_submission) || (rejection & ~allowed)) return false;
+        return failed(now, inconclusive);
     }
     bool failed(std::uint64_t now, bool inconclusive) {
         confirmations = 0;

@@ -501,3 +501,9 @@ shared mono output, cropped locator-grid acquisition, retained unstamped
 frames, missing submitted markers, and reset without submission. The test
 uses CPU transfer to emulate the host bridge; actual R.E.A.L. VR interop and
 headset alignment still require an in-game check.
+
+`CheekyTests.exe --calibration-incomplete` reproduces completed corner captures
+with two source proofs but only one submitted eye. It checks that Auto reaches
+full crop search and can then acquire a complete pair, while incomplete pairs
+never publish a mapping and manually selected corners never escalate. This
+changes failure accounting only; it does not defer or combine eye captures.

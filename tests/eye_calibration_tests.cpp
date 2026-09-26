@@ -810,7 +810,7 @@ int run_eye_calibration_tests() {
 }
 
 
-int run_calibration_modes_tests() {
+int run_calibration_modes_tests(bool incomplete_only) {
     try {
         require(!Settings{}.eye_calibration_continuous, "Default calibration must be one-shot");
         EyeCalibrationPolicy policy;
@@ -835,6 +835,16 @@ int run_calibration_modes_tests() {
             for (unsigned i=0; i<30; ++i) require(!policy.failed(10000+i, false), "Manual overrides must never escalate");
             policy.recover(20000); require(policy.active == method, "Recovery must respect manual override");
         }
+        policy.begin(EyeCalibrationMethod::automatic, 100);
+        for (unsigned mask : {0U, 1U, 2U, 32U, 128U, 0x9DU, 0x9EU, 0xBCU})
+            require(!policy.incomplete(6000, mask, false) && policy.failures == 0,
+                "Only completed incomplete submissions with valid source proof count");
+        require(!policy.incomplete(6000, 0x9CU, false), "One incomplete sample must not escalate");
+        require(policy.incomplete(6010, 0xDCU, false) && policy.active == EyeCalibrationMethod::full,
+            "Persistent incomplete pairs must honor Auto's five-second budget");
+        policy.begin(EyeCalibrationMethod::automatic, 100);
+        for (unsigned i=0;i<30;++i) require(!policy.incomplete(6000+i,0x9C,true) && policy.failures==0,
+            "Motion-inconclusive incomplete pairs must not escalate");
         // Exercise actual GPU stamping/readback, persistence evidence and one-shot quiescence.
         set_eye_calibration_learning(0, 0, 0);
         ComPtr<ID3D11Device> device; ComPtr<ID3D11DeviceContext> context;
@@ -845,7 +855,7 @@ int run_calibration_modes_tests() {
         D3D11_TEXTURE2D_DESC desc{width,height,1,1,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,0,0,0};
         std::array<ComPtr<ID3D11Texture2D>,2> sources, targets;
         for (auto& source : sources) check(device->CreateTexture2D(&desc,nullptr,&source));
-        auto run = [&](bool cropped, EyeCalibrationMethod method, bool expect_success, bool expect_wide, unsigned recovery = 0) {
+        auto run = [&](bool cropped, EyeCalibrationMethod method, bool expect_success, bool expect_wide, unsigned recovery = 0, bool incomplete_corners = false) {
             eye_calibration_stop(); eye_calibration_reset_stats();
             register_stereo_view(8101); register_stereo_view(8102);
             auto settings = configured_settings(); settings.eye_calibration_method=method;
@@ -864,11 +874,15 @@ int run_calibration_modes_tests() {
                     context->CopySubresourceRegion(targets[c].Get(),0,0,0,0,sources[c].Get(),0,&box);
                     if (hide_markers) context->UpdateSubresource(targets[c].Get(),0,nullptr,background.data(),width*4,0);
                 }
+                const bool incomplete = incomplete_corners && eye_calibration_stats().active_method != EyeCalibrationMethod::full;
                 for (unsigned eye=0;eye<2;++eye) {
+                    if (incomplete && eye == 1) continue;
                     const auto ticket=eye_calibration_submit(targets[1-eye].Get(),eye,0,0,1,1);
                     if(ticket) eye_calibration_result(ticket,0);
                 }
                 context->Flush(); Sleep(10); eye_calibration_tick();
+                if (incomplete) require(!eye_calibration_stats().valid,
+                    "Incomplete corner pairs must never authorize a mapping");
             };
             const auto deadline=GetTickCount64()+(expect_success ? 15000 : 3000);
             unsigned frames{}, first_wide_frame{};
@@ -907,6 +921,15 @@ int run_calibration_modes_tests() {
             eye_calibration_stop(); unregister_stereo_view(8101); unregister_stereo_view(8102);
             return std::pair{stats, first_wide_frame};
         };
+        if (incomplete_only) {
+            // Reproduce the report's completed captures: both sources, one eye,
+            // clipped corner markers. Full-search samples supply a valid pair.
+            run(true,EyeCalibrationMethod::automatic,true,true,0,true);
+            set_eye_calibration_learning(0,0,0);
+            run(true,EyeCalibrationMethod::standard,false,false,0,true);
+            std::cout << "PASS: incomplete corner pairs escalate in Auto, never publish, and respect manual selection\n";
+            return 0;
+        }
         run(false,EyeCalibrationMethod::automatic,true,false);
         auto learned=configured_settings();
         require(learned.eye_calibration_learned_method==1 && learned.eye_calibration_learned_signature,"Ordinary calibration must learn standard route");

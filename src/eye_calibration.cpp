@@ -1040,6 +1040,12 @@ void poll(State& s) {
             (failed_wide_search || GetTickCount64() - f.captured_ms < (f.wide_search ? 10000U : 1000U))) {
             placement_epoch(s);
             s.placement_sequence = f.sequence;
+            // A finished but incomplete corner capture must not stall Auto
+            // forever. Only acquisition advances; publication still requires
+            // the unchanged complete-pair checks below.
+            if (!f.wide_search && !s.placements[0].locked && !s.placements[1].locked &&
+                s.policy.incomplete(GetTickCount64(), rejection, f.motion_unreliable))
+                s.frames_until_capture = 0;
             if (!rejection) {
                 if (f.wide_search && acquired) ++s.stats.full_calibration_successes;
                 if (!acquired) for (unsigned physical=0;physical<2;++physical) {

@@ -72,6 +72,8 @@ foreach ($proxy in @('reshade','streamline')) {
 }
 
 $testExecutable = Join-Path $projectRoot "bin\$Configuration\CheekyTests.exe"
+& $testExecutable --calibration-incomplete
+if ($LASTEXITCODE -ne 0) { throw "Incomplete corner calibration escalation test failed." }
 & $testExecutable --rr-contract
 if ($LASTEXITCODE -ne 0) { throw "RR contract tests failed." }
 & $testExecutable
