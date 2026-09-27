@@ -101,11 +101,6 @@ action active**, **Tracking valid**, and **Using gaze**, along with stable, dist
 DLSS-view mappings for both eyes. **Eye gaze extension: Yes** alone does not mean
 the headset supplies eye tracking.
 
-**Varjo headsets in SteamVR (OpenVR games):** Varjo's SteamVR driver does not pass
-eye tracking to SteamVR, so the add-on reads gaze directly from the running Varjo
-Base runtime (its installed `VarjoLib.dll`). Eye tracking must be allowed in Varjo
-Base. The diagnostics runtime name then ends in **+ Varjo gaze**.
-
 Valid gaze sets both eye centers directly; it needs no manual stereo X offset.
 SR and foveated NR share gaze and automatic alignment. NR continues tracking with
 SR foveation disabled; **Use DLSS-SR size and shape** only links region settings.
