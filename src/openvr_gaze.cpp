@@ -3,6 +3,7 @@
 #include "openvr_gaze_math.hpp"
 #include "openvr_menu.hpp"
 #include "openvr_vtable_hook.hpp"
+#include "varjo_gaze.hpp"
 #include "gaze_math.hpp"
 #include "diagnostics.hpp"
 #include "runtime.hpp"
@@ -50,6 +51,12 @@ thread_local unsigned wait_depth{};
 thread_local unsigned submit_depth{};
 std::uint32_t pattern{};
 bool simulate{};
+std::atomic<bool> runtime_gaze_wanted{};
+// Periodic gaze-source counts while runtime gaze is selected; state_mutex.
+struct GazeSourceSummary {
+    unsigned frames{}, steamvr_valid{}, varjo_session{}, varjo_valid{};
+    ULONGLONG next{};
+} gaze_summary;
 struct Submitted {
     ComPtr<IUnknown> identity;
     CheekyGazeViewV1 view{};
@@ -108,11 +115,27 @@ void observe_frame(bool focused) {
     const char* runtime=system->GetRuntimeVersion();
     sprintf_s(snapshot.runtime_name,"SteamVR / OpenVR %s",runtime ? runtime : "");
     vr::HmdVector2_t ndc[2]{};
-    bool valid=!simulate && system->GetEyeTrackedFoveationCenter(&ndc[0],&ndc[1]);
-    vr::ETrackedPropertyError property_error{};
-    if (valid || system->GetBoolTrackedDeviceProperty(0,vr::Prop_SupportsXrEyeGazeInteraction_Bool,&property_error))
-        snapshot.status_flags|=CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED;
     float ray[3]{0,0,-1}, next_ray[3]{};
+    bool valid=!simulate && system->GetEyeTrackedFoveationCenter(&ndc[0],&ndc[1]);
+    const bool steamvr_valid=valid;
+    // Varjo's SteamVR driver never forwards gaze; read the Varjo runtime directly.
+    bool varjo_session{};
+    const bool varjo=!simulate && !valid && read_varjo_gaze(ray,varjo_session);
+    valid=valid || varjo;
+    if (varjo_session)
+        sprintf_s(snapshot.runtime_name,"SteamVR / OpenVR %s + Varjo gaze",runtime ? runtime : "");
+    vr::ETrackedPropertyError property_error{};
+    if (valid || varjo_session || system->GetBoolTrackedDeviceProperty(0,vr::Prop_SupportsXrEyeGazeInteraction_Bool,&property_error))
+        snapshot.status_flags|=CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED;
+    if (!simulate && runtime_gaze_wanted.load()) {
+        auto& s=gaze_summary;
+        ++s.frames; s.steamvr_valid+=steamvr_valid; s.varjo_session+=varjo_session; s.varjo_valid+=varjo;
+        if (now>=s.next) {
+            if (s.next) trace_event("OpenVR gaze sources frames=%u steamvr_valid=%u varjo_session=%u varjo_valid=%u focused=%d",
+                s.frames,s.steamvr_valid,s.varjo_session,s.varjo_valid,focused ? 1 : 0);
+            s={}; s.next=now+10000;
+        }
+    }
     bool next_valid=false;
     if (simulate) {
         snapshot.status_flags|=CHEEKY_GAZE_STATUS_SIMULATED;
@@ -148,7 +171,7 @@ void observe_frame(bool focused) {
             view.fov_left=std::atan(left); view.fov_right=std::atan(right);
             view.fov_up=-std::atan(top); view.fov_down=-std::atan(bottom);
         } else valid=false;
-        const bool projected=simulate
+        const bool projected=simulate || varjo
             ? openvr_project_direction(transform.m,left,right,top,bottom,ray,view.center_u,view.center_v)
             : openvr_ndc_center(ndc[eye].v[0],ndc[eye].v[1],view.center_u,view.center_v);
         valid=valid && projected;
@@ -379,16 +402,17 @@ void* interface_hook(const char* version,vr::EVRInitError* error) {
 }
 }
 void enable_openvr_late_recovery(bool enabled) noexcept { late_recovery_enabled.store(enabled, std::memory_order_release); }
-void poll_openvr_hooks() noexcept {
-    if (stopping.load()) return;
+namespace {
+// Returns whether the application has loaded OpenVR.
+bool poll_compositor_hooks() noexcept {
     std::lock_guard lock(hook_mutex);
-    if (stopping.load()) return;
+    if (stopping.load()) return false;
     if (!api_module) {
-        if (!GetModuleHandleExW(0,L"openvr_api.dll",&api_module)) return;
+        if (!GetModuleHandleExW(0,L"openvr_api.dll",&api_module)) return false;
     }
     if (!original_shutdown) {
         auto* target=reinterpret_cast<void*>(GetProcAddress(api_module,"VR_ShutdownInternal"));
-        if (!target || !install(target,reinterpret_cast<void*>(&shutdown_hook),reinterpret_cast<void**>(&original_shutdown))) return;
+        if (!target || !install(target,reinterpret_cast<void*>(&shutdown_hook),reinterpret_cast<void**>(&original_shutdown))) return false;
     }
     if (!get_interface) {
         auto* target=reinterpret_cast<void*>(GetProcAddress(api_module,"VR_GetGenericInterface"));
@@ -399,6 +423,13 @@ void poll_openvr_hooks() noexcept {
     // Native hosts may recover a cached compositor only without that conflict.
     try { recover_cached_compositors(); }
     catch (...) { log_warning("OpenVR cached-interface recovery failed; waiting for an application request"); }
+    return true;
+}
+}
+void poll_openvr_hooks() noexcept {
+    if (stopping.load()) return;
+    // Outside hook_mutex: opening a Varjo session performs runtime IPC.
+    if (poll_compositor_hooks()) poll_varjo_gaze(runtime_gaze_wanted.load());
 }
 bool attach_openvr_compositor(void* compositor) noexcept {
     if (!compositor || stopping.load()) return false;
@@ -422,6 +453,7 @@ bool attach_openvr_compositor(void* compositor) noexcept {
 }
 void stop_openvr_hooks() noexcept {
     stopping.store(true);
+    stop_varjo_gaze();
     eye_calibration_stop();
     std::lock_guard hooks_lock(hook_mutex);
     for (auto it=vtable_hooks.rbegin();it!=vtable_hooks.rend();++it) it->restore();
@@ -435,6 +467,7 @@ void stop_openvr_hooks() noexcept {
 bool read_openvr_gaze(const Settings& settings,IUnknown* resource,CheekyGazeSnapshotV1& output,std::uint64_t native_identity) noexcept {
     std::lock_guard lock(state_mutex);
     const bool next_simulate=settings.center_mode==FoveationCenterMode::simulated_gaze;
+    runtime_gaze_wanted.store(settings.center_mode==FoveationCenterMode::openxr_gaze);
     if (next_simulate!=simulate || pattern!=settings.simulation_pattern) simulation_start=0;
     simulate=next_simulate; pattern=settings.simulation_pattern;
     if (snapshot.abi_version!=CHEEKY_GAZE_ABI_VERSION) return false;
