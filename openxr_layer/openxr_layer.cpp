@@ -214,6 +214,9 @@ struct SessionState {
     XrTime menu_recenter_time{};
     bool fallback_setup_attempted{};
     XrTime last_fallback_sync_time{};
+    // Successful EndFrame count. A host that renders stereo frames without ever
+    // touching the action system may receive our standalone gaze attachment.
+    unsigned rendered_frames{};
     CheekyGazeInputDiagnosticsV1 input{
         CHEEKY_GAZE_INPUT_DIAGNOSTICS_VERSION, sizeof(CheekyGazeInputDiagnosticsV1), 0,
         0, 0, 0, 0, 0, 0, 0, 0,
@@ -1377,19 +1380,71 @@ bool realvr_present() noexcept {
     return detected;
 }
 
+// Space creation for the gaze action must follow its action set attachment:
+// strict runtimes reject it earlier and leave the handle null, which disables
+// gaze for the whole session. Both attach routes call this afterwards.
+void create_post_attach_spaces_locked(
+    InstanceState& instance, SessionState& state
+) noexcept {
+    const auto& d = instance.dispatch;
+    if (d.create_action_space == nullptr) return;
+    if (state.gaze_space == XR_NULL_HANDLE && state.system_supported &&
+        instance.gaze_action != XR_NULL_HANDLE) {
+        XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        space_info.action = instance.gaze_action;
+        space_info.poseInActionSpace.orientation.w = 1.0F;
+        state.input.space_result = d.create_action_space(
+            state.session, &space_info, &state.gaze_space);
+    }
+    if (instance.menu_aim_action == XR_NULL_HANDLE) return;
+    for (std::size_t hand{}; hand < state.menu_aim_spaces.size(); ++hand) {
+        if (state.menu_aim_spaces[hand] != XR_NULL_HANDLE) continue;
+        XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        space_info.action = instance.menu_aim_action;
+        space_info.subactionPath = instance.menu_hand_paths[hand];
+        space_info.poseInActionSpace.orientation.w = 1.F;
+        static_cast<void>(d.create_action_space(
+            state.session, &space_info, &state.menu_aim_spaces[hand]));
+    }
+}
+
+// Frames a host must present before the standalone gaze attachment may assume
+// it drives no input of its own. A game that uses OpenXR input creates and
+// attaches its action sets during startup, well before this many frames.
+constexpr unsigned standalone_gaze_frame_delay = 90U;
+
+// The standalone fallback exists for hosts that drive no OpenXR input at all:
+// an identified RealVR bridge (nobody owns its menu and gaze actions) or an
+// ordinary application that presents stereo frames through this layer yet
+// never creates, attaches or synchronizes a single action set. Every host that
+// touches the action system keeps full control of its own input.
+[[nodiscard]] bool standalone_gaze_allowed_locked(
+    const InstanceState& instance, const SessionState& state
+) noexcept {
+    if (state.input.realvr_detected) return true;
+    if (instance.host_action_sets_created || state.input.host_attach_calls ||
+        state.input.host_sync_calls) return false;
+    return state.rendered_frames >= standalone_gaze_frame_delay;
+}
+
 // Called under state_mutex before reading gaze, once per distinct display time.
 // Once a host has synchronized input, it owns synchronization for that session:
 // an extra gaze-only sync could deactivate controllers or consume input changes.
 void poll_realvr_gaze_locked(InstanceState& instance, SessionState& state, XrTime time) {
     state.input.realvr_detected = realvr_present();
-    if (!state.input.realvr_detected || !state.running ||
-        state.state != XR_SESSION_STATE_FOCUSED ||
+    if (!state.running || state.state != XR_SESSION_STATE_FOCUSED ||
         state.input.host_sync_calls || time <= 0) return;
-    const bool gaze_available = state.system_supported && instance.gaze_action != XR_NULL_HANDLE &&
-        state.gaze_space != XR_NULL_HANDLE;
-    const bool menu_available = instance.menu_graphics_enabled && instance.menu_action_set != XR_NULL_HANDLE &&
+    if (!standalone_gaze_allowed_locked(instance, state)) return;
+    // Gaze capability must not require an existing action space: a strict
+    // runtime rejects xrCreateActionSpace before attach, so the space can only
+    // be created after the standalone attachment below.
+    const bool gaze_capable = state.system_supported && instance.gaze_action != XR_NULL_HANDLE;
+    // Controller bindings stay reserved for identified RealVR bridges: the
+    // fallback must never add controller actions to an ordinary application.
+    const bool menu_available = state.input.realvr_detected &&
+        instance.menu_graphics_enabled && instance.menu_action_set != XR_NULL_HANDLE &&
         instance.menu_aim_action != XR_NULL_HANDLE && instance.menu_click_action != XR_NULL_HANDLE;
-    if (!gaze_available && !menu_available) return;
+    if (!gaze_capable && !menu_available) return;
     const auto& d = instance.dispatch;
     if (!state.action_attached) {
         // Attachment is irreversible for this session. Leave hosts that created
@@ -1397,11 +1452,12 @@ void poll_realvr_gaze_locked(InstanceState& instance, SessionState& state, XrTim
         if (instance.host_action_sets_created || state.input.host_attach_calls ||
             state.fallback_setup_attempted || !d.attach_action_sets) return;
         state.fallback_setup_attempted = true;
-        if (gaze_available) static_cast<void>(ensure_gaze_binding_locked(instance));
+        // An unanswerable binding must not produce a useless attachment.
+        if (gaze_capable && XR_FAILED(ensure_gaze_binding_locked(instance))) return;
         if (menu_available) ensure_menu_bindings(instance);
         std::array<XrActionSet, 2> sets{};
         unsigned count{};
-        if (gaze_available && instance.gaze_binding_submitted) sets[count++] = instance.action_set;
+        if (gaze_capable && instance.gaze_binding_submitted) sets[count++] = instance.action_set;
         if (menu_available) sets[count++] = instance.menu_action_set;
         if (!count) return;
         XrSessionActionSetsAttachInfo info{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
@@ -1410,15 +1466,21 @@ void poll_realvr_gaze_locked(InstanceState& instance, SessionState& state, XrTim
         ++state.input.fallback_attach_calls;
         state.input.attach_result = d.attach_action_sets(state.session, &info);
         state.action_attached = XR_SUCCEEDED(state.input.attach_result);
+        if (state.action_attached) create_post_attach_spaces_locked(instance, state);
         if (menu_available) report_menu_diagnostic(state.action_attached ?
             "OpenXR menu: RealVR controller actions attached" : "OpenXR menu: RealVR controller action attachment failed");
     }
+    // The attachment above may have created the space; recompute readiness. With
+    // no usable set (failed binding, attach or space) there is nothing to sync.
+    const bool gaze_ready = gaze_capable && state.gaze_space != XR_NULL_HANDLE &&
+        instance.gaze_binding_submitted;
     if (!state.action_attached || !d.sync_actions || state.last_fallback_sync_time == time) return;
     state.last_fallback_sync_time = time;
     std::array<XrActiveActionSet, 2> active{};
     unsigned count{};
-    if (gaze_available && instance.gaze_binding_submitted) active[count++] = {instance.action_set, XR_NULL_PATH};
+    if (gaze_ready) active[count++] = {instance.action_set, XR_NULL_PATH};
     if (menu_available) active[count++] = {instance.menu_action_set, XR_NULL_PATH};
+    if (!count) return;
     XrActionsSyncInfo info{XR_TYPE_ACTIONS_SYNC_INFO};
     info.countActiveActionSets = count;
     info.activeActionSets = active.data();
@@ -1933,33 +1995,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
                 gaze_properties.supportsEyeGazeInteraction == XR_TRUE;
         }
     }
-    if (session_state.system_supported &&
-        instance_state->gaze_action != XR_NULL_HANDLE &&
-        instance_state->dispatch.create_action_space != nullptr) {
-        XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
-        space_info.action = instance_state->gaze_action;
-        space_info.poseInActionSpace.orientation.w = 1.0F;
-        session_state.input.space_result = instance_state->dispatch.create_action_space(
-            *session, &space_info, &session_state.gaze_space
-        );
-    }
+    // Action spaces must be created only after their action set is attached.
+    // VDXR rejects xrCreateActionSpace before xrAttachSessionActionSets and
+    // leaves the handle null, which silently disables gaze in xrLocateViews
+    // for the whole session. The gaze and menu aim spaces are created by
+    // create_post_attach_spaces_locked from the two attach routes instead.
     if (session_state.graphics_api == 11 || session_state.graphics_api == 12) {
         std::lock_guard lock(state_mutex);
         const auto found = instances.find(instance);
         if (found != instances.end()) found->second.menu_graphics_enabled = true;
     }
-    if (instance_state->menu_aim_action != XR_NULL_HANDLE &&
-        instance_state->dispatch.create_action_space) {
-        for (std::size_t hand{}; hand < 2; ++hand) {
-            XrActionSpaceCreateInfo space_info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
-            space_info.action = instance_state->menu_aim_action;
-            space_info.subactionPath = instance_state->menu_hand_paths[hand];
-            space_info.poseInActionSpace.orientation.w = 1.F;
-            static_cast<void>(instance_state->dispatch.create_action_space(
-                *session, &space_info, &session_state.menu_aim_spaces[hand]));
-        }
-    }
-
     {
         std::lock_guard lock(state_mutex);
         sessions.emplace(*session, session_state);
@@ -2229,9 +2274,18 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
-            iterator->second.input.attach_result = result;
-            if (XR_SUCCEEDED(result)) iterator->second.action_attached = true;
-            publish_snapshot_locked(&iterator->second);
+            auto& state = iterator->second;
+            state.input.attach_result = result;
+            if (XR_SUCCEEDED(result)) {
+                state.action_attached = true;
+                // Our action sets were merged into this host attachment, so the
+                // gaze and menu aim spaces become legal only now. Without this
+                // a strict runtime leaves gaze_space null and gaze never routes
+                // for hosts that drive their own input.
+                auto* instance = find_instance_for_session_locked(session);
+                if (instance != nullptr) create_post_attach_spaces_locked(*instance, state);
+            }
+            publish_snapshot_locked(&state);
         }
     }
     return result;
@@ -2933,6 +2987,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
             auto& state = session_it->second;
+            ++state.rendered_frames;
             state.ambiguous_resource = selected.ambiguous;
             state.unsupported_view_configuration = selected.unsupported ||
                 state.view_configuration != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;

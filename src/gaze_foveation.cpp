@@ -603,6 +603,7 @@ bool calculate_coordinated_crop(
     std::uint32_t matched_index{UINT32_MAX};
     std::uint32_t match_count{};
     bool packed_stereo_match{};
+    bool layout_stereo_match{};
     bool copy_match{};
     bool projection_match{};
     const bool openvr_snapshot = (snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U;
@@ -731,6 +732,36 @@ bool calculate_coordinated_crop(
             packed_stereo_match = true;
         }
     }
+    // Two independent eye swapchains, each describing the complete output. An
+    // OpenVR/LibOVR bridge such as the Virtual Desktop runtime submits this way,
+    // and the XR image is never the resource DLSS evaluates, so identity and
+    // copy routes cannot resolve. A verified stereo role plus matching output
+    // extents on both eyes identifies the layout without any shared identity.
+    if (match_count == 0U && eye_assignment.assigned && snapshot.view_count == 2U) {
+        std::uint32_t layout_views{};
+        for (std::uint32_t index{}; index < 2U; ++index) {
+            const auto& view = snapshot.views[index];
+            if ((view.flags & CHEEKY_GAZE_VIEW_RESOURCE_VALID) == 0U) continue;
+            if (view.array_index != 0U) continue;
+            if (view.image_rect_x != static_cast<std::int32_t>(output_origin_x) ||
+                view.image_rect_y != static_cast<std::int32_t>(output_origin_y) ||
+                view.image_rect_width != output_width ||
+                view.image_rect_height != output_height) continue;
+            ++layout_views;
+        }
+        if (layout_views == 2U) {
+            const bool distinct_swapchains =
+                snapshot.views[0].swapchain_identity != snapshot.views[1].swapchain_identity;
+            const bool undisclosed_swapchains =
+                snapshot.views[0].swapchain_identity == 0U ||
+                snapshot.views[1].swapchain_identity == 0U;
+            if (distinct_swapchains || undisclosed_swapchains) {
+                matched_index = eye_assignment.eye_index;
+                match_count = 1U;
+                layout_stereo_match = true;
+            }
+        }
+    }
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
@@ -827,7 +858,7 @@ bool calculate_coordinated_crop(
             "VR gaze mapping established view=%llu eye=%u route=%s",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
-            marker_match ? "pixel-marker" : projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : "exact-resource"
+            marker_match ? "pixel-marker" : projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : layout_stereo_match ? "stereo-layout" : "exact-resource"
         );
     }
 
@@ -840,6 +871,7 @@ bool calculate_coordinated_crop(
             diagnostics.views[index].copy_mapping = false;
             diagnostics.views[index].projection_mapping = false;
             diagnostics.views[index].marker_mapping = false;
+            diagnostics.views[index].layout_mapping = false;
         }
     }
     if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
@@ -856,6 +888,7 @@ bool calculate_coordinated_crop(
         view_diagnostics.stable_matches = state.mapping.consecutive_matches;
         view_diagnostics.resource_mapped = mapping_result.stable;
         view_diagnostics.packed_stereo_mapping = packed_stereo_match;
+        view_diagnostics.layout_mapping = layout_stereo_match;
         view_diagnostics.copy_mapping = copy_match;
         view_diagnostics.projection_mapping = projection_match;
         view_diagnostics.marker_mapping = marker_match;

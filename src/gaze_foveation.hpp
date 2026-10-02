@@ -30,6 +30,7 @@ struct GazeViewDiagnostics {
     bool has_candidate{};
     bool resource_mapped{};
     bool packed_stereo_mapping{};
+    bool layout_mapping{};
     bool copy_mapping{};
     bool projection_mapping{};
     bool marker_mapping{};

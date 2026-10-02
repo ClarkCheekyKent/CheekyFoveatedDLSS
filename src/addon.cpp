@@ -719,7 +719,7 @@ void draw_openxr_gaze_diagnostics() {
                 label, "DLSS view 0x%llX (%u matches, %s)",
                 static_cast<unsigned long long>(view.dlss_view_id),
                 view.stable_matches,
-                view.marker_mapping ? "pixel marker" : view.projection_mapping ? "projection" : view.copy_mapping ? "copy" : view.packed_stereo_mapping ? "packed" : "exact"
+                view.marker_mapping ? "pixel marker" : view.projection_mapping ? "projection" : view.copy_mapping ? "copy" : view.packed_stereo_mapping ? "packed" : view.layout_mapping ? "stereo layout" : "exact"
             );
         } else {
             diagnostic_row(label, "Waiting (%u matches)", view.stable_matches);

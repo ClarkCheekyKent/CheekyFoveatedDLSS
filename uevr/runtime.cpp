@@ -159,6 +159,7 @@ std::string snapshot_locked(State& s) {
             << ",\"view_id\":\"" << v.dlss_view_id << "\",\"stable_matches\":" << v.stable_matches
             << ",\"delta_x\":" << v.crop_delta_x << ",\"delta_y\":" << v.crop_delta_y
             << ",\"mapped\":" << v.resource_mapped << ",\"packed\":" << v.packed_stereo_mapping
+            << ",\"layout\":" << v.layout_mapping
             << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping
             << ",\"marker\":" << v.marker_mapping
             << ",\"alignment\":" << v.alignment_source
