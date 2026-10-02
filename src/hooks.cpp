@@ -3262,6 +3262,9 @@ std::uint32_t hook_sl_set_constants(
             static_cast<const SlConstants*>(values)->camera_view_to_clip.values);
         if (result != 0U || static_cast<const SlConstants*>(values)->orthographic_projection != 0)
             projection = {};
+        if (current_settings().center_mode == FoveationCenterMode::openxr_gaze_right_eye &&
+            GetModuleHandleW(L"CyberpunkVR_Stereo.dll") && (id & 0x60000000U) == 0)
+            record_shared_gaze_projection(projection, id);
         const auto camera_frame_key = gaze_frame_key(frame);
         AcquireSRWLockExclusive(&streamline_lock);
         streamline_gaze_projections.record(id, camera_frame_key, GetTickCount64(), projection);

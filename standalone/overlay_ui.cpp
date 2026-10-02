@@ -13,8 +13,17 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+void report_openxr_menu_diagnostic(const char*) noexcept;
 namespace cheeky::standalone {
 using namespace cheeky::foveated_dlss;
+static void test_control(const char* label) {
+#ifdef CHEEKY_OVERLAY_TEST_DESKTOP
+    extern void overlay_test_control(const char*);
+    overlay_test_control(label);
+#else
+    (void)label;
+#endif
+}
 // Snapshot is emitted by our runtime. This reader only extracts a direct
 // member, respecting nesting and escaped strings so similarly named diagnostic
 // values cannot accidentally become settings.
@@ -88,6 +97,10 @@ bool command(OverlayUiState& r, const OverlayRuntime& runtime, std::string_view 
     if (!runtime.command || !runtime.attachment) return false;
     const auto text = "1\n" + std::to_string(++r.request) + "\n" + std::string(action) + "\n" + std::string(payload);
     const bool result = runtime.command(runtime.attachment, text.c_str());
+    std::string diagnostic = "Menu command v5: " + std::string(action) +
+        " accepted=" + (result ? "1" : "0") + " payload=" + std::string(payload);
+    std::replace(diagnostic.begin(), diagnostic.end(), '\n', ';');
+    report_openxr_menu_diagnostic(diagnostic.c_str());
     refresh(r, runtime, true);
     if (!result && r.message.empty()) r.message = "Runtime rejected the command";
     return result;
@@ -146,6 +159,7 @@ void rr_preset(const char* label, std::uint32_t& value) {
 }
 void draw_sr(Settings& s, bool rr) {
     ImGui::Checkbox("Enable foveated DLSS-SR", &s.enabled);
+    test_control("Enabled");
     ImGui::SeparatorText("Center quality");
     if (rr) { ImGui::TextUnformatted("Ray Reconstruction active"); rr_preset("Center RR preset",s.rr_center_preset); }
     else preset("Center preset", s.center_preset, true);
@@ -167,7 +181,9 @@ void draw_sr(Settings& s, bool rr) {
 }
 
 void draw_gaze(Settings& s) {
-    combo("Foveation center", s.center_mode, "Fixed\0Runtime gaze (OpenXR / OpenVR / LibOVR)\0Simulated gaze\0");
+    combo("Foveation center", s.center_mode, "Fixed\0Runtime gaze (OpenXR / OpenVR / LibOVR)\0Simulated gaze\0Shared right-eye gaze (Cyberpunk compatibility)\0");
+    if (s.center_mode == FoveationCenterMode::openxr_gaze_right_eye)
+        ImGui::TextWrapped("Uses right-eye gaze for BOTH render views, corrected into the game camera. Does not require eye-texture calibration. Eye-order inversion is not used. A fresh render projection is required.");
     ImGui::Checkbox("Automatic stereo alignment", &s.auto_stereo_alignment);
     if (s.center_mode == FoveationCenterMode::openxr_gaze)
         ImGui::TextWrapped("Runtime gaze needs the Cheeky OpenXR layer or a supported OpenVR runtime. Fixed placement is used when tracking is unavailable.");
@@ -285,7 +301,7 @@ double number(std::string_view object, const char* key) {
 bool flag(std::string_view object, const char* key) { return member(object, key) == "true"; }
 
 const char* gaze_warning(const Settings& s, std::string_view snapshot) {
-    if (s.center_mode != FoveationCenterMode::openxr_gaze ||
+    if ((s.center_mode != FoveationCenterMode::openxr_gaze && s.center_mode != FoveationCenterMode::openxr_gaze_right_eye) ||
         (!s.enabled && !(s.nr_enabled && s.nr_foveated))) return nullptr;
     const auto gaze = member(snapshot, "gaze");
     if (gaze.empty()) return "Waiting for eye-tracking diagnostics.";
@@ -296,6 +312,14 @@ const char* gaze_warning(const Settings& s, std::string_view snapshot) {
     if (flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) return "Eye tracking unavailable for this stereo layout. Using fixed placement.";
     if (!(flags & CHEEKY_GAZE_STATUS_SESSION_FOCUSED)) return "VR session is not focused. Using fixed fallback.";
     if (!(flags & CHEEKY_GAZE_STATUS_GAZE_VALID)) return "No valid eye-tracking signal. Using fixed fallback.";
+    if (s.center_mode == FoveationCenterMode::openxr_gaze_right_eye) {
+        if (!flag(gaze, "shared_projection")) return "Shared gaze: waiting for valid headset and game-camera projections.";
+        if (!flag(gaze, "shared_fresh")) return "Shared gaze: no fresh sample; holding briefly or returning to fixed placement.";
+        if (number(gaze, "shared_recent_views") < 2 ||
+            number(gaze, "shared_tracking_views") < number(gaze, "shared_recent_views"))
+            return "Shared gaze is not tracking BOTH render views. See per-view diagnostics.";
+        return nullptr;
+    }
     if (!flag(gaze, "using_gaze")) {
         if (flag(gaze, "ambiguous")) return "Eye mapping is ambiguous. Waiting for a reliable left/right eye assignment.";
         return "Waiting for a fresh eye-tracking sample or stable eye mapping.";
@@ -346,6 +370,9 @@ void draw_gaze_status(const Settings& s, std::string_view snapshot) {
         ImGui::TextUnformatted("Eye Tracking Ready: No");
         warning(reason);
     } else ImGui::TextUnformatted("Eye Tracking Ready: Yes");
+    if (s.center_mode == FoveationCenterMode::openxr_gaze_right_eye)
+        ImGui::TextWrapped("Shared gaze: %.0f / %.0f recent render views tracking (not calibrated eye mapping).",
+            number(gaze, "shared_tracking_views"), number(gaze, "shared_recent_views"));
     ImGui::TextWrapped("Latest alignment: %s", alignment_name(static_cast<unsigned>(number(gaze, "alignment"))));
     warning(alignment_warning(s, snapshot));
 }
@@ -359,6 +386,11 @@ void draw_gaze_details(std::string_view snapshot) {
         diagnostic_line(gaze, "Mapping ambiguity", "ambiguous");
         diagnostic_line(gaze, "Active stereo views", "views");
         diagnostic_line(gaze, "Sample age (ms)", "age_ms");
+        diagnostic_line(gaze, "Shared gaze mode", "shared_gaze");
+        diagnostic_line(gaze, "Shared gaze fresh", "shared_fresh");
+        diagnostic_line(gaze, "Shared render projection", "shared_projection");
+        diagnostic_line(gaze, "Latest shared DLSS view", "shared_view");
+        diagnostic_line(gaze, "Shared gaze evaluations", "shared_evaluations");
         const auto flags = static_cast<unsigned>(number(gaze, "status_flags"));
         for (const auto& item : {std::pair{"System supports eye tracking", CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED},
                  {"Session focused", CHEEKY_GAZE_STATUS_SESSION_FOCUSED},
@@ -689,7 +721,9 @@ template<class T> void raw_setting(const char* name, T& value) {
 }
 
 bool begin_tab(const char* label) {
-    if (!ImGui::BeginTabItem(label)) return false;
+    const bool selected = ImGui::BeginTabItem(label);
+    test_control(label);
+    if (!selected) return false;
     // Keep the header and tabs reachable while long pages scroll independently.
     ImGui::BeginChild(label, ImVec2(0, 0), ImGuiChildFlags_None);
     return true;
@@ -718,7 +752,11 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
             r.menu_key_error = save_menu_key(input, rebound) ? "" : "Could not save the menu key.";
         }
     }
-    ImGui::SetNextWindowSize(ImVec2(620, 650), ImGuiCond_FirstUseEver);
+    const float menu_scale = ImGui::GetIO().FontGlobalScale;
+    const auto display = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowSize(ImVec2((std::min)(620.F * menu_scale, display.x * .9F),
+        (std::min)(650.F * menu_scale, display.y * .9F)), ImGuiCond_Appearing);
+    ImGui::SetNextWindowPos(ImVec2(display.x * .5F, display.y * .5F), ImGuiCond_Appearing, ImVec2(.5F, .5F));
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 300), ImVec2(FLT_MAX, FLT_MAX));
     if (ImGui::Begin("Cheeky Foveated DLSS###CheekyStandalone", &open, ImGuiWindowFlags_NoCollapse)) {
         const auto key_name = menu_key_name(input.menu_key.load());
@@ -747,6 +785,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
                     ImGui::TextWrapped("Required for DLSS-NR in DX11 games.");
                     ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
+                    test_control("D3D12LowerHook");
                     ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");
                 }
                 ImGui::SeparatorText("Status");

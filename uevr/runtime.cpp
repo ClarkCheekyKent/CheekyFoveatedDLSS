@@ -145,6 +145,10 @@ std::string snapshot_locked(State& s) {
         << ",\"gaze\":{\"layer\":" << gaze.layer_present << ",\"abi\":" << gaze.abi_compatible
         << ",\"input\":" << gaze_input_diagnostics_json(gaze.input)
         << ",\"using_gaze\":" << gaze.using_gaze << ",\"alignment\":" << gaze.alignment_source
+        << ",\"shared_gaze\":" << gaze.shared_gaze << ",\"shared_fresh\":" << gaze.shared_fresh
+        << ",\"shared_projection\":" << gaze.shared_projection
+        << ",\"shared_view\":\"" << gaze.shared_view << "\",\"shared_u\":" << gaze.shared_u
+        << ",\"shared_v\":" << gaze.shared_v << ",\"shared_evaluations\":" << gaze.shared_evaluations
         << ",\"afw_bilateral\":" << gaze.afw_bilateral << ",\"afw_fresh_sample\":" << gaze.afw_fresh_sample
         << ",\"ambiguous\":" << gaze.mapping_ambiguous << ",\"views\":" << views.active
         << ",\"submitted_copies\":" << gaze.submitted_copies
@@ -166,6 +170,19 @@ std::string snapshot_locked(State& s) {
             << ",\"submitted_projection\":" << v.submitted_projection
             << ",\"fov_tangents\":[" << v.fov_tangents[0] << ',' << v.fov_tangents[1]
             << ',' << v.fov_tangents[2] << ',' << v.fov_tangents[3] << "]}";
+    }
+    out << "],\"shared_recent_views\":" << gaze.shared_recent_views
+        << ",\"shared_tracking_views\":" << gaze.shared_tracking_views << ",\"shared_views\":[";
+    bool first_shared = true;
+    for (const auto& row : gaze.shared_views) if (row.view) {
+        if (!first_shared) out << ','; first_shared = false;
+        out << "{\"view\":\"" << row.view << "\",\"calls\":" << row.calls
+            << ",\"fresh_calls\":" << row.fresh_calls << ",\"fallback_calls\":" << row.fallback_calls
+            << ",\"fresh\":" << row.fresh << ",\"reject\":" << row.rejection
+            << ",\"camera_viewport\":" << row.camera_viewport << ",\"camera_age_ms\":" << row.camera_age_ms
+            << ",\"evaluation_age_ms\":" << row.evaluation_age_ms
+            << ",\"u\":" << row.u << ",\"v\":" << row.v
+            << ",\"crop_x\":" << row.crop_x << ",\"crop_y\":" << row.crop_y << '}';
     }
     out << "]},\"nr\":\"" << json_escape(dlss_nr_state_name(nr.state)) << "\",\"nr_details\":{"
         << "\"route\":\"" << json_escape(dlss_nr_route_name(nr.route)) << "\",\"candidates\":" << nr.candidate_calls
@@ -403,7 +420,12 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
         *input->attachment = s.attachment_sequence;
         adapter_attached = true;
         allow_afw_stereo_projection(s.host == CheekyRuntimeHost::uevr);
-        eye_calibration_enable(true);
+        // Separate from alignment: disabling alignment does not stop marker
+        // acquisition. This per-install opt-out leaves other hosts unchanged.
+        const bool calibration_on = GetPrivateProfileIntW(L"Calibration", L"Enabled", 1,
+            (s.directory / L"CheekyRuntime.ini").c_str()) != 0;
+        eye_calibration_enable(calibration_on);
+        trace_event("Calibration startup enabled=%u (CheekyRuntime.ini)", unsigned(calibration_on));
         s.cadence.reset();
         set_processing_allowed(s.graphics_ready);
         request_save(s);

@@ -13,6 +13,21 @@ struct GazeProjection {
     bool valid{};
 };
 
+// UV in an asymmetric headset eye is not UV in the game's render camera.
+// Ported from the maintained fork's 44ac27f, with finite-FOV validation.
+inline bool reproject_gaze_center(const GazeProjection& from, const GazeProjection& to,
+    float u, float v, float& out_u, float& out_v) {
+    const auto valid = [](const GazeProjection& p) {
+        return p.valid && std::isfinite(p.left) && std::isfinite(p.right) &&
+            std::isfinite(p.up) && std::isfinite(p.down) &&
+            p.right > p.left && p.up > p.down;
+    };
+    if (!valid(from) || !valid(to) || !std::isfinite(u) || !std::isfinite(v)) return false;
+    out_u = (from.left + u * (from.right - from.left) - to.left) / (to.right - to.left);
+    out_v = (to.up - (from.up - v * (from.up - from.down))) / (to.up - to.down);
+    return std::isfinite(out_u) && std::isfinite(out_v);
+}
+
 inline bool projection_forward_center(const GazeProjection& p, float& u, float& v) {
     if (!p.valid || !std::isfinite(p.left) || !std::isfinite(p.right) ||
         !std::isfinite(p.up) || !std::isfinite(p.down) ||

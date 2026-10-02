@@ -17,7 +17,7 @@ template<class T> bool parse(std::string_view s, T& value) {
         return false;
     } else if constexpr (std::is_enum_v<T>) {
         std::uint32_t n{};
-        constexpr auto maximum = std::is_same_v<T, EyeCalibrationMethod> ? 3U : std::is_same_v<T, NrProcessingOrder> ? 1U : 2U;
+        constexpr auto maximum = (std::is_same_v<T, EyeCalibrationMethod> || std::is_same_v<T, FoveationCenterMode>) ? 3U : std::is_same_v<T, NrProcessingOrder> ? 1U : 2U;
         if (!parse(s, n) || n > maximum) return false;
         value = static_cast<T>(n); return true;
     } else {

@@ -296,7 +296,7 @@ void update_settings(const Settings& settings) noexcept {
     calibration_method.store(unsigned(settings.eye_calibration_method) <= 3 ? unsigned(settings.eye_calibration_method) : 0);
     store_float(aligned_height_offset_bits, std::clamp(settings.aligned_height_offset, -1.0F, 1.0F));
     center_mode.store(
-        static_cast<std::uint32_t>(settings.center_mode) <= 2U
+        static_cast<std::uint32_t>(settings.center_mode) <= 3U
             ? static_cast<std::uint32_t>(settings.center_mode)
             : 0U,
         std::memory_order_release

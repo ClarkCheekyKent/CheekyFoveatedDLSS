@@ -8,6 +8,16 @@ namespace cheeky::xr_menu {
 inline constexpr float radius = 3.F;
 inline constexpr float max_angle = 2.09439510239F;
 
+// A fallback panel is one full-image quad, not many cropped layers sharing a
+// swapchain. This also bounds compositor work when a frame-generation layer
+// retains and replays application overlays. Native cylinders remain separate.
+inline constexpr unsigned fallback_layers(unsigned available) noexcept {
+    return available ? 1U : 0U;
+}
+inline constexpr XrSwapchainUsageFlags swapchain_usage =
+    XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+    XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+
 struct Strip {
     XrVector3f center{};
     float angle{}, width{};

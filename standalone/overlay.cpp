@@ -4,6 +4,7 @@
 #include "settings_io.hpp"
 #include "version.h"
 #include "openvr_menu.hpp"
+#include "menu_backend.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
 #include "../shared/openxr_menu_shared11.hpp"
 void report_openxr_menu_diagnostic(const char* message) noexcept {
@@ -28,6 +29,7 @@ void report_openxr_menu_diagnostic(const char* message) noexcept {
 #include <atomic>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <locale>
 #include <memory>
@@ -97,6 +99,7 @@ struct Renderer : OverlayUiState {
     UINT width{}, height{};
     UINT framebuffer_width{}, framebuffer_height{};
     ULONGLONG last_present{};
+    ULONGLONG input_log_tick{};
     ComPtr<ID3D11Device> device11;
     ComPtr<ID3D11DeviceContext> context11;
     ComPtr<ID3D11DeviceContext1> context11_state;
@@ -111,6 +114,7 @@ struct Renderer : OverlayUiState {
     cheeky::xr_menu::SharedTexture11 xr_shared11;
     ComPtr<ID3D12Resource> headset_texture12;
     vr::IVROverlay* vr_overlay{};
+    bool xr_menu_owner{};
     vr::IVRSystem* vr_system{};
     vr::VROverlayHandle_t vr_handle{vr::k_ulOverlayHandleInvalid};
     std::uint32_t vr_token{};
@@ -137,8 +141,7 @@ struct State {
     std::mutex mutex;
     std::unique_ptr<Renderer> renderer;
     ULONGLONG xr_last_request{};
-    bool xr_input_pending{}, xr_input_active{}, xr_input_down{};
-    float xr_input_x{}, xr_input_y{};
+    MenuPointerQueue xr_inputs;
 };
 State& state() { static auto* value = new State; return *value; }
 
@@ -343,10 +346,19 @@ bool prepare_headset_texture(Renderer& r) {
 
 // Join the game's existing OpenVR session. Never initialize a second session:
 // native games and bridge mods own the lifetime of openvr_api.dll.
+void hide_headset(Renderer& r);
 bool prepare_headset(Renderer& r) {
     const auto now = GetTickCount64();
     const auto module = GetModuleHandleW(L"openvr_api.dll");
     const bool openxr = GetModuleHandleW(L"CheekyOpenXRLayer.dll") != nullptr;
+    if (openxr_menu_owns(r.xr_menu_owner, openxr, now, state().xr_last_request)) {
+        if (!r.xr_menu_owner) {
+            hide_headset(r);
+            r.xr_menu_owner = true;
+            set_status("Headset menu backend: OpenXR exclusively (OpenVR publishing disabled)");
+        }
+        return prepare_headset_texture(r);
+    }
     if (!module && !openxr) return false;
     if (!module) return prepare_headset_texture(r);
     const auto token_fn = reinterpret_cast<std::uint32_t (*)()>(GetProcAddress(module, "VR_GetInitToken"));
@@ -404,7 +416,7 @@ void release_headset_input(Renderer& r) {
 }
 
 void poll_headset_input(Renderer& r, bool ready, int desktop_events_begin) {
-    if (!ready || !r.vr_overlay) { release_headset_input(r); return; }
+    if (!ready || r.xr_menu_owner || !r.vr_overlay) { release_headset_input(r); return; }
     auto& io = ImGui::GetIO();
     // A click can already be queued even if SteamVR's current hover query no
     // longer targets us. Decide pointer ownership from the whole event batch.
@@ -465,6 +477,7 @@ void poll_headset_input(Renderer& r, bool ready, int desktop_events_begin) {
 }
 
 void publish_headset(Renderer& r) {
+    if (r.xr_menu_owner) return;
     if (!r.vr_overlay || !r.vr_system || r.vr_handle == vr::k_ulOverlayHandleInvalid) return;
     const auto display = ImGui::GetIO().DisplaySize;
     if (display.x <= 0 || display.y <= 0 || r.menu_width <= 0 || r.menu_height <= 0) return;
@@ -684,37 +697,54 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         if (r.attachment != runtime.attachment) { r.attachment = runtime.attachment; r.next_snapshot = 0; }
         const int desktop_events_begin = ImGui::GetCurrentContext()->InputEventsQueue.Size;
         process_overlay_input(*r.input, r.vr_buttons | unsigned(r.xr_pointer_down));
-        if (!r.input->open) { release_headset_input(r); r.xr_pointer_down = false; r.xr_pointer_active = false; global.xr_input_pending = false; global.xr_input_active = false; global.xr_input_down = false; hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
+        if (!r.input->open) { release_headset_input(r); r.xr_pointer_down = false; r.xr_pointer_active = false; global.xr_inputs.count = 0; hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
         release_cursor(*r.input);
         ImGui::GetIO().MouseDrawCursor = true;
         if (r.dx12) ImGui_ImplDX12_NewFrame(); else ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
+        apply_desktop_pointer(*r.input, desktop_events_begin);
         set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
         const bool headset_ready = prepare_headset(r);
         poll_headset_input(r, headset_ready, desktop_events_begin);
-        if (global.xr_input_pending) {
-            global.xr_input_pending = false;
-            const bool active = global.xr_input_active && headset_ready;
+        if (global.xr_inputs.count) {
+            const auto pointer = global.xr_inputs.pop();
+            const bool active = headset_ready && controller_pointer_owns(pointer.active,
+                r.xr_pointer_down, pointer.down && !r.xr_pointer_down,
+                GetTickCount64(), r.input->desktop_pointer_tick.load(), r.input->desktop_button_down.load());
             if (active) {
                 discard_desktop_pointer_events(desktop_events_begin);
-                r.xr_pointer_x = global.xr_input_x;
-                r.xr_pointer_y = global.xr_input_y;
+                r.xr_pointer_x = pointer.x;
+                r.xr_pointer_y = pointer.y;
+                ImGui::GetIO().AddFocusEvent(true); // XR focus is independent of desktop focus.
                 ImGui::GetIO().AddMousePosEvent(r.xr_pointer_x, r.xr_pointer_y);
             }
-            if (r.xr_pointer_down != (active && global.xr_input_down)) {
-                r.xr_pointer_down = active && global.xr_input_down;
+            if (r.xr_pointer_down != (active && pointer.down)) {
+                r.xr_pointer_down = active && pointer.down;
                 ImGui::GetIO().AddMouseButtonEvent(0, r.xr_pointer_down);
             }
             r.xr_pointer_active = active;
         }
         if (r.xr_pointer_active && r.xr_pointer_down)
             ImGui::GetIO().AddMousePosEvent(r.xr_pointer_x, r.xr_pointer_y);
+        ImGui::GetIO().FontGlobalScale = float((std::clamp)(int(GetPrivateProfileIntW(
+            L"Overlay", L"TextScalePercent", 100, r.input->config_path.c_str())), 100, 250)) / 100.F;
         ImGui::NewFrame();
         bool open=r.input->open.load();
         draw_overlay_ui(r,runtime,*r.input,r.dx12?"D3D12":"D3D11",status.load(),open);
         // Only the close button writes the atomic; concurrent menu-key input is preserved.
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
         ImGui::Render();
+        if (now - r.input_log_tick >= 1000) {
+            r.input_log_tick = now;
+            const auto& io = ImGui::GetIO();
+            char diagnostic[320]{};
+            std::snprintf(diagnostic, sizeof(diagnostic),
+                "Menu input v5: foreground=%d xr=%d down=%d mouse=%.0f,%.0f display=%.0f,%.0f hovered=%u active=%u queued=%u raw=%d",
+                foreground(r.input->window), r.xr_pointer_active, io.MouseDown[0], io.MousePos.x, io.MousePos.y,
+                io.DisplaySize.x, io.DisplaySize.y, ImGui::GetCurrentContext()->HoveredId,
+                ImGui::GetCurrentContext()->ActiveId, global.xr_inputs.count, r.input->raw_pointer_mode.load());
+            report_openxr_menu_diagnostic(diagnostic);
+        }
         if (r.dx12) render12(r); else render11(r);
         if (GetModuleHandleW(L"CheekyOpenXRLayer.dll") && !r.vr_overlay &&
             GetTickCount64() - global.xr_last_request > 3000)
@@ -833,11 +863,7 @@ extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuSetPointer(
     float x, float y, bool down, bool active) noexcept {
     auto& global = cheeky::standalone::state();
     std::lock_guard lock(global.mutex);
-    global.xr_input_pending = true;
-    global.xr_input_active = active;
-    global.xr_input_down = down;
-    global.xr_input_x = x;
-    global.xr_input_y = y;
+    global.xr_inputs.push({x, y, down, active});
 }
 
 extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuReportStatus(

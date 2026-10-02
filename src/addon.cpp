@@ -830,7 +830,7 @@ void load_settings_from_reshade() noexcept {
         settings.eye_calibration_learned_sessions);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "AlignedHeightOffset", settings.aligned_height_offset));
-    settings.center_mode = center_mode <= 2U
+    settings.center_mode = center_mode <= 3U
         ? static_cast<FoveationCenterMode>(center_mode)
         : FoveationCenterMode::fixed;
     static_cast<void>(reshade::get_config_value(
@@ -1206,7 +1206,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     if (ImGui::Combo(
             "Foveation center",
             &center_mode,
-            "Fixed\0Runtime gaze (OpenXR / OpenVR / LibOVR)\0Simulated gaze (debug)\0"
+            "Fixed\0Runtime gaze (OpenXR / OpenVR / LibOVR)\0Simulated gaze (debug)\0Shared right-eye gaze (Cyberpunk compatibility)\0"
         )) {
         settings.center_mode = static_cast<FoveationCenterMode>(center_mode);
         changed = true;

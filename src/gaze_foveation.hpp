@@ -39,6 +39,13 @@ struct GazeViewDiagnostics {
     float aligned_u{}, aligned_v{};
 };
 
+struct SharedGazeViewDiagnostics {
+    std::uint64_t view{}, calls{}, fresh_calls{}, fallback_calls{}, last_qpc{};
+    float u{}, v{}, camera_age_ms{}, evaluation_age_ms{};
+    unsigned rejection{}, crop_x{}, crop_y{}, camera_viewport{UINT32_MAX};
+    bool fresh{};
+};
+
 struct GazeDiagnostics {
     CheekyGazeInputDiagnosticsV1 input{};
     std::uint64_t submitted_copies{};
@@ -49,6 +56,12 @@ struct GazeDiagnostics {
     bool abi_compatible{};
     bool using_gaze{};
     bool afw_bilateral{}, afw_fresh_sample{};
+    bool shared_gaze{}, shared_fresh{}, shared_projection{};
+    std::uint64_t shared_view{};
+    float shared_u{}, shared_v{};
+    std::uint64_t shared_evaluations{};
+    std::array<SharedGazeViewDiagnostics, 4> shared_views{};
+    unsigned shared_recent_views{}, shared_tracking_views{};
     // Latest evaluated view: 0 manual fallback, 1 Streamline, 2 OpenXR, 3 OpenVR, 4 LibOVR.
     unsigned alignment_source{};
     bool mapping_ambiguous{};
@@ -101,6 +114,9 @@ void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
 [[nodiscard]] std::string gaze_input_diagnostics_json(const CheekyGazeInputDiagnosticsV1& input);
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;
+// Only the Cyberpunk shared mode consumes this recent symmetric camera.
+// Lower NGX evaluations do not inherit the Streamline viewport's view ID.
+void record_shared_gaze_projection(const GazeProjection& projection, std::uint32_t viewport = 0) noexcept;
 void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept;
 void submit_gaze_copies(std::uint64_t command_list) noexcept;
 void reset_gaze_copies(std::uint64_t command_list) noexcept;

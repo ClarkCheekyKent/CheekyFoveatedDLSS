@@ -1,0 +1,130 @@
+Cyberpunk VR standalone compatibility
+====================================
+
+Scope and validation
+--------------------
+Developed against upstream v0.5.4 (d6c18b2). The standalone host/runtime and
+OpenXR layer were tested with Cyberpunk VR Port 0.1.7, PSVR2 eye tracking,
+SteamVR/OpenXR and external OFXR. The tester confirmed working menu controls
+and, after the viewport-cache correction, working gaze on 2026-09-30.
+This is not a claim of testing every runtime, headset, frame-generation mode
+or game. No Cyberpunk port code change is part of this patch.
+
+Problems addressed
+------------------
+1. Preserve host controller bindings when menu graphics becomes available.
+   Applications can suggest bindings before creating their graphics session.
+   Deferred menu setup must augment the successful host suggestion, not replace
+   it. Failed suggestions do not replace the cache; unknown extension chains
+   are not retained by pointer or replayed without their semantics.
+2. Avoid an unconfirmed optional cylinder request for CyberpunkVRPort when the
+   downstream extension enumeration is unavailable. Keep application requests
+   intact and use the quad fallback. A failed speculative create/retry was
+   associated with missing controls/black-world startup failures in testing;
+   this is not asserted to explain every possible startup failure.
+3. Use a single owner for headset menu presentation. Once OpenXR is actively
+   consuming the menu, do not also publish the texture through OpenVR. The
+   no-cylinder fallback uses one full-image sampled quad; busy DX12 allocators
+   are treated as temporary backpressure. The final menu stopped crashing in
+   testing; the original driver crash alone did not prove a unique cause.
+4. Preserve actual clicks. Apply raw mouse motion before button edges so game
+   cursor warping cannot redirect the click. Queue XR press/release edges across
+   independent render cadences and arbitrate desktop/controller ownership.
+   When custom SteamVR bindings omit the layer's menu actions, use the host's
+   already-bound aim/trigger as a read-only fallback. Do not replace user
+   bindings, create a second runtime session or resynchronize game action sets.
+5. Provide explicit shared-gaze compatibility, independent of texture mapping.
+   Valid gaze can exist while automatic eye-resource calibration cannot resolve
+   the port's submitted images. CenterMode=3 uses right-eye gaze for BOTH render
+   views, converting asymmetric headset UV through tangent space into the game
+   render camera. This is shared gaze, NOT successful eye-texture calibration.
+   The projection conversion/shared-mode approach was adapted from the
+   satyaloka93 fork's 44ac27f; its old Streamline processing was not transplanted.
+
+The one-eye regression and correction
+-------------------------------------
+The initial shared-gaze candidate moved one render view while the other stayed
+centered. A regression demonstrated that an invalid projection publication from
+one viewport could erase a different viewport's fresh symmetric camera in a
+single global cache. Native NGX view IDs do not inherit Streamline viewport
+projection scopes, so this fallback matters for both render views.
+
+The corrected cache tracks the publishing viewport in eight bounded slots.
+Invalidation is owner-specific; another fresh valid symmetric camera remains
+available. Reuse is Cyberpunk-only, expires after 100ms, and clears on XR session
+change. Private Cheeky viewports do not publish into it. Missing camera data
+never falls back to raw asymmetric headset UV or a hardcoded FOV.
+
+Gaze must be real, active, focused and fresh within 50ms, with valid session and
+display time. Republishing frozen display time cannot extend validity. Existing
+blink hold/smoothing/return and crop-history policies remain in effect.
+
+Setup (explicit opt-in; global defaults are not changed)
+--------------------------------------------------------
+Use matching standalone host/runtime and OpenXR layer builds. In the game's
+CheekyFoveatedDLSS folder beside the standalone runtime DLL:
+
+  CheekyOverlay.ini:
+    [Overlay]
+    MenuKey=122
+    TextScalePercent=175
+
+122 is F11. Avoid F8 with Cyberpunk VR Port: it controls the port's flat window.
+TextScalePercent is clamped to 100..250; the menu scales and recenters on open.
+
+  CheekyRuntime.ini:
+    [Calibration]
+    Enabled=0
+
+This is a per-install startup opt-out from calibration markers, separate from
+automatic alignment. Missing configuration retains upstream's enabled default.
+Shared gaze does not need marker calibration. In the standalone menu select
+Stereo / Gaze -> Shared right-eye gaze (Cyberpunk compatibility), or persist
+CenterMode=3 in the existing CheekyFoveatedDLSS.ini section. Leave automatic
+stereo alignment enabled. Eye-order inversion is not used by shared mode.
+
+Check both physical eyes while looking left/right/up/down with the head still.
+The menu reports tracking/recent render-view counts instead of claiming success
+from only the last evaluation. Heuristic Left/Right view labels are not proof
+of physical eye identity. Support reports contain gaze.shared_views with
+per-native-view fresh/fallback counts, crop, camera owner/age and rejection bits:
+1 missing camera; 2 projection/layout/UV; 4 gaze/focus; 8 publication freshness;
+16 display freshness; 32 no session; 64 simulated/unsupported layout.
+SHARED GAZE v2 logs include fallback paths as well as successful samples.
+
+Regression coverage
+-------------------
+Build the Release x64 host, runtime, CheekyTests, CheekyRuntimeHostTests and
+CheekyOverlayTests projects with the repository's normal Windows toolchain.
+
+  bin\Release\CheekyTests.exe --cyberpunk-shared-gaze
+  bin\Release\CheekyTests.exe --alignment-history
+  bin\Release\CheekyTests.exe --afw-gaze
+  bin\Release\CheekyTests.exe --openvr-menu-focus
+  bin\Release\CheekyRuntimeHostTests.exe
+  bin\Release\CheekyRuntimeHostTests.exe --calibration-disabled
+  bin\Release\CheekyOverlayTests.exe --ui
+  bin\Release\CheekyOverlayTests.exe --shared11
+  bin\Release\CheekyOverlayTests.exe --dx11
+  bin\Release\CheekyOverlayTests.exe --hdr10
+  bin\Release\CheekyOverlayTests.exe --scrgb
+  bin\Release\CheekyOverlayTests.exe
+
+The shared-gaze test exercises the production coordinator with both unmapped
+native views, asymmetric-FOV correction, cache ownership (failed before the
+correction), stale/future/focus/session/NaN cases, expiration and partial-view
+diagnostics. A harmless DLL-name fixture exercises the Cyberpunk-only cache.
+Runtime-host tests cover real command acceptance, mode3 persistence/reconnect,
+invalid enum rejection and default/disabled calibration. Overlay tests verify
+actual checkbox changes, not only cursor movement, and distinguish 1/2 vs2/2
+tracking. These tests do not replace headset validation.
+
+Additional production OpenXR interception tests (D3D11 and D3D12):
+  cmake -S tests/openxr_binding -B build/openxr-binding-tests -A x64
+  cmake --build build/openxr-binding-tests --config Release
+  ctest --test-dir build/openxr-binding-tests -C Release --output-on-failure
+
+Cover early/late suggestions, failed/replaced suggestions, unknown chains,
+host action-set preservation, unchanged downstream input results, optional
+extension startup, menu ownership, pointer edges, host-action fallback for both
+hands, ray loss and profile/session cleanup. No game install is required.

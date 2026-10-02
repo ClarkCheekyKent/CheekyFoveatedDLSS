@@ -2684,7 +2684,129 @@ int run_d3d12_safety_tests();
 int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int run_debug_exposure_tests();
+void test_cyberpunk_shared_gaze() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation();
+    Settings settings; settings.enabled = true; settings.width = settings.height = .24F;
+    settings.center_mode = FoveationCenterMode::openxr_gaze_right_eye;
+    settings.auto_stereo_alignment = true; settings.gaze_smoothing_ms = 0;
+    settings.gaze_hold_ms = 0; settings.gaze_quantization_pixels = 1;
+    const GazeProjection camera{-1.301965F, 1.301965F, 1.301965F, -1.301965F, true};
+    const GazeProjection eye{-.947191F, 1.841771F, 1.328981F, -1.328981F, true};
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION; snapshot.structure_size = sizeof(snapshot);
+    snapshot.session_generation = 1; snapshot.swapchain_generation = 1; snapshot.view_count = 2;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_GAZE_VALID | CHEEKY_GAZE_STATUS_ACTION_ACTIVE |
+        CHEEKY_GAZE_STATUS_SESSION_FOCUSED; // Deliberately NO mapping-ready flag or resources.
+    auto& source = snapshot.views[1]; source.flags = CHEEKY_GAZE_VIEW_FOV_VALID;
+    source.fov_left = std::atan(eye.left); source.fov_right = std::atan(eye.right);
+    source.fov_up = std::atan(eye.up); source.fov_down = std::atan(eye.down);
+    source.center_u = -eye.left / (eye.right - eye.left); source.center_v = .5F;
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+    const auto fresh = [&] { LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart; ++snapshot.predicted_display_time; };
+    CropGeometry crops[2]{}; FoveationCenter centers[2]{}; bool reset{};
+    const auto evaluate = [&](unsigned i, GazeProjection p) {
+        ScopedGazeProjection scope(1001 + i, p);
+        return calculate_coordinated_crop(settings, 1001 + i, nullptr, 1792, 1792, 3584, 3584,
+            0, 0, crops[i], reset, &snapshot, &centers[i]);
+    };
+    fresh();
+    for (unsigned i = 0; i < 2; ++i) {
+        expect(evaluate(i, camera), "Shared gaze resolves BOTH unmapped NGX views");
+        expect(gaze_diagnostics().shared_fresh && gaze_diagnostics().using_gaze, "Fresh shared gaze is active");
+        expect_near(centers[i].u, .5F, .001F, "Asymmetric headset forward converts to render center");
+        expect(!gaze_diagnostics().views[0].resource_mapped && !gaze_diagnostics().views[1].resource_mapped,
+            "Shared gaze must not claim calibrated texture mapping");
+    }
+    const auto initial = crops[0].input_base_x;
+    source.center_u += .1F; source.center_v -= .1F; fresh();
+    for (unsigned i = 0; i < 2; ++i) {
+        expect(evaluate(i, camera) && crops[i].input_base_x > initial && centers[i].v < .5F,
+            "Both views follow right/up gaze in render space");
+    }
+    expect(crops[0].input_base_x == crops[1].input_base_x, "Shared views receive the same gaze center");
+    source.center_u = .327F; source.center_v = .511F; fresh(); evaluate(0, camera);
+    expect(centers[0].u > .48F && centers[0].u < .50F, "Historical left-edge circle regression rejected");
+    fresh(); snapshot.publication_qpc -= frequency.QuadPart; evaluate(0, camera);
+    expect(!gaze_diagnostics().shared_fresh, "Stale publication rejected");
+    fresh(); snapshot.publication_qpc += frequency.QuadPart; evaluate(0, camera);
+    expect(!gaze_diagnostics().shared_fresh, "Future publication rejected");
+    fresh(); snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_SESSION_FOCUSED; evaluate(0, camera);
+    expect(!gaze_diagnostics().shared_fresh, "Unfocused gaze rejected");
+    snapshot.status_flags |= CHEEKY_GAZE_STATUS_SESSION_FOCUSED | CHEEKY_GAZE_STATUS_SIMULATED;
+    fresh(); evaluate(0, camera); expect(!gaze_diagnostics().shared_fresh, "Simulated gaze cannot impersonate real tracking");
+    snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_SIMULATED;
+    fresh(); evaluate(0, {}); expect(!gaze_diagnostics().using_gaze && !gaze_diagnostics().shared_projection,
+        "Missing camera cannot use raw headset UV or retain old crop");
+    fresh(); source.center_u = std::numeric_limits<float>::quiet_NaN(); evaluate(0, camera);
+    expect(!gaze_diagnostics().shared_fresh, "NaN gaze rejected");
+    source.center_u = .6F; fresh(); evaluate(0, camera);
+    ++snapshot.session_generation; snapshot.status_flags &= ~CHEEKY_GAZE_STATUS_GAZE_VALID;
+    fresh(); evaluate(0, camera); expect(!gaze_diagnostics().using_gaze, "New session clears held gaze");
+    settings.center_mode = FoveationCenterMode::fixed; evaluate(0, camera);
+    expect(!gaze_diagnostics().shared_gaze && !gaze_diagnostics().using_gaze, "Fixed mode disables shared tracking");
+    settings.center_mode = FoveationCenterMode::openxr_gaze_right_eye;
+    snapshot.status_flags |= CHEEKY_GAZE_STATUS_GAZE_VALID;
+    fresh(); record_shared_gaze_projection(camera); evaluate(0, {});
+    expect(!gaze_diagnostics().shared_projection, "Shared camera reuse is unavailable outside Cyberpunk host");
+    // Exercise the actual production host gate/cache without loading the game.
+    // The fixture is a harmless test DLL with the port's module filename.
+    wchar_t executable[MAX_PATH]{}; GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    const auto fixture_dir = std::filesystem::temp_directory_path() /
+        (L"CheekySharedGazeTest-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(fixture_dir);
+    const auto fixture = fixture_dir / L"CyberpunkVR_Stereo.dll";
+    std::filesystem::copy_file(std::filesystem::path(executable).parent_path() /
+        L"test-fixtures/CheekyFakeRealVR.dll", fixture, std::filesystem::copy_options::overwrite_existing);
+    const auto module = LoadLibraryW(fixture.c_str());
+    expect(module != nullptr, "Load harmless Cyberpunk module-name fixture");
+    if (module) {
+        fresh(); record_shared_gaze_projection(camera);
+        for (unsigned i = 0; i < 2; ++i) {
+            evaluate(i, {});
+            expect(gaze_diagnostics().shared_fresh, "Native NGX views consume recent symmetric camera without Streamline view ID");
+        }
+        Sleep(110); fresh(); evaluate(0, {});
+        expect(!gaze_diagnostics().shared_projection, "Shared render camera expires after 100ms");
+        fresh(); record_shared_gaze_projection(camera, 0); evaluate(0, {});
+        record_shared_gaze_projection({}, 1); evaluate(1, {});
+        expect(gaze_diagnostics().shared_fresh,
+            "Invalid second-viewport constants cannot erase the first viewport's fresh shared camera");
+        expect(gaze_diagnostics().shared_recent_views == 2 && gaze_diagnostics().shared_tracking_views == 2,
+            "Diagnostics report both actual native views tracking, not just last view");
+        record_shared_gaze_projection(camera, 1); record_shared_gaze_projection({}, 1); evaluate(1, {});
+        expect(gaze_diagnostics().shared_fresh, "Invalidation of newest publisher retains other viewport's fresh camera");
+        record_shared_gaze_projection({}, 0); evaluate(1, {});
+        expect(!gaze_diagnostics().shared_fresh && gaze_diagnostics().shared_tracking_views == 1,
+            "Same-owner invalidation remains safe and reports partial tracking");
+        const auto rows = gaze_diagnostics().shared_views;
+        expect(std::any_of(rows.begin(), rows.end(), [](const auto& row) {
+            return row.view == 1002 && row.fallback_calls > 0 && (row.rejection & 1);
+        }), "Missing camera is visible per view in support diagnostics");
+        record_shared_gaze_projection(camera); ++snapshot.session_generation; fresh(); evaluate(0, {});
+        expect(!gaze_diagnostics().shared_projection, "Previous-session camera cannot be borrowed");
+        record_shared_gaze_projection(camera); fresh(); evaluate(0, {});
+        expect(gaze_diagnostics().shared_fresh, "New-session camera publication restores shared gaze");
+        auto asymmetric = camera; asymmetric.right += .1F;
+        record_shared_gaze_projection(asymmetric); fresh(); evaluate(0, {});
+        expect(!gaze_diagnostics().shared_projection, "Asymmetric eye-specific camera cannot be shared");
+        record_shared_gaze_projection(camera); fresh(); evaluate(0, {});
+        Sleep(60); LARGE_INTEGER now{}; QueryPerformanceCounter(&now); snapshot.publication_qpc = now.QuadPart;
+        record_shared_gaze_projection(camera); evaluate(0, {});
+        expect(!gaze_diagnostics().shared_fresh, "Republishing an unchanged display time does not refresh gaze");
+        FreeLibrary(module);
+    }
+    std::filesystem::remove(fixture); std::filesystem::remove(fixture_dir);
+    reset_gaze_foveation();
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--cyberpunk-shared-gaze") == 0) {
+        test_cyberpunk_shared_gaze();
+        if (!failures) std::cout << "PASS Cyberpunk shared gaze: both views, projection, stale/session/mode safety\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--transport-geometry") == 0) {
         test_transport_guide_capacity();
         return failures ? 1 : 0;

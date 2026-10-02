@@ -20,6 +20,7 @@ enum class FoveationCenterMode : std::uint32_t {
     fixed = 0U,
     openxr_gaze = 1U,
     simulated_gaze = 2U,
+    openxr_gaze_right_eye = 3U, // Explicit unmapped shared-gaze compatibility mode.
 };
 
 enum class NrProcessingOrder : std::uint32_t {

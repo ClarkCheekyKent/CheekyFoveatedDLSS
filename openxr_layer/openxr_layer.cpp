@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <type_traits>
 
 namespace {
 
@@ -74,8 +75,12 @@ struct Dispatch {
     PFN_xrSuggestInteractionProfileBindings suggest_bindings{};
     PFN_xrAttachSessionActionSets attach_action_sets{};
     PFN_xrSyncActions sync_actions{};
+    PFN_xrGetCurrentInteractionProfile get_current_profile{};
+    PFN_xrPathToString path_to_string{};
     PFN_xrGetActionStatePose get_action_state_pose{};
     PFN_xrGetActionStateBoolean get_action_state_boolean{};
+    PFN_xrGetActionStateFloat get_action_state_float{};
+    PFN_xrGetActionStateVector2f get_action_state_vector2f{};
     PFN_xrCreateActionSpace create_action_space{};
     PFN_xrCreateReferenceSpace create_reference_space{};
     PFN_xrDestroySpace destroy_space{};
@@ -121,8 +126,12 @@ void populate_dispatch(
         gipa, instance, "xrAttachSessionActionSets"
     );
     CHEEKY_LOAD(sync_actions, SyncActions);
+    CHEEKY_LOAD(get_current_profile, GetCurrentInteractionProfile);
+    CHEEKY_LOAD(path_to_string, PathToString);
     CHEEKY_LOAD(get_action_state_pose, GetActionStatePose);
     CHEEKY_LOAD(get_action_state_boolean, GetActionStateBoolean);
+    CHEEKY_LOAD(get_action_state_float, GetActionStateFloat);
+    CHEEKY_LOAD(get_action_state_vector2f, GetActionStateVector2f);
     CHEEKY_LOAD(create_action_space, CreateActionSpace);
     CHEEKY_LOAD(create_reference_space, CreateReferenceSpace);
     CHEEKY_LOAD(destroy_space, DestroySpace);
@@ -149,6 +158,11 @@ struct SubmittedView {
 };
 
 struct SessionState {
+    ULONGLONG input_log_tick{};
+    std::array<ULONGLONG, 3> pose_log_ticks{};
+    struct InputSample { XrAction action; XrPath path; XrStructureType type; ULONGLONG tick; };
+    std::vector<InputSample> input_samples; // bounded, session-owned diagnostic throttle
+    bool diagnostic_menu_visible{};
     struct Menu {
         XrSwapchain swapchain{XR_NULL_HANDLE};
         std::vector<XrSwapchainImageD3D11KHR> images11;
@@ -210,6 +224,17 @@ struct SessionState {
     bool running{};
     bool menu_submission_disabled{};
     bool menu_cylinder_enabled{};
+    int menu_pointer_hand{-1};
+    ULONGLONG menu_pointer_log_tick{};
+    struct HostMenuHand {
+        XrPath profile{};
+        XrSpace space{};
+        XrAction trigger{};
+        XrPath trigger_subaction{};
+        XrActionType trigger_type{XR_ACTION_TYPE_MAX_ENUM};
+        bool initialized{};
+    };
+    std::array<HostMenuHand, 2> host_menu_hands{};
     std::uint32_t max_layers{16};
     XrTime menu_recenter_time{};
     bool fallback_setup_attempted{};
@@ -267,6 +292,10 @@ struct InstanceState {
     std::array<XrPath, 2> menu_hand_paths{};
     std::array<XrPath, 5> menu_profiles{};
     std::array<bool, 5> menu_bindings_submitted{};
+    // Applications may suggest bindings before their graphics session exists.
+    // Later menu setup must augment that successful suggestion, not replace it.
+    std::array<std::vector<XrActionSuggestedBinding>, 5> host_menu_profile_bindings;
+    std::array<bool, 5> host_menu_profile_has_next{};
     bool menu_graphics_enabled{};
     XrAction gaze_action{XR_NULL_HANDLE};
     XrPath gaze_path{XR_NULL_PATH};
@@ -608,7 +637,7 @@ bool initialize_menu(SessionState& session, const Dispatch& dispatch,
         report_menu_status(cheeky_xr_menu_format_unavailable); return false;
     }
     XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    create.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    create.usageFlags = cheeky::xr_menu::swapchain_usage;
     create.sampleCount = 1;
     create.width = frame.width;
     create.height = frame.height;
@@ -707,10 +736,89 @@ bool initialize_menu(SessionState& session, const Dispatch& dispatch,
     return anchor_menu(session, dispatch, frame, time);
 }
 
-void send_menu_pointer(const SessionState& session, const Dispatch& dispatch,
-    const XrTime time, const CheekyOpenXRMenuFrame& frame) {
+// User SteamVR bindings can omit actions added by a layer. Read the host's
+// already-bound aim/trigger as a fallback; never replace bindings, resync action
+// sets, or consume/modify game input. Used only when the layer action is inactive.
+bool sample_host_menu_hand(SessionState& session, const InstanceState& instance,
+    unsigned hand, XrTime time, XrSpaceLocation& location, XrActionStateBoolean& click) {
+    const auto& d = instance.dispatch;
+    if (!d.get_current_profile || !d.string_to_path || !d.create_action_space || !d.locate_space)
+        return false;
+    XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+    if (XR_FAILED(d.get_current_profile(session.session, instance.menu_hand_paths[hand], &profile)) ||
+        profile.interactionProfile == XR_NULL_PATH) return false;
+    auto& cached = session.host_menu_hands[hand];
+    if (!cached.initialized || cached.profile != profile.interactionProfile) {
+        if (cached.space && d.destroy_space) d.destroy_space(cached.space);
+        cached = {}; cached.initialized = true; cached.profile = profile.interactionProfile;
+        const char* prefix = hand ? "/user/hand/right" : "/user/hand/left";
+        XrPath aim_path{}, trigger_path{}, select_path{};
+        d.string_to_path(instance.instance, (std::string(prefix) + "/input/aim/pose").c_str(), &aim_path);
+        d.string_to_path(instance.instance, (std::string(prefix) + "/input/trigger/value").c_str(), &trigger_path);
+        d.string_to_path(instance.instance, (std::string(prefix) + "/input/select/click").c_str(), &select_path);
+        XrAction aim{};
+        for (unsigned i = 0; i < instance.menu_profiles.size(); ++i) {
+            if (instance.menu_profiles[i] != profile.interactionProfile) continue;
+            for (const auto& binding : instance.host_menu_profile_bindings[i]) {
+                if (binding.binding == aim_path) aim = binding.action;
+                if (binding.binding == trigger_path || binding.binding == select_path) cached.trigger = binding.action;
+            }
+        }
+        cached.trigger_subaction = instance.menu_hand_paths[hand];
+        if (aim) {
+            XrActionSpaceCreateInfo info{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+            info.action = aim; info.subactionPath = instance.menu_hand_paths[hand];
+            info.poseInActionSpace.orientation.w = 1.F;
+            auto result = d.create_action_space(session.session, &info, &cached.space);
+            if (result == XR_ERROR_PATH_UNSUPPORTED) {
+                info.subactionPath = XR_NULL_PATH;
+                result = d.create_action_space(session.session, &info, &cached.space);
+            }
+            char message[256]{};
+            std::snprintf(message, sizeof(message), "Menu host fallback hand=%u profile=%llu aim=%p space=%p trigger=%p result=%d",
+                hand, static_cast<unsigned long long>(cached.profile), aim, cached.space, cached.trigger, result);
+            report_menu_diagnostic(message);
+        }
+    }
+    bool valid_pose = false;
+    if (cached.space) valid_pose = XR_SUCCEEDED(d.locate_space(cached.space,
+        session.calibration_local_space, time, &location)) &&
+        (location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+        (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+    if (!cached.trigger) return valid_pose;
+    XrActionStateGetInfo get{XR_TYPE_ACTION_STATE_GET_INFO};
+    get.action = cached.trigger; get.subactionPath = cached.trigger_subaction;
+    XrResult result = XR_ERROR_ACTION_TYPE_MISMATCH;
+    if (d.get_action_state_float && cached.trigger_type != XR_ACTION_TYPE_BOOLEAN_INPUT) {
+        XrActionStateFloat value{XR_TYPE_ACTION_STATE_FLOAT};
+        result = d.get_action_state_float(session.session, &get, &value);
+        if (result == XR_ERROR_PATH_UNSUPPORTED) {
+            get.subactionPath = cached.trigger_subaction = XR_NULL_PATH;
+            result = d.get_action_state_float(session.session, &get, &value);
+        }
+        if (XR_SUCCEEDED(result)) {
+            cached.trigger_type = XR_ACTION_TYPE_FLOAT_INPUT;
+            click.isActive = value.isActive;
+            click.currentState = value.currentState >= .55F;
+        }
+    }
+    if (d.get_action_state_boolean && (cached.trigger_type == XR_ACTION_TYPE_BOOLEAN_INPUT ||
+        result == XR_ERROR_ACTION_TYPE_MISMATCH)) {
+        XrActionStateBoolean value{XR_TYPE_ACTION_STATE_BOOLEAN};
+        result = d.get_action_state_boolean(session.session, &get, &value);
+        if (result == XR_ERROR_PATH_UNSUPPORTED) {
+            get.subactionPath = cached.trigger_subaction = XR_NULL_PATH;
+            result = d.get_action_state_boolean(session.session, &get, &value);
+        }
+        if (XR_SUCCEEDED(result)) { cached.trigger_type = XR_ACTION_TYPE_BOOLEAN_INPUT; click = value; }
+    }
+    return valid_pose;
+}
+
+void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
+    const XrTime time, const CheekyOpenXRMenuFrame& frame, CheekyOpenXRMenuPointer pointer_sink = nullptr) {
     const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
-    const auto send = host ? reinterpret_cast<CheekyOpenXRMenuPointer>(
+    const auto send = pointer_sink ? pointer_sink : host ? reinterpret_cast<CheekyOpenXRMenuPointer>(
         GetProcAddress(host, "CheekyOpenXRMenuSetPointer")) : nullptr;
     if (!send || !dispatch.locate_space || !dispatch.get_action_state_boolean) return;
     const auto instance = instances.find(session.instance);
@@ -719,11 +827,37 @@ void send_menu_pointer(const SessionState& session, const Dispatch& dispatch,
     const auto& menu = session.menu;
     const auto& orientation = menu.pose.orientation;
     const XrQuaternionf inverse{-orientation.x, -orientation.y, -orientation.z, orientation.w};
+    struct Pointer { bool hit{}, down{}; float x{}, y{}; };
+    std::array<Pointer, 2> pointers{};
+    std::array<XrSpaceLocationFlags, 2> pose_flags{};
+    std::array<XrActionStateBoolean, 2> clicks{};
+    std::array<bool, 2> host_fallback{};
     for (const unsigned hand : {1U, 0U}) {
-        if (session.menu_aim_spaces[hand] == XR_NULL_HANDLE) continue;
         XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
-        if (XR_FAILED(dispatch.locate_space(session.menu_aim_spaces[hand],
-            session.calibration_local_space, time, &location)) ||
+        XrActionStateGetInfo get_info{XR_TYPE_ACTION_STATE_GET_INFO};
+        get_info.action = instance->second.menu_click_action;
+        get_info.subactionPath = instance->second.menu_hand_paths[hand];
+        auto& click = clicks[hand];
+        click.type = XR_TYPE_ACTION_STATE_BOOLEAN;
+        dispatch.get_action_state_boolean(session.session, &get_info, &click);
+        auto located = session.menu_aim_spaces[hand] == XR_NULL_HANDLE ? XR_ERROR_HANDLE_INVALID :
+            dispatch.locate_space(session.menu_aim_spaces[hand], session.calibration_local_space, time, &location);
+        if (!click.isActive || XR_FAILED(located) || !(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+            !(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+            XrSpaceLocation fallback_location{XR_TYPE_SPACE_LOCATION};
+            XrActionStateBoolean fallback_click{XR_TYPE_ACTION_STATE_BOOLEAN};
+            const bool fallback_pose = sample_host_menu_hand(session, instance->second, hand, time,
+                fallback_location, fallback_click);
+            if (fallback_pose && (XR_FAILED(located) ||
+                !(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
+                !(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))) {
+                location = fallback_location; located = XR_SUCCESS; host_fallback[hand] = true;
+            }
+            if (!click.isActive && fallback_click.isActive) { click = fallback_click; host_fallback[hand] = true; }
+        }
+        const bool down = click.isActive && click.currentState;
+        pose_flags[hand] = location.locationFlags;
+        if (XR_FAILED(located) ||
             !(location.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
             !(location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) continue;
         const XrVector3f position{
@@ -736,16 +870,31 @@ void send_menu_pointer(const SessionState& session, const Dispatch& dispatch,
         float u{}, v{};
         if (!cheeky::xr_menu::hit(origin, direction, menu.size.width, menu.size.height,
             menu.width, menu.strips, menu.cylinder, u, v)) continue;
-        XrActionStateGetInfo get_info{XR_TYPE_ACTION_STATE_GET_INFO};
-        get_info.action = instance->second.menu_click_action;
-        get_info.subactionPath = instance->second.menu_hand_paths[hand];
-        XrActionStateBoolean click{XR_TYPE_ACTION_STATE_BOOLEAN};
-        const bool down = XR_SUCCEEDED(dispatch.get_action_state_boolean(session.session, &get_info, &click)) &&
-            click.isActive == XR_TRUE && click.currentState == XR_TRUE;
-        send(u * frame.display_width, v * frame.display_height, down, true);
-        return;
+        pointers[hand] = {true, down, u * frame.display_width, v * frame.display_height};
     }
-    send(0, 0, false, false);
+    int selected = session.menu_pointer_hand;
+    if (selected < 0 || !pointers[selected].hit) {
+        selected = -1;
+        for (const int hand : {1, 0}) if (pointers[hand].hit && pointers[hand].down) { selected = hand; break; }
+        if (selected < 0) for (const int hand : {1, 0}) if (pointers[hand].hit) { selected = hand; break; }
+    }
+    if (selected >= 0) {
+        const auto& p = pointers[selected];
+        send(p.x, p.y, p.down, true);
+        session.menu_pointer_hand = p.down ? selected : -1;
+    } else { session.menu_pointer_hand = -1; send(0, 0, false, false); }
+    const auto now = GetTickCount64();
+    if (now - session.menu_pointer_log_tick >= 1000) {
+        session.menu_pointer_log_tick = now;
+        char diagnostic[320]{};
+        std::snprintf(diagnostic, sizeof(diagnostic),
+            "XR pointer v5: hand=%d left(pose=%llu active=%u down=%u hit=%u xy=%.0f,%.0f) right(pose=%llu active=%u down=%u hit=%u xy=%.0f,%.0f) host_fallback=%d,%d",
+            selected, static_cast<unsigned long long>(pose_flags[0]), clicks[0].isActive, clicks[0].currentState,
+            unsigned(pointers[0].hit), pointers[0].x, pointers[0].y,
+            static_cast<unsigned long long>(pose_flags[1]), clicks[1].isActive, clicks[1].currentState,
+            unsigned(pointers[1].hit), pointers[1].x, pointers[1].y, host_fallback[0], host_fallback[1]);
+        report_menu_diagnostic(diagnostic);
+    }
 }
 
 XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
@@ -760,9 +909,13 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
     if (!acquire) return dispatch.end_frame(session, info);
     CheekyOpenXRMenuFrame frame{};
     if (!acquire(&frame)) {
+        { std::lock_guard lock(state_mutex); state.diagnostic_menu_visible = false; }
+        state.menu.anchored = false; // Reopening places the panel in front of the current head pose.
+        state.menu_pointer_hand = -1;
         state.menu_submission_disabled = false;
         return dispatch.end_frame(session, info);
     }
+    { std::lock_guard lock(state_mutex); state.diagnostic_menu_visible = true; }
     if (state.menu_submission_disabled) {
         if (frame.texture) static_cast<IUnknown*>(frame.texture)->Release();
         return dispatch.end_frame(session, info);
@@ -816,7 +969,10 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
     const auto available_layers = state.max_layers > info->layerCount ? state.max_layers - info->layerCount : 0U;
     if (!available_layers) { release_source(); return dispatch.end_frame(session, info); }
     menu.cylinder = state.menu_cylinder_enabled;
-    menu.strips = menu.cylinder ? 1U : (std::min)(12U, available_layers);
+    menu.strips = menu.cylinder ? 1U : cheeky::xr_menu::fallback_layers(available_layers);
+    if (menu.fence_value == 0 && state.graphics_api == 12)
+        report_menu_diagnostic(menu.cylinder ? "OpenXR menu policy: native cylinder, sampled texture" :
+            "OpenXR menu policy: single full-image quad, sampled texture");
     send_menu_pointer(state, dispatch, info->displayTime, frame);
     std::uint32_t index{};
     const XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -831,6 +987,17 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
         const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
         release_source(); return dispatch.end_frame(session, info);
+    }
+    // Runtime availability does not imply our previous queue submission has
+    // completed yet. A busy allocator is backpressure, not a permanent copy
+    // failure: never poison the headset menu until it is reopened for this.
+    if (state.graphics_api == 12 && index < menu.fence_values.size() && menu.fence &&
+        menu.fence->GetCompletedValue() != UINT64_MAX &&
+        menu.fence->GetCompletedValue() < menu.fence_values[index]) {
+        const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
+        release_source();
+        return dispatch.end_frame(session, info);
     }
     bool copied{};
     const char* copy_failure_stage = "image, allocator or fence not ready";
@@ -952,8 +1119,8 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
         cylinder.aspectRatio = menu.size.width / menu.size.height;
         layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinder));
     } else {
-        // Runtimes without cylinder layers receive adjacent chords of the same
-        // curve. Respect the runtime's layer budget and the game's own layers.
+        // Runtimes without cylinders receive a single flat full-image panel.
+        // Geometry and pointer hit-testing both use the same one-strip policy.
         for (unsigned i{}; i < menu.strips; ++i) {
             const auto geometry = cheeky::xr_menu::strip(menu.size.width, menu.width, i, menu.strips);
             auto& quad = strips[i];
@@ -1316,8 +1483,17 @@ void ensure_menu_bindings(InstanceState& state) {
         state.menu_action_set == XR_NULL_HANDLE) return;
     for (std::size_t i{}; i < state.menu_profiles.size(); ++i) {
         if (state.menu_bindings_submitted[i] || state.menu_profiles[i] == XR_NULL_PATH) continue;
-        const auto bindings = menu_bindings_for_profile(state, i);
-        if (bindings.empty()) continue;
+        // Unknown extension chains cannot be retained by pointer or replayed
+        // without their semantics. Preserve the host suggestion in that case.
+        if (state.host_menu_profile_has_next[i]) continue;
+        auto bindings = state.host_menu_profile_bindings[i];
+        const auto menu = menu_bindings_for_profile(state, i);
+        if (menu.empty()) continue;
+        for (const auto& binding : menu) {
+            if (std::none_of(bindings.begin(), bindings.end(), [&](const auto& existing) {
+                return existing.action == binding.action && existing.binding == binding.binding;
+            })) bindings.push_back(binding);
+        }
         const XrInteractionProfileSuggestedBinding suggestion{
             XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING, nullptr,
             state.menu_profiles[i], static_cast<std::uint32_t>(bindings.size()), bindings.data()};
@@ -1534,11 +1710,22 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateActionSet(
     auto& state = it->second;
     if (!state.dispatch.create_action_set) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const auto result = state.dispatch.create_action_set(instance, info, action_set);
+    log_startup("input-v2 create_action_set name=%s priority=%u result=%d set=%p\n",
+        info ? info->actionSetName : "null", info ? info->priority : 0, result,
+        XR_SUCCEEDED(result) && action_set ? *action_set : XR_NULL_HANDLE);
     if (XR_SUCCEEDED(result)) state.host_action_sets_created = true;
     return result;
 }
 
 // Forward declarations for entry points returned by the layer GIPA.
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStateBoolean(
+    XrSession, const XrActionStateGetInfo*, XrActionStateBoolean*);
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStateFloat(
+    XrSession, const XrActionStateGetInfo*, XrActionStateFloat*);
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStateVector2f(
+    XrSession, const XrActionStateGetInfo*, XrActionStateVector2f*);
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStatePose(
+    XrSession, const XrActionStateGetInfo*, XrActionStatePose*);
 extern "C" {
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetInstanceProcAddr(
     XrInstance, const char*, PFN_xrVoidFunction*
@@ -1629,6 +1816,10 @@ namespace {
         "xrAttachSessionActionSets", cheeky_xrAttachSessionActionSets
     )
     CHEEKY_INTERCEPT("xrSyncActions", cheeky_xrSyncActions)
+    CHEEKY_INTERCEPT("xrGetActionStatePose", cheeky_xrGetActionStatePose)
+    CHEEKY_INTERCEPT("xrGetActionStateBoolean", cheeky_xrGetActionStateBoolean)
+    CHEEKY_INTERCEPT("xrGetActionStateFloat", cheeky_xrGetActionStateFloat)
+    CHEEKY_INTERCEPT("xrGetActionStateVector2f", cheeky_xrGetActionStateVector2f)
     CHEEKY_INTERCEPT("xrLocateViews", cheeky_xrLocateViews)
     CHEEKY_INTERCEPT("xrCreateSwapchain", cheeky_xrCreateSwapchain)
     CHEEKY_INTERCEPT("xrDestroySwapchain", cheeky_xrDestroySwapchain)
@@ -1706,8 +1897,17 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
     bool cylinder_enabled{};
     for (std::uint32_t i{}; i < info->enabledExtensionCount; ++i)
         cylinder_enabled |= std::strcmp(info->enabledExtensionNames[i], XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) == 0;
-    const auto cylinder_availability = cylinder_enabled ? ExtensionAvailability::present :
+    auto cylinder_availability = cylinder_enabled ? ExtensionAvailability::present :
         extension_availability(next_gipa, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    // Cyberpunk/OFXR/SteamVR: a rejected speculative creation followed by a
+    // retry correlates with duplicate client state and a missing input manifest.
+    // Cylinders are optional menu geometry; retain the quad fallback when the
+    // downstream layer cannot confirm support. Never remove host requests.
+    if (!cylinder_enabled && cylinder_availability == ExtensionAvailability::unknown &&
+        std::strcmp(info->applicationInfo.applicationName, "CyberpunkVRPort") == 0) {
+        cylinder_availability = ExtensionAvailability::absent;
+        log_startup("Cyberpunk compatibility: unconfirmed optional cylinder skipped; quad menu retained\n");
+    }
     bool inject_cylinder = !cylinder_enabled && cylinder_availability != ExtensionAvailability::absent;
     if (cylinder_enabled) log_startup("probe extension=%s availability=application_requested\n", XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     if (cylinder_availability == ExtensionAvailability::unknown) {
@@ -1976,6 +2176,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
     XrSpace gaze_space{XR_NULL_HANDLE};
     XrSpace calibration_local_space{XR_NULL_HANDLE};
     std::array<XrSpace, 2> menu_aim_spaces{};
+    std::array<XrSpace, 2> host_menu_spaces{};
     {
         std::lock_guard lock(state_mutex);
         const auto session_it = sessions.find(session);
@@ -1987,6 +2188,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         gaze_space = session_it->second.gaze_space;
         calibration_local_space = session_it->second.calibration_local_space;
         menu_aim_spaces = session_it->second.menu_aim_spaces;
+        for (unsigned hand = 0; hand < 2; ++hand) host_menu_spaces[hand] = session_it->second.host_menu_hands[hand].space;
         session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
         sessions.erase(session_it);
         for (auto iterator = swapchains.begin(); iterator != swapchains.end();) {
@@ -2005,6 +2207,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
     if (calibration_local_space != XR_NULL_HANDLE && dispatch.destroy_space)
         static_cast<void>(dispatch.destroy_space(calibration_local_space));
     if (dispatch.destroy_space) for (const auto space : menu_aim_spaces)
+        if (space != XR_NULL_HANDLE) static_cast<void>(dispatch.destroy_space(space));
+    if (dispatch.destroy_space) for (const auto space : host_menu_spaces)
         if (space != XR_NULL_HANDLE) static_cast<void>(dispatch.destroy_space(space));
     return dispatch.destroy_session == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
@@ -2146,7 +2350,7 @@ cheeky_xrSuggestInteractionProfileBindings(
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const bool gaze_profile_match = gaze_action != XR_NULL_HANDLE &&
         suggested->interactionProfile == gaze_profile;
-    if (!gaze_profile_match && menu_bindings.empty()) {
+    if (!gaze_profile_match && menu_bindings.empty() && menu_profile_index >= 5) {
         return next(instance, suggested);
     }
 
@@ -2169,6 +2373,9 @@ cheeky_xrSuggestInteractionProfileBindings(
     merged.countSuggestedBindings = static_cast<std::uint32_t>(bindings.size());
     merged.suggestedBindings = bindings.data();
     const auto result = next(instance, &merged);
+    log_startup("input-v2 suggest profile=%llu host=%u merged=%u menu_profile=%zu result=%d\n",
+        static_cast<unsigned long long>(suggested->interactionProfile),
+        suggested->countSuggestedBindings, merged.countSuggestedBindings, menu_profile_index, result);
     if (XR_SUCCEEDED(result)) {
         std::lock_guard lock(state_mutex);
         const auto iterator = instances.find(instance);
@@ -2177,8 +2384,15 @@ cheeky_xrSuggestInteractionProfileBindings(
                 iterator->second.gaze_binding_submitted = true;
                 iterator->second.binding_result = result;
             }
-            if (menu_profile_index < iterator->second.menu_bindings_submitted.size())
-                iterator->second.menu_bindings_submitted[menu_profile_index] = true;
+            if (menu_profile_index < iterator->second.menu_bindings_submitted.size()) {
+                auto& host = iterator->second.host_menu_profile_bindings[menu_profile_index];
+                host.clear();
+                if (suggested->suggestedBindings && suggested->countSuggestedBindings)
+                    host.assign(suggested->suggestedBindings,
+                        suggested->suggestedBindings + suggested->countSuggestedBindings);
+                iterator->second.host_menu_profile_has_next[menu_profile_index] = suggested->next != nullptr;
+                iterator->second.menu_bindings_submitted[menu_profile_index] = !menu_bindings.empty();
+            }
         }
     }
     return result;
@@ -2225,6 +2439,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrAttachSessionActionSets(
     merged.countActionSets = static_cast<std::uint32_t>(action_sets.size());
     merged.actionSets = action_sets.data();
     const auto result = next(session, &merged);
+    log_startup("input-v2 attach session=%p host=%u merged=%u gaze=%p menu=%p result=%d\n",
+        session, attach_info->countActionSets, merged.countActionSets,
+        layer_action_set, menu_action_set, result);
     {
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
@@ -2248,6 +2465,11 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
     XrActionSet menu_action_set{XR_NULL_HANDLE};
     XrAction gaze_action{XR_NULL_HANDLE};
     bool attached{};
+    Dispatch diagnostic_dispatch{};
+    XrInstance diagnostic_instance{XR_NULL_HANDLE};
+    std::array<XrPath, 2> diagnostic_hands{};
+    XrSessionState diagnostic_state{};
+    bool diagnostic_due{}, diagnostic_menu{};
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
@@ -2259,6 +2481,17 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         gaze_action = instance->gaze_action;
         attached = sessions.at(session).action_attached;
         ++sessions.at(session).input.host_sync_calls;
+        auto& tracked = sessions.at(session);
+        const auto now = GetTickCount64();
+        diagnostic_due = now - tracked.input_log_tick >= 2000;
+        if (diagnostic_due) {
+            tracked.input_log_tick = now;
+            diagnostic_dispatch = instance->dispatch;
+            diagnostic_instance = instance->instance;
+            diagnostic_hands = instance->menu_hand_paths;
+            diagnostic_state = tracked.state;
+            diagnostic_menu = tracked.diagnostic_menu_visible;
+        }
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
 
@@ -2290,6 +2523,23 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
     const auto result = next(session, &merged);
 
     bool active{};
+    if (diagnostic_due) {
+        log_startup("input-v2 sync session=%p state=%d host=%u merged=%u menu_visible=%u menu_active=%u result=%d\n",
+            session, diagnostic_state, sync_info->countActiveActionSets, merged.countActiveActionSets,
+            unsigned(diagnostic_menu), unsigned(attached && menu_action_set != XR_NULL_HANDLE), result);
+        for (unsigned hand = 0; hand < 2; ++hand) {
+            XrInteractionProfileState profile{XR_TYPE_INTERACTION_PROFILE_STATE};
+            const auto hr = diagnostic_dispatch.get_current_profile && diagnostic_hands[hand] != XR_NULL_PATH
+                ? diagnostic_dispatch.get_current_profile(session, diagnostic_hands[hand], &profile)
+                : XR_ERROR_FUNCTION_UNSUPPORTED;
+            char name[XR_MAX_PATH_LENGTH]{}; uint32_t size{};
+            const auto name_hr = XR_SUCCEEDED(hr) && profile.interactionProfile != XR_NULL_PATH && diagnostic_dispatch.path_to_string
+                ? diagnostic_dispatch.path_to_string(diagnostic_instance, profile.interactionProfile,
+                    sizeof(name), &size, name) : XR_ERROR_PATH_INVALID;
+            log_startup("input-v2 profile hand=%u result=%d path=%llu name_result=%d name=%s\n",
+                hand, hr, static_cast<unsigned long long>(profile.interactionProfile), name_hr, name);
+        }
+    }
     XrResult pose_result{static_cast<XrResult>(CHEEKY_GAZE_RESULT_NOT_CALLED)};
     if (result == XR_SUCCESS && attached && gaze_action != XR_NULL_HANDLE &&
         get_pose != nullptr) {
@@ -2319,6 +2569,81 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         }
     }
     return result;
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStatePose(
+    XrSession session, const XrActionStateGetInfo* info, XrActionStatePose* output) {
+    PFN_xrGetActionStatePose next{};
+    bool due{}; unsigned hand = 2;
+    {
+        std::lock_guard lock(state_mutex);
+        const auto it = sessions.find(session);
+        auto* instance = find_instance_for_session_locked(session);
+        if (it == sessions.end() || !instance) return XR_ERROR_HANDLE_INVALID;
+        next = instance->dispatch.get_action_state_pose;
+        if (info) for (unsigned i = 0; i < 2; ++i)
+            if (info->subactionPath == instance->menu_hand_paths[i]) hand = i;
+        const auto now = GetTickCount64();
+        due = now - it->second.pose_log_ticks[hand] >= 2000;
+        if (due) it->second.pose_log_ticks[hand] = now;
+    }
+    if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result = next(session, info, output);
+    if (due) log_startup("input-v2 host_pose session=%p hand=%u action=%p result=%d active=%u\n",
+        session, hand, info ? info->action : XR_NULL_HANDLE, result,
+        unsigned(XR_SUCCEEDED(result) && output && output->isActive == XR_TRUE));
+    return result;
+}
+
+template<class Output, class Fn>
+XrResult diagnostic_input(XrSession session, const XrActionStateGetInfo* info,
+    Output* output, Fn Dispatch::* member, XrStructureType type, const char* label) {
+    Fn next{}; bool due{}; unsigned hand = 2;
+    {
+        std::lock_guard lock(state_mutex);
+        auto it = sessions.find(session);
+        auto* instance = find_instance_for_session_locked(session);
+        if (it == sessions.end() || !instance) return XR_ERROR_HANDLE_INVALID;
+        next = instance->dispatch.*member;
+        if (info) {
+            for (unsigned i = 0; i < 2; ++i)
+                if (info->subactionPath == instance->menu_hand_paths[i]) hand = i;
+            auto& samples = it->second.input_samples;
+            const auto now = GetTickCount64();
+            auto sample = std::find_if(samples.begin(), samples.end(), [&](const auto& s) {
+                return s.action == info->action && s.path == info->subactionPath && s.type == type;
+            });
+            if (sample == samples.end()) {
+                if (samples.size() < 128) { samples.push_back({info->action, info->subactionPath, type, now}); due = true; }
+            } else if (now - sample->tick >= 2000) { sample->tick = now; due = true; }
+        }
+    }
+    if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result = next(session, info, output); // exactly one query; no rewriting host output
+    if (due) {
+        double x{}, y{}; unsigned active{}, changed{};
+        if (XR_SUCCEEDED(result) && output) {
+            active = output->isActive; changed = output->changedSinceLastSync;
+            if constexpr (std::is_same_v<Output, XrActionStateVector2f>) {
+                x = output->currentState.x; y = output->currentState.y;
+            } else x = output->currentState;
+        }
+        log_startup("input-v3 host_%s session=%p hand=%u action=%p result=%d active=%u changed=%u x=%.4f y=%.4f\n",
+            label, session, hand, info->action, result, active, changed, x, y);
+    }
+    return result;
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStateBoolean(
+    XrSession s, const XrActionStateGetInfo* i, XrActionStateBoolean* o) {
+    return diagnostic_input(s, i, o, &Dispatch::get_action_state_boolean, XR_TYPE_ACTION_STATE_BOOLEAN, "button");
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStateFloat(
+    XrSession s, const XrActionStateGetInfo* i, XrActionStateFloat* o) {
+    return diagnostic_input(s, i, o, &Dispatch::get_action_state_float, XR_TYPE_ACTION_STATE_FLOAT, "trigger");
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStateVector2f(
+    XrSession s, const XrActionStateGetInfo* i, XrActionStateVector2f* o) {
+    return diagnostic_input(s, i, o, &Dispatch::get_action_state_vector2f, XR_TYPE_ACTION_STATE_VECTOR2F, "stick");
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(

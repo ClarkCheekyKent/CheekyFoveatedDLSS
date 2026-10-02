@@ -44,6 +44,8 @@ struct ViewState {
     std::int64_t last_snapshot_display_time{};
     std::uint64_t last_snapshot_qpc{};
     bool has_crop{};
+    bool shared_mode{};
+    std::uint64_t shared_session{}, shared_swapchain{};
     bool calibrated_vertical_flip{};
     bool shared_source{};
     std::array<StereoSourceCrop, 2> source_crops{};
@@ -69,6 +71,14 @@ GazeDiagnostics diagnostics{};
 HMODULE snapshot_module{};
 CheekyOpenXRGetGazeSnapshotFn snapshot_function{};
 std::uint64_t qpc_frequency{};
+struct SharedCamera {
+    GazeProjection projection{};
+    std::uint64_t qpc{};
+    std::uint32_t viewport{};
+    bool occupied{};
+};
+std::array<SharedCamera, 8> shared_cameras{};
+std::uint64_t shared_camera_session{};
 
 [[nodiscard]] std::uint64_t qpc_now() noexcept {
     LARGE_INTEGER value{};
@@ -451,6 +461,19 @@ bool calculate_coordinated_crop(
         return true;
     }
     reset_history = false;
+    const bool shared_mode = settings.center_mode == FoveationCenterMode::openxr_gaze_right_eye;
+    {
+        std::lock_guard lock(coordinator_mutex);
+        auto& state = state_for_view(view_id);
+        if (state.shared_mode != shared_mode) {
+            state.temporal = {}; state.mapping = {};
+            state.last_snapshot_display_time = 0; state.last_snapshot_qpc = 0;
+            state.shared_mode = shared_mode;
+        }
+        diagnostics.shared_gaze = shared_mode;
+        diagnostics.shared_fresh = false;
+        diagnostics.shared_projection = false;
+    }
     const auto fixed_settings = settings_for_view(settings, view_id);
     if (resolved_center) *resolved_center = fixed_center(fixed_settings, render_width, render_height);
     const auto eye_assignment = stereo_eye_assignment(view_id);
@@ -493,7 +516,7 @@ bool calculate_coordinated_crop(
     std::lock_guard lock(coordinator_mutex);
     state_for_view(view_id).next_jump_visible = false;
     const bool automatic = settings.auto_stereo_alignment;
-    const auto camera = active_gaze_projection.view == view_id ?
+    auto camera = active_gaze_projection.view == view_id ?
         active_gaze_projection.projection : GazeProjection{};
     // A projection belongs to the current DLSS view, so this route does not
     // depend on guessed left/right evaluation order. Require stereo and a
@@ -584,6 +607,7 @@ bool calculate_coordinated_crop(
         }
     }
     if (!loaded) {
+        if (shared_mode) state_for_view(view_id).temporal = {};
         if (automatic) return auto_crop(nullptr);
         diagnostics.using_gaze = false;
         return calculate_foveation_geometry(
@@ -598,6 +622,122 @@ bool calculate_coordinated_crop(
     const auto now = qpc_now();
     diagnostics.mapping_ambiguous =
         (snapshot.status_flags & CHEEKY_GAZE_STATUS_AMBIGUOUS_RESOURCE) != 0U;
+
+    if (shared_mode) {
+        auto& state = state_for_view(view_id);
+        const bool changed = state.shared_session != snapshot.session_generation ||
+            state.shared_swapchain != snapshot.swapchain_generation;
+        if (changed) {
+            state.temporal = {}; state.mapping = {};
+            state.last_snapshot_display_time = 0; state.last_snapshot_qpc = 0;
+            state.shared_session = snapshot.session_generation;
+            state.shared_swapchain = snapshot.swapchain_generation;
+        }
+        if (shared_camera_session != snapshot.session_generation) {
+            shared_cameras = {};
+            shared_camera_session = snapshot.session_generation;
+        }
+        // Deliberately host-scoped: never borrow another game's/eye's camera.
+        float camera_age_ms = camera.valid ? 0.F : -1.F;
+        unsigned camera_viewport = UINT32_MAX;
+        if (!camera.valid && GetModuleHandleW(L"CyberpunkVR_Stereo.dll")) {
+            const SharedCamera* latest{};
+            for (const auto& entry : shared_cameras) {
+                if (entry.projection.valid && entry.qpc && now >= entry.qpc &&
+                    seconds_between(now, entry.qpc) <= .100 && (!latest || entry.qpc > latest->qpc))
+                    latest = &entry;
+            }
+            if (latest) {
+                camera = latest->projection; camera_viewport = latest->viewport;
+                camera_age_ms = static_cast<float>(1000.0 * seconds_between(now, latest->qpc));
+            }
+        }
+        if (state.last_snapshot_display_time != snapshot.predicted_display_time) {
+            state.last_snapshot_display_time = snapshot.predicted_display_time;
+            state.last_snapshot_qpc = now;
+        }
+        const double age = seconds_between(now, snapshot.publication_qpc);
+        diagnostics.sample_age_ms = static_cast<float>(age * 1000.0);
+        const auto& source = snapshot.views[1];
+        const GazeProjection eye{std::tan(source.fov_left), std::tan(source.fov_right),
+            std::tan(source.fov_up), std::tan(source.fov_down),
+            (source.flags & CHEEKY_GAZE_VIEW_FOV_VALID) != 0U};
+        float u{}, v{};
+        const bool projection = snapshot.view_count == 2 && output_origin_x == 0 && output_origin_y == 0 &&
+            reproject_gaze_center(eye, camera, source.center_u, source.center_v, u, v);
+        constexpr auto required = CHEEKY_GAZE_STATUS_GAZE_VALID | CHEEKY_GAZE_STATUS_ACTION_ACTIVE |
+            CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+        const bool fresh = projection && snapshot.session_generation && snapshot.predicted_display_time &&
+            (snapshot.status_flags & required) == required &&
+            !(snapshot.status_flags & (CHEEKY_GAZE_STATUS_SIMULATED | CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG)) &&
+            snapshot.publication_qpc && now >= snapshot.publication_qpc && age <= gaze_stale_seconds &&
+            seconds_between(now, state.last_snapshot_qpc) <= gaze_stale_seconds;
+        // Never retain a crop expressed in a missing/different camera space.
+        if (!projection) state.temporal = {};
+        const auto fallback = aligned_center(nullptr);
+        const auto temporal = update_gaze_temporal_policy(state.temporal,
+            {seconds_between(now, 0), snapshot.predicted_display_time,
+             std::clamp(u, 0.F, 1.F), std::clamp(v, 0.F, 1.F), fallback.u, fallback.v,
+             settings.gaze_smoothing_ms, gaze_hold_seconds(settings), gaze_return_seconds, fresh});
+        diagnostics.shared_projection = projection;
+        diagnostics.shared_fresh = fresh;
+        diagnostics.shared_view = view_id;
+        diagnostics.shared_u = temporal.center_u; diagnostics.shared_v = temporal.center_v;
+        diagnostics.using_gaze = temporal.using_gaze;
+        // Record failures too: v1 returned before its trace on missing projection,
+        // hiding the static second view behind the first view's ACTIVE status.
+        const unsigned rejection = (!camera.valid ? 1U : 0U) |
+            (!projection ? 2U : 0U) |
+            ((snapshot.status_flags & required) != required ? 4U : 0U) |
+            ((!snapshot.publication_qpc || now < snapshot.publication_qpc || age > gaze_stale_seconds) ? 8U : 0U) |
+            ((!snapshot.predicted_display_time || seconds_between(now, state.last_snapshot_qpc) > gaze_stale_seconds) ? 16U : 0U) |
+            (!snapshot.session_generation ? 32U : 0U) |
+            ((snapshot.status_flags & (CHEEKY_GAZE_STATUS_SIMULATED | CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG)) ? 64U : 0U);
+        const auto publish_result = [&](bool success) {
+            auto* row = &diagnostics.shared_views[0];
+            for (auto& candidate : diagnostics.shared_views) {
+                if (candidate.view == view_id) { row = &candidate; break; }
+                if (!candidate.view || candidate.last_qpc < row->last_qpc) row = &candidate;
+            }
+            if (row->view != view_id) *row = {};
+            row->view = view_id; ++row->calls; row->last_qpc = now;
+            row->fresh = fresh && success; row->fresh_calls += row->fresh; row->fallback_calls += !row->fresh;
+            row->u = temporal.center_u; row->v = temporal.center_v;
+            row->crop_x = crop.input_base_x; row->crop_y = crop.input_base_y;
+            row->rejection = rejection; row->camera_age_ms = camera_age_ms; row->camera_viewport = camera_viewport;
+            if (seconds_between(now, state.last_mapping_log_qpc) >= 2.0) {
+                trace_event("SHARED GAZE v2 view=%llu fresh=%u reject=0x%X projection=%u cameraVP=%u cameraAge=%.1f source=%.4f,%.4f render=%.4f,%.4f crop=%u,%u origin=%u,%u age=%.1f flags=0x%X session=%llu",
+                    static_cast<unsigned long long>(view_id), row->fresh, rejection, projection,
+                    camera_viewport, camera_age_ms, source.center_u, source.center_v,
+                    temporal.center_u, temporal.center_v, crop.input_base_x, crop.input_base_y,
+                    output_origin_x, output_origin_y, diagnostics.sample_age_ms, snapshot.status_flags,
+                    static_cast<unsigned long long>(snapshot.session_generation));
+                state.last_mapping_log_qpc = now;
+            }
+            return success;
+        };
+        // Shared gaze is not calibrated left/right mapping. Keep those claims false.
+        for (auto& d : diagnostics.views) {
+            d.resource_mapped = false; d.stable_matches = 0;
+            d.marker_mapping = d.projection_mapping = d.copy_mapping = d.packed_stereo_mapping = false;
+        }
+        if (!state.temporal.has_filtered) return publish_result(auto_crop(nullptr, changed));
+        const FoveationCenter center{temporal.center_u, temporal.center_v, settings.gaze_quantization_pixels};
+        if (resolved_center) *resolved_center = center;
+        if (!calculate_foveation_geometry_at_center(foveation_parameters(fixed_settings), center,
+                render_width, render_height, output_width, output_height, output_origin_x, output_origin_y, crop))
+            return false;
+        const auto decision = evaluate_gaze_reset(
+            {state.last_crop.input_base_x, state.last_crop.input_base_y,
+                state.last_crop.input_width, state.last_crop.input_height, state.has_crop},
+            {crop.input_base_x, crop.input_base_y, crop.input_width, crop.input_height, true},
+            fresh, temporal.reacquired, changed, settings.gaze_jump_reset_ratio);
+        reset_history = decision.reason != GazeResetReason::none;
+        if (reset_history) diagnostics.last_reset_reason = decision.reason;
+        state.last_crop = crop; state.has_crop = true;
+        if (fresh) ++diagnostics.shared_evaluations;
+        return publish_result(true);
+    }
 
     const auto resource_identity = native_resource_identity?native_resource_identity:canonical_identity(output_resource);
     std::uint32_t matched_index{UINT32_MAX};
@@ -1039,6 +1179,14 @@ void apply_next_jump_preview(Settings& settings, const DlssViewId view_id) noexc
 GazeDiagnostics gaze_diagnostics() noexcept {
     std::lock_guard lock(coordinator_mutex);
     auto result = diagnostics;
+    const auto now = qpc_now();
+    for (auto& row : result.shared_views) if (row.view) {
+        row.evaluation_age_ms = static_cast<float>(1000.0 * seconds_between(now, row.last_qpc));
+        if (result.shared_gaze && now >= row.last_qpc && row.evaluation_age_ms <= 100.F) {
+            ++result.shared_recent_views;
+            result.shared_tracking_views += row.fresh;
+        }
+    }
     // Read independently of DLSS evaluation, so support captures also diagnose
     // sessions where the SR interception path has not run yet.
     HMODULE module{};
@@ -1087,6 +1235,7 @@ void forget_gaze_view(const DlssViewId view_id) noexcept {
     for (auto& view : diagnostics.views) {
         if (view.dlss_view_id == view_id) view = {};
     }
+    for (auto& view : diagnostics.shared_views) if (view.view == view_id) view = {};
 }
 
 void reset_gaze_foveation() noexcept {
@@ -1095,11 +1244,31 @@ void reset_gaze_foveation() noexcept {
     copy_graph.clear();
     pending_copies.clear();
     diagnostics = {};
+    shared_cameras = {}; shared_camera_session = 0;
     snapshot_function = nullptr;
     if (snapshot_module != nullptr) {
         static_cast<void>(FreeLibrary(snapshot_module));
         snapshot_module = nullptr;
     }
+}
+
+void record_shared_gaze_projection(const GazeProjection& projection, std::uint32_t viewport) noexcept {
+    float u{}, v{};
+    const bool valid = projection_forward_center(projection, u, v) &&
+        std::abs(projection.left + projection.right) < .0001F &&
+        std::abs(projection.up + projection.down) < .0001F;
+    std::lock_guard lock(coordinator_mutex);
+    // Invalid data belongs to its publishing viewport, not the other eye.
+    // Keep independent slots so a failed/absent secondary camera cannot erase
+    // the primary's fresh symmetric camera. Same-owner invalidation stays strict.
+    auto* slot = &shared_cameras[0];
+    for (auto& candidate : shared_cameras) {
+        if ((candidate.occupied && candidate.viewport == viewport) || !candidate.occupied) {
+            slot = &candidate; break;
+        }
+        if (candidate.qpc < slot->qpc) slot = &candidate;
+    }
+    *slot = {valid ? projection : GazeProjection{}, qpc_now(), viewport, true};
 }
 
 void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept {

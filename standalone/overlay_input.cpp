@@ -3,6 +3,7 @@
 #include <imgui_internal.h>
 #include <MinHook.h>
 #include <filesystem>
+#include <algorithm>
 extern IMGUI_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 #ifdef CHEEKY_OVERLAY_TEST_DESKTOP
 extern bool cheeky_overlay_test_foreground(HWND);
@@ -145,6 +146,8 @@ void queue_raw_mouse(InputState& input, HRAWINPUT handle) {
     UINT size = sizeof(raw);
     if (GetRawInputData(handle, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) == UINT(-1) ||
         raw.header.dwType != RIM_TYPEMOUSE) return;
+    if (!(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+        queue_raw_motion(input, raw.data.mouse.lLastX, raw.data.mouse.lLastY);
     std::lock_guard lock(input.mutex);
     const auto flags = raw.data.mouse.usButtonFlags;
     for (unsigned button = 0; button < 5; ++button) {
@@ -160,6 +163,8 @@ void toggle_on_window_thread(InputState* input, HWND window) {
     input->open = opening;
     input->pointer_buttons = 0;
     if (opening) {
+        input->raw_pointer_mode = false;
+        { std::lock_guard lock(input->mutex); input->raw_dx = input->raw_dy = 0; }
         capture_owner = input;
         SetCursor(nullptr);
         // Do not leave movement keys held in the game when the menu
@@ -201,12 +206,53 @@ void process_overlay_input(InputState& input, unsigned controller_buttons) {
     }
     if (!input.enabled || !input.open || !foreground(input.window)) return;
     const bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+    input.desktop_button_down = (physical_key_state(swapped ? VK_RBUTTON : VK_LBUTTON) & 0x8000) != 0;
     for (unsigned button = 0; button < 5; ++button) {
         // Preserve message ordering (including quick down/up pairs). Only fill
         // gaps from physical state, bypassing our game's polling suppression.
         if ((message_buttons | controller_buttons) & (1U << button)) continue;
         const auto key = mouse_keys[swapped && button < 2 ? 1 - button : button];
         ImGui::GetIO().AddMouseButtonEvent(button, (physical_key_state(key) & 0x8000) != 0);
+    }
+}
+
+void queue_raw_motion(InputState& input, LONG dx, LONG dy) {
+    if (!dx && !dy) return;
+    std::lock_guard lock(input.mutex);
+    input.raw_dx = (std::clamp)(input.raw_dx + (std::clamp)(dx, -32768L, 32768L), -65536L, 65536L);
+    input.raw_dy = (std::clamp)(input.raw_dy + (std::clamp)(dy, -32768L, 32768L), -65536L, 65536L);
+    input.desktop_pointer_tick = GetTickCount64();
+}
+
+void apply_desktop_pointer(InputState& input, int first_event) {
+    LONG dx{}, dy{};
+    { std::lock_guard lock(input.mutex); dx = input.raw_dx; dy = input.raw_dy; input.raw_dx = input.raw_dy = 0; }
+    if (!foreground(input.window)) { input.raw_pointer_mode = false; input.desktop_button_down = false; return; }
+    auto& io = ImGui::GetIO();
+    if ((dx || dy) && !input.raw_pointer_mode.exchange(true)) {
+        input.raw_x = ImGui::IsMousePosValid(&io.MousePos) ? io.MousePos.x : io.DisplaySize.x * .5F;
+        input.raw_y = ImGui::IsMousePosValid(&io.MousePos) ? io.MousePos.y : io.DisplaySize.y * .5F;
+    }
+    if (input.raw_pointer_mode) {
+        // Games may continuously warp/constrain the OS cursor. Keep the menu's
+        // cursor in client-space and advance it using actual raw mouse motion.
+        input.raw_x = (std::clamp)(input.raw_x + float(dx), 0.F, (std::max)(0.F, io.DisplaySize.x - 1.F));
+        input.raw_y = (std::clamp)(input.raw_y + float(dy), 0.F, (std::max)(0.F, io.DisplaySize.y - 1.F));
+        auto& events = ImGui::GetCurrentContext()->InputEventsQueue;
+        const int first = (std::clamp)(first_event, 0, events.Size);
+        // A backend warp followed by a button edge would make ImGui process
+        // the click at the warped position, then defer our corrected position
+        // until the next frame. Remove conflicting positions and put the raw
+        // cursor BEFORE the edges, retaining buttons/wheel/focus/key ordering.
+        for (int i = events.Size - 1; i >= first; --i)
+            if (events[i].Type == ImGuiInputEventType_MousePos) events.erase(events.Data + i);
+        const int before = events.Size;
+        io.AddMousePosEvent(input.raw_x, input.raw_y);
+        if (events.Size > before) {
+            const auto position = events.back();
+            events.pop_back();
+            events.insert(events.Data + first, position);
+        }
     }
 }
 
@@ -264,6 +310,11 @@ bool save_menu_key(InputState& input, unsigned key) {
 LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     auto* input = static_cast<InputState*>(GetPropW(window, input_property));
     if (!input || !input->previous) return DefWindowProcW(window, message, wparam, lparam);
+    if ((message == WM_MOUSEMOVE && !input->raw_pointer_mode && lparam != input->last_mouse_position) ||
+        message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+        message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
+        input->desktop_pointer_tick = GetTickCount64();
+    if (message == WM_MOUSEMOVE) input->last_mouse_position = lparam;
     const bool focused = foreground(window);
     if (const auto toggle = toggle_message(); toggle && message == toggle) {
         if (input->enabled && focused) toggle_on_window_thread(input, window);

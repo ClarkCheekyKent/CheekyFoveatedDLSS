@@ -597,12 +597,13 @@ void verify_transport(CheekyRuntimeCommandFn command, CheekyRuntimeSnapshotFn ge
 
 int main(int argc, char** argv) {
     try {
-        bool ota_transport{}, ota_only{};
+        bool ota_transport{}, ota_only{}, calibration_disabled{};
         bool uevr{}, dx11{}, conflict{}, optiscaler{}, transport{}, forwarded_transport{},depth24{},backpressure{},init_failure{},release_drain{};
         unsigned openvr_version{}, libovr_mode{};
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--dx11") dx11 = true;
+            else if (arg == "--calibration-disabled") calibration_disabled = true;
             else if (arg == "--libovr") libovr_mode = 1;
             else if (arg == "--libovr-legacy") libovr_mode = 2;
             else if (arg == "--libovr-borrowed") libovr_mode = 3;
@@ -735,7 +736,19 @@ int main(int argc, char** argv) {
             std::ofstream saved(directory / "CheekyFoveatedDLSS.ini");
             saved << "[CheekyFoveatedDLSS]\nSchemaVersion=1\nD3D11D3D12Transport=true\n";
         }
+        if (calibration_disabled) {
+            std::ofstream saved(directory / "CheekyRuntime.ini");
+            saved << "[Calibration]\nEnabled=0\n";
+        }
         require(start(&input) && attachment != 0, "Start before graphics discovery");
+        {
+            const auto full = snapshot(get);
+            const auto pos = full.find("\"eye_calibration\":");
+            require(pos != full.npos, "Calibration snapshot exists");
+            const auto calibration = full.substr(pos);
+            require(contains(calibration, calibration_disabled ? "\"enabled\":false" : "\"enabled\":true"),
+                "Calibration startup preference honored");
+        }
         if (uevr) require(contains(snapshot(get), "\"D3D11D3D12Transport\":true"), "UEVR loads saved transport preference");
         if (libovr_mode) {
             verify_libovr(libovr_mode, fake_libovr, fake_pvr, get, command, attachment);
@@ -878,6 +891,12 @@ int main(int argc, char** argv) {
             "Support ZIP must include capture diagnostics even when VR is unavailable");
         require(contains(zip_contents, optiscaler ? "CheekyFoveatedDLSS-OptiScaler.log" : "CheekyFoveatedDLSS-Standalone.log"), "Support ZIP includes this host's log");
 
+        require(command(attachment, "1\n6\nset\nCenterMode=3"), "Shared-gaze menu command accepted");
+        require(field(snapshot(get), "CenterMode") == 3, "Runtime preserves shared-gaze enum instead of clamping it");
+        require(!command(attachment, "1\n7\nset\nCenterMode=4"), "Unknown center mode rejected");
+        require(command(attachment, "1\n8\nsave"), "Save shared-gaze settings");
+        require(contains(snapshot(get), "\"shared_gaze\":") && contains(snapshot(get), "\"shared_projection\":"),
+            "Support diagnostics expose shared mode separately from eye mapping");
         const auto old_attachment = attachment;
         detach(attachment);
         require(contains(snapshot(get), "\"attached\":false") && contains(snapshot(get), "\"processing\":false"), "Detach pauses resident processing");
@@ -885,6 +904,7 @@ int main(int argc, char** argv) {
         auto wrong_host = input; wrong_host.host = CheekyRuntimeHost::uevr;
         require(!start(&wrong_host), "Resident host identity cannot change");
         require(start(&input) && attachment != old_attachment, "Same host can reattach with a fresh generation");
+        require(field(snapshot(get), "CenterMode") == 3, "Shared gaze survives settings save and reconnect");
         tick(attachment, input.renderer, device, queue.Get());
         detach(old_attachment);
         tick(old_attachment, input.renderer, nullptr, nullptr);

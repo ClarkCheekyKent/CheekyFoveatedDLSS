@@ -21,10 +21,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 using Microsoft::WRL::ComPtr;
 using namespace cheeky::standalone;
 using namespace cheeky::foveated_dlss;
+extern "C" void __cdecl CheekyOpenXRMenuSetPointer(float, float, bool, bool) noexcept;
 // GPU test runners can use a non-interactive window station with no global
 // foreground HWND. Production retains GetForegroundWindow; only this binary
 // supplies an explicit foreground state for reproducible input tests.
@@ -36,6 +38,13 @@ bool test_mouse_down[5]{};
 bool cheeky_overlay_test_mouse_down(unsigned button) { return test_mouse_down[button]; }
 bool cheeky_overlay_test_key_down(int key) { return key == VK_F8 ? test_f8_down : key == test_extra_key && test_extra_down; }
 bool cheeky_overlay_test_foreground(HWND window) { return window && window == test_foreground; }
+std::unordered_map<std::string, ImVec2> control_positions;
+namespace cheeky::standalone {
+void overlay_test_control(const char* label) {
+    const auto a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    control_positions[label] = ImVec2((a.x+b.x)*.5F, (a.y+b.y)*.5F);
+}
+}
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 void check(HRESULT value, const char* message) { require(SUCCEEDED(value), message); }
@@ -135,6 +144,17 @@ void test_ui_diagnostics() {
     state.draft.center_mode = FoveationCenterMode::fixed;
     state.snapshot = R"({"gaze":{"layer":false,"views":1,"alignment":0}})";
     require(render("Stereo / Gaze").find("manual fallback placement") == std::string::npos, "Flat games do not require stereo alignment");
+    state.draft.center_mode = FoveationCenterMode::openxr_gaze;
+    state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":1}})";
+    state.draft.center_mode = FoveationCenterMode::openxr_gaze_right_eye;
+    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"status_flags":127,"alignment":1,"shared_projection":true,"shared_fresh":true,"shared_recent_views":2,"shared_tracking_views":1}})";
+    text = render("Stereo / Gaze");
+    require(text.find("not tracking BOTH") != text.npos && text.find("1 / 2 recent render views") != text.npos,
+        "Last-view success must not hide the static second view");
+    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"status_flags":127,"alignment":1,"shared_projection":true,"shared_fresh":true,"shared_recent_views":2,"shared_tracking_views":2}})";
+    text = render("Stereo / Gaze");
+    require(text.find("Eye Tracking Ready: Yes") != text.npos && text.find("2 / 2 recent render views") != text.npos,
+        "Both-view shared gaze readiness is visible");
     state.draft.center_mode = FoveationCenterMode::openxr_gaze;
     state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":1}})";
     text = render("Stereo / Gaze");
@@ -279,7 +299,24 @@ bool snapshot(char* output, std::uint32_t capacity) {
     const auto text = "{\"message\":\"Overlay regression fixture\",\"settings\":" + settings_json(settings) + "}";
     return strcpy_s(output, capacity, text.c_str()) == 0;
 }
-bool command(std::uint64_t attachment, const char*) { return attachment == 1; }
+unsigned setting_commands{};
+bool command(std::uint64_t attachment, const char* text) {
+    if (attachment != 1) return false;
+    std::string_view request(text);
+    const auto start = request.find("\nset\n");
+    if (start == request.npos) return true;
+    request.remove_prefix(start + 5);
+    while (!request.empty()) {
+        const auto end = request.find('\n');
+        const auto line = request.substr(0, end);
+        const auto equals = line.find('=');
+        if (equals != line.npos) require(set_named_setting(settings, line.substr(0, equals), line.substr(equals+1)), "Runtime fixture rejected setting");
+        if (end == request.npos) break;
+        request.remove_prefix(end+1);
+    }
+    ++setting_commands;
+    return true;
+}
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_POINTERDOWN || message == WM_POINTERUP || message == WM_POINTERUPDATE) ++game_pointer_messages;
     if (message == WM_KEYDOWN || message == WM_KEYUP) ++game_keys;
@@ -574,11 +611,12 @@ int main(int argc, char** argv) {
         ClientToScreen(window.value, &pointer);
         const auto position = MAKELPARAM(pointer.x, pointer.y);
         const auto game_pointer_before = game_pointer_messages;
-        SendMessageW(window.value, WM_POINTERUPDATE, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
+        const auto pointer_proc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window.value, GWLP_WNDPROC));
+        CallWindowProcW(pointer_proc, window.value, WM_POINTERUPDATE, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
         draw();
-        SendMessageW(window.value, WM_POINTERDOWN, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY | POINTER_MESSAGE_FLAG_FIRSTBUTTON | POINTER_MESSAGE_FLAG_INCONTACT), position);
+        CallWindowProcW(pointer_proc, window.value, WM_POINTERDOWN, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY | POINTER_MESSAGE_FLAG_FIRSTBUTTON | POINTER_MESSAGE_FLAG_INCONTACT), position);
         draw();
-        SendMessageW(window.value, WM_POINTERUP, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
+        CallWindowProcW(pointer_proc, window.value, WM_POINTERUP, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
         draw();
         require(pointer_checkbox, "Pointer click must toggle the overlay checkbox");
         require(game_pointer_messages == game_pointer_before, "Menu pointer click leaked to game");
@@ -590,6 +628,59 @@ int main(int argc, char** argv) {
         test_mouse_down[0] = false;
         draw(); draw();
         require(!pointer_checkbox, "Physical mouse click without messages must toggle the menu checkbox once");
+        // Drive the production XR entry point, not a synthetic Win32 click.
+        wchar_t exe_path[32768]{};
+        require(GetModuleFileNameW(nullptr, exe_path, 32768) != 0, "Test executable path");
+        const auto layer_path = std::filesystem::path(exe_path).parent_path().parent_path().parent_path() /
+            L"build/binding-regression/Release/CheekyOpenXRLayer.dll";
+        const auto layer = LoadLibraryW(layer_path.c_str());
+        require(layer != nullptr, "Build binding-regression layer before running XR host pointer integration test");
+        attach_input(window.value)->desktop_pointer_tick = 0;
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, false, true);
+        draw(); draw();
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, true, true);
+        draw(); draw();
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, false, true);
+        draw(); draw();
+        require(pointer_checkbox, "OpenXR pointer must toggle the real overlay checkbox");
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, true, true);
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, false, true);
+        draw(); draw(); draw();
+        require(!pointer_checkbox, "OpenXR press/release between Presents must not be lost");
+        test_foreground = nullptr;
+        SendMessageW(window.value, WM_KILLFOCUS, 0, 0);
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, true, true);
+        draw(); draw();
+        CheekyOpenXRMenuSetPointer(pointer_checkbox_position.x, pointer_checkbox_position.y, false, true);
+        draw(); draw();
+        require(pointer_checkbox, "Headset click must work without desktop focus");
+        test_foreground = window.value;
+        SendMessageW(window.value, WM_SETFOCUS, 0, 0);
+        CheekyOpenXRMenuSetPointer(0, 0, false, false);
+        draw(); draw();
+        auto* raw_input = attach_input(window.value);
+        queue_raw_motion(*raw_input, -100, 100);
+        draw(); draw();
+        require(std::abs(ImGui::GetIO().MousePos.x - (pointer_checkbox_position.x - 100)) < 1.F,
+            "Raw mouse motion must move menu cursor independently of OS cursor");
+        SendMessageW(window.value, WM_MOUSEMOVE, 0, MAKELPARAM(400, 300));
+        draw(); draw();
+        require(std::abs(ImGui::GetIO().MousePos.x - (pointer_checkbox_position.x - 100)) < 1.F,
+            "Game cursor recenter must not reset raw menu pointer");
+        queue_raw_motion(*raw_input, 100, -100);
+        draw(); draw();
+        test_mouse_down[0] = true; draw(); draw();
+        test_mouse_down[0] = false; draw(); draw();
+        require(!pointer_checkbox, "Raw pointer plus physical mouse click must toggle checkbox");
+        // Host warps cursor in the same message batch as the click. The menu
+        // pointer must own the position BEFORE ImGui processes that edge.
+        SendMessageW(window.value, WM_MOUSEMOVE, 0, MAKELPARAM(400, 300));
+        SendMessageW(window.value, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(400, 300));
+        test_mouse_down[0] = true; draw(); draw();
+        SendMessageW(window.value, WM_MOUSEMOVE, 0, MAKELPARAM(400, 300));
+        SendMessageW(window.value, WM_LBUTTONUP, 0, MAKELPARAM(400, 300));
+        test_mouse_down[0] = false; draw(); draw();
+        require(pointer_checkbox, "Same-batch game cursor warp must not steal raw-pointer click");
         test_foreground = nullptr; test_mouse_down[0] = true;
         require((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0, "Unfocused menu suppressed the game's mouse polling");
         test_foreground = window.value; test_mouse_down[0] = false;
@@ -599,6 +690,40 @@ int main(int argc, char** argv) {
             "Menu viewport must match actual backbuffer, not window client size");
         require(ImGui::GetIO().MouseDrawCursor, "Menu cursor must remain visible at the hit-test position");
         ImGui::RemoveContextHook(imgui, hook_id);
+        // Real menu -> real input queue -> command protocol -> settings snapshot.
+        // Record item bounds only; do not directly set UI state or synthesize a
+        // successful command. Include the game's warp in each mouse click batch.
+        const auto click_control = [&](const char* label) {
+            require(control_positions.contains(label), "Real menu control not rendered");
+            const auto target = control_positions.at(label);
+            const auto cursor = ImGui::GetIO().MousePos;
+            queue_raw_motion(*raw_input, LONG(std::lround(target.x-cursor.x)), LONG(std::lround(target.y-cursor.y)));
+            draw(); draw();
+            SendMessageW(window.value, WM_MOUSEMOVE, 0, MAKELPARAM(400, 300));
+            SendMessageW(window.value, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(400, 300));
+            test_mouse_down[0] = true; draw(); draw();
+            SendMessageW(window.value, WM_MOUSEMOVE, 0, MAKELPARAM(400, 300));
+            SendMessageW(window.value, WM_LBUTTONUP, 0, MAKELPARAM(400, 300));
+            test_mouse_down[0] = false; draw(); draw();
+        };
+        draw(); draw();
+        const auto hook_before = settings.d3d12_lower_hook;
+        const auto commands_before = setting_commands;
+        click_control("D3D12LowerHook");
+        require(settings.d3d12_lower_hook != hook_before && setting_commands > commands_before,
+            "Actual General checkbox must send and apply runtime setting");
+        click_control("DLSS-SR");
+        const auto enabled_before = settings.enabled;
+        click_control("Enabled");
+        require(settings.enabled != enabled_before, "Actual DLSS-SR checkbox must change runtime setting");
+        const auto enabled_after_mouse = settings.enabled;
+        const auto xr_target = control_positions.at("Enabled");
+        raw_input->desktop_pointer_tick = 0;
+        CheekyOpenXRMenuSetPointer(xr_target.x, xr_target.y, false, true); draw(); draw();
+        CheekyOpenXRMenuSetPointer(xr_target.x, xr_target.y, true, true); draw(); draw();
+        CheekyOpenXRMenuSetPointer(xr_target.x, xr_target.y, false, true); draw(); draw();
+        require(settings.enabled != enabled_after_mouse, "Actual controller click must change runtime setting");
+        std::puts("PASS: real General/SR tabs and settings commands with warped mouse and XR pointer");
         auto* focus_input = attach_input(window.value);
         test_foreground = nullptr;
         SendMessageW(window.value, WM_KILLFOCUS, 0, 0);
@@ -626,8 +751,8 @@ int main(int argc, char** argv) {
         test_mouse_down[0] = true;
         require((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0, "Closed menu suppressed the game's mouse polling");
         test_mouse_down[0] = false;
-        SendMessageW(window.value, WM_POINTERDOWN, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY | POINTER_MESSAGE_FLAG_FIRSTBUTTON), position);
-        SendMessageW(window.value, WM_POINTERUP, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
+        CallWindowProcW(pointer_proc, window.value, WM_POINTERDOWN, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY | POINTER_MESSAGE_FLAG_FIRSTBUTTON), position);
+        CallWindowProcW(pointer_proc, window.value, WM_POINTERUP, MAKEWPARAM(1, POINTER_MESSAGE_FLAG_PRIMARY), position);
         require(game_pointer_messages == game_pointer_before + 2, "Closed overlay must pass pointer clicks to game");
         const auto pump = [] {
             MSG message;
