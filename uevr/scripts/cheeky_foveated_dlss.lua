@@ -8,6 +8,48 @@ local error_text = nil
 local last_snapshot_frame = 0
 local ready_edits, slider_edits = {}, {}
 
+local config_filename = "cheeky.txt"
+local disableMod = nil
+
+local function check_enable()
+    if disableMod == 1 then 
+        print("dispatching disable command")
+        uevr.api:dispatch_custom_event("load", "false")
+    else
+        print("dispatching enable command")
+        uevr.api:dispatch_custom_event("load", "true")
+    end
+end
+
+local function get_mod_enabled_from_config()
+	local read_val = 1
+    local config_data = fs.read(config_filename)
+    if config_data then
+        for key, value in config_data:gmatch("([^=]+)=([^\n]+)\n?") do
+            local num_val = tonumber(value)
+			if key == "disableMod" then read_val = num_val end
+		end
+	end
+	return read_val
+end
+
+local function write_config()
+    local config = "" -- Initialize config as an empty string
+    if disableMod == nil then  return end
+    
+    ---------------------------------------------------
+    -- Group 1: Integer (or Boolean-like) values
+    ---------------------------------------------------
+    local valid = false
+	local var = 0
+	
+	config = config .. string.format("disableMod=%d\n", disableMod)
+    fs.write(config_filename, config)
+end
+
+disableMod = get_mod_enabled_from_config()
+check_enable() 
+
 local function send(action, changes)
     request = request + 1
     local lines = {tostring(protocol), tostring(request), action}
@@ -236,6 +278,18 @@ local function afw_controls()
 end
 
 uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
+    local changed, value = imgui.checkbox("Disable Cheeky", disableMod == 1)
+    if changed == true then
+        if value == true then 
+            disableMod = 1
+        else
+            disableMod = 0
+        end
+        write_config()
+        check_enable()
+    end
+    if disableMod == 1 then return end
+     
     if not imgui.tree_node("Cheeky Foveated DLSS") then return end
     if error_text then text(error_text) end
     if not status then
