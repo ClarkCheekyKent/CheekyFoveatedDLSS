@@ -154,6 +154,8 @@ struct GpuResources {
     std::array<ID3D12Resource*, exposure_descriptor_slots> exposures{};
     std::array<std::uint64_t, exposure_descriptor_slots> exposure_uses{};
     std::uint64_t exposure_clock{};
+    ID3D12Resource* exposure_readback{}; // Two placed texels for the periodic exposure log.
+    std::uint64_t exposure_samples{};
 };
 
 struct CachedFeature {
@@ -210,6 +212,7 @@ void release_gpu(GpuResources& gpu) noexcept {
     release(gpu.original_output);
     release(gpu.game_output);
     for (auto*& exposure : gpu.exposures) release(exposure);
+    release(gpu.exposure_readback);
     gpu = {};
 }
 
@@ -938,6 +941,58 @@ CodecExposure bind_codec_exposure(const DlssNrFrame& frame, GpuResources& gpu) n
     return {source, null_exposure_descriptor + 1U + slot, source.pre / source.scale};
 }
 
+// Every 900 evaluations, logs the previous sample and copies the current
+// exposure texel. That copy completed hundreds of frames earlier, so reading
+// it never waits on the GPU. 16-bit exposure formats are not sampled.
+void sample_codec_exposure(const DlssNrFrame& frame, GpuResources& gpu, const CodecExposure& exposure) noexcept {
+    constexpr std::uint64_t interval = 900U;
+    constexpr UINT64 slot_bytes = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    if (!exposure.source.texture || gpu.exposure_clock % interval != 1U) return;
+    const auto format = exposure.source.texture->GetDesc().Format;
+    if (format != DXGI_FORMAT_R32_FLOAT && format != DXGI_FORMAT_R32G32_FLOAT &&
+        format != DXGI_FORMAT_R32G32B32A32_FLOAT) return;
+    if (!gpu.exposure_readback) {
+        ID3D12Device* device{};
+        if (FAILED(frame.command_list->GetDevice(IID_PPV_ARGS(&device))) || !device) return;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 2U * slot_bytes;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1U;
+        buffer.SampleDesc.Count = 1U;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto result = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gpu.exposure_readback));
+        release(device);
+        if (FAILED(result)) return;
+    }
+    const auto slot = gpu.exposure_samples++ % 2U;
+    if (gpu.exposure_samples > 1U) {
+        const D3D12_RANGE range{(1U - slot) * slot_bytes, (1U - slot) * slot_bytes + sizeof(float)};
+        void* mapped{};
+        if (SUCCEEDED(gpu.exposure_readback->Map(0U, &range, &mapped))) {
+            float value{};
+            std::memcpy(&value, static_cast<const std::byte*>(mapped) + range.Begin, sizeof(value));
+            const D3D12_RANGE written{};
+            gpu.exposure_readback->Unmap(0U, &written);
+            trace_event("DLSS-NR exposure sample view=%llu exposure=%.9g white=%.9g",
+                static_cast<unsigned long long>(frame.view_id), value,
+                value > 0.F ? exposure.white_multiplier / value : 0.F);
+        }
+    }
+    D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+    source.pResource = exposure.source.texture;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.pResource = gpu.exposure_readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Offset = slot * slot_bytes;
+    destination.PlacedFootprint.Footprint = {format, 1U, 1U, 1U, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+    transition(frame.command_list, exposure.source.texture, exposure.source.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    frame.command_list->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
+    transition(frame.command_list, exposure.source.texture, D3D12_RESOURCE_STATE_COPY_SOURCE, exposure.source.state);
+}
+
 void dispatch_codec(
     const DlssNrFrame& frame,
     GpuResources& gpu,
@@ -1324,6 +1379,7 @@ bool evaluate_dlss_nr(
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
     const auto exposure = bind_codec_exposure(frame, *gpu);
+    sample_codec_exposure(frame, *gpu, exposure);
     dispatch_codec(
         frame,
         *gpu,

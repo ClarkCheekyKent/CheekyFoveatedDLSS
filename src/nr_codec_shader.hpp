@@ -54,7 +54,9 @@ cbuffer CodecConstants : register(b0) {
 };
 
 // Unexposed HDR color (e.g. Control) maps scene white to preExposure /
-// (exposure * exposureScale), not to 1. The Vulkan codec binds no exposure.
+// (exposure * exposureScale), not to 1. Bright scenes exceed the debug
+// overlays' 1024 bound; clipping there turns NR gray again, so only reject
+// degenerate values. The Vulkan codec binds no exposure.
 #ifndef __spirv__
 Texture2D<float4> GameExposure : register(t3);
 #endif
@@ -64,7 +66,7 @@ float ExposureWhite() {
     if (ExposureWhiteMultiplier > 0.0) {
         const float exposure = GameExposure.Load(int3(0, 0, 0)).r;
         if (isfinite(exposure) && exposure > 0.0)
-            white = clamp(ExposureWhiteMultiplier / exposure, 0.0001, 1024.0);
+            white = clamp(ExposureWhiteMultiplier / exposure, 0.000001, 1000000.0);
     }
 #endif
     return white;

@@ -609,40 +609,17 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
     }
     {
         // Control supplies unexposed HDR color with a 1x1 exposure texture: scene
-        // white is preExposure / (exposure * exposureScale) = 100, not 1. NR must
-        // normalize by it; clipping at 1 returns luminance without chroma. The
-        // Streamline route reads the exposure tag, native and lower-hook routes
-        // the NGX parameters.
+        // white is preExposure / (exposure * exposureScale), e.g. 100 indoors and
+        // thousands in bright dialogue lighting, not 1. NR must normalize by it;
+        // clipping returns luminance without chroma. The Streamline route reads
+        // the exposure tag, native and lower-hook routes the NGX parameters.
         D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC exposure_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D,0,1,1,1,1,DXGI_FORMAT_R32_FLOAT,{1,0},
             D3D12_TEXTURE_LAYOUT_UNKNOWN,D3D12_RESOURCE_FLAG_NONE};
         ComPtr<ID3D12Resource> exposure;
-        check(f.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&exposure_desc,D3D12_RESOURCE_STATE_COPY_DEST,
+        check(f.device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&exposure_desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             nullptr,IID_PPV_ARGS(&exposure)), "Create exposure texture");
         auto exposure_upload=make_buffer(256,D3D12_HEAP_TYPE_UPLOAD);
-        check(exposure_upload->Map(0,nullptr,&mapped), "Map exposure");
-        *static_cast<float*>(mapped)=0.01F;
-        exposure_upload->Unmap(0,nullptr);
-        D3D12_TEXTURE_COPY_LOCATION exposure_src{}, exposure_dst{};
-        exposure_src.pResource=exposure_upload.Get(); exposure_src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        exposure_src.PlacedFootprint.Footprint={DXGI_FORMAT_R32_FLOAT,1,1,1,256};
-        exposure_dst.pResource=exposure.Get(); exposure_dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        f.list->CopyTextureRegion(&exposure_dst,0,0,0,&exposure_src,nullptr);
-        transition_resource(exposure.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        check(color_upload->Map(0,nullptr,&mapped), "Map HDR NR color");
-        for (unsigned y = 0; y < color_desc.Height; ++y) {
-            auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + color_fp.Offset + y*color_fp.Footprint.RowPitch);
-            for (unsigned x = 0; x < color_desc.Width; ++x) {
-                row[4*x] = DirectX::PackedVector::XMConvertFloatToHalf(100.F);
-                row[4*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(20.F);
-                row[4*x+2] = DirectX::PackedVector::XMConvertFloatToHalf(5.F);
-                row[4*x+3] = DirectX::PackedVector::XMConvertFloatToHalf(0.25F);
-            }
-        }
-        color_upload->Unmap(0,nullptr);
-        transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
-        f.list->CopyTextureRegion(&color_dst,0,0,0,&color_src,nullptr);
-        transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         // Streamline takes NR's HDR contract from the game's feature creation.
         const auto recreate_flags = [&](unsigned flags) {
             f.params.Set("DLSS.Feature.Create.Flags",flags);
@@ -662,23 +639,54 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
         }
         f.params.Set("ExposureTexture", exposure.Get());
         f.params.Set("DLSS.Pre.Exposure", 1.F); f.params.Set("DLSS.Exposure.Scale", 1.F);
-        command("1\n96\nset\nNrPaperWhiteScale=1\nNrWorkingScale=1\nNrHdrTransferStrength=1"); evaluate(0);
-        require(sr_inputs.size() == 1 && sr_inputs[0].color != f.textures12[0].Get(), "HDR color round trip did not execute NR");
-        auto readback=make_buffer(256,D3D12_HEAP_TYPE_READBACK);
-        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
-        from.pResource=sr_inputs[0].color; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        to.pResource=readback.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        to.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16B16A16_FLOAT,1,1,1,256};
-        const D3D12_BOX pixel{0,0,0,1,1,1};
-        transition_resource(from.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
-        f.list->CopyTextureRegion(&to,0,0,0,&from,&pixel);
-        transition_resource(from.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        f.finish_gpu(); check(readback->Map(0,nullptr,&mapped), "Map HDR NR color result");
-        const auto* result = static_cast<const DirectX::PackedVector::HALF*>(mapped);
-        const float r=DirectX::PackedVector::XMConvertHalfToFloat(result[0]);
-        const float g=DirectX::PackedVector::XMConvertHalfToFloat(result[1]);
-        const float b=DirectX::PackedVector::XMConvertHalfToFloat(result[2]);
-        readback->Unmap(0,nullptr);
+        command("1\n96\nset\nNrPaperWhiteScale=1\nNrWorkingScale=1\nNrHdrTransferStrength=1");
+        // An orange at scene white through an identity model keeps its chroma.
+        const auto round_trip = [&](float white) {
+            check(exposure_upload->Map(0,nullptr,&mapped), "Map exposure");
+            *static_cast<float*>(mapped)=1.F/white;
+            exposure_upload->Unmap(0,nullptr);
+            D3D12_TEXTURE_COPY_LOCATION exposure_src{}, exposure_dst{};
+            exposure_src.pResource=exposure_upload.Get(); exposure_src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            exposure_src.PlacedFootprint.Footprint={DXGI_FORMAT_R32_FLOAT,1,1,1,256};
+            exposure_dst.pResource=exposure.Get(); exposure_dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            transition_resource(exposure.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+            f.list->CopyTextureRegion(&exposure_dst,0,0,0,&exposure_src,nullptr);
+            transition_resource(exposure.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            check(color_upload->Map(0,nullptr,&mapped), "Map HDR NR color");
+            for (unsigned y = 0; y < color_desc.Height; ++y) {
+                auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + color_fp.Offset + y*color_fp.Footprint.RowPitch);
+                for (unsigned x = 0; x < color_desc.Width; ++x) {
+                    row[4*x] = DirectX::PackedVector::XMConvertFloatToHalf(white);
+                    row[4*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(white*.2F);
+                    row[4*x+2] = DirectX::PackedVector::XMConvertFloatToHalf(white*.05F);
+                    row[4*x+3] = DirectX::PackedVector::XMConvertFloatToHalf(0.25F);
+                }
+            }
+            color_upload->Unmap(0,nullptr);
+            transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+            f.list->CopyTextureRegion(&color_dst,0,0,0,&color_src,nullptr);
+            transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            evaluate(0);
+            require(sr_inputs.size() == 1 && sr_inputs[0].color != f.textures12[0].Get(), "HDR color round trip did not execute NR");
+            auto readback=make_buffer(256,D3D12_HEAP_TYPE_READBACK);
+            D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+            from.pResource=sr_inputs[0].color; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=readback.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            to.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16B16A16_FLOAT,1,1,1,256};
+            const D3D12_BOX pixel{0,0,0,1,1,1};
+            transition_resource(from.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            f.list->CopyTextureRegion(&to,0,0,0,&from,&pixel);
+            transition_resource(from.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            f.finish_gpu(); check(readback->Map(0,nullptr,&mapped), "Map HDR NR color result");
+            const auto* result = static_cast<const DirectX::PackedVector::HALF*>(mapped);
+            const std::array<float, 3> rgb{DirectX::PackedVector::XMConvertHalfToFloat(result[0]),
+                DirectX::PackedVector::XMConvertHalfToFloat(result[1]), DirectX::PackedVector::XMConvertHalfToFloat(result[2])};
+            readback->Unmap(0,nullptr);
+            return rgb;
+        };
+        std::array<std::array<float, 3>, 2> results{};
+        constexpr float whites[]{100.F, 5000.F};
+        for (unsigned i = 0; i < 2; ++i) results[i] = round_trip(whites[i]);
         for (const auto* key : exposure_keys) {
             const auto found = previous_exposure.find(key);
             if (found == previous_exposure.end()) f.params.values.erase(key);
@@ -690,10 +698,14 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
             require(f.sl_options(&f.viewport,&f.options)==0, "Restore SDR viewport options");
         }
         recreate_flags(2U);
-        if (std::abs(r-100.F) > 2.F || std::abs(g-20.F) > 0.5F || std::abs(b-5.F) > 0.2F)
-            printf("HDR NR round trip: %.3f %.3f %.3f\n", r, g, b);
-        require(std::abs(r-100.F) <= 2.F && std::abs(g-20.F) <= 0.5F && std::abs(b-5.F) <= 0.2F,
-            "HDR NR round trip ignored the game's exposure and lost chroma");
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto& rgb = results[i];
+            const float white = whites[i];
+            const bool kept = std::abs(rgb[0]/white-1.F) <= .02F && std::abs(rgb[1]/(white*.2F)-1.F) <= .02F &&
+                std::abs(rgb[2]/(white*.05F)-1.F) <= .03F;
+            if (!kept) printf("HDR NR round trip at white %.0f: %.3f %.3f %.3f\n", white, rgb[0], rgb[1], rgb[2]);
+            require(kept, "HDR NR round trip ignored the game's exposure and lost chroma");
+        }
         printf("PASS HDR NR round trip normalizes by the game's exposure texture (%s)\n",
             f.use_sl ? (lower_hook ? "Streamline lower hook" : "Streamline") : "native NGX");
     }
