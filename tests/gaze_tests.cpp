@@ -1809,6 +1809,26 @@ void test_openvr_geometry() {
     const float canted[3][4]{{c,0,s,0},{0,1,0,0},{-s,0,c,0}};
     expect(openvr_project_direction(canted,-1,1,-1,1,forward,u,v),"eye cant is included");
     expect_near(u,(1.F+std::tan(0.2F))*0.5F,0.0001F,"inverse eye rotation projects head forward");
+    float ray[3]{};
+    const double varjo_right_up[3]{0.2,0.1,1.0};
+    expect(varjo_gaze_direction(varjo_right_up,ray) && ray[2]<0,"Varjo +Z forward gaze faces OpenVR forward");
+    expect(openvr_project_direction(identity,-1,1,-1,1,ray,u,v),"Varjo gaze projects through OpenVR frustum");
+    expect_near(u,0.6F,0.0001F,"Varjo gaze right maps right");
+    expect_near(v,0.45F,0.0001F,"Varjo gaze up maps up");
+    const double varjo_negative_z[3]{0.2,0.1,-1.0};
+    expect(varjo_gaze_direction(varjo_negative_z,ray) && openvr_project_direction(identity,-1,1,-1,1,ray,u,v),
+        "Varjo -Z forward gaze projects identically");
+    expect_near(u,0.6F,0.0001F,"forward sign does not mirror horizontal gaze");
+    const double varjo_invalid[3]{NAN,0,1};
+    const double varjo_sideways[3]{1,0,0};
+    expect(!varjo_gaze_direction(varjo_invalid,ray) && !varjo_gaze_direction(varjo_sideways,ray),
+        "nonfinite or perpendicular Varjo gaze is invalid");
+    const double combined[3]{}, left[3]{}, right[3]{};
+    expect(varjo_select_forward(2,3,3,combined,left,right)==combined,"both Varjo eyes use the combined ray");
+    expect(varjo_select_forward(2,0,3,combined,left,right)==right && varjo_select_forward(2,1,0,combined,left,right)==left,
+        "one lost Varjo eye follows the remaining eye");
+    expect(!varjo_select_forward(2,0,0,combined,left,right) && !varjo_select_forward(0,3,3,combined,left,right),
+        "both eyes lost or tracker invalid drops the sample");
 }
 
 // Foveated NR moves its 8-pixel-aligned output region with gaze. BG3 (render

@@ -27,6 +27,29 @@ inline bool openvr_bounds(float lo,float hi,std::uint32_t extent,
     size=static_cast<std::uint32_t>(std::llround(last)-origin);
     return size!=0;
 }
+// Varjo gaze uses HMD space with X right and Y up, but Varjo's documentation
+// disagrees on the sign of forward Z. A gaze ray always points ahead of the
+// viewer, so convert to OpenVR head space (-Z forward) without trusting it.
+inline bool varjo_gaze_direction(const double forward[3],float ray[3]) noexcept {
+    for (unsigned i=0;i<3;++i) if (!std::isfinite(forward[i])) return false;
+    const double z=std::abs(forward[2]);
+    if (z<0.0001) return false;
+    ray[0]=static_cast<float>(forward[0]);
+    ray[1]=static_cast<float>(forward[1]);
+    ray[2]=static_cast<float>(-z);
+    return true;
+}
+// Varjo status 0 is invalid for both the tracker and each eye. Prefer the
+// combined ray; when one eye is lost (a squint or the edge of a blink), follow
+// the remaining eye rather than dropping the sample.
+inline const double* varjo_select_forward(std::int64_t status,std::int64_t left_status,
+    std::int64_t right_status,const double* combined,const double* left,const double* right) noexcept {
+    if (status==0) return nullptr;
+    if (left_status!=0 && right_status!=0) return combined;
+    if (left_status!=0) return left;
+    if (right_status!=0) return right;
+    return nullptr;
+}
 // OpenVR raw top/bottom tangents have down-positive signs. Eye-to-head maps
 // the eye's local basis into head space; transpose it for a head-relative ray.
 inline bool openvr_project_direction(const float eye[3][4],float left,float right,
