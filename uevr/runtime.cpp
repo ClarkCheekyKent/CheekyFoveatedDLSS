@@ -161,7 +161,7 @@ std::string snapshot_locked(State& s) {
             << ",\"mapped\":" << v.resource_mapped << ",\"packed\":" << v.packed_stereo_mapping
             << ",\"layout\":" << v.layout_mapping
             << ",\"copy\":" << v.copy_mapping << ",\"projection\":" << v.projection_mapping
-            << ",\"marker\":" << v.marker_mapping
+            << ",\"marker\":" << v.marker_mapping << ",\"union\":" << v.union_mapping
             << ",\"alignment\":" << v.alignment_source
             << ",\"aligned_u\":" << v.aligned_u << ",\"aligned_v\":" << v.aligned_v
             << ",\"submitted_projection\":" << v.submitted_projection

@@ -1684,6 +1684,93 @@ void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
 
 }  // namespace
 
+// ControlVR on a Pimax Crystal Super: one 7446x4876 DLSS render per frame,
+// alternating eyes, spans both parallel eye frusta (tangents from the log).
+void test_binocular_union_gaze() {
+    using namespace cheeky::foveated_dlss;
+    constexpr float outer = 2.625254F, inner = 0.977903F, vertical = 1.719478F;
+    const auto eye = [&](bool right) {
+        return GazeEyeFrustum{std::atan(right ? -inner : -outer), std::atan(right ? outer : inner),
+            std::atan(vertical), -std::atan(vertical), (right ? inner : outer) / (outer + inner), .5F, true};
+    };
+    const std::array<GazeEyeFrustum, 2> eyes{eye(false), eye(true)};
+    const auto frustum = binocular_union_frustum(eyes, 7446, 4876);
+    expect(frustum.valid, "single render spanning both eye frusta is recognized");
+    expect_near(frustum.left, -outer, .0001F, "union spans the left eye's outer edge");
+    expect_near(frustum.right, outer, .0001F, "union spans the right eye's outer edge");
+    expect(!binocular_union_frustum(eyes, 5110, 4876).valid, "per-eye render is not a union frustum");
+    expect(!binocular_union_frustum(eyes, 10220, 4876).valid, "packed double-wide stereo is not a union frustum");
+    const auto symmetric = GazeEyeFrustum{std::atan(-outer), std::atan(outer), std::atan(vertical), -std::atan(vertical), .5F, .5F, true};
+    expect(!binocular_union_frustum({symmetric, symmetric}, 7446, 4876).valid,
+        "eyes whose own frustum is the union keep per-eye mapping");
+    // A gaze at head tangent (0.5, 0.25) seen from either eye's image.
+    const auto u_for = [&](const GazeEyeFrustum& e, float tangent) {
+        return (tangent - std::tan(e.left)) / (std::tan(e.right) - std::tan(e.left));
+    };
+    const float v = (vertical - .25F) / (2.F * vertical);
+    for (unsigned i = 0; i < 2; ++i) {
+        float union_u{}, union_v{};
+        expect(map_eye_uv_to_union(frustum, eyes[i], i, eyes[i].forward_u, .5F, union_u, union_v),
+            "eye forward maps into the union");
+        expect_near(union_u, .5F, .0001F, "each eye's forward is the union center");
+        expect(map_eye_uv_to_union(frustum, eyes[i], i, u_for(eyes[i], .5F), v, union_u, union_v),
+            "eye gaze maps into the union");
+        expect_near(union_u, (.5F + outer) / (2.F * outer), .0001F, "both eyes map gaze to the same union column");
+        expect_near(union_v, v, .0001F, "vertical gaze keeps its tangent");
+    }
+
+    reset_gaze_foveation();
+    Settings settings{};
+    settings.center_mode = FoveationCenterMode::openxr_gaze;
+    settings.width = settings.height = .2F;
+    settings.gaze_smoothing_ms = 0;
+    settings.gaze_quantization_pixels = 1;
+    settings.auto_stereo_alignment = true;
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION; snapshot.structure_size = sizeof(snapshot);
+    snapshot.session_generation = 1; snapshot.swapchain_generation = 1; snapshot.view_count = 2;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_LAYER_ACTIVE | CHEEKY_GAZE_STATUS_EXTENSION_ENABLED |
+        CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED | CHEEKY_GAZE_STATUS_SESSION_FOCUSED | CHEEKY_GAZE_STATUS_ACTION_ACTIVE |
+        CHEEKY_GAZE_STATUS_GAZE_VALID | CHEEKY_GAZE_STATUS_MAPPING_READY;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& view = snapshot.views[i];
+        view.view_index = i;
+        view.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FOV_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID;
+        view.resource_identity = 29000 + i; view.swapchain_identity = 29100 + i;
+        view.image_rect_width = 5110; view.image_rect_height = 4876;
+        view.fov_left = eyes[i].left; view.fov_right = eyes[i].right; view.fov_up = eyes[i].up; view.fov_down = eyes[i].down;
+        view.forward_u = eyes[i].forward_u; view.forward_v = .5F;
+        view.center_u = u_for(eyes[i], .5F); view.center_v = v;
+    }
+    FoveationCenter center{};
+    const auto frame = [&](std::uint32_t width) {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart; ++snapshot.predicted_display_time;
+        CropGeometry crop{};
+        bool reset{};
+        return calculate_coordinated_crop(settings, 2901U, nullptr, 4319, 2828, width, 4876, 0, 0,
+            crop, reset, &snapshot, &center);
+    };
+    expect(frame(7446) && frame(7446) && frame(7446), "union-mapped gaze resolves a crop");
+    expect(gaze_diagnostics().using_gaze, "union frustum feeds live gaze");
+    expect_near(center.u, (.5F + outer) / (2.F * outer), .002F, "binocular gaze lands on the union column");
+    expect_near(center.v, v, .002F, "binocular gaze keeps its row");
+    for (const auto& view : gaze_diagnostics().views)
+        expect(view.resource_mapped && view.union_mapping && view.dlss_view_id == 2901U,
+            "both headset eyes report the shared union source");
+    settings.center_mode = FoveationCenterMode::fixed;
+    expect(frame(7446), "fixed placement resolves on a union frustum");
+    expect_near(center.u, .5F, .002F, "automatic alignment centers the union horizontally");
+    expect_near(center.v, .5F, .002F, "automatic alignment centers the union vertically");
+    reset_gaze_foveation();
+    settings.center_mode = FoveationCenterMode::openxr_gaze;
+    expect(frame(5110) && frame(5110) && frame(5110), "per-eye sized output still resolves a crop");
+    for (const auto& view : gaze_diagnostics().views)
+        expect(!view.union_mapping, "per-eye sized output is not mapped as a union");
+    reset_gaze_foveation();
+    update_settings(Settings{});
+}
+
 void test_gaze_camera_projection() {
     using namespace cheeky::foveated_dlss;
     const GazeProjection left{-1.2F, 0.8F, 1.F, -0.9F, true};
@@ -2859,6 +2946,10 @@ int main(int argc, char** argv) {
         failures += run_motion_resample_tests();
         return failures ? 1 : 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--binocular-union") == 0) {
+        test_binocular_union_gaze();
+        return failures ? 1 : 0;
+    }
     test_manual_stereo_mapping();
     test_center_supersampling();
     test_nr_only_center(false);
@@ -2883,6 +2974,7 @@ int main(int argc, char** argv) {
     test_simulated_gaze();
     test_gaze_copy_routes();
     test_gaze_camera_projection();
+    test_binocular_union_gaze();
     test_simulation_patterns();
     test_projection();
     test_geometry();
