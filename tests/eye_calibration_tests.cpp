@@ -510,7 +510,8 @@ void test_support_archive_limits() {
     std::filesystem::remove(report_path);
 }
 void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
-                     bool obscure = false, bool duplicate_eye = false, bool support_images = false) {
+                     bool obscure = false, bool duplicate_eye = false, bool support_images = false,
+                     DXGI_FORMAT submitted_format = DXGI_FORMAT_UNKNOWN) {
     register_stereo_view(101);
     register_stereo_view(202);
     Settings settings{};
@@ -525,12 +526,15 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     check(D3D11CreateDevice(nullptr, hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP, nullptr, 0,
                             nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context));
     const auto bytes = calibration_pixel_bytes(format);
+    require(bytes && (submitted_format == DXGI_FORMAT_UNKNOWN || calibration_pixel_bytes(submitted_format) == bytes),
+        "Calibration fixture requires supported, equal-sized source and submitted pixels");
     std::vector<unsigned char> black(256 * 128 * bytes, 0);
     D3D11_TEXTURE2D_DESC desc{128, 128, 1, 1, format, {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
     ComPtr<ID3D11Texture2D> a, b, packed;
     check(device->CreateTexture2D(&desc, nullptr, &a));
     check(device->CreateTexture2D(&desc, nullptr, &b));
     desc.Width = 256;
+    if (submitted_format != DXGI_FORMAT_UNKNOWN) desc.Format = submitted_format;
     check(device->CreateTexture2D(&desc, nullptr, &packed));
     eye_calibration_reset_stats();
     eye_calibration_enable(true);
@@ -667,6 +671,34 @@ void run_calibration(bool hardware = false, DXGI_FORMAT format = DXGI_FORMAT_R8G
     unregister_stereo_view(101);
     unregister_stereo_view(202);
 }
+void typeless_pixel_tests() {
+    require(calibration_pixel_bytes(DXGI_FORMAT_R32G32B32A32_TYPELESS) == 16,
+        "Typeless RGBA32 float color must use sixteen-byte pixels");
+    for (auto format : {DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_SINT, DXGI_FORMAT_UNKNOWN})
+        require(calibration_pixel_bytes(format) == 0, "Integer and unknown formats must remain unsupported");
+    // Independent IEEE-754 words: -0.5, 0.25, 6.0, 0.5; no encoder round trip.
+    constexpr std::array<std::uint32_t, 4> input{0xbf000000U, 0x3e800000U, 0x40c00000U, 0x3f000000U};
+    for (auto format : {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_TYPELESS}) {
+        require(calibration_pixel_bytes(format) == 16, "RGBA32 float pixel stride must remain sixteen bytes");
+        const auto decoded = calibration_decode(reinterpret_cast<const unsigned char*>(input.data()), format);
+        require(decoded.r == -.5F && decoded.g == .25F && decoded.b == 6.F && decoded.a == .5F,
+            "RGBA32 float decoding must retain channel order, negative values, HDR and alpha");
+        constexpr const char* codes[]{"1101000101110001010100110", "1011100100001101100101001"};
+        for (unsigned candidate = 0; candidate < 2; ++candidate)
+            for (unsigned y = 0; y < 5; ++y) for (unsigned x = 0; x < 5; ++x) {
+                std::array<unsigned char, 20> output; output.fill(0xa5);
+                calibration_encode_pattern(output.data(), format, candidate, x * 8, y * 8);
+                std::array<float, 4> values;
+                std::memcpy(values.data(), output.data(), 16);
+                const float expected = codes[candidate][y * 5 + x] == '1' ? 1.F : 0.F;
+                require(values[0] == expected && values[1] == expected && values[2] == expected && values[3] == 1.F,
+                    "RGBA32 marker bytes must encode neutral black/white floats with alpha one");
+                require(std::all_of(output.begin() + 16, output.end(), [](unsigned char v) { return v == 0xa5; }),
+                    "RGBA32 marker encoding must not overrun sixteen bytes");
+            }
+    }
+    std::cout << "PASS typeless float pixels: independent decoding, marker bytes, alpha and bounds\n";
+}
 void pattern_tests() {
     constexpr unsigned side = 60;
     std::array<CalibrationPixel, side * side> pixels{};
@@ -784,6 +816,8 @@ int run_stereo_support_tests() {
         require(calibration_image_bytes.load() == 0, "Readback reservations must be released");
         run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, false, false, true);
         run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, true, false, true);
+        run_calibration(false, DXGI_FORMAT_R32G32B32A32_TYPELESS, false, false, true);
+        run_calibration(false, DXGI_FORMAT_R32G32B32A32_TYPELESS, true, false, true, DXGI_FORMAT_R32G32B32A32_FLOAT);
         require(calibration_image_bytes.load() == 0, "DX11 capture buffers must drain");
         std::cout << "PASS stereo support: bounded previews, timeout, DX11 stamped/submitted pixels and failed recognition\n";
         return 0;
@@ -791,6 +825,7 @@ int run_stereo_support_tests() {
 }
 int run_eye_calibration_tests() {
     try {
+        typeless_pixel_tests();
         test_wide_search();
         test_grid_locator_scale();
         test_hogwarts_corner_pair();
@@ -836,8 +871,11 @@ int run_eye_calibration_tests() {
         run_calibration();
         for (auto format : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
                             DXGI_FORMAT_R11G11B10_FLOAT,
-                            DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT})
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            DXGI_FORMAT_R32G32B32A32_TYPELESS})
             run_calibration(false, format);
+        run_calibration(false, DXGI_FORMAT_R32G32B32A32_TYPELESS, false, false, false,
+            DXGI_FORMAT_R32G32B32A32_FLOAT);
         run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, true);
         run_calibration(false, DXGI_FORMAT_R8G8B8A8_UNORM, false, true);
         run_calibration(false, DXGI_FORMAT_R11G11B10_FLOAT, true);
