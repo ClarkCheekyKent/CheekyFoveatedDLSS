@@ -2,6 +2,7 @@
 #include "vulkan_overlay.hpp"
 #include "runtime_host_api.hpp"
 #include "overlay.hpp"
+#include "com_forwarder.hpp"
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -66,9 +67,10 @@ void log_host(const char* message) noexcept {
     if (count>0) { DWORD written{}; WriteFile(host_log,line,static_cast<DWORD>((std::min)(static_cast<std::size_t>(count),sizeof(line)-1)),&written,nullptr); }
 }
 
-void* method(void* object, unsigned slot) { return (*static_cast<void***>(object))[slot]; }
 template<class Signature,auto Handler> bool hook_method(void* object, unsigned slot) {
-    const auto target = method(object, slot);
+    // A shared proxy forwarding stub would route unrelated interfaces' calls here.
+    const auto target = cheeky::com_forwarder::resolve(object, slot).code;
+    if (!target) return false;
     std::lock_guard lock(hooks_mutex);
     const auto handler=reinterpret_cast<void*>(Handler);
     for (const auto& hook : hooks) if (hook.target == target) return hook.handler==handler;

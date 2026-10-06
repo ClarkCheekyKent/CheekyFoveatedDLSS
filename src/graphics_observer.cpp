@@ -5,8 +5,10 @@
 #include "dlss_nr_lifetime.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "d3d12_native.hpp"
+#include "com_forwarder.hpp"
 #include <MinHook.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -89,6 +91,12 @@ constexpr unsigned execute_slot = 10, reset_slot = 10, copy_texture_slot = 16, c
                    resolve_slot = 19;
 void* method(void* object, unsigned index) {
     return (*static_cast<void***>(object))[index];
+}
+// Copy hooks receive the object a forwarding proxy passes on. Key a list's
+// gaze copies the same way when the proxy itself is submitted or reset.
+std::uint64_t copy_identity(ID3D12GraphicsCommandList* list) noexcept {
+    const auto forwarded = com_forwarder::resolve(list, copy_slot).object;
+    return reinterpret_cast<std::uint64_t>(forwarded ? forwarded : list);
 }
 constexpr GUID observer_lifetime_key{
     0x11cd13ab, 0x47e8, 0x41cc, {0x9d, 0x3f, 0x53, 0x58, 0x9e, 0x2c, 0x17, 0x95}};
@@ -290,7 +298,7 @@ void execute(ExecuteFn real_execute, ID3D12CommandQueue* queue, UINT count, ID3D
                 continue;
             ComPtr<ID3D12GraphicsCommandList> graphics;
             if (SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&graphics)))) {
-                submit_gaze_copies(reinterpret_cast<std::uint64_t>(graphics.Get()));
+                submit_gaze_copies(copy_identity(graphics.Get()));
                 note_d3d12_command_list_submission(queue, graphics.Get());
             }
         }
@@ -328,7 +336,7 @@ HRESULT reset(ResetFn real_reset, ID3D12GraphicsCommandList* list, ID3D12Command
     }
     if (SUCCEEDED(hr)) {
         note_d3d12_command_list_reset(list);
-        reset_gaze_copies(reinterpret_cast<std::uint64_t>(list));
+        reset_gaze_copies(copy_identity(list));
         ++resets;
     }
     return hr;
@@ -416,9 +424,15 @@ bool initialize_native_observer(ID3D12Device* device, ID3D12CommandQueue* queue)
                                          IID_PPV_ARGS(&list))))
         return false;
     list->Close();
-    const std::array<void*, 5> targets{method(queue, execute_slot), method(list.Get(), reset_slot),
-                                       method(list.Get(), copy_slot), method(list.Get(), copy_texture_slot),
-                                       method(list.Get(), resolve_slot)};
+    const std::array<void*, 5> targets{com_forwarder::resolve(queue, execute_slot).code,
+                                       com_forwarder::resolve(list.Get(), reset_slot).code,
+                                       com_forwarder::resolve(list.Get(), copy_slot).code,
+                                       com_forwarder::resolve(list.Get(), copy_texture_slot).code,
+                                       com_forwarder::resolve(list.Get(), resolve_slot).code};
+    if (std::find(targets.begin(), targets.end(), nullptr) != targets.end()) {
+        log_error("D3D12 observer methods forward to other methods; observation is disabled for this object family");
+        return false;
+    }
     // ReShade can detach its UI while game COM lifetime callbacks remain.
     HMODULE resident{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,

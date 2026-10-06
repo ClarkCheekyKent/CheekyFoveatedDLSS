@@ -68,6 +68,8 @@ if ($LASTEXITCODE -ne 0) { throw "NR native observer tests failed with exit code
 if ($LASTEXITCODE -ne 0) { throw "Opaque VR/native D3D12 observer tests failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe") --copy-metadata
 if ($LASTEXITCODE -ne 0) { throw "D3D12 copy metadata regression tests failed." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe") --folded-forwarder
+if ($LASTEXITCODE -ne 0) { throw "Folded proxy forwarding-stub observer tests failed." }
 foreach ($proxy in @('reshade','streamline')) {
     & (Join-Path $projectRoot "bin\$Configuration\CheekyNrObserverTests.exe") "--wrapped-$proxy"
     if ($LASTEXITCODE -ne 0) { throw "Wrapped D3D12 observer failed: $proxy" }
