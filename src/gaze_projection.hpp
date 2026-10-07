@@ -60,6 +60,69 @@ inline GazeProjectionMatch match_gaze_projection_eyes(const GazeProjection& came
     return result;
 }
 
+// One render can feed both eyes: ControlVR's alternate-eye mode draws a single
+// frustum spanning both eye frusta and crops each eye from it, so the output
+// has the union's aspect ratio and neither eye's own. Inputs are the published
+// eye angles (radians, left/down negative) and the head forward in eye UV.
+struct GazeEyeFrustum {
+    float left{}, right{}, up{}, down{};
+    float forward_u{}, forward_v{};
+    bool forward_valid{};
+};
+struct BinocularUnionFrustum {
+    std::array<float, 2> yaw{}, pitch{}; // Each eye's forward direction, removed to reach head space.
+    float left{}, right{}, up{}, down{}; // Union tangents in head space.
+    bool valid{};
+};
+// Angle of a UV coordinate across a planar projection spanning the two angles.
+inline float gaze_uv_angle(float t, float first, float second) {
+    const auto a = std::tan(first), b = std::tan(second);
+    return std::atan(a + t * (b - a));
+}
+inline BinocularUnionFrustum binocular_union_frustum(const std::array<GazeEyeFrustum, 2>& eyes,
+    std::uint32_t output_width, std::uint32_t output_height) {
+    constexpr float limit = 1.55F; // Keep every bound short of a right angle.
+    if (output_width == 0U || output_height == 0U) return {};
+    const float output_aspect = static_cast<float>(output_width) / static_cast<float>(output_height);
+    BinocularUnionFrustum frustum{};
+    float left = limit, right = -limit, up = -limit, down = limit;
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto& e = eyes[i];
+        for (const auto value : {e.left, e.right, e.up, e.down, e.forward_u, e.forward_v})
+            if (!std::isfinite(value)) return {};
+        if (!(e.left < 0.F && e.right > 0.F && e.up > 0.F && e.down < 0.F) ||
+            std::abs(e.left) >= limit || std::abs(e.right) >= limit || std::abs(e.up) >= limit || std::abs(e.down) >= limit)
+            return {};
+        // An eye's own frustum matching the output is an ordinary per-eye render.
+        const float eye_aspect = (std::tan(e.right) - std::tan(e.left)) / (std::tan(e.up) - std::tan(e.down));
+        if (std::abs(eye_aspect / output_aspect - 1.F) <= 0.02F) return {};
+        frustum.yaw[i] = e.forward_valid ? gaze_uv_angle(e.forward_u, e.left, e.right) : 0.F;
+        frustum.pitch[i] = e.forward_valid ? gaze_uv_angle(e.forward_v, e.up, e.down) : 0.F;
+        left = (std::min)(left, e.left - frustum.yaw[i]);
+        right = (std::max)(right, e.right - frustum.yaw[i]);
+        up = (std::max)(up, e.up - frustum.pitch[i]);
+        down = (std::min)(down, e.down - frustum.pitch[i]);
+    }
+    if (!(left > -limit && right < limit && up < limit && down > -limit && left < 0.F && right > 0.F && up > 0.F && down < 0.F))
+        return {};
+    frustum.left = std::tan(left); frustum.right = std::tan(right);
+    frustum.up = std::tan(up); frustum.down = std::tan(down);
+    const float union_aspect = (frustum.right - frustum.left) / (frustum.up - frustum.down);
+    frustum.valid = std::abs(union_aspect / output_aspect - 1.F) <= 0.01F;
+    return frustum;
+}
+// Maps a UV in one eye's image to the union output. Each eye renders from its
+// own position, so a binocular gaze averages both eyes' mapped points.
+inline bool map_eye_uv_to_union(const BinocularUnionFrustum& frustum, const GazeEyeFrustum& eye, unsigned index,
+    float u, float v, float& union_u, float& union_v) {
+    if (!frustum.valid || index > 1U || !std::isfinite(u) || !std::isfinite(v)) return false;
+    const auto horizontal = std::tan(gaze_uv_angle(u, eye.left, eye.right) - frustum.yaw[index]);
+    const auto vertical = std::tan(gaze_uv_angle(v, eye.up, eye.down) - frustum.pitch[index]);
+    union_u = (horizontal - frustum.left) / (frustum.right - frustum.left);
+    union_v = (frustum.up - vertical) / (frustum.up - frustum.down);
+    return std::isfinite(union_u) && std::isfinite(union_v);
+}
+
 class GazeProjectionCache {
     struct Entry { std::uint32_t viewport; std::uintptr_t frame; std::uint64_t time;
         GazeProjection projection; };

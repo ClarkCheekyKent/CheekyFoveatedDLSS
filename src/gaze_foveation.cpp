@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <vector>
 #include <sstream>
@@ -642,7 +643,7 @@ bool calculate_coordinated_crop(
     }
     // The calibrated transform above already includes the vertical flip.
     calibrated_vertical_flip = false;
-    const bool shared_source = marker_match && eye_assignment.shared_source;
+    bool shared_source = marker_match && eye_assignment.shared_source;
     // Both submitted images were verified to contain the same source. That
     // source gets one binocular center, not an arbitrary left/right role.
     CheekyGazeViewV1 shared_view = snapshot.views[0];
@@ -771,6 +772,53 @@ bool calculate_coordinated_crop(
             }
         }
     }
+    // One full-frame render cropped for both eyes (ControlVR alternate-eye):
+    // which eye a frame serves is unknown, so it gets one binocular center.
+    bool union_match{};
+    if (match_count == 0U && snapshot.view_count == 2U && output_origin_x == 0U && output_origin_y == 0U &&
+        (snapshot.status_flags & CHEEKY_GAZE_STATUS_MAPPING_READY) != 0U &&
+        (snapshot.status_flags & CHEEKY_GAZE_STATUS_UNSUPPORTED_VIEW_CONFIG) == 0U &&
+        (snapshot.views[0].flags & snapshot.views[1].flags & CHEEKY_GAZE_VIEW_FOV_VALID) != 0U) {
+        std::array<GazeEyeFrustum, 2> eyes{};
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto& v = snapshot.views[i];
+            eyes[i] = {v.fov_left, v.fov_right, v.fov_up, v.fov_down, v.forward_u, v.forward_v,
+                (v.flags & CHEEKY_GAZE_VIEW_FORWARD_VALID) != 0U};
+        }
+        const auto frustum = binocular_union_frustum(eyes, output_width, output_height);
+        // Averages the eyes' mapped points; an eye without a finite point is skipped.
+        const auto binocular = [&](float CheekyGazeViewV1::* u, float CheekyGazeViewV1::* v, float& out_u, float& out_v) {
+            float sum_u{}, sum_v{};
+            unsigned count{};
+            for (unsigned i = 0; i < 2; ++i) {
+                float mapped_u{}, mapped_v{};
+                if (map_eye_uv_to_union(frustum, eyes[i], i, snapshot.views[i].*u, snapshot.views[i].*v, mapped_u, mapped_v)) {
+                    sum_u += mapped_u; sum_v += mapped_v; ++count;
+                }
+            }
+            if (count != 0U) { out_u = sum_u / count; out_v = sum_v / count; }
+            return count != 0U;
+        };
+        if (frustum.valid) {
+            shared_view = snapshot.views[0];
+            shared_view.view_index = 0U;
+            shared_view.flags &= snapshot.views[1].flags;
+            shared_view.center_u = shared_view.center_v = std::numeric_limits<float>::quiet_NaN();
+            static_cast<void>(binocular(&CheekyGazeViewV1::center_u, &CheekyGazeViewV1::center_v,
+                shared_view.center_u, shared_view.center_v));
+            if (!binocular(&CheekyGazeViewV1::forward_u, &CheekyGazeViewV1::forward_v,
+                    shared_view.forward_u, shared_view.forward_v))
+                shared_view.flags &= ~CHEEKY_GAZE_VIEW_FORWARD_VALID;
+            if ((shared_view.flags & CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID) != 0U &&
+                !binocular(&CheekyGazeViewV1::next_jump_u, &CheekyGazeViewV1::next_jump_v,
+                    shared_view.next_jump_u, shared_view.next_jump_v))
+                shared_view.flags &= ~CHEEKY_GAZE_VIEW_NEXT_JUMP_VALID;
+            matched_index = 0U;
+            match_count = 1U;
+            union_match = true;
+            shared_source = true;
+        }
+    }
     diagnostics.mapping_ambiguous = diagnostics.mapping_ambiguous ||
         match_count > 1U;
     auto& state = state_for_view(view_id);
@@ -880,7 +928,9 @@ bool calculate_coordinated_crop(
             "VR gaze mapping established view=%llu eye=%u route=%s",
             static_cast<unsigned long long>(view_id),
             state.mapping.view_index,
-            marker_match ? "pixel-marker" : projection_match ? "camera-projection" : copy_match ? "submitted-copy" : packed_stereo_match ? "packed-stereo" : layout_stereo_match ? "manual-stereo-layout" : "exact-resource"
+            marker_match ? "pixel-marker" : projection_match ? "camera-projection" : copy_match ? "submitted-copy" :
+                packed_stereo_match ? "packed-stereo" : layout_stereo_match ? "manual-stereo-layout" :
+                union_match ? "binocular-union" : "exact-resource"
         );
     }
 
@@ -894,6 +944,7 @@ bool calculate_coordinated_crop(
             diagnostics.views[index].projection_mapping = false;
             diagnostics.views[index].marker_mapping = false;
             diagnostics.views[index].layout_mapping = false;
+            diagnostics.views[index].union_mapping = false;
         }
     }
     if (eye_assignment.assigned && eye_assignment.eye_index < CHEEKY_GAZE_MAX_VIEWS) {
@@ -914,6 +965,7 @@ bool calculate_coordinated_crop(
         view_diagnostics.copy_mapping = copy_match;
         view_diagnostics.projection_mapping = projection_match;
         view_diagnostics.marker_mapping = marker_match;
+        view_diagnostics.union_mapping = union_match;
         const auto& projected = snapshot.views[index];
         view_diagnostics.submitted_projection = (projected.flags & CHEEKY_GAZE_VIEW_SUBMITTED_PROJECTION) != 0;
         view_diagnostics.fov_tangents = {std::tan(projected.fov_left), std::tan(projected.fov_right),

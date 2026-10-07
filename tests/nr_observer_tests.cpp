@@ -9,7 +9,9 @@
 #include <dxgi1_4.h>
 #include <d3d12sdklayers.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -25,12 +27,14 @@ void log_error(const char*) noexcept {}
 void trace_event(const char*, ...) noexcept {}
 unsigned observed_copy_count{};
 GazeCopyEdge observed_copy_edge{};
-void record_gaze_copy(std::uint64_t, GazeCopyEdge edge) noexcept {
+std::uint64_t test_recorded_copy_list{}, test_submitted_copy_list{}, test_reset_copy_list{};
+void record_gaze_copy(std::uint64_t list, GazeCopyEdge edge) noexcept {
     ++observed_copy_count;
     observed_copy_edge = edge;
+    test_recorded_copy_list = list;
 }
-void submit_gaze_copies(std::uint64_t) noexcept {}
-void reset_gaze_copies(std::uint64_t) noexcept {}
+void submit_gaze_copies(std::uint64_t list) noexcept { test_submitted_copy_list = list; }
+void reset_gaze_copies(std::uint64_t list) noexcept { test_reset_copy_list = list; }
 void forget_gaze_resource(std::uint64_t) noexcept {}
 void note_d3d12_command_list_submission(ID3D12CommandQueue*, ID3D12GraphicsCommandList*) noexcept {}
 void note_d3d12_command_list_reset(ID3D12GraphicsCommandList*) noexcept {}
@@ -419,6 +423,183 @@ int run_legacy_tests() {
         std::cout<<"PASS opaque VR/native observer families, single submission/reset, GPU lifetime\n"; return 0;
     } catch(const std::exception& e){std::cerr<<"FAIL opaque observer: "<<e.what()<<'\n';return 1;}
 }
+// ControlVR's dxgi.dll wraps objects with one-line forwarders, and its linker
+// folded identical ones: a single stub is both CommandList::CopyResource and
+// IDXGISwapChain::GetLastPresentCount. These are its exact bytes. Observation
+// must follow the stubs to the wrapped list instead of patching them.
+struct ForwarderStubs {
+    std::uint8_t* page{};
+    void* copy_texture{}; void* copy{}; void* resolve{};
+    static constexpr std::uint8_t copy_texture_code[]{0x48,0x8B,0x49,0x10, 0x48,0x8B,0x01, 0x4C,0x8B,0x90,0x80,0,0,0, 0x49,0xFF,0xE2};
+    static constexpr std::uint8_t copy_code[]{0x48,0x8B,0x49,0x10, 0x48,0x8B,0x01, 0x48,0xFF,0xA0,0x88,0,0,0};
+    static constexpr std::uint8_t resolve_code[]{0x48,0x8B,0x49,0x10, 0x48,0x8B,0x01, 0x4C,0x8B,0x90,0x98,0,0,0, 0x49,0xFF,0xE2};
+    ForwarderStubs() {
+        page=static_cast<std::uint8_t*>(VirtualAlloc(nullptr,4096,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE));
+        require(page!=nullptr,"Could not allocate forwarding stubs");
+        std::memset(page,0xCC,4096);
+        std::memcpy(page,copy_texture_code,sizeof(copy_texture_code));
+        std::memcpy(page+0x20,copy_code,sizeof(copy_code));
+        std::memcpy(page+0x40,resolve_code,sizeof(resolve_code));
+        DWORD previous{}; require(VirtualProtect(page,4096,PAGE_EXECUTE_READ,&previous)!=0,"Could not protect forwarding stubs");
+        FlushInstructionCache(GetCurrentProcess(),page,4096);
+        copy_texture=page; copy=page+0x20; resolve=page+0x40;
+    }
+    bool intact() const {
+        return std::memcmp(copy_texture,copy_texture_code,sizeof(copy_texture_code))==0 &&
+            std::memcmp(copy,copy_code,sizeof(copy_code))==0 && std::memcmp(resolve,resolve_code,sizeof(resolve_code))==0;
+    }
+};
+const ForwarderStubs* folded_stubs{};
+// The wrapped object sits at +0x10, where the stubs load it.
+struct FoldedList {
+    void** vtable;
+    void* reserved{};
+    ID3D12GraphicsCommandList* target;
+    std::array<void*,60> methods{};
+    unsigned references{1}, resets{};
+    FoldedList(ID3D12GraphicsCommandList* list, const ForwarderStubs& stubs) : vtable(methods.data()), target(list) {
+        methods.fill(reinterpret_cast<void*>(&ProbeDevice::unexpected));
+        methods[0]=reinterpret_cast<void*>(&query); methods[1]=reinterpret_cast<void*>(&addref); methods[2]=reinterpret_cast<void*>(&release);
+        methods[3]=reinterpret_cast<void*>(&get_private); methods[4]=reinterpret_cast<void*>(&set);
+        methods[5]=reinterpret_cast<void*>(&set_interface); methods[7]=reinterpret_cast<void*>(&device);
+        methods[9]=reinterpret_cast<void*>(&close); methods[10]=reinterpret_cast<void*>(&reset);
+        methods[16]=stubs.copy_texture; methods[17]=stubs.copy; methods[19]=stubs.resolve;
+    }
+    static HRESULT STDMETHODCALLTYPE query(FoldedList* s, REFIID iid, void** out) {
+        if (!out) return E_POINTER;
+        *out=nullptr;
+        if (iid!=__uuidof(IUnknown) && iid!=__uuidof(ID3D12Object) && iid!=__uuidof(ID3D12CommandList) &&
+            iid!=__uuidof(ID3D12GraphicsCommandList)) return E_NOINTERFACE;
+        *out=s; addref(s); return S_OK;
+    }
+    static ULONG STDMETHODCALLTYPE addref(FoldedList* s) { return ++s->references; }
+    static ULONG STDMETHODCALLTYPE release(FoldedList* s) {
+        const auto left=--s->references; if (!left) { s->target->Release(); delete s; } return left;
+    }
+    static HRESULT STDMETHODCALLTYPE get_private(FoldedList* s, REFGUID key, UINT* size, void* data) { return s->target->GetPrivateData(key,size,data); }
+    static HRESULT STDMETHODCALLTYPE set(FoldedList* s, REFGUID key, UINT size, const void* data) { return s->target->SetPrivateData(key,size,data); }
+    static HRESULT STDMETHODCALLTYPE set_interface(FoldedList* s, REFGUID key, const IUnknown* value) { return s->target->SetPrivateDataInterface(key,value); }
+    static HRESULT STDMETHODCALLTYPE device(FoldedList* s, REFIID iid, void** out) { return s->target->GetDevice(iid,out); }
+    static HRESULT STDMETHODCALLTYPE close(FoldedList* s) { return s->target->Close(); }
+    // Real wrapper code, like ControlVR's Reset, so it is hooked on the proxy.
+    static HRESULT STDMETHODCALLTYPE reset(FoldedList* s, ID3D12CommandAllocator* a, ID3D12PipelineState* p) { ++s->resets; return s->target->Reset(a,p); }
+};
+struct FoldedQueue {
+    void** vtable;
+    void* reserved{};
+    ID3D12CommandQueue* target;
+    std::array<void*,19> methods{};
+    explicit FoldedQueue(ID3D12CommandQueue* queue) : vtable(methods.data()), target(queue) {
+        methods.fill(reinterpret_cast<void*>(&ProbeDevice::unexpected));
+        methods[0]=reinterpret_cast<void*>(&query); methods[1]=reinterpret_cast<void*>(&addref);
+        methods[2]=reinterpret_cast<void*>(&release); methods[10]=reinterpret_cast<void*>(&execute);
+    }
+    static HRESULT STDMETHODCALLTYPE query(FoldedQueue* s, REFIID iid, void** out) {
+        if (!out) return E_POINTER;
+        *out=nullptr;
+        if (iid!=__uuidof(IUnknown) && iid!=__uuidof(ID3D12CommandQueue)) return E_NOINTERFACE;
+        *out=s; addref(s); return S_OK;
+    }
+    static ULONG STDMETHODCALLTYPE addref(FoldedQueue* s) { return s->target->AddRef(); }
+    static ULONG STDMETHODCALLTYPE release(FoldedQueue* s) { return s->target->Release(); }
+    static void STDMETHODCALLTYPE execute(FoldedQueue* s, UINT count, ID3D12CommandList* const* lists) {
+        std::array<ID3D12CommandList*,8> native{};
+        count=(std::min)(count,static_cast<UINT>(native.size()));
+        for (UINT i=0; i<count; ++i) native[i]=reinterpret_cast<FoldedList*>(lists[i])->target;
+        s->target->ExecuteCommandLists(count,native.data());
+    }
+    ID3D12CommandQueue* get() { return reinterpret_cast<ID3D12CommandQueue*>(this); }
+};
+struct FoldedDevice : ProbeDevice {
+    explicit FoldedDevice(ID3D12Device* device) : ProbeDevice(device) {
+        methods[12]=reinterpret_cast<void*>(&create_list);
+    }
+    static HRESULT STDMETHODCALLTYPE create_list(FoldedDevice* s, UINT node, D3D12_COMMAND_LIST_TYPE type,
+        ID3D12CommandAllocator* a, ID3D12PipelineState* p, REFIID id, void** out) {
+        ID3D12GraphicsCommandList* list{}; const auto hr=s->target->CreateCommandList(node,type,a,p,id,reinterpret_cast<void**>(&list));
+        if (SUCCEEDED(hr)) *out=new FoldedList(list,*folded_stubs); return hr;
+    }
+    ID3D12Device* get() { return reinterpret_cast<ID3D12Device*>(this); }
+};
+// A swap chain wrapper whose GetLastPresentCount is the folded copy stub.
+struct PresentCounter {
+    void** vtable;
+    std::array<void*,18> methods{};
+    unsigned calls{};
+    PresentCounter() : vtable(methods.data()) {
+        methods.fill(reinterpret_cast<void*>(&ProbeDevice::unexpected));
+        methods[17]=reinterpret_cast<void*>(&last_present_count);
+    }
+    static HRESULT STDMETHODCALLTYPE last_present_count(PresentCounter* s, UINT* count) { ++s->calls; *count=42; return S_OK; }
+};
+struct FoldedChain {
+    void** vtable;
+    void* reserved{};
+    PresentCounter* target;
+    std::array<void*,18> methods{};
+    FoldedChain(PresentCounter* counter, void* stub) : vtable(methods.data()), target(counter) {
+        methods.fill(reinterpret_cast<void*>(&ProbeDevice::unexpected));
+        methods[17]=stub;
+    }
+};
+// Stands in for the stale register the swap-chain call leaves where a copy
+// expects its source resource.
+bool decoy_inspected{};
+struct DecoyResource {
+    void** vtable;
+    std::array<void*,20> methods{};
+    DecoyResource() : vtable(methods.data()) { methods.fill(reinterpret_cast<void*>(&inspect)); }
+    static D3D12_RESOURCE_DESC* STDMETHODCALLTYPE inspect(DecoyResource*, D3D12_RESOURCE_DESC* out) { decoy_inspected=true; *out={}; return out; }
+};
+int run_folded_forwarder_tests() {
+    using namespace cheeky::foveated_dlss;
+    try {
+        Settings settings; settings.enabled=false; settings.nr_enabled=false; settings.auto_stereo_alignment=true;
+        update_settings(settings);
+        ForwarderStubs stubs; folded_stubs=&stubs;
+        ComPtr<IDXGIFactory4> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+        ComPtr<IDXGIAdapter> warp; check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
+        ComPtr<ID3D12Device> device; check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)));
+        D3D12_COMMAND_QUEUE_DESC desc{}; ComPtr<ID3D12CommandQueue> queue; check(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue)));
+        FoldedDevice folded_device(device.Get()); FoldedQueue folded_queue(queue.Get());
+        require(initialize_native_observer(folded_device.get(),folded_queue.get()),"Observer rejected a forwarding proxy family");
+        require(stubs.intact(),"Observer patched a proxy forwarding stub shared by other interfaces");
+
+        PresentCounter counter; FoldedChain chain(&counter,stubs.copy); DecoyResource decoy; UINT presents{};
+        using LastPresentCount=HRESULT(STDMETHODCALLTYPE*)(void*,UINT*,void*);
+        check(reinterpret_cast<LastPresentCount>(chain.vtable[17])(&chain,&presents,&decoy));
+        require(counter.calls==1 && presents==42,"Folded swap-chain call was not forwarded intact");
+        require(!decoy_inspected,"Folded swap-chain call was observed as a resource copy");
+
+        D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC texture{D3D12_RESOURCE_DIMENSION_TEXTURE2D,0,64,64,1,1,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},
+            D3D12_TEXTURE_LAYOUT_UNKNOWN,D3D12_RESOURCE_FLAG_NONE};
+        ComPtr<ID3D12Resource> source, destination;
+        check(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&texture,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&source)));
+        check(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&texture,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&destination)));
+        ComPtr<ID3D12CommandAllocator> allocator; check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)));
+        ComPtr<ID3D12GraphicsCommandList> list;
+        check(FoldedDevice::create_list(&folded_device,0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,
+            __uuidof(ID3D12GraphicsCommandList),reinterpret_cast<void**>(list.GetAddressOf())));
+        auto* folded=reinterpret_cast<FoldedList*>(list.Get());
+        const auto wrapped=reinterpret_cast<std::uint64_t>(folded->target);
+        const auto before=native_observer_status();
+        list->CopyResource(destination.Get(),source.Get());
+        require(native_observer_status().copies==before.copies+1 && test_recorded_copy_list==wrapped,
+            "Copy through a proxy forwarding stub was not observed on the wrapped list");
+        check(list->Close());
+        ID3D12CommandList* lists[]{list.Get()}; folded_queue.get()->ExecuteCommandLists(1,lists);
+        require(test_submitted_copy_list==wrapped,"Proxy submission did not use the wrapped list's copy identity");
+        ComPtr<ID3D12Fence> fence; check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
+        check(queue->Signal(fence.Get(),1));
+        for (unsigned i=0; i<400 && fence->GetCompletedValue()<1; ++i) Sleep(5);
+        require(fence->GetCompletedValue()==1,"Forwarded copy did not complete");
+        check(list->Reset(allocator.Get(),nullptr));
+        require(folded->resets==1 && test_reset_copy_list==wrapped,"Proxy reset did not use the wrapped list's copy identity");
+        check(list->Close());
+        std::cout<<"PASS folded proxy forwarders: stubs untouched, unrelated calls intact, copies keyed to wrapped list\n"; return 0;
+    } catch(const std::exception& e){std::cerr<<"FAIL folded forwarder: "<<e.what()<<'\n';return 1;}
+}
 int run_wrapped_tests(bool streamline) {
     using namespace cheeky::foveated_dlss;
     try {
@@ -531,6 +712,7 @@ int run_probe_tests() {
 int main(int argc, char** argv) {
     if (argc==2 && std::strcmp(argv[1],"--copy-metadata")==0) return run_copy_metadata_tests();
     if (argc==2 && std::strcmp(argv[1],"--opaque-vr")==0) return run_legacy_tests();
+    if (argc==2 && std::strcmp(argv[1],"--folded-forwarder")==0) return run_folded_forwarder_tests();
     if (argc==2 && std::strcmp(argv[1],"--wrapped-reshade")==0) return run_wrapped_tests(false);
     if (argc==2 && std::strcmp(argv[1],"--wrapped-streamline")==0) return run_wrapped_tests(true);
     if (argc==2 && std::strcmp(argv[1],"--probe")==0) return run_probe_tests();

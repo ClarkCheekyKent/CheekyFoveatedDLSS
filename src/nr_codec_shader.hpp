@@ -17,7 +17,10 @@ struct CodecConstants {
         float foveation_roundness;
         float foveation_feather;
         std::uint32_t show_alignment_border;
-        std::uint32_t mask_count, padding[2];
+        std::uint32_t mask_count;
+        // preExposure / exposureScale with a game exposure texture; zero disables it.
+        float exposure_white_multiplier;
+        std::uint32_t padding;
         float mask_bounds[4][4];
     };
     static_assert(sizeof(CodecConstants) == 40U * sizeof(std::uint32_t));
@@ -45,9 +48,29 @@ cbuffer CodecConstants : register(b0) {
     float FoveationFeather;
     uint ShowAlignmentBorder;
     uint MaskCount;
-    uint2 MaskPadding;
+    float ExposureWhiteMultiplier;
+    uint MaskPadding;
     float4 MaskBounds[4];
 };
+
+// Unexposed HDR color (e.g. Control) maps scene white to preExposure /
+// (exposure * exposureScale), not to 1. Bright scenes exceed the debug
+// overlays' 1024 bound; clipping there turns NR gray again, so only reject
+// degenerate values. The Vulkan codec binds no exposure.
+#ifndef __spirv__
+Texture2D<float4> GameExposure : register(t3);
+#endif
+float ExposureWhite() {
+    float white = 1.0;
+#ifndef __spirv__
+    if (ExposureWhiteMultiplier > 0.0) {
+        const float exposure = GameExposure.Load(int3(0, 0, 0)).r;
+        if (isfinite(exposure) && exposure > 0.0)
+            white = clamp(ExposureWhiteMultiplier / exposure, 0.000001, 1000000.0);
+    }
+#endif
+    return white;
+}
 
 float FoveationShapeDistance(float2 pixel) {
     if (MaskCount != 0) {
@@ -181,7 +204,7 @@ void EncodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             SourceSize
         );
         const float3 linear_color = max(
-            proxy_source.rgb / max(PaperWhiteScale, 0.0001),
+            proxy_source.rgb / max(PaperWhiteScale * ExposureWhite(), 0.0001),
             0.0
         );
         const float3 encoded = HdrMode != 0 ? SrgbEncode(linear_color) : proxy_source.rgb;
@@ -244,14 +267,12 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
         return;
     }
-    const float3 original = max(
-        original_sample.rgb / max(PaperWhiteScale, 0.0001),
-        0.0
-    );
+    const float white = max(PaperWhiteScale * ExposureWhite(), 0.0001);
+    const float3 original = max(original_sample.rgb / white, 0.0);
     const float3 proxy = SrgbDecode(proxy_sample.rgb);
     const float3 neural = SrgbDecode(neural_sample.rgb);
     const float3 upgraded = UpgradeToneMap(original, proxy, neural);
-    const float3 decoded = lerp(original, upgraded, ColorStrength) * PaperWhiteScale;
+    const float3 decoded = lerp(original, upgraded, ColorStrength) * white;
     const float4 processed = float4(max(decoded, 0.0), original_sample.a);
     Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
 }

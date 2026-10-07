@@ -4,6 +4,7 @@
 #include "dlss_nr.hpp"
 #include "nr_codec_shader.hpp"
 #include "d3d_shaders.hpp"
+#include "debug_exposure.hpp"
 #include "nr_parameters.hpp"
 #include "nr_runtime_module.hpp"
 
@@ -123,6 +124,13 @@ bool verify_model_tuning(NgxParameters* parameters, const Settings& settings,
     return valid;
 }
 
+// Codec descriptors: 0-7 fixed views, 8 a null exposure view, then one view per
+// recently used game exposure texture. A slot is rewritten only for a new
+// texture, so double-buffered exposure never touches a descriptor in flight.
+constexpr std::uint32_t null_exposure_descriptor = 8U;
+constexpr std::uint32_t exposure_descriptor_slots = 4U;
+constexpr std::uint64_t exposure_slot_reuse_age = 8U;
+
 struct GpuResources {
     bool border_only{};
     NrGuidePass guides;
@@ -142,6 +150,12 @@ struct GpuResources {
     std::uint32_t working_width{};
     std::uint32_t working_height{};
     std::uint32_t descriptor_size{};
+    // Referenced so a recycled address cannot alias a texture a view still names.
+    std::array<ID3D12Resource*, exposure_descriptor_slots> exposures{};
+    std::array<std::uint64_t, exposure_descriptor_slots> exposure_uses{};
+    std::uint64_t exposure_clock{};
+    ID3D12Resource* exposure_readback{}; // Two placed texels for the periodic exposure log.
+    std::uint64_t exposure_samples{};
 };
 
 struct CachedFeature {
@@ -197,6 +211,8 @@ void release_gpu(GpuResources& gpu) noexcept {
     release(gpu.color_proxy);
     release(gpu.original_output);
     release(gpu.game_output);
+    for (auto*& exposure : gpu.exposures) release(exposure);
+    release(gpu.exposure_readback);
     gpu = {};
 }
 
@@ -614,7 +630,7 @@ void evict_retired_features(ViewState& view) noexcept {
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap{};
     descriptor_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptor_heap.NumDescriptors = 8U;
+    descriptor_heap.NumDescriptors = null_exposure_descriptor + 1U + exposure_descriptor_slots;
     descriptor_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     result = device->CreateDescriptorHeap(
         &descriptor_heap,
@@ -663,6 +679,13 @@ void evict_retired_features(ViewState& view) noexcept {
     device->CreateUnorderedAccessView(game_output, nullptr, &game_uav, cpu);
     cpu.ptr += gpu.descriptor_size;
     device->CreateUnorderedAccessView(game_output, nullptr, &game_uav, cpu);
+    cpu.ptr += gpu.descriptor_size;
+    D3D12_SHADER_RESOURCE_VIEW_DESC null_exposure{};
+    null_exposure.Format = DXGI_FORMAT_R32_FLOAT;
+    null_exposure.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    null_exposure.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    null_exposure.Texture2D.MipLevels = 1U;
+    device->CreateShaderResourceView(nullptr, &null_exposure, cpu);
 
     if (shared && shared->root_signature && shared->border_pipeline &&
         (gpu.border_only || (shared->encode_pipeline && shared->decode_pipeline))) {
@@ -674,14 +697,17 @@ void evict_retired_features(ViewState& view) noexcept {
         }
         cleanup(); return true;
     }
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    D3D12_DESCRIPTOR_RANGE ranges[3]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 3U;
     ranges[0].BaseShaderRegister = 0U;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 2U;
     ranges[1].BaseShaderRegister = 0U;
-    D3D12_ROOT_PARAMETER root_parameters[3]{};
+    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[2].NumDescriptors = 1U;
+    ranges[2].BaseShaderRegister = 3U;
+    D3D12_ROOT_PARAMETER root_parameters[4]{};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     root_parameters[0].DescriptorTable.NumDescriptorRanges = 1U;
     root_parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
@@ -691,8 +717,11 @@ void evict_retired_features(ViewState& view) noexcept {
     root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[2].Constants.ShaderRegister = 0U;
     root_parameters[2].Constants.Num32BitValues = 40U;
+    root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[3].DescriptorTable.NumDescriptorRanges = 1U;
+    root_parameters[3].DescriptorTable.pDescriptorRanges = &ranges[2];
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
-    root_desc.NumParameters = 3U;
+    root_desc.NumParameters = 4U;
     root_desc.pParameters = root_parameters;
     result = D3D12SerializeRootSignature(
         &root_desc,
@@ -866,6 +895,104 @@ void uav_barrier(
     command_list->ResourceBarrier(1U, &barrier);
 }
 
+// The codec's exposure binding for this evaluation: a descriptor slot and the
+// preExposure / exposureScale multiplier its shader divides by the texture value.
+struct CodecExposure {
+    DebugExposure source{};
+    std::uint32_t descriptor{null_exposure_descriptor};
+    float white_multiplier{};
+};
+
+// Unexposed HDR color needs the game's exposure to reach display range. Falls
+// back to the null view (no normalization) rather than overwrite a slot that a
+// recent, possibly in-flight, evaluation still references.
+CodecExposure bind_codec_exposure(const DlssNrFrame& frame, GpuResources& gpu) noexcept {
+    const auto& source = debug_exposure_supported(debug_exposure) ? debug_exposure : nr_exposure;
+    if ((frame.create_flags & 1U) == 0U || !debug_exposure_supported(source)) return {};
+    const auto clock = ++gpu.exposure_clock;
+    auto slot = exposure_descriptor_slots;
+    for (std::uint32_t i = 0; i < exposure_descriptor_slots; ++i)
+        if (gpu.exposures[i] == source.texture) { slot = i; break; }
+    if (slot == exposure_descriptor_slots) {
+        for (std::uint32_t i = 0; i < exposure_descriptor_slots; ++i)
+            if (!gpu.exposures[i] || clock - gpu.exposure_uses[i] >= exposure_slot_reuse_age) {
+                if (slot == exposure_descriptor_slots || gpu.exposure_uses[i] < gpu.exposure_uses[slot]) slot = i;
+            }
+        if (slot == exposure_descriptor_slots) return {};
+        ID3D12Device* device{};
+        if (FAILED(source.texture->GetDevice(IID_PPV_ARGS(&device))) || !device) return {};
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = source.texture->GetDesc().Format;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1U;
+        auto cpu = gpu.descriptors->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += static_cast<std::uint64_t>(null_exposure_descriptor + 1U + slot) * gpu.descriptor_size;
+        device->CreateShaderResourceView(source.texture, &view, cpu);
+        release(device);
+        release(gpu.exposures[slot]);
+        gpu.exposures[slot] = source.texture;
+        gpu.exposures[slot]->AddRef();
+        trace_event("DLSS-NR exposure normalization view=%llu texture=%p format=%u pre=%.9g scale=%.9g slot=%u",
+            static_cast<unsigned long long>(frame.view_id), source.texture, static_cast<unsigned>(view.Format),
+            source.pre, source.scale, slot);
+    }
+    gpu.exposure_uses[slot] = clock;
+    return {source, null_exposure_descriptor + 1U + slot, source.pre / source.scale};
+}
+
+// Every 900 evaluations, logs the previous sample and copies the current
+// exposure texel. That copy completed hundreds of frames earlier, so reading
+// it never waits on the GPU. 16-bit exposure formats are not sampled.
+void sample_codec_exposure(const DlssNrFrame& frame, GpuResources& gpu, const CodecExposure& exposure) noexcept {
+    constexpr std::uint64_t interval = 900U;
+    constexpr UINT64 slot_bytes = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    if (!exposure.source.texture || gpu.exposure_clock % interval != 1U) return;
+    const auto format = exposure.source.texture->GetDesc().Format;
+    if (format != DXGI_FORMAT_R32_FLOAT && format != DXGI_FORMAT_R32G32_FLOAT &&
+        format != DXGI_FORMAT_R32G32B32A32_FLOAT) return;
+    if (!gpu.exposure_readback) {
+        ID3D12Device* device{};
+        if (FAILED(frame.command_list->GetDevice(IID_PPV_ARGS(&device))) || !device) return;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = 2U * slot_bytes;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1U;
+        buffer.SampleDesc.Count = 1U;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        const auto result = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gpu.exposure_readback));
+        release(device);
+        if (FAILED(result)) return;
+    }
+    const auto slot = gpu.exposure_samples++ % 2U;
+    if (gpu.exposure_samples > 1U) {
+        const D3D12_RANGE range{(1U - slot) * slot_bytes, (1U - slot) * slot_bytes + sizeof(float)};
+        void* mapped{};
+        if (SUCCEEDED(gpu.exposure_readback->Map(0U, &range, &mapped))) {
+            float value{};
+            std::memcpy(&value, static_cast<const std::byte*>(mapped) + range.Begin, sizeof(value));
+            const D3D12_RANGE written{};
+            gpu.exposure_readback->Unmap(0U, &written);
+            trace_event("DLSS-NR exposure sample view=%llu exposure=%.9g white=%.9g",
+                static_cast<unsigned long long>(frame.view_id), value,
+                value > 0.F ? exposure.white_multiplier / value : 0.F);
+        }
+    }
+    D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+    source.pResource = exposure.source.texture;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.pResource = gpu.exposure_readback;
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint.Offset = slot * slot_bytes;
+    destination.PlacedFootprint.Footprint = {format, 1U, 1U, 1U, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+    transition(frame.command_list, exposure.source.texture, exposure.source.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    frame.command_list->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
+    transition(frame.command_list, exposure.source.texture, D3D12_RESOURCE_STATE_COPY_SOURCE, exposure.source.state);
+}
+
 void dispatch_codec(
     const DlssNrFrame& frame,
     GpuResources& gpu,
@@ -873,7 +1000,8 @@ void dispatch_codec(
     const std::uint32_t source_descriptor,
     const std::uint32_t destination_descriptor,
     const Settings& settings,
-    const NrRegion& region
+    const NrRegion& region,
+    const CodecExposure& exposure = {}
 ) noexcept {
     ID3D12DescriptorHeap* heaps[]{gpu.descriptors};
     frame.command_list->SetDescriptorHeaps(1U, heaps);
@@ -887,6 +1015,13 @@ void dispatch_codec(
     handle.ptr += static_cast<std::uint64_t>(destination_descriptor) *
         gpu.descriptor_size;
     frame.command_list->SetComputeRootDescriptorTable(1U, handle);
+    handle = gpu.descriptors->GetGPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<std::uint64_t>(exposure.descriptor) * gpu.descriptor_size;
+    frame.command_list->SetComputeRootDescriptorTable(3U, handle);
+    // The texture is shared with the game; read it in a shader state, then restore.
+    if (exposure.source.texture)
+        transition(frame.command_list, exposure.source.texture, exposure.source.state,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const auto width = gpu.border_only ? region.width : gpu.width;
     const auto height = gpu.border_only ? region.height : gpu.height;
     CodecConstants constants{
@@ -905,7 +1040,7 @@ void dispatch_codec(
         region.roundness,
         region.transition,
         settings.nr_alignment_border_enabled ? 1U : 0U,
-        region.mask.count, {}, {},
+        region.mask.count, exposure.white_multiplier, 0U, {},
     };
     std::memcpy(constants.mask_bounds, region.mask.bounds, sizeof(constants.mask_bounds));
     frame.command_list->SetComputeRoot32BitConstants(2U, 40U, &constants, 0U);
@@ -916,6 +1051,9 @@ void dispatch_codec(
         (dispatch_height + 15U) / 16U,
         1U
     );
+    if (exposure.source.texture)
+        transition(frame.command_list, exposure.source.texture,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, exposure.source.state);
 }
 
 // Resolve NR independently of SR: changing NR dimensions must not resize the
@@ -1240,6 +1378,8 @@ bool evaluate_dlss_nr(
         frame.color_state,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
+    const auto exposure = bind_codec_exposure(frame, *gpu);
+    sample_codec_exposure(frame, *gpu, exposure);
     dispatch_codec(
         frame,
         *gpu,
@@ -1247,7 +1387,8 @@ bool evaluate_dlss_nr(
         0U,
         4U,
         settings,
-        codec_region
+        codec_region,
+        exposure
     );
     uav_barrier(frame.command_list, gpu->original_output);
     uav_barrier(frame.command_list, gpu->color_proxy);
@@ -1370,7 +1511,8 @@ bool evaluate_dlss_nr(
         1U,
         6U,
         settings,
-        codec_region
+        codec_region,
+        exposure
     );
     uav_barrier(frame.command_list, frame.color);
     transition(

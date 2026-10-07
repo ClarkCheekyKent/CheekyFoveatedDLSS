@@ -5139,6 +5139,15 @@ void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* h
         get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
         get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"));
 }
+// NGX inputs are shader-readable during evaluation; HDR scene white is
+// preExposure / (exposure * exposureScale), which NR must undo (Control).
+DebugExposure native_nr_exposure(const NgxParameters* parameters) noexcept {
+    const DebugExposure exposure{get_d3d12_parameter_resource(parameters, "ExposureTexture"),
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        ngx_float(parameters, "DLSS.Pre.Exposure", 1.0F), ngx_float(parameters, "DLSS.Exposure.Scale", 1.0F)};
+    return debug_exposure_supported(exposure) ? exposure : DebugExposure{};
+}
+
 NgxResult process_d3d12_evaluation(const D3D12NgxEvaluationCall& call,
     D3D12NgxEvaluateFn original, void* context) {
     // Streamline supplies its own tagged extents. Restrict normalization to
@@ -5146,6 +5155,8 @@ NgxResult process_d3d12_evaluation(const D3D12NgxEvaluationCall& call,
     const bool native_dlss = !inside_streamline_evaluation && recognizable_d3d12_dlss_evaluation(call);
     const NgxEvaluationExtentScope extent_scope(native_dlss ? call.parameters : nullptr,
         native_dlss ? d3d12_game_output_extent(call.handle) : NgxOutputExtent{});
+    const DebugExposureScope exposure_scope(native_dlss ? native_nr_exposure(call.parameters) : DebugExposure{},
+        nr_exposure);
     const auto result = process_d3d12_evaluation_impl(call, original, context);
     stamp_d3d12_game_output(call.command_list, call.handle, call.parameters, result);
     return result;
@@ -5255,6 +5266,7 @@ NgxResult evaluate_d3d12_c_impl(
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
     }
+    const DebugExposureScope exposure_scope(native_nr_exposure(parameters), nr_exposure);
     NrPipelineTimingScope pipeline_timing{command_list, settings};
     NativeNrInputScope nr_input{command_list, handle, parameters, settings};
     ScopedCoordinatedCrop nr_crop{nr_input.crop_ready ? nr_input.frame.view_id : 0U,

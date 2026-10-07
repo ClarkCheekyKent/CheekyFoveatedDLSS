@@ -34,6 +34,7 @@ struct GazeViewDiagnostics {
     bool copy_mapping{};
     bool projection_mapping{};
     bool marker_mapping{};
+    bool union_mapping{}; // One render cropped for both eyes (binocular union frustum).
     bool submitted_projection{};
     std::array<float, 4> fov_tangents{};
     unsigned alignment_source{};
