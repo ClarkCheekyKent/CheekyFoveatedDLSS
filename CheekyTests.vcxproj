@@ -51,6 +51,7 @@
     <ClCompile Include="tests\debug_exposure_tests.cpp" />
     <ClCompile Include="tests\d3d11_binding_tests.cpp" />
     <ClCompile Include="src\d3d11_backend.cpp" />
+    <ClCompile Include="src\d3d11_peripheral_dlaa.cpp" />
     <ClCompile Include="tests\motion_resample_tests.cpp" />
     <ClCompile Include="tests\d3d12_history_tests.cpp" />
     <ClCompile Include="tests\d3d12_safety_tests.cpp" />

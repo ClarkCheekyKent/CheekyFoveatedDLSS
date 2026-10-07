@@ -111,6 +111,33 @@ void release(T*& object) noexcept {
     }
 }
 
+// Unity's floating-point color targets can use typeless RGBA32 storage.
+// Preserve default view inference for every other resource format.
+HRESULT create_color_srv(ID3D11Device* device, ID3D11Resource* resource,
+    ID3D11ShaderResourceView** view) noexcept {
+    D3D11_TEXTURE2D_DESC texture_desc{};
+    ID3D11Texture2D* texture{};
+    if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&texture)))) {
+        texture->GetDesc(&texture_desc);
+        release(texture);
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    desc.Texture2D.MipLevels = texture_desc.MipLevels;
+    return device->CreateShaderResourceView(resource,
+        texture_desc.Format == DXGI_FORMAT_R32G32B32A32_TYPELESS ? &desc : nullptr, view);
+}
+
+HRESULT create_color_uav(ID3D11Device* device, ID3D11Resource* resource,
+    DXGI_FORMAT format, ID3D11UnorderedAccessView** view) noexcept {
+    D3D11_UNORDERED_ACCESS_VIEW_DESC desc{};
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    return device->CreateUnorderedAccessView(resource,
+        format == DXGI_FORMAT_R32G32B32A32_TYPELESS ? &desc : nullptr, view);
+}
+
 [[nodiscard]] std::uint32_t read_ui(
     const NgxParameters* const parameters,
     const char* const name
@@ -195,6 +222,8 @@ void release_resource_set(ResourceSet& resources) noexcept {
     // IMPORTANT: unlike the old implementation, the private texture is the
     // size of the foveated output itself. DLSS writes the crop packed at (0, 0).
     D3D11_TEXTURE2D_DESC private_desc = game_output_desc;
+    if (private_desc.Format == DXGI_FORMAT_R32G32B32A32_TYPELESS)
+        private_desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     private_desc.Width = private_width;
     private_desc.Height = private_height;
     private_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -920,13 +949,14 @@ extern "C" D3D11Evaluation* prepare_d3d11_private(
 
     ID3D11Device* device{};
     context->GetDevice(&device);
-    if (device == nullptr || FAILED(device->CreateShaderResourceView(
+    if (device == nullptr || FAILED(create_color_srv(
+            device,
             color_resource,
-            nullptr,
             &evaluation->color_srv
-        )) || FAILED(device->CreateUnorderedAccessView(
+        )) || FAILED(create_color_uav(
+            device,
             output_resource,
-            nullptr,
+            output_desc.Format,
             &evaluation->output_uav
         ))) {
         release(device);
@@ -1371,9 +1401,9 @@ bool composite_d3d11_crop(
     ID3D11UnorderedAccessView* output_uav{};
     context->GetDevice(&device);
     const bool views_ready = device != nullptr &&
-        SUCCEEDED(device->CreateShaderResourceView(game_color, nullptr, &color_srv)) &&
-        SUCCEEDED(device->CreateShaderResourceView(packed_dlss_output, nullptr, &dlss_srv)) &&
-        SUCCEEDED(device->CreateUnorderedAccessView(game_output, nullptr, &output_uav));
+        SUCCEEDED(create_color_srv(device, game_color, &color_srv)) &&
+        SUCCEEDED(create_color_srv(device, packed_dlss_output, &dlss_srv)) &&
+        SUCCEEDED(create_color_uav(device, game_output, output_desc.Format, &output_uav));
     release(device);
     if (!views_ready) {
         release(output_uav);
