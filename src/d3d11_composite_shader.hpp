@@ -162,13 +162,19 @@ void CompositeMain(uint3 dispatch_id : SV_DispatchThreadID) {
     }
     const float normalized_feather = Feather /
         max(0.0001, min(ShapeWidth, ShapeHeight));
+    // Perceptual feather: blend the reconstructed center into the native
+    // periphery with a quintic smootherstep. Unlike HLSL smoothstep (cubic),
+    // this has zero first AND second derivatives at both ends, which makes
+    // changes in DLSS-NR sharpness/texture much less visible at the ring.
+    const float feather_start = max(0.0, 1.0 - normalized_feather);
+    const float feather_t = Feather <= 0.0 ? 0.0 :
+        saturate((distance_from_center - feather_start) /
+            max(0.000001, 1.0 - feather_start));
+    const float smoother = feather_t * feather_t * feather_t *
+        (feather_t * (feather_t * 6.0 - 15.0) + 10.0);
     const float weight = Feather <= 0.0
         ? (distance_from_center <= 1.0 ? 1.0 : 0.0)
-        : 1.0 - smoothstep(
-            max(0.0, 1.0 - normalized_feather),
-            1.0,
-            distance_from_center
-        );
+        : 1.0 - smoother;
     const bool inside_rect = all(output_pixel >= RectBase) &&
         all(output_pixel < RectBase + RectSize);
     if (!inside_rect || weight <= 0.0) {

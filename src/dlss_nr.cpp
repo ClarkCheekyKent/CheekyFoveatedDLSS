@@ -918,6 +918,18 @@ void dispatch_codec(
     );
 }
 
+// Extra DLSS-NR passes use private view IDs for temporal history only.
+// Never feed those private bits into AFW/gaze coordination: bit 62 is already
+// AFW's own coordinator namespace. Keeping coverage on the original view ID
+// prevents pass 3 from accidentally selecting/toggling the wrong eye/gaze view.
+constexpr DlssViewId kNrPass2ViewBit = (DlssViewId{1} << 63U);
+constexpr DlssViewId kNrPass3ViewBit = (DlssViewId{1} << 61U);
+constexpr DlssViewId kNrExtraPassViewMask = kNrPass2ViewBit | kNrPass3ViewBit;
+
+static DlssViewId nr_base_view_id(const DlssViewId view_id) noexcept {
+    return view_id & ~kNrExtraPassViewMask;
+}
+
 // Resolve NR independently of SR: changing NR dimensions must not resize the
 // SR history, and NR must keep tracking when foveated SR is disabled.
 bool resolve_afw_nr_coverage(DlssNrFrame& frame, Settings& settings) noexcept {
@@ -936,11 +948,11 @@ bool resolve_afw_nr_coverage(DlssNrFrame& frame, Settings& settings) noexcept {
         if (!frame.input_width || !frame.input_height) return false;
         frame.center = foveation_center_from_geometry(crop, frame.input_width, frame.input_height);
         coverage.afw_mask = settings.afw_mask;
-        apply_next_jump_preview(coverage, frame.view_id);
-    } else if (!calculate_coordinated_crop(coverage, afw_nr_gaze_view(frame.view_id), frame.color,
+        apply_next_jump_preview(coverage, nr_base_view_id(frame.view_id));
+    } else if (!calculate_coordinated_crop(coverage, afw_nr_gaze_view(nr_base_view_id(frame.view_id)), frame.color,
             frame.input_width, frame.input_height, frame.output_width, frame.output_height,
             frame.view_output_base_x, frame.view_output_base_y, crop, reset, nullptr, &frame.center)) return false;
-    else apply_next_jump_preview(coverage, afw_nr_gaze_view(frame.view_id));
+    else apply_next_jump_preview(coverage, afw_nr_gaze_view(nr_base_view_id(frame.view_id)));
     frame.has_center = true; frame.reset |= reset;
     settings.nr_width = static_cast<float>(crop.input_width) / frame.input_width;
     settings.nr_height = static_cast<float>(crop.input_height) / frame.input_height;
@@ -952,14 +964,41 @@ bool resolve_afw_nr_coverage(DlssNrFrame& frame, Settings& settings) noexcept {
 }
 }  // namespace
 
-bool evaluate_dlss_nr(
+
+static Settings nr_settings_for_extra_pass(const Settings& base, const unsigned pass) {
+    auto out = base;
+#define COPY_PASS_FIELD(field) out.nr_##field = base.nr_pass##pass##_##field
+    if (pass == 2U) {
+#define COPY2(field) out.nr_##field = base.nr_pass2_##field
+        COPY2(working_scale); COPY2(preset); COPY2(style); COPY2(intensity); COPY2(local_tone_strength);
+        COPY2(local_structure_strength); COPY2(skin_structure_strength); COPY2(automatic_mask);
+        COPY2(ui_correction); COPY2(paper_white_scale); COPY2(hdr_transfer_strength);
+        COPY2(color_strength); COPY2(depth_convention); COPY2(motion_scale_x_multiplier);
+        COPY2(motion_scale_y_multiplier);
+#undef COPY2
+    } else {
+#define COPY3(field) out.nr_##field = base.nr_pass3_##field
+        COPY3(working_scale); COPY3(preset); COPY3(style); COPY3(intensity); COPY3(local_tone_strength);
+        COPY3(local_structure_strength); COPY3(skin_structure_strength); COPY3(automatic_mask);
+        COPY3(ui_correction); COPY3(paper_white_scale); COPY3(hdr_transfer_strength);
+        COPY3(color_strength); COPY3(depth_convention); COPY3(motion_scale_x_multiplier);
+        COPY3(motion_scale_y_multiplier);
+#undef COPY3
+    }
+#undef COPY_PASS_FIELD
+    return out;
+}
+
+bool evaluate_dlss_nr_internal(
     const DlssNrFrame& input_frame,
-    const Settings& input_settings
+    const Settings& input_settings,
+    const bool allow_second_pass
 ) noexcept {
     auto frame = input_frame;
     auto settings = input_settings;
     if (!resolve_afw_nr_coverage(frame, settings)) { skip_dlss_nr_history(frame.view_id); return false; }
     AfwPrivateWorkScope private_work;
+    {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
     collect_retired_views();
@@ -1424,7 +1463,90 @@ bool evaluate_dlss_nr(
             static_cast<unsigned long long>(diagnostics.evaluation_calls)
         );
     }
+    } // Release NR execution locks before starting the independent second pass.
+
+    // Optional second DLSS-NR pass. It intentionally reuses the exact same
+    // foveated geometry, but gets its own temporal history/view identity so
+    // the second pass never corrupts the first pass history. The first pass
+    // has already decoded its result back into frame.color at this point, so
+    // this pass consumes the first-pass image and writes its refined result
+    // back into the same foveated region.
+    bool second_pass_succeeded = false;
+    if (allow_second_pass && settings.nr_second_pass && settings.nr_foveated) {
+        static std::atomic<unsigned long long> second_pass_count{0};
+        const auto second_pass_index = second_pass_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (second_pass_index <= 12) {
+            trace_event(
+                "[SecondDLSS5] PASS 2 START index=%llu view=%llu",
+                second_pass_index,
+                static_cast<unsigned long long>(frame.view_id)
+            );
+        }
+        auto second_frame = frame;
+        // Reserve the high bit as an internal NR-pass namespace. Normal view
+        // IDs are small per-eye handles; keeping the namespace separate avoids
+        // sharing temporal history between pass 1 and pass 2.
+        second_frame.view_id = frame.view_id | kNrPass2ViewBit;
+        second_frame.reset = false;
+        const auto second_settings = nr_settings_for_extra_pass(settings, 2U);
+        if (!evaluate_dlss_nr_internal(second_frame, second_settings, false)) {
+            trace_event(
+                "[SecondDLSS5] PASS 2 FAILED index=%llu view=%llu; keeping first-pass result",
+                second_pass_index,
+                static_cast<unsigned long long>(frame.view_id)
+            );
+        } else {
+            second_pass_succeeded = true;
+            if (second_pass_index <= 12) {
+                trace_event(
+                    "[SecondDLSS5] PASS 2 SUCCESS index=%llu view=%llu",
+                    second_pass_index,
+                    static_cast<unsigned long long>(frame.view_id)
+                );
+            }
+        }
+    }
+
+    // Optional third pass: only runs after a successful pass 2. Pass 2 has
+    // already decoded/composited into frame.color, so pass 3 consumes that
+    // refined image. Pass 3 uses bit 61: bit 62 is reserved by AFW gaze coordination.
+    if (allow_second_pass && settings.nr_third_pass && settings.nr_second_pass &&
+        settings.nr_foveated && second_pass_succeeded) {
+        static std::atomic<unsigned long long> third_pass_count{0};
+        const auto third_pass_index = third_pass_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (third_pass_index <= 12) {
+            trace_event(
+                "[ThirdDLSS5] PASS 3 START index=%llu view=%llu",
+                third_pass_index,
+                static_cast<unsigned long long>(frame.view_id)
+            );
+        }
+        auto third_frame = frame;
+        third_frame.view_id = frame.view_id | kNrPass3ViewBit;
+        third_frame.reset = false;
+        const auto third_settings = nr_settings_for_extra_pass(settings, 3U);
+        if (!evaluate_dlss_nr_internal(third_frame, third_settings, false)) {
+            trace_event(
+                "[ThirdDLSS5] PASS 3 FAILED index=%llu view=%llu; keeping second-pass result",
+                third_pass_index,
+                static_cast<unsigned long long>(frame.view_id)
+            );
+        } else if (third_pass_index <= 12) {
+            trace_event(
+                "[ThirdDLSS5] PASS 3 SUCCESS index=%llu view=%llu",
+                third_pass_index,
+                static_cast<unsigned long long>(frame.view_id)
+            );
+        }
+    }
     return true;
+}
+
+bool evaluate_dlss_nr(
+    const DlssNrFrame& frame,
+    const Settings& settings
+) noexcept {
+    return evaluate_dlss_nr_internal(frame, settings, true);
 }
 
 void draw_dlss_nr_border(const DlssNrFrame& input_frame, const Settings& input_settings) noexcept {
@@ -1484,14 +1606,21 @@ void collect_dlss_nr_submissions() noexcept {
 }
 void skip_dlss_nr_history(const DlssViewId view_id) noexcept {
     std::lock_guard lock(nr_mutex);
-    for (auto& view : views) if (view.view_id == view_id) view.was_enabled = false;
+    const auto base = nr_base_view_id(view_id);
+    for (auto& view : views) {
+        if (nr_base_view_id(view.view_id) == base) view.was_enabled = false;
+    }
 }
 
 void release_dlss_nr_view(const DlssViewId view_id) noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
-    release_dlss_nr_inputs(view_id);
+    const auto base = nr_base_view_id(view_id);
+    // Inputs are owned by the real game view; pass 2/3 only have private NR histories.
+    release_dlss_nr_inputs(base);
     std::lock_guard lock(nr_mutex);
-    for (auto& view : views) if (view.view_id == view_id) view.retired = true;
+    for (auto& view : views) {
+        if (nr_base_view_id(view.view_id) == base) view.retired = true;
+    }
     collect_retired_views();
 }
 void release_dlss_nr_resources() noexcept {

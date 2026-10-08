@@ -489,32 +489,79 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     end
                     check("Show NR alignment border", "NrAlignmentBorder")
                 end
-                section("Neural rendering")
+
+                section("Pass 1 DLSS 5 settings")
                 if status.settings.NrProcessingOrder ~= nil then
-                    combo("Rendering order", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
+                    combo("Rendering order##P1", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
                 else
                     text("Rendering order: Unavailable in this runtime")
                 end
-                slider("NR working scale", "NrWorkingScale", 0.1, 1)
-                combo("DLSS-NR style", "NrStyle", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
-                slider("NR intensity", "NrIntensity", 0, 1)
+                slider("Working scale##P1", "NrWorkingScale", 0.1, 1)
+                combo("DLSS-NR style##P1", "NrStyle", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
+                slider("Intensity##P1", "NrIntensity", 0, 1)
                 text("Intensity: 0 = no model edit, 1 = full model edit.")
-                if imgui.tree_node("Advanced NR") then
-                    slider("Local tone", "NrLocalToneStrength", 0, 2)
-                    slider("Local structure", "NrLocalStructureStrength", 0, 2)
-                    check("Automatic mask", "NrAutomaticMask")
+                if imgui.tree_node("Advanced NR##P1") then
+                    slider("Local tone##P1", "NrLocalToneStrength", 0, 2)
+                    slider("Local structure##P1", "NrLocalStructureStrength", 0, 2)
+                    check("Automatic mask##P1", "NrAutomaticMask")
                     if draft.NrAutomaticMask == true then
-                        slider("Skin structure", "NrSkinStructureStrength", 0, 2)
+                        slider("Skin structure##P1", "NrSkinStructureStrength", 0, 2)
                     end
                     if (status.nr_details or {}).hdr_input == true then
-                        slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
+                        slider("Paper white##P1", "NrPaperWhiteScale", 0.01, 8)
                     end
-                    slider("Transfer strength", "NrHdrTransferStrength", 0, 2)
-                    slider("Color strength", "NrColorStrength", 0, 2)
-                    combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
-                    slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
-                    slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
+                    slider("Transfer strength##P1", "NrHdrTransferStrength", 0, 2)
+                    slider("Color strength##P1", "NrColorStrength", 0, 2)
+                    combo("Depth convention##P1", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
+                    slider("Motion scale X##P1", "NrMotionScaleXMultiplier", -4, 4)
+                    slider("Motion scale Y##P1", "NrMotionScaleYMultiplier", -4, 4)
                     imgui.tree_pop()
+                end
+
+                if draft.NrFoveated then
+                    check("Second DLSS 5 pass", "NrSecondPass")
+                    text("Pass 2 consumes pass 1 output and keeps separate temporal history.")
+                    if draft.NrSecondPass then
+                        if imgui.tree_node("Pass 2 DLSS 5 settings") then
+                            slider("Working scale##P2", "NrPass2WorkingScale", 0.1, 1)
+                            combo("DLSS-NR preset##P2", "NrPass2Preset", {[0]="Game/default",[1]="A",[2]="B",[3]="C",[4]="D",[5]="E",[6]="F",[7]="G"})
+                            combo("DLSS-NR style##P2", "NrPass2Style", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
+                            slider("Intensity##P2", "NrPass2Intensity", 0, 1)
+                            slider("Local tone##P2", "NrPass2LocalToneStrength", 0, 2)
+                            slider("Local structure##P2", "NrPass2LocalStructureStrength", 0, 2)
+                            check("Automatic mask##P2", "NrPass2AutomaticMask")
+                            if draft.NrPass2AutomaticMask == true then slider("Skin structure##P2", "NrPass2SkinStructureStrength", 0, 2) end
+                            check("UI correction##P2", "NrPass2UiCorrection")
+                            if (status.nr_details or {}).hdr_input == true then slider("Paper white##P2", "NrPass2PaperWhiteScale", 0.01, 8) end
+                            slider("Transfer strength##P2", "NrPass2HdrTransferStrength", 0, 2)
+                            slider("Color strength##P2", "NrPass2ColorStrength", 0, 2)
+                            combo("Depth convention##P2", "NrPass2DepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
+                            slider("Motion scale X##P2", "NrPass2MotionScaleXMultiplier", -4, 4)
+                            slider("Motion scale Y##P2", "NrPass2MotionScaleYMultiplier", -4, 4)
+                            imgui.tree_pop()
+                        end
+
+                        check("Third DLSS 5 pass", "NrThirdPass")
+                        text("Pass 3 consumes pass 2 output and keeps separate temporal history.")
+                        if draft.NrThirdPass and imgui.tree_node("Pass 3 DLSS 5 settings") then
+                            slider("Working scale##P3", "NrPass3WorkingScale", 0.1, 1)
+                            combo("DLSS-NR preset##P3", "NrPass3Preset", {[0]="Game/default",[1]="A",[2]="B",[3]="C",[4]="D",[5]="E",[6]="F",[7]="G"})
+                            combo("DLSS-NR style##P3", "NrPass3Style", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
+                            slider("Intensity##P3", "NrPass3Intensity", 0, 1)
+                            slider("Local tone##P3", "NrPass3LocalToneStrength", 0, 2)
+                            slider("Local structure##P3", "NrPass3LocalStructureStrength", 0, 2)
+                            check("Automatic mask##P3", "NrPass3AutomaticMask")
+                            if draft.NrPass3AutomaticMask == true then slider("Skin structure##P3", "NrPass3SkinStructureStrength", 0, 2) end
+                            check("UI correction##P3", "NrPass3UiCorrection")
+                            if (status.nr_details or {}).hdr_input == true then slider("Paper white##P3", "NrPass3PaperWhiteScale", 0.01, 8) end
+                            slider("Transfer strength##P3", "NrPass3HdrTransferStrength", 0, 2)
+                            slider("Color strength##P3", "NrPass3ColorStrength", 0, 2)
+                            combo("Depth convention##P3", "NrPass3DepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
+                            slider("Motion scale X##P3", "NrPass3MotionScaleXMultiplier", -4, 4)
+                            slider("Motion scale Y##P3", "NrPass3MotionScaleYMultiplier", -4, 4)
+                            imgui.tree_pop()
+                        end
+                    end
                 end
             end
             if imgui.button("Reset NR history / retry") then send("reset_nr") end
