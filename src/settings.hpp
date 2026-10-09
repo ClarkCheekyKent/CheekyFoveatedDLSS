@@ -97,6 +97,8 @@ struct Settings {
     bool nr_enabled{false};
     NrProcessingOrder nr_processing_order{NrProcessingOrder::after_upscaling};
     bool nr_foveated{true};
+    bool nr_second_pass{false};
+    bool nr_third_pass{false};
     bool nr_use_sr_foveation{false};
     bool nr_alignment_border_enabled{false};
     // Transient final-resolution border for DX11 transport composition.
@@ -121,6 +123,40 @@ struct Settings {
     std::uint32_t nr_depth_convention{};
     float nr_motion_scale_x_multiplier{1.0F};
     float nr_motion_scale_y_multiplier{1.0F};
+
+    // Independent DLSS-NR tuning for passes 2 and 3. Geometry remains shared.
+    // Pass 2
+    float nr_pass2_working_scale{1.0F};
+    std::uint32_t nr_pass2_preset{};
+    std::uint32_t nr_pass2_style{0U};
+    float nr_pass2_intensity{1.0F};
+    float nr_pass2_local_tone_strength{1.0F};
+    float nr_pass2_local_structure_strength{1.0F};
+    float nr_pass2_skin_structure_strength{1.0F};
+    bool nr_pass2_automatic_mask{false};
+    bool nr_pass2_ui_correction{false};
+    float nr_pass2_paper_white_scale{1.0F};
+    float nr_pass2_hdr_transfer_strength{1.0F};
+    float nr_pass2_color_strength{1.0F};
+    std::uint32_t nr_pass2_depth_convention{0U};
+    float nr_pass2_motion_scale_x_multiplier{1.0F};
+    float nr_pass2_motion_scale_y_multiplier{1.0F};
+    // Pass 3
+    float nr_pass3_working_scale{1.0F};
+    std::uint32_t nr_pass3_preset{};
+    std::uint32_t nr_pass3_style{0U};
+    float nr_pass3_intensity{1.0F};
+    float nr_pass3_local_tone_strength{1.0F};
+    float nr_pass3_local_structure_strength{1.0F};
+    float nr_pass3_skin_structure_strength{1.0F};
+    bool nr_pass3_automatic_mask{false};
+    bool nr_pass3_ui_correction{false};
+    float nr_pass3_paper_white_scale{1.0F};
+    float nr_pass3_hdr_transfer_strength{1.0F};
+    float nr_pass3_color_strength{1.0F};
+    std::uint32_t nr_pass3_depth_convention{0U};
+    float nr_pass3_motion_scale_x_multiplier{1.0F};
+    float nr_pass3_motion_scale_y_multiplier{1.0F};
 };
 
 inline bool uses_coordinated_center(const Settings& settings) noexcept {

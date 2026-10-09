@@ -866,6 +866,12 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "NrFoveated", settings.nr_foveated
     ));
     static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrSecondPass", settings.nr_second_pass
+    ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrThirdPass", settings.nr_third_pass
+    ));
+    static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "NrUseSrFoveation",
         settings.nr_use_sr_foveation
     ));
@@ -1045,6 +1051,12 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     );
     reshade::set_config_value(
         nullptr, config_section, "NrFoveated", settings.nr_foveated
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "NrSecondPass", settings.nr_second_pass
+    );
+    reshade::set_config_value(
+        nullptr, config_section, "NrThirdPass", settings.nr_third_pass
     );
     reshade::set_config_value(
         nullptr, config_section, "NrUseSrFoveation",
@@ -1506,6 +1518,56 @@ void draw_nr_controls(Settings& settings, bool& changed) {
 
     changed |= ImGui::Checkbox("Foveated DLSS-NR", &settings.nr_foveated);
     if (settings.nr_foveated) {
+        ImGui::Checkbox("Second DLSS 5 pass", &settings.nr_second_pass);
+        ImGui::TextDisabled("Runs a second DLSS-NR pass only inside the same foveated region.");
+        if (settings.nr_second_pass) {
+            ImGui::Checkbox("Third DLSS 5 pass", &settings.nr_third_pass);
+            ImGui::TextDisabled("Runs a third DLSS-NR pass on the output of pass 2 with separate history.");
+            if (ImGui::TreeNode("Pass 2 DLSS 5 tuning")) {
+                changed |= ImGui::SliderFloat("Working scale##P2", &settings.nr_pass2_working_scale, 0.10F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                int p2preset = static_cast<int>(settings.nr_pass2_preset);
+                if (ImGui::SliderInt("DLSS-NR preset##P2", &p2preset, 0, 7)) { settings.nr_pass2_preset = static_cast<std::uint32_t>(p2preset); changed = true; }
+                int p2style = static_cast<int>(settings.nr_pass2_style);
+                if (ImGui::Combo("DLSS-NR style##P2", &p2style, "Standard\0Natural\0Cinematic\0")) { settings.nr_pass2_style = static_cast<std::uint32_t>(p2style); changed = true; }
+                changed |= ImGui::SliderFloat("Intensity##P2", &settings.nr_pass2_intensity, 0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Local tone strength##P2", &settings.nr_pass2_local_tone_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Local structure strength##P2", &settings.nr_pass2_local_structure_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::Checkbox("Automatic mask##P2", &settings.nr_pass2_automatic_mask);
+                if (settings.nr_pass2_automatic_mask) changed |= ImGui::SliderFloat("Skin structure strength##P2", &settings.nr_pass2_skin_structure_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::Checkbox("UI correction##P2", &settings.nr_pass2_ui_correction);
+                if (dlss_nr_snapshot().hdr_input) changed |= ImGui::SliderFloat("Paper white scale##P2", &settings.nr_pass2_paper_white_scale, 0.01F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Transfer strength##P2", &settings.nr_pass2_hdr_transfer_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Color strength##P2", &settings.nr_pass2_color_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                int p2depth = static_cast<int>(settings.nr_pass2_depth_convention);
+                if (ImGui::Combo("Depth convention##P2", &p2depth, "Use game NGX flags\0Normal depth\0Reversed depth\0")) { settings.nr_pass2_depth_convention = static_cast<std::uint32_t>(p2depth); changed = true; }
+                changed |= ImGui::SliderFloat("Motion scale X##P2", &settings.nr_pass2_motion_scale_x_multiplier, -4.0F, 4.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Motion scale Y##P2", &settings.nr_pass2_motion_scale_y_multiplier, -4.0F, 4.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::TreePop();
+            }
+            if (settings.nr_third_pass && ImGui::TreeNode("Pass 3 DLSS 5 tuning")) {
+                changed |= ImGui::SliderFloat("Working scale##P3", &settings.nr_pass3_working_scale, 0.10F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                int p3preset = static_cast<int>(settings.nr_pass3_preset);
+                if (ImGui::SliderInt("DLSS-NR preset##P3", &p3preset, 0, 7)) { settings.nr_pass3_preset = static_cast<std::uint32_t>(p3preset); changed = true; }
+                int p3style = static_cast<int>(settings.nr_pass3_style);
+                if (ImGui::Combo("DLSS-NR style##P3", &p3style, "Standard\0Natural\0Cinematic\0")) { settings.nr_pass3_style = static_cast<std::uint32_t>(p3style); changed = true; }
+                changed |= ImGui::SliderFloat("Intensity##P3", &settings.nr_pass3_intensity, 0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Local tone strength##P3", &settings.nr_pass3_local_tone_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Local structure strength##P3", &settings.nr_pass3_local_structure_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::Checkbox("Automatic mask##P3", &settings.nr_pass3_automatic_mask);
+                if (settings.nr_pass3_automatic_mask) changed |= ImGui::SliderFloat("Skin structure strength##P3", &settings.nr_pass3_skin_structure_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::Checkbox("UI correction##P3", &settings.nr_pass3_ui_correction);
+                if (dlss_nr_snapshot().hdr_input) changed |= ImGui::SliderFloat("Paper white scale##P3", &settings.nr_pass3_paper_white_scale, 0.01F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Transfer strength##P3", &settings.nr_pass3_hdr_transfer_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Color strength##P3", &settings.nr_pass3_color_strength, 0.0F, 2.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                int p3depth = static_cast<int>(settings.nr_pass3_depth_convention);
+                if (ImGui::Combo("Depth convention##P3", &p3depth, "Use game NGX flags\0Normal depth\0Reversed depth\0")) { settings.nr_pass3_depth_convention = static_cast<std::uint32_t>(p3depth); changed = true; }
+                changed |= ImGui::SliderFloat("Motion scale X##P3", &settings.nr_pass3_motion_scale_x_multiplier, -4.0F, 4.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                changed |= ImGui::SliderFloat("Motion scale Y##P3", &settings.nr_pass3_motion_scale_y_multiplier, -4.0F, 4.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::TreePop();
+            }
+        } else {
+            settings.nr_third_pass = false;
+        }
         ImGui::TextDisabled("Uses the shared gaze/alignment center, even with SR disabled.");
         changed |= ImGui::Checkbox(
             "Use DLSS-SR size and shape",
@@ -1568,6 +1630,8 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         1.0F,
         "%.2f"
     );
+    int preset = static_cast<int>(settings.nr_preset);
+    if (ImGui::SliderInt("DLSS-NR preset", &preset, 0, 7)) { settings.nr_preset = static_cast<std::uint32_t>(preset); changed = true; }
     int style = static_cast<int>(settings.nr_style);
     if (ImGui::Combo(
             "DLSS-NR style",
@@ -1638,6 +1702,8 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         const Settings defaults{};
         settings.nr_enabled = defaults.nr_enabled;
         settings.nr_foveated = defaults.nr_foveated;
+        settings.nr_second_pass = defaults.nr_second_pass;
+        settings.nr_third_pass = defaults.nr_third_pass;
         settings.nr_use_sr_foveation = defaults.nr_use_sr_foveation;
         settings.nr_alignment_border_enabled =
             defaults.nr_alignment_border_enabled;
