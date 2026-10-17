@@ -1,5 +1,6 @@
 #include "fg_focus.hpp"
 #include "fg_color_format.hpp"
+#include "fg_timing.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -137,7 +138,8 @@ bool FocusPipeline::initialize(ID3D12Device* dev){
  stride=dev->GetDescriptorHandleIncrementSize(heap.Type);return true;
 }
 bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,unsigned pass,
- ID3D12Resource* color,const CheekyFgEye& g,const FocusRect& r,unsigned w,unsigned h,unsigned depth_bits,unsigned motion_bits,D3D12_RESOURCE_STATES color_state){
+ ID3D12Resource* color,const CheekyFgEye& g,const FocusRect& r,unsigned w,unsigned h,unsigned depth_bits,unsigned motion_bits,
+ D3D12_RESOURCE_STATES color_state,GpuTimings* timings){
  if(eye>1||pass>1||!color||!w||!h||!r.w||!r.h||!initialize(dev))return false;
  const bool need_color=pass==0||g.peripheral_method==3;
  const bool need_motion=need_color||g.peripheral_method!=0;
@@ -146,7 +148,10 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  if(!need_color)s.color.Reset();if(!need_depth)s.depth.Reset();if(!need_motion)s.motion.Reset();
  // Custom periphery samples the original color frames directly. Previous-frame
  // mode needs no guides at all; simple warp needs motion only.
- if(!need_color&&!need_motion)return true;
+ if(!need_color&&!need_motion){
+  if(timings)for(unsigned phase=0;phase<4;++phase)timings->preparation_stamp(list,eye,pass,phase);
+  return true;
+ }
  if((need_depth&&!g.depth)||(need_motion&&!g.motion))return false;
  auto df=need_depth?depth_srv_format(g.depth->GetDesc().Format):DXGI_FORMAT_R32_FLOAT;
  auto mf=need_motion?motion_srv_format(g.motion->GetDesc().Format):DXGI_FORMAT_R32G32_FLOAT;
@@ -175,15 +180,19 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];
  c.options[0]=need_color?1.f:0.f;c.options[1]=need_depth?1.f:0.f;c.options[2]=need_motion?1.f:0.f;
  c.options[3]=srgb_color(cd.Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
+ if(timings)timings->preparation_stamp(list,eye,pass,0);
  for(auto* out:{s.color.Get(),s.depth.Get(),s.motion.Get()})transition(list,out,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
  if(need_color&&color_state==D3D12_RESOURCE_STATE_COMMON)transition(list,color,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
  // Borrowed NGX guides retain the engine's shader-readable state. Our owned
  // copies begin in COMMON and are implicitly promoted for these read-only SRVs.
  bind(*this,dev,list,eye,pass,prepare.Get(),{need_color?color:nullptr,need_depth?g.depth:nullptr,need_motion?g.motion:nullptr,nullptr,nullptr},
   {cd.Format,df,mf,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT},{s.color.Get(),s.depth.Get(),s.motion.Get()},c);
+ if(timings)timings->preparation_stamp(list,eye,pass,1);
  list->Dispatch((std::max(need_color?w:0u,gw)+7)/8,(std::max(need_color?h:0u,gh)+7)/8,1);
+ if(timings)timings->preparation_stamp(list,eye,pass,2);
  for(auto* out:{s.color.Get(),s.depth.Get(),s.motion.Get()})transition(list,out,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
  if(need_color&&color_state==D3D12_RESOURCE_STATE_COMMON)transition(list,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+ if(timings)timings->preparation_stamp(list,eye,pass,3);
  return true;
 }
 bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,
@@ -216,15 +225,23 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  return true;
 }
 bool FocusPipeline::compose_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,
- ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect& r,unsigned w,unsigned h){
- if(!center||!periphery||!allocate(dev,w,h,color_format,full[eye]))return false;
+ ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect& r,unsigned w,unsigned h,
+ ID3D12Resource* destination,D3D12_RESOURCE_STATES destination_state){
+ if(!center||!periphery||eye>=2)return false;
+ if(destination){const auto d=destination->GetDesc();
+  if(destination==center||destination==periphery||d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
+     d.Width!=w||d.Height!=h||d.DepthOrArraySize!=1||d.MipLevels!=1||d.SampleDesc.Count!=1||
+     d.Format!=color_format||!(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))return false;
+ }else if(!allocate(dev,w,h,color_format,full[eye]))return false;
  Constants c{};c.rect[0]=float(r.x)/w;c.rect[1]=float(r.y)/h;c.rect[2]=float(r.w)/w;c.rect[3]=float(r.h)/h;c.options[2]=r.active?1.f:0.f;c.options[3]=r.feather;
- auto* output=full[eye].Get();transition(list,output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ auto* output=destination?destination:full[eye].Get();
+ transition(list,output,destination?destination_state:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
  transition(list,center,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
  if(periphery!=center)transition(list,periphery,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
  bind(*this,dev,list,eye,3,compose.Get(),{periphery,center,center,center,center},
   {periphery->GetDesc().Format,center->GetDesc().Format,center->GetDesc().Format,center->GetDesc().Format,center->GetDesc().Format},{output,nullptr,nullptr},c);
- list->Dispatch((w+7)/8,(h+7)/8,1);transition(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+ list->Dispatch((w+7)/8,(h+7)/8,1);
+ transition(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,destination?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_COMMON);
  transition(list,center,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  if(periphery!=center)transition(list,periphery,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  return true;

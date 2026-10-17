@@ -530,6 +530,25 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 elseif p and p.asynchronous_presenter then
                     text("Update the OpenXR layer for measured unique-output FPS.")
                 end
+                local presentation = fg.presentation
+                if presentation and presentation.supported then
+                    local function age(samples, mean, last)
+                        return (samples or 0)>0 and string.format("%.3f / %.3f ms",mean or 0,last or 0) or "No samples yet"
+                    end
+                    text("Frame age at OpenXR submission: average / last")
+                    rows("fg_frame_age", {
+                        {"Native frame age",age(presentation.native_samples,presentation.native_age_ms,presentation.native_age_last_ms)},
+                        {"Generated frame age (midpoint)",age(presentation.generated_samples,presentation.generated_age_ms,presentation.generated_age_last_ms)},
+                        {"Newest FG input age",age(presentation.generated_samples,presentation.newest_input_age_ms,presentation.newest_input_age_last_ms)},
+                        {"Repeated frame age",age(presentation.repeat_samples,presentation.repeat_age_ms,presentation.repeat_age_last_ms)}})
+                    text("Age starts at color capture; generated content uses the input-time midpoint.")
+                    text("Excludes earlier game rendering and runtime/display latency.")
+                    rows("fg_late_wait", {
+                        {"Late FG wait (CPU)",age(presentation.wait_samples,presentation.late_wait_ms,presentation.late_wait_last_ms)},
+                        {"Late FG wait budget",string.format("%.3f ms (10 ms maximum)",presentation.wait_budget_ms or 0)},
+                        {"New pairs / wait timeouts",string.format("%.0f / %.0f",presentation.wait_arrivals or 0,presentation.wait_timeouts or 0)}})
+                    text("Wait ends on a new pair; reserves 4 ms of the headset period for submission.")
+                end
                 if fg.frame_source then
                     rows("fg_source", {{"Frame ID source",fg.frame_source},
                         {"Frame ID calls / guides captured",string.format("%.0f / %.0f",fg.frame_source_calls or 0,fg.captured_guides or 0)}})
@@ -540,6 +559,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     end
                 end
                 text("GPU timings: average / last (ms), both eyes")
+                local extra = fg.overhead
                 if not p or not p.supported then
                     text("Install the matching OpenXR update for FG timings.")
                 else
@@ -560,8 +580,21 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             {resized and "Output resize" or "Periphery + blending", (focused or resized) and
                                 gpu_ms(p.periphery_ms,p.periphery_last_ms) or "Not used (full-frame FG)"},
                             {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)},
-                            {"FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}})
+                            {extra and extra.supported and "FG processing subtotal" or "FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}})
                         text("Average of up to 60 completed stereo pairs.")
+                        if extra and extra.supported then
+                            local function stage(samples, mean, last)
+                                return (samples or 0)>0 and gpu_ms(mean,last) or "Waiting for GPU samples"
+                            end
+                            text("Additional GPU stages outside the processing subtotal:")
+                            rows("fg_transport_gpu", {
+                                {"Guide snapshot copies / native",stage(extra.guide_samples,extra.guide_ms,extra.guide_last_ms)},
+                                {"Capture + guide handoff / native",stage(extra.capture_samples,extra.capture_ms,extra.capture_last_ms)},
+                                {"Generated output copy / generated",stage(extra.publication_samples,extra.publication_ms,extra.publication_last_ms)},
+                                {"OpenXR uploads / presentation",stage(extra.upload_samples,extra.upload_ms,extra.upload_last_ms)}})
+                            text("Color / guide preparation above is already in the subtotal.")
+                            text("Runtime compositor GPU work is outside these application timers.")
+                        end
                     elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then
                         text("GPU timestamps unavailable or FG has not started.")
                     else

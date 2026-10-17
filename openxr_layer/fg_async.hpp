@@ -14,13 +14,23 @@ struct BufferedPresenter final : Presenter {
     struct Auxiliary {XrSwapchain source{};Image image;};
     struct Native {
         std::uint64_t id{},ready{},epoch{};
+        TimingClock::time_point captured_at{},handed_off_at{};
         std::array<Image,2> color;
         std::array<XrCompositionLayerProjectionView,2> views;
         XrSpace space{};XrEnvironmentBlendMode blend{};
         FrameLayers layers;
         std::vector<Auxiliary> auxiliary;
-        FocusPipeline snapshot;
         CheekyFgPair guides;
+        ComPtr<IUnknown> guide_lease;
+        std::array<ComPtr<ID3D12Resource>,2> guide_depth,guide_motion;
+        void retain_guides(const CheekyFgPair& source) noexcept {
+            guides=source;guide_lease=source.lease;
+            for(unsigned eye=0;eye<2;++eye){guide_depth[eye]=source.eyes[eye].depth;guide_motion[eye]=source.eyes[eye].motion;}
+            // Explicit members own the returned references. The metadata copy
+            // must never be passed to the bridge's ReleasePair function.
+            guides.lease=nullptr;guides.producer_queue=nullptr;
+        }
+        void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};guide_lease.Reset();}
         bool guides_valid{};
         CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
         unsigned source_depth{},source_motion{};
@@ -29,6 +39,7 @@ struct BufferedPresenter final : Presenter {
     };
     struct Pair {
         std::uint64_t native_id{},current_id{},ready{};
+        TimingClock::time_point native_captured{},current_captured{},completed_at{},handed_off_at{},worker_started_at{},submitted_at{};
         std::array<Image,2> native,generated,current;
         std::array<XrCompositionLayerProjectionView,2> native_views,generated_views,current_views;
         FrameLayers layers;
@@ -44,11 +55,11 @@ struct BufferedPresenter final : Presenter {
     std::mutex capture_mutex;
     std::thread presentation_thread,generation_thread;
     Transport producer,output,uploads;
-    FocusPipeline snapshot_programs;
     ComPtr<ID3D12CommandQueue> generation_queue;
     std::unordered_map<XrSwapchain,Image> captured;
     std::unordered_map<XrSwapchain,std::uint64_t> capture_tokens;
     std::unordered_map<XrSwapchain,std::uint64_t> capture_frames;
+    std::unordered_map<XrSwapchain,TimingClock::time_point> capture_times;
     bool capture_overflow{};
     std::array<std::shared_ptr<Native>,3> slots;
     std::deque<std::shared_ptr<Native>> pending;
@@ -57,6 +68,18 @@ struct BufferedPresenter final : Presenter {
     std::unordered_map<XrSwapchain,Chain> auxiliary_chains;
     Chain scene_chains[2][2];
     CheekyFgPerformance telemetry;
+    CheekyFgOverhead extra_gpu;
+    // Unique native, generated midpoint, newest FG input, repeated native.
+    std::array<TimingAverage,4> frame_ages;
+    std::array<std::uint64_t,4> age_samples{};
+    TimingAverage late_pair_wait;
+    std::uint64_t late_wait_samples{},late_wait_arrivals{},late_wait_timeouts{};
+    std::uint64_t late_ready_skips{},late_idle_skips{};
+    TimingAverage capture_to_completion,completion_to_native,completion_to_generated;
+    std::array<TimingAverage,4> generation_stages;
+    std::uint64_t deferred_credits{},released_deferred_credits{},submitted_native_id{};
+    bool credit_deferred{};
+    double late_wait_budget_ms{};
     TimingAverage producer_cpu,pacing_wait;
     TimingAverage app_image_wait,present_image_wait,runtime_begin,runtime_end,present_cpu;
     std::array<TimingAverage,3> app_calls;
@@ -72,6 +95,7 @@ struct BufferedPresenter final : Presenter {
     bool started{},stopping{},bypass{},fg_active{},pacing_active{},degraded{};
     unsigned credits{},app_waiters{};
     std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{};
+    std::uint64_t last_credit_tick{},completed_pair_id{},inflight_id{};
     XrFrameState predicted{XR_TYPE_FRAME_STATE};
     XrTime app_display_time{};
     XrResult terminal{XR_SUCCESS},raw_result{XR_SUCCESS};
@@ -87,7 +111,7 @@ struct BufferedPresenter final : Presenter {
         // uses the game's queue. A competing direct queue adds scheduling jitter
         // inside the FG timestamp range and races the next game render for time.
         generation_queue=q;
-        return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q)&&snapshot_programs.initialize(dev);
+        return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
     }
     CheekyFgPerformance performance() const noexcept override {
         auto result=telemetry;result.asynchronous_presenter=1;result.queued_native=unsigned(pending.size());
@@ -104,6 +128,53 @@ struct BufferedPresenter final : Presenter {
         result.begin_ms=runtime_begin.mean();result.end_ms=runtime_end.mean();result.present_cpu_ms=present_cpu.mean();
         result.app_begin_ms=app_calls[0].mean();result.app_end_ms=app_calls[1].mean();result.app_release_ms=app_calls[2].mean();return result;
     }
+    CheekyFgOverhead overhead() const noexcept override {
+        auto result=extra_gpu;result.supported=1;
+        const auto capture=producer.gpu_cost.summary(),upload=uploads.gpu_cost.summary();
+        result.capture_samples=capture.samples;result.capture_ms=capture.mean;result.capture_last_ms=capture.last;
+        result.upload_samples=upload.samples;result.upload_ms=upload.mean;result.upload_last_ms=upload.last;
+        return result;
+    }
+    CheekyFgPresentation presentation() const noexcept override {
+        CheekyFgPresentation out;out.supported=1;
+        out.native_samples=age_samples[0];out.generated_samples=age_samples[1];out.repeat_samples=age_samples[3];
+        out.native_age_ms=frame_ages[0].mean();out.native_age_last_ms=frame_ages[0].last;
+        out.generated_age_ms=frame_ages[1].mean();out.generated_age_last_ms=frame_ages[1].last;
+        out.newest_input_age_ms=frame_ages[2].mean();out.newest_input_age_last_ms=frame_ages[2].last;
+        out.repeat_age_ms=frame_ages[3].mean();out.repeat_age_last_ms=frame_ages[3].last;
+        out.wait_samples=late_wait_samples;out.wait_arrivals=late_wait_arrivals;out.wait_timeouts=late_wait_timeouts;
+        out.late_wait_ms=late_pair_wait.mean();out.late_wait_last_ms=late_pair_wait.last;out.wait_budget_ms=late_wait_budget_ms;
+        return out;
+    }
+    void note_frame_age(const Pair& pair,bool generated,bool repeated,TimingClock::time_point submitted_at) noexcept {
+        // Hold mx. Timestamps travel with immutable images, not with their pool
+        // slots or the latest game frame. Repeats keep their original source.
+        auto add=[&](unsigned index,TimingClock::time_point source) {
+            if(source==TimingClock::time_point{}||source>submitted_at)return;
+            frame_ages[index].add(std::chrono::duration<double,std::milli>(submitted_at-source).count());++age_samples[index];
+        };
+        if(generated) {
+            if(pair.native_captured!=TimingClock::time_point{}&&pair.current_captured>=pair.native_captured)
+                add(1,pair.native_captured+(pair.current_captured-pair.native_captured)/2);
+            add(2,pair.current_captured);
+        }else add(repeated?3u:0u,pair.native_captured);
+        if(pair.interpolated&&pair.completed_at!=TimingClock::time_point{}&&pair.completed_at<=submitted_at&&!repeated) {
+            const auto ready_age=std::chrono::duration<double,std::milli>(submitted_at-pair.completed_at).count();
+            if(generated&&pair.current_captured!=TimingClock::time_point{}&&pair.current_captured<=pair.completed_at) {
+                // Same generated submissions enter both windows, so their sum
+                // accounts for newest-input age without mixing populations.
+                capture_to_completion.add(std::chrono::duration<double,std::milli>(pair.completed_at-pair.current_captured).count());
+                completion_to_generated.add(ready_age);
+                if(pair.handed_off_at>=pair.current_captured&&pair.worker_started_at>=pair.handed_off_at&&
+                    pair.submitted_at>=pair.worker_started_at&&pair.completed_at>=pair.submitted_at) {
+                    const std::array<TimingClock::time_point,5> boundaries{pair.current_captured,pair.handed_off_at,
+                        pair.worker_started_at,pair.submitted_at,pair.completed_at};
+                    for(unsigned i=0;i<generation_stages.size();++i)
+                        generation_stages[i].add(std::chrono::duration<double,std::milli>(boundaries[i+1]-boundaries[i]).count());
+                }
+            }else if(!generated)completion_to_native.add(ready_age);
+        }
+    }
     void note_app_image_wait(double ms) noexcept override {std::lock_guard lock(mx);app_image_wait.add(ms);}
     void note_app_call(unsigned stage,double ms) noexcept override {std::lock_guard lock(mx);if(stage<app_calls.size())app_calls[stage].add(ms);}
     XrResult runtime_end_frame(const XrFrameEndInfo* end) {
@@ -111,16 +182,24 @@ struct BufferedPresenter final : Presenter {
         std::lock_guard lock(mx);runtime_end.add(elapsed_ms(start));return result;
     }
     const char* diagnostic_text() const noexcept override {return diagnostic;}
+    // Caller holds mx (or has joined the workers). Dropped jobs have never
+    // submitted inference, so their raw snapshot leases can retire immediately.
+    void discard_pending() noexcept {for(auto& job:pending)job->clear_guides();pending.clear();}
     void stop() noexcept {
         {std::lock_guard lock(mx);stopping=true;changed.notify_all();}
         if(presentation_thread.joinable())presentation_thread.join();
         if(generation_thread.joinable())generation_thread.join();
         std::lock_guard capture_lock(capture_mutex);
         producer.drain();output.drain();uploads.drain();worker.wait_idle();
-        std::lock_guard lock(mx);pending.clear();ready.clear();latest_native.reset();slots={};
-        captured.clear();capture_tokens.clear();capture_frames.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;
+        std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();slots={};
+        captured.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
+        producer.gpu_cost.reset();uploads.gpu_cost.reset();extra_gpu={};
+        frame_ages={};age_samples={};late_pair_wait={};late_wait_samples=late_wait_arrivals=late_wait_timeouts=0;
+        late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
+        late_ready_skips=late_idle_skips=0;capture_to_completion={};completion_to_native={};completion_to_generated={};
+        generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
         distinct_native=repeated_presentations=runtime_submissions=0;
     }
     void destroy_chains() noexcept {
@@ -184,6 +263,7 @@ struct BufferedPresenter final : Presenter {
         if(bypass||!original)return false;
         std::lock_guard capture_lock(capture_mutex);
         {std::lock_guard lock(mx);if(stopping||degraded)return false;}
+        const auto captured_at=TimingClock::now();
         AddElapsed elapsed{capture_cpu_accumulator};
         auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
         const auto stamp_fn=guide_stamp?guide_stamp:runtime?reinterpret_cast<CheekyFgCaptureStampFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureStamp")):nullptr;
@@ -193,11 +273,12 @@ struct BufferedPresenter final : Presenter {
         if(guide_token&&!stamp_fn){stamp.token=guide_token(original);stamp.render_frame=stamp.token/2;}
         const auto token=stamp.token;
         const auto format=capture_format(original->GetDesc().Format,declared);if(format==DXGI_FORMAT_UNKNOWN)return false;
-        auto* c=producer.begin();if(!c){capture_overflow=true;return false;}
+        std::uint64_t profile_frame{};{std::lock_guard lock(mx);profile_frame=next_id+1;}
+        auto* c=producer.begin(profile_frame);if(!c){capture_overflow=true;return false;}
         auto copy=producer.copy(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,format);
         if(!copy){capture_overflow=true;c->list->Close();return false;}
         std::uint64_t ticket{};if(!producer.execute(*c,ticket))return false;
-        captured[sc]=std::move(copy);capture_tokens[sc]=token;capture_frames[sc]=stamp.render_frame;return true;
+        captured[sc]=std::move(copy);capture_tokens[sc]=token;capture_frames[sc]=stamp.render_frame;capture_times[sc]=captured_at;return true;
     }
     template<class Fn> static bool subimages(FrameLayers& layers,Fn&& visit) {
         for(auto& layer:layers.layers)if(!layer.scene)switch(layer.type) {
@@ -212,7 +293,7 @@ struct BufferedPresenter final : Presenter {
     }
     XrResult passthrough(const XrFrameEndInfo* end) noexcept {
         std::unique_lock lock(mx);if(!degraded)state=CheekyFgState::unsupported_submission;
-        ++epoch;raw=end;raw_done=false;credits=0;pending.clear();ready.clear();latest_native.reset();fg_active=pacing_active=false;changed.notify_all();
+        ++epoch;raw=end;raw_done=false;credits=0;credit_deferred=false;discard_pending();ready.clear();latest_native.reset();fg_active=pacing_active=false;changed.notify_all();
         // Unknown next chains cannot be copied generically. Their application
         // storage remains alive until the owning thread submits this frame.
         changed.wait(lock,[&]{return stopping||raw_done;});
@@ -234,20 +315,18 @@ struct BufferedPresenter final : Presenter {
         {
             std::lock_guard lock(mx);
             for(auto& slot:slots) {
-                if(!slot){slot=std::make_shared<Native>();auto& s=slot->snapshot;
-                    s.root=snapshot_programs.root;s.prepare=snapshot_programs.prepare;
-                    s.peripheral=snapshot_programs.peripheral;s.compose=snapshot_programs.compose;}
+                if(!slot)slot=std::make_shared<Native>();
                 if(slot.use_count()==1&&producer.completed(slot->ready)){job=slot;break;}
             }
         }
         const bool inference_slot=bool(job);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
-        job->color={};job->auxiliary.clear();job->guides={};job->guides_valid=false;job->guide_token=0;job->render_frame=0;
+        job->color={};job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         if(!projection||!job->layers.prepare(end,projection))result=passthrough(end);
         else {
             std::lock_guard capture_lock(capture_mutex);
-            auto* c=producer.begin();
+            auto* c=producer.begin(id,true);
             if(!c){std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;}
             bool good=true;std::uint64_t expected_token{},expected_frame{};bool tokens_match=true;
             if(good)for(unsigned eye=0;eye<2;++eye) {
@@ -257,6 +336,8 @@ struct BufferedPresenter final : Presenter {
                 if(!job->color[eye]){good=false;break;}
                 const auto token=capture_tokens[sub.swapchain];
                 const auto frame=capture_frames[sub.swapchain];
+                const auto captured_at=capture_times[sub.swapchain];
+                if(!eye||captured_at<job->captured_at)job->captured_at=captured_at;
                 if(!eye){expected_token=token;expected_frame=frame;}else tokens_match&=token==expected_token&&frame==expected_frame;
                 producer.freeze(*c,job->color[eye]);job->views[eye]=projection->views[eye];
             }
@@ -283,30 +364,20 @@ struct BufferedPresenter final : Presenter {
                     if(guides.capture_token!=expected_token||guides.eyes[1].evaluation!=expected_token||
                        guides.eyes[0].evaluation+1!=expected_token||guides.eyes[0].render_frame!=expected_frame||
                        guides.eyes[1].render_frame!=expected_frame){job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;}
-                    if(guides.lease)c->leases.emplace_back(guides.lease);
                     for(unsigned eye=0;eye<2&&job->guides_valid;++eye) {
                         auto g=guides.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
                         if(!g.depth||!g.motion){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
                         job->source_depth=unsigned(g.depth->GetDesc().Format);job->source_motion=unsigned(g.motion->GetDesc().Format);
                         if(g.width!=d.Width||g.height!=d.Height){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
-                        // Normalize immutable evaluation-time snapshots into
-                        // UV guides owned by this native transport lease.
-                        g.peripheral_method=2;FocusRect full{0,0,unsigned(d.Width),d.Height,0,false};
-                        job->guides_valid=job->snapshot.prepare_inputs(device.Get(),c->list.Get(),eye,1,
-                            job->color[eye]->texture.Get(),g,full,unsigned(d.Width),d.Height);
-                        if(!job->guides_valid){job->guide_state=CheekyFgState::generation_failed;break;}
-                        auto& owned=job->snapshot.inputs[eye][1];auto& meta=job->guides.eyes[eye];meta=guides.eyes[eye];
-                        const auto guide=owned.depth->GetDesc();
-                        meta.jitter_x*=float(guide.Width)/std::max(1u,meta.depth_width);
-                        meta.jitter_y*=float(guide.Height)/std::max(1u,meta.depth_height);
-                        meta.depth=owned.depth.Get();meta.motion=owned.motion.Get();
-                        meta.depth_width=meta.motion_width=unsigned(guide.Width);meta.depth_height=meta.motion_height=guide.Height;
-                        meta.depth_base_x=meta.depth_base_y=meta.motion_base_x=meta.motion_base_y=0;
-                        meta.motion_scale_x=float(guide.Width);meta.motion_scale_y=float(guide.Height);
-                        meta.jitter_correction_x=meta.jitter_correction_y=0;meta.motion_jittered=0;
-                        c->borrowed.emplace_back(g.depth);c->borrowed.emplace_back(g.motion);
                     }
-                    if(job->guides_valid){job->guide_token=expected_token;job->render_frame=expected_frame;}
+                    if(job->guides_valid){
+                        // The plugin has ALREADY captured immutable guides.
+                        // Retain its lease through inference rather than
+                        // converting another full guide set at handoff.
+                        // Worker preparation now crops/normalizes once using
+                        // the original offsets, scales and jitter correction.
+                        job->retain_guides(guides);job->guide_token=expected_token;job->render_frame=expected_frame;
+                    }
                     release(&guides);
                 }else if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
                 {std::lock_guard lock(mx);telemetry.color_token=expected_token;telemetry.guide_token=job->guide_token;
@@ -317,12 +388,13 @@ struct BufferedPresenter final : Presenter {
             if(!good)result=passthrough(end);
             else {
                 job->space=projection->space;job->blend=end->environmentBlendMode;
-                std::lock_guard lock(mx);job->id=id;job->epoch=epoch;
+                std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();
                 Pair native;native.native_id=native.current_id=id;native.ready=job->ready;
+                native.native_captured=native.current_captured=job->captured_at;
                 native.native=native.current=job->color;native.native_views=native.current_views=job->views;
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
                 latest_native=std::move(native);
-                if(inference_slot){pending.push_back(job);while(pending.size()>2){pending.pop_front();++skipped;}}
+                if(inference_slot){pending.push_back(job);while(pending.size()>2){pending.front()->clear_guides();pending.pop_front();++skipped;}}
                 ++frames;held_valid=true;changed.notify_all();
             }
         }
@@ -348,8 +420,11 @@ struct BufferedPresenter final : Presenter {
         try {for(;;) {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
-             job=pending.back();skipped+=pending.size()-1;pending.clear();}
+             job=pending.back();inflight_id=job->id;skipped+=pending.size()-1;
+             for(auto& dropped:pending)if(dropped!=job)dropped->clear_guides();pending.clear();}
             Pair pair;pair.native_id=pair.current_id=job->id;pair.native=pair.current=job->color;
+            pair.native_captured=pair.current_captured=job->captured_at;
+            pair.handed_off_at=job->handed_off_at;pair.worker_started_at=TimingClock::now();
             pair.native_views=pair.current_views=job->views;pair.layers=job->layers;pair.auxiliary=job->auxiliary;
             pair.space=job->space;pair.blend=job->blend;pair.ready=job->ready;
             bool success{};
@@ -372,12 +447,15 @@ struct BufferedPresenter final : Presenter {
                     std::array<Worker::OutputCopy,2> copies;
                     bool available=true;
                     for(unsigned eye=0;eye<2;++eye) {
-                        pair.generated[eye]=output.image(publication);
+                        pair.generated[eye]=output.image(publication,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
                         if(!pair.generated[eye]){available=false;break;}
                         copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state};
                     }
                     if(available) {
-                        success=worker.generate(guides,input,prior,cameras,result,&copies);attempted=!worker.failed;
+                        success=worker.generate(guides,input,prior,cameras,result,&copies,[](void* context) noexcept {
+                            static_cast<BufferedPresenter*>(context)->inference_submitted();
+                        },this);attempted=!worker.failed;
+                        pair.submitted_at=worker.submitted_at;
                         for(unsigned eye=0;eye<2;++eye) {
                             pair.generated[eye]->state=copies[eye].state;
                             pair.generated[eye]->presentation_format=srgb_color(d.Format)&&publication.Format==DXGI_FORMAT_R8G8B8A8_UNORM?
@@ -387,11 +465,20 @@ struct BufferedPresenter final : Presenter {
                 }
             }
             if(success){pair.interpolated=true;pair.native_id=previous->id;pair.native=previous->color;
-                pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views);}
+                pair.native_captured=previous->captured_at;
+                pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views);
+                pair.completed_at=TimingClock::now();}
             reset_history=!attempted;
             {std::lock_guard lock(mx);if(stopping)break;
+                // Previous-frame history needs colors/poses, not its original
+                // guides. Release completed leases now instead of pinning raw
+                // textures in reusable slots or temporal history indefinitely.
+                if(!worker.fence||worker.fence->GetCompletedValue()>=worker.serial)job->clear_guides();
+                inflight_id=0;
+                release_deferred_credit();
                 if(job->epoch!=epoch||degraded){previous.reset();reset_history=true;continue;}
                 ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();
+                if(success)completed_pair_id=job->id;
                 // Once real interpolation is available, briefly stop the
                 // speculative native mailbox from running ahead of its first
                 // usable pair. Inference/native failures release this priming.
@@ -405,6 +492,11 @@ struct BufferedPresenter final : Presenter {
                 telemetry.color_token=color_token;telemetry.guide_token=guide_token;telemetry.mismatched_guides=mismatches;
                 telemetry.color_render_frame=color_frame;telemetry.guide_render_frame=guide_frame;
                 telemetry.inference_color_format=unsigned(worker.focus.color_format);telemetry.shared_gpu_queue=1;
+                if(worker.gpu_timings.valid) {
+                    extra_gpu.publication_samples=worker.gpu_timings.samples;
+                    extra_gpu.publication_ms=worker.gpu_timings.publication.mean();
+                    extra_gpu.publication_last_ms=worker.gpu_timings.publication.last;
+                }
                 telemetry.source_depth_format=job->source_depth;telemetry.source_motion_format=job->source_motion;
                 state=success?CheekyFgState::generating:worker.failed?(worker.capability_ready?CheekyFgState::generation_failed:CheekyFgState::ngx_unavailable):
                     job->guides_valid?CheekyFgState::waiting_for_history:job->guide_state;
@@ -415,7 +507,7 @@ struct BufferedPresenter final : Presenter {
                 else strcpy_s(diagnostic,worker.diagnostic);changed.notify_all();}
             previous=std::move(job);
         }}catch(...) {std::lock_guard lock(mx);state=CheekyFgState::generation_failed;degraded=true;fg_active=pacing_active=false;
-            pending.clear();ready.clear();++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");}
+            discard_pending();ready.clear();inflight_id=0;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
         worker.wait_idle();output.drain();
     }
     bool ensure_chain(Chain& chain,const Image& image) {
@@ -447,19 +539,82 @@ struct BufferedPresenter final : Presenter {
         const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
         {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
         const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images.size()&&
-            uploads.upload(source,chain.images[index].texture);
+            uploads.upload(source,chain.images[index].texture,ticks);
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         const bool released=XR_SUCCEEDED(xr.release(chain.handle,&release));
         if(released&&copied)chain.uploaded=source;
         return released&&copied;
     }
-    void wake_producer() {
-        std::lock_guard lock(mx);
-        if(!stopping&&!raw&&(!pacing_active||(ticks%2)==0))credits=std::min(2u,credits+(ticks==1?2u:1u));
+    void wake_producer_locked() {
+        // Early late-selection wake and ordinary submission share one credit.
+        if(last_credit_tick==ticks)return;
+        last_credit_tick=ticks;
+        if(!stopping&&!raw&&(!pacing_active||(ticks%2)==0)) {
+            if(pacing_active&&unsubmitted_native()) {
+                // Bound render-ahead at the already-existing pacing point.
+                // FG uses the game queue; another native render must not get
+                // in front of an older job still waiting for CPU submission.
+                if(!credit_deferred)++deferred_credits;credit_deferred=true;
+            }else credits=std::min(2u,credits+(ticks==1?2u:1u));
+        }
         changed.notify_all();
     }
+    bool unsubmitted_native() const noexcept {
+        return inflight_id>submitted_native_id||(!pending.empty()&&pending.back()->id>submitted_native_id);
+    }
+    void release_deferred_credit() noexcept {
+        // Hold mx. Coalesce missed ticks rather than bursting queued renders.
+        if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()) {
+            credits=std::min(2u,credits+1);credit_deferred=false;++released_deferred_credits;changed.notify_all();
+        }
+    }
+    void inference_submitted() noexcept {
+        std::lock_guard lock(mx);submitted_native_id=std::max(submitted_native_id,inflight_id);
+        release_deferred_credit();
+    }
+    void wake_producer() {std::lock_guard lock(mx);wake_producer_locked();}
+    static TimingClock::time_point pair_wait_deadline(TimingClock::time_point start,XrDuration period) noexcept {
+        // Match the reference's heuristic: at most 10 ms, reserving 4 ms of
+        // the XR period for uploads/rendering/submission. Never a GPU deadline.
+        const auto budget=period>0?std::min<XrDuration>(10000000,std::max<XrDuration>(0,period-4000000)):10000000;
+        return start+std::chrono::nanoseconds(budget);
+    }
+    std::deque<Pair>::iterator newest_ready_pair(double position) {
+        auto selected=ready.end();
+        for(auto it=ready.begin();it!=ready.end();++it)
+            if(producer.completed(it->ready)&&double(it->native_id)>=position)selected=it;
+        return selected;
+    }
+    void wait_for_new_pair(TimingClock::time_point start,XrDuration period,double position=0) {
+        std::unique_lock lock(mx);
+        if(!fg_active||stopping||raw||degraded||state!=CheekyFgState::generating)return;
+        const auto baseline=completed_pair_id,generation=epoch;
+        const auto deadline=pair_wait_deadline(start,period);
+        late_wait_budget_ms=std::chrono::duration<double,std::milli>(deadline-start).count();
+        const auto available=newest_ready_pair(position);
+        // Our ready queue owns pairs which have not yet been selected. Unlike
+        // a reference host re-reading its active shared-memory publication,
+        // a forward pair here is already useful NEW content. Do not wait for
+        // yet another native render when that pair can be presented now.
+        if(available!=ready.end()&&(double(available->native_id)>position||
+            (available->interpolated&&double(available->current_id)>position))){++late_ready_skips;return;}
+        // Snapshot BEFORE releasing the game credit. An already-published pair
+        // cannot falsely satisfy this wait; it remains selectable on timeout.
+        wake_producer_locked();
+        // Unlike the reference's per-frame transport token, our game credit is
+        // released only at native cadence. Do not burn the selection budget
+        // when no newer render/inference can arrive before the next credit.
+        if(inflight_id<=baseline&&(pending.empty()||pending.back()->id<=baseline)&&
+            waited==ended&&!(credits&&app_waiters)){++late_idle_skips;return;}
+        const auto waiting=TimingClock::now();if(waiting>=deadline)return;
+        changed.wait_until(lock,deadline,[&]{return stopping||raw||degraded||epoch!=generation||
+            state!=CheekyFgState::generating||completed_pair_id>baseline;});
+        late_pair_wait.add(elapsed_ms(waiting));++late_wait_samples;
+        if(completed_pair_id>baseline&&epoch==generation)++late_wait_arrivals;
+        else if(!stopping&&!raw&&!degraded&&epoch==generation&&TimingClock::now()>=deadline)++late_wait_timeouts;
+    }
     bool render(Pair& pair,const std::array<Image,2>& images,
-                const std::array<XrCompositionLayerProjectionView,2>& original_views,bool generated,XrTime time,
+                const std::array<XrCompositionLayerProjectionView,2>& original_views,bool generated,bool repeated,XrTime time,
                 XrResult& result,bool& closed) {
         // An interpolated pair is published only after the worker's single
         // inference + immutable-copy fence completes. Native pairs retain the
@@ -473,13 +628,16 @@ struct BufferedPresenter final : Presenter {
         }
         auto layers=pair.layers;
         for(auto& a:pair.auxiliary)if(!upload_image(auxiliary_chains[a.source],a.image))return false;
+        uploads.close_profile_frame(ticks);
         if(!subimages(layers,[&](XrSwapchainSubImage& sub){const auto i=auxiliary_chains.find(sub.swapchain);
             if(i==auxiliary_chains.end())return false;sub.swapchain=i->second.handle;return true;}))return false;
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=pair.space;
         projection.layerFlags=layers.scene_flags;projection.viewCount=2;projection.views=views.data();
         auto headers=layers.replace_scene(projection);XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=time;
         end.environmentBlendMode=pair.blend;end.layerCount=unsigned(headers.size());end.layers=headers.data();
-        wake_producer();closed=true;result=runtime_end_frame(&end);return XR_SUCCEEDED(result);
+        wake_producer();closed=true;const auto submitted_at=TimingClock::now();result=runtime_end_frame(&end);
+        if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);note_frame_age(pair,generated,repeated,submitted_at);}
+        return XR_SUCCEEDED(result);
     }
     void presentation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky OpenXR presentation");
@@ -497,12 +655,11 @@ struct BufferedPresenter final : Presenter {
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 predicted=frame;telemetry.xr_period_ms=double(frame.predictedDisplayPeriod)/1000000.;
                 xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;
+            }
+            if(!generated_phase&&frame.shouldRender==XR_TRUE)wait_for_new_pair(present_start,frame.predictedDisplayPeriod,last_position);
+            {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
-                    auto selected=ready.end();
-                    for(auto it=ready.begin();it!=ready.end();++it) {
-                        const bool complete=producer.completed(it->ready);
-                        if(complete&&double(it->native_id)>=last_position)selected=it;
-                    }
+                    auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {
                         active=std::move(*selected);ready.erase(ready.begin(),std::next(selected));have_active=true;
                         fg_active=active.interpolated;
@@ -531,11 +688,12 @@ struct BufferedPresenter final : Presenter {
                 is_generated=generated_phase&&active.interpolated;
                 const auto& images=is_generated?active.generated:active.native;
                 const auto& views=is_generated?active.generated_views:active.native_views;
-                submitted=render(active,images,views,is_generated,frame.predictedDisplayTime,result,closed);
+                repeated=!is_generated&&double(active.native_id)==last_position;
+                submitted=render(active,images,views,is_generated,repeated,frame.predictedDisplayTime,result,closed);
                 if(submitted) {
-                    repeated=!is_generated&&double(active.native_id)==last_position;
                     last_position=double(active.native_id)+(is_generated?.5:0.);
-                    if(is_generated){active.native=active.current;active.native_views=active.current_views;active.native_id=active.current_id;generated_phase=false;}
+                    if(is_generated){active.native=active.current;active.native_views=active.current_views;active.native_id=active.current_id;
+                        active.native_captured=active.current_captured;generated_phase=false;}
                     else generated_phase=active.interpolated&&last_position<double(active.current_id);
                 }
             }
@@ -545,6 +703,7 @@ struct BufferedPresenter final : Presenter {
                 wake_producer();
                 result=runtime_end_frame(&empty);
             }
+            char age_log[512]{},stage_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted)++generated_count;
                 if(submitted&&!is_generated&&!raw_frame){if(repeated)++repeated_presentations;else ++distinct_native;}
@@ -552,8 +711,19 @@ struct BufferedPresenter final : Presenter {
                 if(XR_SUCCEEDED(result)){++runtime_submissions;
                     const auto now_ms=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
                     cadence_window.add(now_ms,{native_count,distinct_native,generated_count,repeated_presentations,runtime_submissions});}
+                if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
+                    sprintf_s(age_log,"FG source-age CPU ms: generated_samples=%llu latest_capture_to_complete=%.3f complete_to_generated_submit=%.3f newest_input_age=%.3f complete_to_native_submit=%.3f; late_waits=%llu arrivals=%llu timeouts=%llu ready_skips=%llu idle_skips=%llu",
+                        static_cast<unsigned long long>(generated_count),capture_to_completion.mean(),completion_to_generated.mean(),
+                        frame_ages[2].mean(),completion_to_native.mean(),static_cast<unsigned long long>(late_wait_samples),
+                        static_cast<unsigned long long>(late_wait_arrivals),static_cast<unsigned long long>(late_wait_timeouts),
+                        static_cast<unsigned long long>(late_ready_skips),static_cast<unsigned long long>(late_idle_skips));
+                    sprintf_s(stage_log,"FG capture-path CPU ms: samples=%u capture_to_handoff=%.3f handoff_to_worker=%.3f worker_to_GPU_submit=%.3f GPU_submit_to_complete=%.3f sum=%.3f; credit_deferred=%llu released_after_submit_or_retire=%llu outstanding=%u",
+                        generation_stages[0].count,generation_stages[0].mean(),generation_stages[1].mean(),generation_stages[2].mean(),
+                        generation_stages[3].mean(),generation_stages[0].mean()+generation_stages[1].mean()+generation_stages[2].mean()+generation_stages[3].mean(),
+                        static_cast<unsigned long long>(deferred_credits),static_cast<unsigned long long>(released_deferred_credits),unsigned(credit_deferred));
+                }
                 if(have_active&&!submitted&&!stop_now&&frame.shouldRender==XR_TRUE){++fallback_count;state=CheekyFgState::presentation_failed;
-                    degraded=true;fg_active=pacing_active=false;pending.clear();ready.clear();latest_native.reset();have_active=false;generated_phase=false;++epoch;
+                    degraded=true;fg_active=pacing_active=false;discard_pending();ready.clear();latest_native.reset();have_active=false;generated_phase=false;++epoch;
                     strcpy_s(diagnostic,"Private presentation failed; using coordinated original native submissions");}
                 // Bounded semaphore-equivalent credits. Two prime credits let
                 // the game overlap production with prior FG/compositor work.
@@ -561,6 +731,8 @@ struct BufferedPresenter final : Presenter {
                 changed.notify_all();
                 if(XR_FAILED(result)){terminal=result;stopping=true;changed.notify_all();break;}
             }
+            if(age_log[0])trace(age_log);
+            if(stage_log[0])trace(stage_log);
         }}catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
 };

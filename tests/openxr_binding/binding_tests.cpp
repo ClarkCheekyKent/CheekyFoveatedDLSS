@@ -411,6 +411,11 @@ void fg_toggle_test() {
     CheekyFgCadence cadence;
     check(CheekyFG_GetCadenceV1(&cadence)&&cadence.supported,"Optional measured-cadence export");
     cadence.abi=999;check(!CheekyFG_GetCadenceV1(&cadence),"Reject mismatched cadence ABI");
+    CheekyFgPresentation presentation;
+    check(CheekyFG_GetPresentationV1(&presentation)&&presentation.supported,"Optional capture-age and late-wait export");
+    presentation.abi=999;check(!CheekyFG_GetPresentationV1(&presentation),"Reject mismatched presentation telemetry ABI");
+    presentation={};--presentation.size;
+    check(!CheekyFG_GetPresentationV1(&presentation)&&!CheekyFG_GetPresentationV1(nullptr),"Reject invalid presentation size/pointer");
     auto retired=update_fg_at_frame_boundary(live,d,false);
     check(!live.fg && retired==first,"Disable must retire the presenter at the frame boundary");
     first.reset();retired.reset();
@@ -731,8 +736,9 @@ int main(int argc,char** argv) {
                 if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,false,2,100,50,false,512,512,true);
                 if(ready&&std::string(argv[1])=="--fg-generate")fg_hardware_probe(worker,device.Get(),argc>3&&std::string(argv[3])=="bgra",argc>4&&std::string(argv[4])=="foveated",
                     argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
-                    argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&std::string(argv[8])=="game-guides",
-                    argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u);
+                    argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&(std::string(argv[8])=="game-guides"||std::string(argv[8])=="full-guides"),
+                    argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u,
+                    false,argc>8&&std::string(argv[8])=="full-guides");
                 return ready?0:2;
             }
             throw std::runtime_error("No NVIDIA adapter found");

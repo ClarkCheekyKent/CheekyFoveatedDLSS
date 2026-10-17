@@ -89,6 +89,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         "Cropped motion must retain normalized UV displacement instead of scaling with destination grid size");
     guide_readback->Unmap(0,nullptr);
     cheeky::fg::Camera camera{};camera.clip_to_prev=cheeky::fg::identity();
+    cheeky::fg::Transport publication;check(publication.initialize(device,queue),"Direct composition publication pool");
     for(unsigned method=0;method<3;++method) {
         begin();guides.peripheral_method=method;
         // Supply no depth in simple warp and no guides at all in previous mode.
@@ -118,7 +119,43 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         readback->Unmap(0,nullptr);
         check(center_green,"The center crop must remain green while the periphery changes");
         check(edge_correct,"Previous/simple modes must retain red; bidirectional mode must interpolate red and blue");
+
+        // The output pool itself is the final UAV destination. Keep the first
+        // generated image leased while the next job writes different pixels.
+        auto pinned=publication.image(desc,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        check(bool(pinned),"Direct publication UAV");begin();
+        check(!pipeline.compose_frame(device,list.Get(),0,center.Get(),pipeline.peripheral_output[0].Get(),region,64,64,center.Get()),
+            "Reject a composition target that aliases its input before recording barriers");
+        check(pipeline.compose_frame(device,list.Get(),0,center.Get(),pipeline.peripheral_output[0].Get(),region,64,64,
+            pinned->texture.Get(),pinned->state),"Compose directly into a leased output");execute();
+        pinned->state=D3D12_RESOURCE_STATE_GENERIC_READ;
+        auto next=publication.image(desc,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        auto plain=publication.image(desc);
+        check(next&&next!=pinned&&plain&&plain!=pinned&&plain!=next&&
+            !(plain->texture->GetDesc().Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+            "Pool must preserve live output leases and distinguish UAV from copy-only allocations");begin();
+        check(pipeline.compose_frame(device,list.Get(),0,previous.Get(),current.Get(),region,64,64,
+            next->texture.Get(),next->state),"Compose the next job into a distinct output");execute();
+        next->state=D3D12_RESOURCE_STATE_GENERIC_READ;
+        auto verify_publication=[&](const cheeky::fg::Image& image,bool original) {
+            begin();from.pResource=image->texture.Get();list->CopyTextureRegion(&to,0,0,0,&from,nullptr);execute();
+            check(SUCCEEDED(readback->Map(0,nullptr,&data)),"Direct publication readback");
+            const auto* e=pixel(2,2);const auto* m=pixel(32,32);
+            const bool correct=original?
+                (m[0]==0&&m[1]==0x3c00&&m[2]==0&&e[1]==0&&
+                    (method<2?(e[0]==0x3c00&&e[2]==0):(e[0]==0x3800&&e[2]==0x3800))):
+                (m[0]==0x3c00&&m[1]==0&&m[2]==0&&e[0]==0&&e[1]==0&&e[2]==0x3c00);
+            readback->Unmap(0,nullptr);check(correct,"Direct output pixels must survive newer generation jobs");
+        };
+        verify_publication(pinned,true);verify_publication(next,false);
+        auto* retired=pinned.get();pinned.reset();
+        auto reused=publication.image(desc,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        check(reused.get()==retired,"Retired direct output allocation may be reused");begin();
+        check(pipeline.compose_frame(device,list.Get(),0,center.Get(),pipeline.peripheral_output[0].Get(),region,64,64,
+            reused->texture.Get(),reused->state),"Rewrite a retired GENERIC_READ output via UAV");execute();
+        reused->state=D3D12_RESOURCE_STATE_GENERIC_READ;verify_publication(reused,true);
     }
     check(SUCCEEDED(device->GetDeviceRemovedReason()),"Periphery pipeline device removal");
     std::cout << "PASS actual periphery pixels: previous/simple red, bidirectional purple, independent green center; source-sized guide crop and nonzero UV motion; unused inputs omitted\n";
+    std::cout << "PASS direct composition: original pixels retained through a newer output, distinct UAV/copy pools, retired GENERIC_READ reuse and alias rejection\n";
 }

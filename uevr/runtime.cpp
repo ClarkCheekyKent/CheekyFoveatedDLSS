@@ -93,6 +93,8 @@ std::string snapshot_locked(State& s) {
     const auto fg = fg_status();
     CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
+    CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
+    CheekyFgPresentation fg_present;fg_presentation(fg_present);
     CheekyFgCaptureHealth fg_capture;
     if(auto self=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"))
         if(auto query=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(self,"CheekyFG_GetCaptureHealth")))query(&fg_capture);
@@ -166,7 +168,24 @@ std::string snapshot_locked(State& s) {
         << ",\"begin_ms\":" << fg_rates.begin_ms << ",\"end_ms\":" << fg_rates.end_ms
         << ",\"present_cpu_ms\":" << fg_rates.present_cpu_ms
         << ",\"app_begin_ms\":" << fg_rates.app_begin_ms << ",\"app_end_ms\":" << fg_rates.app_end_ms
-        << ",\"app_release_ms\":" << fg_rates.app_release_ms << "}}"
+        << ",\"app_release_ms\":" << fg_rates.app_release_ms << "}"
+        << ",\"overhead\":{\"supported\":" << bool(fg_extra.supported)
+        << ",\"guide_samples\":" << fg_extra.guide_samples << ",\"capture_samples\":" << fg_extra.capture_samples
+        << ",\"publication_samples\":" << fg_extra.publication_samples << ",\"upload_samples\":" << fg_extra.upload_samples
+        << ",\"guide_ms\":" << fg_extra.guide_ms << ",\"guide_last_ms\":" << fg_extra.guide_last_ms
+        << ",\"capture_ms\":" << fg_extra.capture_ms << ",\"capture_last_ms\":" << fg_extra.capture_last_ms
+        << ",\"publication_ms\":" << fg_extra.publication_ms << ",\"publication_last_ms\":" << fg_extra.publication_last_ms
+        << ",\"upload_ms\":" << fg_extra.upload_ms << ",\"upload_last_ms\":" << fg_extra.upload_last_ms << "}"
+        << ",\"presentation\":{\"supported\":" << bool(fg_present.supported)
+        << ",\"native_samples\":" << fg_present.native_samples << ",\"generated_samples\":" << fg_present.generated_samples
+        << ",\"repeat_samples\":" << fg_present.repeat_samples << ",\"wait_samples\":" << fg_present.wait_samples
+        << ",\"wait_arrivals\":" << fg_present.wait_arrivals << ",\"wait_timeouts\":" << fg_present.wait_timeouts
+        << ",\"native_age_ms\":" << fg_present.native_age_ms << ",\"native_age_last_ms\":" << fg_present.native_age_last_ms
+        << ",\"generated_age_ms\":" << fg_present.generated_age_ms << ",\"generated_age_last_ms\":" << fg_present.generated_age_last_ms
+        << ",\"newest_input_age_ms\":" << fg_present.newest_input_age_ms << ",\"newest_input_age_last_ms\":" << fg_present.newest_input_age_last_ms
+        << ",\"repeat_age_ms\":" << fg_present.repeat_age_ms << ",\"repeat_age_last_ms\":" << fg_present.repeat_age_last_ms
+        << ",\"late_wait_ms\":" << fg_present.late_wait_ms << ",\"late_wait_last_ms\":" << fg_present.late_wait_last_ms
+        << ",\"wait_budget_ms\":" << fg_present.wait_budget_ms << "}}"
         << ",\"d3d12_lower_hook_active\":" << d3d12_lower_hook_enabled()
         << ",\"d3d12_hook_restart_required\":" << d3d12_hook_restart_required(configured_settings().d3d12_lower_hook)
         << ",\"afw_experiment\":{\"enabled\":" << afw.enabled

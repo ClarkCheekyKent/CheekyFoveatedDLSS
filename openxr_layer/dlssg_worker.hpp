@@ -35,9 +35,11 @@ struct Worker {
     std::uint64_t configuration{};
     unsigned center_width{},center_height{},peripheral_width{},peripheral_height{},peripheral_method{};
     unsigned source_depth_format{},source_motion_format{};
+    bool direct_publication{};
     void reset_features() noexcept;
     GpuTimings gpu_timings;
     TimingAverage completion_wait;
+    TimingClock::time_point submitted_at{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};unsigned width{},height{};
     bool configured{};
     ComPtr<ID3D12Device> probed_device;
@@ -58,6 +60,7 @@ struct Worker {
                   const std::array<ID3D12Resource*,2>& previous,
                   const std::array<Camera,2>& camera,
                   std::array<ID3D12Resource*,2>& output,
-                  std::array<OutputCopy,2>* copies=nullptr) noexcept;
+                  std::array<OutputCopy,2>* copies=nullptr,
+                  void(*on_submitted)(void*) noexcept=nullptr,void* submitted_context=nullptr) noexcept;
 };
 }

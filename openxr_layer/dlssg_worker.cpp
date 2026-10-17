@@ -63,7 +63,7 @@ void Worker::reset_features() noexcept {
 }
 void Worker::reset() noexcept {
     std::lock_guard lock(ngx_mutex);wait_idle();reset_features();
-    gpu_timings.reset();completion_wait={};
+    gpu_timings.reset();completion_wait={};submitted_at={};
     if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();list.Reset();fence.Reset();
     allocate=nullptr;destroy=nullptr;create=nullptr;evaluate=nullptr;release=nullptr;
     configured=false;serial=0;width=height=0;init=nullptr;capabilities=nullptr;
@@ -159,7 +159,9 @@ bool Worker::initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsig
 }
 bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource*,2>& colors,
     const std::array<ID3D12Resource*,2>& previous,const std::array<Camera,2>& cameras,
-    std::array<ID3D12Resource*,2>& outputs,std::array<OutputCopy,2>* copies) noexcept {
+    std::array<ID3D12Resource*,2>& outputs,std::array<OutputCopy,2>* copies,
+    void(*on_submitted)(void*) noexcept,void* submitted_context) noexcept {
+    submitted_at={};
     std::lock_guard lock(ngx_mutex);
     if(!configured||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!wait_idle())return false;
@@ -167,9 +169,25 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         reset_features();configuration=guides.eyes[0].configuration;gpu_timings.initialize(device.Get(),queue.Get());completion_wait={};
     }
     if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
-    gpu_timings.valid=false;gpu_timings.stamp(list.Get(),0);
+    gpu_timings.begin(list.Get());
     bool good=true;unsigned focused{};
     auto scaled=[](unsigned dimension,unsigned percent){return std::max(32u,(dimension*percent+50u)/100u);};
+    // A foveated/scaled frame already has a final composition dispatch. Write
+    // it into a leased publication image instead of a private scratch image
+    // followed by another full stereo copy. The caller owns each destination
+    // until the presenter and its GPU uploads have finished using it.
+    bool direct=copies&&(*copies)[0].texture&&(*copies)[1].texture&&(*copies)[0].texture!=(*copies)[1].texture;
+    for(unsigned eye=0;eye<2&&direct;++eye) {
+        const auto& g=guides.eyes[eye];const auto d=(*copies)[eye].texture->GetDesc();
+        const bool composition=g.focus_width<.999f||g.focus_height<.999f||
+            scaled(width,g.resolution_percent)!=width||scaled(height,g.resolution_percent)!=height;
+        direct=composition&&d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&d.Width==width&&d.Height==height&&
+            d.DepthOrArraySize==1&&d.MipLevels==1&&d.SampleDesc.Count==1&&d.Format==focus.color_format&&
+            (d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        for(unsigned source=0;source<2&&direct;++source)
+            direct=(*copies)[eye].texture!=colors[source]&&(*copies)[eye].texture!=previous[source]&&
+                (*copies)[eye].texture!=guides.eyes[source].depth&&(*copies)[eye].texture!=guides.eyes[source].motion;
+    }
     auto transpose=[](Matrix m){Matrix result{};for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)result.m[r*4+c]=m.m[c*4+r];return result;};
     auto evaluate_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect) {
         const auto desc=input.color->GetDesc();const auto tw=unsigned(desc.Width),th=desc.Height;
@@ -235,7 +253,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         barrier(list.Get(),f.disable.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);return true;
     };
     bool foveated[2]{};
-    for(unsigned eye=0;eye<2&&good;++eye) {
+    // Diagnostic comparison: alternate processing order, never eye identity.
+    // All features, guides, cameras, histories and publication slots remain
+    // indexed by the original eye. This distinguishes a first-work delay from
+    // a slow or differently laid-out left-eye input without changing queues.
+    for(unsigned step=0;step<2&&good;++step) {
+        const unsigned eye=(gpu_timings.first_eye+step)%2;
         const auto& g=guides.eyes[eye];const unsigned query=2+eye*6;gpu_timings.stamp(list.Get(),query);
         if(!g.depth||!g.motion||g.width!=width||g.height!=height){report("FG guide/output dimensions disagree",unsigned(E_INVALIDARG));failed=true;good=false;break;}
         source_depth_format=unsigned(g.depth->GetDesc().Format);source_motion_format=unsigned(g.motion->GetDesc().Format);
@@ -257,10 +280,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         Camera camera=cameras[eye];
         // Camera matrices already use the guide's native depth convention.
         // Converting reversed depth again here cancels the caller's conversion.
-        if(!focus.prepare_inputs(device.Get(),list.Get(),eye,0,colors[eye],g,rect,center_width,center_height,32,32,input_color_state)) {report("FG center guide conversion",unsigned(E_FAIL));failed=true;good=false;break;}
-        if(rect.active&&!focus.prepare_inputs(device.Get(),list.Get(),eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,g.depth_bits,g.motion_bits,input_color_state)) {
+        auto* detail=gpu_timings.record_preparation?&gpu_timings:nullptr;
+        if(!focus.prepare_inputs(device.Get(),list.Get(),eye,0,colors[eye],g,rect,center_width,center_height,32,32,input_color_state,detail)) {report("FG center guide conversion",unsigned(E_FAIL));failed=true;good=false;break;}
+        if(rect.active&&!focus.prepare_inputs(device.Get(),list.Get(),eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,g.depth_bits,g.motion_bits,input_color_state,detail)) {
             report("FG periphery guide conversion",unsigned(E_FAIL));failed=true;good=false;break;
         }
+        if(!rect.active)for(unsigned phase=0;phase<4;++phase)gpu_timings.preparation_stamp(list.Get(),eye,1,phase);
         gpu_timings.stamp(list.Get(),query+1);gpu_timings.stamp(list.Get(),query+2);
         good=evaluate_pass(features[eye],focus.inputs[eye][0],camera,g,rect);gpu_timings.stamp(list.Get(),query+3);
         if(!good)break;gpu_timings.stamp(list.Get(),query+4);
@@ -275,26 +300,65 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             }
         }
         if(good&&(rect.active||center_width!=width||center_height!=height)) {
-            good=focus.compose_frame(device.Get(),list.Get(),eye,features[eye].output.Get(),base,rect,width,height);
-            outputs[eye]=focus.full[eye].Get();
+            good=focus.compose_frame(device.Get(),list.Get(),eye,features[eye].output.Get(),base,rect,width,height,
+                direct?(*copies)[eye].texture:nullptr,direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON);
+            outputs[eye]=direct?(*copies)[eye].texture:focus.full[eye].Get();
         }else outputs[eye]=base;
         if(good&&rect.active&&g.peripheral_method==2)good=focus.save_depth(device.Get(),list.Get(),eye);
         if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
         gpu_timings.stamp(list.Get(),query+5);
     }
-    if(good){gpu_timings.stamp(list.Get(),1);gpu_timings.resolve(list.Get());}
+    if(good)gpu_timings.stamp(list.Get(),1);
+    if(good)gpu_timings.stamp(list.Get(),14);
     // Publish immutable output in the SAME GPU submission as inference. A copy
     // submitted only after the CPU completion wait can land behind a newer game
     // frame and delay a finished interpolation by another render interval.
-    if(good&&copies&&!record_output_copies(list.Get(),outputs,*copies)) {
+    if(good&&copies&&!direct&&!record_output_copies(list.Get(),outputs,*copies)) {
         report("FG immutable output copy",unsigned(E_INVALIDARG));failed=true;good=false;
     }
+    if(good){gpu_timings.stamp(list.Get(),15);gpu_timings.resolve(list.Get());}
     if(FAILED(list->Close())||!good)return false;
     ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
     if(copies)for(auto& copy:*copies)copy.state=D3D12_RESOURCE_STATE_GENERIC_READ;
     if(FAILED(queue->Signal(fence.Get(),++serial)))return false;
+    submitted_at=TimingClock::now();
+    // Notify only after commands AND their completion fence are queued. The
+    // presenter may release the next native render without waiting for FG to
+    // finish, but must not let it overtake a still-unsubmitted FG job.
+    if(on_submitted)on_submitted(submitted_context);
     const auto wait_begin=TimingClock::now();const bool complete=wait_idle();completion_wait.add(elapsed_ms(wait_begin));if(!complete)return false;
-    gpu_timings.collect(focused);
+    direct_publication=direct;gpu_timings.collect(focused,copies&&!direct);
+    // Existing timestamp data only: distinguish consistently expensive work
+    // from occasional long elapsed intervals without changing the GPU schedule.
+    if(trace&&gpu_timings.valid&&(gpu_timings.samples%120)==0) {
+        const auto& prep=gpu_timings.preparation;char message[384]{};
+        sprintf_s(message,"FG preparation GPU ms: avg=%.3f median=%.3f p95=%.3f max=%.3f left_avg=%.3f right_avg=%.3f; processing_median=%.3f processing_p95=%.3f",
+            prep.mean(),prep.percentile(50),prep.percentile(95),prep.percentile(100),
+            gpu_timings.eye_preparation[0].mean(),gpu_timings.eye_preparation[1].mean(),
+            gpu_timings.total.percentile(50),gpu_timings.total.percentile(95));trace(message);
+        for(unsigned first=0;first<2;++first)if(gpu_timings.order_samples[first]) {
+            const auto& prep=gpu_timings.preparation_by_first[first];
+            const auto& eye=gpu_timings.eye_preparation_by_first[first];
+            const auto& center=gpu_timings.center_dispatch_by_first[first];
+            sprintf_s(message,"FG preparation order GPU ms: first=%s frames=%llu detail=%llu; prep_avg=%.3f prep_p95=%.3f left_avg=%.3f right_avg=%.3f; sampled_center_left=%.3f sampled_center_right=%.3f",
+                first?"right":"left",static_cast<unsigned long long>(gpu_timings.order_samples[first]),
+                static_cast<unsigned long long>(gpu_timings.order_detail_samples[first]),prep.mean(),prep.percentile(95),
+                eye[0].mean(),eye[1].mean(),center[0].mean(),center[1].mean());trace(message);
+        }
+        if(gpu_timings.preparation_samples) {
+            sprintf_s(message,"FG preparation sampled GPU ms: samples=%llu (1 in 17); avg=%.3f median=%.3f p95=%.3f; gaps_avg=%.3f",
+                static_cast<unsigned long long>(gpu_timings.preparation_samples),gpu_timings.sampled_preparation.mean(),
+                gpu_timings.sampled_preparation.percentile(50),gpu_timings.sampled_preparation.percentile(95),gpu_timings.preparation_gaps.mean());trace(message);
+            for(unsigned pass=0;pass<4;++pass) {
+                const auto& part=gpu_timings.preparation_parts[pass];const auto& input=focus.inputs[pass/2][pass%2];
+                const auto guide=input.motion?input.motion->GetDesc():D3D12_RESOURCE_DESC{};
+                sprintf_s(message,"FG preparation stage GPU ms: eye=%s pass=%s color=%ux%u guides=%llux%u; before/dispatch/after avg=%.3f/%.3f/%.3f last=%.3f/%.3f/%.3f p95=%.3f/%.3f/%.3f",
+                    pass<2?"left":"right",pass%2?"periphery":"center",input.color?input.output_width:0,input.color?input.output_height:0,
+                    static_cast<unsigned long long>(guide.Width),guide.Height,part[0].mean(),part[1].mean(),part[2].mean(),
+                    part[0].last,part[1].last,part[2].last,part[0].percentile(95),part[1].percentile(95),part[2].percentile(95));trace(message);
+            }
+        }
+    }
     bool enabled=true;
     for(unsigned eye=0;eye<2;++eye){
         focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;

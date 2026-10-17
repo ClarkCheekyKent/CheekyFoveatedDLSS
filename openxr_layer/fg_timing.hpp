@@ -20,6 +20,11 @@ struct TimingAverage {
         values[next]=last=ms;sum+=ms;next=(next+1)%values.size();
     }
     double mean() const noexcept {return count?sum/count:0;}
+    double percentile(unsigned percent) const noexcept {
+        if(!count)return 0;auto ordered=values;std::sort(ordered.begin(),ordered.begin()+count);
+        const auto rank=std::clamp((count*std::min(percent,100u)+99u)/100u,1u,count);
+        return ordered[rank-1];
+    }
 };
 struct CadenceWindow {
     // Counters: game submissions, distinct native, generated, repeated, runtime
@@ -56,17 +61,33 @@ struct CommitWait {
 };
 
 struct GpuTimings {
-    // Whole worker [0,1], then preparation/NGX/periphery pairs for each eye.
-    static constexpr unsigned query_count=14;
+    // Processing [0,1], preparation/NGX/periphery pairs for each eye, then
+    // immutable output publication [14,15] outside the processing subtotal.
+    // [16,31] are four preparation boundaries per eye/pass, sampled 1 in 17.
+    static constexpr unsigned main_query_count=16,query_count=32;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     std::uint64_t frequency{},samples{};
-    TimingAverage preparation,center,periphery,total;
+    TimingAverage preparation,center,periphery,total,publication;
+    std::array<TimingAverage,2> eye_preparation;
+    std::array<TimingAverage,2> preparation_by_first;
+    std::array<std::array<TimingAverage,2>,2> eye_preparation_by_first,center_dispatch_by_first;
+    std::array<std::uint64_t,2> order_samples{},order_detail_samples{};
+    unsigned first_eye{};
+    // Sampled independently of the main 60-frame window: eye * 2 + pass,
+    // then transitions/setup before dispatch, dispatch, transitions after.
+    std::array<std::array<TimingAverage,3>,4> preparation_parts;
+    TimingAverage sampled_preparation,preparation_gaps;
+    std::uint64_t preparation_samples{};
+    bool record_preparation{},preparation_valid{};
     unsigned foveated_eyes{};
     bool valid{};
     void reset() noexcept {
         heap.Reset();readback.Reset();frequency=samples=0;
-        preparation={};center={};periphery={};total={};foveated_eyes=0;valid=false;
+        preparation={};center={};periphery={};total={};publication={};eye_preparation={};foveated_eyes=0;valid=false;
+        preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
+        preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};first_eye=0;
+        record_preparation=preparation_valid=false;
     }
     bool initialize(ID3D12Device* device,ID3D12CommandQueue* queue) noexcept {
         reset();
@@ -87,28 +108,67 @@ struct GpuTimings {
     void stamp(ID3D12GraphicsCommandList* list,unsigned index) noexcept {
         if(supported())list->EndQuery(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,index);
     }
+    void begin(ID3D12GraphicsCommandList* list) noexcept {
+        valid=preparation_valid=false;record_preparation=supported()&&(samples%17)==0;
+        first_eye=unsigned(samples&1);
+        stamp(list,0);
+    }
+    void preparation_stamp(ID3D12GraphicsCommandList* list,unsigned eye,unsigned pass,unsigned phase) noexcept {
+        if(record_preparation)stamp(list,main_query_count+(eye*2+pass)*4+phase);
+    }
     void resolve(ID3D12GraphicsCommandList* list) noexcept {
-        if(supported())list->ResolveQueryData(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,query_count,readback.Get(),0);
+        if(supported())list->ResolveQueryData(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,
+            record_preparation?query_count:main_query_count,readback.Get(),0);
     }
     // Caller has already completed the ordinary generation fence wait. Reading
     // telemetry must not add another wait, flush or command-list submission.
-    bool collect(unsigned focused_eyes) noexcept {
-        valid=false;if(!supported())return false;
-        void* mapped{};D3D12_RANGE range{0,query_count*sizeof(std::uint64_t)};
+    bool collect(unsigned focused_eyes,bool copied_output=true) noexcept {
+        valid=preparation_valid=false;if(!supported())return false;
+        const unsigned count=record_preparation?query_count:main_query_count;
+        void* mapped{};D3D12_RANGE range{0,count*sizeof(std::uint64_t)};
         if(FAILED(readback->Map(0,&range,&mapped))||!mapped)return false;
         std::array<std::uint64_t,query_count> ticks{};
-        for(unsigned i=0;i<query_count;++i)ticks[i]=static_cast<const std::uint64_t*>(mapped)[i];
+        for(unsigned i=0;i<count;++i)ticks[i]=static_cast<const std::uint64_t*>(mapped)[i];
         const D3D12_RANGE written{0,0};readback->Unmap(0,&written);
-        for(unsigned i=0;i<query_count;i+=2)
+        for(unsigned i=0;i<main_query_count;i+=2)
             if(!ticks[i]||ticks[i+1]<ticks[i])return false;
         auto ms=[&](unsigned start){return double(ticks[start+1]-ticks[start])*1000.0/double(frequency);};
         const double whole=ms(0),prep=ms(2)+ms(8),ngx=ms(4)+ms(10),edge=ms(6)+ms(12);
         // Reject incomplete/unordered samples instead of showing fabricated 0ms.
         if(!std::isfinite(whole)||whole<=0||prep+ngx+edge>whole+0.001)return false;
         if(samples&&foveated_eyes!=focused_eyes) {
-            preparation={};center={};periphery={};total={};samples=0;
+            preparation={};center={};periphery={};total={};publication={};eye_preparation={};samples=0;
+            preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
+            preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};
         }
         preparation.add(prep);center.add(ngx);periphery.add(edge);total.add(whole);
+        // Direct composition has no publication copy. Its final transition is
+        // already inside the measured composition scope; adjacent timestamps
+        // must not turn an omitted operation into a fabricated copy cost.
+        publication.add(copied_output?ms(14):0);
+        eye_preparation[0].add(ms(2));eye_preparation[1].add(ms(8));
+        preparation_by_first[first_eye].add(prep);++order_samples[first_eye];
+        for(unsigned eye=0;eye<2;++eye)eye_preparation_by_first[first_eye][eye].add(ms(2+eye*6));
+        if(record_preparation) {
+            std::array<std::array<double,3>,4> parts{};double covered{};bool ordered=true;
+            for(unsigned pass=0;pass<4;++pass) {
+                const auto base=main_query_count+pass*4,outer=2+(pass/2)*6;
+                ordered&=ticks[base]>=ticks[outer]&&ticks[base+3]<=ticks[outer+1];
+                for(unsigned phase=0;phase<3;++phase) {
+                    if(!ticks[base+phase]||ticks[base+phase+1]<ticks[base+phase]){ordered=false;continue;}
+                    const double value=double(ticks[base+phase+1]-ticks[base+phase])*1000./double(frequency);
+                    parts[pass][phase]=value;covered+=value;
+                }
+            }
+            if(ordered&&covered<=prep+.001) {
+                for(unsigned pass=0;pass<4;++pass)for(unsigned phase=0;phase<3;++phase)
+                    preparation_parts[pass][phase].add(parts[pass][phase]);
+                sampled_preparation.add(prep);preparation_gaps.add(std::max(0.,prep-covered));
+                ++order_detail_samples[first_eye];
+                for(unsigned eye=0;eye<2;++eye)center_dispatch_by_first[first_eye][eye].add(parts[eye*2][1]);
+                ++preparation_samples;preparation_valid=true;
+            }
+        }
         foveated_eyes=focused_eyes;++samples;valid=true;return true;
     }
 };

@@ -62,6 +62,8 @@ struct Presenter {
     }
     TimingAverage copy_wait,xr_wait;
     virtual CheekyFgCadence cadence() const noexcept {return {};}
+    virtual CheekyFgOverhead overhead() const noexcept {return {};}
+    virtual CheekyFgPresentation presentation() const noexcept {return {};}
     virtual void note_app_image_wait(double) noexcept {}
     virtual void note_app_call(unsigned,double) noexcept {}
     double copy_wait_accumulator{},xr_period_ms{};

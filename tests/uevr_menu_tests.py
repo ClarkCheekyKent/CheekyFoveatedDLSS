@@ -182,6 +182,17 @@ def run(engine):
                  "FG GPU total", "4.200 ms", "18.200 ms", "11.111 ms", "280 x 232", "256 x 256", "512 x 512"):
         assert text in list(g.drawn.values()), "Missing FG timing: " + text
     assert len(g.sent) == count, "Reading FG performance must not change settings"
+    state["fg"]["overhead"] = {"supported":True,"guide_samples":10,"capture_samples":10,
+        "publication_samples":10,"upload_samples":20,"guide_ms":.2,"guide_last_ms":.1,
+        "capture_ms":1.3,"capture_last_ms":1.2,"publication_ms":.3,"publication_last_ms":.2,
+        "upload_ms":.4,"upload_last_ms":.3}
+    receive(state)
+    draw()
+    for label in ("FG processing subtotal","Guide snapshot copies / native","Capture + guide handoff / native",
+                  "Generated output copy / generated","OpenXR uploads / presentation","1.300 / 1.200"):
+        assert label in list(g.drawn.values()), "Missing separately measured GPU stage: " + label
+    assert "FG GPU total" not in list(g.drawn.values()), "Do not label a partial processing interval as complete FG overhead"
+    assert len(g.sent) == count, "Reading additional GPU stages must not change settings"
     performance["asynchronous_presenter"] = True
     performance["producer_cpu_ms"] = .25
     performance["pacing_wait_ms"] = 12
@@ -212,6 +223,27 @@ def run(engine):
                   "Game image wait / call","Presenter image wait / call","Runtime begin / end","6.000 / 7.000 ms"):
         assert label in list(g.drawn.values()), "Missing measured cadence: " + label
     assert len(g.sent) == count, "Reading cadence must not change settings"
+    assert "Native frame age" not in list(g.drawn.values()), "Older layers must not show zero as a measured frame age"
+    state["fg"]["presentation"] = {"supported":True,"native_samples":10,"generated_samples":9,"repeat_samples":2,
+        "native_age_ms":30,"native_age_last_ms":31,"generated_age_ms":22,"generated_age_last_ms":23,
+        "newest_input_age_ms":12,"newest_input_age_last_ms":13,"repeat_age_ms":40,"repeat_age_last_ms":41,
+        "wait_samples":20,"wait_arrivals":12,"wait_timeouts":8,"late_wait_ms":2,"late_wait_last_ms":3,"wait_budget_ms":4.333}
+    receive(state)
+    draw()
+    for label in ("Native frame age","30.000 / 31.000 ms","Generated frame age (midpoint)","22.000 / 23.000 ms",
+                  "Newest FG input age","12.000 / 13.000 ms","Repeated frame age","40.000 / 41.000 ms",
+                  "Late FG wait (CPU)","2.000 / 3.000 ms","Late FG wait budget","4.333 ms (10 ms maximum)",
+                  "New pairs / wait timeouts","12 / 8"):
+        assert label in list(g.drawn.values()), "Missing frame age or bounded-wait telemetry: " + label
+    assert len(g.sent) == count, "Frame-age telemetry must never apply settings"
+    state["fg"]["presentation"]["repeat_samples"] = 0
+    receive(state)
+    draw()
+    assert "No samples yet" in list(g.drawn.values()) and "40.000 / 41.000 ms" not in list(g.drawn.values())
+    state["fg"]["presentation"]["supported"] = False
+    receive(state)
+    draw()
+    assert "Native frame age" not in list(g.drawn.values()), "Missing optional export must preserve older layer compatibility"
     performance["asynchronous_presenter"] = False
     performance["foveated_eyes"] = 0
     performance["center_width"] = performance["center_height"] = 512

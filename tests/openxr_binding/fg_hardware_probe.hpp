@@ -22,21 +22,22 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
 // Opt-in integration probe. Uses the production worker, the physical GPU and
 // real NVIDIA inference, without starting a game or an OpenXR session.
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
-    unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,bool motion_test=false) {
+    unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
+    bool motion_test=false,bool full_guides=false) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Hardware probe queue");
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
     check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator))),"Probe allocator");
     check(SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))),"Probe list");
-    ComPtr<ID3D12DescriptorHeap> rtvs;D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=3;
+    ComPtr<ID3D12DescriptorHeap> rtvs;D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=4;
     check(SUCCEEDED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))),"Probe RTV heap");
     const auto stride=device->GetDescriptorHandleIncrementSize(hd.Type);
-    ComPtr<ID3D12Resource> color,depth,motion;
+    ComPtr<ID3D12Resource> color,right_color,depth,motion;
     auto make=[&](DXGI_FORMAT format,unsigned index,const float* clear,ComPtr<ID3D12Resource>& texture) {
         D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=width;d.Height=height;
-        if(game_guides&&index){d.Width=width/2;d.Height=height/2;}
+        if(game_guides&&!full_guides&&(index==1||index==2)){d.Width=width/2;d.Height=height/2;}
         d.DepthOrArraySize=d.MipLevels=1;d.Format=game_guides&&index==1?DXGI_FORMAT_R32_TYPELESS:format;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&texture))),"Probe texture");
         auto slot=rtvs->GetCPUDescriptorHandleForHeapStart();slot.ptr+=stride*index;
@@ -45,8 +46,10 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         cheeky::fg::color_transition(list.Get(),texture.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
     };
     const float red[]{1,.1f,.05f,1},z[]{motion_test?.04999525f:.5f,0,0,0},zero[]{motion_test?-16.f/width:0.f,0,0,0};
+    const float blue[]{.05f,.1f,1,1};
     const auto color_format=bgra?DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:DXGI_FORMAT_R8G8B8A8_UNORM;
     make(color_format,0,red,color);make(DXGI_FORMAT_R32_FLOAT,1,z,depth);make(game_guides?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,2,zero,motion);
+    make(color_format,3,blue,right_color);
     check(SUCCEEDED(list->Close()),"Probe close");ID3D12CommandList* commands[]{list.Get()};queue->ExecuteCommandLists(1,commands);
     ComPtr<ID3D12Fence> fence;check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))),"Probe fence");
     check(SUCCEEDED(queue->Signal(fence.Get(),1)),"Probe signal");
@@ -58,19 +61,19 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     CheekyFgPair guides{};guides.producer_queue=queue.Get();
     for(auto& eye:guides.eyes) {
         eye.depth=depth.Get();eye.motion=motion.Get();eye.width=width;eye.height=height;
-        eye.depth_width=eye.motion_width=game_guides?width/2:width;
-        eye.depth_height=eye.motion_height=game_guides?height/2:height;
+        eye.depth_width=eye.motion_width=game_guides&&!full_guides?width/2:width;
+        eye.depth_height=eye.motion_height=game_guides&&!full_guides?height/2:height;
         if(foveated) {eye.focus_width=.55f;eye.focus_height=.45f;}
         eye.peripheral_method=method;eye.resolution_percent=scale;eye.peripheral_percent=peripheral_scale;
         eye.depth_inverted=1;
         if(motion_test){eye.motion_scale_x=float(width);eye.motion_scale_y=float(height);}
-        if(game_guides)eye.depth_bits=eye.motion_bits=16;
+        if(game_guides&&!full_guides)eye.depth_bits=eye.motion_bits=16;
     }
     XrCompositionLayerProjectionView view{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
     view.pose.orientation.w=1;view.fov={-.7f,.7f,.7f,-.7f};
     const auto camera=cheeky::fg::camera(view,&view,true);
     std::array<cheeky::fg::Camera,2> cameras{camera,camera};
-    std::array<ID3D12Resource*,2> colors{color.Get(),color.Get()},outputs{};
+    std::array<ID3D12Resource*,2> colors{color.Get(),motion_test?color.Get():right_color.Get()},outputs{};
     ComPtr<ID3D12Resource> upload;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT upload_footprint{};UINT64 upload_bytes{};
     if(motion_test){
@@ -107,7 +110,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(generated,worker.diagnostic);
     check(fg_probe_native_depth&&(worker.force_fp16||fg_probe_sdr),"Actual SDK camera/HDR parameters match the native depth and color formats");
     if(motion_test)for(unsigned frame=last_frame+1;frame<=12;++frame){move_scene(frame);check(worker.generate(guides,colors,colors,cameras,outputs),"Moving-scene interpolation");}
-    else if(width>512)for(unsigned frame=0;frame<64;++frame)check(worker.generate(guides,colors,colors,cameras,outputs),"Steady benchmark generation");
+    else if(width>512)for(unsigned frame=0;frame<128;++frame)check(worker.generate(guides,colors,colors,cameras,outputs),"Steady benchmark generation");
     const auto& timing=worker.gpu_timings;
     check(timing.supported()&&timing.valid&&timing.samples>0,"Physical GPU timing sample must resolve after the ordinary fence wait");
     check(timing.center.last>0&&timing.total.last>=timing.center.last&&
@@ -134,11 +137,26 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         << "; completion wait CPU=" << worker.completion_wait.last << '\n';
     std::cout<<"GPU stereo ms (average): center="<<timing.center.mean()<<" periphery="<<timing.periphery.mean()
         <<" preparation="<<timing.preparation.mean()<<" total="<<timing.total.mean()<<" input format="<<unsigned(center_input.color->GetDesc().Format)<<'\n';
+    check(timing.preparation_samples>0&&timing.sampled_preparation.mean()>0,"Hardware preparation detail samples");
+    check(timing.preparation_samples<=(timing.samples+16)/17,"Preparation detail queries must be sampled, not recorded every frame");
+    double accounted=timing.preparation_gaps.mean();
+    for(unsigned pass=0;pass<4;++pass) {
+        const auto& part=timing.preparation_parts[pass];for(const auto& phase:part)accounted+=phase.mean();
+        std::cout<<"Sampled preparation eye="<<pass/2<<" pass="<<pass%2<<" before/dispatch/after ms="
+            <<part[0].mean()<<'/'<<part[1].mean()<<'/'<<part[2].mean()<<'\n';
+    }
+    check(std::abs(accounted-timing.sampled_preparation.mean())<.001,"Preparation stages must account for their enclosing GPU scope");
+    std::cout<<"Preparation detail samples="<<timing.preparation_samples<<" sampled total="<<timing.sampled_preparation.mean()
+        <<" gaps="<<timing.preparation_gaps.mean()<<" ms\n";
+    check(timing.order_samples[0]>0&&timing.order_samples[1]>0,"Both eye execution orders must be exercised");
     // Verify the interpolated texture actually contains the non-black scene.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
     const auto desc=outputs[0]->GetDesc();device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT right_footprint{};UINT64 right_bytes{};
+    const UINT64 right_offset=(bytes+511)&~UINT64(511);
+    const auto right_desc=outputs[1]->GetDesc();device->GetCopyableFootprints(&right_desc,0,1,right_offset,&right_footprint,nullptr,nullptr,&right_bytes);
     D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC rb{};rb.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rb.Width=bytes;rb.Height=1;
+    D3D12_RESOURCE_DESC rb{};rb.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rb.Width=right_offset+right_bytes;rb.Height=1;
     rb.DepthOrArraySize=rb.MipLevels=1;rb.SampleDesc.Count=1;rb.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> readback;
     check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&rb,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback))),"Probe readback");
@@ -148,6 +166,10 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
     list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
     cheeky::fg::color_transition(list.Get(),outputs[0],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    cheeky::fg::color_transition(list.Get(),outputs[1],D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    from.pResource=outputs[1];to.PlacedFootprint=right_footprint;
+    list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    cheeky::fg::color_transition(list.Get(),outputs[1],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
     check(SUCCEEDED(list->Close()),"Probe readback close");queue->ExecuteCommandLists(1,commands);
     check(SUCCEEDED(queue->Signal(fence.Get(),2)),"Probe readback signal");
     event=CreateEventW(nullptr,FALSE,FALSE,nullptr);check(event!=nullptr,"Probe readback event");
@@ -170,6 +192,11 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         "sRGB source must retain encoded colors when converted to RGBA8 inference/output");
     const auto* edge=static_cast<const unsigned char*>(data)+footprint.Offset+2*footprint.Footprint.RowPitch+2*(floating?8:4);
     const bool edge_nonblack=floating?(*reinterpret_cast<const unsigned short*>(edge)>=0x3800):edge[0]>128;
+    const auto* right_pixel=static_cast<const unsigned char*>(data)+right_footprint.Offset+height/2*right_footprint.Footprint.RowPitch+width/2*(floating?8:4);
+    const bool right_blue=floating?reinterpret_cast<const unsigned short*>(right_pixel)[2]>=0x3800:
+        right_pixel[2]>128&&right_pixel[2]>right_pixel[0]*2;
+    check(right_blue,"Alternating execution order must preserve the distinct blue right-eye output");
     readback->Unmap(0,nullptr);check(nonblack&&edge_nonblack,"Actual NGX output and generated periphery must contain the red scene");
+    std::cout << "PASS alternating eye processing retains red left / blue right output pixels\n";
     std::cout << "PASS physical GPU NGX inference and non-black generated pixels\n";
 }

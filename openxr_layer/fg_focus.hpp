@@ -7,6 +7,7 @@
 namespace cheeky::fg {
 using Microsoft::WRL::ComPtr;
 struct FocusRect {unsigned x{},y{},w{},h{};float feather{};bool active{};};
+struct GpuTimings;
 DXGI_FORMAT depth_srv_format(DXGI_FORMAT) noexcept;
 DXGI_FORMAT motion_srv_format(DXGI_FORMAT) noexcept;
 struct FocusInput {
@@ -25,12 +26,14 @@ struct FocusPipeline {
     bool initialize(ID3D12Device*);
     bool prepare_inputs(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,unsigned pass,
         ID3D12Resource* color,const CheekyFgEye&,const FocusRect&,unsigned width,unsigned height,
-        unsigned depth_bits=32,unsigned motion_bits=32,D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON);
+        unsigned depth_bits=32,unsigned motion_bits=32,D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
+        GpuTimings* timings=nullptr);
     bool generate_periphery(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* previous,ID3D12Resource* current,const CheekyFgEye&,const Camera&,
         D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON);
     bool compose_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
-        ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect&,unsigned width,unsigned height);
+        ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect&,unsigned width,unsigned height,
+        ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON);
     bool save_depth(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye);
     void reset() noexcept;
 };

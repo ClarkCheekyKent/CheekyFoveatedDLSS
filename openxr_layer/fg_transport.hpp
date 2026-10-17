@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_present.hpp"
+#include "../shared/cheeky_gpu_span.hpp"
 #include <vector>
 
 namespace cheeky::fg {
@@ -15,6 +16,9 @@ struct Transport {
         std::vector<ComPtr<ID3D12Resource>> borrowed;
         std::vector<ComPtr<IUnknown>> leases;
         std::uint64_t retired{};
+        cheeky::gpu::Span gpu_span;
+        std::uint64_t frame{};
+        bool closes_frame{},profile_pending{};
     };
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
@@ -22,13 +26,30 @@ struct Transport {
     std::array<Context,16> contexts;
     std::vector<Image> pool;
     std::uint64_t serial{};
+    std::uint64_t timestamp_frequency{};
+    cheeky::gpu::Groups gpu_cost;
     bool initialize(ID3D12Device* d,ID3D12CommandQueue* q) {
-        device=d;queue=q;return SUCCEEDED(d->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
+        device=d;queue=q;timestamp_frequency=0;q->GetTimestampFrequency(&timestamp_frequency);
+        return SUCCEEDED(d->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
     }
     bool completed(std::uint64_t value) const {return fence&&fence->GetCompletedValue()>=value;}
-    Context* begin() {
+    void collect(std::uint64_t done) {
+        for(auto& c:contexts)if(c.retired<=done&&c.profile_pending) {
+            c.profile_pending=false;double ms{};
+            if(c.gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(c.frame,ms,c.closes_frame);
+        }
+        gpu_cost.commit();
+    }
+    void close_profile_frame(std::uint64_t frame) {
+        Context* last{};
+        for(auto& c:contexts)if(c.profile_pending&&c.frame==frame&&(!last||last->retired<c.retired))last=&c;
+        if(last)last->closes_frame=true;
+        else {gpu_cost.add(frame,0,true);gpu_cost.commit();} // Unchanged images need no upload.
+    }
+    Context* begin(std::uint64_t frame=0,bool closes_frame=false) {
         if(!device||FAILED(device->GetDeviceRemovedReason()))return nullptr;
         const auto done=fence->GetCompletedValue();
+        collect(done);
         for(auto& c:contexts)if(c.retired<=done){c.images.clear();c.borrowed.clear();c.leases.clear();}
         for(auto& c:contexts)if(c.retired<=done) {
             if(!c.allocator) {
@@ -36,23 +57,29 @@ struct Transport {
                    FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,c.allocator.Get(),nullptr,IID_PPV_ARGS(&c.list))))return nullptr;
                 if(FAILED(c.list->Close()))return nullptr;
             }
-            if(SUCCEEDED(c.allocator->Reset())&&SUCCEEDED(c.list->Reset(c.allocator.Get(),nullptr)))return &c;
+            if(SUCCEEDED(c.allocator->Reset())&&SUCCEEDED(c.list->Reset(c.allocator.Get(),nullptr))) {
+                c.frame=frame;c.closes_frame=closes_frame;c.profile_pending=false;
+                if(frame&&timestamp_frequency)c.gpu_span.begin(device.Get(),c.list.Get());
+                return &c;
+            }
         }
         return nullptr;
     }
     bool execute(Context& c,std::uint64_t& ticket) {
+        if(c.frame&&timestamp_frequency)c.gpu_span.end(c.list.Get());
         if(FAILED(c.list->Close()))return false;
         ID3D12CommandList* lists[]{c.list.Get()};queue->ExecuteCommandLists(1,lists);
         // Even a failed signal must not make this allocator reusable.
         c.retired=UINT64_MAX;
         if(FAILED(queue->Signal(fence.Get(),++serial)))return false;
-        c.retired=ticket=serial;return true;
+        c.retired=ticket=serial;c.profile_pending=c.frame&&c.gpu_span.pending;return true;
     }
-    Image image(D3D12_RESOURCE_DESC desc) {
-        desc.Flags=D3D12_RESOURCE_FLAG_NONE;desc.SampleDesc.Count=1;desc.SampleDesc.Quality=0;
+    Image image(D3D12_RESOURCE_DESC desc,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE) {
+        desc.Flags=flags;desc.SampleDesc.Count=1;desc.SampleDesc.Quality=0;
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
-            if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.Format==desc.Format){p->presentation_format=DXGI_FORMAT_UNKNOWN;return p;}
+            if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
@@ -94,13 +121,13 @@ struct Transport {
         color_transition(c.list.Get(),from,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
         destination->state=D3D12_RESOURCE_STATE_COMMON;c.images.push_back(source);c.images.push_back(destination);return destination;
     }
-    bool upload(const Image& source,ID3D12Resource* target) {
+    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0) {
         if(!source)return false;
-        auto* c=begin();
+        auto* c=begin(frame);
         // Only the background presenter uses upload(). Allocator pressure here
         // may wait for retirement without turning a transient busy ring into a
         // permanent presentation failure. Producer begin() remains nonblocking.
-        if(!c){drain();c=begin();}if(!c)return false;
+        if(!c){drain();c=begin(frame);}if(!c)return false;
         if(!compatible_color(target->GetDesc().Format,source->texture->GetDesc().Format)){c->list->Close();return false;}
         const auto read_state=(source->state&D3D12_RESOURCE_STATE_COPY_SOURCE)?source->state:D3D12_RESOURCE_STATE_COPY_SOURCE;
         color_transition(c->list.Get(),source->texture.Get(),source->state,read_state);
@@ -121,6 +148,7 @@ struct Transport {
             if(event&&SUCCEEDED(fence->SetEventOnCompletion(serial,event)))WaitForSingleObject(event,100);else Sleep(1);
         }
         if(event)CloseHandle(event);
+        collect(fence->GetCompletedValue());
         for(auto& c:contexts){c.images.clear();c.borrowed.clear();c.leases.clear();}
     }
     ~Transport(){drain();}

@@ -1,6 +1,7 @@
 #pragma once
 #include "d3d12_native.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
+#include "../shared/cheeky_gpu_span.hpp"
 #include <memory>
 #include <vector>
 
@@ -17,6 +18,7 @@ class FgSnapshots {
         std::uint64_t recording{};
         std::uint64_t retired{};
         bool submitted{},foreign{},cancelled{};
+        cheeky::gpu::Span gpu_span;
     };
     class Lease final : public IUnknown {
         std::atomic<ULONG> references{1};
@@ -38,6 +40,8 @@ class FgSnapshots {
     std::vector<Latch> latched;
     std::uint64_t ordinal{},serial{},consumed{};
     std::uint64_t failed_record{};
+    std::uint64_t timestamp_frequency{};
+    cheeky::gpu::Groups gpu_cost;
     CheekyFgEye previous_raw[2];
     static void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;v.Transition.pResource=r;
@@ -60,6 +64,7 @@ class FgSnapshots {
         barrier(list,from,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 public:
+    cheeky::gpu::Summary capture_gpu() const {return gpu_cost.summary();}
     struct Match {
         std::uint64_t frame{},latest_frame{},latest{},consumed{},failed{};
         unsigned eligible{},pending{},foreign{},cancelled{};
@@ -105,7 +110,8 @@ public:
         // Queue changes must not free recorded or submitted GPU references.
         // This object is process-resident; retain old generations until exit.
         if(!shots.empty())return false;
-        queue=native;device.Reset();fence.Reset();ordinal=serial=consumed=0;
+        queue=native;device.Reset();fence.Reset();ordinal=serial=consumed=0;timestamp_frequency=0;
+        if(queue)queue->GetTimestampFrequency(&timestamp_frequency);
         return queue&&SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))&&
             SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
     }
@@ -115,8 +121,16 @@ public:
         if(need&&SUCCEEDED(queue->Signal(fence.Get(),serial+1))) {
             ++serial;for(auto& s:shots)if(s->submitted&&!s->retired&&!s->foreign)s->retired=serial;
         }
+        collect_completed();
+    }
+    void collect_completed() {
+        if(!fence)return;
         const auto done=fence->GetCompletedValue();
-        for(auto& s:shots)if(s->retired&&s->retired<=done){s->source_depth.Reset();s->source_motion.Reset();}
+        for(auto& s:shots)if(s->retired&&s->retired<=done){
+            double ms{};if(s->gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(s->meta.render_frame,ms,false,2);
+            s->source_depth.Reset();s->source_motion.Reset();
+        }
+        gpu_cost.commit();
     }
     bool record(ID3D12GraphicsCommandList* commands,CheekyFgEye meta) {
         const auto id=++ordinal; // Failed/dropped captures must leave a gap.
@@ -128,6 +142,10 @@ public:
         // when its GPU work has already completed.
         for(auto& s:shots)if(s.use_count()==1&&(s->cancelled||(s->retired&&s->retired<=done&&s->meta.evaluation+2<id&&!s->foreign))){slot=s;break;}
         if(!slot){if(shots.size()>=24){failed_record=id;return false;}slot=std::make_shared<Shot>();shots.push_back(slot);}
+        if(slot->retired&&slot->retired<=done) {
+            double ms{};if(slot->gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(slot->meta.render_frame,ms,false,2);
+            gpu_cost.commit();
+        }
         if(!allocate(meta.depth,slot->depth)||!allocate(meta.motion,slot->motion)){failed_record=id;return false;}
         slot->source_depth=meta.depth;slot->source_motion=meta.motion;slot->list=native_d3d12_interface(commands);
         slot->recording=recording;
@@ -142,7 +160,9 @@ public:
         }
         prior=meta;prior.depth=prior.motion=nullptr;
         tag_recording(commands);
+        if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
         copy(commands,meta.depth,slot->depth.Get());copy(commands,meta.motion,slot->motion.Get());
+        if(timestamp_frequency)slot->gpu_span.end(commands);
         meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.evaluation=id;slot->meta=meta;return true;
     }
     void submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands) {
@@ -155,6 +175,7 @@ public:
         const auto recording=recording_identity(commands);
         for(auto& s:shots)if(!s->submitted&&recording&&s->recording==recording){
             s->cancelled=true;s->submitted=true;s->list.Reset();s->source_depth.Reset();s->source_motion.Reset();
+            s->gpu_span.pending=false;
             failed_record=std::max(failed_record,s->meta.evaluation);
         }
     }

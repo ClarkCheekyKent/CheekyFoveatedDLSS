@@ -5,6 +5,8 @@ CheekyFgStatus fg_status() noexcept;
 CheekyFgDiagnostic fg_diagnostic() noexcept;
 bool fg_performance(CheekyFgPerformance&) noexcept;
 bool fg_cadence(CheekyFgCadence&) noexcept;
+bool fg_overhead(CheekyFgOverhead&) noexcept;
+bool fg_presentation(CheekyFgPresentation&) noexcept;
 const char* fg_state_name(CheekyFgState state) noexcept;
 }
 #include "ngx_abi.hpp"

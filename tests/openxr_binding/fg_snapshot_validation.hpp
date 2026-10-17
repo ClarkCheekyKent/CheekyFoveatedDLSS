@@ -74,6 +74,10 @@ void fg_snapshot_validation(ID3D12Device* device) {
     check(capture.acquire(pair)&&pair.eyes[0].evaluation==1&&pair.eyes[1].evaluation==2,
         "Acquire must select the color's exact token, never substitute the newer pair");
     auto release=[&](CheekyFgPair& p){for(auto& eye:p.eyes){eye.depth->Release();eye.motion->Release();}p.producer_queue->Release();p.lease->Release();};
+    cheeky::fg::BufferedPresenter::Native retained;
+    retained.retain_guides(pair);release(pair);pair=retained.guides;
+    check(retained.guide_lease&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,
+        "Native FG job must retain the exact original stereo guide lease after releasing the bridge response");
     // Read every snapshot after the engine has reused the SAME original guide
     // textures for both eyes and a later frame. No constant-source mock passes.
     const auto d=pair.eyes[0].depth->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes{};
@@ -82,6 +86,7 @@ void fg_snapshot_validation(ID3D12Device* device) {
     D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;D3D12_RESOURCE_DESC rd{};
     rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=bytes*4;rd.Height=1;rd.DepthOrArraySize=rd.MipLevels=rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     ComPtr<ID3D12Resource> rb;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&rb))),"Snapshot readback buffer");
+    auto read_retained=[&] {
     allocator->Reset();list->Reset(allocator.Get(),nullptr);
     unsigned index{};
     for(auto& eye:pair.eyes)for(auto* source:{eye.depth,eye.motion}) {
@@ -97,9 +102,22 @@ void fg_snapshot_validation(ID3D12Device* device) {
     void* mapped{};D3D12_RANGE range{0,SIZE_T(bytes*4)};check(SUCCEEDED(rb->Map(0,&range,&mapped)),"Snapshot readback map");
     for(unsigned i=0;i<4;++i)check(std::abs(*reinterpret_cast<float*>(static_cast<char*>(mapped)+bytes*i)-(i<2?.25f:.75f))<.0001f,
         "Depth/motion snapshot must retain the correct eye and native frame despite source reuse");
-    D3D12_RANGE empty{};rb->Unmap(0,&empty);release(pair);
+    D3D12_RANGE empty{};rb->Unmap(0,&empty);
+    };read_retained();
     CheekyFgPair duplicate;duplicate.capture_token=color_token;check(!capture.acquire(duplicate),"Old guides cannot be reused for another native frame");
     CheekyFgPair next;next.capture_token=4;check(capture.acquire(next),"Next exact frame pair");release(next);
+    // Recycle the producer pool for 32 newer stereo frames after returning the
+    // bridge response. Holding resource pointers alone would not prevent its
+    // Shot objects from being selected and overwritten by the producer.
+    for(unsigned frame=79;frame<111;++frame) {
+        allocator->Reset();list->Reset(allocator.Get(),nullptr);capture.reset(list.Get());
+        recording_frame=frame;record(.1f);record(.9f);
+        list->Close();queue->ExecuteCommandLists(1,lists);capture.submitted(queue.Get(),list.Get());
+        check(capture.token(frame)!=0,"Guide pool must remain usable while one old stereo job is retained");
+        wait();capture.retire();wait();
+    }
+    read_retained();retained.clear_guides();
+    check(!retained.guide_lease&&!retained.guide_depth[0]&&!retained.guide_motion[1],"Retired native job releases guide leases and resources");
     capture.invalidate();check(capture.token()==0,"Configuration/session reset rejects previous-frame guides");
     provenance.invalidate();check(provenance.token(depth.Get())==0,"Session reset clears color provenance");
     allocator->Reset();list->Reset(allocator.Get(),nullptr);
@@ -129,5 +147,7 @@ void fg_snapshot_validation(ID3D12Device* device) {
     CheekyFgPair alias_pair;alias_pair.capture_token=2;alias_pair.render_frame=909;
     check(aliased.acquire(alias_pair),"Opaque alias must preserve the exact native frame's guide lease");release(alias_pair);
     check(alias.references==0,"Alias guide/color command references retire after native enqueue");
+    aliased.retire();const auto guide_gpu=aliased.capture_gpu();
+    check(guide_gpu.samples==1&&guide_gpu.mean>0,"Both completed eye snapshots must contribute one measured stereo guide-copy sample");
     std::cout<<"Guide alignment: reused source pixels, copy provenance, delayed consumption, bounded/reset recovery and reversed-Z head translation passed\n";
 }

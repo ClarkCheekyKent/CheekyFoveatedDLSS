@@ -113,3 +113,25 @@ struct CheekyFgCadence {
     double app_begin_ms{},app_end_ms{},app_release_ms{};
 };
 using CheekyFgCadenceFn=bool(__cdecl*)(CheekyFgCadence*);
+
+// Optional GPU stages outside the original processing timestamp interval.
+struct CheekyFgOverhead {
+    std::uint32_t abi{1},size{sizeof(CheekyFgOverhead)},supported{};
+    std::uint64_t guide_samples{},capture_samples{},publication_samples{},upload_samples{};
+    double guide_ms{},guide_last_ms{},capture_ms{},capture_last_ms{};
+    double publication_ms{},publication_last_ms{},upload_ms{},upload_last_ms{};
+};
+using CheekyFgOverheadFn=bool(__cdecl*)(CheekyFgOverhead*);
+
+// Optional presentation telemetry; previous export layouts remain unchanged.
+// CPU color-capture observation -> xrEndFrame entry, NOT motion-to-photon.
+// Generated content time is the midpoint of its two native capture times.
+struct CheekyFgPresentation {
+    std::uint32_t abi{1},size{sizeof(CheekyFgPresentation)},supported{};
+    std::uint64_t native_samples{},generated_samples{},repeat_samples{};
+    std::uint64_t wait_samples{},wait_arrivals{},wait_timeouts{};
+    double native_age_ms{},native_age_last_ms{},generated_age_ms{},generated_age_last_ms{};
+    double newest_input_age_ms{},newest_input_age_last_ms{},repeat_age_ms{},repeat_age_last_ms{};
+    double late_wait_ms{},late_wait_last_ms{},wait_budget_ms{};
+};
+using CheekyFgPresentationFn=bool(__cdecl*)(CheekyFgPresentation*);
