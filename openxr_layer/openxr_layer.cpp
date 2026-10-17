@@ -18,6 +18,7 @@
 #include "gaze_math.hpp"
 #include "eye_calibration.hpp"
 #include "projection_selection.hpp"
+#include "fg_async.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
 #include "menu_geometry.hpp"
 #include "../src/realvr_runtime.hpp"
@@ -97,6 +98,7 @@ struct Dispatch {
     PFN_xrAcquireSwapchainImage acquire_swapchain_image{};
     PFN_xrWaitSwapchainImage wait_swapchain_image{};
     PFN_xrReleaseSwapchainImage release_swapchain_image{};
+    PFN_xrWaitFrame wait_frame{};
     PFN_xrBeginFrame begin_frame{};
     PFN_xrEndFrame end_frame{};
 };
@@ -148,6 +150,7 @@ void populate_dispatch(
     CHEEKY_LOAD(acquire_swapchain_image, AcquireSwapchainImage);
     CHEEKY_LOAD(wait_swapchain_image, WaitSwapchainImage);
     CHEEKY_LOAD(release_swapchain_image, ReleaseSwapchainImage);
+    CHEEKY_LOAD(wait_frame, WaitFrame);
     CHEEKY_LOAD(begin_frame, BeginFrame);
     CHEEKY_LOAD(end_frame, EndFrame);
 #undef CHEEKY_LOAD
@@ -263,6 +266,9 @@ struct SessionState {
     bool ambiguous_resource{};
     XrTime predicted_display_time{};
     XrTime sample_time{};
+    std::shared_ptr<cheeky::fg::Presenter> fg;
+    CheekyFgState fg_state{CheekyFgState::off};
+    bool fg_requested{};
     std::uint32_t gaze_location_flags{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_u{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_v{};
@@ -1863,6 +1869,7 @@ XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitSwapchainImage(
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
     XrSwapchain, const XrSwapchainImageReleaseInfo*
 );
+XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(XrSession session, const XrFrameWaitInfo* info, XrFrameState* state);
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(XrSession session, const XrFrameBeginInfo* info);
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     XrSession, const XrFrameEndInfo*
@@ -1916,6 +1923,7 @@ namespace {
     CHEEKY_INTERCEPT(
         "xrReleaseSwapchainImage", cheeky_xrReleaseSwapchainImage
     )
+    CHEEKY_INTERCEPT("xrWaitFrame", cheeky_xrWaitFrame)
     CHEEKY_INTERCEPT("xrBeginFrame", cheeky_xrBeginFrame)
     CHEEKY_INTERCEPT("xrEndFrame", cheeky_xrEndFrame)
 #undef CHEEKY_INTERCEPT
@@ -2066,6 +2074,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
     const XrInstance instance
 ) {
     std::lock_guard menu_lock(menu_mutex);
+    std::vector<std::shared_ptr<cheeky::fg::Presenter>> retired_presenters;
     Dispatch dispatch{};
     XrAction action{XR_NULL_HANDLE};
     XrActionSet action_set{XR_NULL_HANDLE};
@@ -2086,6 +2095,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
             if (session_it->second.instance == instance) {
                 destroy_menu(session_it->second.menu, dispatch);
                 session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
+                if(session_it->second.fg)retired_presenters.push_back(std::move(session_it->second.fg));
                 session_it = sessions.erase(session_it);
             } else {
                 ++session_it;
@@ -2102,6 +2112,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
         instances.erase(iterator);
         publish_snapshot_locked(nullptr);
     }
+    for(auto& presenter:retired_presenters)presenter->invalidate_temporal();
+    retired_presenters.clear();
     if (action != XR_NULL_HANDLE && dispatch.destroy_action != nullptr) {
         static_cast<void>(dispatch.destroy_action(action));
     }
@@ -2242,6 +2254,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
     const XrSession session
 ) {
     std::lock_guard menu_lock(menu_mutex);
+    std::shared_ptr<cheeky::fg::Presenter> retired_fg;
     Dispatch dispatch{};
     XrSpace gaze_space{XR_NULL_HANDLE};
     XrSpace calibration_local_space{XR_NULL_HANDLE};
@@ -2260,6 +2273,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         menu_aim_spaces = session_it->second.menu_aim_spaces;
         for (unsigned hand = 0; hand < 2; ++hand) host_menu_spaces[hand] = session_it->second.host_menu_hands[hand].space;
         session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
+        retired_fg=std::move(session_it->second.fg);
         sessions.erase(session_it);
         for (auto iterator = swapchains.begin(); iterator != swapchains.end();) {
             if (iterator->second.session == session) {
@@ -2271,6 +2285,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         swapchain_generation.fetch_add(1U, std::memory_order_release);
         publish_snapshot_locked(nullptr);
     }
+    if(retired_fg)retired_fg->invalidate_temporal();
+    retired_fg.reset();
     if (gaze_space != XR_NULL_HANDLE && dispatch.destroy_space != nullptr) {
         static_cast<void>(dispatch.destroy_space(gaze_space));
     }
@@ -2356,6 +2372,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
+            if(iterator->second.fg)iterator->second.fg->invalidate_temporal();
             iterator->second.running = true;
             iterator->second.last_fallback_sync_time = 0;
             iterator->second.view_configuration =
@@ -2373,6 +2390,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndSession(
     const XrSession session
 ) {
     PFN_xrEndSession next{};
+    std::shared_ptr<cheeky::fg::Presenter> presenter;
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
@@ -2380,11 +2398,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndSession(
         next = instance->dispatch.end_session;
         auto& session_state = sessions.at(session);
         session_state.calibration.destroy(cheeky::openxr_calibration::bridge());
+        presenter=session_state.fg;
         session_state.running = false;
         session_state.action_active = false;
         session_state.gaze_valid = false;
         publish_snapshot_locked(&session_state);
     }
+    if(presenter)presenter->invalidate_temporal();
     return next == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
         : next(session);
@@ -2994,6 +3014,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
 ) {
     PFN_xrDestroySwapchain next{};
     XrSession session{XR_NULL_HANDLE};
+    std::shared_ptr<cheeky::fg::Presenter> fg_to_invalidate;
     {
         std::lock_guard lock(state_mutex);
         const auto swapchain_it = swapchains.find(swapchain);
@@ -3004,6 +3025,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
         next = instance->dispatch.destroy_swapchain;
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
+            fg_to_invalidate=session_it->second.fg;
             auto& calibration = session_it->second.calibration;
             for (const auto& region : calibration.history) {
                 if (region.swapchain == reinterpret_cast<std::uint64_t>(swapchain)) {
@@ -3021,6 +3043,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
             publish_snapshot_locked(&session_it->second);
         }
     }
+    if(fg_to_invalidate)fg_to_invalidate->invalidate_temporal();
     return next == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
         : next(swapchain);
@@ -3129,6 +3152,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitSwapchainImage(
     const XrSwapchainImageWaitInfo* const wait_info
 ) {
     PFN_xrWaitSwapchainImage next{};
+    std::shared_ptr<cheeky::fg::Presenter> presenter;
     {
         std::lock_guard lock(state_mutex);
         const auto swapchain_it = swapchains.find(swapchain);
@@ -3138,9 +3162,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitSwapchainImage(
         );
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.wait_swapchain_image;
+        const auto owner=sessions.find(swapchain_it->second.session);
+        if(owner!=sessions.end())presenter=owner->second.fg;
     }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto wait_start=cheeky::fg::TimingClock::now();
     const auto result = next(swapchain, wait_info);
+    if(presenter)presenter->note_app_image_wait(cheeky::fg::elapsed_ms(wait_start));
     if (result == XR_SUCCESS || result == XR_SESSION_LOSS_PENDING) {
         std::lock_guard lock(state_mutex);
         auto it = swapchains.find(swapchain);
@@ -3156,6 +3184,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
     const XrSwapchainImageReleaseInfo* const release_info
 ) {
     PFN_xrReleaseSwapchainImage next{};
+    std::shared_ptr<cheeky::fg::Presenter> fg_presenter;
+    cheeky::fg::AppFrameCallTimer app_timer{fg_presenter,2};
     XrSession session{XR_NULL_HANDLE};
     std::uint32_t acquired_index{};
     bool has_acquired{};
@@ -3180,6 +3210,31 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
         }
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    // Copy the completed OpenXR color image before giving its ownership back.
+    // The GPU-owned copy remains stable while UEVR renders another frame.
+    ID3D12Resource* fg_source{};
+    unsigned fg_width{}, fg_height{}, fg_array{};
+    DXGI_FORMAT fg_format{DXGI_FORMAT_UNKNOWN};
+    {
+        std::lock_guard fg_lock(state_mutex);
+        const auto chain = swapchains.find(swapchain);
+        const auto owner = sessions.find(session);
+        if (chain != swapchains.end() && owner != sessions.end() && owner->second.fg &&
+            (chain->second.create_info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
+            has_acquired && acquired_index < chain->second.calibration_images.size()) {
+            fg_presenter=owner->second.fg;
+            fg_source=static_cast<ID3D12Resource*>(chain->second.calibration_images[acquired_index]);
+            if (fg_source) fg_source->AddRef();
+            fg_width=chain->second.create_info.width;
+            fg_height=chain->second.create_info.height;
+            fg_array=chain->second.create_info.arraySize;
+            fg_format=static_cast<DXGI_FORMAT>(chain->second.create_info.format);
+        }
+    }
+    if (fg_presenter && fg_source) {
+        fg_presenter->capture(swapchain,acquired_index,fg_source,fg_width,fg_height,fg_array,fg_format);
+        fg_source->Release();
+    }
     const auto result = next(swapchain, release_info);
     {
         std::lock_guard lock(state_mutex);
@@ -3207,17 +3262,138 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
     return result;
 }
 
+// Caller holds state_mutex; returned resources retire outside that lock.
+std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
+    SessionState& owner, const Dispatch& d, bool requested) {
+    const bool supported=owner.running && owner.graphics_api==12 &&
+        owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    if (!requested || !supported) {
+        if(owner.fg)log_startup("DLSS-FG disabling session=%p; draining private GPU work\n",owner.session);
+        owner.fg_requested=false;
+        owner.fg_state=requested?CheekyFgState::waiting_for_stereo:CheekyFgState::off;
+        return std::move(owner.fg);
+    }
+    if (!owner.fg_requested) {
+        owner.fg_requested=true;
+        log_startup("DLSS-FG enabling session=%p device=%p queue=%p; OpenXR color state=RENDER_TARGET\n",
+            owner.session,owner.graphics_device,owner.graphics_queue);
+        cheeky::fg::XrFns fn{};
+        fn.create=d.create_swapchain;fn.destroy=d.destroy_swapchain;
+        fn.enumerate=d.enumerate_swapchain_images;fn.acquire=d.acquire_swapchain_image;
+        fn.wait_image=d.wait_swapchain_image;fn.release=d.release_swapchain_image;
+        fn.wait_frame=d.wait_frame;fn.begin_frame=d.begin_frame;fn.end_frame=d.end_frame;
+        auto candidate=std::make_shared<cheeky::fg::BufferedPresenter>();
+        candidate->trace=[](const char* message) noexcept {log_startup("%s\n",message);};
+        if (candidate->setup(owner.session,fn,static_cast<ID3D12Device*>(owner.graphics_device),
+            static_cast<ID3D12CommandQueue*>(owner.graphics_queue))) {
+            owner.fg=std::move(candidate);
+            owner.fg_state=CheekyFgState::waiting_for_history;
+            log_startup("DLSS-FG presenter initialized session=%p\n",owner.session);
+        } else {
+            owner.fg_state=CheekyFgState::presenter_failed;
+            log_startup("DLSS-FG presenter initialization failed session=%p\n",owner.session);
+        }
+    }
+    return {};
+}
+
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
+    const XrSession session, const XrFrameWaitInfo* const info,
+    XrFrameState* const state) {
+    PFN_xrWaitFrame downstream{};
+    std::shared_ptr<cheeky::fg::Presenter> presenter;
+    std::shared_ptr<cheeky::fg::Presenter> retired;
+    // Read the runtime setting before taking the layer lock. Changes are
+    // latched here, so one application frame keeps the same cadence throughout.
+    CheekyFgControl control;
+    const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+    const auto get_control=runtime?reinterpret_cast<CheekyFgControlFn>(GetProcAddress(runtime,"CheekyFG_GetControl")):nullptr;
+    const bool requested=get_control && get_control(&control) && control.enabled;
+    {
+        std::lock_guard lock(state_mutex);
+        const auto* instance=find_instance_for_session_locked(session);
+        if (!instance) return XR_ERROR_HANDLE_INVALID;
+        downstream=instance->dispatch.wait_frame;
+        auto it=sessions.find(session);
+        if (it!=sessions.end()) {
+            auto& owner=it->second;
+            if (state) retired=update_fg_at_frame_boundary(owner,instance->dispatch,requested);
+            if (owner.running && state) presenter=owner.fg;
+        }
+    }
+    // Draining GPU work and destroying private swapchains happens outside the
+    // layer lock, before forwarding this frame's WaitFrame.
+    if(retired)retired->invalidate_temporal();
+    retired.reset();
+    if (presenter) {presenter->configure(control.configuration);return presenter->wait_frame(info,state);}
+    return downstream ? downstream(session,info,state) : XR_ERROR_FUNCTION_UNSUPPORTED;
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStatus(CheekyFgStatus* out) noexcept {
+    if (!out || out->abi!=CHEEKY_FG_CONTROL_ABI || out->size!=sizeof(*out)) return false;
+    CheekyFgStatus status;
+    status.layer_present=1;status.controls_supported=1;
+    std::lock_guard lock(state_mutex);
+    for (const auto& [handle,owner]:sessions) {
+        if (owner.graphics_api!=12 || !owner.running ||
+            owner.view_configuration!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) continue;
+        status.compatible_session=1;
+        status.state=owner.fg_state;
+        if (!owner.fg) continue;
+        std::lock_guard fg_lock(owner.fg->mx);
+        status.active=1;status.state=owner.fg->state;
+        status.native_frames=owner.fg->native_count;
+        status.generated_frames=owner.fg->generated_count;
+        status.fallback_frames=owner.fg->fallback_count;
+        break;
+    }
+    *out=status;
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDiagnostic(CheekyFgDiagnostic* out) noexcept {
+    if(!out||out->abi!=CHEEKY_FG_CONTROL_ABI||out->size!=sizeof(*out))return false;
+    out->message[0]=0;
+    std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions) {
+        if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);
+        strcpy_s(out->message,owner.fg->diagnostic_text());return true;
+    }
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPerformance(CheekyFgPerformance* out) noexcept {
+    if(!out||out->abi!=CHEEKY_FG_CONTROL_ABI||out->size!=sizeof(*out))return false;
+    *out=CheekyFgPerformance{};
+    std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions) {
+        if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);
+        *out=owner.fg->performance();return true;
+    }
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCadenceV1(CheekyFgCadence* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgCadence{};std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->cadence();return true;}
+    return true;
+}
+
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
     const XrSession session, const XrFrameBeginInfo* info) {
     PFN_xrBeginFrame next{};
+    std::shared_ptr<cheeky::fg::Presenter> presenter;
+    cheeky::fg::AppFrameCallTimer app_timer{presenter,0};
     { std::lock_guard lock(state_mutex);
       const auto* instance = find_instance_for_session_locked(session);
       if (!instance) return XR_ERROR_HANDLE_INVALID;
-      next = instance->dispatch.begin_frame; }
+      next = instance->dispatch.begin_frame;
+      const auto owner=sessions.find(session);if(owner!=sessions.end())presenter=owner->second.fg; }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
     // Some hosts render DLSS before BeginFrame and call it just before submitting.
     // Preserve the source markers collected since the previous EndFrame.
-    return next(session, info);
+    return presenter?presenter->begin_frame(info):next(session, info);
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
@@ -3225,6 +3401,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     const XrFrameEndInfo* const frame_end_info
 ) {
     PFN_xrEndFrame next{};
+    std::shared_ptr<cheeky::fg::Presenter> presenter;
+    cheeky::fg::AppFrameCallTimer app_timer{presenter,1};
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
@@ -3244,9 +3422,42 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
             menu_dispatch = instances.at(found->second.instance).dispatch;
         }
     }
-    const auto result = menu_session
-        ? submit_menu_frame(session, frame_end_info, menu_dispatch, *menu_session)
-        : next(session, frame_end_info);
+    // Privately owned swapchains let the layer hold native A until real B
+    // arrives, then display A / DLSS-G(A,B) / B in chronological order.
+    std::array<unsigned,2> release_indices{};
+    const XrCompositionLayerProjection* fg_projection{};
+    bool fg_compatible{};
+    {
+        std::lock_guard fg_lock(state_mutex);
+        const auto it=sessions.find(session);
+        if(it!=sessions.end() && it->second.running && it->second.fg &&
+            it->second.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO){
+            presenter=it->second.fg;
+            const auto selected=cheeky::openxr::select_projection(frame_end_info,[session](XrSwapchain sc){
+                const auto ch=swapchains.find(sc);
+                return ch!=swapchains.end() && ch->second.session==session &&
+                    ch->second.create_info.width==4 && ch->second.create_info.height==4;
+            });
+            if(selected.projection && !selected.ambiguous && !selected.unsupported &&
+               frame_end_info) {
+                fg_compatible=true;
+                for(unsigned eye=0;eye<2;++eye){
+                    const auto sc=selected.projection->views[eye].subImage.swapchain;
+                    const auto ch=swapchains.find(sc);
+                    if(ch==swapchains.end()||!ch->second.has_released){fg_compatible=false;break;}
+                    release_indices[eye]=ch->second.released_index;
+                }
+                if(fg_compatible) {
+                    presenter=it->second.fg;
+                    fg_projection=selected.projection;
+                }
+            }
+        }
+    }
+    const auto result = presenter
+        ? presenter->end_frame(frame_end_info,release_indices,fg_projection)
+        : menu_session ? submit_menu_frame(session,frame_end_info,menu_dispatch,*menu_session)
+                       : next(session,frame_end_info);
     menu_lock.unlock();
     std::unique_lock lock(state_mutex);
     const auto selected = cheeky::openxr::select_projection(frame_end_info, [session](XrSwapchain handle) {

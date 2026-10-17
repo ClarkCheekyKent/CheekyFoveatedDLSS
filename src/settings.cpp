@@ -12,6 +12,7 @@ namespace cheeky::foveated_dlss {
 namespace {
 
 std::mutex settings_mutex;
+Settings::FrameGeneration fg_settings;
 std::atomic<bool> processing_allowed{true};
 
 std::atomic<bool> enabled{true};
@@ -150,6 +151,7 @@ void store_float(std::atomic<std::uint32_t>& destination, float value) noexcept 
 Settings configured_settings() noexcept {
     std::lock_guard lock(settings_mutex);
     Settings settings{};
+    settings.fg = fg_settings;
     settings.enabled = enabled.load(std::memory_order_acquire);
     settings.d3d12_lower_hook = d3d12_lower_hook.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
@@ -236,12 +238,28 @@ Settings current_settings() noexcept {
     if (!processing_allowed.load(std::memory_order_acquire)) {
         settings.enabled = false;
         settings.nr_enabled = false;
+        settings.fg.enabled = false;
     }
     return settings;
 }
 
 void update_settings(const Settings& settings) noexcept {
     std::lock_guard lock(settings_mutex);
+    fg_settings = settings.fg;
+    const auto bounded = [](float value, float lo, float hi, float fallback) {
+        return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
+    };
+    fg_settings.width = bounded(fg_settings.width, 0.2F, 1.0F, 0.55F);
+    fg_settings.height = bounded(fg_settings.height, 0.2F, 1.0F, 0.45F);
+    fg_settings.x = bounded(fg_settings.x, -0.5F, 0.5F, 0.0F);
+    fg_settings.y = bounded(fg_settings.y, -1.0F, 1.0F, 0.0F);
+    fg_settings.feather = bounded(fg_settings.feather, 0.0F, 0.3F, 0.04F);
+    auto fg_percent=[](std::uint32_t n) {return n==25||n==50||n==75||n==100?n:100u;};
+    fg_settings.resolution_percent=fg_percent(fg_settings.resolution_percent);
+    fg_settings.peripheral_percent=fg_percent(fg_settings.peripheral_percent);
+    fg_settings.peripheral_method=std::min(fg_settings.peripheral_method,3u);
+    fg_settings.depth_bits=fg_settings.depth_bits==16?16:32;
+    fg_settings.motion_bits=fg_settings.motion_bits==16?16:32;
     d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(

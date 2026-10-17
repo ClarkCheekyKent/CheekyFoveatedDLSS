@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -464,6 +464,141 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             end
         end
         reset_group("Reset DLSS-SR defaults", "sr")
+        imgui.tree_pop()
+    end
+
+    if imgui.tree_node("DLSS-FG (experimental)") then
+        if draft.FgEnabled == nil then
+            text("Install the matching DLSS-FG plugin, runtime and Lua script.")
+        else
+            check("Enable DLSS Frame Generation (2x)", "FgEnabled")
+            text("Applies at the next OpenXR frame and saves automatically.")
+            text("Requires D3D12 OpenXR, native stereo DLSS and NVIDIA frame generation support.")
+            local fg = status.fg or {}
+            if not fg.layer_present then
+                text("OpenXR layer not loaded. Install the updated OpenXR support and restart the game.")
+            elseif not fg.controls_supported then
+                text("OpenXR layer needs updating. Run the matching installer and restart the game.")
+            elseif not status.settings.FgEnabled then
+                text("Status: Off")
+            elseif not fg.compatible_session then
+                text("Status: Waiting for a running D3D12 OpenXR stereo session")
+            elseif not fg.active and fg.state == "Off" then
+                text("Status: Starting at the next frame")
+            else
+                text("Status: " .. tostring(fg.state or "Waiting"))
+                if fg.state ~= "Generating frames" and fg.diagnostic and fg.diagnostic ~= "" then
+                    text(tostring(fg.diagnostic))
+                end
+            end
+            if draft.FgEnabled then
+                if draft.FgResolutionPercent ~= nil then
+                    combo("FG scale", "FgResolutionPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
+                end
+                check("Foveated frame generation", "FgFoveated")
+                if draft.FgFoveated then
+                    slider("FG region width", "FgWidth", 0.2, 1)
+                    slider("FG region height", "FgHeight", 0.2, 1)
+                    slider("FG horizontal offset", "FgXOffset", -0.5, 0.5)
+                    slider("FG vertical offset", "FgYOffset", -1, 1)
+                    slider("FG transition width", "FgFeather", 0, 0.3)
+                    if draft.FgPeripheralPercent ~= nil then
+                        combo("FG periphery scale", "FgPeripheralPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
+                        combo("FG periphery method", "FgPeripheralMethod", {[0]="None (previous frame)", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS"})
+                        combo("FG periphery depth", "FgDepthBits", {[16]="16-bit", [32]="32-bit"})
+                        combo("FG periphery motion", "FgMotionBits", {[16]="16-bit", [32]="32-bit"})
+                    end
+                    text("Fixed center, independent of SR. FG scale controls center resolution.")
+                    text("Unsupported guides preserve native frames; see status.")
+                end
+                text("Target: 2x. Native cadence continues until generation succeeds.")
+                rows("fg_frames", {{"Native frames", fg.native_frames or 0},
+                    {"Generated frames presented", fg.generated_frames or 0},
+                    {"Repeated fallback frames", fg.fallback_frames or 0}})
+                local p = fg.performance
+                local cadence = fg.cadence
+                if cadence and cadence.supported then
+                    if cadence.valid then
+                        rows("fg_cadence", {{"Game / native target", string.format("%.1f / %.1f FPS",cadence.game_fps or 0,cadence.native_target_fps or 0)},
+                            {"Unique output",string.format("%.1f FPS",cadence.unique_fps or 0)},
+                            {"Native / generated output",string.format("%.1f / %.1f FPS",cadence.native_fps or 0,cadence.generated_fps or 0)},
+                            {"Repeated presentations",string.format("%.1f FPS",cadence.repeat_fps or 0)},
+                            {"OpenXR submissions",string.format("%.1f FPS",cadence.submission_fps or 0)},
+                            {"Headset refresh target",string.format("%.1f Hz",cadence.refresh_hz or 0)}})
+                        text("Unique output excludes repeats. Refresh target is not measured output FPS.")
+                    else text("Measuring actual presentation cadence...") end
+                elseif p and p.asynchronous_presenter then
+                    text("Update the OpenXR layer for measured unique-output FPS.")
+                end
+                if fg.frame_source then
+                    rows("fg_source", {{"Frame ID source",fg.frame_source},
+                        {"Frame ID calls / guides captured",string.format("%.0f / %.0f",fg.frame_source_calls or 0,fg.captured_guides or 0)}})
+                    if fg.match_reason then
+                        rows("fg_source_match",{{"Captured frame (color / guides)",string.format("%.0f / %.0f",fg.last_color_frame or 0,fg.last_guide_frame or 0)},
+                            {"Matching guides (ready / pending)",string.format("%.0f / %.0f",fg.eligible_guides or 0,fg.pending_guides or 0)},
+                            {"Frame match",fg.match_reason}})
+                    end
+                end
+                text("GPU timings: average / last (ms), both eyes")
+                if not p or not p.supported then
+                    text("Install the matching OpenXR update for FG timings.")
+                else
+                    local function gpu_ms(mean, last)
+                        return string.format("%.3f / %.3f", mean or 0, last or 0)
+                    end
+                    if p.gpu_valid then
+                        local focused = (p.foveated_eyes or 0) > 0
+                        local resized = not focused and (p.center_width or 0)>0 and
+                            (p.center_width~=p.output_width or p.center_height~=p.output_height)
+                        if (p.center_width or 0) > 0 then
+                            rows("fg_resolutions", {{focused and "Center FG input" or "Full-frame FG input", size(p.center_width,p.center_height)},
+                                {"Periphery input", focused and size(p.peripheral_width,p.peripheral_height) or "Not used"},
+                                {"Output per eye", size(p.output_width,p.output_height)}})
+                        end
+                        rows("fg_gpu_timings", {
+                            {focused and "DLSS-FG center" or "DLSS-FG full frame", gpu_ms(p.center_ms, p.center_last_ms)},
+                            {resized and "Output resize" or "Periphery + blending", (focused or resized) and
+                                gpu_ms(p.periphery_ms,p.periphery_last_ms) or "Not used (full-frame FG)"},
+                            {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)},
+                            {"FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}})
+                        text("Average of up to 60 completed stereo pairs.")
+                    elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then
+                        text("GPU timestamps unavailable or FG has not started.")
+                    else
+                        text("Waiting for a complete GPU timing sample.")
+                    end
+                    rows("fg_wait_timings", {
+                        {p.asynchronous_presenter and "FG completion wait (background)" or "FG completion wait (CPU)", string.format("%.3f ms", p.completion_wait_ms or 0)},
+                        {p.asynchronous_presenter and "Game GPU-fence waits" or "Capture / upload waits (CPU)", string.format("%.3f ms", p.copy_wait_ms or 0)},
+                        {p.asynchronous_presenter and "OpenXR waits (presenter)" or "OpenXR frame waits (CPU)", string.format("%.3f ms", p.xr_wait_ms or 0)},
+                        {"Headset frame period", string.format("%.3f ms", p.xr_period_ms or 0)}})
+                    text("CPU waits overlap GPU work; do not add them.")
+                    text("GPU timings are elapsed intervals; contention can increase them.")
+                    if cadence and cadence.supported then
+                        rows("fg_runtime_waits", {{"Game image wait / call",string.format("%.3f ms",cadence.app_image_wait_ms or 0)},
+                            {"Game begin / end calls",string.format("%.3f / %.3f ms",cadence.app_begin_ms or 0,cadence.app_end_ms or 0)},
+                            {"Game image release / call",string.format("%.3f ms",cadence.app_release_ms or 0)},
+                            {"Presenter image wait / call",string.format("%.3f ms",cadence.present_image_wait_ms or 0)},
+                            {"Runtime begin / end",string.format("%.3f / %.3f ms",cadence.begin_ms or 0,cadence.end_ms or 0)},
+                            {"Presenter work / submission",string.format("%.3f ms",cadence.present_cpu_ms or 0)}})
+                    end
+                    if p.asynchronous_presenter then
+                        text("Pacing wait: game sleeps until the next native-frame slot.")
+                        rows("fg_alignment", {{"Color / guide submission",string.format("%.0f / %.0f",p.color_token or 0,p.guide_token or 0)},
+                            {"UEVR frame (color / guides)",string.format("%.0f / %.0f",p.color_render_frame or 0,p.guide_render_frame or 0)},
+                            {"FG input color",p.inference_color_format==28 and "RGBA8 SDR" or p.inference_color_format==24 and "RGB10" or "FP16"},
+                            {"FG GPU queue",p.shared_gpu_queue==1 and "Game queue; background CPU worker" or "Separate queue"},
+                            {"Rejected guide matches",tostring(p.mismatched_guides or 0)}})
+                        text("Buffered presentation: FG completion runs off the game thread.")
+                        rows("fg_buffered", {{"Game frame handoff (CPU)", string.format("%.3f ms",p.producer_cpu_ms or 0)},
+                            {"Game pacing wait", string.format("%.3f ms",p.pacing_wait_ms or 0)},
+                            {"Native frames queued",p.queued_native or 0},{"Skipped FG jobs (busy)",p.skipped_native or 0}})
+                    end
+                end
+                text("If generation is unavailable, the original native frame is displayed.")
+            end
+            reset_group("Reset DLSS-FG defaults", "fg")
+        end
         imgui.tree_pop()
     end
 

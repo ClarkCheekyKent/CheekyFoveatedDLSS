@@ -36,6 +36,7 @@ Source: "{#SourceDir}\CheekyOpenXRLayer.dll"; DestDir: "{app}"; Flags: ignorever
 Source: "{#SourceDir}\XR_APILAYER_CHEEKY_foveated_dlss.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"
 Source: "..\third_party\openxr\LICENSE.txt"; DestDir: "{app}"; DestName: "OpenXR-LICENSE.txt"
+Source: "..\third_party\ngx-sdk\LICENSE.txt"; DestDir: "{app}"; DestName: "NVIDIA-NGX-LICENSE.txt"
 
 [Registry]
 ; Remove only our manifest value on uninstall, never the shared OpenXR key.

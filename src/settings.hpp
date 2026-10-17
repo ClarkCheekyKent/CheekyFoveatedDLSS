@@ -38,6 +38,13 @@ inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
 }
 
 struct Settings {
+    struct FrameGeneration {
+        bool enabled{false};
+        bool foveated{true};
+        std::uint32_t resolution_percent{100},peripheral_percent{50};
+        std::uint32_t peripheral_method{2},depth_bits{32},motion_bits{32};
+        float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F};
+    } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
     bool d3d11_use_d3d12_transport{false};

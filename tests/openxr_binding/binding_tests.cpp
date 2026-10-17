@@ -1,8 +1,28 @@
 // Exercise production interceptors with a downstream runtime; no headset needed.
+#include <d3d12.h>
+void fg_barrier_observer(ID3D12Resource*,D3D12_RESOURCE_STATES,D3D12_RESOURCE_STATES);
+#define CHEEKY_FG_BARRIER_OBSERVER fg_barrier_observer
 #include "../../openxr_layer/openxr_layer.cpp"
 #include <iostream>
 #include <stdexcept>
 #include "../../standalone/menu_backend.hpp"
+#include <d3d12sdklayers.h>
+#include <dxgi1_4.h>
+#include "../../src/fg_snapshot.hpp"
+namespace {
+bool observe_fg_barriers{};
+unsigned fg_barrier_errors{};
+std::unordered_map<ID3D12Resource*,D3D12_RESOURCE_STATES> fg_expected_states;
+}
+void fg_barrier_observer(ID3D12Resource* texture,D3D12_RESOURCE_STATES from,D3D12_RESOURCE_STATES to) {
+    if(!observe_fg_barriers)return;
+    auto [it,inserted]=fg_expected_states.try_emplace(texture,D3D12_RESOURCE_STATE_COMMON);
+    if(it->second!=from) {
+        ++fg_barrier_errors;
+        std::cerr << "FG resource-state contract mismatch: expected=" << it->second << " actual=" << from << '\n';
+    }
+    it->second=to;
+}
 namespace {
 template<class T> T h(uintptr_t n) { return reinterpret_cast<T>(n); }
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
@@ -325,8 +345,400 @@ void custom_binding_menu_test() {
     fallback_profile = profile; fallback_tracking = true;
     std::cout << "PASS custom SteamVR binding: host fallback aim, both triggers, release, ray loss, profile cleanup\n";
 }
+
+void fg_toggle_test() {
+    reset();
+    const auto session=h<XrSession>(2);
+    auto& d=instances.at(instance).dispatch;
+    static std::atomic<unsigned> waits{},begins{},ends{};
+    waits=begins=ends=0;
+    d.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* state) {
+        Sleep(1);const auto tick=++waits;state->predictedDisplayPeriod=100;state->predictedDisplayTime=1000+100*tick;
+        state->shouldRender=XR_TRUE;return XR_SUCCESS;
+    };
+    d.begin_frame=[](XrSession,const XrFrameBeginInfo*) {++begins;return XR_SUCCESS;};
+    d.end_frame=[](XrSession,const XrFrameEndInfo*) {++ends;return XR_SUCCESS;};
+    d.create_swapchain=[](XrSession,const XrSwapchainCreateInfo*,XrSwapchain*) {return XR_ERROR_RUNTIME_FAILURE;};
+    d.destroy_swapchain=[](XrSwapchain) {return XR_SUCCESS;};
+    d.enumerate_swapchain_images=[](XrSwapchain,uint32_t,uint32_t*,XrSwapchainImageBaseHeader*) {return XR_ERROR_RUNTIME_FAILURE;};
+    d.acquire_swapchain_image=[](XrSwapchain,const XrSwapchainImageAcquireInfo*,uint32_t*) {return XR_ERROR_RUNTIME_FAILURE;};
+    d.wait_swapchain_image=[](XrSwapchain,const XrSwapchainImageWaitInfo*) {return XR_ERROR_RUNTIME_FAILURE;};
+    d.release_swapchain_image=[](XrSwapchain,const XrSwapchainImageReleaseInfo*) {return XR_ERROR_RUNTIME_FAILURE;};
+    SessionState owner{};owner.session=session;owner.instance=instance;
+    owner.running=true;owner.graphics_api=11;owner.view_configuration=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    update_fg_at_frame_boundary(owner,d,true);
+    check(!owner.fg && owner.fg_state==CheekyFgState::waiting_for_stereo,"FG must reject DX11");
+    owner.graphics_api=12;
+    update_fg_at_frame_boundary(owner,d,true);
+    check(!owner.fg && owner.fg_state==CheekyFgState::presenter_failed,"Presenter failure must be reported");
+    update_fg_at_frame_boundary(owner,d,false);
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    check(SUCCEEDED(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"FG test D3D12 device");
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC desc{};desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+    check(SUCCEEDED(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue))),"FG test queue");
+    owner.graphics_device=device.Get();owner.graphics_queue=queue.Get();
+    sessions.emplace(session,std::move(owner));
+    auto& live=sessions.at(session);
+    update_fg_at_frame_boundary(live,d,true);
+    check(live.fg!=nullptr,"Saved toggle must create presenter without an environment variable");
+    auto first=live.fg;
+    update_fg_at_frame_boundary(live,d,true);
+    check(live.fg==first,"Repeated enable must preserve frame history");
+    first->configure(101);first->held_valid=true;first->native_count=7;first->generated_count=2;
+    first->configure(101);
+    check(first->held_valid,"Unchanged FG quality controls must preserve history");
+    first->worker.failed=true;first->configure(102);
+    check(!first->held_valid&&!first->worker.failed&&first->native_count==7&&first->generated_count==2,
+        "Changing FG quality must clear stale resources/failures while preserving lifetime counters");
+    first->held_valid=true;first->frames=1;
+    XrFrameWaitInfo info{XR_TYPE_FRAME_WAIT_INFO};XrFrameState state{XR_TYPE_FRAME_STATE};
+    check(XR_SUCCEEDED(first->wait_frame(&info,&state)) && waits>=1 && begins>=1 &&
+        state.predictedDisplayPeriod==100 && first->fallback_count==0,"Enabling FG without a generated frame must preserve native cadence");
+    XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};XrFrameEndInfo empty{XR_TYPE_FRAME_END_INFO};empty.displayTime=state.predictedDisplayTime;
+    check(XR_SUCCEEDED(first->begin_frame(&begin))&&XR_SUCCEEDED(first->end_frame(&empty,{},nullptr)),
+        "Buffered application frames must close through the presentation owner");
+    CheekyFgStatus status;
+    check(CheekyFG_GetStatus(&status) && status.active && status.compatible_session &&
+        status.fallback_frames==0,"FG status must expose real presenter counters");
+    status.abi=999;
+    check(!CheekyFG_GetStatus(&status),"Reject mismatched FG status ABI");
+    CheekyFgPerformance performance;
+    check(CheekyFG_GetPerformance(&performance)&&!performance.gpu_valid&&performance.gpu_samples==0&&
+        std::abs(performance.xr_period_ms-.0001)<1e-9,"FG performance must preserve raw headset period before any cadence scaling");
+    performance.abi=999;
+    check(!CheekyFG_GetPerformance(&performance),"Reject mismatched FG performance ABI");
+    CheekyFgCadence cadence;
+    check(CheekyFG_GetCadenceV1(&cadence)&&cadence.supported,"Optional measured-cadence export");
+    cadence.abi=999;check(!CheekyFG_GetCadenceV1(&cadence),"Reject mismatched cadence ABI");
+    auto retired=update_fg_at_frame_boundary(live,d,false);
+    check(!live.fg && retired==first,"Disable must retire the presenter at the frame boundary");
+    first.reset();retired.reset();
+    waits=begins=ends=0;
+    check(XR_SUCCEEDED(cheeky_xrWaitFrame(session,&info,&state)) && waits==1 && !begins && !ends &&
+        state.predictedDisplayPeriod==100,"Disabled FG must restore the ordinary application cadence");
+    update_fg_at_frame_boundary(live,d,true);
+    check(live.fg && !live.fg->held_valid && live.fg->frames==0,"Re-enable must start with fresh history");
+    live.running=false;
+    retired=update_fg_at_frame_boundary(live,d,true);
+    check(!live.fg,"Session stop must retire FG");
+    retired.reset();sessions.clear();
+    std::cout << "PASS FG live enable/disable/re-enable, cadence, session stop, failures and status ABI\n";
 }
-int main() {
-    try { run(); startup_test(); menu_policy_test(); custom_binding_menu_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0; }
+
+#include "fg_periphery_validation.hpp"
+#include "fg_async_validation.hpp"
+#include "fg_snapshot_validation.hpp"
+void fg_copy_validation_test() {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12Debug> debug;
+    const auto debug_result=D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+    if(FAILED(debug_result)) {
+        std::cerr << "D3D12GetDebugInterface HRESULT=0x" << std::hex << unsigned(debug_result) << std::dec << '\n';
+        const auto core=GetModuleHandleW(L"D3D12Core.dll");
+        wchar_t path[32768]{};if(core)GetModuleFileNameW(core,path,32768);
+        std::wcerr << L"Core module: " << path << L'\n';
+    }
+    if(debug)debug->EnableDebugLayer();
+    ComPtr<IDXGIFactory4> factory;ComPtr<IDXGIAdapter> warp;
+    check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))),"FG validation WARP adapter");
+    ComPtr<ID3D12Device> device;
+    check(SUCCEEDED(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"FG validation device");
+    ComPtr<ID3D12InfoQueue> messages;
+    device.As(&messages);
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+    check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"FG validation queue");
+    auto color=[&](DXGI_FORMAT format=DXGI_FORMAT_R8G8B8A8_UNORM) {
+        D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width=64;d.Height=64;d.DepthOrArraySize=1;d.MipLevels=1;d.Format=format;
+        d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        ComPtr<ID3D12Resource> result;
+        check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&result))),"FG mock OpenXR render target");
+        return result;
+    };
+    auto source=color(DXGI_FORMAT_B8G8R8A8_TYPELESS);
+    std::array<ComPtr<ID3D12Resource>,2> targets{color(DXGI_FORMAT_B8G8R8A8_TYPELESS),color(DXGI_FORMAT_B8G8R8A8_TYPELESS)};
+    // A red scene lets the test distinguish a real copy from an uninitialized
+    // or black allocation, including typeless <-> sRGB typed copies.
+    ComPtr<ID3D12CommandAllocator> test_allocator;ComPtr<ID3D12GraphicsCommandList> test_list;
+    ComPtr<ID3D12Fence> test_fence;UINT64 test_serial{};
+    check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&test_allocator))) &&
+        SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,test_allocator.Get(),nullptr,IID_PPV_ARGS(&test_list))) &&
+        SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&test_fence))),"Pixel test command objects");
+    auto execute_test=[&] {
+        check(SUCCEEDED(test_list->Close()),"Pixel test close");
+        ID3D12CommandList* commands[]{test_list.Get()};queue->ExecuteCommandLists(1,commands);
+        check(SUCCEEDED(queue->Signal(test_fence.Get(),++test_serial)),"Pixel test signal");
+        const HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);check(event!=nullptr,"Pixel test event");
+        const bool completed=SUCCEEDED(test_fence->SetEventOnCompletion(test_serial,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0;
+        CloseHandle(event);check(completed,"Pixel test GPU completion");
+    };
+    ComPtr<ID3D12DescriptorHeap> rtv_heap;D3D12_DESCRIPTOR_HEAP_DESC rh{};rh.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;rh.NumDescriptors=1;
+    check(SUCCEEDED(device->CreateDescriptorHeap(&rh,IID_PPV_ARGS(&rtv_heap))),"Pixel test RTV heap");
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{};rtv.Format=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;rtv.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+    const auto rtv_handle=rtv_heap->GetCPUDescriptorHandleForHeapStart();device->CreateRenderTargetView(source.Get(),&rtv,rtv_handle);
+    const float red[]{1,0,0,1};test_list->ClearRenderTargetView(rtv_handle,red,0,nullptr);execute_test();
+    cheeky::fg::XrFns xr;
+    xr.create=[](XrSession,const XrSwapchainCreateInfo*,XrSwapchain*) {return XR_ERROR_RUNTIME_FAILURE;};
+    xr.destroy=[](XrSwapchain) {return XR_SUCCESS;};
+    xr.enumerate=[](XrSwapchain,uint32_t,uint32_t*,XrSwapchainImageBaseHeader*) {return XR_ERROR_RUNTIME_FAILURE;};
+    xr.acquire=[](XrSwapchain,const XrSwapchainImageAcquireInfo*,uint32_t* index) {*index=0;return XR_SUCCESS;};
+    xr.wait_image=[](XrSwapchain,const XrSwapchainImageWaitInfo*) {return XR_SUCCESS;};
+    xr.release=[](XrSwapchain,const XrSwapchainImageReleaseInfo*) {return XR_SUCCESS;};
+    xr.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState*) {return XR_SUCCESS;};
+    xr.begin_frame=[](XrSession,const XrFrameBeginInfo*) {return XR_SUCCESS;};
+    xr.end_frame=[](XrSession,const XrFrameEndInfo*) {return XR_SUCCESS;};
+    cheeky::fg::Presenter presenter;
+    const auto sc=h<XrSwapchain>(200);
+    check(presenter.setup(h<XrSession>(2),xr,device.Get(),queue.Get()),"FG copy presenter setup");
+    // This test exercises copies and presentation, not NVIDIA inference on WARP.
+    presenter.worker.probed_device=device;presenter.worker.probe_attempted=true;
+    presenter.worker.capability_ready=true;
+    if(messages)messages->ClearStoredMessages();
+    fg_expected_states.clear();fg_barrier_errors=0;observe_fg_barriers=true;
+    for(auto* texture:{source.Get(),targets[0].Get(),targets[1].Get()})
+        fg_expected_states[texture]=D3D12_RESOURCE_STATE_RENDER_TARGET;
+    check(!presenter.capture(sc,0,source.Get(),64,64,1),"Typeless capture requires its declared OpenXR format");
+    check(presenter.capture(sc,0,source.Get(),64,64,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),"FG capture typeless resource with typed OpenXR format");
+    XrRect2Di rect{{0,0},{64,64}};
+    auto copy=presenter.subrect(sc,0,rect,0);
+    check(copy!=nullptr,"FG capture crop");
+    check(copy->GetDesc().Format==DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,"Owned color must preserve the declared typed format");
+    std::array<ComPtr<ID3D12Resource>,2> inputs{copy,copy};
+    for(unsigned i=0;i<2;++i) {
+        presenter.real_chains[i]=h<XrSwapchain>(300+i);
+        XrSwapchainImageD3D12KHR image{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR};image.texture=targets[i].Get();
+        presenter.real_images[i].push_back(image);
+    }
+    std::array<unsigned,2> indices{};
+    check(presenter.upload(inputs,presenter.real_chains,presenter.real_images,indices),"FG upload into acquired OpenXR render targets");
+    // Feed the production EndFrame interceptor a typical UEVR layout: VD
+    // helper projection, scene, game UI quad and cylindrical framework UI.
+    reset();swapchains.clear();
+    static unsigned composed{},synthetic_composed{};composed=synthetic_composed=0;
+    presenter.xr.end_frame=[](XrSession,const XrFrameEndInfo* end) {
+        if(!end->layerCount)return XR_SUCCESS;
+        check(end->layerCount==4,"FG must preserve all UEVR composition layers");
+        const XrStructureType expected[]{XR_TYPE_COMPOSITION_LAYER_PROJECTION,XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+            XR_TYPE_COMPOSITION_LAYER_QUAD,XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+        for(unsigned i=0;i<4;++i)check(end->layers[i]->type==expected[i],"FG changed UEVR composition order");
+        const auto* dummy=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
+        const auto* scene=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[1]);
+        const auto* quad=reinterpret_cast<const XrCompositionLayerQuad*>(end->layers[2]);
+        check(dummy->views[1].subImage.imageRect.offset.x==2,"VD helper views must be copied");
+        check(quad->size.width==1 && quad->subImage.swapchain==h<XrSwapchain>(202),"UI quad must survive the extra slot");
+        const auto scene_chain=scene->views[0].subImage.swapchain;
+        check(scene_chain==h<XrSwapchain>(200)||scene_chain==h<XrSwapchain>(300)||scene_chain==h<XrSwapchain>(400),"Scene must use original or private FG swapchains");
+        if(scene_chain==h<XrSwapchain>(400))++synthetic_composed;
+        ++composed;return XR_SUCCESS;
+    };
+    presenter.xr.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* state) {
+        state->shouldRender=XR_TRUE;state->predictedDisplayTime=300;state->predictedDisplayPeriod=100;return XR_SUCCESS;
+    };
+    auto& dispatch=instances.at(instance).dispatch;dispatch.end_frame=presenter.xr.end_frame;
+    SessionState owner{};owner.instance=instance;owner.session=h<XrSession>(2);owner.running=true;
+    owner.graphics_api=12;owner.view_configuration=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    owner.fg=std::shared_ptr<cheeky::fg::Presenter>(&presenter,[](auto*){});
+    sessions.emplace(owner.session,std::move(owner));
+    for(unsigned i=0;i<2;++i) {
+        SwapchainState chain{};chain.session=h<XrSession>(2);chain.has_released=true;chain.released_index=0;
+        chain.create_info={XR_TYPE_SWAPCHAIN_CREATE_INFO};chain.create_info.width=i?4:64;
+        chain.create_info.height=i?4:64;chain.create_info.arraySize=1;
+        swapchains.emplace(h<XrSwapchain>(200+i),std::move(chain));
+    }
+    std::array<XrCompositionLayerProjectionView,2> scene_views{},dummy_views{};
+    for(unsigned i=0;i<2;++i) {
+        scene_views[i]={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};scene_views[i].pose.orientation.w=1;
+        scene_views[i].subImage={sc,{{0,0},{64,64}},0};
+        dummy_views[i]={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};dummy_views[i].pose.orientation.w=1;
+        dummy_views[i].subImage={h<XrSwapchain>(201),{{int(i*2),0},{2,4}},0};
+    }
+    XrCompositionLayerProjection scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    scene.space=h<XrSpace>(1);scene.viewCount=2;scene.views=scene_views.data();
+    XrCompositionLayerProjection dummy{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    dummy.space=scene.space;dummy.viewCount=2;dummy.views=dummy_views.data();
+    dummy.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};quad.space=scene.space;
+    quad.pose.orientation.w=1;quad.size={1,2};quad.subImage={h<XrSwapchain>(202),{{0,0},{64,64}},0};
+    XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};cylinder.space=scene.space;
+    cylinder.pose.orientation.w=1;cylinder.radius=2;cylinder.centralAngle=1;cylinder.aspectRatio=1;
+    cylinder.subImage={h<XrSwapchain>(203),{{0,0},{64,64}},0};
+    const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&dummy),
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&scene),reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad),
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinder)};
+    XrFrameEndInfo frame{XR_TYPE_FRAME_END_INFO};frame.displayTime=100;frame.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    frame.layerCount=4;frame.layers=layers;
+    check(XR_SUCCEEDED(cheeky_xrEndFrame(h<XrSession>(2),&frame)) && presenter.held_valid && presenter.native_count==1,
+        "UEVR's extra UI/helper layers must reach FG and establish history");
+    check(presenter.capture(sc,0,source.Get(),64,64,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),"Capture second UEVR scene frame");
+    frame.displayTime=200;
+    check(XR_SUCCEEDED(cheeky_xrEndFrame(h<XrSession>(2),&frame)) && presenter.native_count==2 && composed==2,
+        "Multi-layer native frame must reach the presenter");
+    // Simulate the application's stack structures being reused after EndFrame.
+    quad.size.width=99;dummy_views[1].subImage.imageRect.offset.x=91;
+    XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};XrFrameState frame_state{XR_TYPE_FRAME_STATE};
+    check(XR_SUCCEEDED(presenter.wait_frame(&wait,&frame_state)) && composed==2 && presenter.fallback_count==0 &&
+        frame_state.predictedDisplayPeriod==100,"Missing NGX guides must preserve native presentation and cadence");
+    // Supply a synthetic scene fixture independently of NVIDIA NGX, and
+    // verify its separate private chains preserve the same helper/UI layers.
+    presenter.generated=presenter.held;presenter.generated_views=presenter.held_views;presenter.generated_valid=true;
+    for(unsigned i=0;i<2;++i) {
+        presenter.fg_chains[i]=h<XrSwapchain>(400+i);
+        presenter.fg_images[i]=presenter.real_images[i];
+    }
+    check(XR_SUCCEEDED(presenter.wait_frame(&wait,&frame_state)) && composed==3 && synthetic_composed==1 &&
+        presenter.generated_count==1 && presenter.fallback_count==0,"Generated scene slot must composite the same saved UI/helper layers");
+    presenter.xr.end_frame=[](XrSession,const XrFrameEndInfo*) {return XR_SUCCESS;};
+    XrBaseInStructure unknown{XR_TYPE_INSTANCE_CREATE_INFO};quad.next=&unknown;
+    check(XR_SUCCEEDED(presenter.end_frame(&frame,indices,&scene)) && !presenter.held_valid && presenter.native_count==3 &&
+        presenter.state==CheekyFgState::unsupported_submission,"Unsupported chains must report a reason without resetting the native counter");
+    quad.next=nullptr;quad.size.width=1;dummy_views[1].subImage.imageRect.offset.x=2;
+    static std::array<ID3D12Resource*,2> runtime_images{};runtime_images={targets[0].Get(),targets[1].Get()};
+    static unsigned creates{};creates=0;
+    auto typed_xr=xr;
+    typed_xr.create=[](XrSession,const XrSwapchainCreateInfo* info,XrSwapchain* chain) {
+        if(info->format!=DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+        *chain=h<XrSwapchain>(500+creates++);return XR_SUCCESS;
+    };
+    typed_xr.enumerate=[](XrSwapchain chain,uint32_t capacity,uint32_t* count,XrSwapchainImageBaseHeader* images) {
+        *count=1;if(capacity)reinterpret_cast<XrSwapchainImageD3D12KHR*>(images)[0].texture=runtime_images[uintptr_t(chain)-500];
+        return XR_SUCCESS;
+    };
+    cheeky::fg::Presenter typed_presenter;
+    check(typed_presenter.setup(h<XrSession>(2),typed_xr,device.Get(),queue.Get()),"Typed OpenXR presenter");
+    check(typed_presenter.upload(inputs,typed_presenter.real_chains,typed_presenter.real_images,indices) && creates==2,
+        "Private swapchains must request the typed format and accept typeless runtime images");
+    check(typed_presenter.upload(inputs,typed_presenter.real_chains,typed_presenter.real_images,indices) && creates==2,
+        "Typed swapchains must be reusable with typeless resources");
+    static unsigned native_ends{},blank_ends{},wait_calls{},begin_calls{};
+    native_ends=blank_ends=wait_calls=begin_calls=0;
+    auto failed_xr=typed_xr;
+    failed_xr.create=[](XrSession,const XrSwapchainCreateInfo*,XrSwapchain*) {return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;};
+    failed_xr.end_frame=[](XrSession,const XrFrameEndInfo* end) {
+        if(!end->layerCount)++blank_ends;
+        else {
+            const auto* scene=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[1]);
+            check(end->layerCount==4 && scene->views[0].subImage.swapchain==h<XrSwapchain>(200),"Failure must submit the original scene and UI");
+            ++native_ends;
+        }
+        return XR_SUCCESS;
+    };
+    failed_xr.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* state) {
+        ++wait_calls;state->shouldRender=XR_TRUE;state->predictedDisplayTime=400;state->predictedDisplayPeriod=100;return XR_SUCCESS;
+    };
+    failed_xr.begin_frame=[](XrSession,const XrFrameBeginInfo*) {++begin_calls;return XR_SUCCESS;};
+    cheeky::fg::Presenter failed_presenter;
+    check(failed_presenter.setup(h<XrSession>(2),failed_xr,device.Get(),queue.Get()) &&
+        failed_presenter.frame_layers.prepare(&frame,&scene),"Failure fixture setup");
+    failed_presenter.blend=frame.environmentBlendMode;
+    bool used_private=true;
+    check(XR_SUCCEEDED(failed_presenter.submit(&frame,200,&inputs,&scene_views,false,&used_private)) && !used_private &&
+        native_ends==1 && blank_ends==0,"Failed native upload must close the frame using original layers, never blank");
+    failed_presenter.generated=inputs;failed_presenter.generated_views=scene_views;failed_presenter.generated_valid=true;
+    check(XR_SUCCEEDED(failed_presenter.wait_frame(&wait,&frame_state)) && native_ends==2 && !blank_ends &&
+        wait_calls==2 && begin_calls==1 && failed_presenter.fallback_count==1 && failed_presenter.generated_count==0,
+        "Failed extra-slot upload must end that slot with the saved native scene");
+    typed_presenter.frame_layers.prepare(&frame,&scene);typed_presenter.blend=frame.environmentBlendMode;
+    typed_presenter.xr.end_frame=[](XrSession,const XrFrameEndInfo* end) {
+        const auto* scene=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[1]);
+        if(scene->views[0].subImage.swapchain!=h<XrSwapchain>(200))return XR_ERROR_LAYER_INVALID;
+        ++native_ends;return XR_SUCCESS;
+    };
+    check(XR_SUCCEEDED(typed_presenter.submit(&frame,200,&inputs,&scene_views,false,&used_private)) && !used_private &&
+        native_ends==3,"Runtime rejection of a private layer must retry the original native frame");
+    typed_presenter.reset();failed_presenter.reset();
+    std::cout << "PASS typed OpenXR formats over typeless resources; creation/upload/submission failures preserve native frames and balance frame calls\n";
+    sessions.clear();swapchains.clear();
+    std::cout << "PASS UEVR helper + scene + quad + cylinder routing, owned extra-slot layers and rejection status\n";
+    presenter.invalidate_temporal();presenter.reset();
+    const auto target_desc=targets[0]->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 readback_bytes{};
+    device->GetCopyableFootprints(&target_desc,0,1,0,&footprint,nullptr,nullptr,&readback_bytes);
+    D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;buffer.Width=readback_bytes;
+    buffer.Height=1;buffer.DepthOrArraySize=1;buffer.MipLevels=1;buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES read_heap{};read_heap.Type=D3D12_HEAP_TYPE_READBACK;ComPtr<ID3D12Resource> readback;
+    check(SUCCEEDED(device->CreateCommittedResource(&read_heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,IID_PPV_ARGS(&readback))),"Pixel readback allocation");
+    check(SUCCEEDED(test_allocator->Reset())&&SUCCEEDED(test_list->Reset(test_allocator.Get(),nullptr)),"Pixel readback command reset");
+    cheeky::fg::color_transition(test_list.Get(),targets[0].Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=targets[0].Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
+    test_list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    cheeky::fg::color_transition(test_list.Get(),targets[0].Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);
+    execute_test();void* pixels{};check(SUCCEEDED(readback->Map(0,nullptr,&pixels)),"Pixel readback map");
+    const auto* pixel=static_cast<const unsigned char*>(pixels)+footprint.Offset;
+    const bool red_preserved=pixel[0]==0 && pixel[1]==0 && pixel[2]==255 && pixel[3]==255;readback->Unmap(0,nullptr);
+    check(red_preserved,"Captured scene pixel must survive typed/typeless copies without black output or swapped channels");
+    std::cout << "PASS actual BGRA scene pixels preserved through capture/crop/private OpenXR upload\n";
+    unsigned errors{};
+    for(UINT64 i=0;messages && i<messages->GetNumStoredMessagesAllowedByRetrievalFilter();++i) {
+        SIZE_T bytes{};messages->GetMessage(i,nullptr,&bytes);std::vector<unsigned char> storage(bytes);
+        auto* message=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        if(SUCCEEDED(messages->GetMessage(i,message,&bytes)) &&
+            message->Severity<=D3D12_MESSAGE_SEVERITY_ERROR) {
+            ++errors;std::cerr << "D3D12 ERROR: " << message->pDescription << '\n';
+        }
+    }
+    observe_fg_barriers=false;
+    fg_periphery_validation(device.Get(),queue.Get());
+    // The buffered pipeline uses multiple threads; the legacy state observer is
+    // deliberately single-threaded and is only used by the copy checks above.
+    observe_fg_barriers=false;
+    fg_snapshot_validation(device.Get());
+    fg_buffered_validation(device.Get());
+    for(auto* texture:{source.Get(),targets[0].Get(),targets[1].Get()})
+        check(fg_expected_states[texture]==D3D12_RESOURCE_STATE_RENDER_TARGET,"OpenXR image must be restored to RENDER_TARGET");
+    check(!fg_barrier_errors,"FG copy path violated known OpenXR resource-state contracts");
+    check(!errors,"FG GPU copy path must produce zero D3D12 validation errors");
+    check(SUCCEEDED(device->GetDeviceRemovedReason()),"FG GPU validation device removed");
+    presenter.invalidate_temporal();
+    presenter.worker.capability_ready=false;presenter.worker.failed=true;
+    const auto serial_before=presenter.serial,native_before=presenter.native_count;
+    check(!presenter.capture(sc,0,source.Get(),64,64,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+        presenter.serial==serial_before&&presenter.copies.empty(),"Unavailable NGX must skip all capture GPU work");
+    check(XR_SUCCEEDED(presenter.end_frame(&frame,indices,&scene)) &&
+        presenter.native_count==native_before+1&&presenter.serial==serial_before,
+        "Unavailable NGX must forward the original native frame without GPU work");
+    std::cout << "PASS FG GPU capture/crop/upload and OpenXR RENDER_TARGET state contracts (WARP); debug layer="
+        << (debug?"enabled":"unavailable") << '\n';
+}
+}
+#include "fg_hardware_probe.hpp"
+int main(int argc,char** argv) {
+    try {
+        if(argc>2 && (std::string(argv[1])=="--fg-capability" || std::string(argv[1])=="--fg-generate" || std::string(argv[1])=="--fg-buffered"||std::string(argv[1])=="--fg-motion")) {
+            Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+            check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))),"DXGI factory");
+            for(UINT i=0;;++i) {
+                Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+                if(factory->EnumAdapters1(i,&adapter)==DXGI_ERROR_NOT_FOUND)break;
+                DXGI_ADAPTER_DESC1 description{};adapter->GetDesc1(&description);
+                if(description.VendorId!=0x10de || (description.Flags&DXGI_ADAPTER_FLAG_SOFTWARE))continue;
+                std::wcout << L"GPU: " << description.Description << L'\n';
+                Microsoft::WRL::ComPtr<ID3D12Device> device;
+                check(SUCCEEDED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&device))),"NVIDIA D3D12 device");
+                const int count=MultiByteToWideChar(CP_UTF8,0,argv[2],-1,nullptr,0);
+                std::wstring directory(count,L'\0');MultiByteToWideChar(CP_UTF8,0,argv[2],-1,directory.data(),count);
+                cheeky::fg::Worker worker;worker.trace=[](const char* line) noexcept {std::cout << line << '\n';};
+                worker.force_fp16=argc>9&&std::string(argv[9])=="fp16";
+                fg_probe_legacy_mvec=argc>3&&std::string(argv[3])=="identity-mv";
+                const bool ready=worker.probe(device.Get(),directory.c_str());
+                std::cout << "Frame generation capability: " << (ready?"AVAILABLE":"UNAVAILABLE") << '\n';
+                if(ready&&std::string(argv[1])=="--fg-buffered")fg_buffered_validation(device.Get(),directory.c_str(),argc>3?unsigned(std::stoul(argv[3])):2u);
+                if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,false,2,100,50,false,512,512,true);
+                if(ready&&std::string(argv[1])=="--fg-generate")fg_hardware_probe(worker,device.Get(),argc>3&&std::string(argv[3])=="bgra",argc>4&&std::string(argv[4])=="foveated",
+                    argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
+                    argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&std::string(argv[8])=="game-guides",
+                    argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u);
+                return ready?0:2;
+            }
+            throw std::runtime_error("No NVIDIA adapter found");
+        }
+        if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
+        run(); startup_test(); menu_policy_test(); custom_binding_menu_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
+    }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

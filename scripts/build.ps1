@@ -80,6 +80,8 @@ foreach ($gazeMode in @('--manual-gaze', '--openxr-independent-on', '--openxr-in
 }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe")
 if ($LASTEXITCODE -ne 0) { throw "OpenXR binding and pointer regressions failed." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-gpu-validation
+if ($LASTEXITCODE -ne 0) { throw "FG OpenXR image state and software GPU copy regressions failed." }
 & $testExecutable --calibration-search
 if ($LASTEXITCODE -ne 0) { throw "Calibration locator scale and ambiguity regressions failed." }
 & $testExecutable --libovr-policy
@@ -96,7 +98,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $uevrTest = Join-Path $projectRoot "bin\$Configuration\CheekyUEVRTests.exe"
-foreach ($loaderMode in @('--loader-lifecycle', '--loader-missing')) {
+foreach ($loaderMode in @('--loader-lifecycle', '--loader-missing', '--fg-controls')) {
     & $uevrTest $loaderMode
     if ($LASTEXITCODE -ne 0) { throw "UEVR loader regression failed: $loaderMode" }
 }

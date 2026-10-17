@@ -5,6 +5,7 @@
 #include "dlss_nr_lifetime.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "d3d12_native.hpp"
+#include "fg_capture.hpp"
 #include <MinHook.h>
 #include <wrl/client.h>
 #include <array>
@@ -252,7 +253,7 @@ struct CopyObservation {
 // its VR thread there). Identities are private data, tagged while recording and
 // kept across Reset, so a closed or resetting list reads them without a lock.
 bool tracked(ID3D12GraphicsCommandList* list) noexcept {
-    return nr_recording_tagged(list) || calibration12_tagged(list);
+    return nr_recording_tagged(list) || calibration12_tagged(list) || fg_recording_tagged(list);
 }
 bool any_tracked(UINT count, ID3D12CommandList* const* lists) noexcept {
     for (UINT i = 0; i < count; ++i) {
@@ -279,6 +280,7 @@ void execute(ExecuteFn real_execute, ID3D12CommandQueue* queue, UINT count, ID3D
             if (lists[i] && SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&graphics)))) {
                 nr_recording_submitted(queue, graphics.Get());
                 calibration12_submitted(queue, graphics.Get());
+                fg_note_submission(queue,graphics.Get());
             }
         }
     }
@@ -324,6 +326,7 @@ HRESULT reset(ResetFn real_reset, ID3D12GraphicsCommandList* list, ID3D12Command
         if (SUCCEEDED(hr)) {
             nr_recording_reset(list, hr);
             calibration12_retired(list);
+            fg_note_reset(list);
         }
     }
     if (SUCCEEDED(hr)) {
@@ -350,6 +353,7 @@ void copy_resource(CopyFn real_copy, ID3D12GraphicsCommandList* list, ID3D12Reso
     // Retain the snapshotted identities until publication; otherwise a wrapper
     // releasing its arguments could invalidate them before an edge is recorded.
     real_copy(list, destination, source);
+    if(scope.outer&&ready)fg_note_color_copy(list,destination);
     observation.publish(list);
 }
 void capture_texture_copy(CopyObservation& observation, ID3D12GraphicsCommandList* list,
@@ -384,6 +388,11 @@ void copy_texture(CopyTextureFn real_copy_texture, ID3D12GraphicsCommandList* li
     CopyObservation observation;
     if (scope.outer && ready) try { capture_texture_copy(observation, list, dst, x, y, z, src, box); } catch (...) {}
     real_copy_texture(list, dst, x, y, z, src, box);
+    if(scope.outer&&ready&&dst){
+        D3D12_TEXTURE_COPY_LOCATION target{};
+        if(probe_metadata("FG color copy location",dst,[&]{target=*dst;})&&target.Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
+            fg_note_color_copy(list,target.pResource);
+    }
     observation.publish(list);
 }
 void resolve(ResolveFn real_resolve, ID3D12GraphicsCommandList* list, ID3D12Resource* dst, UINT dst_sub,
@@ -396,6 +405,7 @@ void resolve(ResolveFn real_resolve, ID3D12GraphicsCommandList* list, ID3D12Reso
             observation.capture_list(list);
     } catch (...) {}
     real_resolve(list, dst, dst_sub, src, src_sub, format);
+    if(scope.outer&&ready)fg_note_color_copy(list,dst);
     observation.publish(list);
 }
 } // namespace

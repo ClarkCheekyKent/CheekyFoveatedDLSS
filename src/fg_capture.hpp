@@ -1,0 +1,23 @@
+#pragma once
+#include "../shared/cheeky_fg_bridge.hpp"
+namespace cheeky::foveated_dlss {
+CheekyFgStatus fg_status() noexcept;
+CheekyFgDiagnostic fg_diagnostic() noexcept;
+bool fg_performance(CheekyFgPerformance&) noexcept;
+bool fg_cadence(CheekyFgCadence&) noexcept;
+const char* fg_state_name(CheekyFgState state) noexcept;
+}
+#include "ngx_abi.hpp"
+#include <d3d12.h>
+namespace cheeky::foveated_dlss {
+void fg_publish_ngx(ID3D12GraphicsCommandList*,const NgxHandle*,const NgxParameters*,NgxResult) noexcept;
+void fg_remember_feature(const NgxHandle*,const NgxParameters*) noexcept;
+void fg_forget_feature(const NgxHandle*) noexcept;
+void fg_set_uevr_queue(ID3D12CommandQueue*) noexcept;
+void fg_note_submission(ID3D12CommandQueue*,ID3D12GraphicsCommandList*) noexcept;
+void fg_retire_snapshots() noexcept;
+void fg_note_reset(ID3D12GraphicsCommandList*) noexcept;
+void fg_note_color_copy(ID3D12GraphicsCommandList*,ID3D12Resource*) noexcept;
+bool fg_recording_tagged(ID3D12GraphicsCommandList*) noexcept;
+void fg_abandon_frame_source() noexcept; // Loader-lock-safe; UEVR owns hook cleanup on plugin unload.
+}

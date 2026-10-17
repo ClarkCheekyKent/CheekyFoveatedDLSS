@@ -45,6 +45,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     return false;
 }
 std::string_view setting_group(std::string_view key) {
+    if (key.starts_with("Fg")) return "fg";
     if (key.starts_with("Nr")) return "nr";
     for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
             "AutoStereoAlignment", "EyeCalibrationContinuous", "EyeCalibrationMethod", "EyeCalibrationLearnedMethod", "EyeCalibrationLearnedSignature", "EyeCalibrationLearnedSessions", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
@@ -55,7 +56,7 @@ std::string_view setting_group(std::string_view key) {
     return "sr";
 }
 bool reset_settings_group(Settings& s, std::string_view group) {
-    if (group != "sr" && group != "nr" && group != "gaze") return false;
+    if (group != "sr" && group != "nr" && group != "gaze" && group != "fg") return false;
     const Settings defaults;
 #define CHEEKY_SETTING(name, field) if (!std::string_view(name).starts_with("EyeCalibrationLearned") && setting_group(name) == group) s.field = defaults.field;
 #include "settings_fields.inc"
@@ -98,6 +99,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     std::ifstream in(path);
     if (!in) { error = "Cannot read settings file"; return false; }
     auto candidate = s;
+    candidate.fg = Settings{}.fg;
     candidate.d3d12_lower_hook = true; // Older files use the new lower-hook default.
     candidate.manual_stereo_mapping = false;
     candidate.manual_stereo_right_first = false;

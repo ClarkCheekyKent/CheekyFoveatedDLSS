@@ -1,0 +1,124 @@
+// A known red previous frame, blue current frame and green center distinguish
+// real periphery algorithms and composition from a black/no-op dispatch.
+void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12Fence> fence;UINT64 serial{};
+    check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator))),"Periphery allocator");
+    check(SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))),"Periphery list");
+    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))),"Periphery fence");
+    auto execute=[&] {
+        check(SUCCEEDED(list->Close()),"Periphery close");ID3D12CommandList* commands[]{list.Get()};queue->ExecuteCommandLists(1,commands);
+        check(SUCCEEDED(queue->Signal(fence.Get(),++serial)),"Periphery signal");
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);check(event!=nullptr,"Periphery event");
+        check(SUCCEEDED(fence->SetEventOnCompletion(serial,event)),"Periphery completion");
+        const auto result=WaitForSingleObject(event,10000);CloseHandle(event);check(result==WAIT_OBJECT_0,"Periphery wait");
+    };
+    auto begin=[&] {check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Periphery reset");};
+    ComPtr<ID3D12DescriptorHeap> rtvs;D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=5;
+    check(SUCCEEDED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))),"Periphery RTV heap");
+    const unsigned stride=device->GetDescriptorHandleIncrementSize(hd.Type);
+    auto texture=[&](DXGI_FORMAT format,DXGI_FORMAT view,unsigned index,const float* clear) {
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};
+        d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=d.Height=index>=3?32:64;d.DepthOrArraySize=d.MipLevels=1;
+        d.Format=format;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ComPtr<ID3D12Resource> resource;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&resource))),"Periphery texture");
+        auto handle=rtvs->GetCPUDescriptorHandleForHeapStart();handle.ptr+=stride*index;
+        D3D12_RENDER_TARGET_VIEW_DESC vd{};vd.Format=view;vd.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+        device->CreateRenderTargetView(resource.Get(),&vd,handle);list->ClearRenderTargetView(handle,clear,0,nullptr);
+        cheeky::fg::color_transition(list.Get(),resource.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);return resource;
+    };
+    const float red[]{1,0,0,1},blue[]{0,0,1,1},green[]{0,1,0,1},z[]{.5f,0,0,0},zero[4]{};
+    auto previous=texture(DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM,0,red);
+    auto current=texture(DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM,1,blue);
+    auto center=texture(DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM,2,green);
+    auto depth=texture(DXGI_FORMAT_R32_TYPELESS,DXGI_FORMAT_R32_FLOAT,3,z);
+    auto motion=texture(DXGI_FORMAT_R16G16_FLOAT,DXGI_FORMAT_R16G16_FLOAT,4,zero);
+    // A guide patch catches wrong crop coordinates or motion normalization even
+    // when uniform endpoint colors would conceal the error in final pixels.
+    const D3D12_RECT patch{8,8,16,16};const float patch_depth[]{.75f,0,0,0},patch_motion[]{2,-4,0,0};
+    auto paint=[&](ID3D12Resource* resource,unsigned index,const float* value){
+        cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        auto handle=rtvs->GetCPUDescriptorHandleForHeapStart();handle.ptr+=stride*index;
+        list->ClearRenderTargetView(handle,value,1,&patch);
+        cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
+    };
+    paint(depth.Get(),3,patch_depth);paint(motion.Get(),4,patch_motion);
+    execute();begin();
+    CheekyFgEye guides{};guides.depth=depth.Get();guides.motion=motion.Get();
+    guides.width=guides.height=64;
+    guides.depth_width=guides.depth_height=guides.motion_width=guides.motion_height=32;
+    cheeky::fg::FocusPipeline pipeline;cheeky::fg::FocusRect full{0,0,64,64,0,false};
+    cheeky::fg::FocusRect region{16,16,32,32,0,true};
+    check(pipeline.prepare_inputs(device,list.Get(),0,0,current.Get(),guides,region,32,32),"Independent cropped center guides");
+    check(pipeline.inputs[0][0].color->GetDesc().Width==32&&pipeline.inputs[0][0].depth->GetDesc().Width==16&&
+        pipeline.inputs[0][0].motion->GetDesc().Height==16,"Center color and source-sized cropped guides must have independent grids");
+    check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Typeless depth / FP16 motion normalization");
+    check(pipeline.inputs[0][1].depth->GetDesc().Format==DXGI_FORMAT_R16_FLOAT&&
+        pipeline.inputs[0][1].motion->GetDesc().Format==DXGI_FORMAT_R16G16_FLOAT&&
+        pipeline.inputs[0][1].depth->GetDesc().Width==16,"Periphery precision controls and source-sized guide grid");
+    check(pipeline.save_depth(device,list.Get(),0),"Periphery depth history");
+    auto& normalized=pipeline.inputs[0][0];
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT guide_footprints[2]{};UINT64 guide_bytes[2]{};
+    ID3D12Resource* normalized_resources[]{normalized.depth.Get(),normalized.motion.Get()};
+    UINT64 guide_total{};
+    for(unsigned i=0;i<2;++i){const auto desc=normalized_resources[i]->GetDesc();
+        const auto offset=(guide_total+511)&~UINT64(511);
+        device->GetCopyableFootprints(&desc,0,1,offset,&guide_footprints[i],nullptr,nullptr,&guide_bytes[i]);
+        guide_total=offset+guide_bytes[i];}
+    D3D12_HEAP_PROPERTIES guide_heap{};guide_heap.Type=D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC guide_buffer{};guide_buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;guide_buffer.Width=guide_total;
+    guide_buffer.Height=guide_buffer.DepthOrArraySize=guide_buffer.MipLevels=1;guide_buffer.SampleDesc.Count=1;guide_buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> guide_readback;
+    check(SUCCEEDED(device->CreateCommittedResource(&guide_heap,D3D12_HEAP_FLAG_NONE,&guide_buffer,D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,IID_PPV_ARGS(&guide_readback))),"Normalized guide readback");
+    for(unsigned i=0;i<2;++i){auto* resource=normalized_resources[i];
+        cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=resource;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=guide_readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=guide_footprints[i];
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);}
+    execute();pipeline.history[0]=true;
+    void* guide_data{};check(SUCCEEDED(guide_readback->Map(0,nullptr,&guide_data)),"Map normalized guides");
+    auto guide_pixel=[&](unsigned plane,unsigned x,unsigned y,unsigned components){return reinterpret_cast<const float*>(
+        static_cast<const unsigned char*>(guide_data)+guide_footprints[plane].Offset+y*guide_footprints[plane].Footprint.RowPitch+x*components*sizeof(float));};
+    check(*guide_pixel(0,0,0,1)==.75f&&*guide_pixel(0,15,15,1)==.5f,"Independent guide grid must sample the correct cropped source depth");
+    const auto* vector=guide_pixel(1,0,0,2);const auto* outside=guide_pixel(1,15,15,2);
+    check(vector[0]==.125f&&vector[1]==-.25f&&outside[0]==0&&outside[1]==0,
+        "Cropped motion must retain normalized UV displacement instead of scaling with destination grid size");
+    guide_readback->Unmap(0,nullptr);
+    cheeky::fg::Camera camera{};camera.clip_to_prev=cheeky::fg::identity();
+    for(unsigned method=0;method<3;++method) {
+        begin();guides.peripheral_method=method;
+        // Supply no depth in simple warp and no guides at all in previous mode.
+        guides.depth=method==2?depth.Get():nullptr;guides.motion=method?motion.Get():nullptr;
+        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Prepare only inputs used by the periphery mode");
+        check(!pipeline.inputs[0][1].color&&bool(pipeline.inputs[0][1].depth)==(method==2)&&
+            bool(pipeline.inputs[0][1].motion)==(method!=0),"Custom periphery must omit unused color/depth/motion resources");
+        check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera),"Periphery dispatch");
+        check(pipeline.compose_frame(device,list.Get(),0,center.Get(),pipeline.peripheral_output[0].Get(),region,64,64),"Center/periphery composition");
+        auto* output=pipeline.full[0].Get();const auto desc=output->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
+        device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;D3D12_RESOURCE_DESC rd{};
+        rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=bytes;rd.Height=1;rd.DepthOrArraySize=rd.MipLevels=1;
+        rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;ComPtr<ID3D12Resource> readback;
+        check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback))),"Periphery readback");
+        cheeky::fg::color_transition(list.Get(),output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=output;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        cheeky::fg::color_transition(list.Get(),output,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);execute();
+        void* data{};check(SUCCEEDED(readback->Map(0,nullptr,&data)),"Periphery map");
+        auto pixel=[&](unsigned x,unsigned y){return reinterpret_cast<const unsigned short*>(static_cast<const unsigned char*>(data)+footprint.Offset+y*footprint.Footprint.RowPitch+x*8);};
+        const auto* edge=pixel(2,2);const auto* middle=pixel(32,32);
+        const bool center_green=middle[0]==0&&middle[1]==0x3c00&&middle[2]==0;
+        const bool edge_correct=method<2?(edge[0]==0x3c00&&edge[1]==0&&edge[2]==0):
+            (edge[0]==0x3800&&edge[1]==0&&edge[2]==0x3800);
+        readback->Unmap(0,nullptr);
+        check(center_green,"The center crop must remain green while the periphery changes");
+        check(edge_correct,"Previous/simple modes must retain red; bidirectional mode must interpolate red and blue");
+    }
+    check(SUCCEEDED(device->GetDeviceRemovedReason()),"Periphery pipeline device removal");
+    std::cout << "PASS actual periphery pixels: previous/simple red, bidirectional purple, independent green center; source-sized guide crop and nonzero UV motion; unused inputs omitted\n";
+}

@@ -145,6 +145,120 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["Use lower DLSS hook (DX12)"] is True
+    assert "DLSS-FG (experimental)" in g.trees
+    assert g["values"]["Enable DLSS Frame Generation (2x)"] is False
+    draw(changes={"Enable DLSS Frame Generation (2x)": True})
+    assert "FgEnabled=true" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["FgEnabled"] = True
+    state["fg"] = {"layer_present": True, "controls_supported": True, "compatible_session": True,
+                   "active": True, "state": "Generating frames", "native_frames": 5,
+                   "generated_frames": 3, "fallback_frames": 1,
+                   "frame_source": "Plugin hook: UEVR render-pose frame argument",
+                   "frame_source_calls": 20, "captured_guides": 38,
+                   "last_color_frame": 80, "last_guide_frame": 79,
+                   "eligible_guides": 0, "pending_guides": 2,
+                   "match_reason": "No guides with the color frame ID"}
+    receive(state)
+    draw()
+    assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
+    assert any("Generating frames" in t for t in g.drawn.values())
+    assert "Frame ID source" in list(g.drawn.values()) and "20 / 38" in list(g.drawn.values())
+    for text in ("Captured frame (color / guides)","80 / 79","Matching guides (ready / pending)","0 / 2","No guides with the color frame ID"):
+        assert text in list(g.drawn.values()), "Missing precise match diagnostic: " + text
+    assert any("matching OpenXR update for FG timings" in t for t in g.drawn.values())
+    performance = {"supported": True, "gpu_supported": True, "gpu_valid": True, "gpu_samples": 42,
+                   "window_samples": 42, "foveated_eyes": 2, "center_ms": 2.75, "center_last_ms": 2.5,
+                   "periphery_ms": .4, "periphery_last_ms": .35, "preparation_ms": .6,
+                   "preparation_last_ms": .55, "total_ms": 3.9, "total_last_ms": 3.5,
+                   "completion_wait_ms": 4.2, "copy_wait_ms": 1.1, "xr_wait_ms": 18.2, "xr_period_ms": 11.111,
+                   "center_width": 280, "center_height": 232, "peripheral_width": 256, "peripheral_height": 256,
+                   "output_width": 512, "output_height": 512}
+    state["fg"]["performance"] = performance
+    count = len(g.sent)
+    receive(state)
+    draw()
+    for text in ("DLSS-FG center", "Periphery + blending", "2.750 / 2.500", "0.400 / 0.350",
+                 "FG GPU total", "4.200 ms", "18.200 ms", "11.111 ms", "280 x 232", "256 x 256", "512 x 512"):
+        assert text in list(g.drawn.values()), "Missing FG timing: " + text
+    assert len(g.sent) == count, "Reading FG performance must not change settings"
+    performance["asynchronous_presenter"] = True
+    performance["producer_cpu_ms"] = .25
+    performance["pacing_wait_ms"] = 12
+    performance["queued_native"] = 2
+    performance["skipped_native"] = 7
+    performance["color_token"] = performance["guide_token"] = 42
+    performance["color_render_frame"] = performance["guide_render_frame"] = 77
+    performance["inference_color_format"] = 28
+    performance["shared_gpu_queue"] = 1
+    performance["mismatched_guides"] = 3
+    receive(state)
+    draw()
+    for label in ("FG completion wait (background)", "OpenXR waits (presenter)",
+                  "Game frame handoff (CPU)", "Game pacing wait", "Skipped FG jobs (busy)",
+                  "Color / guide submission", "42 / 42", "Rejected guide matches",
+                  "UEVR frame (color / guides)", "77 / 77", "FG input color", "RGBA8 SDR",
+                  "FG GPU queue", "Game queue; background CPU worker"):
+        assert label in list(g.drawn.values()), "Missing buffered FG diagnostic: " + label
+    assert "FG completion wait (CPU)" not in list(g.drawn.values())
+    state["fg"]["cadence"] = {"supported":True,"valid":True,"game_fps":32,"native_target_fps":60,
+        "native_fps":32,"generated_fps":32,"unique_fps":64,"repeat_fps":56,"submission_fps":120,"refresh_hz":120,
+        "app_image_wait_ms":4,"present_image_wait_ms":5,"begin_ms":6,"end_ms":7,"present_cpu_ms":8}
+    count = len(g.sent)
+    receive(state)
+    draw()
+    for label in ("Game / native target","32.0 / 60.0 FPS","Unique output","64.0 FPS","Native / generated output",
+                  "Repeated presentations","56.0 FPS","OpenXR submissions","Headset refresh target","120.0 Hz",
+                  "Game image wait / call","Presenter image wait / call","Runtime begin / end","6.000 / 7.000 ms"):
+        assert label in list(g.drawn.values()), "Missing measured cadence: " + label
+    assert len(g.sent) == count, "Reading cadence must not change settings"
+    performance["asynchronous_presenter"] = False
+    performance["foveated_eyes"] = 0
+    performance["center_width"] = performance["center_height"] = 512
+    receive(state)
+    draw()
+    assert "DLSS-FG full frame" in list(g.drawn.values())
+    assert "Not used (full-frame FG)" in list(g.drawn.values())
+    assert "0.400 / 0.350" not in list(g.drawn.values()), "Do not present full-frame FG as a measured periphery pass"
+    performance["gpu_valid"] = False
+    receive(state)
+    draw()
+    assert "Waiting for a complete GPU timing sample." in list(g.drawn.values())
+    assert "2.750 / 2.500" not in list(g.drawn.values()), "Do not show stale/invalid GPU samples as current"
+    performance["gpu_valid"] = True
+    assert g.slider_ranges["FG transition width"][1] == 0
+    for label,key,value in (("FG scale","FgResolutionPercent",50),
+                            ("FG periphery scale","FgPeripheralPercent",25),
+                            ("FG periphery method","FgPeripheralMethod",3),
+                            ("FG periphery depth","FgDepthBits",16),
+                            ("FG periphery motion","FgMotionBits",16)):
+        draw(changes={label:value})
+        assert f"{key}={value}" in last(), "FG control must send its actual setting: " + label
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"][key] = value
+        receive(state)
+    draw(changes={"Foveated frame generation": False})
+    assert "FgFoveated=false" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["FgFoveated"] = False
+    receive(state)
+    draw()
+    assert g["values"]["FG region width"] is None
+    old_layer = copy.deepcopy(state)
+    old_layer["fg"]["controls_supported"] = False
+    receive(old_layer)
+    draw()
+    assert any("layer needs updating" in t for t in g.drawn.values())
+    receive(state)
+    draw("Reset DLSS-FG defaults")
+    assert last().endswith("\ndefaults_fg")
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    for key, value in baseline["settings"].items():
+        if key.startswith("Fg"):
+            state["settings"][key] = value
+    receive(state)
+    draw()
+    assert g["values"]["Enable DLSS Frame Generation (2x)"] is False
     draw(changes={"Use lower DLSS hook (DX12)": False})
     assert "D3D12LowerHook=false" in last()
     state["request"] = state["applied_request"] = int(last().splitlines()[1])

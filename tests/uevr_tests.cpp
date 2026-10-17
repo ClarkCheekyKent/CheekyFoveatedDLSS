@@ -5,6 +5,8 @@
 #include "runtime_search.hpp"
 #include "frame_cadence.hpp"
 #include "support_bundle.hpp"
+#include "../shared/cheeky_fg_bridge.hpp"
+#include "mock_ngx_parameters.hpp"
 #include <uevr/API.h>
 #include <d3d12.h>
 #include <d3d11.h>
@@ -21,6 +23,8 @@
 #include <thread>
 #include <string>
 #include <vector>
+#include "../src/uevr_frame_source.hpp"
+#include "uevr_frame_source_fixture.hpp"
 
 using namespace cheeky::foveated_dlss;
 using Microsoft::WRL::ComPtr;
@@ -83,7 +87,37 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
     check(fence->SetEventOnCompletion(1, event), "SetEventOnCompletion");
     auto result = WaitForSingleObject(event, 10000); CloseHandle(event); require(result == WAIT_OBJECT_0, "GPU timeout");
 }
+#include "fg_runtime_validation.hpp"
 void settings_tests(const std::filesystem::path& root) {
+    {
+        Settings fg;
+        require(!fg.fg.enabled && set_named_setting(fg,"FgEnabled","true") && fg.fg.enabled,
+            "FG is opt-in and configurable");
+        require(set_named_setting(fg,"FgWidth","0.37") && set_named_setting(fg,"FgYOffset","-0.12") &&
+            !set_named_setting(fg,"FgEnabled","invalid") && !set_named_setting(fg,"FgWidth","nan"),
+            "FG settings validate types");
+        std::string error;const auto path=root/"fg.ini";
+        require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
+            set_named_setting(fg,"FgPeripheralMethod","3")&&set_named_setting(fg,"FgDepthBits","16")&&
+            set_named_setting(fg,"FgMotionBits","16"),"FG quality and periphery controls parse");
+        require(write_settings_file(path,fg,error),"Save FG settings");
+        Settings restored;
+        require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
+            restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
+            restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16,"FG settings survive restart");
+        require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
+        require(reset_settings_group(restored,"fg") && !restored.fg.enabled,"FG reset restores opt-out");
+        {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
+        restored=fg;
+        require(read_settings_file(path,restored,error) && !restored.fg.enabled,"Old profiles default FG off");
+        fg.fg.width=5;fg.fg.height=-1;fg.fg.feather=3;
+        update_settings(fg);
+        require(current_settings().fg.enabled && current_settings().fg.width==1 && current_settings().fg.height==0.2f &&
+            current_settings().fg.feather==0.3f,"Runtime clamps FG geometry");
+        set_processing_allowed(false);
+        require(!current_settings().fg.enabled && configured_settings().fg.enabled,"Detach pauses FG and preserves preference");
+        set_processing_allowed(true);update_settings(Settings{});
+    }
     Settings s; require(s.d3d12_lower_hook, "Lower hook is the default");
     require(!s.manual_stereo_mapping && !s.manual_stereo_right_first && !s.independent_openxr_gaze,
         "Gaze compatibility must be opt-in");
@@ -190,6 +224,18 @@ void settings_tests(const std::filesystem::path& root) {
 }
 int main(int argc, char** argv) {
     try {
+        if(argc>2&&std::string(argv[1])=="--fg-frame-source-pe"){
+            auto path=std::filesystem::path(argv[2]);auto module=LoadLibraryExW(path.c_str(),nullptr,DONT_RESOLVE_DLL_REFERENCES);
+            require(module!=nullptr,"Map original UEVR image without executing it");
+            const auto found=uevr_frames::locate(module);
+            require(found.function!=nullptr,"Resolve existing OpenXR runtime frame method by validated RTTI");
+            std::printf("PASS original UEVR image: table RVA=0x%X method RVA=0x%llX\n",found.table_rva,
+                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(found.function)-reinterpret_cast<std::uintptr_t>(module)));
+            const auto roots=uevr_frames::rhi_dispatchers(uevr_frames::image(module));
+            std::printf("Verified RHI command dispatchers: %zu\n",roots.size());
+            require(!roots.empty(),"Identify RHI entry points by three call-site literals and unwind boundaries");
+            FreeLibrary(module);return 0;
+        }
         wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const auto bin = std::filesystem::path(exe).parent_path();
         // Windows reuses PIDs. Keep fixtures from earlier runs from masquerading
@@ -262,6 +308,10 @@ int main(int argc, char** argv) {
             renderer = {UEVR_RENDERER_D3D11, device11.Get(), nullptr, nullptr};
         }
         UEVR_PluginInitializeParam api{}; api.version = &version; api.functions = &functions; api.callbacks = &callbacks; api.renderer = &renderer;
+        if(mode=="--fg-controls"){
+            api.uevr_module=GetModuleHandleW(nullptr);
+            functions.register_inline_hook=fg_test_install_hook;functions.unregister_inline_hook=fg_test_remove_hook;
+        }
         UEVR_VRData vr_api{}; vr_api.is_openvr = is_openvr;
         vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
         vr_api.get_mod_value = get_mod_value;
@@ -362,6 +412,31 @@ int main(int argc, char** argv) {
         const auto runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"); require(runtime != nullptr, "Runtime dependency loaded");
         auto get = reinterpret_cast<CheekyUEVRSnapshotFn>(GetProcAddress(runtime, "CheekyUEVR_Snapshot"));
         auto start = reinterpret_cast<CheekyUEVRStartFn>(GetProcAddress(runtime, "CheekyUEVR_Start"));
+        if (mode == "--fg-controls") {
+            const auto control_fn=reinterpret_cast<CheekyFgControlFn>(GetProcAddress(runtime,"CheekyFG_GetControl"));
+            require(control_fn!=nullptr,"FG controls export missing");
+            CheekyFgControl control;
+            require(control_fn(&control) && !control.enabled,"FG starts disabled");
+            control.abi=999;
+            require(!control_fn(&control),"FG control rejects ABI mismatch");
+            control=CheekyFgControl{};
+            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08");
+            require(control_fn(&control) && control.enabled && std::abs(field(snapshot(get),"FgWidth")-0.37)<0.00001,
+                "Lua protocol controls real FG runtime");
+            command("1\n903\nset\nEnabled=false");
+            fg_runtime_frame_validation(runtime,bin,device.Get(),queue.Get());
+            custom("cheeky.foveated_dlss.load.v1","false");present();
+            require(fg_test_hook_removals==2&&fg_test_hook_targets.empty(),"Unload removes the plugin-owned frame hooks");
+            require(control_fn(&control) && !control.enabled && snapshot(get).find("\"FgEnabled\":true")!=std::string::npos,
+                "Host detach pauses FG without discarding saved preference");
+            custom("cheeky.foveated_dlss.load.v1","true");present();
+            require(fg_test_hook_installs==4&&fg_test_hook_targets.size()==2,"Reload restores the plugin frame hooks");
+            require(control_fn(&control) && control.enabled,"Host re-enable restores FG preference");
+            command("1\n902\ndefaults_fg");
+            require(control_fn(&control) && !control.enabled,"FG reset restores live opt-out");
+            std::puts("PASS FG protocol, control ABI, host detach/re-enable and FG group reset");
+            return 0;
+        }
         if (mode == "--loader-lifecycle" || mode == "--loader-missing") {
             const auto before = field(snapshot(get), "Width");
             custom("cheeky.foveated_dlss.command.v1", "1\n999\nset\nWidth=0.777");

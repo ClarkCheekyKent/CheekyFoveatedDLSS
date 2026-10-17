@@ -2,7 +2,11 @@
 param(
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build",
-    [switch]$IncludeOpenXRSetup = $true
+    [switch]$IncludeOpenXRSetup = $true,
+    [string]$FrameBridgeBackend,
+    [string]$ReadmePath,
+    [string]$FrameBridgeSourcePatch,
+    [string]$FrameBridgeLicense
 )
 
 Set-StrictMode -Version Latest
@@ -22,10 +26,15 @@ $files = [ordered]@{
     "licenses\MinHook.txt" = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     "licenses\OpenVR.txt" = Join-Path $projectRoot "third_party\openvr\LICENSE"
     "licenses\UEVR-API-MIT.txt" = Join-Path $projectRoot "third_party\uevr\LICENSE.txt"
+    "licenses\NVIDIA-NGX.txt" = Join-Path $projectRoot "third_party\ngx-sdk\LICENSE.txt"
 }
 if ($IncludeOpenXRSetup) {
     $files["OpenXR\CheekyOpenXRSetup.exe"] = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe"
 }
+if ($FrameBridgeBackend) {$files["UEVR\UEVRBackend.dll"]=$FrameBridgeBackend}
+if ($ReadmePath) {$files["README.txt"]=$ReadmePath}
+if ($FrameBridgeSourcePatch) {$files["UEVR\frame-bridge-source.patch"]=$FrameBridgeSourcePatch}
+if ($FrameBridgeLicense) {$files["licenses\UEVR-Backend.txt"]=$FrameBridgeLicense}
 foreach ($entry in $files.GetEnumerator()) {
     if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "Missing input: $($entry.Value). Build first." }
     $destination = Join-Path $stage $entry.Key

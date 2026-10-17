@@ -1,4 +1,5 @@
 #include "runtime_api.hpp"
+#include "../shared/cheeky_fg_bridge.hpp"
 #include <uevr/API.h>
 #include <atomic>
 #include <array>
@@ -19,6 +20,7 @@ CheekyUEVRPublishStereoFn runtime_publish_stereo{};
 CheekyUEVRPublishRenderingModeFn runtime_publish_mode{};
 CheekyUEVRCommandFn runtime_command{};
 CheekyUEVRSnapshotFn runtime_snapshot{};
+CheekyFgDetachFrameSourceFn runtime_detach_frame_source{};
 std::atomic<bool> initialized{};
 std::atomic<bool> should_load{};
 bool callbacks_registered{}, load_attempted{};
@@ -199,6 +201,12 @@ bool initialize_dll() {
         start.config_directory = directory.data(); start.renderer = r->renderer_type;
         start.device = r->device; start.queue = r->command_queue; start.attachment = &attachment;
         initialized = runtime_start(&start);
+        if(initialized){
+            CheekyFgAttachFrameSourceFn attach_frames{};
+            load_export(dll.value,"CheekyFG_DetachUEVRFrameSource",runtime_detach_frame_source);
+            if(load_export(dll.value,"CheekyFG_AttachUEVRFrameSource",attach_frames))
+                attach_frames(api->uevr_module,api->functions->register_inline_hook,api->functions->unregister_inline_hook);
+        }
         if (!initialized) {
             if (attachment) runtime_detach(attachment);
             attachment = 0;
@@ -213,6 +221,8 @@ bool initialize_dll() {
 }
 
 void detach_runtime() {
+    if(runtime_detach_frame_source)runtime_detach_frame_source();
+    runtime_detach_frame_source=nullptr;
     if (runtime_detach && attachment) runtime_detach(attachment);
     attachment = 0;
     attached_compositor = nullptr; next_openvr_attach = 0;

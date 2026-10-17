@@ -26,6 +26,7 @@
 #include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "fg_capture.hpp"
 
 #include <Windows.h>
 #include <winver.h>
@@ -1680,6 +1681,7 @@ void note_d3d12_command_list_submission_impl(
 void note_d3d12_present_impl(
     ID3D12CommandQueue* const present_queue
 ) noexcept {
+    fg_retire_snapshots();
     collect_dlss_nr_input_submissions();
     collect_dlss_nr_submissions();
     collect_peripheral_dlaa_resources();
@@ -3670,6 +3672,7 @@ void remember_d3d12_game_view(
 }
 
 void forget_d3d12_game_view(const NgxHandle* const handle) noexcept {
+    fg_forget_feature(handle);
     if (handle == nullptr) return;
     const auto view_id = static_cast<DlssViewId>(
         reinterpret_cast<std::uintptr_t>(handle)
@@ -4540,6 +4543,7 @@ NgxResult runtime_create_d3d12(
     const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 2);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
+        if (is_dlss_feature(feature)) fg_remember_feature(*handle,parameters);
     }
     return result;
 }
@@ -4584,6 +4588,7 @@ NgxResult hook_core_create_d3d12(
     const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 3);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
+        if (is_dlss_feature(feature)) fg_remember_feature(*handle,parameters);
     }
     return result;
 }

@@ -65,6 +65,7 @@
     <ClCompile Include="src\foveation.cpp" />
     <ClCompile Include="src\gaze_policy.cpp" />
     <ClCompile Include="src\d3d12_ngx_dispatch.cpp" />
+    <ClCompile Include="src\fg_capture.cpp" />
     <ClCompile Include="src\d3d12_output_contract.cpp" />
     <ClCompile Include="src\diagnostics.cpp" />
     <ClCompile Include="src\dlss_nr_contract.cpp" />

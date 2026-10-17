@@ -88,6 +88,10 @@
     <ClCompile Include="uevr\settings_io.cpp" />
     <ClCompile Include="src\settings.cpp" />
     <ClCompile Include="src\foveation.cpp" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\buffer.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\hook.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\trampoline.c" />
+    <ClCompile Include="third_party\reshade\deps\minhook\src\hde\hde64.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\*.hpp" />

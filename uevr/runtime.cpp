@@ -17,6 +17,7 @@
 #include "libovr_gaze.hpp"
 #include "dlss_nr.hpp"
 #include "d3d12_ngx_dispatch.hpp"
+#include "fg_capture.hpp"
 #include "afw_compatibility.hpp"
 #include "version.h"
 #include <atomic>
@@ -89,6 +90,12 @@ std::string snapshot_locked(State& s) {
     const auto afw_coverage = afw_coverage_status();
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
+    const auto fg = fg_status();
+    CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
+    CheekyFgCadence fg_rates;fg_cadence(fg_rates);
+    CheekyFgCaptureHealth fg_capture;
+    if(auto self=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"))
+        if(auto query=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(self,"CheekyFG_GetCaptureHealth")))query(&fg_capture);
     out << "{\"protocol\":1,\"version\":\"" CHEEKY_VERSION "-" << host_id(s.host)
         << "\",\"host\":\"" << host_id(s.host)
         << "\",\"host_supports_afw_projection\":" << (s.host == CheekyRuntimeHost::uevr)
@@ -100,6 +107,66 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"fg\":{\"layer_present\":" << bool(fg.layer_present)
+        << ",\"controls_supported\":" << bool(fg.controls_supported)
+        << ",\"compatible_session\":" << bool(fg.compatible_session)
+        << ",\"active\":" << bool(fg.active)
+        << ",\"state\":\"" << fg_state_name(fg.state) << "\""
+        << ",\"diagnostic\":\"" << json_escape(fg_diagnostic().message) << "\""
+        << ",\"native_frames\":" << fg.native_frames
+        << ",\"generated_frames\":" << fg.generated_frames
+        << ",\"fallback_frames\":" << fg.fallback_frames
+        << ",\"frame_source\":\"" << json_escape(fg_capture.source) << "\""
+        << ",\"frame_source_hook\":" << bool(fg_capture.plugin_hook)
+        << ",\"frame_source_calls\":" << fg_capture.frame_calls
+        << ",\"captured_guides\":" << fg_capture.captured_guides
+        << ",\"missing_frame_guides\":" << fg_capture.missing_frame_guides
+        << ",\"last_guide_frame\":" << fg_capture.last_guide_frame
+        << ",\"color_copies\":" << fg_capture.color_copies
+        << ",\"last_color_frame\":" << fg_capture.color_frame
+        << ",\"latest_captured_frame\":" << fg_capture.latest_frame
+        << ",\"eligible_guides\":" << fg_capture.eligible
+        << ",\"pending_guides\":" << fg_capture.pending
+        << ",\"foreign_guides\":" << fg_capture.foreign
+        << ",\"match_reason\":\"" << json_escape(fg_capture.match_reason) << "\""
+        << ",\"performance\":{\"supported\":" << fg_time_supported
+        << ",\"gpu_supported\":" << bool(fg_time.gpu_supported)
+        << ",\"gpu_valid\":" << bool(fg_time.gpu_valid)
+        << ",\"foveated_eyes\":" << fg_time.foveated_eyes
+        << ",\"window_samples\":" << fg_time.window_samples
+        << ",\"gpu_samples\":" << fg_time.gpu_samples
+        << ",\"center_ms\":" << fg_time.center_ms << ",\"center_last_ms\":" << fg_time.center_last_ms
+        << ",\"periphery_ms\":" << fg_time.periphery_ms << ",\"periphery_last_ms\":" << fg_time.periphery_last_ms
+        << ",\"preparation_ms\":" << fg_time.preparation_ms << ",\"preparation_last_ms\":" << fg_time.preparation_last_ms
+        << ",\"total_ms\":" << fg_time.total_ms << ",\"total_last_ms\":" << fg_time.total_last_ms
+        << ",\"completion_wait_ms\":" << fg_time.completion_wait_ms
+        << ",\"copy_wait_ms\":" << fg_time.copy_wait_ms
+        << ",\"xr_wait_ms\":" << fg_time.xr_wait_ms
+        << ",\"xr_period_ms\":" << fg_time.xr_period_ms
+        << ",\"asynchronous_presenter\":" << bool(fg_time.asynchronous_presenter)
+        << ",\"queued_native\":" << fg_time.queued_native << ",\"skipped_native\":" << fg_time.skipped_native
+        << ",\"producer_cpu_ms\":" << fg_time.producer_cpu_ms << ",\"pacing_wait_ms\":" << fg_time.pacing_wait_ms
+        << ",\"color_token\":" << fg_time.color_token << ",\"guide_token\":" << fg_time.guide_token
+        << ",\"mismatched_guides\":" << fg_time.mismatched_guides
+        << ",\"color_render_frame\":" << fg_time.color_render_frame << ",\"guide_render_frame\":" << fg_time.guide_render_frame
+        << ",\"inference_color_format\":" << fg_time.inference_color_format << ",\"shared_gpu_queue\":" << fg_time.shared_gpu_queue
+        << ",\"center_width\":" << fg_time.center_width << ",\"center_height\":" << fg_time.center_height
+        << ",\"peripheral_width\":" << fg_time.peripheral_width << ",\"peripheral_height\":" << fg_time.peripheral_height
+        << ",\"output_width\":" << fg_time.output_width << ",\"output_height\":" << fg_time.output_height
+        << ",\"peripheral_method\":" << fg_time.peripheral_method
+        << ",\"source_depth_format\":" << fg_time.source_depth_format
+        << ",\"source_motion_format\":" << fg_time.source_motion_format << "}"
+        << ",\"cadence\":{\"supported\":" << bool(fg_rates.supported) << ",\"valid\":" << bool(fg_rates.valid)
+        << ",\"game_fps\":" << fg_rates.game_fps << ",\"native_fps\":" << fg_rates.native_fps
+        << ",\"generated_fps\":" << fg_rates.generated_fps << ",\"unique_fps\":" << fg_rates.unique_fps
+        << ",\"repeat_fps\":" << fg_rates.repeat_fps << ",\"submission_fps\":" << fg_rates.submission_fps
+        << ",\"refresh_hz\":" << fg_rates.refresh_hz << ",\"native_target_fps\":" << fg_rates.native_target_fps
+        << ",\"application_period_ms\":" << fg_rates.application_period_ms
+        << ",\"app_image_wait_ms\":" << fg_rates.app_image_wait_ms << ",\"present_image_wait_ms\":" << fg_rates.present_image_wait_ms
+        << ",\"begin_ms\":" << fg_rates.begin_ms << ",\"end_ms\":" << fg_rates.end_ms
+        << ",\"present_cpu_ms\":" << fg_rates.present_cpu_ms
+        << ",\"app_begin_ms\":" << fg_rates.app_begin_ms << ",\"app_end_ms\":" << fg_rates.app_end_ms
+        << ",\"app_release_ms\":" << fg_rates.app_release_ms << "}}"
         << ",\"d3d12_lower_hook_active\":" << d3d12_lower_hook_enabled()
         << ",\"d3d12_hook_restart_required\":" << d3d12_hook_restart_required(configured_settings().d3d12_lower_hook)
         << ",\"afw_experiment\":{\"enabled\":" << afw.enabled
@@ -422,6 +489,7 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
 extern "C" __declspec(dllexport) void CheekyRuntime_Detach(std::uint64_t attachment) {
     if (!attachment || active_attachment.load(std::memory_order_acquire) != attachment) return;
     adapter_attached.store(false, std::memory_order_release);
+    fg_abandon_frame_source();
     allow_afw_stereo_projection(false);
     eye_calibration_suspend();
     set_processing_allowed(false);
@@ -459,6 +527,7 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
         auto& s = state(); std::lock_guard lock(s.mutex);
         if (!attachment || !adapter_attached.load() || attachment != active_attachment.load()) return;
         configure_graphics(s, renderer, device, queue);
+        fg_set_uevr_queue(renderer == 1 ? static_cast<ID3D12CommandQueue*>(queue) : nullptr);
         if (!s.graphics_ready || renderer != 1) {
             const float empty[2][16]{};
             publish_afw_stereo_projection(empty, 0, 0, false);

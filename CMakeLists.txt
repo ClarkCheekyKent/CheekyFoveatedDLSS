@@ -97,6 +97,8 @@ add_library(
     CheekyOpenXRLayer
     MODULE
         "${CMAKE_CURRENT_SOURCE_DIR}/openxr_layer/openxr_layer.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/openxr_layer/dlssg_worker.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/openxr_layer/fg_focus.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/shared/gaze_math.cpp"
 )
 target_compile_features(CheekyOpenXRLayer PRIVATE cxx_std_20)
@@ -111,6 +113,7 @@ target_compile_definitions(
     PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
 )
 target_link_libraries(CheekyOpenXRLayer PRIVATE d3d11 d3d12 d3dcompiler dxgi dxguid version)
+target_link_libraries(CheekyOpenXRLayer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx-sdk/nvsdk_ngx_s$<$<CONFIG:Debug>:_dbg>.lib")
 set_target_properties(
     CheekyOpenXRLayer
     PROPERTIES
@@ -173,6 +176,7 @@ add_executable(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/foveation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/gaze_policy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12_ngx_dispatch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/fg_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12_output_contract.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/diagnostics.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dlss_nr_contract.cpp"
@@ -237,6 +241,7 @@ add_executable(CheekyNrObserverTests
     src/dlss_nr_lifetime.cpp src/dlss_nr_input.cpp src/dlss_nr_contract.cpp
     src/d3d12_output_contract.cpp src/foveation.cpp src/settings.cpp src/graphics_observer.cpp
     src/d3d12_ngx_dispatch.cpp
+    src/fg_capture.cpp
     third_party/reshade/deps/minhook/src/buffer.c
     third_party/reshade/deps/minhook/src/hook.c
     third_party/reshade/deps/minhook/src/trampoline.c
@@ -281,7 +286,9 @@ if(CHEEKY_BUILD_UEVR OR CHEEKY_BUILD_STANDALONE)
 endif()
 if(CHEEKY_BUILD_UEVR)
     add_library(CheekyFoveatedDLSSUEVR MODULE uevr/plugin.cpp)
-    add_executable(CheekyUEVRTests tests/uevr_tests.cpp tests/late_attach_tests.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp)
+    add_executable(CheekyUEVRTests tests/uevr_tests.cpp tests/late_attach_tests.cpp uevr/settings_io.cpp src/settings.cpp src/foveation.cpp
+        third_party/reshade/deps/minhook/src/buffer.c third_party/reshade/deps/minhook/src/hook.c
+        third_party/reshade/deps/minhook/src/trampoline.c third_party/reshade/deps/minhook/src/hde/hde64.c)
     add_library(CheekyFakeNGX MODULE tests/fake_ngx.cpp)
     add_library(CheekyFakeStreamline MODULE tests/fake_streamline.cpp)
     add_library(CheekyFakeOpenVR MODULE tests/fake_openvr.cpp)
@@ -323,6 +330,7 @@ if(CHEEKY_BUILD_UEVR)
     add_test(NAME CheekyUEVRHost COMMAND CheekyUEVRTests)
     add_test(NAME CheekyUEVRLoaderLifecycle COMMAND CheekyUEVRTests --loader-lifecycle)
     add_test(NAME CheekyUEVRLoaderMissing COMMAND CheekyUEVRTests --loader-missing)
+    add_test(NAME CheekyUEVRFgControls COMMAND CheekyUEVRTests --fg-controls)
     find_program(CHEEKY_LUA_EXECUTABLE NAMES lua54 lua)
     if(CHEEKY_LUA_EXECUTABLE)
         add_test(NAME CheekyUEVRLuaLoader COMMAND "${CHEEKY_LUA_EXECUTABLE}"

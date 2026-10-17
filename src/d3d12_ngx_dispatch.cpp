@@ -1,4 +1,5 @@
 #include "d3d12_ngx_dispatch.hpp"
+#include "fg_capture.hpp"
 #include <atomic>
 #include <Windows.h>
 #include "afw_compatibility.hpp"
@@ -235,18 +236,17 @@ NgxResult dispatch_d3d12_ngx_evaluation(
     // not mark that ordinary full-frame passthrough as private interception.
     if (!d3d12_ngx_interception_active() && !afw_claim_lower_evaluation()) {
         if (skipped) skipped(call);
-        return original(call.command_list, call.handle, call.parameters, call.callback);
+        const auto result = original(call.command_list, call.handle, call.parameters, call.callback);
+        fg_publish_ngx(call.command_list, call.handle, call.parameters, result);
+        return result;
     }
     D3D12NgxInterceptionScope scope;
     if (scope.outermost() && processor != nullptr) {
-        return processor(call, original, context);
+        const auto result = processor(call, original, context);
+        fg_publish_ngx(call.command_list, call.handle, call.parameters, result);
+        return result;
     }
-    return original(
-            call.command_list,
-            call.handle,
-            call.parameters,
-            call.callback
-        );
+    return original(call.command_list, call.handle, call.parameters, call.callback);
 }
 
 bool d3d12_ngx_interception_active() noexcept {
