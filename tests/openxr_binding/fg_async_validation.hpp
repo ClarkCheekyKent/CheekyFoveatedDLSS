@@ -86,6 +86,18 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Repeat queue");
     cheeky::fg::BufferedPresenter p;check(p.setup(h<XrSession>(3),Runtime::functions(),device,queue.Get()),"Repeat presenter");
+    // HIGH priority is a property of the GPU command queue, not the CPU
+    // generation thread. On supported devices, only FG uses the new queue;
+    // all captures and runtime-visible uploads remain on the original queue.
+    check(p.generation_queue.Get()!=nullptr,"FG GPU queue selected");
+    check(p.producer.queue.Get()==queue.Get()&&p.uploads.queue.Get()==queue.Get(),
+        "Capture and OpenXR uploads retain the game GPU queue");
+    if(p.generation_high_priority) {
+        const auto desc=p.generation_queue->GetDesc();
+        check(p.generation_queue.Get()!=queue.Get()&&desc.Type==D3D12_COMMAND_LIST_TYPE_DIRECT&&
+            desc.Priority==D3D12_COMMAND_QUEUE_PRIORITY_HIGH&&desc.NodeMask==queue->GetDesc().NodeMask,
+            "FG executes on a separate HIGH-priority direct queue on the same GPU node");
+    } else check(p.generation_queue.Get()==queue.Get(),"Unsupported HIGH priority falls back to game queue");
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> commands;
     check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))&&
         SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&commands))),"Repeat commands");
@@ -109,6 +121,16 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
         auto image=p.producer.copy(*c,source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);check(bool(image),"Repeat snapshot");
         p.producer.freeze(*c,image);std::uint64_t ticket{};check(p.producer.execute(*c,ticket),"Repeat snapshot submit");return image;};
     auto old=snapshot();cheeky::fg::BufferedPresenter::Chain chain;
+    // The cross-queue wait must retire only after the native snapshot signal.
+    // This also tests the harmless same-queue fallback on devices without HIGH.
+    ComPtr<ID3D12Fence> fg_ready;
+    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fg_ready))),"FG queue fence");
+    check(SUCCEEDED(p.generation_queue->Wait(p.producer.fence.Get(),p.producer.serial))&&
+        SUCCEEDED(p.generation_queue->Signal(fg_ready.Get(),1)),"FG GPU wait and signal");
+    HANDLE fg_event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+    check(fg_event&&SUCCEEDED(fg_ready->SetEventOnCompletion(1,fg_event))&&
+        WaitForSingleObject(fg_event,10000)==WAIT_OBJECT_0,"FG queue GPU fence retirement");
+    CloseHandle(fg_event);
     check(p.upload_image(chain,old),"First image upload");const auto first=p.uploads.serial;
     for(unsigned i=0;i<8;++i)check(p.upload_image(chain,old),"Repeat last released image");
     check(p.uploads.serial==first,"Repeated presentations must not enqueue another GPU image upload");

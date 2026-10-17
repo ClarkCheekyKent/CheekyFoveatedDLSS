@@ -55,7 +55,11 @@ struct BufferedPresenter final : Presenter {
     std::mutex capture_mutex;
     std::thread presentation_thread,generation_thread;
     Transport producer,output,uploads;
+    // Dedicated HIGH-priority queue for inference only. The OpenXR binding,
+    // guide capture and swapchain uploads must keep using the application's
+    // original queue; D3D12 GPU fences order work across the two queues.
     ComPtr<ID3D12CommandQueue> generation_queue;
+    bool generation_high_priority{};
     std::unordered_map<XrSwapchain,Image> captured;
     std::unordered_map<XrSwapchain,std::uint64_t> capture_tokens;
     std::unordered_map<XrSwapchain,std::uint64_t> capture_frames;
@@ -107,10 +111,36 @@ struct BufferedPresenter final : Presenter {
     ~BufferedPresenter() override {reset();}
     bool setup(XrSession s,const XrFns& f,ID3D12Device* dev,ID3D12CommandQueue* q) noexcept override {
         if(!Presenter::setup(s,f,dev,q))return false;
-        // Match the reference: CPU completion is asynchronous, but FG GPU work
-        // uses the game's queue. A competing direct queue adds scheduling jitter
-        // inside the FG timestamp range and races the next game render for time.
-        generation_queue=q;
+
+        // Create the FG queue on the very same D3D12 device/node as the game.
+        // The OpenXR runtime continues to own/use the queue supplied in the
+        // graphics binding. Only NGX evaluation and its final publication copy
+        // are submitted to this dedicated queue. A GPU-side wait in
+        // generation_loop() orders it after the native snapshot/guide work.
+        //
+        // If HIGH priority is unavailable, retain the proven same-queue path;
+        // never make the whole VR presenter fail because of a priority hint.
+        const auto game_desc=q->GetDesc();
+        D3D12_COMMAND_QUEUE_DESC fg_desc{};
+        fg_desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+        fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+        fg_desc.Flags=D3D12_COMMAND_QUEUE_FLAG_NONE;
+        fg_desc.NodeMask=game_desc.NodeMask;
+        ComPtr<ID3D12CommandQueue> high_queue;
+        const HRESULT priority_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&high_queue));
+        generation_high_priority=SUCCEEDED(priority_result)&&high_queue.Get()!=nullptr;
+        if(generation_high_priority) {
+            generation_queue=std::move(high_queue);
+            if(trace)trace("DLSS-FG: dedicated HIGH-priority D3D12 direct queue active; capture and OpenXR uploads stay on the game queue");
+        } else {
+            generation_queue=q;
+            if(trace) {
+                char message[192]{};
+                sprintf_s(message,"DLSS-FG: HIGH-priority queue unavailable (HRESULT 0x%08lx); using game queue",
+                    static_cast<unsigned long>(priority_result));
+                trace(message);
+            }
+        }
         return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
     }
     CheekyFgPerformance performance() const noexcept override {
@@ -208,7 +238,11 @@ struct BufferedPresenter final : Presenter {
         auxiliary_chains.clear();
     }
     void reset() noexcept override {
+        // Stop/join both workers and drain their GPU fences before dropping the
+        // dedicated queue. A temporal reset only stops the workers; it keeps
+        // the queue available for the next interpolation session.
         stop();destroy_chains();Presenter::reset();
+        generation_queue.Reset();generation_high_priority=false;
     }
     void invalidate_temporal() noexcept override {
         stop();worker.reset();worker.failed=false;destroy_chains();
@@ -432,9 +466,22 @@ struct BufferedPresenter final : Presenter {
             if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
                previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
                previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height) {
-                generation_queue->Wait(producer.fence.Get(),job->ready);
+                // The snapshot is recorded on the game queue. Queue::Wait is
+                // GPU-side, so neither the game nor the FG CPU worker needs to
+                // block while capture finishes. It also covers the earlier
+                // game-queue guide writes that precede the snapshot signal.
+                const HRESULT ready_result=generation_queue->Wait(producer.fence.Get(),job->ready);
+                if(FAILED(ready_result)) {
+                    worker.failed=true;
+                    if(trace) {
+                        char message[160]{};
+                        sprintf_s(message,"DLSS-FG: GPU capture-fence queue wait failed (HRESULT 0x%08lx)",
+                            static_cast<unsigned long>(ready_result));
+                        trace(message);
+                    }
+                }
                 auto d=job->color[0]->texture->GetDesc();worker.trace=trace;worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
-                if(worker.initialize(device.Get(),generation_queue.Get(),unsigned(d.Width),d.Height,d.Format)) {
+                if(SUCCEEDED(ready_result)&&worker.initialize(device.Get(),generation_queue.Get(),unsigned(d.Width),d.Height,d.Format)) {
                     auto guides=job->guides;guides.producer_queue=generation_queue.Get();
                     if(previous->guide_token+2!=job->guide_token)reset_history=true;
                     if(previous->render_frame+1!=job->render_frame)reset_history=true;
@@ -491,7 +538,8 @@ struct BufferedPresenter final : Presenter {
                 telemetry=Presenter::performance();telemetry.copy_wait_ms=0;telemetry.xr_wait_ms=xr_ms;telemetry.xr_period_ms=period_ms;
                 telemetry.color_token=color_token;telemetry.guide_token=guide_token;telemetry.mismatched_guides=mismatches;
                 telemetry.color_render_frame=color_frame;telemetry.guide_render_frame=guide_frame;
-                telemetry.inference_color_format=unsigned(worker.focus.color_format);telemetry.shared_gpu_queue=1;
+                telemetry.inference_color_format=unsigned(worker.focus.color_format);
+                telemetry.shared_gpu_queue=generation_queue.Get()==queue.Get()?1u:0u;
                 if(worker.gpu_timings.valid) {
                     extra_gpu.publication_samples=worker.gpu_timings.samples;
                     extra_gpu.publication_ms=worker.gpu_timings.publication.mean();
@@ -552,8 +600,9 @@ struct BufferedPresenter final : Presenter {
         if(!stopping&&!raw&&(!pacing_active||(ticks%2)==0)) {
             if(pacing_active&&unsubmitted_native()) {
                 // Bound render-ahead at the already-existing pacing point.
-                // FG uses the game queue; another native render must not get
-                // in front of an older job still waiting for CPU submission.
+                // Even with a high-priority FG queue, avoid allowing a new
+                // native frame to render before the older FG job is submitted.
+                // Once queued, D3D12 priority and fences arbitrate GPU work.
                 if(!credit_deferred)++deferred_credits;credit_deferred=true;
             }else credits=std::min(2u,credits+(ticks==1?2u:1u));
         }

@@ -4,6 +4,29 @@ Runs Cheeky's DLSS processing with controls in UEVR. Remove ReShade from the gam
 
 ## Installation
 
+### Build a combined package from source
+
+Install Visual Studio C++ build tools (MSBuild and an x64 C++ toolset) and Inno
+Setup 6.3 or newer, then run this from the repository root:
+
+```powershell
+.\scripts\build-uevr-package.ps1 -Label release
+```
+
+This builds the Release solution, runs the tests, rebuilds the OpenXR layer
+installer, and packages the plugin DLL, processing runtime, Lua script, licenses,
+and `OpenXR/CheekyOpenXRSetup.exe` into
+`bin/Release/CheekyFoveatedDLSS-<version>-UEVR-release.zip`. The packager verifies
+every ZIP payload against its staged SHA-256 hash and prints the archive hash.
+An existing ZIP with the same version and label is replaced.
+
+Use `-SkipTests` to skip test execution, or
+`-IsccPath 'C:\path\to\ISCC.exe'` if Inno Setup is not found automatically.
+The installer is compiled during packaging; run the included installer separately
+to install the shared OpenXR layer.
+
+### Install the package
+
 1. Close the game. Use UEVR with plugin API **2.39.0 or compatible newer 2.x**.
 2. Uninstall ReShade from the game using the ReShade installer, and remove `CheekyFoveatedDLSS.addon64` if present.
 3. Open the game's configuration directory from UEVR—normally `%APPDATA%\UnrealVRMod\<game-executable-name>`—and extract the UEVR ZIP there, preserving this structure:
