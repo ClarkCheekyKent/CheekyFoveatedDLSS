@@ -713,6 +713,7 @@ void fg_copy_validation_test() {
 }
 #include "fg_hardware_probe.hpp"
 int main(int argc,char** argv) {
+    std::cout.setf(std::ios::unitbuf);
     try {
         if(argc>2 && (std::string(argv[1])=="--fg-capability" || std::string(argv[1])=="--fg-generate" || std::string(argv[1])=="--fg-buffered"||std::string(argv[1])=="--fg-motion")) {
             Microsoft::WRL::ComPtr<IDXGIFactory1> factory;

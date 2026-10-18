@@ -6,7 +6,7 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464735; // CFG5: explicit UEVR RHI render-frame identity
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464739; // CFG9: release milestones and repeat-submission experiment
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -36,6 +36,11 @@ struct CheekyFgPair {
     std::uint64_t capture_token{}; // Required input: token observed at color release.
     IUnknown* lease{}; // Retain until the consumer GPU has finished reading guides.
     std::uint64_t render_frame{}; // Required identity received with the color stamp.
+    std::uint32_t diagnostic_mode{}; // 0 normal, 1 prepare-first, 2 left-only, 3 right-only, 4 split-lists.
+    std::uint32_t enable_frame_id{1}; // Optional NGX BackbufferFrameID A/B; applied to each feature.
+    std::uint32_t fg_queue_priority{1}; // 0 separate NORMAL queue; 1 separate HIGH queue.
+    std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 stereo completion.
+    std::uint32_t submit_repeats{1}; // Resubmit unchanged scene content at runtime frame opportunities.
 };
 using CheekyFgAcquireFn=bool(__cdecl*)(CheekyFgPair*);
 using CheekyFgReleaseFn=void(__cdecl*)(CheekyFgPair*);

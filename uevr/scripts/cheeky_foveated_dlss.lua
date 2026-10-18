@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -492,6 +492,42 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
             end
             if draft.FgEnabled then
+                if draft.FgDiagnosticMode ~= nil then
+                    section("Stereo NGX diagnostic mode")
+                    combo("FG diagnostic mode", "FgDiagnosticMode", {
+                        [0]="Normal (both eyes)", [1]="Prepare both eyes first",
+                        [2]="Left NGX only", [3]="Right NGX only",
+                        [4]="Split NGX into two command lists"})
+                    if draft.FgDiagnosticMode == 2 or draft.FgDiagnosticMode == 3 then
+                        text("Diagnostics only: one eye uses a native center, not interpolated. Avoid normal VR play.")
+                    end
+                    if draft.FgDiagnosticMode == 4 then
+                        text("Two ordered submissions on the selected FG GPU queue; no extra fence wait.")
+                    end
+                    text("Applies live to the FG worker; logged as 'FG diagnostic mode=...'.")
+                end
+                if draft.FgBackbufferFrameId ~= nil then
+                    section("DLSS-G frame identity and GPU scheduling")
+                    check("Pass native BackbufferFrameID to NGX", "FgBackbufferFrameId")
+                    text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
+                end
+                if draft.FgQueuePriority ~= nil then
+                    combo("FG GPU queue priority", "FgQueuePriority", {
+                        [0]="Separate NORMAL queue", [1]="Separate HIGH queue"})
+                    text("Switches live after the previous FG job retires; recreates NGX histories and resets timings.")
+                end
+                if draft.FgReleasePoint ~= nil then
+                    combo("Release game rendering", "FgReleasePoint", {
+                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion"})
+                    text("Preparation waits for both eyes' GPU input preparation, then overlaps native rendering with NGX.")
+                elseif draft.FgWaitForCompletion ~= nil then
+                    check("Wait for FG completion before next frame", "FgWaitForCompletion")
+                    text("A/B test: holds the next native frame until both FG eyes finish. May reduce FPS.")
+                end
+                if draft.FgSubmitRepeats ~= nil then
+                    check("Submit repeat frames", "FgSubmitRepeats")
+                    text("OFF submits fresh content only; the runtime handles repeats. Native pacing continues independently.")
+                end
                 if draft.FgResolutionPercent ~= nil then
                     combo("FG scale", "FgResolutionPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                 end

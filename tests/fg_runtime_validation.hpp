@@ -86,6 +86,7 @@ void fg_runtime_frame_validation(HMODULE runtime,const std::filesystem::path& bi
     CheekyFgPair pair;pair.capture_token=s.token;pair.render_frame=78;
     require(!acquire(&pair),"Matching evaluation counters cannot override a different RHI frame identity");
     pair.render_frame=77;require(acquire(&pair)&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,"Both guides belong to the color's RHI frame");
+    require(pair.release_point==2&&pair.submit_repeats==0,"Lua completion gate reaches the real captured stereo pair");
     require(pair.eyes[0].depth_inverted&&pair.eyes[1].depth_inverted&&pair.eyes[0].motion_jittered&&pair.eyes[1].motion_jittered,
         "Signed creation flags survive a separate evaluation parameter object");release(&pair);
     begin();copy();submit();require(stamp(output.Get(),&s)&&s.render_frame==78,"Next color uses its own RHI frame");

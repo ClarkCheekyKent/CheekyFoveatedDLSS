@@ -93,9 +93,16 @@ void settings_tests(const std::filesystem::path& root) {
         Settings fg;
         require(!fg.fg.enabled && set_named_setting(fg,"FgEnabled","true") && fg.fg.enabled,
             "FG is opt-in and configurable");
+        require(fg.fg.release_point==0&&set_named_setting(fg,"FgWaitForCompletion","true")&&
+            fg.fg.release_point==2&&!set_named_setting(fg,"FgWaitForCompletion","invalid"),
+            "FG completion gate is opt-in and validates boolean values");
         require(set_named_setting(fg,"FgWidth","0.37") && set_named_setting(fg,"FgYOffset","-0.12") &&
             !set_named_setting(fg,"FgEnabled","invalid") && !set_named_setting(fg,"FgWidth","nan"),
             "FG settings validate types");
+        require(set_named_setting(fg,"FgReleasePoint","1")&&fg.fg.release_point==1&&
+            !set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
+            set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
+        require(set_named_setting(fg,"FgReleasePoint","2"),"Select completion for persistence");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","3")&&set_named_setting(fg,"FgDepthBits","16")&&
@@ -104,12 +111,17 @@ void settings_tests(const std::filesystem::path& root) {
         Settings restored;
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16,"FG settings survive restart");
+            restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
+            restored.fg.release_point==2&&!restored.fg.submit_repeats,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
-        require(reset_settings_group(restored,"fg") && !restored.fg.enabled,"FG reset restores opt-out");
+        require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==0,"FG reset restores opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
-        require(read_settings_file(path,restored,error) && !restored.fg.enabled,"Old profiles default FG off");
+        require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==0,"Old profiles default FG off");
+        {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgWaitForCompletion=1\n";}
+        require(read_settings_file(path,restored,error)&&restored.fg.release_point==2&&restored.fg.submit_repeats,"Migrate old completion checkbox");
+        {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgReleasePoint=1\nFgWaitForCompletion=1\n";}
+        require(read_settings_file(path,restored,error)&&restored.fg.release_point==1,"Explicit release point overrides legacy key");
         fg.fg.width=5;fg.fg.height=-1;fg.fg.feather=3;
         update_settings(fg);
         require(current_settings().fg.enabled && current_settings().fg.width==1 && current_settings().fg.height==0.2f &&
@@ -420,11 +432,14 @@ int main(int argc, char** argv) {
             control.abi=999;
             require(!control_fn(&control),"FG control rejects ABI mismatch");
             control=CheekyFgControl{};
-            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08");
+            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=2\nFgSubmitRepeats=false");
             require(control_fn(&control) && control.enabled && std::abs(field(snapshot(get),"FgWidth")-0.37)<0.00001,
                 "Lua protocol controls real FG runtime");
             command("1\n903\nset\nEnabled=false");
             fg_runtime_frame_validation(runtime,bin,device.Get(),queue.Get());
+            command("1\n905\nset\nFgReleasePoint=0\nFgSubmitRepeats=true");
+            require(snapshot(get).find("\"FgReleasePoint\":0")!=std::string::npos,
+                "Lua protocol restores overlapping native rendering");
             custom("cheeky.foveated_dlss.load.v1","false");present();
             require(fg_test_hook_removals==2&&fg_test_hook_targets.empty(),"Unload removes the plugin-owned frame hooks");
             require(control_fn(&control) && !control.enabled && snapshot(get).find("\"FgEnabled\":true")!=std::string::npos,

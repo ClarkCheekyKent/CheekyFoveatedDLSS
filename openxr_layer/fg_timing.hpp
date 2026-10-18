@@ -63,15 +63,24 @@ struct CommitWait {
 struct GpuTimings {
     // Processing [0,1], preparation/NGX/periphery pairs for each eye, then
     // immutable output publication [14,15] outside the processing subtotal.
-    // [16,31] are four preparation boundaries per eye/pass, sampled 1 in 17.
-    static constexpr unsigned main_query_count=16,query_count=32;
+    // [16,23] are four NGX boundaries per eye (always recorded).
+    // [24,39] are four preparation boundaries per eye/pass, sampled 1 in 17.
+    static constexpr unsigned main_query_count=16,ngx_detail_count=8;
+    static constexpr unsigned always_query_count=main_query_count+ngx_detail_count;
+    static constexpr unsigned query_count=always_query_count+16;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     std::uint64_t frequency{},samples{};
     TimingAverage preparation,center,periphery,total,publication;
     std::array<TimingAverage,2> eye_preparation;
+    // These use the existing NGX timestamp pairs [4,5] (left) and [10,11]
+    // (right), with no additional queries or synchronization. Separate eye
+    // identity from evaluation order: one eye alternates into the first slot.
+    std::array<TimingAverage,2> eye_center,center_by_position;
+    std::array<std::array<TimingAverage,3>,2> ngx_parts,ngx_by_position;
+    unsigned active_eye_mask{3};
     std::array<TimingAverage,2> preparation_by_first;
-    std::array<std::array<TimingAverage,2>,2> eye_preparation_by_first,center_dispatch_by_first;
+    std::array<std::array<TimingAverage,2>,2> eye_preparation_by_first,center_dispatch_by_first,eye_center_by_first;
     std::array<std::uint64_t,2> order_samples{},order_detail_samples{};
     unsigned first_eye{};
     // Sampled independently of the main 60-frame window: eye * 2 + pass,
@@ -84,7 +93,8 @@ struct GpuTimings {
     bool valid{};
     void reset() noexcept {
         heap.Reset();readback.Reset();frequency=samples=0;
-        preparation={};center={};periphery={};total={};publication={};eye_preparation={};foveated_eyes=0;valid=false;
+        preparation={};center={};periphery={};total={};publication={};eye_preparation={};
+        eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};active_eye_mask=3;foveated_eyes=0;valid=false;
         preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
         preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};first_eye=0;
         record_preparation=preparation_valid=false;
@@ -108,23 +118,26 @@ struct GpuTimings {
     void stamp(ID3D12GraphicsCommandList* list,unsigned index) noexcept {
         if(supported())list->EndQuery(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,index);
     }
+    void ngx_stamp(ID3D12GraphicsCommandList* list,unsigned eye,unsigned phase) noexcept {
+        stamp(list,main_query_count+eye*4+phase);
+    }
     void begin(ID3D12GraphicsCommandList* list) noexcept {
         valid=preparation_valid=false;record_preparation=supported()&&(samples%17)==0;
         first_eye=unsigned(samples&1);
         stamp(list,0);
     }
     void preparation_stamp(ID3D12GraphicsCommandList* list,unsigned eye,unsigned pass,unsigned phase) noexcept {
-        if(record_preparation)stamp(list,main_query_count+(eye*2+pass)*4+phase);
+        if(record_preparation)stamp(list,always_query_count+(eye*2+pass)*4+phase);
     }
     void resolve(ID3D12GraphicsCommandList* list) noexcept {
         if(supported())list->ResolveQueryData(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,
-            record_preparation?query_count:main_query_count,readback.Get(),0);
+            record_preparation?query_count:always_query_count,readback.Get(),0);
     }
     // Caller has already completed the ordinary generation fence wait. Reading
     // telemetry must not add another wait, flush or command-list submission.
     bool collect(unsigned focused_eyes,bool copied_output=true) noexcept {
         valid=preparation_valid=false;if(!supported())return false;
-        const unsigned count=record_preparation?query_count:main_query_count;
+        const unsigned count=record_preparation?query_count:always_query_count;
         void* mapped{};D3D12_RANGE range{0,count*sizeof(std::uint64_t)};
         if(FAILED(readback->Map(0,&range,&mapped))||!mapped)return false;
         std::array<std::uint64_t,query_count> ticks{};
@@ -137,22 +150,47 @@ struct GpuTimings {
         // Reject incomplete/unordered samples instead of showing fabricated 0ms.
         if(!std::isfinite(whole)||whole<=0||prep+ngx+edge>whole+0.001)return false;
         if(samples&&foveated_eyes!=focused_eyes) {
-            preparation={};center={};periphery={};total={};publication={};eye_preparation={};samples=0;
+            preparation={};center={};periphery={};total={};publication={};eye_preparation={};
+            eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};samples=0;
             preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
             preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};
         }
+        // The subregions must remain ordered and bounded by the legacy NGX
+        // interval; discard a malformed window instead of logging bad timing.
+        std::array<std::array<double,3>,2> ngx_sub{};
+        for(unsigned eye=0;eye<2;++eye) {
+            const unsigned base=main_query_count+eye*4,outer=4+eye*6;
+            if(!ticks[base]||ticks[base]<ticks[outer]||ticks[base+3]>ticks[outer+1])return false;
+            for(unsigned part=0;part<3;++part) {
+                if(ticks[base+part+1]<ticks[base+part])return false;
+                ngx_sub[eye][part]=double(ticks[base+part+1]-ticks[base+part])*1000.0/double(frequency);
+            }
+        }
         preparation.add(prep);center.add(ngx);periphery.add(edge);total.add(whole);
+        for(unsigned eye=0;eye<2;++eye)
+            if(active_eye_mask&(1u<<eye))for(unsigned part=0;part<3;++part) {
+                ngx_parts[eye][part].add(ngx_sub[eye][part]);
+                ngx_by_position[eye==first_eye?0:1][part].add(ngx_sub[eye][part]);
+            }
         // Direct composition has no publication copy. Its final transition is
         // already inside the measured composition scope; adjacent timestamps
         // must not turn an omitted operation into a fabricated copy cost.
         publication.add(copied_output?ms(14):0);
         eye_preparation[0].add(ms(2));eye_preparation[1].add(ms(8));
+        // Preserve the exact same sample admission rules as the HUD's combined
+        // center metric, so left+right averages remain directly comparable.
+        const double left_center=ms(4),right_center=ms(10);
+        eye_center[0].add(left_center);eye_center[1].add(right_center);
+        center_by_position[0].add(first_eye?right_center:left_center);
+        center_by_position[1].add(first_eye?left_center:right_center);
+        eye_center_by_first[first_eye][0].add(left_center);
+        eye_center_by_first[first_eye][1].add(right_center);
         preparation_by_first[first_eye].add(prep);++order_samples[first_eye];
         for(unsigned eye=0;eye<2;++eye)eye_preparation_by_first[first_eye][eye].add(ms(2+eye*6));
         if(record_preparation) {
             std::array<std::array<double,3>,4> parts{};double covered{};bool ordered=true;
             for(unsigned pass=0;pass<4;++pass) {
-                const auto base=main_query_count+pass*4,outer=2+(pass/2)*6;
+                const auto base=always_query_count+pass*4,outer=2+(pass/2)*6;
                 ordered&=ticks[base]>=ticks[outer]&&ticks[base+3]<=ticks[outer+1];
                 for(unsigned phase=0;phase<3;++phase) {
                     if(!ticks[base+phase]||ticks[base+phase+1]<ticks[base+phase]){ordered=false;continue;}

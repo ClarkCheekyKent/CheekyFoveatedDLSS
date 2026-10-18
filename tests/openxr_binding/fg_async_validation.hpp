@@ -58,7 +58,11 @@ struct Runtime {
     }
     static bool __cdecl missing_stamp(ID3D12Resource*,CheekyFgCaptureStamp* out){out->token=out->render_frame=0;return true;}
     static bool __cdecl acquire_guides(CheekyFgPair* out) {
-        if(snapshots)return snapshots->acquire(*out);
+        if(snapshots){
+            const bool acquired=snapshots->acquire(*out);
+            if(acquired){out->release_point=guides.release_point;out->submit_repeats=guides.submit_repeats;}
+            return acquired;
+        }
         const auto expected=out->capture_token;*out=guides;out->capture_token=expected;
         out->render_frame=expected/2;out->eyes[0].evaluation=expected-1;out->eyes[1].evaluation=expected;
         for(auto& eye:out->eyes)eye.render_frame=out->render_frame;return true;
@@ -270,9 +274,74 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         ordered.ticks=6;ordered.credits=0;ordered.inflight_id=7;ordered.wake_producer();ordered.stopping=true;ordered.inference_submitted();
         check(ordered.credits==0,"Shutdown must not release a deferred render credit");
     }
+    {
+        P held;held.started=true;held.credits=2;held.pacing_active=true;held.ticks=2;
+        auto job=std::make_shared<P::Native>();job->id=5;job->guides_valid=true;job->guides.release_point=2;
+        held.pending.push_back(job);held.wake_producer();
+        check(held.release_gate_active()&&held.credits==2&&held.credit_deferred,
+            "Completion policy must block pre-existing credits before worker pickup");
+        held.pending.clear();held.inflight_id=5;held.inflight_release_point=2;held.submitted_native_id=4;
+        held.inference_submitted();
+        check(held.release_gate_active()&&held.credit_deferred&&held.released_deferred_credits==0,
+            "FG submission must not release a completion-held native frame");
+        held.ticks=4;held.wake_producer();
+        check(held.credit_deferred&&held.credits==2,"Ordinary pacing must not bypass the completion hold");
+        std::atomic<bool> returned{};XrResult result{};XrFrameState state{XR_TYPE_FRAME_STATE};
+        std::thread waiter([&]{result=held.wait_frame(nullptr,&state);returned=true;});
+        bool waiting{};
+        for(unsigned i=0;i<1000&&!waiting;++i){
+            {std::lock_guard lock(held.mx);waiting=held.app_waiters!=0;}
+            if(!waiting)Sleep(1);
+        }
+        const bool blocked=waiting&&!returned;
+        {std::lock_guard lock(held.mx);held.inflight_id=0;held.inflight_release_point=0;
+            held.release_deferred_credit();held.changed.notify_all();}
+        waiter.join();
+        check(blocked&&XR_SUCCEEDED(result)&&held.released_deferred_credits==1,
+            "xrWaitFrame with an existing credit must wait until stereo FG retirement");
+        // Reproduce a wait credit consumed before the previous frame handed off.
+        held.waited=2;held.begun=held.ended=1;held.inflight_id=6;held.inflight_release_point=2;
+        std::atomic<bool> entered{};returned=false;
+        std::thread beginner([&]{entered=true;result=held.begin_frame(nullptr);returned=true;});
+        while(!entered)Sleep(1);Sleep(10);const bool begin_blocked=!returned;
+        {std::lock_guard lock(held.mx);held.inflight_id=0;held.inflight_release_point=0;held.changed.notify_all();}
+        beginner.join();
+        check(begin_blocked&&XR_SUCCEEDED(result)&&held.begun==2,
+            "A pipelined pre-consumed wait credit must not bypass the hold at xrBeginFrame");
+        job->guides_valid=false;held.pending.push_back(job);
+        check(!held.release_gate_active(),"Invalid guides must preserve native fallback");
+        held.pending.clear();held.inflight_id=7;held.inflight_release_point=2;held.degraded=true;
+        check(!held.release_gate_active(),"Degraded/native fallback must release the completion gate");
+        held.degraded=false;held.stopping=true;const auto credits=held.credits;
+        check(held.wait_frame(nullptr,&state)==XR_ERROR_SESSION_NOT_RUNNING&&held.credits==credits,
+            "Shutdown must wake completion-held frames without consuming a credit");
+    }
+    {
+        P prepared;prepared.inflight_id=9;prepared.inflight_release_point=1;
+        prepared.credits=0;prepared.credit_deferred=true;
+        check(prepared.release_gate_active(),"Preparation gate blocks before submission");
+        prepared.inference_submitted();
+        check(prepared.release_gate_active()&&prepared.credits==0,"CPU submission is not GPU preparation completion");
+        prepared.inference_prepared();
+        check(!prepared.release_gate_active()&&prepared.credits==1&&prepared.inflight_id==9,
+            "GPU preparation releases producer while stereo FG remains in flight");
+        prepared.inference_prepared();check(prepared.credits==1,"Preparation callback cannot duplicate credits");
+        prepared.inflight_release_point=2;prepared.credit_deferred=true;
+        prepared.inference_prepared();check(prepared.release_gate_active(),"Completion policy cannot release at preparation");
+    }
+    {
+        P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=8.333333;
+        clock.submit_repeat_frames=false;
+        std::thread pacer([&]{clock.pacing_loop();});
+        bool delivered{};{std::unique_lock lock(clock.mx);delivered=clock.changed.wait_for(lock,seconds(1),[&]{return clock.credits>0;});
+            clock.stopping=true;clock.changed.notify_all();}
+        pacer.join();check(delivered&&clock.ticks==0,"Native clock must deliver credits without any XR or repeat submissions");
+    }
     std::cout<<"PASS bounded late FG wait: baseline race, completion wake, timeout, refresh budget and single pacing credit; native/generated/repeat capture ages\n";
     std::cout<<"PASS ready-pair late selection: useful completed pairs bypass new-publication waits, stale pairs cannot rewind, source age decomposes into completion and residence\n";
     std::cout<<"PASS FG submission backpressure: next render waits for older FG enqueue, not GPU completion; retirement/fallback releases, no duplicate credits or shutdown wake\n";
+    std::cout<<"PASS FG completion gate: pending/in-flight holds, submit and pacing paths, existing/pipelined credits, retirement, fallback and shutdown\n";
+    std::cout<<"PASS FG preparation milestone and independent native clock without XR submissions\n";
 }
 
 void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,unsigned method=2) {
@@ -374,6 +443,11 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     // Block the GPU, then verify multiple application submissions still return.
     // Signal before assertions so a failed check cannot strand queue teardown.
     queue->Wait(blocked.Get(),1);double maximum_handoff{};bool accepted=true;
+    // Native Wait/Begin now deliberately enforce the submission milestone.
+    // Release this synthetic GPU blockage independently of that app loop;
+    // continue measuring only capture/end-frame's nonblocking handoff.
+    struct InitialRelease {std::thread thread;~InitialRelease(){if(thread.joinable())thread.join();}} initial_release{
+        std::thread([gate=blocked]{Sleep(80);gate->Signal(1);})};
     for(unsigned frame=0;frame<7;++frame) {
         accepted&=XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin));end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
         const auto start=cheeky::fg::TimingClock::now();
@@ -383,6 +457,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         quad.size.width=99;Sleep(1);quad.size.width=1;
     }
     blocked->Signal(1);
+    initial_release.thread.join();
     check(accepted,"Buffered submissions must succeed while producer GPU work is blocked");
     check(maximum_handoff<40,"Game handoff must not wait for the blocked producer fence or inference completion");
     for(unsigned frame=0;frame<(models?1000u:5u);++frame) {
@@ -392,6 +467,21 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),"Buffered capture reuse");
         check(XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Buffered handoff");quad.size.width=99;Sleep(1);quad.size.width=1;
         if(models&&frame>=24&&Runtime::generated>=4)break;
+    }
+    if(!models) {
+        {std::lock_guard lock(p.mx);p.submit_repeat_frames=false;p.changed.notify_all();}
+        for(unsigned frame=0;frame<8;++frame) {
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"No-repeat native clock progression");
+            end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;
+            check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"No-repeat native content");
+        }
+        Sleep(50);const auto submitted=Runtime::ends.load();Sleep(40);
+        check(Runtime::ends==submitted,"No new content must mean no further XR frame submissions, including empty frames");
+        {std::lock_guard lock(p.mx);p.submit_repeat_frames=true;p.changed.notify_all();}
+        Sleep(40);check(Runtime::ends>submitted,"Repeat submissions can resume live");
+        std::cout<<"PASS no-repeat native fallback: fresh images advance; stalled content produces zero XR submissions; live re-enable\n";
     }
     if(models) {
         p.guide_stamp=Runtime::missing_stamp;
@@ -445,6 +535,63 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             {std::lock_guard lock(p.mx);check(p.deferred_credits>deferred_before&&p.released_deferred_credits>released_before,
                 "A real blocked inference queue must defer render-ahead and release it through the submission/retirement path");}
             std::cout<<"PASS physical GPU queue pressure: unsent FG backpressure exercised, game resumed without fence waits on its thread\n";
+            Runtime::guides.release_point=2;
+            auto submit_native=[&] {
+                end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
+                check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                    p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                    XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Completion-held native handoff");
+            };
+            // Apply the live option to actual captured guide pairs first.
+            for(unsigned frame=0;frame<2;++frame){
+                check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Enable live completion hold");
+                submit_native();
+            }
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Prepare completion-gate pressure frame");
+            ComPtr<ID3D12Fence> gate;
+            check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)))&&
+                SUCCEEDED(p.generation_queue->Wait(gate.Get(),1)),"Block only the FG queue until the timed release");
+            Releaser completion_release{std::thread([gate]{Sleep(80);gate->Signal(1);})};
+            submit_native();
+            const auto held_result=p.wait_frame(&wait,&state);
+            const bool gpu_released=gate->GetCompletedValue()>=1;
+            bool retired{};{std::lock_guard lock(p.mx);retired=p.inflight_id==0&&p.pending.empty();}
+            completion_release.thread.join();
+            check(XR_SUCCEEDED(held_result)&&gpu_released&&retired,
+                "Next native credit must wait for actual FG GPU completion, not just command submission");
+            check(XR_SUCCEEDED(p.begin_frame(&begin)),"Resume after FG GPU completion");submit_native();
+            Runtime::guides.release_point=0;
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Disable live completion hold");
+            submit_native();
+            for(unsigned point:{0u,1u,2u})for(bool repeats:{true,false}) {
+                Runtime::guides.release_point=point;Runtime::guides.submit_repeats=repeats?1u:0u;
+                std::uint64_t repeat_baseline{};
+                for(unsigned frame=0;frame<40;++frame){
+                    check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Live release/repeat experiment frame");
+                    submit_native();
+                    if(frame==5){std::lock_guard lock(p.mx);repeat_baseline=p.repeated_presentations;}
+                }
+                {std::unique_lock lock(p.mx);
+                    check(p.changed.wait_for(lock,std::chrono::seconds(2),[&]{return p.inflight_id==0&&p.pending.empty();}),"Experiment GPU retirement");
+                    check(p.active_release_point==point&&p.submit_repeat_frames==repeats,"Live experiment settings reach presenter");
+                    if(point==1)check(p.worker.prepared_serial>0&&p.worker.prepared_serial<p.worker.serial&&
+                        p.worker.fence->GetCompletedValue()>=p.worker.serial,"Both-eye GPU preparation fence precedes final stereo fence");
+                    if(!repeats)check(p.repeated_presentations==repeat_baseline,"Fresh-only mode must skip duplicate native prefixes before generated frames too");
+                }
+                if(!repeats){
+                    Sleep(50);const auto submitted=Runtime::ends.load();Sleep(40);
+                    check(Runtime::ends==submitted,"Fresh-only FG must stop runtime frame calls while input is paused");
+                }
+                std::cout<<"PASS physical experiment: release="<<point<<" repeat_submissions="<<repeats<<"\n";
+            }
+            Runtime::guides.release_point=0;Runtime::guides.submit_repeats=1;
+            // Policy changes clear GPU timing windows. Refill both alternating
+            // execution orders and the 17-frame detailed sampling cadence.
+            for(unsigned frame=0;frame<36;++frame){
+                check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Resume normal overlap after live OFF");
+                submit_native();
+            }
+            std::cout<<"PASS physical GPU completion gate: live ON/OFF, blocked FG fence holds the next native frame until stereo work retires\n";
         }
     }
     Sleep(40);
@@ -476,7 +623,8 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     check(Runtime::errors==0&&Runtime::waits==Runtime::begins&&Runtime::begins==Runtime::ends,
         "Exactly one background owner must balance runtime Wait/Begin/End and retain helper/UI descriptions");
     check(Runtime::owner!=GetCurrentThreadId()&&Runtime::scenes>0,"Presentation must run independently of the game");
-    check(p.skipped>0,"Busy slots must skip publication instead of waiting for GPU completion");
+    // Submission backpressure can now prevent startup ring exhaustion. The
+    // explicitly occupied inference slots below exercise busy publication.
     if(models){
         check(Runtime::generated>0,"Real NGX output must reach the buffered runtime presentation loop");
         check(p.output.serial==0,"Generated snapshots must share the inference submission; no copy may be queued after its CPU completion wait");
@@ -526,6 +674,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Busy inference must permit native-only publication");
     }
     Sleep(25);p.stop();busy={};
+    check(p.skipped>0,"Explicitly occupied inference slots must skip FG publication without blocking native handoff");
     check(Runtime::scenes>native_before&&Runtime::errors==0,"Native images must reach the headset while every inference lease is occupied");
     std::cout<<"PASS independent native mailbox while every FG transport lease is busy\n";
     // Restart and forward an unknown extension while its stack data is alive.
@@ -548,7 +697,11 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     }
     check(Runtime::raw_frames>raw_before,"Private swapchain failure must reach original native presentation");
     Runtime::paused=true;
-    {std::lock_guard lock(failed.mx);failed.credits=0;}
+    {std::lock_guard lock(failed.mx);failed.credits=0;
+        // Pausing the runtime no longer pauses native credits. Hold an
+        // already-waited frame before Begin so this second Wait is reliably
+        // blocked on call order while testing cancellation by Stop.
+        ++failed.waited;}
     XrResult interrupted=XR_SUCCESS;
     std::thread waiting([&]{XrFrameState f{XR_TYPE_FRAME_STATE};interrupted=failed.wait_frame(&wait,&f);});
     bool blocked_wait{};

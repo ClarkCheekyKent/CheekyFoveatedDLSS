@@ -300,8 +300,18 @@ extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair* out) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!out || out->abi!=CHEEKY_FG_PAIR_ABI || out->size!=sizeof(CheekyFgPair)||!enabled())return false;
+    // Capture the persisted UEVR Lua setting alongside this guide pair.
+    // Read settings before taking the snapshot mutex (consistent with enabled()).
+    const auto settings=current_settings().fg;
+    const auto mode=settings.diagnostic_mode;
     std::lock_guard lock(mutex);
-    return snapshots().acquire(*out);
+    if(!snapshots().acquire(*out))return false;
+    out->diagnostic_mode=mode;
+    out->enable_frame_id=settings.backbuffer_frame_id ? 1u : 0u;
+    out->fg_queue_priority=settings.queue_priority == 0u ? 0u : 1u;
+    out->release_point=settings.release_point<=2u?settings.release_point:0u;
+    out->submit_repeats=settings.submit_repeats?1u:0u;
+    return true;
 }
 extern "C" __declspec(dllexport) void __cdecl CheekyFG_ReleasePair(CheekyFgPair* p) noexcept {
     if(!p||p->abi!=CHEEKY_FG_PAIR_ABI)return;

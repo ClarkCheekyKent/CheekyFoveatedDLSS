@@ -53,12 +53,14 @@ struct BufferedPresenter final : Presenter {
     };
     std::condition_variable_any changed;
     std::mutex capture_mutex;
-    std::thread presentation_thread,generation_thread;
+    std::thread presentation_thread,generation_thread,pacing_thread;
     Transport producer,output,uploads;
     // Dedicated HIGH-priority queue for inference only. The OpenXR binding,
     // guide capture and swapchain uploads must keep using the application's
     // original queue; D3D12 GPU fences order work across the two queues.
     ComPtr<ID3D12CommandQueue> generation_queue;
+    ComPtr<ID3D12CommandQueue> fg_high_queue,fg_normal_queue;
+    unsigned last_fg_priority_requested{UINT32_MAX};
     bool generation_high_priority{};
     std::unordered_map<XrSwapchain,Image> captured;
     std::unordered_map<XrSwapchain,std::uint64_t> capture_tokens;
@@ -83,6 +85,8 @@ struct BufferedPresenter final : Presenter {
     std::array<TimingAverage,4> generation_stages;
     std::uint64_t deferred_credits{},released_deferred_credits{},submitted_native_id{};
     bool credit_deferred{};
+    unsigned inflight_release_point{},last_release_point{},active_release_point{};
+    bool inflight_prepared{},release_policy_known{},submit_repeat_frames{true},clock_pacing_active{};
     double late_wait_budget_ms{};
     TimingAverage producer_cpu,pacing_wait;
     TimingAverage app_image_wait,present_image_wait,runtime_begin,runtime_end,present_cpu;
@@ -126,20 +130,21 @@ struct BufferedPresenter final : Presenter {
         fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
         fg_desc.Flags=D3D12_COMMAND_QUEUE_FLAG_NONE;
         fg_desc.NodeMask=game_desc.NodeMask;
-        ComPtr<ID3D12CommandQueue> high_queue;
-        const HRESULT priority_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&high_queue));
-        generation_high_priority=SUCCEEDED(priority_result)&&high_queue.Get()!=nullptr;
-        if(generation_high_priority) {
-            generation_queue=std::move(high_queue);
-            if(trace)trace("DLSS-FG: dedicated HIGH-priority D3D12 direct queue active; capture and OpenXR uploads stay on the game queue");
-        } else {
-            generation_queue=q;
-            if(trace) {
-                char message[192]{};
-                sprintf_s(message,"DLSS-FG: HIGH-priority queue unavailable (HRESULT 0x%08lx); using game queue",
-                    static_cast<unsigned long>(priority_result));
-                trace(message);
-            }
+        const HRESULT high_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_high_queue));
+        fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+        const HRESULT normal_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_normal_queue));
+        // The default remains HIGH. NORMAL is a separate queue, not a return to
+        // the game's capture queue (which regressed guide preparation).
+        generation_queue=fg_high_queue.Get() ? fg_high_queue.Get() : fg_normal_queue.Get() ? fg_normal_queue.Get() : q;
+        generation_high_priority=fg_high_queue.Get()!=nullptr&&generation_queue.Get()==fg_high_queue.Get();
+        last_fg_priority_requested=UINT32_MAX;
+        if(trace) {
+            char message[240]{};
+            sprintf_s(message,"DLSS-FG queue A/B: HIGH=%s(0x%08lx), separate NORMAL=%s(0x%08lx); active=%s; capture remains game queue",
+                fg_high_queue?"available":"FAILED",static_cast<unsigned long>(high_result),
+                fg_normal_queue?"available":"FAILED",static_cast<unsigned long>(normal_result),
+                generation_high_priority?"HIGH":fg_normal_queue?"NORMAL":"shared fallback");
+            trace(message);
         }
         return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
     }
@@ -219,6 +224,7 @@ struct BufferedPresenter final : Presenter {
         {std::lock_guard lock(mx);stopping=true;changed.notify_all();}
         if(presentation_thread.joinable())presentation_thread.join();
         if(generation_thread.joinable())generation_thread.join();
+        if(pacing_thread.joinable())pacing_thread.join();
         std::lock_guard capture_lock(capture_mutex);
         producer.drain();output.drain();uploads.drain();worker.wait_idle();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();slots={};
@@ -230,6 +236,7 @@ struct BufferedPresenter final : Presenter {
         late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
         late_ready_skips=late_idle_skips=0;capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
+        inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
         distinct_native=repeated_presentations=runtime_submissions=0;
     }
     void destroy_chains() noexcept {
@@ -242,7 +249,8 @@ struct BufferedPresenter final : Presenter {
         // dedicated queue. A temporal reset only stops the workers; it keeps
         // the queue available for the next interpolation session.
         stop();destroy_chains();Presenter::reset();
-        generation_queue.Reset();generation_high_priority=false;
+        generation_queue.Reset();fg_high_queue.Reset();fg_normal_queue.Reset();generation_high_priority=false;
+        last_fg_priority_requested=UINT32_MAX;
     }
     void invalidate_temporal() noexcept override {
         stop();worker.reset();worker.failed=false;destroy_chains();
@@ -257,7 +265,8 @@ struct BufferedPresenter final : Presenter {
         if(started)return true;
         stopping=false;terminal=XR_SUCCESS;raw_done=false;
         try {
-            started=true;
+            started=true;clock_pacing_active=true;
+            pacing_thread=std::thread([this]{pacing_loop();});
             generation_thread=std::thread([this]{generation_loop();});
             presentation_thread=std::thread([this]{presentation_loop();});
         } catch(...) {stopping=true;changed.notify_all();return false;}
@@ -270,7 +279,7 @@ struct BufferedPresenter final : Presenter {
         if(!start())return XR_ERROR_RUNTIME_FAILURE;
         const auto wait_begin=TimingClock::now();
         ++app_waiters;
-        changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw);});
+        changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw&&!release_gate_active());});
         --app_waiters;
         pacing_wait.add(elapsed_ms(wait_begin));
         if(stopping||XR_FAILED(terminal))return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
@@ -288,7 +297,9 @@ struct BufferedPresenter final : Presenter {
         if(info&&info->next)return XR_ERROR_VALIDATION_FAILURE;
         std::unique_lock lock(mx);
         if(waited==begun)return XR_ERROR_CALL_ORDER_INVALID;
-        changed.wait(lock,[&]{return stopping||begun==ended;});
+        // A pipelined xrWaitFrame may already have consumed a credit before
+        // the previous end_frame enqueues its FG job. Gate begin_frame too.
+        changed.wait(lock,[&]{return stopping||(begun==ended&&!release_gate_active());});
         if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();return XR_SUCCESS;
     }
@@ -450,12 +461,38 @@ struct BufferedPresenter final : Presenter {
     }
     void generation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky FG completion");
-        std::shared_ptr<Native> previous;bool reset_history=true;
+        std::shared_ptr<Native> previous;bool reset_history=true,last_repeat_policy=true;
         try {for(;;) {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
-             job=pending.back();inflight_id=job->id;skipped+=pending.size()-1;
+             job=pending.back();inflight_id=job->id;
+             inflight_release_point=job->guides_valid?job->guides.release_point:0u;inflight_prepared=false;
+             if(job->guides_valid){
+                 if(submit_repeat_frames!=(job->guides.submit_repeats!=0)||active_release_point!=job->guides.release_point)cadence_window={};
+                 submit_repeat_frames=job->guides.submit_repeats!=0;active_release_point=job->guides.release_point;
+             }changed.notify_all();
+             skipped+=pending.size()-1;
              for(auto& dropped:pending)if(dropped!=job)dropped->clear_guides();pending.clear();}
+            if(job->guides_valid) {
+                const auto point=job->guides.release_point;
+                const bool changed_policy=!release_policy_known||last_release_point!=point;
+                if(changed_policy) {
+                    if(release_policy_known&&worker.device&&worker.queue)
+                        worker.gpu_timings.initialize(worker.device.Get(),worker.queue.Get());
+                    last_release_point=point;
+                    if(trace)trace(point==2u?"FG native release=after stereo GPU completion (Lua; histories retained)":
+                        point==1u?"FG native release=after both-eye GPU preparation (Lua; histories retained)":
+                        "FG native release=after submission (Lua; default overlap)");
+                }
+                if(!release_policy_known||last_repeat_policy!=(job->guides.submit_repeats!=0)) {
+                    last_repeat_policy=job->guides.submit_repeats!=0;
+                    if(!changed_policy&&worker.device&&worker.queue)
+                        worker.gpu_timings.initialize(worker.device.Get(),worker.queue.Get());
+                    if(trace)trace(last_repeat_policy?"FG repeat submissions=ON (independent native clock)":
+                        "FG repeat submissions=OFF (fresh content only; independent native clock)");
+                }
+                release_policy_known=true;
+            }
             Pair pair;pair.native_id=pair.current_id=job->id;pair.native=pair.current=job->color;
             pair.native_captured=pair.current_captured=job->captured_at;
             pair.handed_off_at=job->handed_off_at;pair.worker_started_at=TimingClock::now();
@@ -470,6 +507,33 @@ struct BufferedPresenter final : Presenter {
                 // GPU-side, so neither the game nor the FG CPU worker needs to
                 // block while capture finishes. It also covers the earlier
                 // game-queue guide writes that precede the snapshot signal.
+                // Lua setting travels with this native stereo pair. Switch queues
+                // only on the single generation worker after the previous fence
+                // has retired; recreating NGX handles prevents cross-queue history
+                // hazards and makes the A/B measurements independent.
+                const unsigned requested_priority=job->guides.fg_queue_priority==0u?0u:1u;
+                ID3D12CommandQueue* requested=requested_priority==0u?fg_normal_queue.Get():fg_high_queue.Get();
+                ID3D12CommandQueue* selected=requested ? requested : (fg_high_queue.Get()?fg_high_queue.Get():fg_normal_queue.Get()?fg_normal_queue.Get():queue.Get());
+                if(selected!=generation_queue.Get()) {
+                    worker.wait_idle();worker.reset();generation_queue=selected;
+                    generation_high_priority=fg_high_queue.Get()!=nullptr&&selected==fg_high_queue.Get();
+                    reset_history=true;
+                    if(trace)trace(generation_high_priority?"DLSS-FG queue mode=HIGH (Lua; NGX histories reset)":
+                        selected==fg_normal_queue.Get()?"DLSS-FG queue mode=separate NORMAL (Lua; NGX histories reset)":
+                        "DLSS-FG queue mode=game fallback (Lua; NGX histories reset)");
+                }
+                if(last_fg_priority_requested!=requested_priority) {
+                    last_fg_priority_requested=requested_priority;
+                    if(trace) {
+                        char msg[176]{};
+                        sprintf_s(msg,"DLSS-FG queue request=%s selected=%s fallback=%u",
+                            requested_priority==0u?"NORMAL":"HIGH",
+                            generation_queue.Get()==fg_high_queue.Get()&&fg_high_queue.Get()?"HIGH":
+                            generation_queue.Get()==fg_normal_queue.Get()&&fg_normal_queue.Get()?"separate NORMAL":"game queue",
+                            selected!=requested?1u:0u);
+                        trace(msg);
+                    }
+                }
                 const HRESULT ready_result=generation_queue->Wait(producer.fence.Get(),job->ready);
                 if(FAILED(ready_result)) {
                     worker.failed=true;
@@ -501,7 +565,9 @@ struct BufferedPresenter final : Presenter {
                     if(available) {
                         success=worker.generate(guides,input,prior,cameras,result,&copies,[](void* context) noexcept {
                             static_cast<BufferedPresenter*>(context)->inference_submitted();
-                        },this);attempted=!worker.failed;
+                        },this,[](void* context) noexcept {
+                            static_cast<BufferedPresenter*>(context)->inference_prepared();
+                        });attempted=!worker.failed;
                         pair.submitted_at=worker.submitted_at;
                         for(unsigned eye=0;eye<2;++eye) {
                             pair.generated[eye]->state=copies[eye].state;
@@ -521,7 +587,7 @@ struct BufferedPresenter final : Presenter {
                 // guides. Release completed leases now instead of pinning raw
                 // textures in reusable slots or temporal history indefinitely.
                 if(!worker.fence||worker.fence->GetCompletedValue()>=worker.serial)job->clear_guides();
-                inflight_id=0;
+                inflight_id=0;inflight_release_point=0;inflight_prepared=false;
                 release_deferred_credit();
                 if(job->epoch!=epoch||degraded){previous.reset();reset_history=true;continue;}
                 ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();
@@ -555,7 +621,7 @@ struct BufferedPresenter final : Presenter {
                 else strcpy_s(diagnostic,worker.diagnostic);changed.notify_all();}
             previous=std::move(job);
         }}catch(...) {std::lock_guard lock(mx);state=CheekyFgState::generation_failed;degraded=true;fg_active=pacing_active=false;
-            discard_pending();ready.clear();inflight_id=0;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
+            discard_pending();ready.clear();inflight_id=0;inflight_release_point=0;inflight_prepared=false;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
         worker.wait_idle();output.drain();
     }
     bool ensure_chain(Chain& chain,const Image& image) {
@@ -594,32 +660,72 @@ struct BufferedPresenter final : Presenter {
         return released&&copied;
     }
     void wake_producer_locked() {
+        if(clock_pacing_active){changed.notify_all();return;}
         // Early late-selection wake and ordinary submission share one credit.
         if(last_credit_tick==ticks)return;
         last_credit_tick=ticks;
         if(!stopping&&!raw&&(!pacing_active||(ticks%2)==0)) {
-            if(pacing_active&&unsubmitted_native()) {
-                // Bound render-ahead at the already-existing pacing point.
-                // Even with a high-priority FG queue, avoid allowing a new
-                // native frame to render before the older FG job is submitted.
-                // Once queued, D3D12 priority and fences arbitrate GPU work.
+            if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
+                // Default: hold until FG submission. The opt-in completion
+                // policy holds through both eyes' ordinary completion fence.
+                // Coalesce pacing ticks while either policy blocks production.
                 if(!credit_deferred)++deferred_credits;credit_deferred=true;
             }else credits=std::min(2u,credits+(ticks==1?2u:1u));
         }
         changed.notify_all();
     }
+    void pacing_loop() noexcept {
+        SetThreadDescription(GetCurrentThread(),L"Cheeky native pacing");
+        try {
+            std::unique_lock lock(mx);
+            // The first game credit needs a real runtime prediction. Do not
+            // let the independent clock expose an uninitialized frame state.
+            changed.wait(lock,[&]{return stopping||telemetry.xr_period_ms>0;});
+            auto next=TimingClock::now();
+            while(!stopping) {
+                const auto now=TimingClock::now();
+                if(now>=next) {
+                    const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
+                    const auto period=std::chrono::duration_cast<TimingClock::duration>(
+                        std::chrono::duration<double,std::milli>(std::max(1.,display_ms*(pacing_active?2.:1.))));
+                    if(!raw) {
+                        if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
+                            if(!credit_deferred)++deferred_credits;credit_deferred=true;
+                        }else if(credit_deferred)release_deferred_credit();
+                        else credits=std::min(2u,credits+1);
+                        changed.notify_all();
+                    }
+                    next+=period;if(next<=now)next=now+period;
+                }
+                changed.wait_until(lock,next);
+            }
+        }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
+    }
     bool unsubmitted_native() const noexcept {
         return inflight_id>submitted_native_id||(!pending.empty()&&pending.back()->id>submitted_native_id);
     }
+    bool release_gate_active() const noexcept {
+        // Hold mx. Inspect pending jobs as well as the worker's latched policy
+        // so pre-existing credits cannot let a render race worker pickup.
+        if(stopping||raw||degraded)return false;
+        if(inflight_id&&(inflight_id>submitted_native_id||inflight_release_point==2u||
+            (inflight_release_point==1u&&!inflight_prepared)))return true;
+        return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
+            return job->guides_valid&&(job->guides.release_point!=0||job->id>submitted_native_id);
+        });
+    }
     void release_deferred_credit() noexcept {
         // Hold mx. Coalesce missed ticks rather than bursting queued renders.
-        if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()) {
+        if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()&&!release_gate_active()) {
             credits=std::min(2u,credits+1);credit_deferred=false;++released_deferred_credits;changed.notify_all();
         }
     }
     void inference_submitted() noexcept {
         std::lock_guard lock(mx);submitted_native_id=std::max(submitted_native_id,inflight_id);
         release_deferred_credit();
+    }
+    void inference_prepared() noexcept {
+        std::lock_guard lock(mx);inflight_prepared=true;release_deferred_credit();changed.notify_all();
     }
     void wake_producer() {std::lock_guard lock(mx);wake_producer_locked();}
     static TimingClock::time_point pair_wait_deadline(TimingClock::time_point start,XrDuration period) noexcept {
@@ -688,11 +794,35 @@ struct BufferedPresenter final : Presenter {
         if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);note_frame_age(pair,generated,repeated,submitted_at);}
         return XR_SUCCEEDED(result);
     }
+    bool fresh_content(const Pair& active,bool have_active,bool generated_phase,double position) {
+        // Hold mx. A pair whose native image was already displayed can still
+        // contribute its interpolation; do not submit that native image twice.
+        if(have_active&&(generated_phase||double(active.native_id)>position))return true;
+        const auto selected=newest_ready_pair(position);
+        if(selected!=ready.end()&&(double(selected->native_id)>position||
+            (selected->interpolated&&double(selected->current_id)>position)))return true;
+        return !fg_active&&ticks>=transition_until&&latest_native&&producer.completed(latest_native->ready)&&
+            double(latest_native->native_id)>position;
+    }
+    bool await_content(const Pair& active,bool have_active,bool generated_phase,double position,bool& allow_repeats) {
+        std::unique_lock lock(mx);
+        while(!stopping&&!raw&&!submit_repeat_frames&&!fresh_content(active,have_active,generated_phase,position)) {
+            // FG completion and new captures notify changed. Poll only an
+            // outstanding producer fence (native-only startup/fallback), not
+            // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
+            const bool producer_pending=(!fg_active&&latest_native&&!producer.completed(latest_native->ready))||
+                std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !producer.completed(pair.ready);});
+            if(producer_pending)changed.wait_for(lock,std::chrono::milliseconds(1));
+            else changed.wait(lock);
+        }
+        allow_repeats=submit_repeat_frames;return !stopping;
+    }
     void presentation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky OpenXR presentation");
         Pair active;bool have_active{},generated_phase{};double last_position{};
         try {for(;;) {
-            {std::lock_guard lock(mx);if(stopping)break;}
+            bool allow_repeats{};
+            if(!await_content(active,have_active,generated_phase,last_position,allow_repeats))break;
             XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};XrFrameState frame{XR_TYPE_FRAME_STATE};
             const auto start=TimingClock::now();auto result=xr.wait_frame(session,&wait,&frame);const auto waited_ms=elapsed_ms(start);
             if(XR_FAILED(result)){std::lock_guard lock(mx);terminal=result;stopping=true;changed.notify_all();break;}
@@ -703,15 +833,17 @@ struct BufferedPresenter final : Presenter {
             const XrFrameEndInfo* raw_frame{};bool stop_now{};
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 predicted=frame;telemetry.xr_period_ms=double(frame.predictedDisplayPeriod)/1000000.;
-                xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;
+                xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;changed.notify_all();
             }
-            if(!generated_phase&&frame.shouldRender==XR_TRUE)wait_for_new_pair(present_start,frame.predictedDisplayPeriod,last_position);
+            if(allow_repeats&&!generated_phase&&frame.shouldRender==XR_TRUE)wait_for_new_pair(present_start,frame.predictedDisplayPeriod,last_position);
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
                     auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {
                         active=std::move(*selected);ready.erase(ready.begin(),std::next(selected));have_active=true;
                         fg_active=active.interpolated;
+                        if(!allow_repeats&&active.interpolated&&double(active.native_id)<=last_position&&
+                            double(active.current_id)>last_position)generated_phase=true;
                         // A transient skipped/reset pair must not accelerate
                         // native production to 1x and overload FG again.
                         if(fg_active)pacing_active=true;
@@ -752,7 +884,7 @@ struct BufferedPresenter final : Presenter {
                 wake_producer();
                 result=runtime_end_frame(&empty);
             }
-            char age_log[512]{},stage_log[512]{};
+            char age_log[512]{},stage_log[512]{},cadence_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted)++generated_count;
                 if(submitted&&!is_generated&&!raw_frame){if(repeated)++repeated_presentations;else ++distinct_native;}
@@ -761,6 +893,11 @@ struct BufferedPresenter final : Presenter {
                     const auto now_ms=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
                     cadence_window.add(now_ms,{native_count,distinct_native,generated_count,repeated_presentations,runtime_submissions});}
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
+                    const auto c=cadence();
+                    sprintf_s(cadence_log,"FG experiment cadence: release=%s repeats=%s clock=independent valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f repeated=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f",
+                        active_release_point==2u?"completion":active_release_point==1u?"preparation":"submission",
+                        submit_repeat_frames?"ON":"OFF",c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.repeat_fps,c.submission_fps,
+                        xr_wait.mean(),runtime_end.mean(),present_cpu.mean());
                     sprintf_s(age_log,"FG source-age CPU ms: generated_samples=%llu latest_capture_to_complete=%.3f complete_to_generated_submit=%.3f newest_input_age=%.3f complete_to_native_submit=%.3f; late_waits=%llu arrivals=%llu timeouts=%llu ready_skips=%llu idle_skips=%llu",
                         static_cast<unsigned long long>(generated_count),capture_to_completion.mean(),completion_to_generated.mean(),
                         frame_ages[2].mean(),completion_to_native.mean(),static_cast<unsigned long long>(late_wait_samples),
@@ -782,6 +919,7 @@ struct BufferedPresenter final : Presenter {
             }
             if(age_log[0])trace(age_log);
             if(stage_log[0])trace(stage_log);
+            if(cadence_log[0])trace(cadence_log);
         }}catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
 };

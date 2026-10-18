@@ -39,6 +39,14 @@ std::string_view trim(std::string_view s) {
 }
 }
 bool set_named_setting(Settings& s, std::string_view key, std::string_view value) {
+    if (key == "FgWaitForCompletion") { // Migrate the previous diagnostic checkbox.
+        bool hold{}; if (!parse(value, hold)) return false;
+        s.fg.release_point = hold ? 2U : 0U; return true;
+    }
+    if (key == "FgReleasePoint") {
+        std::uint32_t point{}; if (!parse(value, point) || point > 2U) return false;
+        s.fg.release_point = point; return true;
+    }
 #define CHEEKY_SETTING(name, field) if (key == name) return parse(value, s.field);
 #include "settings_fields.inc"
 #undef CHEEKY_SETTING
@@ -112,7 +120,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     candidate.afw_manual_coverage = false; // Older AFW builds used the centered safety region.
     candidate.afw_automatic_coverage = false;
     candidate.afw_warp_margin = Settings{}.afw_warp_margin;
-    std::string line; bool section = false;
+    std::string line; bool section = false, explicit_release_point = false;
     while (std::getline(in, line)) {
         const auto text = trim(line);
         if (text.empty() || text.front() == ';' || text.front() == '#') continue;
@@ -120,12 +128,14 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
         if (!section) continue;
         const auto split = text.find('='); if (split == text.npos) continue;
         const auto key = trim(text.substr(0, split)), value = trim(text.substr(split + 1));
+        if (key == "FgWaitForCompletion" && explicit_release_point) continue;
+        if (key == "FgReleasePoint") explicit_release_point = true;
         if (key == "SchemaVersion") {
             if (value != "1") { error = "Unsupported settings schema"; return false; }
         } else {
             // Unknown future keys are ignored, but malformed known values reject
             // the file as a transaction instead of applying half a configuration.
-            bool known = false;
+            bool known = key == "FgWaitForCompletion";
 #define CHEEKY_SETTING(name, field) known |= key == name;
 #include "settings_fields.inc"
 #undef CHEEKY_SETTING

@@ -162,6 +162,24 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
+    assert g["values"]["Release game rendering"] == 0
+    assert g["values"]["Submit repeat frames"] is True
+    for point in (1, 2, 0):
+        draw(changes={"Release game rendering": point})
+        assert "FgReleasePoint=" + str(point) in last()
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"]["FgReleasePoint"] = point
+        receive(state)
+        draw()
+        assert g["values"]["Release game rendering"] == point
+    for enabled in (False, True):
+        draw(changes={"Submit repeat frames": enabled})
+        assert "FgSubmitRepeats=" + str(enabled).lower() in last()
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"]["FgSubmitRepeats"] = enabled
+        receive(state)
+        draw()
+        assert g["values"]["Submit repeat frames"] is enabled
     assert any("Generating frames" in t for t in g.drawn.values())
     assert "Frame ID source" in list(g.drawn.values()) and "20 / 38" in list(g.drawn.values())
     for text in ("Captured frame (color / guides)","80 / 79","Matching guides (ready / pending)","0 / 2","No guides with the color frame ID"):

@@ -26,11 +26,16 @@ struct Worker {
     using Release=decltype(&NVSDK_NGX_D3D12_ReleaseFeature);
     Allocate allocate{};Destroy destroy{};Create create{};Evaluate evaluate{};Release release{};
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{};
+    ComPtr<ID3D12CommandAllocator> allocator,split_allocator;
+    ComPtr<ID3D12GraphicsCommandList> list,split_list;
+    ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;
     D3D12_RESOURCE_STATES input_color_state{D3D12_RESOURCE_STATE_COMMON};
+    enum class DiagnosticMode { Normal, PrepareFirst, LeftOnly, RightOnly, SplitLists };
+    DiagnosticMode diagnostic_mode{DiagnosticMode::Normal};
+    bool frame_id_enabled{true},last_frame_id_logged{};
+    std::uint64_t last_frame_id_sample{};
     bool force_fp16{}; // Explicit A/B probe only; preserve SDR precision by default.
     std::uint64_t configuration{};
     unsigned center_width{},center_height{},peripheral_width{},peripheral_height{},peripheral_method{};
@@ -50,6 +55,7 @@ struct Worker {
     void report(const char* stage,std::uint32_t code) noexcept;
     ~Worker(){reset();}
     bool wait_idle() noexcept;
+    bool wait_fence(std::uint64_t value) noexcept;
     void reset() noexcept;
     bool initialize(ID3D12Device*,ID3D12CommandQueue*,unsigned,unsigned,DXGI_FORMAT) noexcept;
     static bool record_output_copies(ID3D12GraphicsCommandList*,const std::array<ID3D12Resource*,2>&,
@@ -61,6 +67,7 @@ struct Worker {
                   const std::array<Camera,2>& camera,
                   std::array<ID3D12Resource*,2>& output,
                   std::array<OutputCopy,2>* copies=nullptr,
-                  void(*on_submitted)(void*) noexcept=nullptr,void* submitted_context=nullptr) noexcept;
+                  void(*on_submitted)(void*) noexcept=nullptr,void* submitted_context=nullptr,
+                  void(*on_prepared)(void*) noexcept=nullptr) noexcept;
 };
 }
