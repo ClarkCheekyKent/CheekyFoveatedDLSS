@@ -205,3 +205,13 @@ second while frames advance; capture/worker/presenter/guide sample ticks are in
 the JSON and logs. Older OpenXR layers show a partial guide-only breakdown;
 install the matching OpenXR update for all presenter categories. The resource
 export is additive and preserves existing status/performance ABIs.
+
+Capture/output transport pools now release pool-only textures unused for at
+least three seconds, checking at most once per second as frames advance.
+Recent working textures remain cached. Pending GPU contexts, history, queued
+pairs and uploads retain their image references, so reclamation adds no GPU
+fence wait and does not free resources still held by those clients. A reusable
+snapshot is not a promise that every such byte will be reclaimed: some textures
+are reused in the next frames. Compare settled resource counts and DXGI usage.
+Completed native lease slots also drop color/guide/UI references once the slot
+is their only owner; this prevents unused slots from pinning older allocations.

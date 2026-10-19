@@ -140,7 +140,24 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
         image.reset();cheeky::fg_memory::Collector idle_collect(device);const auto idle=p.producer.memory(idle_collect);
         check(idle.bytes==held.bytes&&idle.reusable_bytes==held.bytes&&idle.reusable_resources==1,
             "Dropping a client reference leaves allocated but reusable pool memory visible");
-        p.producer.pool.clear();
+        auto pinned=p.producer.image(d);std::weak_ptr<cheeky::fg::TransportImage> pinned_lifetime=pinned;
+        auto cold=p.producer.image(d);std::weak_ptr<cheeky::fg::TransportImage> cold_lifetime=cold;
+        const auto used=cold->last_used_tick;cold.reset();
+        p.producer.next_trim_tick=0;p.producer.trim_unused(used+2000);
+        check(!cold_lifetime.expired(),"Keep recent spare textures to avoid reallocating the steady frame working set");
+        p.producer.trim_unused(used+4000);
+        check(cold_lifetime.expired()&&!pinned_lifetime.expired()&&p.producer.trimmed_images==1,
+            "Trim only cold pool-only textures; a retained client remains valid even after the idle timeout");
+        pinned.reset();p.producer.trim_unused(used+6000);
+        check(pinned_lifetime.expired()&&p.producer.pool.empty()&&p.producer.trimmed_images==2,
+            "Unused pooled resources are reclaimed after their last client releases them");
+        p.producer.next_trim_tick=0;
+        p.slots[0]=std::make_shared<cheeky::fg::BufferedPresenter::Native>();
+        p.slots[0]->color[0]=p.producer.image(d);auto client=p.slots[0];
+        p.release_idle_slots();check(bool(client->color[0]),"A worker/history client protects its native slot images");
+        client.reset();p.release_idle_slots();
+        check(!p.slots[0]->color[0],"An idle completed native lease must not pin old capture textures indefinitely");
+        p.slots={};p.producer.trim_unused(GetTickCount64()+4000);p.producer.next_trim_tick=0;
     }
     auto execute=[&]{check(SUCCEEDED(commands->Close()),"Repeat close");ID3D12CommandList* lists[]{commands.Get()};queue->ExecuteCommandLists(1,lists);
         // The test alone waits for readback/reset. Production repeat handling
@@ -154,6 +171,9 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
         auto image=p.producer.copy(*c,source.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET);check(bool(image),"Repeat snapshot");
         p.producer.freeze(*c,image);std::uint64_t ticket{};check(p.producer.execute(*c,ticket),"Repeat snapshot submit");return image;};
     auto old=snapshot();cheeky::fg::BufferedPresenter::Chain chain;
+    p.producer.trim_unused(GetTickCount64()+4000);
+    check(!p.producer.pool.empty(),"Pending GPU copy/context references protect captured pixels during trimming");
+    p.producer.next_trim_tick=0;
     // The cross-queue wait must retire only after the native snapshot signal.
     // This also tests the harmless same-queue fallback on devices without HIGH.
     ComPtr<ID3D12Fence> fg_ready;

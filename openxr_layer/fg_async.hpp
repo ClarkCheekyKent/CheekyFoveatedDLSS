@@ -94,6 +94,14 @@ struct BufferedPresenter final : Presenter {
     std::unordered_map<XrSwapchain,ColorReady> capture_ready;
     bool capture_overflow{};
     std::array<std::shared_ptr<Native>,3> slots;
+    void release_idle_slots() noexcept {
+        // Hold mx. Only the slot itself owns these completed jobs; pending and
+        // worker/history users retain the Native, and ready/upload users retain
+        // their Images independently. Do not let an unused lease pin old pixels.
+        for(auto& slot:slots)if(slot&&slot.use_count()==1&&producer.completed(slot->ready)){
+            slot->color={};slot->color_ready={};slot->auxiliary.clear();slot->clear_guides();
+        }
+    }
     std::deque<std::shared_ptr<Native>> pending;
     std::deque<Pair> ready;
     std::optional<Pair> latest_native;
@@ -127,6 +135,7 @@ struct BufferedPresenter final : Presenter {
         BufferedPresenter& owner;TimingClock::time_point begin{TimingClock::now()};
         ~ProducerElapsed(){std::lock_guard capture_lock(owner.capture_mutex);std::lock_guard lock(owner.mx);
             owner.producer_cpu.add(elapsed_ms(begin)+owner.capture_cpu_accumulator);owner.capture_cpu_accumulator=0;
+            owner.release_idle_slots();
             const auto now=GetTickCount64();if(now>=owner.next_capture_memory){
                 fg_memory::Collector collect(owner.device.Get());
                 owner.memory_state.categories[fg_memory::capture]=owner.producer.memory(collect);

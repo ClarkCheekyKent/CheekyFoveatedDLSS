@@ -8,7 +8,7 @@
 namespace cheeky::fg {
 // Each command allocator and every referenced image stays leased until its
 // fence retires. The producer only polls for a free context; it never waits.
-struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};};
+struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{};};
 using Image=std::shared_ptr<TransportImage>;
 struct ColorReadyStamp {
     std::atomic<std::uint64_t> ready_qpc{};
@@ -36,8 +36,21 @@ struct Transport {
     std::vector<Image> pool;
     std::uint64_t serial{};
     std::uint64_t timestamp_frequency{};
+    std::uint64_t next_trim_tick{},trimmed_images{};
     std::atomic<std::uint64_t> full_copies{},region_copies{},upload_copies{},submissions{};
     cheeky::gpu::Groups gpu_cost;
+    void trim_unused(std::uint64_t now) {
+        if(now<next_trim_tick)return;
+        next_trim_tick=now+1000;
+        // Contexts pin every image until its submitted GPU fence retires; frame,
+        // history, ready-pair and upload owners pin their images too. Pool-only
+        // references are therefore safe to release without a GPU wait. Keep
+        // the recent working set so ordinary frame reuse does not reallocate.
+        std::erase_if(pool,[&](const Image& image){
+            if(image.use_count()!=1||now<image->last_used_tick||now-image->last_used_tick<3000)return false;
+            ++trimmed_images;return true;
+        });
+    }
     CheekyFgMemoryBucket memory(fg_memory::Collector& collect) const {
         CheekyFgMemoryBucket out;
         for(const auto& image:pool)collect.add(out,image->texture.Get(),image.use_count()==1);
@@ -79,6 +92,7 @@ struct Transport {
         const auto done=fence->GetCompletedValue();
         collect(done);
         for(auto& c:contexts)if(c.retired<=done){c.images.clear();c.borrowed.clear();c.leases.clear();}
+        trim_unused(GetTickCount64());
         for(auto& c:contexts)if(c.retired<=done) {
             if(!c.allocator) {
                 if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&c.allocator)))||
@@ -109,11 +123,12 @@ struct Transport {
         c.retired=ticket=serial;c.profile_pending=c.frame&&c.gpu_span.pending;return true;
     }
     Image image(D3D12_RESOURCE_DESC desc,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE) {
+        const auto now=GetTickCount64();trim_unused(now);
         desc.Flags=flags;desc.SampleDesc.Count=1;desc.SampleDesc.Quality=0;
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
             if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
-               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;return p;}
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->last_used_tick=now;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
@@ -122,6 +137,7 @@ struct Transport {
             pool.erase(free);
         }
         auto result=std::make_shared<TransportImage>();
+        result->last_used_tick=now;
         D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         if(FAILED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,
             nullptr,IID_PPV_ARGS(&result->texture))))return {};
