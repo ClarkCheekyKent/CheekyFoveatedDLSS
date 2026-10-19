@@ -66,8 +66,8 @@ struct Transport {
     bool completed(std::uint64_t value) const {return fence&&fence->GetCompletedValue()>=value;}
     void collect(std::uint64_t done) {
         for(auto& c:contexts)if(c.retired<=done&&c.profile_pending) {
-            c.profile_pending=false;double ms{};std::uint64_t start{};
-            if(c.gpu_span.collect(timestamp_frequency,ms,&start)){
+            c.profile_pending=false;double ms{};std::uint64_t end{};
+            if(c.gpu_span.collect(timestamp_frequency,ms,nullptr,&end)){
                 gpu_cost.add(c.frame,ms,c.closes_frame);
                 if(c.color_ready&&c.color_ready->calibrated){
                     std::uint64_t gpu{},cpu{};auto& stamp=*c.color_ready;
@@ -75,7 +75,7 @@ struct Transport {
                         const double cpu_rate=LatencyProbe::cpu_frequency(),gpu_rate=double(timestamp_frequency);
                         const double drift=(double(cpu)-double(stamp.before_cpu))*1000./cpu_rate-
                             (double(gpu)-double(stamp.before_gpu))*1000./gpu_rate;
-                        const double ready=double(cpu)+(double(start)-double(gpu))*cpu_rate/gpu_rate;
+                        const double ready=double(cpu)+(double(end)-double(gpu))*cpu_rate/gpu_rate;
                         if(std::abs(drift)<=.5&&std::isfinite(ready)&&ready>0&&ready<=double(cpu)+cpu_rate*.0001)
                             stamp.ready_qpc.store(std::uint64_t(ready));
                     }

@@ -502,6 +502,11 @@ bool fg_pacing_timeline(CheekyFgPacingTimeline& out) noexcept {
     const auto query=layer?reinterpret_cast<CheekyFgPacingTimelineFn>(GetProcAddress(layer,"CheekyFG_GetPacingTimelineV1")):nullptr;
     return query&&query(&out);
 }
+bool fg_native_submission_latency(CheekyFgNativeSubmissionLatency& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgNativeSubmissionLatencyFn>(GetProcAddress(layer,"CheekyFG_GetNativeSubmissionLatencyV1")):nullptr;
+    return query&&query(&out);
+}
 bool fg_overhead(CheekyFgOverhead& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
     const auto query=layer?reinterpret_cast<CheekyFgOverheadFn>(GetProcAddress(layer,"CheekyFG_GetOverheadV1")):nullptr;

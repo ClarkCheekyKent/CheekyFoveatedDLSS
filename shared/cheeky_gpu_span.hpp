@@ -64,12 +64,12 @@ struct Span {
         list->EndQuery(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,1);
         list->ResolveQueryData(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,2,readback.Get(),0);pending=true;
     }
-    bool collect(std::uint64_t frequency,double& ms,std::uint64_t* begin_tick=nullptr) {
+    bool collect(std::uint64_t frequency,double& ms,std::uint64_t* begin_tick=nullptr,std::uint64_t* end_tick=nullptr) {
         if(!pending||!frequency)return false;pending=false;
         void* mapped{};D3D12_RANGE range{0,16};if(FAILED(readback->Map(0,&range,&mapped))||!mapped)return false;
         const auto* t=static_cast<const std::uint64_t*>(mapped);const auto a=t[0],b=t[1];
         D3D12_RANGE written{0,0};readback->Unmap(0,&written);
-        if(!a||b<a)return false;if(begin_tick)*begin_tick=a;
+        if(!a||b<a)return false;if(begin_tick)*begin_tick=a;if(end_tick)*end_tick=b;
         ms=double(b-a)*1000./double(frequency);return std::isfinite(ms);
     }
 };

@@ -895,6 +895,25 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     })
                     text("Fresh-content wait occurs before the presenter's private xrWaitFrame.")
                 end
+                local native_latency=fg.native_submission_latency
+                if native_latency and native_latency.supported then
+                    text("NATIVE image to OpenXR: mean / latest (ms), not motion-to-photon")
+                    if not native_latency.enabled then
+                        text("Enable FG latency diagnostics to collect calibrated GPU timestamps.")
+                    elseif (native_latency.gpu_samples or 0)==0 then
+                        text("Awaiting native color GPU-copy completion samples.")
+                    else
+                        local function metric(m,last) return string.format("%.3f / %.3f",m or 0,last or 0) end
+                        rows("fg_native_submission_latency",{
+                            {"GPU-ready to native xrEndFrame entry (signed)",metric(native_latency.gpu_ready_to_submit_ms,native_latency.gpu_ready_to_submit_last_ms)},
+                            {"Held AFTER ready (when positive)",metric(native_latency.native_hold_ms,native_latency.native_hold_last_ms)},
+                            {"Submitted BEFORE ready (when negative)",metric(native_latency.submit_ahead_ms,native_latency.submit_ahead_last_ms)},
+                            {"CPU color capture to native xrEndFrame",metric(native_latency.capture_to_submit_ms,native_latency.capture_to_submit_last_ms)},
+                            {"GPU samples / pending / unavailable",string.format("%.0f / %.0f / %.0f",native_latency.gpu_samples or 0,native_latency.pending or 0,native_latency.missing_stamps or 0)}})
+                    end
+                    text("Ready means both eyes and their final color assembly/crop finished on the GPU. Negative signed time means xrEndFrame was called earlier; runtime/GPU completion is separate.")
+                    text("This is the FG-ON native delay, NOT added FG latency: no matching FG-OFF GPU-ready baseline is measured.")
+                end
                 text("If generation is unavailable, the original native frame is displayed.")
             end
             gpu_memory("fg")

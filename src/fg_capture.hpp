@@ -6,6 +6,7 @@ CheekyFgDiagnostic fg_diagnostic() noexcept;
 bool fg_performance(CheekyFgPerformance&) noexcept;
 bool fg_cadence(CheekyFgCadence&) noexcept;
 bool fg_pacing_timeline(CheekyFgPacingTimeline&) noexcept;
+bool fg_native_submission_latency(CheekyFgNativeSubmissionLatency&) noexcept;
 bool fg_overhead(CheekyFgOverhead&) noexcept;
 bool fg_presentation(CheekyFgPresentation&) noexcept;
 bool fg_experiment_diagnostics(CheekyFgExperimentDiagnostics&) noexcept;

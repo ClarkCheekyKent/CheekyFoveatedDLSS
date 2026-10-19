@@ -444,6 +444,21 @@ void fg_toggle_test() {
     CheekyFgCadence cadence;
     check(CheekyFG_GetCadenceV1(&cadence)&&cadence.supported,"Optional measured-cadence export");
     cadence.abi=999;check(!CheekyFG_GetCadenceV1(&cadence),"Reject mismatched cadence ABI");
+    CheekyFgNativeSubmissionLatency native_latency;
+    check(CheekyFG_GetNativeSubmissionLatencyV1(&native_latency)&&native_latency.supported,
+        "Optional native GPU-ready-to-OpenXR submit diagnostic export");
+    native_latency.abi=999;
+    check(!CheekyFG_GetNativeSubmissionLatencyV1(&native_latency),"Reject mismatched native latency ABI");
+    native_latency={};--native_latency.size;
+    check(!CheekyFG_GetNativeSubmissionLatencyV1(&native_latency)&&
+        !CheekyFG_GetNativeSubmissionLatencyV1(nullptr),"Reject invalid native latency size/pointer");
+    check(std::abs(cheeky::fg::native_submission_delta_ms(150000,100000,125000,1000000.)-25.)<1e-9,
+        "Native GPU-ready timestamp chooses the later stereo eye");
+    check(std::abs(cheeky::fg::native_submission_delta_ms(125000,150000,175000,1000000.)+50.)<1e-9,
+        "Native GPU-ready timestamp preserves early OpenXR submission as negative time");
+    cheeky::fg::SignedTimingAverage signed_native_samples;
+    signed_native_samples.add(-15.);signed_native_samples.add(5.);
+    check(std::abs(signed_native_samples.mean()+5.)<1e-9,"Native signed timing window keeps negative samples");
     CheekyFgPresentation presentation;
     check(CheekyFG_GetPresentationV1(&presentation)&&presentation.supported,"Optional capture-age and late-wait export");
     presentation.abi=999;check(!CheekyFG_GetPresentationV1(&presentation),"Reject mismatched presentation telemetry ABI");

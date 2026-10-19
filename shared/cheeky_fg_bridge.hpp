@@ -140,6 +140,20 @@ struct CheekyFgPacingTimeline {
 };
 using CheekyFgPacingTimelineFn=bool(__cdecl*)(CheekyFgPacingTimeline*);
 
+// Native color GPU-copy completion -> actual private xrEndFrame ENTER (not display).
+// Signed delta >0: held after the native copy finished; <0: submitted before
+// the copy finished (the GPU/runtime may still wait). This does NOT provide
+// an FG-on/off delta because the native capture is bypassed with FG disabled.
+struct CheekyFgNativeSubmissionLatency {
+    std::uint32_t abi{1},size{sizeof(CheekyFgNativeSubmissionLatency)},supported{},enabled{};
+    std::uint64_t gpu_samples{},missing_stamps{},held_samples{},early_samples{},pending{};
+    double gpu_ready_to_submit_ms{},gpu_ready_to_submit_last_ms{}; // Signed.
+    double native_hold_ms{},native_hold_last_ms{}; // Positive part only.
+    double submit_ahead_ms{},submit_ahead_last_ms{}; // Positive magnitude of negative part.
+    double capture_to_submit_ms{},capture_to_submit_last_ms{}; // CPU capture observation -> submit.
+};
+using CheekyFgNativeSubmissionLatencyFn=bool(__cdecl*)(CheekyFgNativeSubmissionLatency*);
+
 // Optional GPU stages outside the original processing timestamp interval.
 struct CheekyFgOverhead {
     std::uint32_t abi{1},size{sizeof(CheekyFgOverhead)},supported{};

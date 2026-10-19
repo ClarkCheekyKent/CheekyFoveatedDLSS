@@ -123,6 +123,7 @@ std::string snapshot_locked(State& s) {
     CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
     CheekyFgPacingTimeline fg_pacing;fg_pacing_timeline(fg_pacing);
+    CheekyFgNativeSubmissionLatency fg_native_latency;fg_native_submission_latency(fg_native_latency);
     CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
     CheekyFgPresentation fg_present;fg_presentation(fg_present);
     CheekyFgExperimentDiagnostics fg_exp;fg_experiment_diagnostics(fg_exp);
@@ -222,6 +223,21 @@ std::string snapshot_locked(State& s) {
         << ",\"native_xr_end_ms\":" << fg_pacing.native_xr_end_ms << ",\"native_xr_end_last_ms\":" << fg_pacing.native_xr_end_last_ms
         << ",\"generated_xr_end_ms\":" << fg_pacing.generated_xr_end_ms << ",\"generated_xr_end_last_ms\":" << fg_pacing.generated_xr_end_last_ms
         << ",\"fg_submit_to_complete_ms\":" << fg_pacing.fg_submit_to_complete_ms << ",\"fg_submit_to_complete_last_ms\":" << fg_pacing.fg_submit_to_complete_last_ms << "}"
+        << ",\"native_submission_latency\":{\"supported\":" << bool(fg_native_latency.supported)
+        << ",\"enabled\":" << bool(fg_native_latency.enabled)
+        << ",\"gpu_samples\":" << fg_native_latency.gpu_samples
+        << ",\"missing_stamps\":" << fg_native_latency.missing_stamps
+        << ",\"pending\":" << fg_native_latency.pending
+        << ",\"held_samples\":" << fg_native_latency.held_samples
+        << ",\"early_samples\":" << fg_native_latency.early_samples
+        << ",\"gpu_ready_to_submit_ms\":" << fg_native_latency.gpu_ready_to_submit_ms
+        << ",\"gpu_ready_to_submit_last_ms\":" << fg_native_latency.gpu_ready_to_submit_last_ms
+        << ",\"native_hold_ms\":" << fg_native_latency.native_hold_ms
+        << ",\"native_hold_last_ms\":" << fg_native_latency.native_hold_last_ms
+        << ",\"submit_ahead_ms\":" << fg_native_latency.submit_ahead_ms
+        << ",\"submit_ahead_last_ms\":" << fg_native_latency.submit_ahead_last_ms
+        << ",\"capture_to_submit_ms\":" << fg_native_latency.capture_to_submit_ms
+        << ",\"capture_to_submit_last_ms\":" << fg_native_latency.capture_to_submit_last_ms << "}"
         << ",\"cadence\":{\"supported\":" << bool(fg_rates.supported) << ",\"valid\":" << bool(fg_rates.valid)
         << ",\"game_fps\":" << fg_rates.game_fps << ",\"native_fps\":" << fg_rates.native_fps
         << ",\"generated_fps\":" << fg_rates.generated_fps << ",\"unique_fps\":" << fg_rates.unique_fps

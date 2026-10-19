@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_transport.hpp"
+#include "fg_native_submission_math.hpp"
 #include "../src/d3d12_native.hpp"
 #include "../src/fg_source_lifecycle.hpp"
 #include <condition_variable>
@@ -27,6 +28,7 @@ struct BufferedPresenter final : Presenter {
         TimingClock::time_point captured_at{},handed_off_at{};
         std::array<Image,2> color;
         std::array<ColorReady,2> color_ready;
+        ColorReady final_color_ready; // GPU end of the combined native-eye crop/assembly batch.
         std::array<XrCompositionLayerProjectionView,2> views;
         XrSpace space{};XrEnvironmentBlendMode blend{};
         FrameLayers layers;
@@ -61,7 +63,8 @@ struct BufferedPresenter final : Presenter {
         unsigned upload_mode{};
         TimingClock::time_point native_captured{},current_captured{},completed_at{},handed_off_at{},worker_started_at{},submitted_at{};
         std::array<Image,2> native,generated,current;
-        std::array<ColorReady,2> current_color_ready;
+        std::array<ColorReady,2> native_color_ready,current_color_ready;
+        ColorReady native_final_ready,current_final_ready;
         std::array<XrCompositionLayerProjectionView,2> native_views,generated_views,current_views;
         FrameLayers layers;
         std::vector<Auxiliary> auxiliary;
@@ -181,6 +184,48 @@ struct BufferedPresenter final : Presenter {
     std::uint64_t late_wait_samples{},late_wait_arrivals{},late_wait_timeouts{};
     std::uint64_t late_ready_skips{},late_idle_skips{};
     TimingAverage capture_to_completion,completion_to_native,completion_to_generated;
+    // Native GPU-copy -> OpenXR handoff; retire only after the capture GPU fence
+    // has published both calibrated timestamps. No GPU wait, timer or query here.
+    struct NativeSubmissionProbe {
+        std::array<ColorReady,2> color;
+        ColorReady final_color;
+        std::uint64_t submit_qpc{},submitted_tick{};
+    };
+    std::deque<NativeSubmissionProbe> pending_native_submissions;
+    SignedTimingAverage native_ready_to_submit;
+    TimingAverage native_hold,submit_ahead,native_capture_to_submit;
+    std::uint64_t native_latency_samples{},native_latency_missing{},native_latency_held{},native_latency_early{};
+    void collect_native_submission_probes() noexcept {
+        // Called on the presenter thread without mx held. Reclaim producer
+        // timestamps only after its queue fence retires; never block the GPU.
+        collect_color_stamps();
+        std::lock_guard lock(mx);
+        while(!pending_native_submissions.empty()) {
+            auto& p=pending_native_submissions.front();
+            if(!p.color[0]||!p.color[1]||!p.final_color||!p.color[0]->calibrated||!p.color[1]->calibrated||!p.final_color->calibrated||
+                GetTickCount64()-p.submitted_tick>2000){
+                ++native_latency_missing;pending_native_submissions.pop_front();continue;
+            }
+            const auto left=p.color[0]->ready_qpc.load(std::memory_order_acquire);
+            const auto right=p.color[1]->ready_qpc.load(std::memory_order_acquire);
+            const auto final=p.final_color->ready_qpc.load(std::memory_order_acquire);
+            if(!left||!right||!final)break;
+            // The final assembly/crop GPU batch is ordered after both eye copies.
+            // Require all three timestamps to avoid measuring a partial image.
+            const double signed_ms=native_submission_delta_ms(p.submit_qpc,std::max(left,right),final,LatencyProbe::cpu_frequency());
+            if(!std::isfinite(signed_ms)||std::abs(signed_ms)>1000.){++native_latency_missing;}
+            else {
+                native_ready_to_submit.add(signed_ms);
+                if(signed_ms>=0){native_hold.add(signed_ms);++native_latency_held;}
+                else {submit_ahead.add(-signed_ms);++native_latency_early;}
+                ++native_latency_samples;
+            }
+            pending_native_submissions.pop_front();
+        }
+        // A dead/missing calibration must not pin a resource indefinitely.
+        // Cap samples; the skip count is explicit rather than reporting zero ms.
+        while(pending_native_submissions.size()>128){pending_native_submissions.pop_front();++native_latency_missing;}
+    }
     std::array<TimingAverage,3> gpu_ready_ages;
     std::uint64_t gpu_ready_samples{},predicted_samples{},prediction_late{};
     std::uint64_t awaiting_generated_submission{},generated_gate_releases{},generated_gate_skips{};
@@ -269,6 +314,18 @@ struct BufferedPresenter final : Presenter {
     CheekyFgPerformance performance() const noexcept override {
         auto result=telemetry;result.asynchronous_presenter=1;result.queued_native=unsigned(pending.size());
         result.skipped_native=skipped;result.producer_cpu_ms=producer_cpu.mean();result.pacing_wait_ms=pacing_wait.mean();return result;
+    }
+    CheekyFgNativeSubmissionLatency native_submission_latency() const noexcept override {
+        CheekyFgNativeSubmissionLatency t;t.supported=1;t.enabled=latency_diagnostics.load()!=0;
+        t.gpu_samples=native_latency_samples;t.missing_stamps=native_latency_missing;
+        t.held_samples=native_latency_held;t.early_samples=native_latency_early;
+        t.pending=pending_native_submissions.size();
+        t.gpu_ready_to_submit_ms=native_ready_to_submit.mean();t.gpu_ready_to_submit_last_ms=native_ready_to_submit.last;
+        t.native_hold_ms=native_hold.mean();t.native_hold_last_ms=native_hold.last;
+        t.submit_ahead_ms=submit_ahead.mean();t.submit_ahead_last_ms=submit_ahead.last;
+        t.capture_to_submit_ms=native_capture_to_submit.mean();
+        t.capture_to_submit_last_ms=native_capture_to_submit.last;
+        return t;
     }
     CheekyFgPacingTimeline pacing_timeline() const noexcept override {
         CheekyFgPacingTimeline t;t.supported=1;
@@ -464,7 +521,10 @@ struct BufferedPresenter final : Presenter {
         late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
         late_ready_skips=late_idle_skips=0;capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
-        gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;experiment_state={};direct_request.reset();direct_stats={};direct_wait={};
+        gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
+        pending_native_submissions.clear();native_ready_to_submit={};native_hold={};submit_ahead={};native_capture_to_submit={};
+        native_latency_samples=native_latency_missing=native_latency_held=native_latency_early=0;
+        experiment_state={};direct_request.reset();direct_stats={};direct_wait={};
         direct_details={};logged_direct_details={};
         direct_blocked_target=0;
         guide_sync_fence.Reset();guide_sync_serial=0;guide_sync_reported=false;
@@ -532,6 +592,11 @@ struct BufferedPresenter final : Presenter {
             const auto old_color=color_capture_mode.exchange(options.color_capture_mode==1u?1u:0u);
             const auto old_upload=upload_mode.exchange(options.upload_mode==1u?1u:0u);
             const auto old_diagnostics=latency_diagnostics.exchange(options.latency_diagnostics==1u?1u:0u);
+            if(old_diagnostics!=latency_diagnostics.load()){
+                std::lock_guard lock(mx);
+                pending_native_submissions.clear();native_ready_to_submit={};native_hold={};submit_ahead={};native_capture_to_submit={};
+                native_latency_samples=native_latency_missing=native_latency_held=native_latency_early=0;
+            }
             if(trace&&(old_color!=color_capture_mode||old_upload!=upload_mode||old_diagnostics!=latency_diagnostics)){
                 char message[192]{};sprintf_s(message,"FG transport A/B: color=%s uploads=%s latency=%s (next native frame)",
                     color_capture_mode?"direct-eyes":"full-snapshot",upload_mode?"batched":"per-image",latency_diagnostics?"1-in-17":"OFF");trace(message);
@@ -663,7 +728,7 @@ struct BufferedPresenter final : Presenter {
         // In hook-free mode only the completed xrEndFrame can claim a pair.
         if(!inference_slot&&hookless_complete)hookless_complete(0);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
-        job->color={};job->color_ready={};job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
+        job->color={};job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         if(!projection||!job->layers.prepare(end,projection)){
             if(inference_slot&&hookless_complete)hookless_complete(0);
@@ -774,6 +839,8 @@ struct BufferedPresenter final : Presenter {
                 {std::lock_guard lock(mx);telemetry.color_token=expected_token;telemetry.guide_token=job->guide_token;
                     telemetry.color_render_frame=expected_frame;telemetry.guide_render_frame=job->guides_valid?expected_frame:0;
                     if(inference_slot&&job->guide_state==CheekyFgState::guide_frame_mismatch)++telemetry.mismatched_guides;}
+                if(job->latency_diagnostics)
+                    job->final_color_ready=producer.mark_color_ready(*c,LatencyProbe::cpu_now());
                 good=producer.execute(*c,job->ready);
                 if(!good&&inference_slot&&hookless_complete)hookless_complete(0);
             }else if(c){
@@ -788,7 +855,8 @@ struct BufferedPresenter final : Presenter {
                 job->space=projection->space;job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();
                 Pair native;native.upload_mode=job->upload_mode;native.native_id=native.current_id=id;native.ready=job->ready;
-                native.current_color_ready=job->color_ready;
+                native.native_color_ready=native.current_color_ready=job->color_ready;
+                native.native_final_ready=native.current_final_ready=job->final_color_ready;
                 native.native_captured=native.current_captured=job->captured_at;
                 native.native=native.current=job->color;native.native_views=native.current_views=job->views;
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
@@ -868,7 +936,8 @@ struct BufferedPresenter final : Presenter {
             std::shared_ptr<DirectRequest> direct_job;
             struct CompleteRequest {BufferedPresenter& owner;std::shared_ptr<DirectRequest>& request;
                 ~CompleteRequest(){if(request){std::lock_guard lock(owner.mx);request->complete=true;owner.changed.notify_all();}}} complete_request{*this,direct_job};
-            pair.current_color_ready=job->color_ready;
+            pair.native_color_ready=pair.current_color_ready=job->color_ready;
+            pair.native_final_ready=pair.current_final_ready=job->final_color_ready;
             pair.native_captured=pair.current_captured=job->captured_at;
             pair.handed_off_at=job->handed_off_at;pair.worker_started_at=TimingClock::now();
             pair.native_views=pair.current_views=job->views;pair.layers=job->layers;pair.auxiliary=job->auxiliary;
@@ -995,6 +1064,8 @@ struct BufferedPresenter final : Presenter {
                 }
             }
             if(success){pair.interpolated=true;pair.native_id=previous->id;pair.native=previous->color;
+                pair.native_color_ready=previous->color_ready;
+                pair.native_final_ready=previous->final_color_ready;
                 pair.native_captured=previous->captured_at;
                 pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views);
                 pair.completed_at=TimingClock::now();}
@@ -1290,7 +1361,7 @@ struct BufferedPresenter final : Presenter {
         // inference + immutable-copy fence completes. Native pairs retain the
         // producer fence; both paths therefore refer to the original job here.
         if(!producer.completed(pair.ready))return false;
-        if(generated&&pair.current_color_ready[0])collect_color_stamps();
+        if(latency_diagnostics.load()!=0)collect_native_submission_probes();
         auto views=original_views;
         std::vector<std::pair<Chain*,Image>> batch;
         for(unsigned eye=0;eye<2;++eye) {
@@ -1321,7 +1392,15 @@ struct BufferedPresenter final : Presenter {
         CHEEKY_FG_SUBMISSION_OBSERVER(generated);
 #endif
         result=runtime_end_frame(&end);
-        {std::lock_guard lock(mx);(generated?generated_xr_end:native_xr_end).add(elapsed_ms(submitted_at));}
+        {std::lock_guard lock(mx);(generated?generated_xr_end:native_xr_end).add(elapsed_ms(submitted_at));
+            if(!generated&&!repeated&&XR_SUCCEEDED(result)&&latency_diagnostics.load()!=0) {
+                // The native eyes have been submitted to the OpenXR runtime.
+                // The GPU may still be working. Resolve their completed GPU
+                // timestamps on a subsequent presenter iteration.
+                pending_native_submissions.push_back({pair.native_color_ready,pair.native_final_ready,submitted_cpu,GetTickCount64()});
+                if(pair.native_captured!=TimingClock::time_point{}&&pair.native_captured<=submitted_at)
+                    native_capture_to_submit.add(std::chrono::duration<double,std::milli>(submitted_at-pair.native_captured).count());
+            }}
         if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);note_frame_age(pair,generated,repeated,submitted_at);
             if(generated){note_gpu_ready_age(pair,submitted_cpu,display_cpu);finish_generated_gate(pair.current_id,true);}}
         return XR_SUCCEEDED(result);
@@ -1421,6 +1500,8 @@ struct BufferedPresenter final : Presenter {
                 if(submitted) {
                     last_position=double(active.native_id)+(is_generated?.5:0.);
                     if(is_generated){active.native=active.current;active.native_views=active.current_views;active.native_id=active.current_id;
+                        active.native_color_ready=active.current_color_ready;
+                        active.native_final_ready=active.current_final_ready;
                         active.native_captured=active.current_captured;generated_phase=false;}
                     else generated_phase=active.interpolated&&last_position<double(active.current_id);
                 }
@@ -1432,7 +1513,7 @@ struct BufferedPresenter final : Presenter {
                 result=runtime_end_frame(&empty);
             }
             measure_presenter_memory();
-            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{};
+            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{},native_latency_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted){++generated_count;last_generated_submit_tick=GetTickCount64();}
                 if(submitted&&!is_generated&&!raw_frame){if(repeated)++repeated_presentations;else ++distinct_native;}
@@ -1460,6 +1541,12 @@ struct BufferedPresenter final : Presenter {
                         time.clock_late_ms,time.credit_deferred_ms,time.game_wait_credit_ms,time.game_begin_gate_ms,
                         time.presenter_content_ms,time.native_xr_end_ms,time.generated_xr_end_ms,
                         time.fg_submit_to_complete_ms,time.deferred_events,time.deferred_releases);
+                    const auto native_latency=native_submission_latency();
+                    sprintf_s(native_latency_log,"FG NATIVE submit latency (GPU final stereo capture end to xrEndFrame ENTER): enabled=%u samples=%llu pending=%llu missing=%llu signed_ms=%.3f last=%.3f hold_after_ready=%.3f early_before_ready=%.3f CPU_capture_to_submit=%.3f; NO FG-off baseline",
+                        native_latency.enabled,static_cast<unsigned long long>(native_latency.gpu_samples),
+                        static_cast<unsigned long long>(native_latency.pending),static_cast<unsigned long long>(native_latency.missing_stamps),
+                        native_latency.gpu_ready_to_submit_ms,native_latency.gpu_ready_to_submit_last_ms,
+                        native_latency.native_hold_ms,native_latency.submit_ahead_ms,native_latency.capture_to_submit_ms);
                     sprintf_s(gpu_age_log,"FG GPU-ready latency ms: samples=%llu native_tail_excluded=%.3f generated_submit=%.3f predicted_display=%.3f predicted_samples=%llu late_targets=%llu gate_released=%llu gate_skipped=%llu",
                         gpu_ready_samples,gpu_ready_samples?gpu_ready_ages[0].mean():-1.,gpu_ready_samples?gpu_ready_ages[1].mean():-1.,
                         predicted_samples?gpu_ready_ages[2].mean():-1.,predicted_samples,prediction_late,
@@ -1479,6 +1566,7 @@ struct BufferedPresenter final : Presenter {
             if(cadence_log[0])trace(cadence_log);
             if(gpu_age_log[0])trace(gpu_age_log);
             if(pacing_log[0])trace(pacing_log);
+            if(native_latency_log[0])trace(native_latency_log);
         }}catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
 };
