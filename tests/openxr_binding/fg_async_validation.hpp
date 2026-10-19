@@ -535,6 +535,30 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         prepared.inference_prepared();check(prepared.release_gate_active(),"Completion policy cannot release at preparation");
     }
     {
+        P soft;soft.inflight_id=11;soft.inflight_release_point=4;soft.submitted_native_id=10;
+        soft.credit_deferred=true;
+        check(soft.release_gate_active(),"Soft release must hold before FG queue submission");
+        soft.inference_submitted();
+        check(soft.release_gate_active()&&soft.credits==0&&soft.credit_deferred&&
+            soft.release_delay_until>TimingClock::now(),"4ms release must defer credit, not wait for a GPU fence");
+        soft.release_delay_until=TimingClock::now()-std::chrono::milliseconds(1);
+        check(!soft.release_gate_active(),"Expired soft release must not hold the game");
+        soft.release_deferred_credit();
+        check(soft.credits==1&&!soft.credit_deferred,"Soft release must issue the deferred game credit once");
+    }
+    {
+        P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=100.;
+        clock.inflight_id=12;clock.inflight_release_point=4;clock.submitted_native_id=12;
+        clock.credit_deferred=true;
+        clock.release_delay_until=TimingClock::now()+std::chrono::milliseconds(4);
+        std::thread pacer([&]{clock.pacing_loop();});
+        bool delivered{};{std::unique_lock lock(clock.mx);delivered=clock.changed.wait_for(lock,std::chrono::milliseconds(100),[&]{return clock.credits>0;});
+            clock.stopping=true;clock.changed.notify_all();}
+        pacer.join();
+        check(delivered&&clock.released_deferred_credits==1&&clock.ticks==0,
+            "Soft release deadline wakes the native clock without waiting for a full XR interval");
+    }
+    {
         P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=8.333333;
         clock.submit_repeat_frames=false;
         std::thread pacer([&]{clock.pacing_loop();});
@@ -857,7 +881,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             Runtime::guides.release_point=0;
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Disable live completion hold");
             submit_native();
-            for(unsigned point:{0u,1u,2u,3u})for(bool repeats:{true,false}) {
+            for(unsigned point:{0u,4u,1u,2u,3u})for(bool repeats:{true,false}) {
                 Runtime::guides.release_point=point;Runtime::guides.submit_repeats=repeats?1u:0u;
                 std::uint64_t repeat_baseline{};
                 for(unsigned frame=0;frame<40;++frame){

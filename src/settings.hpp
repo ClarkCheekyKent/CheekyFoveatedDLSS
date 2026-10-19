@@ -47,7 +47,7 @@ struct Settings {
         std::uint32_t diagnostic_mode{}; // UEVR Lua: normal, prepare-first, left-only, right-only, split-lists.
         bool backbuffer_frame_id{true}; // Native render-frame identity shared by both NGX stereo evaluations.
         std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
-        std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission.
+        std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit.
         bool hookless_mode3{false}; // Experimental all release modes: no private UEVR frame hooks or native frame IDs.
         bool submit_repeats{false}; // Runtime handles repeated display content.
         std::uint32_t color_capture_mode{1},upload_mode{1}; // Proven Joey-run defaults; 0 retains each baseline for A/B testing.

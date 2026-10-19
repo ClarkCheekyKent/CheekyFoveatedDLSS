@@ -97,9 +97,13 @@ bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
 }
 bool hookless_selected() noexcept {return hookless_selected(current_settings().fg);}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
+    // Pacing policy is NOT a texture/NGX feature configuration. Hashing
+    // release_point here stopped FG, invalidated stereo snapshots and reset
+    // both NGX histories every time a release mode was changed live.
+    // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{unsigned(s.foveated),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
-        s.peripheral_method,s.depth_bits,s.motion_bits,s.release_point,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
+        s.peripheral_method,s.depth_bits,s.motion_bits,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
     return hash;
@@ -412,7 +416,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     out->diagnostic_mode=mode;
     out->enable_frame_id=!hookless_selected(settings)&&settings.backbuffer_frame_id ? 1u : 0u;
     out->fg_queue_priority=settings.queue_priority <= 2u ? settings.queue_priority : 1u;
-    out->release_point=settings.release_point<=3u?settings.release_point:0u;
+    out->release_point=settings.release_point<=4u?settings.release_point:0u;
     out->submit_repeats=settings.submit_repeats?1u:0u;
     return true;
 }

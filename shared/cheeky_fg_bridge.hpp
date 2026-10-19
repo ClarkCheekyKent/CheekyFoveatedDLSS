@@ -42,7 +42,7 @@ struct CheekyFgPair {
     std::uint32_t diagnostic_mode{}; // 0 normal, 1 prepare-first, 2 left-only, 3 right-only, 4 split-lists.
     std::uint32_t enable_frame_id{1}; // Optional NGX BackbufferFrameID A/B; applied to each feature.
     std::uint32_t fg_queue_priority{1}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
-    std::uint32_t release_point{}; // 0 FG submission, 1 GPU preparation, 2 stereo completion, 3 generated XR submission.
+    std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
     std::uint32_t submit_repeats{1}; // Resubmit unchanged scene content at runtime frame opportunities.
 };
 using CheekyFgAcquireFn=bool(__cdecl*)(CheekyFgPair*);

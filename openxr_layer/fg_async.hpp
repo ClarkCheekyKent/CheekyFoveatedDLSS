@@ -192,6 +192,7 @@ struct BufferedPresenter final : Presenter {
     TimingAverage clock_late,credit_deferral,begin_gate_wait,presenter_content_wait;
     TimingAverage native_xr_end,generated_xr_end;
     TimingClock::time_point credit_deferred_since{};
+    TimingClock::time_point release_delay_until{}; // Mode 4: 4 ms after FG submission; not a GPU fence wait.
     std::uint64_t last_generated_submit_tick{};
     TimingAverage app_image_wait,present_image_wait,runtime_begin,runtime_end,present_cpu;
     std::array<TimingAverage,3> app_calls;
@@ -455,7 +456,7 @@ struct BufferedPresenter final : Presenter {
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
-        native_xr_end={};generated_xr_end={};credit_deferred_since={};last_generated_submit_tick=0;
+        native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
         producer.gpu_cost.reset();uploads.gpu_cost.reset();extra_gpu={};
         frame_ages={};age_samples={};late_pair_wait={};late_wait_samples=late_wait_arrivals=late_wait_timeouts=0;
         late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
@@ -846,6 +847,7 @@ struct BufferedPresenter final : Presenter {
                     if(trace)trace(point==3u?"FG native release=after generated frame OpenXR submission (Lua; histories retained)":
                         point==2u?"FG native release=after stereo GPU completion (Lua; histories retained)":
                         point==1u?"FG native release=after both-eye GPU preparation (Lua; histories retained)":
+                        point==4u?"FG native release=4 ms after FG command submission (Lua; CPU timer, no GPU wait)":
                         "FG native release=after submission (Lua; default overlap)");
                 }
                 if(!release_policy_known||last_repeat_policy!=(job->guides.submit_repeats!=0)) {
@@ -1166,6 +1168,14 @@ struct BufferedPresenter final : Presenter {
             auto next=TimingClock::now();
             while(!stopping) {
                 const auto now=TimingClock::now();
+                // A deferred native credit may become available between
+                // display clock ticks. Wake exactly at the soft-release
+                // deadline instead of adding a whole XR tick of latency.
+                if(release_delay_until!=TimingClock::time_point{}&&now>=release_delay_until) {
+                    release_delay_until={};
+                    release_deferred_credit();
+                    changed.notify_all(); // Existing wait/begin credits may also be gated.
+                }
                 if(now>=next) {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
@@ -1180,7 +1190,9 @@ struct BufferedPresenter final : Presenter {
                     }
                     next+=period;if(next<=now)next=now+period;
                 }
-                changed.wait_until(lock,next);
+                const auto wake=release_delay_until!=TimingClock::time_point{}?
+                    std::min(next,release_delay_until):next;
+                changed.wait_until(lock,wake);
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
@@ -1192,7 +1204,8 @@ struct BufferedPresenter final : Presenter {
         // so pre-existing credits cannot let a render race worker pickup.
         if(stopping||raw||degraded)return false;
         if(awaiting_generated_submission)return true;
-        if(inflight_id&&(inflight_id>submitted_native_id||inflight_release_point>=2u||
+        if(release_delay_until!=TimingClock::time_point{}&&TimingClock::now()<release_delay_until)return true;
+        if(inflight_id&&(inflight_id>submitted_native_id||inflight_release_point==2u||inflight_release_point==3u||
             (inflight_release_point==1u&&!inflight_prepared)))return true;
         return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
             return job->guides_valid&&(job->guides.release_point!=0||job->id>submitted_native_id);
@@ -1216,6 +1229,10 @@ struct BufferedPresenter final : Presenter {
     }
     void inference_submitted() noexcept {
         std::lock_guard lock(mx);submitted_native_id=std::max(submitted_native_id,inflight_id);
+        if(inflight_release_point==4u) {
+            release_delay_until=TimingClock::now()+std::chrono::milliseconds(4);
+            changed.notify_all(); // Wake the pacing clock to install the deadline.
+        }
         release_deferred_credit();
     }
     void inference_prepared() noexcept {
@@ -1422,7 +1439,7 @@ struct BufferedPresenter final : Presenter {
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
                     const auto c=cadence();
                     sprintf_s(cadence_log,"FG experiment cadence: release=%s repeats=%s queue=%s clock=independent valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f repeated=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f",
-                        active_release_point==3u?"generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":"submission",
+                        active_release_point==3u?"generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
                         submit_repeat_frames?"ON":"OFF",queue_mode_name(reported_queue_mode),c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.repeat_fps,c.submission_fps,
                         xr_wait.mean(),runtime_end.mean(),present_cpu.mean());
                     sprintf_s(age_log,"FG source-age CPU ms: generated_samples=%llu latest_capture_to_complete=%.3f complete_to_generated_submit=%.3f newest_input_age=%.3f complete_to_native_submit=%.3f; late_waits=%llu arrivals=%llu timeouts=%llu ready_skips=%llu idle_skips=%llu",

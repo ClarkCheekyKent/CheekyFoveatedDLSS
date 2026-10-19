@@ -103,7 +103,8 @@ void settings_tests(const std::filesystem::path& root) {
             !set_named_setting(fg,"FgEnabled","invalid") && !set_named_setting(fg,"FgWidth","nan"),
             "FG settings validate types");
         require(set_named_setting(fg,"FgReleasePoint","1")&&fg.fg.release_point==1&&
-            set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","4")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
+            set_named_setting(fg,"FgReleasePoint","3")&&set_named_setting(fg,"FgReleasePoint","4")&&fg.fg.release_point==4&&
+            !set_named_setting(fg,"FgReleasePoint","5")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
             set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
         require(!fg.fg.hookless_mode3&&set_named_setting(fg,"FgHooklessMode3","true")&&fg.fg.hookless_mode3&&
@@ -489,6 +490,15 @@ int main(int argc, char** argv) {
             options.size=0;require(!transport_fn(&options),"Transport options reject incorrect ABI size");
             require(control_fn(&control) && control.enabled && std::abs(field(snapshot(get),"FgWidth")-0.37)<0.00001,
                 "Lua protocol controls real FG runtime");
+            // Release policy is scheduling-only: do not restart FG or invalidate NGX history.
+            const auto before_release_configuration=control.configuration;
+            command("1\n907\nset\nFgReleasePoint=4");
+            require(control_fn(&control)&&control.enabled&&control.configuration==before_release_configuration&&
+                snapshot(get).find("\"FgReleasePoint\":4")!=std::string::npos,
+                "4ms soft release is live without resetting FG or its capture configuration");
+            command("1\n908\nset\nFgReleasePoint=3");
+            require(control_fn(&control)&&control.enabled&&control.configuration==before_release_configuration,
+                "Switching release modes preserves an enabled FG pipeline and its temporal configuration");
             command("1\n903\nset\nEnabled=false");
             fg_runtime_frame_validation(runtime,bin,device.Get(),queue.Get());
             command("1\n905\nset\nFgReleasePoint=0\nFgSubmitRepeats=true");

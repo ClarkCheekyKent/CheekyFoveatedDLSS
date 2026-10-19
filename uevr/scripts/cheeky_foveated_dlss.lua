@@ -616,7 +616,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgReleasePoint ~= nil then
                     combo("Release game rendering", "FgReleasePoint", {
-                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission"})
+                        [0]="After FG submission", [4]="4 ms after FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission"})
+                    text("4 ms: CPU pacing delay after FG queue submission; does NOT wait on a GPU fence.")
                     text("Preparation waits for both eyes' GPU input preparation, then overlaps native rendering with NGX.")
                     if draft.FgReleasePoint == 3 then
                         text("Holds the next native frame through generated-frame uploads and OpenXR submission.")

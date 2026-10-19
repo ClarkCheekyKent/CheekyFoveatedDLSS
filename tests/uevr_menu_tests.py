@@ -220,7 +220,7 @@ def run(engine):
         receive(state)
         draw()
         assert g["values"]["FG GPU queue"] == option
-    for point in (1, 2, 3, 0):
+    for point in (1, 2, 3, 4, 0):
         draw(changes={"Release game rendering": point})
         assert "FgReleasePoint=" + str(point) in last()
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
