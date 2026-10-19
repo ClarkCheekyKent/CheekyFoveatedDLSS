@@ -3417,6 +3417,14 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetExperimentDiagnosticsV
     return true;
 }
 
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetMemoryV1(CheekyFgMemory* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgMemory{};out->supported=1;std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->memory();return true;}
+    return true;
+}
+
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
     const XrSession session, const XrFrameBeginInfo* info) {
     PFN_xrBeginFrame next{};

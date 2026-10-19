@@ -129,6 +129,19 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
     ComPtr<ID3D12DescriptorHeap> rtv;D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=1;
     check(SUCCEEDED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtv))),"Repeat RTV");
     device->CreateRenderTargetView(source.Get(),nullptr,rtv->GetCPUDescriptorHandleForHeapStart());
+    {
+        auto image=p.producer.image(d);check(bool(image),"Memory inventory pool image");
+        cheeky::fg_memory::Collector collect(device);const auto held=p.producer.memory(collect);
+        const auto desc=image->texture->GetDesc();const auto expected=device->GetResourceAllocationInfo(0,1,&desc).SizeInBytes;
+        check(held.resources==1&&held.bytes==expected&&held.reusable_resources==0&&held.unknown_resources==0,
+            "Pool allocation bytes include alignment and distinguish retained client references");
+        CheekyFgMemoryBucket duplicate;collect.add(duplicate,image->texture.Get());
+        check(duplicate.resources==0&&duplicate.bytes==0,"Aliased references must never count a GPU resource twice");
+        image.reset();cheeky::fg_memory::Collector idle_collect(device);const auto idle=p.producer.memory(idle_collect);
+        check(idle.bytes==held.bytes&&idle.reusable_bytes==held.bytes&&idle.reusable_resources==1,
+            "Dropping a client reference leaves allocated but reusable pool memory visible");
+        p.producer.pool.clear();
+    }
     auto execute=[&]{check(SUCCEEDED(commands->Close()),"Repeat close");ID3D12CommandList* lists[]{commands.Get()};queue->ExecuteCommandLists(1,lists);
         // The test alone waits for readback/reset. Production repeat handling
         // must not submit GPU work or wait for allocator retirement.
@@ -813,6 +826,14 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         std::cout<<"Guide snapshot GPU="<<guide.mean<<" ms/native (both eyes)\n";
     }
     {std::lock_guard lock(p.mx);const auto extra=p.overhead();
+        const auto memory=p.memory();
+        check(memory.supported&&memory.presenter_present&&memory.capture_tick&&memory.presenter_tick&&
+            memory.categories[cheeky::fg_memory::capture].bytes>0&&memory.categories[cheeky::fg_memory::swapchain_native].resources>0,
+            "Actual buffered capture and XR images publish independent resource memory categories");
+        if(models)check(memory.worker_tick&&memory.categories[cheeky::fg_memory::generated].bytes>0&&
+            memory.categories[cheeky::fg_memory::prepared_color].bytes>0&&memory.categories[cheeky::fg_memory::ngx_outputs].bytes>0&&
+            memory.categories[cheeky::fg_memory::composition].bytes==0&&memory.categories[cheeky::fg_memory::swapchain_generated].bytes>0,
+            "Real NGX reports output/preparation memory with zero duplicate direct-publication composition scratch");
         check(extra.supported&&extra.capture_samples>0&&extra.upload_samples>0&&extra.capture_ms>0&&extra.upload_ms>0,
             "Actual capture/handoff and presentation-upload GPU queries must retire without adding CPU waits");
         if(models)check(extra.publication_samples>0&&extra.publication_ms==0,

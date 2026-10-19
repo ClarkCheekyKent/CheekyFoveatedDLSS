@@ -4,6 +4,7 @@
 #include "late_attach_tests.hpp"
 #include "runtime_search.hpp"
 #include "frame_cadence.hpp"
+#include "gpu_memory.hpp"
 #include "support_bundle.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "mock_ngx_parameters.hpp"
@@ -105,10 +106,10 @@ void settings_tests(const std::filesystem::path& root) {
             set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","4")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
             set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
-        require(fg.fg.queue_priority==1&&set_named_setting(fg,"FgQueuePriority","0")&&
+        require(fg.fg.queue_priority==2&&set_named_setting(fg,"FgQueuePriority","0")&&
             set_named_setting(fg,"FgQueuePriority","1")&&set_named_setting(fg,"FgQueuePriority","2")&&
             !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
-            "Shared game and separate GPU queues validate without changing the HIGH default");
+            "Shared game queue is the default; separate GPU queues remain selectable");
         require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==1,"Transport defaults use direct eyes and batched uploads");
         for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics"})
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
@@ -126,7 +127,7 @@ void settings_tests(const std::filesystem::path& root) {
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
             !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
-            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==1,"FG reset restores the tested preset and opt-out");
+            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,"FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
         require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&
@@ -320,6 +321,25 @@ int main(int argc, char** argv) {
         if (hardware) puts("Testing native D3D12 hooks on the default hardware adapter (no game).");
         D3D12_COMMAND_QUEUE_DESC q{}; q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
         ComPtr<ID3D12CommandQueue> queue; check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)), "Queue");
+        {
+            GpuMemory::Segment segment;DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+            info.CurrentUsage=1024;info.Budget=2048;segment.update(S_OK,info);
+            require(segment.valid&&segment.headroom==1024&&segment.over_budget==0&&segment.peak==1024,"Memory budget headroom");
+            info.CurrentUsage=4096;segment.update(S_OK,info);
+            require(segment.headroom==0&&segment.over_budget==2048&&segment.over_budget_samples==1&&segment.peak==4096,
+                "Over-budget memory must not underflow headroom");
+            segment.update(E_FAIL,{});
+            require(!segment.valid&&segment.usage==0&&segment.peak==4096,"Failed memory queries are unavailable, not valid zero usage");
+            GpuMemory memory;memory.attach(1,device.Get(),queue.Get());
+            const auto expected=device->GetAdapterLuid();
+            require(memory.adapter&&memory.luid.LowPart==expected.LowPart&&memory.luid.HighPart==expected.HighPart,"Memory adapter must match the actual render device");
+            require(memory.poll(1000)&&memory.samples==1&&!memory.poll(1500)&&memory.samples==1,"GPU memory queries are throttled to one per second");
+            require(memory.mark_baseline(1600,false)==memory.local.valid&&memory.baseline_at==1600&&!memory.baseline_fg_enabled,
+                "Baseline performs a fresh query and preserves FG state");
+            if(hardware)require(memory.local.valid&&memory.nonlocal.valid,"Hardware DXGI local and nonlocal memory queries succeed");
+            memory.attach(2,nullptr,nullptr);
+            require(!memory.adapter&&!memory.baseline_valid&&memory.samples==0,"Device changes discard stale memory samples and baselines");
+        }
         UEVR_PluginVersion version{2,39,0};
         UEVR_PluginFunctions functions{};
         functions.get_persistent_dir = get_dir; functions.dispatch_lua_event = dispatch; functions.remove_callback = remove_callback;
@@ -541,6 +561,14 @@ int main(int argc, char** argv) {
             puts("UEVR ownership conflict test passed"); return 0;
         }
         require(received.find("\"ready\":true") != received.npos, "Renderer initialized");
+        require(received.find("\"gpu_memory\":{\"supported\":true,\"scope\":\"process\"")!=received.npos,
+            "Actual runtime snapshot reports process GPU memory on the render adapter");
+        command("1\n79\nmark_vram_baseline");
+        const auto memory_start=received.find("\"gpu_memory\":{");
+        const auto memory_json=received.substr(memory_start,received.find(",\"fg\":{",memory_start)-memory_start);
+        const bool memory_valid=memory_json.find("\"local\":{\"valid\":true")!=memory_json.npos;
+        require(memory_json.find(memory_valid?"\"baseline\":{\"valid\":true":"\"baseline\":{\"valid\":false")!=memory_json.npos,
+            "Lua baseline command reflects actual DXGI query availability");
         const auto calibration_start = received.find("\"eye_calibration\":{");
         require(calibration_start != received.npos, "Shared eye calibration diagnostics present");
         const auto calibration = received.substr(calibration_start, received.find('}', calibration_start) - calibration_start);

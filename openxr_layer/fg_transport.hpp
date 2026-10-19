@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_present.hpp"
 #include "../shared/cheeky_gpu_span.hpp"
+#include "../shared/fg_resource_memory.hpp"
 #include <vector>
 #include <atomic>
 
@@ -37,6 +38,11 @@ struct Transport {
     std::uint64_t timestamp_frequency{};
     std::atomic<std::uint64_t> full_copies{},region_copies{},upload_copies{},submissions{};
     cheeky::gpu::Groups gpu_cost;
+    CheekyFgMemoryBucket memory(fg_memory::Collector& collect) const {
+        CheekyFgMemoryBucket out;
+        for(const auto& image:pool)collect.add(out,image->texture.Get(),image.use_count()==1);
+        return out;
+    }
     bool initialize(ID3D12Device* d,ID3D12CommandQueue* q) {
         device=d;queue=q;timestamp_frequency=0;q->GetTimestampFrequency(&timestamp_frequency);
         return SUCCEEDED(d->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));

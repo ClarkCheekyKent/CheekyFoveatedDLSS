@@ -299,6 +299,13 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(Che
     out->upload_mode=settings.upload_mode==1u?1u:0u;
     out->latency_diagnostics=settings.latency_diagnostics==1u?1u:0u;return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFgMemory* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    using namespace cheeky::foveated_dlss;
+    *out=CheekyFgMemory{};std::lock_guard lock(mutex);cheeky::fg_memory::Collector collect;
+    for(const auto& generation:store().generations)generation->memory(*out,collect);
+    out->guides_supported=1;out->guide_tick=GetTickCount64();return true;
+}
 extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(ID3D12Resource* color) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!enabled())return 0;
@@ -391,5 +398,16 @@ bool fg_experiment_diagnostics(CheekyFgExperimentDiagnostics& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
     const auto query=layer?reinterpret_cast<CheekyFgExperimentDiagnosticsFn>(GetProcAddress(layer,"CheekyFG_GetExperimentDiagnosticsV1")):nullptr;
     return query&&query(&out);
+}
+bool fg_memory_diagnostics(CheekyFgMemory& out) noexcept {
+    if(out.abi!=1||out.size!=sizeof(out))return false;
+    out=CheekyFgMemory{};
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgMemoryFn>(GetProcAddress(layer,"CheekyFG_GetMemoryV1")):nullptr;
+    const bool supported=query&&query(&out);
+    CheekyFgMemory guides;CheekyFG_GetGuideMemoryV1(&guides);
+    out.categories[fg_memory::guide_depth]=guides.categories[fg_memory::guide_depth];
+    out.categories[fg_memory::guide_motion]=guides.categories[fg_memory::guide_motion];
+    out.guides_supported=guides.guides_supported;out.guide_tick=guides.guide_tick;return supported;
 }
 }

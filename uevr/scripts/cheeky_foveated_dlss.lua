@@ -220,7 +220,90 @@ local function reset_group(label, group)
 end
 local alignment = {[0]="Manual fallback", [1]="Streamline projection", [2]="OpenXR", [3]="OpenVR", [4]="LibOVR"}
 
+local function fg_resource_memory(id, r)
+    if not r then text("Update the plugin/runtime for the FG resource memory breakdown."); return end
+    if not imgui.tree_node("FG resource memory breakdown##" .. id) then return end
+    local c = r.categories or {}
+    local function mib(bytes) return string.format("%.1f MiB", (bytes or 0) / 1048576) end
+    local entries = {}
+    local function item(label, key, available)
+        local b = c[key] or {}
+        local value = available and (mib(b.bytes) .. string.format(" / %.0f resources",b.resources or 0)) or "Unavailable / awaiting sample"
+        if available and (b.unknown_resources or 0)>0 then value=value .. string.format("; %.0f unsized",b.unknown_resources) end
+        entries[#entries+1] = {label,value}
+    end
+    local capture = r.layer_supported and (not r.presenter_present or (r.capture_tick or 0)>0)
+    local worker = r.layer_supported and (not r.presenter_present or (r.worker_tick or 0)>0)
+    local presenter = r.layer_supported and (not r.presenter_present or (r.presenter_tick or 0)>0)
+    item("Native color / capture pool","capture",capture)
+    item("Generated output pool","generated",worker)
+    item("Upload transport pool","upload_pool",presenter)
+    item("Captured depth guides","guide_depth",r.guides_supported)
+    item("Captured motion guides","guide_motion",r.guides_supported)
+    item("Prepared FG color","prepared_color",worker)
+    item("Prepared FG depth","prepared_depth",worker)
+    item("Prepared FG motion","prepared_motion",worker)
+    item("NGX output textures + flags","ngx_outputs",worker)
+    item("Periphery + depth history","periphery",worker)
+    item("Composition scratch","composition",worker)
+    item("Native XR images (estimated)","swapchain_native",presenter)
+    item("Generated XR images (estimated)","swapchain_generated",presenter)
+    item("Auxiliary XR images (estimated)","swapchain_auxiliary",presenter)
+    rows("fg_memory_categories_" .. id,entries)
+    rows("fg_memory_totals_" .. id,{
+        {"Known app FG resources",mib(r.app_resource_bytes)},
+        {"XR image allocation estimates",mib(r.swapchain_estimated_bytes)},
+        {"Known resources + XR estimates",mib(r.known_resource_bytes)},
+        {"Reusable capture / output pool",mib((c.capture or {}).reusable_bytes) .. " / " .. mib((c.generated or {}).reusable_bytes)},
+        {"NVIDIA internal / driver memory","Not measured"}
+    })
+    if not r.layer_supported then text("Partial breakdown: update OpenXR support for presenter resources.") end
+    if (r.unknown_resources or 0)>0 then text("Some resource sizes are unavailable; totals omit those sizes.") end
+    text("Unique resource allocation sizes, not resident VRAM. XR images are estimates; borrowed game textures are excluded.")
+    text("Reusable pools are a subset of the totals. They are retained allocations, not extra copies per reference.")
+    text("Does not measure NVIDIA internal workspace, command/descriptor storage or driver overhead; do not subtract from DXGI usage to infer NVIDIA's share.")
+    imgui.tree_pop()
+end
+
+local function gpu_memory(id)
+    section("GPU memory (game process)")
+    local m = status.gpu_memory or {}
+    local l, n, b = m["local"] or {}, m.nonlocal or {}, m.baseline or {}
+    local function mib(bytes) return string.format("%.1f MiB", (bytes or 0) / 1048576) end
+    local function delta(bytes) return string.format("%+.1f MiB", (bytes or 0) / 1048576) end
+    if not m.supported then
+        text("GPU memory query unavailable in this runtime or renderer.")
+        return
+    end
+    rows("gpu_memory_" .. id, {
+        {"GPU adapter", m.adapter or "Unknown"},
+        {"Local usage / budget", l.valid and (mib(l.usage_bytes) .. " / " .. mib(l.budget_bytes)) or "Unavailable"},
+        {"Local budget headroom", l.valid and mib(l.headroom_bytes) or "Unavailable"},
+        {"Local sampled peak", l.valid and mib(l.peak_bytes) or "Unavailable"},
+        {"Samples over local budget", l.valid and string.format("%.0f",l.over_budget_samples or 0) or "Unavailable"},
+        {"Shared / nonlocal usage", n.valid and mib(n.usage_bytes) or "Unavailable"},
+        {"Shared / nonlocal budget", n.valid and mib(n.budget_bytes) or "Unavailable"},
+        {"Dedicated adapter capacity", (m.dedicated_capacity_bytes or 0)>0 and mib(m.dedicated_capacity_bytes) or "Unavailable / shared-memory GPU"}
+    })
+    if l.valid and (l.over_budget_bytes or 0)>0 then text("OVER LOCAL BUDGET by " .. mib(l.over_budget_bytes)) end
+    if b.valid then
+        rows("gpu_memory_baseline_" .. id, {
+            {"Baseline FG setting", b.fg_enabled and "ON" or "OFF"},
+            {"Local change from baseline", l.valid and delta(b.local_delta_bytes) or "Unavailable"},
+            {"Shared change from baseline", n.valid and b.nonlocal_valid and delta(b.nonlocal_delta_bytes) or "Unavailable"}
+        })
+    else text("No VRAM baseline marked.") end
+    imgui.begin_disabled(not l.valid)
+    if imgui.button("Mark VRAM baseline##" .. id) then send("mark_vram_baseline") end
+    imgui.end_disabled()
+    text("Sampled once per second. Local memory is VRAM on discrete GPUs; budget is assigned by Windows.")
+    text("Includes the game, Cheeky and in-process runtime allocations. Excludes other processes; capacity is not free VRAM.")
+    text("Mark a baseline with FG OFF, then enable FG in the same scene. The change also includes game allocations.")
+    fg_resource_memory(id,m.fg_resources)
+end
+
 local function performance(d, f)
+    gpu_memory("performance")
     section("Frame rate comparison")
     rows("fps", {{"SR enabled", fps(f.sr_enabled_ms)}, {"SR disabled", fps(f.sr_disabled_ms)},
         {"Frame time savings", saving(f.sr_disabled_ms, f.sr_enabled_ms)}})
@@ -727,6 +810,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 text("If generation is unavailable, the original native frame is displayed.")
             end
+            gpu_memory("fg")
             reset_group("Reset DLSS-FG defaults", "fg")
         end
         imgui.tree_pop()

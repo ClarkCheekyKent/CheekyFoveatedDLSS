@@ -8,6 +8,7 @@ bool fg_cadence(CheekyFgCadence&) noexcept;
 bool fg_overhead(CheekyFgOverhead&) noexcept;
 bool fg_presentation(CheekyFgPresentation&) noexcept;
 bool fg_experiment_diagnostics(CheekyFgExperimentDiagnostics&) noexcept;
+bool fg_memory_diagnostics(CheekyFgMemory&) noexcept;
 const char* fg_state_name(CheekyFgState state) noexcept;
 }
 #include "ngx_abi.hpp"

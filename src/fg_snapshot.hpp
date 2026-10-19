@@ -2,6 +2,7 @@
 #include "d3d12_native.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "../shared/cheeky_gpu_span.hpp"
+#include "../shared/fg_resource_memory.hpp"
 #include <memory>
 #include <vector>
 
@@ -64,6 +65,15 @@ class FgSnapshots {
         barrier(list,from,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 public:
+    void memory(CheekyFgMemory& out,fg_memory::Collector& collect) const {
+        const auto done=fence?fence->GetCompletedValue():0;
+        for(const auto& shot:shots){
+            const bool reusable=shot.use_count()==1&&(shot->cancelled||
+                (shot->retired&&shot->retired<=done&&shot->meta.evaluation+2<ordinal+1&&!shot->foreign));
+            collect.add(out.categories[fg_memory::guide_depth],shot->depth.Get(),reusable);
+            collect.add(out.categories[fg_memory::guide_motion],shot->motion.Get(),reusable);
+        }
+    }
     cheeky::gpu::Summary capture_gpu() const {return gpu_cost.summary();}
     struct Match {
         std::uint64_t frame{},latest_frame{},latest{},consumed{},failed{};

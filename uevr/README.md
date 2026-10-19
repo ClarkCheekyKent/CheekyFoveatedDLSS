@@ -148,8 +148,8 @@ For final testing, compare SR off/on with peripheral DLAA, check both eyes durin
 
 ## FG GPU queue comparison
 
-The Lua **FG GPU queue** dropdown selects **Separate HIGH queue** (the unchanged
-default), **Separate NORMAL queue**, or **Shared game queue**. The saved key
+The Lua **FG GPU queue** dropdown selects **Separate HIGH queue**,
+**Separate NORMAL queue**, or **Shared game queue** (the default). The saved key
 remains `FgQueuePriority`: 1, 0, and 2 respectively. Switching applies live after
 the current FG job retires and recreates NGX histories. FG processing, calibrated
 latency, source-age, pacing-wait, and FPS windows restart for the new queue.
@@ -163,3 +163,45 @@ queue entry, capture dependency, and FG GPU work. Shared queue markers reach the
 GPU after preceding work on the game queue, so dependency time may move into
 queue-entry time; compare their sum rather than expecting both fields to fall.
 These are scheduling experiments, not an established fix for gameplay slowdown.
+
+## GPU memory diagnostics
+
+Lua's FG diagnostics and Performance section report the render adapter/node's
+DXGI process memory usage, assigned budget, local headroom, sampled peak, and
+over-budget sample count. Local memory is VRAM on a discrete GPU. Nonlocal
+usage is shown separately; it does not by itself prove paging. The adapter's
+dedicated capacity is hardware capacity, not free memory or a process budget.
+Failed/unsupported queries show unavailable, including unsupported renderers.
+
+Sampling is limited to once per second, with no GPU fence wait. The runtime log
+records samples with FG state, selected queue request, and FPS; support ZIPs
+also include the latest values and peak in diagnostics.json. Peaks are sampled,
+not an exhaustive allocation high-water mark. Capture is available with FG OFF.
+
+In the same scene, disable FG, allow memory to settle, and press **Mark VRAM
+baseline**. Enable FG and compare the signed local/shared changes and budget
+headroom. The baseline button takes a fresh sample. Counts cover the entire
+game process, including Cheeky and in-process runtime allocations; they exclude
+other processes. Changes can include game streaming and driver allocations, so
+the comparison is not an exact count of memory allocated by FG. Baselines and
+peaks reset when the observed graphics device changes. Saved queue choices
+remain unchanged; new/reset profiles default to the shared game queue.
+
+Expand **FG resource memory breakdown** for capture/output pools, captured depth
+and motion guides, prepared color/depth/motion inputs, application-owned NGX
+output textures/flags, periphery/history, composition scratch, and native,
+generated and auxiliary XR images. Counts deduplicate resource identities;
+borrowed engine textures are excluded. Reusable bytes are already part of the
+pool/guide totals. They indicate allocations the current pool can reuse, not
+necessarily every resource whose GPU work has finished.
+
+Sizes use the driver's resource allocation requirements, including alignment.
+XR images are estimates because the runtime owns their backing heaps. These
+counts are not residency, and omit NVIDIA internal allocations, command and
+descriptor storage, readback/system-memory buffers, and driver overhead. Do not
+subtract the sum from DXGI usage or the FG ON/OFF difference to infer NVIDIA's
+share. Categories are sampled on their owning threads, approximately once per
+second while frames advance; capture/worker/presenter/guide sample ticks are in
+the JSON and logs. Older OpenXR layers show a partial guide-only breakdown;
+install the matching OpenXR update for all presenter categories. The resource
+export is additive and preserves existing status/performance ABIs.

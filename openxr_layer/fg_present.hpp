@@ -67,6 +67,7 @@ struct Presenter {
     virtual CheekyFgOverhead overhead() const noexcept {return {};}
     virtual CheekyFgPresentation presentation() const noexcept {return {};}
     virtual CheekyFgExperimentDiagnostics experiments() const noexcept {return {};}
+    virtual CheekyFgMemory memory() const noexcept {return {};}
     virtual void note_app_image_wait(double) noexcept {}
     virtual void note_app_call(unsigned,double) noexcept {}
     double copy_wait_accumulator{},xr_period_ms{};

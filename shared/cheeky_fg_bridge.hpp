@@ -159,3 +159,23 @@ struct CheekyFgExperimentDiagnostics {
     CheekyFgTimingValue native_gpu_tail,gpu_ready_to_submit,gpu_ready_to_display;
 };
 using CheekyFgExperimentDiagnosticsFn=bool(__cdecl*)(CheekyFgExperimentDiagnostics*);
+
+// Resource allocation requirements, not residency or total NGX memory. Separate
+// export so existing performance/status/pair ABI layouts remain unchanged.
+namespace cheeky::fg_memory {
+enum Category : unsigned {capture,generated,upload_pool,guide_depth,guide_motion,
+    prepared_color,prepared_depth,prepared_motion,ngx_outputs,periphery,composition,
+    swapchain_native,swapchain_generated,swapchain_auxiliary,count};
+inline constexpr const char* names[count]{"capture","generated","upload_pool","guide_depth","guide_motion",
+    "prepared_color","prepared_depth","prepared_motion","ngx_outputs","periphery","composition",
+    "swapchain_native","swapchain_generated","swapchain_auxiliary"};
+}
+struct CheekyFgMemoryBucket {
+    std::uint64_t bytes{},resources{},reusable_bytes{},reusable_resources{},unknown_resources{};
+};
+struct CheekyFgMemory {
+    std::uint32_t abi{1},size{sizeof(CheekyFgMemory)},supported{},presenter_present{},guides_supported{};
+    std::uint64_t capture_tick{},worker_tick{},presenter_tick{},guide_tick{};
+    CheekyFgMemoryBucket categories[cheeky::fg_memory::count]{};
+};
+using CheekyFgMemoryFn=bool(__cdecl*)(CheekyFgMemory*);

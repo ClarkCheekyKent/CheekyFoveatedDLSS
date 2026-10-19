@@ -88,6 +88,12 @@ void fg_runtime_frame_validation(HMODULE runtime,const std::filesystem::path& bi
     pair.render_frame=77;require(acquire(&pair)&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,"Both guides belong to the color's RHI frame");
     require(pair.release_point==3&&pair.submit_repeats==0,"Lua generated-submission gate reaches the real captured stereo pair");
     require(pair.fg_queue_priority==2,"Lua shared GPU queue selection survives the actual captured-pair ABI");
+    const auto query_memory=reinterpret_cast<CheekyFgMemoryFn>(GetProcAddress(runtime,"CheekyFG_GetGuideMemoryV1"));
+    CheekyFgMemory memory;require(query_memory&&query_memory(&memory)&&memory.guides_supported&&
+        memory.categories[cheeky::fg_memory::guide_depth].resources>=2&&memory.categories[cheeky::fg_memory::guide_motion].resources>=2&&
+        memory.categories[cheeky::fg_memory::guide_depth].bytes>0&&memory.categories[cheeky::fg_memory::guide_motion].bytes>0,
+        "Memory inventory counts actual owned guide snapshots separately from borrowed native inputs");
+    memory.size=0;require(!query_memory(&memory),"Guide memory export rejects mismatched ABI sizes");
     require(pair.eyes[0].depth_inverted&&pair.eyes[1].depth_inverted&&pair.eyes[0].motion_jittered&&pair.eyes[1].motion_jittered,
         "Signed creation flags survive a separate evaluation parameter object");release(&pair);
     begin();copy();submit();require(stamp(output.Get(),&s)&&s.render_frame==78,"Next color uses its own RHI frame");

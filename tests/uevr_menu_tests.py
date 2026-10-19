@@ -166,6 +166,51 @@ def run(engine):
     assert g["values"]["Submit repeat frames"] is False
     assert g["values"]["FG color capture"] == 1
     assert g["values"]["FG OpenXR uploads"] == 1
+    state["gpu_memory"] = {"supported":True,"scope":"process","adapter":"Test GPU","dedicated_capacity_bytes":12288*1048576,
+        "local":{"valid":True,"usage_bytes":9000*1048576,"budget_bytes":8192*1048576,"headroom_bytes":0,
+                 "over_budget_bytes":808*1048576,"peak_bytes":10000*1048576,"over_budget_samples":3},
+        "nonlocal":{"valid":True,"usage_bytes":512*1048576,"budget_bytes":16384*1048576},
+        "baseline":{"valid":True,"nonlocal_valid":True,"fg_enabled":False,"local_delta_bytes":500*1048576,"nonlocal_delta_bytes":-256*1048576}}
+    receive(state)
+    draw()
+    for value in ("9000.0 MiB / 8192.0 MiB", "OVER LOCAL BUDGET by 808.0 MiB", "+500.0 MiB", "-256.0 MiB"):
+        assert value in list(g.drawn.values()), "Missing memory diagnostic: " + value
+    draw("Mark VRAM baseline##fg")
+    assert last().endswith("\nmark_vram_baseline"), "VRAM baseline button did not reach the runtime"
+    state["settings"]["FgEnabled"] = False
+    receive(state)
+    draw("Mark VRAM baseline##fg")
+    assert last().endswith("\nmark_vram_baseline"), "VRAM baseline must remain accessible with FG OFF"
+    state["settings"]["FgEnabled"] = True
+    state["gpu_memory"]["local"]["valid"] = False
+    state["gpu_memory"]["nonlocal"]["valid"] = False
+    receive(state)
+    draw()
+    assert "OVER LOCAL BUDGET by 808.0 MiB" not in list(g.drawn.values())
+    assert "+500.0 MiB" not in list(g.drawn.values()), "Unavailable queries must not display stale memory deltas"
+    state["gpu_memory"]["supported"] = False
+    receive(state)
+    draw()
+    assert any("GPU memory query unavailable" in t for t in g.drawn.values())
+    state["gpu_memory"]["supported"] = True
+    state["gpu_memory"]["local"]["valid"] = True
+    state["gpu_memory"]["nonlocal"]["valid"] = True
+    state["gpu_memory"]["fg_resources"] = {"layer_supported":True,"guides_supported":True,"presenter_present":True,
+        "capture_tick":1,"worker_tick":1,"presenter_tick":1,"app_resource_bytes":320*1048576,
+        "swapchain_estimated_bytes":128*1048576,"known_resource_bytes":448*1048576,"categories":{
+            "capture":{"bytes":128*1048576,"resources":4,"reusable_bytes":32*1048576},
+            "generated":{"bytes":64*1048576,"resources":2,"reusable_bytes":16*1048576}}}
+    receive(state)
+    draw()
+    for value in ("128.0 MiB / 4 resources","64.0 MiB / 2 resources","448.0 MiB","32.0 MiB / 16.0 MiB","Not measured"):
+        assert value in list(g.drawn.values()), "Missing per-category FG memory: " + value
+    state["gpu_memory"]["fg_resources"]["layer_supported"] = False
+    receive(state)
+    draw()
+    assert any("Partial breakdown: update OpenXR" in t for t in g.drawn.values())
+    state["gpu_memory"]["fg_resources"]["layer_supported"] = True
+    receive(state)
+    draw()
     assert g.combos["FG GPU queue"][2] == "Shared game queue"
     for option in (2, 0, 1):
         draw(changes={"FG GPU queue": option})

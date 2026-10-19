@@ -2,6 +2,7 @@
 #include "runtime_api.hpp"
 #include "settings_io.hpp"
 #include "frame_cadence.hpp"
+#include "gpu_memory.hpp"
 #include "support_bundle.hpp"
 #include "eye_calibration_capture.hpp"
 #include <shellapi.h>
@@ -48,6 +49,10 @@ struct State {
     std::uint64_t revision{}, saved_revision{}, request{}, applied_request{};
     std::uint64_t attachment_sequence{};
     FrameCadence cadence;
+    GpuMemory memory;
+    CheekyFgMemory fg_memory;
+    std::uint64_t next_fg_memory_sample{};
+    std::uint64_t logged_memory_sample{};
     ULONGLONG next_timing_log{};
     std::string message{"Not initialized"};
     std::atomic<bool> save_requested{}, report_requested{};
@@ -57,6 +62,28 @@ struct State {
     std::string report_summary;
 };
 State& state() { static auto* instance = new State; return *instance; }
+void sample_fg_memory(State& s,std::uint64_t now) {
+    if(now<s.next_fg_memory_sample)return;
+    CheekyFgMemory value;fg_memory_diagnostics(value);s.fg_memory=value;s.next_fg_memory_sample=now+1000;
+}
+std::string fg_memory_json(const CheekyFgMemory& value) {
+    std::ostringstream out;out << std::boolalpha;
+    out << "{\"layer_supported\":" << bool(value.supported) << ",\"presenter_present\":" << bool(value.presenter_present)
+        << ",\"guides_supported\":" << bool(value.guides_supported) << ",\"capture_tick\":" << value.capture_tick
+        << ",\"worker_tick\":" << value.worker_tick << ",\"presenter_tick\":" << value.presenter_tick << ",\"guide_tick\":" << value.guide_tick
+        << ",\"categories\":{";
+    std::uint64_t app_bytes{},runtime_bytes{},unknown{};
+    for(unsigned i=0;i<fg_memory::count;++i){const auto& b=value.categories[i];
+        if(i)out << ',';
+        out << '"' << fg_memory::names[i] << "\":{\"bytes\":" << b.bytes << ",\"resources\":" << b.resources
+            << ",\"reusable_bytes\":" << b.reusable_bytes << ",\"reusable_resources\":" << b.reusable_resources
+            << ",\"unknown_resources\":" << b.unknown_resources << '}';
+        if(i<fg_memory::swapchain_native)app_bytes+=b.bytes;else runtime_bytes+=b.bytes;
+        unknown+=b.unknown_resources;
+    }
+    out << "},\"app_resource_bytes\":" << app_bytes << ",\"swapchain_estimated_bytes\":" << runtime_bytes
+        << ",\"known_resource_bytes\":" << app_bytes+runtime_bytes << ",\"unknown_resources\":" << unknown << '}';return out.str();
+}
 // DllMain detach uses only these atomics, never state() construction or a lock.
 std::atomic<bool> adapter_attached{};
 std::atomic<std::uint64_t> active_attachment{};
@@ -91,6 +118,8 @@ std::string snapshot_locked(State& s) {
     const auto frame = diagnostic_snapshot(DiagnosticApi::d3d11);
     const auto gpu = gpu_timing_status();
     const auto fg = fg_status();
+    s.memory.poll(GetTickCount64());
+    sample_fg_memory(s,GetTickCount64());
     CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
     CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
@@ -109,7 +138,25 @@ std::string snapshot_locked(State& s) {
         << ",\"processing\":" << current_settings().enabled
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
-        << ",\"setting_groups\":" << setting_groups_json()
+        << ",\"setting_groups\":" << setting_groups_json();
+    const auto& memory=s.memory;
+    out << ",\"gpu_memory\":{\"supported\":" << bool(memory.adapter)
+        << ",\"scope\":\"process\",\"adapter\":\"" << json_escape(memory.name) << "\",\"node\":" << memory.node
+        << ",\"dedicated_capacity_bytes\":" << memory.dedicated_capacity << ",\"samples\":" << memory.samples
+        << ",\"sampled_at_tick\":" << memory.sampled_at << ",\"sample_age_ms\":" << GetTickCount64()-memory.sampled_at
+        << ",\"adapter_result\":" << static_cast<unsigned long>(memory.adapter_result);
+    const auto memory_segment=[&](const char* name,const GpuMemory::Segment& m){
+        out << ",\"" << name << "\":{\"valid\":" << m.valid << ",\"result\":" << static_cast<unsigned long>(m.result)
+            << ",\"usage_bytes\":" << m.usage << ",\"budget_bytes\":" << m.budget << ",\"headroom_bytes\":" << m.headroom
+            << ",\"over_budget_bytes\":" << m.over_budget << ",\"peak_bytes\":" << m.peak << ",\"over_budget_samples\":" << m.over_budget_samples << "}";
+    };
+    memory_segment("local",memory.local);memory_segment("nonlocal",memory.nonlocal);
+    out << ",\"baseline\":{\"valid\":" << memory.baseline_valid << ",\"nonlocal_valid\":" << memory.baseline_nonlocal_valid
+        << ",\"fg_enabled\":" << memory.baseline_fg_enabled << ",\"tick\":" << memory.baseline_at
+        << ",\"local_bytes\":" << memory.baseline_local << ",\"nonlocal_bytes\":" << memory.baseline_nonlocal
+        << ",\"local_delta_bytes\":" << (memory.baseline_valid&&memory.local.valid?std::int64_t(memory.local.usage)-std::int64_t(memory.baseline_local):0)
+        << ",\"nonlocal_delta_bytes\":" << (memory.baseline_nonlocal_valid&&memory.nonlocal.valid?std::int64_t(memory.nonlocal.usage)-std::int64_t(memory.baseline_nonlocal):0) << "}"
+        << ",\"fg_resources\":" << fg_memory_json(s.fg_memory) << "}"
         << ",\"fg\":{\"layer_present\":" << bool(fg.layer_present)
         << ",\"controls_supported\":" << bool(fg.controls_supported)
         << ",\"compatible_session\":" << bool(fg.compatible_session)
@@ -416,11 +463,13 @@ bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* qu
     s.renderer = renderer;
     if (renderer > 2) {
         s.graphics_ready = false;
+        s.memory.attach(renderer,nullptr,nullptr);
         s.message = "Unsupported renderer; processing paused";
         return false;
     }
     if (!device) {
         s.graphics_ready = false;
+        s.memory.attach(renderer,nullptr,nullptr);
         s.observed_device = nullptr; s.observed_queue = nullptr;
         s.message = "Waiting for a graphics device";
         reset_gaze_foveation();
@@ -429,10 +478,14 @@ bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* qu
     if (previous_renderer == renderer && s.observed_device == device && s.observed_queue == queue && s.graphics_ready) return true;
     if (renderer == 1 && !initialize_native_observer(static_cast<ID3D12Device*>(device), static_cast<ID3D12CommandQueue*>(queue))) {
         s.graphics_ready = false;
+        s.memory.attach(renderer,nullptr,nullptr);
         s.message = "D3D12 submission observer unavailable; processing paused";
         return false;
     }
     s.observed_device = device; s.observed_queue = queue; s.graphics_ready = true;
+    s.memory.attach(renderer,device,queue);
+    s.logged_memory_sample=0;
+    s.fg_memory={};s.next_fg_memory_sample=0;
     s.message = "Ready. Enable DLSS in the game; complete future evaluations can be adopted after injection. Check diagnostics if processing is waiting.";
     return true;
 }
@@ -585,6 +638,20 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
             if (ms > 0) diagnostic_note_frame_rate(static_cast<float>(1000.0 / ms), enabled);
         } else s.cadence.reset();
         if (s.graphics_ready && renderer == 1) note_d3d12_present(nullptr);
+        if(s.graphics_ready)s.memory.poll(GetTickCount64());
+        if(s.graphics_ready&&s.memory.samples!=s.logged_memory_sample){
+            s.logged_memory_sample=s.memory.samples;
+            sample_fg_memory(s,GetTickCount64());
+            const auto& m=s.memory;CheekyFgCadence fg_rates;fg_cadence(fg_rates);
+            trace_event("GPU memory process tick=%llu node=%u fg_enabled=%u fg_active=%u queue_request=%u local_valid=%u local_usage=%llu local_budget=%llu local_headroom=%llu local_over=%llu local_peak=%llu local_over_samples=%llu nonlocal_valid=%u nonlocal_usage=%llu nonlocal_budget=%llu baseline_valid=%u baseline_fg=%u baseline_tick=%llu baseline_local=%llu game_fps=%.3f unique_fps=%.3f cadence_valid=%u present_fps=%.3f hr=0x%08lX/0x%08lX (bytes)",
+                m.sampled_at,m.node,configured_settings().fg.enabled?1u:0u,fg_status().active,configured_settings().fg.queue_priority,
+                m.local.valid?1u:0u,m.local.usage,m.local.budget,m.local.headroom,m.local.over_budget,m.local.peak,m.local.over_budget_samples,
+                m.nonlocal.valid?1u:0u,m.nonlocal.usage,m.nonlocal.budget,m.baseline_valid?1u:0u,m.baseline_fg_enabled?1u:0u,
+                m.baseline_at,m.baseline_local,fg_rates.game_fps,fg_rates.unique_fps,fg_rates.valid,s.cadence.average_ms>0?1000./s.cadence.average_ms:0.,
+                static_cast<unsigned long>(m.local.result),static_cast<unsigned long>(m.nonlocal.result));
+            trace_event("FG resource memory tick=%llu %s (allocation requirements; excludes NGX internals/driver overhead; not residency)",
+                m.sampled_at,fg_memory_json(s.fg_memory).c_str());
+        }
         if (s.graphics_ready && renderer == 1 && GetTickCount64() >= s.next_timing_log) {
             s.next_timing_log = GetTickCount64() + 5000;
             const auto gpu = gpu_timing_status();
@@ -628,6 +695,13 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
         if (parsed.ec != std::errc{} || parsed.ptr != request.data()+request.size()) return false;
         s.request = id;
         if (action == "get") return true;
+        if (action == "mark_vram_baseline") {
+            const bool marked=s.memory.mark_baseline(GetTickCount64(),configured_settings().fg.enabled);
+            s.message=marked?"Process GPU memory baseline marked":"GPU memory query unavailable; baseline not marked";
+            trace_event("GPU memory baseline marked=%u tick=%llu fg_enabled=%u local=%llu nonlocal=%llu (process bytes)",
+                marked?1u:0u,s.memory.baseline_at,s.memory.baseline_fg_enabled?1u:0u,s.memory.baseline_local,s.memory.baseline_nonlocal);
+            return marked;
+        }
         if (action == "calibration_enable" || action == "calibration_disable") {
             eye_calibration_enable(action == "calibration_enable" && !configured_settings().manual_stereo_mapping); return true;
         }

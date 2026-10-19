@@ -86,6 +86,8 @@ struct BufferedPresenter final : Presenter {
     CheekyFgTransportOptionsFn transport_options_query{};
     std::atomic<std::uint64_t> direct_eye_copies{},eye_crop_copies{},capture_fallbacks{};
     CheekyFgExperimentDiagnostics experiment_state;
+    CheekyFgMemory memory_state;
+    std::uint64_t next_capture_memory{},next_worker_memory{},next_presenter_memory{};
     std::unordered_map<XrSwapchain,std::uint64_t> capture_tokens;
     std::unordered_map<XrSwapchain,std::uint64_t> capture_frames;
     std::unordered_map<XrSwapchain,TimingClock::time_point> capture_times;
@@ -124,7 +126,12 @@ struct BufferedPresenter final : Presenter {
     struct ProducerElapsed {
         BufferedPresenter& owner;TimingClock::time_point begin{TimingClock::now()};
         ~ProducerElapsed(){std::lock_guard capture_lock(owner.capture_mutex);std::lock_guard lock(owner.mx);
-            owner.producer_cpu.add(elapsed_ms(begin)+owner.capture_cpu_accumulator);owner.capture_cpu_accumulator=0;}
+            owner.producer_cpu.add(elapsed_ms(begin)+owner.capture_cpu_accumulator);owner.capture_cpu_accumulator=0;
+            const auto now=GetTickCount64();if(now>=owner.next_capture_memory){
+                fg_memory::Collector collect(owner.device.Get());
+                owner.memory_state.categories[fg_memory::capture]=owner.producer.memory(collect);
+                owner.memory_state.capture_tick=now;owner.next_capture_memory=now+1000;
+            }}
     };
     char diagnostic[384]{"Buffered presenter waiting for stereo frames"};
     bool started{},stopping{},bypass{},fg_active{},pacing_active{},degraded{};
@@ -211,6 +218,49 @@ struct BufferedPresenter final : Presenter {
         out.native_gpu_tail={gpu_ready_ages[0].mean(),gpu_ready_ages[0].last};
         out.gpu_ready_to_submit={gpu_ready_ages[1].mean(),gpu_ready_ages[1].last};
         out.gpu_ready_to_display={gpu_ready_ages[2].mean(),gpu_ready_ages[2].last};return out;
+    }
+    CheekyFgMemory memory() const noexcept override {
+        auto out=memory_state;out.supported=out.presenter_present=1;return out;
+    }
+    void measure_worker_memory() {
+        // Single generation worker, after the prior GPU fence retired. Publish
+        // only integer snapshots; diagnostic readers never walk live resources.
+        const auto now=GetTickCount64();if(now<next_worker_memory)return;
+        CheekyFgMemory value;fg_memory::Collector collect(device.Get());
+        value.categories[fg_memory::generated]=output.memory(collect);
+        for(const auto& eye:worker.focus.inputs)for(const auto& input:eye){
+            collect.add(value.categories[fg_memory::prepared_color],input.color.Get());
+            collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());
+            collect.add(value.categories[fg_memory::prepared_motion],input.motion.Get());
+        }
+        for(const auto* features:{&worker.features,&worker.peripheral_features})for(const auto& f:*features){
+            collect.add(value.categories[fg_memory::ngx_outputs],f.output.Get());
+            collect.add(value.categories[fg_memory::ngx_outputs],f.disable.Get());
+        }
+        for(unsigned eye=0;eye<2;++eye){
+            collect.add(value.categories[fg_memory::periphery],worker.focus.peripheral_output[eye].Get());
+            collect.add(value.categories[fg_memory::periphery],worker.focus.previous_depth[eye].Get());
+            collect.add(value.categories[fg_memory::composition],worker.focus.full[eye].Get());
+        }
+        std::lock_guard lock(mx);
+        for(auto category:{fg_memory::generated,fg_memory::prepared_color,fg_memory::prepared_depth,
+                fg_memory::prepared_motion,fg_memory::ngx_outputs,fg_memory::periphery,fg_memory::composition})
+            memory_state.categories[category]=value.categories[category];
+        memory_state.worker_tick=now;next_worker_memory=now+1000;
+    }
+    void measure_presenter_memory() {
+        // Only the presentation thread creates/destroys/enumerates these chains.
+        const auto now=GetTickCount64();if(now<next_presenter_memory)return;
+        CheekyFgMemory value;fg_memory::Collector collect(device.Get());
+        value.categories[fg_memory::upload_pool]=uploads.memory(collect);
+        for(unsigned mode=0;mode<2;++mode)for(const auto& chain:scene_chains[mode])for(const auto& image:chain.images)
+            collect.add(value.categories[mode?fg_memory::swapchain_generated:fg_memory::swapchain_native],image.texture);
+        for(const auto& [sc,chain]:auxiliary_chains)for(const auto& image:chain.images)
+            collect.add(value.categories[fg_memory::swapchain_auxiliary],image.texture);
+        std::lock_guard lock(mx);
+        for(auto category:{fg_memory::upload_pool,fg_memory::swapchain_native,fg_memory::swapchain_generated,fg_memory::swapchain_auxiliary})
+            memory_state.categories[category]=value.categories[category];
+        memory_state.presenter_tick=now;next_presenter_memory=now+1000;
     }
     CheekyFgPresentation presentation() const noexcept override {
         CheekyFgPresentation out;out.supported=1;
@@ -307,6 +357,7 @@ struct BufferedPresenter final : Presenter {
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
         gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;experiment_state={};
         awaiting_generated_submission=generated_gate_releases=generated_gate_skips=0;
+        memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
         distinct_native=repeated_presentations=runtime_submissions=0;
     }
@@ -723,6 +774,7 @@ struct BufferedPresenter final : Presenter {
                 pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views);
                 pair.completed_at=TimingClock::now();}
             reset_history=!attempted;if(job->latency_diagnostics)collect_color_stamps();
+            measure_worker_memory();
             {std::lock_guard lock(mx);if(stopping)break;
                 // Previous-frame history needs colors/poses, not its original
                 // guides. Release completed leases now instead of pinning raw
@@ -1095,6 +1147,7 @@ struct BufferedPresenter final : Presenter {
                 wake_producer();
                 result=runtime_end_frame(&empty);
             }
+            measure_presenter_memory();
             char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted)++generated_count;
