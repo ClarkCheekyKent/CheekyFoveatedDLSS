@@ -113,6 +113,12 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
         hash=(hash^n)*1099511628211ull;
     return hash;
 }
+// Unlike the FG-specific settings, the main SR foveation toggle changes
+// both OpenXR capture geometry and the guide source used by DLSS-G. The
+// presenter uses this key to retire the old pipeline at the next xrWaitFrame.
+std::uint64_t configuration(const Settings& s) noexcept {
+    return fg_sr_mode_configuration(configuration(s.fg),s.enabled);
+}
 ID3D12Resource* read(const NgxParameters* p,const char* n) noexcept {
     ID3D12Resource* r{};if (p) p->Get(n,&r);return r;
 }
@@ -246,7 +252,9 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
     m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
-    const auto settings_configuration=configuration(settings.fg);
+    // Include the primary foveated-SR ON/OFF state, even if the game keeps
+    // both NGX-SR feature handles alive while the mod changes rendering paths.
+    const auto settings_configuration=configuration(settings);
     std::lock_guard lock(mutex);
     // Capture the source revision under the SAME lock as release/create and
     // snapshot recording. A stereo pair spanning a DLSS quality change is
@@ -365,8 +373,19 @@ extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHookless
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgControl* out) noexcept {
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
-    out->enabled = cheeky::foveated_dlss::current_settings().fg.enabled;
-    out->configuration=cheeky::foveated_dlss::configuration(cheeky::foveated_dlss::current_settings().fg);
+    using namespace cheeky::foveated_dlss;
+    const auto settings=current_settings();
+    out->enabled=settings.fg.enabled;
+    out->configuration=configuration(settings);
+    // This transition does not require users to uncheck/recheck FG. The
+    // OpenXR layer observes the changed key on its next xrWaitFrame and
+    // drains/rebuilds the presenter, preserving the FG enable request.
+    static std::atomic<int> previous_sr{-1};
+    const int sr=settings.enabled?1:0;
+    const int before=previous_sr.exchange(sr,std::memory_order_relaxed);
+    if(before>=0&&before!=sr&&settings.fg.enabled)
+        trace_event("FG main DLSS-SR foveation toggled %s -> %s: requesting automatic FG presenter rebuild",
+            before?"ON":"OFF",sr?"ON":"OFF");
     {
         using namespace cheeky::foveated_dlss;
         std::lock_guard lock(mutex);

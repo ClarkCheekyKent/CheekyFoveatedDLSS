@@ -502,6 +502,7 @@ struct BufferedPresenter final : Presenter {
     const char* diagnostic_text() const noexcept override {return diagnostic;}
     // Caller holds mx (or has joined the workers). Dropped jobs have never
     // submitted inference, so their raw snapshot leases can retire immediately.
+    std::uint64_t passthrough_events{};
     void discard_pending() noexcept {for(auto& job:pending)job->clear_guides();pending.clear();}
     void stop() noexcept {
         {std::lock_guard lock(mx);stopping=true;changed.notify_all();}
@@ -511,7 +512,7 @@ struct BufferedPresenter final : Presenter {
         std::lock_guard capture_lock(capture_mutex);
         producer.drain();output.drain();uploads.drain();worker.wait_idle();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();slots={};
-        captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;
+        captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;passthrough_events=0;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
@@ -552,7 +553,10 @@ struct BufferedPresenter final : Presenter {
     }
     void configure(std::uint64_t next) noexcept override {
         if(!next||configuration==next)return;
-        if(configuration)invalidate_temporal();
+        if(configuration){
+            if(trace)trace("DLSS-FG source/presenter configuration changed: draining and restarting without changing FG enabled state");
+            invalidate_temporal();
+        }
         std::lock_guard lock(mx);configuration=next;state=CheekyFgState::waiting_for_history;
     }
     bool start() noexcept {
@@ -687,8 +691,16 @@ struct BufferedPresenter final : Presenter {
         }
         return true;
     }
-    XrResult passthrough(const XrFrameEndInfo* end) noexcept {
-        std::unique_lock lock(mx);if(!degraded)state=CheekyFgState::unsupported_submission;
+    XrResult passthrough(const XrFrameEndInfo* end,const char* reason) noexcept {
+        std::unique_lock lock(mx);
+        ++passthrough_events;
+        if(trace&&(passthrough_events<=3||passthrough_events%120==0)) {
+            char message[256]{};
+            sprintf_s(message,"DLSS-FG native passthrough: reason=%s count=%llu layers=%u degraded=%u; waiting for compatible stereo capture",
+                reason,static_cast<unsigned long long>(passthrough_events),end?end->layerCount:0,unsigned(degraded));
+            trace(message);
+        }
+        if(!degraded)state=CheekyFgState::unsupported_submission;
         ++epoch;raw=end;raw_done=false;credits=0;credit_deferred=false;awaiting_generated_submission=0;discard_pending();ready.clear();latest_native.reset();fg_active=pacing_active=false;changed.notify_all();
         // Unknown next chains cannot be copied generically. Their application
         // storage remains alive until the owning thread submits this frame.
@@ -708,7 +720,7 @@ struct BufferedPresenter final : Presenter {
             GetProcAddress(fg_runtime,"CheekyFG_CompleteHooklessFrameV1")):nullptr;
         if(use_raw){
             if(hookless_complete)hookless_complete(0);
-            const auto result=passthrough(end);std::lock_guard lock(mx);++ended;changed.notify_all();return result;
+            const auto result=passthrough(end,"presenter degraded");std::lock_guard lock(mx);++ended;changed.notify_all();return result;
         }
         {std::lock_guard capture_lock(capture_mutex);if(capture_overflow){
             if(hookless_complete)hookless_complete(0);
@@ -732,7 +744,7 @@ struct BufferedPresenter final : Presenter {
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         if(!projection||!job->layers.prepare(end,projection)){
             if(inference_slot&&hookless_complete)hookless_complete(0);
-            result=passthrough(end);
+            result=passthrough(end,"unsupported OpenXR projection/layers");
         }
         else {
             std::lock_guard capture_lock(capture_mutex);
@@ -850,7 +862,7 @@ struct BufferedPresenter final : Presenter {
                 // consistent before falling back to the original native frame.
                 std::uint64_t discarded{};producer.execute(*c,discarded);
             }
-            if(!good)result=passthrough(end);
+            if(!good)result=passthrough(end,"incomplete native color capture / changed swapchain layout");
             else {
                 job->space=projection->space;job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();

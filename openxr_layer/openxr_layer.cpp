@@ -19,6 +19,7 @@
 #include "eye_calibration.hpp"
 #include "projection_selection.hpp"
 #include "fg_async.hpp"
+#include "fg_restart_policy.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
 #include "menu_geometry.hpp"
 #include "../src/realvr_runtime.hpp"
@@ -3316,6 +3317,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     PFN_xrWaitFrame downstream{};
     std::shared_ptr<cheeky::fg::Presenter> presenter;
     std::shared_ptr<cheeky::fg::Presenter> retired;
+    bool replacing_source_presenter{};
     // Read the runtime setting before taking the layer lock. Changes are
     // latched here, so one application frame keeps the same cadence throughout.
     CheekyFgControl control;
@@ -3330,13 +3332,45 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
         auto it=sessions.find(session);
         if (it!=sessions.end()) {
             auto& owner=it->second;
-            if (state) retired=update_fg_at_frame_boundary(owner,instance->dispatch,requested);
+            if (state && requested && owner.fg) {
+                // A foveated-SR toggle changes both the capture layout and the
+                // guide history.  An in-place temporal reset stops the threads,
+                // but does NOT run BufferedPresenter::setup() again. The user
+                // disabling and re-enabling FG works because it constructs a
+                // completely fresh presenter. Do precisely that here, without
+                // changing the FG enabled setting or introducing private UEVR
+                // hooks. Other (pacing-only) changes are excluded from the hash.
+                std::uint64_t active_configuration{};
+                {
+                    std::lock_guard fg_lock(owner.fg->mx);
+                    active_configuration=owner.fg->configuration;
+                }
+                if (cheeky::fg::replace_presenter_for_configuration(
+                        requested,active_configuration,control.configuration)) {
+                    log_startup("DLSS-FG source configuration changed 0x%llx -> 0x%llx: replacing presenter at xrWaitFrame (keeping FG enabled)\n",
+                        static_cast<unsigned long long>(active_configuration),
+                        static_cast<unsigned long long>(control.configuration));
+                    retired=std::move(owner.fg);
+                    owner.fg_requested=false; // Reuse the proven manual-enable setup path.
+                    owner.fg_state=CheekyFgState::waiting_for_history;
+                    replacing_source_presenter=true;
+                }
+            }
+            if (state) {
+                auto disabled=update_fg_at_frame_boundary(owner,instance->dispatch,requested);
+                if(disabled)retired=std::move(disabled);
+            }
             if (owner.running && state) presenter=owner.fg;
         }
     }
-    // Draining GPU work and destroying private swapchains happens outside the
-    // layer lock, before forwarding this frame's WaitFrame.
-    if(retired)retired->invalidate_temporal();
+    // Never drain GPU work under state_mutex: callbacks that release captured
+    // color resources also take it. Retire the old presenter fully before the
+    // new presenter's first xrWaitFrame, so its GPU fences and private OpenXR
+    // swapchains are gone before a new frame is submitted.
+    if(retired) {
+        if(replacing_source_presenter)retired->reset();
+        else retired->invalidate_temporal();
+    }
     retired.reset();
     if (presenter) {presenter->configure(control.configuration);return presenter->wait_frame(info,state);}
     return downstream ? downstream(session,info,state) : XR_ERROR_FUNCTION_UNSUPPORTED;
