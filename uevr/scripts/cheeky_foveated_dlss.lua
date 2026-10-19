@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -593,7 +593,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgBackbufferFrameId ~= nil then
                     section("DLSS-G frame identity and GPU scheduling")
                     check("Pass native BackbufferFrameID to NGX", "FgBackbufferFrameId")
-                    text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
+                    if draft.FgReleasePoint == 3 and draft.FgHooklessMode3 then
+                        text("Overridden by hook-free mode: no native frame number is attached to either eye.")
+                    else
+                        text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
+                    end
                 end
                 if draft.FgQueuePriority ~= nil then
                     combo("FG GPU queue", "FgQueuePriority", {
@@ -605,7 +609,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     combo("Release game rendering", "FgReleasePoint", {
                         [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission"})
                     text("Preparation waits for both eyes' GPU input preparation, then overlaps native rendering with NGX.")
-                    if draft.FgReleasePoint == 3 then text("Holds the next native frame through generated-frame uploads and OpenXR submission.") end
+                    if draft.FgReleasePoint == 3 then
+                        text("Holds the next native frame through generated-frame uploads and OpenXR submission.")
+                        if draft.FgHooklessMode3 ~= nil then
+                            check("Hook-free FG guide matching (UEVR compatibility)", "FgHooklessMode3")
+                            text("Skips private UEVR frame/RHI hooks, matches one unconsumed stereo guide pair to the final color copy.")
+                            text("Omits NGX BackbufferFrameID regardless of the A/B setting. Ambiguous pairs fall back to native.")
+                        end
+                    elseif draft.FgHooklessMode3 then
+                        text("Hook-free matching is inactive: release mode 3 is required; UEVR frame hooks remain enabled.")
+                    end
                 elseif draft.FgWaitForCompletion ~= nil then
                     check("Wait for FG completion before next frame", "FgWaitForCompletion")
                     text("A/B test: holds the next native frame until both FG eyes finish. May reduce FPS.")

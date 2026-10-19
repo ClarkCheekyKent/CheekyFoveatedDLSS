@@ -189,4 +189,34 @@ void fg_runtime_frame_validation(HMODULE runtime,const std::filesystem::path& bi
     std::puts("PASS late pose-marker regression: RHI entry stamps both guides and later color with one ticket; all 12 arguments forwarded");
     std::puts("PASS next-entry color regression: early old color and later new color match both guide tickets AND GPU pixels; empty/partial intervals rejected");
     std::puts("PASS plugin-owned inline frame hook, original forwarding, native observer, delayed color/guide matching and mismatched-frame rejection");
+
+    // Switch live to mode-3 hook-free capture. In this mode there is no UEVR
+    // ticket, no inline hook, and no NGX BackbufferFrameID. The final copy
+    // must still match exactly two submitted eyes (including same-list copies).
+    const auto need_hook=reinterpret_cast<bool(__cdecl*)()>(GetProcAddress(runtime,"CheekyFG_NeedsUEVRFrameSourceV1"));
+    auto control=reinterpret_cast<CheekyFgControlFn>(GetProcAddress(runtime,"CheekyFG_GetControl"));
+    require(need_hook&&need_hook()&&control,"Legacy mode initially requires a UEVR frame source");
+    command("1\n907\nset\nFgHooklessMode3=true");
+    CheekyFgControl fg_control;require(control(&fg_control),"Refresh the capture configuration after toggle");
+    require(!need_hook()&&fg_test_hook_removals==2&&fg_test_hook_targets.empty()&&
+        health(&status)&&!status.plugin_hook&&std::string(status.source).find("Hook-free")!=std::string::npos,
+        "Live Lua setting detaches both UEVR hooks and no longer depends on the private backend layout");
+    set_frame(0); // No frame identity; guide grouping is capture-order only.
+    auto untagged_guides=[&](unsigned count){
+        for(unsigned i=0;i<count;++i)require(ngx_succeeded(evaluate(list.Get(),handle,&p,nullptr)),"Hook-free native NGX guide evaluation");
+    };
+    begin();untagged_guides(2);copy();submit();
+    require(stamp(output.Get(),&s)&&s.token&&s.render_frame==0,"Mode-3 same-list color resolves a frame-ID-free stereo pair");
+    pair={};pair.capture_token=s.token;pair.render_frame=0;
+    require(acquire(&pair)&&!pair.render_frame&&!pair.eyes[0].render_frame&&!pair.eyes[1].render_frame&&
+        !pair.enable_frame_id&&pair.release_point==3&&pair.eyes[0].evaluation+1==pair.eyes[1].evaluation,
+        "Hook-free guide pair has no native tags/NGX frame ID, but preserves evaluation and capture identity");release(&pair);
+    begin();untagged_guides(3);copy();submit();
+    require(stamp(output.Get(),&s)&&!s.token,"Three unticketed eyes must not silently use the newest two");
+    begin();untagged_guides(2);submit();begin();copy();submit();
+    require(stamp(output.Get(),&s)&&s.token&&!s.render_frame,"After an ambiguous pair the next clean split-list stereo interval recovers");
+    pair={};pair.capture_token=s.token;require(acquire(&pair)&&!pair.enable_frame_id,"Split-list hookless guide lease");release(&pair);
+    begin();copy();submit();
+    require(stamp(output.Get(),&s)&&!s.token,"Color with no fresh guide pair cannot reuse consumed frames");
+    std::puts("PASS mode-3 hook-free live transition, strict stereo matching, split-list handoff, rejection and resynchronization");
 }

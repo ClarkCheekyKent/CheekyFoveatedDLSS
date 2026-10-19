@@ -106,6 +106,8 @@ void settings_tests(const std::filesystem::path& root) {
             set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","4")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
             set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
+        require(!fg.fg.hookless_mode3&&set_named_setting(fg,"FgHooklessMode3","true")&&fg.fg.hookless_mode3&&
+            !set_named_setting(fg,"FgHooklessMode3","invalid"),"Hook-free mode 3 toggle validates and defaults off");
         require(fg.fg.queue_priority==2&&set_named_setting(fg,"FgQueuePriority","0")&&
             set_named_setting(fg,"FgQueuePriority","1")&&set_named_setting(fg,"FgQueuePriority","2")&&
             !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
@@ -128,11 +130,12 @@ void settings_tests(const std::filesystem::path& root) {
             restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
             restored.fg.release_point==3&&!restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&
             restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1&&
-            restored.fg.direct_peripheral_shading==2,"FG settings survive restart");
+            restored.fg.direct_peripheral_shading==2&&restored.fg.hookless_mode3,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
             !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
-            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2&&restored.fg.direct_peripheral_shading==1,"FG reset restores the tested preset and opt-out");
+            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2&&restored.fg.direct_peripheral_shading==1&&
+            !restored.fg.hookless_mode3,"FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
         require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&
@@ -491,12 +494,16 @@ int main(int argc, char** argv) {
             command("1\n905\nset\nFgReleasePoint=0\nFgSubmitRepeats=true");
             require(snapshot(get).find("\"FgReleasePoint\":0")!=std::string::npos,
                 "Lua protocol restores overlapping native rendering");
+            CheekyFgCaptureHealth resumed;
+            auto capture_health=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureHealth"));
+            require(capture_health&&capture_health(&resumed)&&resumed.plugin_hook&&fg_test_hook_installs==4&&
+                fg_test_hook_targets.size()==2,"Non-mode-3 releases reactivate the legacy UEVR hooks even if toggle stays set");
             custom("cheeky.foveated_dlss.load.v1","false");present();
-            require(fg_test_hook_removals==2&&fg_test_hook_targets.empty(),"Unload removes the plugin-owned frame hooks");
+            require(fg_test_hook_removals==4&&fg_test_hook_targets.empty(),"Unload removes the plugin-owned frame hooks");
             require(control_fn(&control) && !control.enabled && snapshot(get).find("\"FgEnabled\":true")!=std::string::npos,
                 "Host detach pauses FG without discarding saved preference");
             custom("cheeky.foveated_dlss.load.v1","true");present();
-            require(fg_test_hook_installs==4&&fg_test_hook_targets.size()==2,"Reload restores the plugin frame hooks");
+            require(fg_test_hook_installs==6&&fg_test_hook_targets.size()==2,"Reload restores the plugin frame hooks");
             require(control_fn(&control) && control.enabled,"Host re-enable restores FG preference");
             command("1\n902\ndefaults_fg");
             direct=CheekyFgDirectOutput{};require(direct_fn(&direct)&&!direct.requested&&

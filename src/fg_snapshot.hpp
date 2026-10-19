@@ -217,12 +217,18 @@ public:
         slot->submitted=slot->foreign=slot->cancelled=false;slot->retired=0;
         auto& prior=previous_raw[(id-1)%2];
         if(meta.motion_jittered){
-            if(prior.render_frame+1==meta.render_frame&&prior.feature==meta.feature&&prior.motion_width==meta.motion_width&&
+            // Without a UEVR frame ticket, the consecutive left/right
+            // evaluation ordinal is the same-eye temporal identity. Never
+            // compare two identical zero frame IDs as native frame numbers.
+            const bool previous_eye=meta.render_frame ? prior.render_frame+1==meta.render_frame :
+                prior.render_frame==0 && prior.evaluation+2==id;
+            if(previous_eye&&prior.feature==meta.feature&&prior.motion_width==meta.motion_width&&
                prior.motion_height==meta.motion_height&&!meta.reset){
                 meta.jitter_correction_x=(prior.jitter_x-meta.jitter_x)/std::max(1u,meta.motion_width);
                 meta.jitter_correction_y=(prior.jitter_y-meta.jitter_y)/std::max(1u,meta.motion_height);
             }else meta.reset=1;
         }
+        meta.evaluation=id;
         prior=meta;prior.depth=prior.motion=nullptr;prior.peripheral_depth=prior.peripheral_motion=nullptr;
         tag_recording(commands);
         if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
@@ -240,7 +246,7 @@ public:
             if(!mr.full){meta.motion_base_x=meta.motion_base_y=0;meta.motion_width=mr.w;meta.motion_height=mr.h;}
             meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.prepared_guides=0;
         }
-        meta.evaluation=id;slot->meta=meta;return true;
+        slot->meta=meta;return true;
     }
     void submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands) {
         const auto recording=recording_identity(commands);auto native=native_d3d12_interface(q);
@@ -256,8 +262,32 @@ public:
             failed_record=std::max(failed_record,s->meta.evaluation);
         }
     }
-    std::uint64_t token(std::uint64_t render_frame=0) {
-        retire();last_match=inspect(render_frame);const auto latest=last_match.latest;
+    std::uint64_t token(std::uint64_t render_frame=0,bool hookless=false) {
+        retire();last_match=inspect(render_frame);
+        if(hookless){
+            // Exactly two consecutive, submitted guide recordings since the
+            // last consumed COLOR interval. Never silently take the newest
+            // two from a 1/3/4-eye interval or across a failed recording.
+            last_match={};last_match.consumed=consumed;last_match.failed=failed_record;
+            last_match.latest_frame=0;last_match.frame=0;
+            for(const auto& s:shots)if(s->meta.evaluation>consumed){
+                if(s->cancelled)++last_match.cancelled;
+                else if(s->foreign)++last_match.foreign;
+                else if(!s->submitted)++last_match.pending;
+                else {++last_match.eligible;last_match.latest=std::max(last_match.latest,s->meta.evaluation);}
+            }
+            if(ordinal<consumed||ordinal-consumed!=2||failed_record>consumed||
+                last_match.eligible!=2||last_match.pending||last_match.foreign||last_match.cancelled||
+                last_match.latest!=ordinal){
+                last_match.reason=failed_record>consumed?"Hook-free guide capture failed":
+                    last_match.pending?"Hook-free guides await submission":
+                    last_match.foreign?"Hook-free guide queue mismatch":
+                    last_match.cancelled?"Hook-free guide commands cancelled":
+                    "Hook-free color interval has not exactly two fresh eyes";
+                return 0;
+            }
+        }
+        const auto latest=last_match.latest;
         if(render_frame&&last_match.eligible!=2){
             last_match.reason=last_match.pending?"Guides are not submitted":last_match.foreign?"Guides submitted on a different queue":
                 last_match.cancelled?"Guide command list was reset":last_match.eligible?"Frame does not contain exactly two guides":"No guides with the color frame ID";
@@ -269,11 +299,19 @@ public:
         for(auto& latch:latched)if(latch.token==latest)return latest;
         std::shared_ptr<Shot> a,b;
         for(auto& s:shots)if(s->submitted&&!s->foreign&&!s->cancelled){if(s->meta.evaluation==latest-1)a=s;if(s->meta.evaluation==latest)b=s;}
-        if(!a||!b||(render_frame&&(a->meta.render_frame!=render_frame||b->meta.render_frame!=render_frame))){last_match.reason="Guide pair is interrupted";return 0;}
+        if(!a||!b||(render_frame&&(a->meta.render_frame!=render_frame||b->meta.render_frame!=render_frame))||
+            (hookless&&(a->meta.render_frame||b->meta.render_frame))){last_match.reason="Guide pair is interrupted";return 0;}
         // Pin guides at COLOR release, not later at EndFrame. A future DLSS
         // recording must not recycle either snapshot while color awaits submit.
         if(latched.size()>=4)latched.erase(latched.begin());
         latched.push_back({latest,a,b});return latest;
+    }
+    void discard_hookless_interval() {
+        // A partial/ambiguous color handoff consumes the interval without
+        // generating FG. Start fresh with the next native stereo pair rather
+        // than permanently starving on an extra or failed evaluation.
+        consumed=ordinal;
+        std::erase_if(latched,[&](const Latch& l){return l.token<=consumed;});
     }
     bool acquire(CheekyFgPair& out) {
         const auto expected=out.capture_token;
@@ -301,7 +339,7 @@ public:
 class FgColorProvenance {
     template<class T> using ComPtr=Microsoft::WRL::ComPtr<T>;
     struct Tag {std::uint64_t generation{},token{},render_frame{};};
-    struct Pending {ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> color;Tag tag;std::uint64_t recording{};bool conflicted{};};
+    struct Pending {ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> color;Tag tag;std::uint64_t recording{};bool conflicted{},hookless{};};
     static inline constexpr GUID key{0x41c548c2,0x8d8a,0x4f23,{0x83,0x24,0x90,0xbe,0xa5,0xf8,0x22,0x7d}};
     std::vector<Pending> pending;
     std::uint64_t generation{1};
@@ -323,30 +361,41 @@ public:
         return tag.token;
     }
     std::uint64_t frame(ID3D12Resource* color) {Tag tag;return read(color,tag)&&tag.generation==generation?tag.render_frame:0;}
-    void observe(ID3D12GraphicsCommandList* list,ID3D12Resource* color,FgSnapshots& guides,std::uint64_t render_frame=0) {
+    void observe(ID3D12GraphicsCommandList* list,ID3D12Resource* color,FgSnapshots& guides,
+                 std::uint64_t render_frame=0,bool hookless=false) {
         if(!registered(color))return;
         auto native=native_d3d12_interface(list);
-        const Tag tag{generation,render_frame?guides.token(render_frame):0,render_frame};
+        const Tag tag{generation,hookless?guides.token(0,true):render_frame?guides.token(render_frame):0,render_frame};
         const auto recording=FgSnapshots::tag_recording(list);if(!recording)return;
         for(auto& p:pending)if(p.recording==recording&&p.color.Get()==color){
-            if(p.tag.render_frame!=tag.render_frame||(p.tag.token!=tag.token&&(!render_frame||(p.tag.token&&tag.token)))){
+            if(p.hookless!=hookless||p.tag.render_frame!=tag.render_frame||
+               (p.tag.token!=tag.token&&(!render_frame||(p.tag.token&&tag.token)))){
                 p.conflicted=true;p.tag.token=0;
             }else if(!p.conflicted&&tag.token)p.tag.token=tag.token;
             return;
         }
         if(pending.size()>=128){Tag invalid{generation,0};color->SetPrivateData(key,sizeof(invalid),&invalid);return;}
-        pending.push_back({native,color,tag,recording});
+        pending.push_back({native,color,tag,recording,false,hookless});
     }
     void submitted(ID3D12CommandQueue* queue,ID3D12GraphicsCommandList* list,FgSnapshots& guides) {
         const auto recording=FgSnapshots::recording_identity(list);
         std::erase_if(pending,[&](Pending& p){
             if(!recording||p.recording!=recording)return false;
             if(p.tag.generation!=generation||!guides.matches(queue))p.tag={generation,0};
-            else if(!p.conflicted&&!p.tag.token&&p.tag.render_frame)
-                // Guides and final color can be recorded in the SAME command
-                // list. They become eligible only after this enqueue. Resolve
-                // that exact frame now, never substitute a later frame.
-                p.tag.token=guides.token(p.tag.render_frame);
+            else if(!p.conflicted){
+                if(p.hookless){
+                    // Recheck even an early-observed token: a third NGX
+                    // evaluation between color recording and queue submission
+                    // makes the untagged interval ambiguous.
+                    const auto matched=guides.token(0,true);
+                    if(!matched|| (p.tag.token&&p.tag.token!=matched))p.tag.token=0;
+                    else p.tag.token=matched;
+                }else if(!p.tag.token&&p.tag.render_frame)
+                    // Guides and final color can be recorded in the SAME command
+                    // list. They become eligible only after this enqueue.
+                    p.tag.token=guides.token(p.tag.render_frame);
+            }
+            if(p.hookless&&!p.tag.token)guides.discard_hookless_interval();
             p.color->SetPrivateData(key,sizeof(p.tag),&p.tag);return true;
         });
     }

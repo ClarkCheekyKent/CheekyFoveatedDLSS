@@ -647,14 +647,18 @@ struct BufferedPresenter final : Presenter {
                 auto acquire=guide_acquire?guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
                 auto release=guide_release?guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
                 CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
-                if(inference_slot&&(!tokens_match||!expected_token||!expected_frame))job->guide_state=CheekyFgState::guide_frame_mismatch;
-                if(inference_slot&&tokens_match&&expected_token&&expected_frame&&acquire&&release&&acquire(&guides)) {
+                // render_frame is deliberately zero for hook-free mode 3.
+                // The nonzero color token still identifies the immutable pair.
+                if(inference_slot&&(!tokens_match||!expected_token))job->guide_state=CheekyFgState::guide_frame_mismatch;
+                if(inference_slot&&tokens_match&&expected_token&&acquire&&release&&acquire(&guides)) {
                     job->guides_valid=cheeky::foveated_dlss::native_d3d12_interface(guides.producer_queue)==
                         cheeky::foveated_dlss::native_d3d12_interface(queue.Get());
                     if(!job->guides_valid)job->guide_state=CheekyFgState::queue_mismatch;
                     if(guides.capture_token!=expected_token||guides.eyes[1].evaluation!=expected_token||
                        guides.eyes[0].evaluation+1!=expected_token||guides.eyes[0].render_frame!=expected_frame||
-                       guides.eyes[1].render_frame!=expected_frame){job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;}
+                       guides.eyes[1].render_frame!=expected_frame||(!expected_frame&&guides.release_point!=3u)){
+                        job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;
+                    }
                     for(unsigned eye=0;eye<2&&job->guides_valid;++eye) {
                         auto g=guides.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
                         if(!g.depth||!g.motion){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
@@ -820,7 +824,11 @@ struct BufferedPresenter final : Presenter {
                     if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");
                     auto guides=job->guides;guides.producer_queue=generation_queue.Get();
                     if(previous->guide_token+2!=job->guide_token)reset_history=true;
-                    if(previous->render_frame+1!=job->render_frame)reset_history=true;
+                    // Hook-free mode 3 deliberately has no native-frame ID.
+                    // Preserve history when the capture tokens are consecutive;
+                    // reset on any transition between tagged and untagged mode.
+                    if((previous->render_frame||job->render_frame)&&
+                       previous->render_frame+1!=job->render_frame)reset_history=true;
                     if(reset_history)for(auto& eye:guides.eyes)eye.reset=1;
                     std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)
                         cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.eyes[eye].depth_inverted!=0);

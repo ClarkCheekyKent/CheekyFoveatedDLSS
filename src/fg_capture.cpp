@@ -90,10 +90,14 @@ FgSnapshots& snapshots(){return *store().active;}
 bool enabled() noexcept {
     return current_settings().fg.enabled;
 }
+bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
+    return s.hookless_mode3 && s.release_point==3u;
+}
+bool hookless_selected() noexcept {return hookless_selected(current_settings().fg);}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{unsigned(s.foveated),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
-        s.peripheral_method,s.depth_bits,s.motion_bits,std::bit_cast<unsigned>(s.width),
+        s.peripheral_method,s.depth_bits,s.motion_bits,s.release_point,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
     return hash;
@@ -132,10 +136,11 @@ void fg_note_color_copy(ID3D12GraphicsCommandList* list,ID3D12Resource* color) n
     // Most copies (including our guide snapshots) are unrelated. Inspect the
     // registration before taking the mutex; snapshot recording already owns it.
     if(!enabled()||!FgColorProvenance::registered(color))return;
-    const auto color_frame=ticket_epoch!=source_epoch.load()?0:rhi_ticket?frame_phase.color():render_frame;
+    const bool hookless=hookless_selected();
+    const auto color_frame=hookless?0:ticket_epoch!=source_epoch.load()?0:rhi_ticket?frame_phase.color():render_frame;
     ++color_copies;
-    std::lock_guard lock(mutex);store().colors.observe(list,color,snapshots(),color_frame);
-    if(rhi_ticket&&phase_traces.fetch_add(1)<48)
+    std::lock_guard lock(mutex);store().colors.observe(list,color,snapshots(),color_frame,hookless);
+    if(!hookless&&rhi_ticket&&phase_traces.fetch_add(1)<48)
         trace_event("FG color phase copy=%p command=%p render_entry=%llu color_content=%llu evaluations=%u previous_complete=%llu",
             color,list,render_frame,color_frame,frame_phase.evaluations,frame_phase.previous);
 } catch(...) {}
@@ -151,10 +156,12 @@ void fg_forget_feature(const NgxHandle* handle) noexcept try {
 void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
                     const NgxParameters* p,NgxResult result) noexcept try {
     if(!enabled()||!cmd||!p||!handle||!ngx_succeeded(result))return;
-    if(!render_frame||ticket_epoch!=source_epoch.load()){++missing_frame_guides;return;}
-    // A failed/unsupported capture still advances rendering. Do not let it
-    // leave the preceding frame eligible as the new color's identity.
-    if(rhi_ticket)frame_phase.evaluated();
+    const auto settings=current_settings();
+    const bool hookless=hookless_selected(settings.fg);
+    if(!hookless&&(!render_frame||ticket_epoch!=source_epoch.load())){++missing_frame_guides;return;}
+    // Hook-free mode has no frame ticket. Only the ordered, immutable guide
+    // recordings and final color-copy enqueue are used to associate a pair.
+    if(!hookless&&rhi_ticket)frame_phase.evaluated();
     std::uint32_t flags{};bool flags_known{};
     {std::lock_guard lock(mutex);if(auto entry=feature_flags.find(handle);entry!=feature_flags.end()){flags=entry->second;flags_known=true;}}
     // Late attachment can still recover an explicitly supplied declaration.
@@ -168,7 +175,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const unsigned w=ui(p,"OutWidth"),h=ui(p,"OutHeight");
     if(!w||!h)return;
     CheekyFgEye m;
-    m.render_frame=render_frame;
+    m.render_frame=hookless?0:render_frame;
     m.depth=depth;m.motion=motion;
     m.feature=reinterpret_cast<std::uintptr_t>(handle);m.width=w;m.height=h;
     m.depth_width=ui(p,"DLSS.Render.Subrect.Dimensions.Width",static_cast<unsigned>(dd.Width));
@@ -189,7 +196,6 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.depth_inverted=(flags & 8U)!=0;
     m.low_res_mv=(flags & 2U)!=0;
     m.reset=ui(p,"Reset");
-    const auto& settings=current_settings();
     m.focus_width=settings.fg.foveated ? settings.fg.width : 1.0f;
     m.focus_height=settings.fg.foveated ? settings.fg.height : 1.0f;
     m.focus_x=settings.fg.x;
@@ -201,13 +207,22 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
     m.configuration=configuration(settings.fg);
     std::lock_guard lock(mutex);
-    if(snapshots().record(cmd,m)){++captured_guides;last_guide_frame=render_frame;}
+    if(snapshots().record(cmd,m)){++captured_guides;last_guide_frame=m.render_frame;}
 } catch(...) {}
+}
+// Called by the adapter before installing any UEVR-private inline hooks and
+// after Lua settings changes. In hook-free mode the adapter never probes UEVR.
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_NeedsUEVRFrameSourceV1() noexcept {
+    return !cheeky::foveated_dlss::hookless_selected();
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AttachUEVRFrameSource(void* backend,
     CheekyFgRegisterHookFn install,CheekyFgUnregisterHookFn remove) noexcept try {
     using namespace cheeky::foveated_dlss;
     std::lock_guard lock(source_mutex);
+    if(hookless_selected()){
+        strcpy_s(source_message,"Hook-free mode 3: no UEVR frame hooks");
+        return true; // Do not even inspect the installed UEVR runtime layout.
+    }
     if(source_hook>=0&&!source_abandoned.load())return true;
     // On a complete plugin unload UEVR clears its own inline hooks after
     // FreeLibrary. The resident runtime must not reuse that old hook ID or
@@ -241,7 +256,7 @@ extern "C" __declspec(dllexport) void __cdecl CheekyFG_DetachUEVRFrameSource() n
     for(unsigned n=0;n<rhi_hook_count;++n)if(rhi_hooks[n].id>=0&&unregister_source)unregister_source(rhi_hooks[n].id);
     rhi_hook_count=0;selected_rhi=-1;
     source_hook=-1;unregister_source=nullptr;++source_epoch;render_frame=0;
-    strcpy_s(source_message,"Plugin frame source detached");
+    strcpy_s(source_message,hookless_selected()?"Hook-free mode 3: no UEVR frame hooks":"Plugin frame source detached");
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFgCaptureHealth* out) noexcept {
     using namespace cheeky::foveated_dlss;
@@ -249,7 +264,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFg
     std::lock_guard lock(source_mutex);out->plugin_hook=source_hook>=0&&!source_abandoned.load();
     out->frame_calls=source_calls;out->last_guide_frame=last_guide_frame;out->captured_guides=captured_guides;
     out->missing_frame_guides=missing_frame_guides;out->color_copies=color_copies;
-    strcpy_s(out->source,selected_rhi.load()>=0?"Plugin hook: RHI stereo phases":source_message);
+    strcpy_s(out->source,hookless_selected()?"Hook-free mode 3: capture-ordered stereo pairs":
+        selected_rhi.load()>=0?"Plugin hook: RHI stereo phases":source_message);
     std::lock_guard captures(mutex);const auto& match=last_color_match;
     out->color_frame=last_color_frame;out->match_frame=match.frame;out->latest_frame=match.latest_frame;
     out->latest_evaluation=match.latest;out->consumed_evaluation=match.consumed;
@@ -266,9 +282,11 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureStamp(ID3D12Res
     using namespace cheeky::foveated_dlss;
     if(!out||out->abi!=1||out->size!=sizeof(*out)||!enabled())return false;
     std::lock_guard lock(mutex);out->token=store().colors.token(color);out->render_frame=store().colors.frame(color);
-    last_color_frame=out->render_frame;last_color_match=snapshots().inspect(out->render_frame);
+    const bool hookless=hookless_selected();
+    last_color_frame=out->render_frame;
+    last_color_match=hookless?snapshots().last_match:snapshots().inspect(out->render_frame);
     if(out->token)last_color_match.reason="Matched";
-    else if(!out->render_frame)last_color_match.reason="Color copy has no completed stereo interval";
+    else if(!hookless&&!out->render_frame)last_color_match.reason="Color copy has no completed stereo interval";
     static ULONGLONG next_trace{};const auto now=GetTickCount64();
     if(now>=next_trace){next_trace=now+2000;const auto& m=last_color_match;
         trace_event("FG match color_frame=%llu token=%llu last_guide_frame=%llu latest_frame=%llu eligible=%u pending=%u foreign=%u cancelled=%u latest_eval=%llu consumed=%llu failed=%llu reason=%s",
@@ -345,7 +363,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     std::lock_guard lock(mutex);
     if(!snapshots().acquire(*out))return false;
     out->diagnostic_mode=mode;
-    out->enable_frame_id=settings.backbuffer_frame_id ? 1u : 0u;
+    out->enable_frame_id=!hookless_selected(settings)&&settings.backbuffer_frame_id ? 1u : 0u;
     out->fg_queue_priority=settings.queue_priority <= 2u ? settings.queue_priority : 1u;
     out->release_point=settings.release_point<=3u?settings.release_point:0u;
     out->submit_repeats=settings.submit_repeats?1u:0u;
