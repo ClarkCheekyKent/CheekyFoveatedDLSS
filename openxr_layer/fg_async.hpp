@@ -61,7 +61,7 @@ struct BufferedPresenter final : Presenter {
     };
     struct Chain {
         XrSwapchain handle{};std::vector<XrSwapchainImageD3D12KHR> images;D3D12_RESOURCE_DESC desc{};
-        Image uploaded; // Pins immutable content until this chain is updated/destroyed.
+        std::uint64_t uploaded{}; // Content identity; GPU contexts retain sources only until their upload fence.
     };
     std::condition_variable_any changed;
     std::mutex capture_mutex;
@@ -84,6 +84,7 @@ struct BufferedPresenter final : Presenter {
     std::unordered_map<XrSwapchain,D3D12_RESOURCE_DESC> captured_descs;
     std::atomic<unsigned> color_capture_mode{},upload_mode{},latency_diagnostics{1};
     CheekyFgTransportOptionsFn transport_options_query{};
+    CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
     std::atomic<std::uint64_t> direct_eye_copies{},eye_crop_copies{},capture_fallbacks{};
     CheekyFgExperimentDiagnostics experiment_state;
     CheekyFgMemory memory_state;
@@ -106,7 +107,7 @@ struct BufferedPresenter final : Presenter {
     std::deque<Pair> ready;
     std::optional<Pair> latest_native;
     std::unordered_map<XrSwapchain,Chain> auxiliary_chains;
-    Chain scene_chains[2][2];
+    Chain scene_chains[2]; // Native and generated presentations share each eye's destination.
     CheekyFgPerformance telemetry;
     CheekyFgOverhead extra_gpu;
     // Unique native, generated midpoint, newest FG input, repeated native.
@@ -262,8 +263,8 @@ struct BufferedPresenter final : Presenter {
         const auto now=GetTickCount64();if(now<next_presenter_memory)return;
         CheekyFgMemory value;fg_memory::Collector collect(device.Get());
         value.categories[fg_memory::upload_pool]=uploads.memory(collect);
-        for(unsigned mode=0;mode<2;++mode)for(const auto& chain:scene_chains[mode])for(const auto& image:chain.images)
-            collect.add(value.categories[mode?fg_memory::swapchain_generated:fg_memory::swapchain_native],image.texture);
+        for(const auto& chain:scene_chains)for(const auto& image:chain.images)
+            collect.add(value.categories[fg_memory::swapchain_native],image.texture);
         for(const auto& [sc,chain]:auxiliary_chains)for(const auto& image:chain.images)
             collect.add(value.categories[fg_memory::swapchain_auxiliary],image.texture);
         std::lock_guard lock(mx);
@@ -371,7 +372,7 @@ struct BufferedPresenter final : Presenter {
         distinct_native=repeated_presentations=runtime_submissions=0;
     }
     void destroy_chains() noexcept {
-        for(auto& mode:scene_chains)for(auto& c:mode){if(c.handle)xr.destroy(c.handle);c={};}
+        for(auto& c:scene_chains){if(c.handle)xr.destroy(c.handle);c={};}
         for(auto& [key,c]:auxiliary_chains)if(c.handle)xr.destroy(c.handle);
         auxiliary_chains.clear();
     }
@@ -407,6 +408,10 @@ struct BufferedPresenter final : Presenter {
         if(bypass)return xr.wait_frame(session,info,frame);
         if(!frame||(info&&info->next))return XR_ERROR_VALIDATION_FAILURE;
         const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+        const auto storage_query=runtime?reinterpret_cast<CheekyFgStorageOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetStorageOptionsV1")):nullptr;
+        CheekyFgStorageOptions storage;
+        if(storage_query)storage_query(&storage);
+        {std::lock_guard capture_lock(capture_mutex);storage_options=storage;}
         const auto query=transport_options_query?transport_options_query:runtime?
             reinterpret_cast<CheekyFgTransportOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetTransportOptionsV1")):nullptr;
         CheekyFgTransportOptions options;
@@ -474,7 +479,10 @@ struct BufferedPresenter final : Presenter {
         DirectCapture eyes;Image copy;
         if(direct){
             for(auto slice:plan->second.slices){
-                auto image=producer.region_copy(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,slice.rect,slice.layer,format);
+                const auto& s=storage_options;
+                const auto layout=compact_layout(slice.rect.extent.width,slice.rect.extent.height,s.compact!=0,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
+                auto image=layout.packed()?producer.packed_region(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,slice.rect,slice.layer,format,layout):
+                    producer.region_copy(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,slice.rect,slice.layer,format);
                 if(!image){capture_overflow=true;std::uint64_t discarded{};producer.execute(*c,discarded);return false;}
                 eyes.eyes.push_back({slice,std::move(image)});++direct_eye_copies;
             }
@@ -555,7 +563,14 @@ struct BufferedPresenter final : Presenter {
                     if(!job->color[eye])++capture_fallbacks; // Changed layout: coordinated native passthrough below.
                 }else {
                     const auto found=captured.find(sub.swapchain);
-                    job->color[eye]=found==captured.end()?Image{}:producer.crop(*c,found->second,sub.imageRect,sub.imageArrayIndex);
+                    if(found!=captured.end()){
+                        const auto& s=storage_options;const auto layout=compact_layout(sub.imageRect.extent.width,sub.imageRect.extent.height,
+                            s.compact!=0,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
+                        if(layout.packed()){
+                            job->color[eye]=producer.packed_region(*c,found->second->texture.Get(),found->second->state,sub.imageRect,sub.imageArrayIndex,
+                                found->second->texture->GetDesc().Format,layout);c->images.push_back(found->second);
+                        }else job->color[eye]=producer.crop(*c,found->second,sub.imageRect,sub.imageArrayIndex);
+                    }
                     if(job->color[eye])++eye_crop_copies;
                 }
                 if(!job->color[eye]){good=false;break;}
@@ -594,7 +609,8 @@ struct BufferedPresenter final : Presenter {
                         auto g=guides.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
                         if(!g.depth||!g.motion){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
                         job->source_depth=unsigned(g.depth->GetDesc().Format);job->source_motion=unsigned(g.motion->GetDesc().Format);
-                        if(g.width!=d.Width||g.height!=d.Height){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
+                        const auto& layout=job->color[eye]->layout;
+                        if(g.width!=(layout.width?layout.width:d.Width)||g.height!=(layout.height?layout.height:d.Height)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
                     }
                     if(job->guides_valid){
                         // The plugin has ALREADY captured immutable guides.
@@ -743,7 +759,9 @@ struct BufferedPresenter final : Presenter {
                     }
                 }
                 auto d=job->color[0]->texture->GetDesc();worker.trace=trace;worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
-                if(worker.initialize(device.Get(),generation_queue.Get(),unsigned(d.Width),d.Height,d.Format)) {
+                const auto& color_layout=job->color[0]->layout;
+                if(worker.initialize(device.Get(),generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format)) {
+                    for(unsigned eye=0;eye<2;++eye){worker.color_layouts[eye]=job->color[eye]->layout;worker.previous_layouts[eye]=previous->color[eye]->layout;}
                     const auto ready_result=worker.latency.enqueue_wait(device.Get(),generation_queue.Get(),producer.fence.Get(),job->ready,job->latency_diagnostics);
                     if(FAILED(ready_result)){worker.failed=true;worker.report("FG capture dependency queue wait",unsigned(ready_result));}
                     if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");
@@ -759,9 +777,14 @@ struct BufferedPresenter final : Presenter {
                     std::array<Worker::OutputCopy,2> copies;
                     bool available=true;
                     for(unsigned eye=0;eye<2;++eye) {
+                        const auto& g=guides.eyes[eye];
+                        const auto layout=compact_layout(worker.width,worker.height,job->color[eye]->layout.packed(),g.focus_width,g.focus_height,
+                            g.focus_x,g.focus_y,g.peripheral_percent,g.focus_feather,g.resolution_percent);
+                        publication.Width=layout.stored_width();publication.Height=layout.stored_height();
                         pair.generated[eye]=output.image(publication,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
                         if(!pair.generated[eye]){available=false;break;}
-                        copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state};
+                        pair.generated[eye]->layout=layout;
+                        copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};
                     }
                     if(available) {
                         success=worker.generate(guides,input,prior,cameras,result,&copies,[](void* context) noexcept {
@@ -837,9 +860,14 @@ struct BufferedPresenter final : Presenter {
             discard_pending();ready.clear();awaiting_generated_submission=0;inflight_id=0;inflight_release_point=0;inflight_prepared=false;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
         worker.wait_idle();output.drain();
     }
-    bool ensure_chain(Chain& chain,const Image& image) {
+    bool ensure_chain(Chain& chain,const Image& image,bool scene=false) {
         auto d=image->texture->GetDesc();
         if(image->presentation_format!=DXGI_FORMAT_UNKNOWN)d.Format=image->presentation_format;
+        if(scene){
+            if(image->layout.width){d.Width=image->layout.width;d.Height=image->layout.height;}
+            const bool srgb=srgb_color(d.Format);d.Format=inference_color_format(d.Format);
+            if(srgb&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM)d.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        }
         if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.DepthOrArraySize)) {
             uploads.drain();xr.destroy(chain.handle);chain={};
         }
@@ -853,31 +881,31 @@ struct BufferedPresenter final : Presenter {
         if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images.data()))))return false;
         chain.desc=d;return true;
     }
-    bool upload_image(Chain& chain,const Image& source) {
-        if(!ensure_chain(chain,source))return false;
+    bool upload_image(Chain& chain,const Image& source,bool scene=false) {
+        if(!ensure_chain(chain,source,scene))return false;
         // xrEndFrame uses the most recently released image. Resubmitting that
         // image needs no acquire/copy/release when its immutable content has
-        // not changed. Pinning the source prevents transport-pool reuse from
-        // making pointer equality accidentally identify newer pixels.
-        if(chain.uploaded==source)return true;
+        // not changed. A new content ID on every pool lease prevents recycled
+        // pointers from being mistaken for the previously uploaded pixels.
+        if(chain.uploaded==source->identity)return true;
         unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         if(XR_FAILED(xr.acquire(chain.handle,&acquire,&index)))return false;
         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
         const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
         {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
         const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images.size()&&
-            uploads.upload(source,chain.images[index].texture,ticks);
+            uploads.upload(source,chain.images[index].texture,ticks,chain.desc.Format);
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         const bool released=XR_SUCCEEDED(xr.release(chain.handle,&release));
-        if(released&&copied)chain.uploaded=source;
+        if(released&&copied)chain.uploaded=source->identity;
         return released&&copied;
     }
     bool upload_batch(const std::vector<std::pair<Chain*,Image>>& requests) {
         struct Item {Chain* chain;Image source;unsigned index{};bool acquired{},waited{};};
         std::vector<Item> items;
         for(const auto& [chain,source]:requests){
-            if(!ensure_chain(*chain,source))return false;
-            if(chain->uploaded!=source)items.push_back({chain,source});
+            if(!chain->handle&&!ensure_chain(*chain,source))return false;
+            if(chain->uploaded!=source->identity)items.push_back({chain,source});
         }
         if(items.empty())return true;
         bool good=true;
@@ -895,7 +923,7 @@ struct BufferedPresenter final : Presenter {
             auto* c=uploads.begin(ticks);if(!c){uploads.drain();c=uploads.begin(ticks);}
             good=c!=nullptr;
             if(c){
-                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture)){good=false;break;}
+                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format)){good=false;break;}
                 if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);}
                 else c->list->Close();
             }
@@ -906,7 +934,7 @@ struct BufferedPresenter final : Presenter {
         for(auto& item:items)if(item.acquired&&item.waited){
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             const bool released=XR_SUCCEEDED(xr.release(item.chain->handle,&release));
-            if(submitted&&released)item.chain->uploaded=item.source;
+            if(submitted&&released)item.chain->uploaded=item.source->identity;
             good&=released;
         }
         return good;
@@ -1036,15 +1064,15 @@ struct BufferedPresenter final : Presenter {
         auto views=original_views;
         std::vector<std::pair<Chain*,Image>> batch;
         for(unsigned eye=0;eye<2;++eye) {
-            auto& chain=scene_chains[generated?1:0][eye];
-            if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye]))return false;batch.push_back({&chain,images[eye]});}
-            else if(!upload_image(chain,images[eye]))return false;
+            auto& chain=scene_chains[eye];
+            if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
+            else if(!upload_image(chain,images[eye],true))return false;
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
-            const auto d=images[eye]->texture->GetDesc();views[eye].subImage={chain.handle,{{0,0},{int(d.Width),int(d.Height)}},0};
+            views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
         }
         auto layers=pair.layers;
         for(auto& a:pair.auxiliary){
-            if(pair.upload_mode==1u)batch.push_back({&auxiliary_chains[a.source],a.image});
+            if(pair.upload_mode==1u){auto& chain=auxiliary_chains[a.source];if(!ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});}
             else if(!upload_image(auxiliary_chains[a.source],a.image))return false;
         }
         if(pair.upload_mode==1u&&!upload_batch(batch))return false;

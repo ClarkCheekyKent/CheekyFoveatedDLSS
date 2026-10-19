@@ -15,8 +15,9 @@ namespace cheeky::fg {
 using Microsoft::WRL::ComPtr;
 using NgxParameters=NVSDK_NGX_Parameter;
 struct Worker {
-    struct Feature {NVSDK_NGX_Handle* handle{}; NgxParameters* params{};ComPtr<ID3D12Resource> output,disable,readback;};
-    struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};};
+    struct Feature {NVSDK_NGX_Handle* handle{}; NgxParameters* params{};ComPtr<ID3D12Resource> output,disable,readback;
+        ID3D12Resource* target{};unsigned width{},height{},eye{},offset_y{};bool direct{},direct_rejected{};};
+    struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;};
     using Init=decltype(&NVSDK_NGX_D3D12_Init_with_ProjectID);
     using Caps=decltype(&NVSDK_NGX_D3D12_GetCapabilityParameters);
     Init init{}; Caps capabilities{};
@@ -32,6 +33,7 @@ struct Worker {
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;
+    std::array<CompactLayout,2> color_layouts,previous_layouts;
     D3D12_RESOURCE_STATES input_color_state{D3D12_RESOURCE_STATE_COMMON};
     enum class DiagnosticMode { Normal, PrepareFirst, LeftOnly, RightOnly, SplitLists };
     DiagnosticMode diagnostic_mode{DiagnosticMode::Normal};

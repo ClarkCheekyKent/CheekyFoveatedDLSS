@@ -48,19 +48,39 @@ class FgSnapshots {
         D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;v.Transition.pResource=r;
         v.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;v.Transition.StateBefore=a;v.Transition.StateAfter=b;list->ResourceBarrier(1,&v);
     }
-    bool allocate(ID3D12Resource* source,ComPtr<ID3D12Resource>& out) {
+    struct Region {unsigned x{},y{},w{},h{};bool full{};};
+    static Region region(ID3D12Resource* source,unsigned x,unsigned y,unsigned w,unsigned h) {
+        const auto d=source->GetDesc();
+        // D3D12 requires whole-subresource copies for depth/stencil resources.
+        // Keep their original shape; ordinary NGX guide textures can be cropped.
+        if((d.Flags&D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)||d.MipLevels!=1||d.DepthOrArraySize!=1)
+            return {0,0,unsigned(d.Width),d.Height,true};
+        if(x>=d.Width||y>=d.Height)return {};
+        return {x,y,std::min(w?w:unsigned(d.Width),unsigned(d.Width)-x),std::min(h?h:d.Height,d.Height-y),false};
+    }
+    bool allocate(ID3D12Resource* source,ComPtr<ID3D12Resource>& out,const Region& region) {
         auto d=source->GetDesc();
+        d.Width=region.w;d.Height=region.h;
         if(out){auto p=out->GetDesc();if(p.Width==d.Width&&p.Height==d.Height&&p.Format==d.Format)return true;}
         // Keep the original format/planes; the layer converts the owned copy.
         d.Flags=D3D12_RESOURCE_FLAG_NONE;d.Alignment=0;d.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;out.Reset();
         return SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out)));
     }
-    static void copy(ID3D12GraphicsCommandList* list,ID3D12Resource* from,ID3D12Resource* to) {
+    void copy(ID3D12GraphicsCommandList* list,ID3D12Resource* from,ID3D12Resource* to,const Region& region) {
         // Native NGX's depth/MV contract is NON_PIXEL_SHADER_RESOURCE. Restore
         // it exactly; do not install descriptor heaps or alter compute bindings.
         barrier(list,from,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
-        barrier(list,to,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);list->CopyResource(to,from);
+        barrier(list,to,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+        if(region.full)list->CopyResource(to,from);
+        else {
+            D3D12_FEATURE_DATA_FORMAT_INFO info{from->GetDesc().Format,1};device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO,&info,sizeof(info));
+            for(unsigned plane=0;plane<std::max(1u,unsigned(info.PlaneCount));++plane){
+                D3D12_TEXTURE_COPY_LOCATION a{},b{};a.pResource=from;b.pResource=to;
+                a.Type=b.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;a.SubresourceIndex=b.SubresourceIndex=plane;
+                D3D12_BOX box{region.x,region.y,0,region.x+region.w,region.y+region.h,1};list->CopyTextureRegion(&b,0,0,0,&a,&box);
+            }
+        }
         barrier(list,to,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
         barrier(list,from,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
@@ -156,7 +176,9 @@ public:
             double ms{};if(slot->gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(slot->meta.render_frame,ms,false,2);
             gpu_cost.commit();
         }
-        if(!allocate(meta.depth,slot->depth)||!allocate(meta.motion,slot->motion)){failed_record=id;return false;}
+        const auto dr=region(meta.depth,meta.depth_base_x,meta.depth_base_y,meta.depth_width,meta.depth_height),
+                   mr=region(meta.motion,meta.motion_base_x,meta.motion_base_y,meta.motion_width,meta.motion_height);
+        if(!dr.w||!dr.h||!mr.w||!mr.h||!allocate(meta.depth,slot->depth,dr)||!allocate(meta.motion,slot->motion,mr)){failed_record=id;return false;}
         slot->source_depth=meta.depth;slot->source_motion=meta.motion;slot->list=native_d3d12_interface(commands);
         slot->recording=recording;
         slot->submitted=slot->foreign=slot->cancelled=false;slot->retired=0;
@@ -171,8 +193,10 @@ public:
         prior=meta;prior.depth=prior.motion=nullptr;
         tag_recording(commands);
         if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
-        copy(commands,meta.depth,slot->depth.Get());copy(commands,meta.motion,slot->motion.Get());
+        copy(commands,meta.depth,slot->depth.Get(),dr);copy(commands,meta.motion,slot->motion.Get(),mr);
         if(timestamp_frequency)slot->gpu_span.end(commands);
+        if(!dr.full){meta.depth_base_x=meta.depth_base_y=0;meta.depth_width=dr.w;meta.depth_height=dr.h;}
+        if(!mr.full){meta.motion_base_x=meta.motion_base_y=0;meta.motion_width=mr.w;meta.motion_height=mr.h;}
         meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.evaluation=id;slot->meta=meta;return true;
     }
     void submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands) {

@@ -92,7 +92,7 @@ bool enabled() noexcept {
 }
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{unsigned(s.foveated),s.resolution_percent,s.peripheral_percent,
+    for(const auto n:{unsigned(s.foveated),s.compact_storage,s.resolution_percent,s.peripheral_percent,
         s.peripheral_method,s.depth_bits,s.motion_bits,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
@@ -298,6 +298,12 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(Che
     out->color_capture_mode=settings.color_capture_mode==1u?1u:0u;
     out->upload_mode=settings.upload_mode==1u?1u:0u;
     out->latency_diagnostics=settings.latency_diagnostics==1u?1u:0u;return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(CheekyFgStorageOptions* out) noexcept {
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    const auto& s=cheeky::foveated_dlss::current_settings().fg;
+    out->compact=s.compact_storage==1u&&s.foveated;out->peripheral_percent=s.peripheral_percent;
+    out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFgMemory* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;

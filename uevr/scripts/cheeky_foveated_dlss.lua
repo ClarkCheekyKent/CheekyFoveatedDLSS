@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -246,8 +246,8 @@ local function fg_resource_memory(id, r)
     item("NGX output textures + flags","ngx_outputs",worker)
     item("Periphery + depth history","periphery",worker)
     item("Composition scratch","composition",worker)
-    item("Native XR images (estimated)","swapchain_native",presenter)
-    item("Generated XR images (estimated)","swapchain_generated",presenter)
+    item("Shared scene XR images (estimated)","swapchain_native",presenter)
+    item("Separate generated XR images (estimated)","swapchain_generated",presenter)
     item("Auxiliary XR images (estimated)","swapchain_auxiliary",presenter)
     rows("fg_memory_categories_" .. id,entries)
     rows("fg_memory_totals_" .. id,{
@@ -612,6 +612,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgSubmitRepeats ~= nil then
                     check("Submit repeat frames", "FgSubmitRepeats")
                     text("OFF submits fresh content only; the runtime handles repeats. Native pacing continues independently.")
+                end
+                if draft.FgCompactStorage ~= nil then
+                    combo("FG frame storage", "FgCompactStorage", {[0]="Full-resolution frames", [1]="Compact center + periphery"})
+                    text("Compact storage keeps a sharp native center; native and generated peripheral detail follows Periphery scale.")
                 end
                 if draft.FgColorCaptureMode ~= nil then
                     combo("FG color capture", "FgColorCaptureMode", {[0]="Full snapshot + eye crops (baseline)", [1]="Direct eye capture"})

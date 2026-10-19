@@ -43,10 +43,11 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.queue_priority=mode; return true;
     }
-    if (key == "FgColorCaptureMode" || key == "FgUploadMode" || key == "FgLatencyDiagnostics") {
+    if (key == "FgColorCaptureMode" || key == "FgUploadMode" || key == "FgLatencyDiagnostics" || key == "FgCompactStorage") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 1U) return false;
         if(key == "FgColorCaptureMode") s.fg.color_capture_mode=mode;
         else if(key == "FgUploadMode") s.fg.upload_mode=mode;
+        else if(key == "FgCompactStorage") s.fg.compact_storage=mode;
         else s.fg.latency_diagnostics=mode;
         return true;
     }

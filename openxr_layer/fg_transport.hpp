@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_present.hpp"
+#include "fg_color_draw.hpp"
 #include "../shared/cheeky_gpu_span.hpp"
 #include "../shared/fg_resource_memory.hpp"
 #include <vector>
@@ -8,7 +9,7 @@
 namespace cheeky::fg {
 // Each command allocator and every referenced image stays leased until its
 // fence retires. The producer only polls for a free context; it never waits.
-struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{};};
+struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;};
 using Image=std::shared_ptr<TransportImage>;
 struct ColorReadyStamp {
     std::atomic<std::uint64_t> ready_qpc{};
@@ -25,6 +26,7 @@ struct Transport {
         std::vector<ComPtr<IUnknown>> leases;
         std::uint64_t retired{};
         cheeky::gpu::Span gpu_span;
+        ColorDrawBindings bindings;
         ColorReady color_ready;
         std::uint64_t frame{};
         bool closes_frame{},profile_pending{};
@@ -34,6 +36,7 @@ struct Transport {
     ComPtr<ID3D12Fence> fence;
     std::array<Context,16> contexts;
     std::vector<Image> pool;
+    ColorDraw draw;
     std::uint64_t serial{};
     std::uint64_t timestamp_frequency{};
     std::uint64_t next_trim_tick{},trimmed_images{};
@@ -100,7 +103,7 @@ struct Transport {
                 if(FAILED(c.list->Close()))return nullptr;
             }
             if(SUCCEEDED(c.allocator->Reset())&&SUCCEEDED(c.list->Reset(c.allocator.Get(),nullptr))) {
-                c.frame=frame;c.closes_frame=closes_frame;c.profile_pending=false;c.color_ready.reset();
+                c.frame=frame;c.closes_frame=closes_frame;c.profile_pending=false;c.color_ready.reset();c.bindings.used=0;
                 if(frame&&timestamp_frequency)c.gpu_span.begin(device.Get(),c.list.Get());
                 return &c;
             }
@@ -123,12 +126,13 @@ struct Transport {
         c.retired=ticket=serial;c.profile_pending=c.frame&&c.gpu_span.pending;return true;
     }
     Image image(D3D12_RESOURCE_DESC desc,D3D12_RESOURCE_FLAGS flags=D3D12_RESOURCE_FLAG_NONE) {
+        static std::atomic<std::uint64_t> next_identity{};
         const auto now=GetTickCount64();trim_unused(now);
         desc.Flags=flags;desc.SampleDesc.Count=1;desc.SampleDesc.Quality=0;
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
             if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
-               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->last_used_tick=now;return p;}
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->identity=++next_identity;p->last_used_tick=now;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
@@ -137,6 +141,7 @@ struct Transport {
             pool.erase(free);
         }
         auto result=std::make_shared<TransportImage>();
+        result->identity=++next_identity;
         result->last_used_tick=now;
         D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         if(FAILED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,
@@ -179,11 +184,50 @@ struct Transport {
         auto result=region_copy(c,source->texture.Get(),source->state,rect,layer);
         if(result)c.images.push_back(source);return result;
     }
-    bool record_upload(Context& c,const Image& source,ID3D12Resource* target) {
+    Image packed_region(Context& c,ID3D12Resource* source,D3D12_RESOURCE_STATES source_state,
+                        XrRect2Di rect,unsigned layer,DXGI_FORMAT format,const CompactLayout& layout) {
+        if(!source||!layout.packed())return {};
+        auto desc=source->GetDesc();
+        if(rect.offset.x<0||rect.offset.y<0||rect.extent.width!=int(layout.width)||rect.extent.height!=int(layout.height)||
+           std::uint64_t(rect.offset.x)+layout.width>desc.Width||std::uint64_t(rect.offset.y)+layout.height>desc.Height||layer>=desc.DepthOrArraySize)return {};
+        const auto original=desc;
+        desc.Width=layout.stored_width();desc.Height=layout.stored_height();desc.DepthOrArraySize=desc.MipLevels=1;desc.Format=format;
+        auto destination=image(desc,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);if(!destination)return {};
+        color_transition(c.list.Get(),source,source_state,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        color_transition(c.list.Get(),destination->texture.Get(),destination->state,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ColorDraw::Constants constants;
+        constants.region[0]=float(rect.offset.x+int(layout.x))/original.Width;constants.region[1]=float(rect.offset.y+int(layout.y))/original.Height;
+        constants.region[2]=float(layout.w)/original.Width;constants.region[3]=float(layout.h)/original.Height;
+        bool good=draw.record(device.Get(),c.list.Get(),c.bindings,source,format,layer,destination->texture.Get(),format,
+            D3D12_VIEWPORT{0,0,float(layout.center_width),float(layout.center_height),0,1},constants);
+        constants.region[0]=float(rect.offset.x)/original.Width;constants.region[1]=float(rect.offset.y)/original.Height;
+        constants.region[2]=float(layout.width)/original.Width;constants.region[3]=float(layout.height)/original.Height;
+        good=good&&draw.record(device.Get(),c.list.Get(),c.bindings,source,format,layer,destination->texture.Get(),format,
+            D3D12_VIEWPORT{0,float(layout.center_height),float(layout.context_width),float(layout.context_height),0,1},constants);
+        color_transition(c.list.Get(),destination->texture.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
+        color_transition(c.list.Get(),source,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,source_state);
+        destination->state=D3D12_RESOURCE_STATE_COMMON;destination->layout=layout;
+        c.images.push_back(destination);c.borrowed.emplace_back(source);++region_copies;
+        return good?destination:Image{};
+    }
+    bool record_upload(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN) {
         if(!source||!target||target==source->texture.Get())return false;
         const auto a=source->texture->GetDesc(),b=target->GetDesc();
-        if(!compatible_color(b.Format,a.Format)||a.Width!=b.Width||a.Height!=b.Height||
-           a.DepthOrArraySize!=b.DepthOrArraySize||a.MipLevels!=b.MipLevels)return false;
+        if(target_format==DXGI_FORMAT_UNKNOWN)target_format=b.Format;
+        const auto sf=source->presentation_format==DXGI_FORMAT_UNKNOWN?a.Format:source->presentation_format;
+        if(source->layout.packed()||!compatible_color(b.Format,a.Format)){
+            const unsigned width=source->layout.width?source->layout.width:unsigned(a.Width),height=source->layout.height?source->layout.height:a.Height;
+            if(b.Width!=width||b.Height!=height||a.DepthOrArraySize!=1||b.DepthOrArraySize!=1)return false;
+            const auto readable=(source->state&D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)?source->state:D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            color_transition(c.list.Get(),source->texture.Get(),source->state,readable);
+            ColorDraw::Constants constants;source->layout.constants(constants.crop,constants.spans,constants.texel);
+            constants.options[0]=srgb_color(sf)&&!srgb_color(target_format)?1.f:0.f;
+            const bool good=draw.record(device.Get(),c.list.Get(),c.bindings,source->texture.Get(),sf,0,target,target_format,
+                D3D12_VIEWPORT{0,0,float(width),float(height),0,1},constants);
+            color_transition(c.list.Get(),source->texture.Get(),readable,source->state);
+            c.images.push_back(source);c.borrowed.emplace_back(target);++upload_copies;return good;
+        }
+        if(a.Width!=b.Width||a.Height!=b.Height||a.DepthOrArraySize!=b.DepthOrArraySize||a.MipLevels!=b.MipLevels)return false;
         const auto read_state=(source->state&D3D12_RESOURCE_STATE_COPY_SOURCE)?source->state:D3D12_RESOURCE_STATE_COPY_SOURCE;
         color_transition(c.list.Get(),source->texture.Get(),source->state,read_state);
         color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_DEST);
@@ -192,14 +236,14 @@ struct Transport {
         color_transition(c.list.Get(),source->texture.Get(),read_state,source->state);
         c.images.push_back(source);c.borrowed.emplace_back(target);return true;
     }
-    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0) {
+    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN) {
         if(!source)return false;
         auto* c=begin(frame);
         // Only the background presenter uses upload(). Allocator pressure here
         // may wait for retirement without turning a transient busy ring into a
         // permanent presentation failure. Producer begin() remains nonblocking.
         if(!c){drain();c=begin(frame);}if(!c)return false;
-        if(!record_upload(*c,source,target)){c->list->Close();return false;}
+        if(!record_upload(*c,source,target,target_format)){c->list->Close();return false;}
         std::uint64_t ticket{};return execute(*c,ticket);
     }
     void freeze(Context& c,const Image& image) {

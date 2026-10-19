@@ -203,6 +203,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(configuration!=guides.eyes[0].configuration) {
         reset_features();configuration=guides.eyes[0].configuration;gpu_timings.initialize(device.Get(),queue.Get());completion_wait={};
     }
+    focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
     if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
     const bool release_after_prepare=guides.release_point==1u;
     const bool split_lists=diagnostic_mode==DiagnosticMode::SplitLists&&!release_after_prepare;
@@ -257,25 +258,35 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         const auto& g=guides.eyes[eye];const auto d=(*copies)[eye].texture->GetDesc();
         const bool composition=g.focus_width<.999f||g.focus_height<.999f||
             scaled(width,g.resolution_percent)!=width||scaled(height,g.resolution_percent)!=height;
-        direct=composition&&d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&d.Width==width&&d.Height==height&&
+        direct=(composition||(*copies)[eye].layout.packed())&&d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&d.Width==((*copies)[eye].layout.packed()?(*copies)[eye].layout.stored_width():width)&&d.Height==((*copies)[eye].layout.packed()?(*copies)[eye].layout.stored_height():height)&&
             d.DepthOrArraySize==1&&d.MipLevels==1&&d.SampleDesc.Count==1&&d.Format==focus.color_format&&
             (d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
         for(unsigned source=0;source<2&&direct;++source)
             direct=(*copies)[eye].texture!=colors[source]&&(*copies)[eye].texture!=previous[source]&&
                 (*copies)[eye].texture!=guides.eyes[source].depth&&(*copies)[eye].texture!=guides.eyes[source].motion;
     }
+    if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed())){list->Close();if(two_lists)split_list->Close();return false;}
     auto transpose=[](Matrix m){Matrix result{};for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)result.m[r*4+c]=m.m[c*4+r];return result;};
-    auto configure_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect) {
+    auto configure_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect,unsigned eye=0,bool center_pass=true) {
         const auto desc=input.color->GetDesc();const auto tw=unsigned(desc.Width),th=desc.Height;
         const auto guide_desc=input.depth->GetDesc();const auto gw=unsigned(guide_desc.Width),gh=guide_desc.Height;
-        if(f.output&&(f.output->GetDesc().Width!=tw||f.output->GetDesc().Height!=th)) {
-            if(f.handle)release(f.handle);if(f.params)destroy(f.params);f={};
+        if(f.width!=tw||f.height!=th) {
+            if(f.handle)release(f.handle);if(f.params)destroy(f.params);f={};f.width=tw;f.height=th;
         }
-        if(!f.output&&(!texture(device.Get(),input.color.Get(),tw,th,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,f.output)||
-            !buffer(device.Get(),8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON,f.disable)||
-            !buffer(device.Get(),8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,f.readback))) {
+        f.eye=eye;f.offset_y=0;f.direct=false;
+        if(direct&&copies&&(*copies)[eye].layout.packed()&&!f.direct_rejected){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
+            const auto& layout=destination.layout;
+            f.offset_y=layout.packed()&&!center_pass?layout.center_height:0;
+            f.direct=d.Format==desc.Format&&(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)&&
+                (layout.packed()?(tw==(center_pass?layout.center_width:layout.context_width)&&th==(center_pass?layout.center_height:layout.context_height)):
+                    (tw==d.Width&&th==d.Height));
+        }
+        if((!f.disable&&!buffer(device.Get(),8,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON,f.disable))||
+           (!f.readback&&!buffer(device.Get(),8,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,f.readback))||
+           (!f.direct&&!f.output&&!texture(device.Get(),input.color.Get(),tw,th,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,f.output))) {
             report("NGX FG output allocation",unsigned(E_FAIL));failed=true;return false;
         }
+        f.target=f.direct?(*copies)[eye].texture:f.output.Get();
         if(!f.params) {const auto result=allocate(&f.params);if(!ok(result)||!f.params){report("NGX FG parameters",result);failed=true;return false;}}
         bool created=false;auto* p=f.params;
         if(!f.handle) {
@@ -317,9 +328,10 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(frame_id_enabled && guides.render_frame)
             p->Set("DLSSG.BackbufferFrameID",static_cast<unsigned long long>(guides.render_frame));
         p->Set("DLSSG.Backbuffer",input.color.Get());p->Set("DLSSG.Depth",input.depth.Get());p->Set("DLSSG.MVecs",input.motion.Get());
-        p->Set("DLSSG.OutputInterpolated",f.output.Get());p->Set("DLSSG.OutputDisableInterpolation",f.disable.Get());
+        p->Set("DLSSG.OutputInterpolated",f.target);p->Set("DLSSG.OutputDisableInterpolation",f.disable.Get());
         for(const char* key:{"DLSSG.BackbufferSubrectBaseX","DLSSG.BackbufferSubrectBaseY","DLSSG.InputBackbufferSubrectBaseX","DLSSG.InputBackbufferSubrectBaseY",
             "DLSSG.DepthSubrectBaseX","DLSSG.DepthSubrectBaseY","DLSSG.MVecsSubrectBaseX","DLSSG.MVecsSubrectBaseY","DLSSG.OutputInterpolatedSubrectBaseX","DLSSG.OutputInterpolatedSubrectBaseY"})p->Set(key,0u);
+        p->Set("DLSSG.OutputInterpolatedSubrectBaseY",f.direct?f.offset_y:0u);
         for(const char* key:{"DLSSG.BackbufferSubrectWidth","DLSSG.InputBackbufferSubrectWidth","DLSSG.OutputInterpolatedSubrectWidth"})p->Set(key,tw);
         for(const char* key:{"DLSSG.BackbufferSubrectHeight","DLSSG.InputBackbufferSubrectHeight","DLSSG.OutputInterpolatedSubrectHeight"})p->Set(key,th);
         for(const char* key:{"DLSSG.DepthSubrectWidth","DLSSG.MVecsSubrectWidth"})p->Set(key,gw);
@@ -331,13 +343,29 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         // post-UAV transitions and disable-interpolation readback copy. In
         // split-lists mode the second eye uses another list on the same queue.
         if(center_pass)gpu_timings.ngx_stamp(commands,eye,0);
-        barrier(commands,f.output.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barrier(commands,f.target,f.direct?(*copies)[f.eye].state:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if(center_pass)gpu_timings.ngx_stamp(commands,eye,1);
-        const auto result=evaluate(commands,f.handle,f.params,nullptr);
+        auto result=evaluate(commands,f.handle,f.params,nullptr);
+        if(!ok(result)&&f.direct){
+            // Some NGX versions reject subrect/shared destinations. Keep only a
+            // compact private fallback, allocated on demand after rejection.
+            f.direct_rejected=true;
+            report("NGX direct output rejected; using compact scratch",result);
+            D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=f.target;commands->ResourceBarrier(1,&uav);
+            barrier(commands,f.target,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);(*copies)[f.eye].state=D3D12_RESOURCE_STATE_COMMON;
+            uav.UAV.pResource=f.disable.Get();commands->ResourceBarrier(1,&uav);
+            if(!f.output&&!texture(device.Get(),focus.inputs[f.eye][center_pass?0:1].color.Get(),f.width,f.height,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,f.output)){failed=true;return false;}
+            f.direct=false;f.target=f.output.Get();f.params->Set("DLSSG.OutputInterpolated",f.target);
+            f.params->Set("DLSSG.OutputInterpolatedSubrectBaseY",0u);f.params->Set("DLSSG.Reset",1u);
+            barrier(commands,f.target,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            result=evaluate(commands,f.handle,f.params,nullptr);
+        }
         if(center_pass)gpu_timings.ngx_stamp(commands,eye,2);
         if(!ok(result)){report("NGX FG EvaluateFeature",result);failed=true;return false;}
-        barrier(commands,f.output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        barrier(commands,f.target,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        if(f.direct)(*copies)[f.eye].state=D3D12_RESOURCE_STATE_COMMON;
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->CopyBufferRegion(f.readback.Get(),0,f.disable.Get(),0,4);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
@@ -345,8 +373,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         return true;
     };
 
-    auto evaluate_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect) {
-        return configure_pass(f,input,camera,g,rect)&&dispatch_pass(f,0,false);
+    auto evaluate_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect,unsigned eye) {
+        return configure_pass(f,input,camera,g,rect,eye,false)&&dispatch_pass(f,eye,false);
     };
     bool foveated[2]{};
     std::array<FocusRect,2> center_rects{};
@@ -398,7 +426,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(!rect.active)for(unsigned part=0;part<4;++part)gpu_timings.preparation_stamp(commands,eye,1,part);
                 // Feature creation can record GPU commands. In prepare-first
                 // mode configure both feature instances before either evaluates.
-                if(prepare_first&&evaluate_center&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect)) {
+                if(prepare_first&&evaluate_center&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)) {
                     good=false;break;
                 }
                 gpu_timings.stamp(commands,query+1);
@@ -419,7 +447,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 gpu_timings.stamp(commands,query+2);
                 if(evaluate_center) {
                     good=prepare_first?dispatch_pass(features[eye],eye,true):
-                        (configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect)&&dispatch_pass(features[eye],eye,true));
+                        (configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)&&dispatch_pass(features[eye],eye,true));
                 } else {
                     // In single-eye mode the skipped eye displays its current
                     // native source. Not an interpolated stereo pair: only for
@@ -431,23 +459,30 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             }
             if(prepare_first&&phase==1)continue;
             gpu_timings.stamp(commands,query+4);
-            auto* center=evaluate_center?features[eye].output.Get():focus.inputs[eye][0].color.Get();
+            auto* center=evaluate_center?features[eye].target:focus.inputs[eye][0].color.Get();
             auto* base=center;
             if(rect.active) {
                 if(g.peripheral_method==3) {
                     if(evaluate_center) {
-                        good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false});
-                        base=peripheral_features[eye].output.Get();
+                        good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
+                        base=peripheral_features[eye].target;
                     } else base=focus.inputs[eye][1].color.Get();
                 }else {
                     good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state);
                     base=focus.peripheral_output[eye].Get();
                 }
             }
-            if(good&&(rect.active||center_output_width[eye]!=width||center_output_height[eye]!=height)) {
+            if(good&&copies&&(*copies)[eye].layout.packed()) {
+                const bool center_direct=evaluate_center&&features[eye].direct;
+                const bool context_direct=evaluate_center&&g.peripheral_method==3&&peripheral_features[eye].direct;
+                good=focus.pack_frame(device.Get(),commands,eye,center,base,(*copies)[eye].texture,(*copies)[eye].state,
+                    (*copies)[eye].layout,center_direct,context_direct);
+                outputs[eye]=(*copies)[eye].texture;(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
+            }else if(good&&(rect.active||center_output_width[eye]!=width||center_output_height[eye]!=height)) {
                 good=focus.compose_frame(device.Get(),commands,eye,center,base,rect,width,height,
                     direct?(*copies)[eye].texture:nullptr,direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON);
                 outputs[eye]=direct?(*copies)[eye].texture:focus.full[eye].Get();
+                if(direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_GENERIC_READ;
             } else outputs[eye]=base;
             if(good&&rect.active&&g.peripheral_method==2)good=focus.save_depth(device.Get(),commands,eye);
             if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
@@ -460,6 +495,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(FAILED(commands->Close())) {good=false;break;}
             commands=split_list.Get();cut_to_second_list=true;
         }
+    }
+    if(good&&direct)for(auto& copy:*copies){
+        barrier(commands,copy.texture,copy.state,D3D12_RESOURCE_STATE_GENERIC_READ);copy.state=D3D12_RESOURCE_STATE_GENERIC_READ;
     }
     if(good)gpu_timings.stamp(commands,1);
     if(good)gpu_timings.stamp(commands,14);

@@ -7,17 +7,22 @@
 #include <cstring>
 namespace cheeky::fg {
 namespace {
-constexpr char prepare_shader[]=R"HLSL(
+constexpr char prepare_shader[]=CHEEKY_FG_COMPACT_HLSL R"HLSL(
 Texture2D<float4> Color:register(t0); Texture2D<float> Depth:register(t1); Texture2D<float2> Motion:register(t2);
 RWTexture2D<float4> OutColor:register(u0); RWTexture2D<float> OutDepth:register(u1); RWTexture2D<float2> OutMotion:register(u2);
-cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;row_major float4x4 ClipToPrevious;}
+cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
 SamplerState LinearClamp:register(s0);
+float4 samplePacked(Texture2D<float4> image,float2 uv,float4 crop,float4 spans,float4 texel){
+ if(spans.x<=0)return image.SampleLevel(LinearClamp,uv,0);
+ uint sw,sh;image.GetDimensions(sw,sh);texel.xy=.5/float2(sw,sh);
+ return lerp(image.SampleLevel(LinearClamp,contextUV(uv,spans,texel),0),
+ image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0),centerFade(uv,crop,texel));}
 float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));return c;}
 [numthreads(8,8,1)] void Main(uint3 id:SV_DispatchThreadID){
  uint w,h;
  if(Options.x>.5){OutColor.GetDimensions(w,h);if(id.x<w&&id.y<h){
   float2 uv=Rect.xy+(float2(id.xy)+.5)/float2(w,h)*Rect.zw;
-  OutColor[id.xy]=encodeColor(Color.SampleLevel(LinearClamp,uv,0));}}
+  OutColor[id.xy]=encodeColor(samplePacked(Color,uv,AtlasCrop,AtlasSpans,AtlasTexel));}}
  if(Options.z<.5)return;
  OutMotion.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
  float2 uv=Rect.xy+(float2(id.xy)+.5)/float2(w,h)*Rect.zw;
@@ -30,27 +35,32 @@ float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(ma
  mv=clamp(mv*MotionAdjust.xy-JitterCorrection.xy,-MotionAdjust.z,MotionAdjust.z);
  OutMotion[id.xy]=good?mv:float2(MotionAdjust.z,MotionAdjust.z);
 })HLSL";
-constexpr char peripheral_shader[]=R"HLSL(
+constexpr char peripheral_shader[]=CHEEKY_FG_COMPACT_HLSL R"HLSL(
 Texture2D<float4> Previous:register(t0);Texture2D<float4> Current:register(t1);
 Texture2D<float2> Motion:register(t2);Texture2D<float> Depth:register(t3);Texture2D<float> PreviousDepth:register(t4);
 RWTexture2D<float4> Output:register(u0);
-cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;row_major float4x4 ClipToPrevious;}
+cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
 SamplerState LinearClamp:register(s0);
+float4 samplePacked(Texture2D<float4> image,float2 uv,float4 crop,float4 spans,float4 texel){
+ if(spans.x<=0)return image.SampleLevel(LinearClamp,uv,0);
+ uint sw,sh;image.GetDimensions(sw,sh);texel.xy=.5/float2(sw,sh);
+ return lerp(image.SampleLevel(LinearClamp,contextUV(uv,spans,texel),0),
+ image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0),centerFade(uv,crop,texel));}
 float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));return c;}
 bool inside(float2 p){return all(isfinite(p))&&all(p>=0)&&all(p<=1);}
 bool motionAt(float2 uv,out float2 mv){uint w,h;Motion.GetDimensions(w,h);mv=Motion.Load(int3(min(uint2(saturate(uv)*float2(w,h)),uint2(w,h)-1),0));return all(isfinite(mv))&&all(abs(mv)<=2);}
 [numthreads(8,8,1)] void Main(uint3 id:SV_DispatchThreadID){
  uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
  float2 uv=(float2(id.xy)+.5)/float2(w,h);
- if(Options.z<.5){Output[id.xy]=encodeColor(Current.SampleLevel(LinearClamp,uv,0));return;}
- if(Options.x<.5){Output[id.xy]=encodeColor(Previous.SampleLevel(LinearClamp,uv,0));return;}
+ if(Options.z<.5){Output[id.xy]=encodeColor(samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel));return;}
+ if(Options.x<.5){Output[id.xy]=encodeColor(samplePacked(Previous,uv,PriorCrop,PriorSpans,AtlasTexel));return;}
  float2 cuv=uv,mv=0;bool valid=true;
  [unroll]for(uint i=0;i<4;++i){if(!inside(cuv)||!motionAt(cuv,mv)){valid=false;break;}cuv=uv-(1-Options.y)*mv;}
  valid=valid&&inside(cuv)&&motionAt(cuv,mv);float2 puv=cuv+mv;
  valid=valid&&all(abs((cuv+(1-Options.y)*mv-uv)*float2(w,h))<=2);
- float4 result=Options.x<1.5?Previous.SampleLevel(LinearClamp,uv,0):Current.SampleLevel(LinearClamp,uv,0);
- if(valid){float4 b=0;if(Options.x>=1.5)b=Current.SampleLevel(LinearClamp,cuv,0);
-  if(inside(puv)){float4 a=Previous.SampleLevel(LinearClamp,puv,0);
+ float4 result=Options.x<1.5?samplePacked(Previous,uv,PriorCrop,PriorSpans,AtlasTexel):samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel);
+ if(valid){float4 b=0;if(Options.x>=1.5)b=samplePacked(Current,cuv,AtlasCrop,AtlasSpans,AtlasTexel);
+  if(inside(puv)){float4 a=samplePacked(Previous,puv,PriorCrop,PriorSpans,AtlasTexel);
    if(Options.x<1.5)result=a;
    else{uint dw,dh;Depth.GetDimensions(dw,dh);float z=Depth.Load(int3(min(uint2(cuv*float2(dw,dh)),uint2(dw,dh)-1),0));
     float4 clip=mul(ClipToPrevious,float4(cuv.x*2-1,1-cuv.y*2,z,1));
@@ -63,7 +73,7 @@ bool motionAt(float2 uv,out float2 mv){uint w,h;Motion.GetDimensions(w,h);mv=Mot
 })HLSL";
 constexpr char compose_shader[]=R"HLSL(
 Texture2D<float4> Periphery:register(t0);Texture2D<float4> Center:register(t1);RWTexture2D<float4> Output:register(u0);
-cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;row_major float4x4 ClipToPrevious;}
+cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
 SamplerState LinearClamp:register(s0);
 [numthreads(8,8,1)]void Main(uint3 id:SV_DispatchThreadID){
  uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
@@ -74,6 +84,19 @@ SamplerState LinearClamp:register(s0);
  float2 edge=min(uv-Rect.xy,Rect.xy+Rect.zw-uv);
  float fade=Options.w>0?saturate(min(edge.x,edge.y)/Options.w):(all(local>=0)&&all(local<=1)?1:0);
  Output[id.xy]=lerp(base,Center.SampleLevel(LinearClamp,saturate(local),0),fade);
+})HLSL";
+constexpr char pack_shader[]=R"HLSL(
+Texture2D<float4> Periphery:register(t0);Texture2D<float4> Center:register(t1);RWTexture2D<float4> Output:register(u0);
+cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;
+ float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
+SamplerState LinearClamp:register(s0);
+[numthreads(8,8,1)]void Main(uint3 id:SV_DispatchThreadID){
+ uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
+ if(id.y<uint(Dimensions.y)){
+  if(id.x<uint(Dimensions.x)&&Options.x<.5)Output[id.xy]=Center.SampleLevel(LinearClamp,(float2(id.xy)+.5)/Dimensions.xy,0);
+ }else if(id.x<uint(Dimensions.z)&&id.y<uint(Dimensions.y+Dimensions.w)&&Options.y<.5){
+  Output[id.xy]=Periphery.SampleLevel(LinearClamp,(float2(id.x,id.y-Dimensions.y)+.5)/Dimensions.zw,0);
+ }
 })HLSL";
 void transition(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
  if(!r||a==b)return;D3D12_RESOURCE_BARRIER t{};t.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;t.Transition.pResource=r;
@@ -86,7 +109,7 @@ bool allocate(ID3D12Device* d,unsigned w,unsigned h,DXGI_FORMAT fmt,ComPtr<ID3D1
  rd.MipLevels=rd.DepthOrArraySize=1;rd.Format=fmt;rd.SampleDesc.Count=1;rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
  return SUCCEEDED(d->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out)));
 }
-struct Constants {float rect[4]{},offset[4]{},dimensions[4]{},motion[4]{},options[4]{},jitter[4]{};Matrix previous{identity()};};
+struct Constants {float rect[4]{},offset[4]{},dimensions[4]{},motion[4]{},options[4]{},jitter[4]{},atlas_crop[4]{},atlas_spans[4]{},atlas_texel[4]{},prior_crop[4]{},prior_spans[4]{};Matrix previous{identity()};};
 void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,unsigned operation,
  ID3D12PipelineState* state,const std::array<ID3D12Resource*,5>& in,const std::array<DXGI_FORMAT,5>& formats,
  const std::array<ID3D12Resource*,3>& out,const Constants& constants){
@@ -114,12 +137,12 @@ DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {
  default:return DXGI_FORMAT_UNKNOWN;}
 }
 void FocusPipeline::reset() noexcept {
- root.Reset();prepare.Reset();peripheral.Reset();compose.Reset();descriptors.Reset();stride=0;
+ root.Reset();prepare.Reset();peripheral.Reset();compose.Reset();pack.Reset();descriptors.Reset();stride=0;
  for(auto& eye:inputs)for(auto& input:eye)input={};
  for(unsigned i=0;i<2;++i){peripheral_output[i].Reset();full[i].Reset();previous_depth[i].Reset();history[i]=false;}
 }
 bool FocusPipeline::initialize(ID3D12Device* dev){
- if(root&&prepare&&peripheral&&compose&&descriptors)return true;
+ if(root&&prepare&&peripheral&&compose&&pack&&descriptors)return true;
  D3D12_DESCRIPTOR_RANGE ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,5,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,3,0,0,5}};
  D3D12_ROOT_PARAMETER params[2]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable={2,ranges};
  params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;params[1].Constants={0,0,sizeof(Constants)/4};
@@ -132,7 +155,7 @@ bool FocusPipeline::initialize(ID3D12Device* dev){
   if(target)return true;
   if(FAILED(D3DCompile(source,strlen(source),nullptr,nullptr,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors)))return false;
   D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};return SUCCEEDED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(&target)));};
- if(!compile(prepare_shader,prepare)||!compile(peripheral_shader,peripheral)||!compile(compose_shader,compose))return false;
+ if(!compile(prepare_shader,prepare)||!compile(peripheral_shader,peripheral)||!compile(compose_shader,compose)||!compile(pack_shader,pack))return false;
  D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=64;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
  if(FAILED(dev->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&descriptors))))return false;
  stride=dev->GetDescriptorHandleIncrementSize(heap.Type);return true;
@@ -156,7 +179,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  auto df=need_depth?depth_srv_format(g.depth->GetDesc().Format):DXGI_FORMAT_R32_FLOAT;
  auto mf=need_motion?motion_srv_format(g.motion->GetDesc().Format):DXGI_FORMAT_R32G32_FLOAT;
  if(df==DXGI_FORMAT_UNKNOWN||mf==DXGI_FORMAT_UNKNOWN)return false;
- const auto cd=color->GetDesc();
+ auto cd=color->GetDesc();if(color_layouts[eye].width){cd.Width=color_layouts[eye].width;cd.Height=color_layouts[eye].height;}
  auto active=[](ID3D12Resource* resource,unsigned bw,unsigned bh,unsigned aw,unsigned ah,unsigned& ow,unsigned& oh){
   if(!resource){ow=oh=0;return true;}const auto d=resource->GetDesc();
   if(bw>=d.Width||bh>=d.Height)return false;
@@ -173,7 +196,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  if((need_color&&!allocate(dev,w,h,color_format,s.color))||
     (need_depth&&!allocate(dev,gw,gh,depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT,s.depth))||
     (need_motion&&!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.motion)))return false;
- Constants c{};c.rect[0]=float(r.x)/cd.Width;c.rect[1]=float(r.y)/cd.Height;c.rect[2]=float(r.w)/cd.Width;c.rect[3]=float(r.h)/cd.Height;
+ Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);c.rect[0]=float(r.x)/cd.Width;c.rect[1]=float(r.y)/cd.Height;c.rect[2]=float(r.w)/cd.Width;c.rect[3]=float(r.h)/cd.Height;
  c.offset[0]=float(g.depth_base_x);c.offset[1]=float(g.depth_base_y);c.offset[2]=float(g.motion_base_x);c.offset[3]=float(g.motion_base_y);
  c.dimensions[0]=float(dw);c.dimensions[1]=float(dh);c.dimensions[2]=float(mw);c.dimensions[3]=float(mh);
  c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);c.motion[2]=motion_bits==16?65504.f:3.402823466e38f;
@@ -204,7 +227,7 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  if(!allocate(dev,s.output_width,s.output_height,color_format,peripheral_output[eye]))return false;
  if(need_depth&&(!previous_depth[eye]||previous_depth[eye]->GetDesc().Width!=s.depth->GetDesc().Width||
      previous_depth[eye]->GetDesc().Height!=s.depth->GetDesc().Height))history[eye]=false;
- Constants c{};c.options[0]=float(g.peripheral_method);c.options[1]=.5f;
+ Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);float unused[4];previous_layouts[eye].constants(c.prior_crop,c.prior_spans,unused);c.options[0]=float(g.peripheral_method);c.options[1]=.5f;
  c.options[2]=(!need_depth||history[eye])&&!g.reset?1.f:0.f;c.previous=camera.clip_to_prev;
  c.options[3]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
  auto* mv=need_motion?s.motion.Get():nullptr;auto* depth=need_depth?s.depth.Get():nullptr;
@@ -244,6 +267,25 @@ bool FocusPipeline::compose_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* l
  transition(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,destination?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_COMMON);
  transition(list,center,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  if(periphery!=center)transition(list,periphery,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+ return true;
+}
+bool FocusPipeline::pack_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,ID3D12Resource* center,ID3D12Resource* context,
+ ID3D12Resource* destination,D3D12_RESOURCE_STATES state,const CompactLayout& layout,bool center_direct,bool context_direct){
+ if(!layout.packed()||!destination||eye>=2||(!center_direct&&!center)||(!context_direct&&!context))return false;
+ if(center_direct&&context_direct)return true;
+ Constants c;c.dimensions[0]=float(layout.center_width);c.dimensions[1]=float(layout.center_height);
+ c.dimensions[2]=float(layout.context_width);c.dimensions[3]=float(layout.context_height);
+ c.options[0]=center_direct?1.f:0.f;c.options[1]=context_direct?1.f:0.f;
+ if(center_direct)center=nullptr;if(context_direct)context=nullptr;
+ transition(list,destination,state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ transition(list,center,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+ if(context!=center)transition(list,context,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+ bind(*this,dev,list,eye,3,pack.Get(),{context,center,nullptr,nullptr,nullptr},
+  {color_format,color_format,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT},{destination,nullptr,nullptr},c);
+ list->Dispatch((layout.stored_width()+7)/8,(layout.stored_height()+7)/8,1);
+ transition(list,destination,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+ transition(list,center,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+ if(context!=center)transition(list,context,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  return true;
 }
 bool FocusPipeline::save_depth(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye){

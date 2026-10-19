@@ -147,6 +147,12 @@ struct CheekyFgTransportOptions {
     std::uint32_t color_capture_mode{},upload_mode{},latency_diagnostics{1};
 };
 using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
+struct CheekyFgStorageOptions {
+    std::uint32_t abi{1},size{sizeof(CheekyFgStorageOptions)};
+    std::uint32_t compact{},peripheral_percent{25};
+    float width{.55f},height{.45f},x{},y{},feather{.04f};
+};
+using CheekyFgStorageOptionsFn=bool(__cdecl*)(CheekyFgStorageOptions*);
 struct CheekyFgTimingValue {double mean{},last{};};
 struct CheekyFgExperimentDiagnostics {
     std::uint32_t abi{1},size{sizeof(CheekyFgExperimentDiagnostics)},supported{};

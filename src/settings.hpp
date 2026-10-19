@@ -51,6 +51,7 @@ struct Settings {
         bool submit_repeats{false}; // Runtime handles repeated display content.
         std::uint32_t color_capture_mode{1},upload_mode{1}; // Proven Joey-run defaults; 0 retains each baseline for A/B testing.
         std::uint32_t latency_diagnostics{1}; // Sparse calibrated GPU/CPU timeline; independently switchable.
+        std::uint32_t compact_storage{1}; // Native-density center plus reduced peripheral context, reconstructed at XR upload.
     } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.

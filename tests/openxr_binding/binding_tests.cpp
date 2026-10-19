@@ -467,6 +467,7 @@ void fg_toggle_test() {
 
 #include "fg_periphery_validation.hpp"
 #include "fg_async_validation.hpp"
+#include "fg_compact_validation.hpp"
 #include "fg_snapshot_validation.hpp"
 void fg_copy_validation_test() {
     using Microsoft::WRL::ComPtr;
@@ -727,6 +728,7 @@ void fg_copy_validation_test() {
     // deliberately single-threaded and is only used by the copy checks above.
     observe_fg_barriers=false;
     fg_snapshot_validation(device.Get());
+    fg_compact_validation(device.Get());
     fg_buffered_validation(device.Get());
     for(auto* texture:{source.Get(),targets[0].Get(),targets[1].Get()})
         check(fg_expected_states[texture]==D3D12_RESOURCE_STATE_RENDER_TARGET,"OpenXR image must be restored to RENDER_TARGET");
