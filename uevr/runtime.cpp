@@ -122,6 +122,7 @@ std::string snapshot_locked(State& s) {
     sample_fg_memory(s,GetTickCount64());
     CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
+    CheekyFgPacingTimeline fg_pacing;fg_pacing_timeline(fg_pacing);
     CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
     CheekyFgPresentation fg_present;fg_presentation(fg_present);
     CheekyFgExperimentDiagnostics fg_exp;fg_experiment_diagnostics(fg_exp);
@@ -209,6 +210,18 @@ std::string snapshot_locked(State& s) {
         << ",\"peripheral_method\":" << fg_time.peripheral_method
         << ",\"source_depth_format\":" << fg_time.source_depth_format
         << ",\"source_motion_format\":" << fg_time.source_motion_format << "}"
+        << ",\"pacing_timeline\":{\"supported\":" << bool(fg_pacing.supported)
+        << ",\"recent_generated\":" << bool(fg_pacing.recent_generated)
+        << ",\"generated_last_tick\":" << fg_pacing.generated_last_tick
+        << ",\"deferred_events\":" << fg_pacing.deferred_events << ",\"deferred_releases\":" << fg_pacing.deferred_releases
+        << ",\"clock_late_ms\":" << fg_pacing.clock_late_ms << ",\"clock_late_last_ms\":" << fg_pacing.clock_late_last_ms
+        << ",\"credit_deferred_ms\":" << fg_pacing.credit_deferred_ms << ",\"credit_deferred_last_ms\":" << fg_pacing.credit_deferred_last_ms
+        << ",\"game_wait_credit_ms\":" << fg_pacing.game_wait_credit_ms << ",\"game_wait_credit_last_ms\":" << fg_pacing.game_wait_credit_last_ms
+        << ",\"game_begin_gate_ms\":" << fg_pacing.game_begin_gate_ms << ",\"game_begin_gate_last_ms\":" << fg_pacing.game_begin_gate_last_ms
+        << ",\"presenter_content_ms\":" << fg_pacing.presenter_content_ms << ",\"presenter_content_last_ms\":" << fg_pacing.presenter_content_last_ms
+        << ",\"native_xr_end_ms\":" << fg_pacing.native_xr_end_ms << ",\"native_xr_end_last_ms\":" << fg_pacing.native_xr_end_last_ms
+        << ",\"generated_xr_end_ms\":" << fg_pacing.generated_xr_end_ms << ",\"generated_xr_end_last_ms\":" << fg_pacing.generated_xr_end_last_ms
+        << ",\"fg_submit_to_complete_ms\":" << fg_pacing.fg_submit_to_complete_ms << ",\"fg_submit_to_complete_last_ms\":" << fg_pacing.fg_submit_to_complete_last_ms << "}"
         << ",\"cadence\":{\"supported\":" << bool(fg_rates.supported) << ",\"valid\":" << bool(fg_rates.valid)
         << ",\"game_fps\":" << fg_rates.game_fps << ",\"native_fps\":" << fg_rates.native_fps
         << ",\"generated_fps\":" << fg_rates.generated_fps << ",\"unique_fps\":" << fg_rates.unique_fps

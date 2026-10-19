@@ -3393,6 +3393,14 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCadenceV1(CheekyFgCade
     return true;
 }
 
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingTimelineV1(CheekyFgPacingTimeline* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgPacingTimeline{};std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->pacing_timeline();return true;}
+    return true;
+}
+
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetOverheadV1(CheekyFgOverhead* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
     *out=CheekyFgOverhead{};std::lock_guard lock(state_mutex);

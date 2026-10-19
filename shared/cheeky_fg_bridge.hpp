@@ -126,6 +126,20 @@ struct CheekyFgCadence {
 };
 using CheekyFgCadenceFn=bool(__cdecl*)(CheekyFgCadence*);
 
+// Separate optional ABI: CPU pacing timeline. None of these durations is input-to-photon latency.
+// All entries are milliseconds; mean and last use a bounded 60-sample window.
+struct CheekyFgPacingTimeline {
+    std::uint32_t abi{1},size{sizeof(CheekyFgPacingTimeline)},supported{};
+    std::uint32_t recent_generated{}; // Generated xrEndFrame completed within the last 2 seconds.
+    std::uint64_t generated_last_tick{},deferred_events{},deferred_releases{};
+    double clock_late_ms{},clock_late_last_ms{},credit_deferred_ms{},credit_deferred_last_ms{};
+    double game_wait_credit_ms{},game_wait_credit_last_ms{},game_begin_gate_ms{},game_begin_gate_last_ms{};
+    double presenter_content_ms{},presenter_content_last_ms{};
+    double native_xr_end_ms{},native_xr_end_last_ms{},generated_xr_end_ms{},generated_xr_end_last_ms{};
+    double fg_submit_to_complete_ms{},fg_submit_to_complete_last_ms{};
+};
+using CheekyFgPacingTimelineFn=bool(__cdecl*)(CheekyFgPacingTimeline*);
+
 // Optional GPU stages outside the original processing timestamp interval.
 struct CheekyFgOverhead {
     std::uint32_t abi{1},size{sizeof(CheekyFgOverhead)},supported{};

@@ -405,8 +405,17 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     text("Alt+Shift+/ toggles SR.")
     local d = (status.apis or {})[status.renderer == 1 and 2 or 1] or {}
     local f = status.frame or {}
+    local fg_state = status.fg or {}
+    local fg_timeline = fg_state.pacing_timeline or {}
+    local fg_cadence = fg_state.cadence or {}
+    local fg_status_text = "Disabled"
+    if draft.FgEnabled then
+        fg_status_text = (fg_timeline.supported and fg_timeline.recent_generated) and
+            string.format("Generating (%.1f FG FPS)",fg_cadence.generated_fps or 0) or "No recent generated frames"
+    end
     rows("overview", {{"Renderer", status.renderer == 1 and "DX12" or "DX11 direct"},
         {"SR status", d.state or "Waiting"}, {"NR status", status.nr or "Waiting"},
+        {"DLSS-FG status", fg_status_text},
         {"UEVR present cadence", fps(f.present_ms)}})
     if afw.enabled then rows("afw_overview", {{"AFW", afw_mode(afw)}}) end
     -- A reset is a native transaction. Wait for its authoritative snapshot before editing again.
@@ -593,7 +602,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgBackbufferFrameId ~= nil then
                     section("DLSS-G frame identity and GPU scheduling")
                     check("Pass native BackbufferFrameID to NGX", "FgBackbufferFrameId")
-                    if draft.FgReleasePoint == 3 and draft.FgHooklessMode3 then
+                    if draft.FgHooklessMode3 then
                         text("Overridden by hook-free mode: no native frame number is attached to either eye.")
                     else
                         text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
@@ -611,13 +620,14 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     text("Preparation waits for both eyes' GPU input preparation, then overlaps native rendering with NGX.")
                     if draft.FgReleasePoint == 3 then
                         text("Holds the next native frame through generated-frame uploads and OpenXR submission.")
-                        if draft.FgHooklessMode3 ~= nil then
-                            check("Hook-free FG guide matching (UEVR compatibility)", "FgHooklessMode3")
-                            text("Skips private UEVR frame/RHI hooks, matches one unconsumed stereo guide pair to the final color copy.")
-                            text("Omits NGX BackbufferFrameID regardless of the A/B setting. Ambiguous pairs fall back to native.")
+                    end
+                    if draft.FgHooklessMode3 ~= nil then
+                        check("Hook-free FG guide matching (UEVR compatibility)", "FgHooklessMode3")
+                        text("Disables private UEVR frame/RHI hooks and native frame IDs for every release mode.")
+                        text("Matches exactly one unconsumed stereo guide pair at xrEndFrame; ambiguous pairs fall back to native.")
+                        if draft.FgHooklessMode3 and draft.FgReleasePoint ~= 3 then
+                            text("EXPERIMENTAL: modes 0-2 allow additional overlap; capture order alone cannot prove frame identity.")
                         end
-                    elseif draft.FgHooklessMode3 then
-                        text("Hook-free matching is inactive: release mode 3 is required; UEVR frame hooks remain enabled.")
                     end
                 elseif draft.FgWaitForCompletion ~= nil then
                     check("Wait for FG completion before next frame", "FgWaitForCompletion")
@@ -864,6 +874,25 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             {"Game pacing wait", string.format("%.3f ms",p.pacing_wait_ms or 0)},
                             {"Native frames queued",p.queued_native or 0},{"Skipped FG jobs (busy)",p.skipped_native or 0}})
                     end
+                end
+                local timeline = fg.pacing_timeline
+                if timeline and timeline.supported then
+                    local function metric(mean, last)
+                        return string.format("%.3f / %.3f ms",mean or 0,last or 0)
+                    end
+                    text("CPU pacing timeline: mean / latest (waits may overlap; not additive)")
+                    rows("fg_pacing_timeline", {
+                        {"Pacing clock lateness",metric(timeline.clock_late_ms,timeline.clock_late_last_ms)},
+                        {"Deferred game credit",metric(timeline.credit_deferred_ms,timeline.credit_deferred_last_ms)},
+                        {"Game xrWaitFrame credit",metric(timeline.game_wait_credit_ms,timeline.game_wait_credit_last_ms)},
+                        {"Game xrBeginFrame gate",metric(timeline.game_begin_gate_ms,timeline.game_begin_gate_last_ms)},
+                        {"Presenter fresh-content wait",metric(timeline.presenter_content_ms,timeline.presenter_content_last_ms)},
+                        {"Native xrEndFrame",metric(timeline.native_xr_end_ms,timeline.native_xr_end_last_ms)},
+                        {"Generated xrEndFrame",metric(timeline.generated_xr_end_ms,timeline.generated_xr_end_last_ms)},
+                        {"FG submit-to-complete",metric(timeline.fg_submit_to_complete_ms,timeline.fg_submit_to_complete_last_ms)},
+                        {"Deferred / released credits",string.format("%.0f / %.0f",timeline.deferred_events or 0,timeline.deferred_releases or 0)},
+                    })
+                    text("Fresh-content wait occurs before the presenter's private xrWaitFrame.")
                 end
                 text("If generation is unavailable, the original native frame is displayed.")
             end

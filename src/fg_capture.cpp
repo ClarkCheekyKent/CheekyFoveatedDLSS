@@ -93,7 +93,7 @@ bool enabled() noexcept {
     return current_settings().fg.enabled;
 }
 bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
-    return s.hookless_mode3 && s.release_point==3u;
+    return s.hookless_mode3;
 }
 bool hookless_selected() noexcept {return hookless_selected(current_settings().fg);}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
@@ -150,7 +150,7 @@ void fg_note_reset(ID3D12GraphicsCommandList* list) noexcept try {
 void fg_note_color_copy(ID3D12GraphicsCommandList* list,ID3D12Resource* color) noexcept try {
     // Most copies (including our guide snapshots) are unrelated. Inspect the
     // registration before taking the mutex; snapshot recording already owns it.
-    // Mode 3 matches at xrEndFrame, after the complete stereo submission.
+    // Hook-free matching happens at xrEndFrame, after the complete stereo submission.
     // Do not require private UEVR color-copy queues or resource identities.
     if(!enabled()||hookless_selected()||!FgColorProvenance::registered(color))return;
     const bool hookless=false;
@@ -239,7 +239,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AttachUEVRFrameSource(voi
     using namespace cheeky::foveated_dlss;
     std::lock_guard lock(source_mutex);
     if(hookless_selected()){
-        strcpy_s(source_message,"Hook-free mode 3: no UEVR frame hooks");
+        strcpy_s(source_message,"Hook-free FG: no UEVR frame hooks");
         return true; // Do not even inspect the installed UEVR runtime layout.
     }
     if(source_hook>=0&&!source_abandoned.load())return true;
@@ -275,7 +275,7 @@ extern "C" __declspec(dllexport) void __cdecl CheekyFG_DetachUEVRFrameSource() n
     for(unsigned n=0;n<rhi_hook_count;++n)if(rhi_hooks[n].id>=0&&unregister_source)unregister_source(rhi_hooks[n].id);
     rhi_hook_count=0;selected_rhi=-1;
     source_hook=-1;unregister_source=nullptr;++source_epoch;render_frame=0;
-    strcpy_s(source_message,hookless_selected()?"Hook-free mode 3: no UEVR frame hooks":"Plugin frame source detached");
+    strcpy_s(source_message,hookless_selected()?"Hook-free FG: no UEVR frame hooks":"Plugin frame source detached");
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFgCaptureHealth* out) noexcept {
     using namespace cheeky::foveated_dlss;
@@ -283,7 +283,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFg
     std::lock_guard lock(source_mutex);out->plugin_hook=source_hook>=0&&!source_abandoned.load();
     out->frame_calls=source_calls;out->last_guide_frame=last_guide_frame;out->captured_guides=captured_guides;
     out->missing_frame_guides=missing_frame_guides;out->color_copies=color_copies;
-    strcpy_s(out->source,hookless_selected()?"Hook-free mode 3: capture-ordered stereo pairs":
+    strcpy_s(out->source,hookless_selected()?"Hook-free FG: capture-ordered stereo pairs":
         selected_rhi.load()>=0?"Plugin hook: RHI stereo phases":source_message);
     std::lock_guard captures(mutex);const auto& match=last_color_match;
     out->color_frame=last_color_frame;out->match_frame=match.frame;out->latest_frame=match.latest_frame;
@@ -397,7 +397,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFg
 extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(ID3D12Resource* color) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!enabled())return 0;
-    if(hookless_selected())return 0; // Only xrEndFrame may claim a mode-3 pair.
+    if(hookless_selected())return 0; // Only xrEndFrame may claim a hook-free stereo pair.
     std::lock_guard lock(mutex);return store().colors.token(color,&snapshots(),false);
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair* out) noexcept {
@@ -469,6 +469,11 @@ bool fg_performance(CheekyFgPerformance& out) noexcept {
 bool fg_cadence(CheekyFgCadence& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
     const auto query=layer?reinterpret_cast<CheekyFgCadenceFn>(GetProcAddress(layer,"CheekyFG_GetCadenceV1")):nullptr;
+    return query&&query(&out);
+}
+bool fg_pacing_timeline(CheekyFgPacingTimeline& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgPacingTimelineFn>(GetProcAddress(layer,"CheekyFG_GetPacingTimelineV1")):nullptr;
     return query&&query(&out);
 }
 bool fg_overhead(CheekyFgOverhead& out) noexcept {

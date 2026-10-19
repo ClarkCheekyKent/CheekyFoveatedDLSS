@@ -113,7 +113,7 @@ struct BufferedPresenter final : Presenter {
     bool accept_guide_queue(const CheekyFgPair& guides,Native& job,bool hookless) noexcept {
         if(cheeky::foveated_dlss::same_d3d12_queue(guides.producer_queue,queue.Get()))return true;
         // Legacy modes intentionally retain their established same-queue contract.
-        if(!hookless||guides.release_point!=3u||!guide_sync_fence||!device||!queue)return false;
+        if(!hookless||!guide_sync_fence||!device||!queue)return false;
         auto actual=cheeky::foveated_dlss::native_d3d12_interface(guides.producer_queue);
         if(!actual||actual->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT||
            queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return false;
@@ -189,6 +189,10 @@ struct BufferedPresenter final : Presenter {
     bool inflight_prepared{},release_policy_known{},submit_repeat_frames{true},clock_pacing_active{};
     double late_wait_budget_ms{};
     TimingAverage producer_cpu,pacing_wait;
+    TimingAverage clock_late,credit_deferral,begin_gate_wait,presenter_content_wait;
+    TimingAverage native_xr_end,generated_xr_end;
+    TimingClock::time_point credit_deferred_since{};
+    std::uint64_t last_generated_submit_tick{};
     TimingAverage app_image_wait,present_image_wait,runtime_begin,runtime_end,present_cpu;
     std::array<TimingAverage,3> app_calls;
     CadenceWindow cadence_window;
@@ -262,6 +266,22 @@ struct BufferedPresenter final : Presenter {
     CheekyFgPerformance performance() const noexcept override {
         auto result=telemetry;result.asynchronous_presenter=1;result.queued_native=unsigned(pending.size());
         result.skipped_native=skipped;result.producer_cpu_ms=producer_cpu.mean();result.pacing_wait_ms=pacing_wait.mean();return result;
+    }
+    CheekyFgPacingTimeline pacing_timeline() const noexcept override {
+        CheekyFgPacingTimeline t;t.supported=1;
+        t.generated_last_tick=last_generated_submit_tick;
+        t.recent_generated=last_generated_submit_tick&&GetTickCount64()-last_generated_submit_tick<2000;
+        t.deferred_events=deferred_credits;t.deferred_releases=released_deferred_credits;
+        t.clock_late_ms=clock_late.mean();t.clock_late_last_ms=clock_late.last;
+        t.credit_deferred_ms=credit_deferral.mean();t.credit_deferred_last_ms=credit_deferral.last;
+        t.game_wait_credit_ms=pacing_wait.mean();t.game_wait_credit_last_ms=pacing_wait.last;
+        t.game_begin_gate_ms=begin_gate_wait.mean();t.game_begin_gate_last_ms=begin_gate_wait.last;
+        t.presenter_content_ms=presenter_content_wait.mean();t.presenter_content_last_ms=presenter_content_wait.last;
+        t.native_xr_end_ms=native_xr_end.mean();t.native_xr_end_last_ms=native_xr_end.last;
+        t.generated_xr_end_ms=generated_xr_end.mean();t.generated_xr_end_last_ms=generated_xr_end.last;
+        t.fg_submit_to_complete_ms=generation_stages[3].mean();
+        t.fg_submit_to_complete_last_ms=generation_stages[3].last;
+        return t;
     }
     CheekyFgCadence cadence() const noexcept override {
         CheekyFgCadence result;result.supported=1;std::array<double,5> rates{};
@@ -434,6 +454,8 @@ struct BufferedPresenter final : Presenter {
         captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
+        clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
+        native_xr_end={};generated_xr_end={};credit_deferred_since={};last_generated_submit_tick=0;
         producer.gpu_cost.reset();uploads.gpu_cost.reset();extra_gpu={};
         frame_ages={};age_samples={};late_pair_wait={};late_wait_samples=late_wait_arrivals=late_wait_timeouts=0;
         late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
@@ -536,7 +558,9 @@ struct BufferedPresenter final : Presenter {
         if(waited==begun)return XR_ERROR_CALL_ORDER_INVALID;
         // A pipelined xrWaitFrame may already have consumed a credit before
         // the previous end_frame enqueues its FG job. Gate begin_frame too.
+        const auto gate_started=TimingClock::now();
         changed.wait(lock,[&]{return stopping||(begun==ended&&!release_gate_active());});
+        begin_gate_wait.add(elapsed_ms(gate_started));
         if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();return XR_SUCCESS;
     }
@@ -701,9 +725,8 @@ struct BufferedPresenter final : Presenter {
             });
             if(good) {
                 if(inference_slot&&hookless_complete){
-                    // Both final stereo colors are now captured. The strict
-                    // mode-3 scheduler gates the next native frame until FG
-                    // submission. No UEVR private frame ID/color hook needed.
+                    // Both final stereo colors are now captured. Stereo guides are claimed at the final OpenXR handoff, independent
+                    // of the native-frame release policy.
                     const auto completed=hookless_complete(1);
                     if(completed){expected_token=completed;expected_frame=0;tokens_match=true;}
                     else if(!expected_frame){expected_token=0;tokens_match=false;}
@@ -724,7 +747,7 @@ struct BufferedPresenter final : Presenter {
                     if(!job->guides_valid)job->guide_state=CheekyFgState::queue_mismatch;
                     if(guides.capture_token!=expected_token||guides.eyes[1].evaluation!=expected_token||
                        guides.eyes[0].evaluation+1!=expected_token||guides.eyes[0].render_frame!=expected_frame||
-                       guides.eyes[1].render_frame!=expected_frame||(!expected_frame&&guides.release_point!=3u)){
+                       guides.eyes[1].render_frame!=expected_frame){
                         job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;
                     }
                     for(unsigned eye=0;eye<2&&job->guides_valid;++eye) {
@@ -1128,7 +1151,7 @@ struct BufferedPresenter final : Presenter {
                 // Default: hold until FG submission. The opt-in completion
                 // policy holds through both eyes' ordinary completion fence.
                 // Coalesce pacing ticks while either policy blocks production.
-                if(!credit_deferred)++deferred_credits;credit_deferred=true;
+                mark_credit_deferred();
             }else credits=std::min(2u,credits+(ticks==1?2u:1u));
         }
         changed.notify_all();
@@ -1144,12 +1167,13 @@ struct BufferedPresenter final : Presenter {
             while(!stopping) {
                 const auto now=TimingClock::now();
                 if(now>=next) {
+                    clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
                     const auto period=std::chrono::duration_cast<TimingClock::duration>(
                         std::chrono::duration<double,std::milli>(std::max(1.,display_ms*(pacing_active?2.:1.))));
                     if(!raw) {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
-                            if(!credit_deferred)++deferred_credits;credit_deferred=true;
+                            mark_credit_deferred();
                         }else if(credit_deferred)release_deferred_credit();
                         else credits=std::min(2u,credits+1);
                         changed.notify_all();
@@ -1178,10 +1202,16 @@ struct BufferedPresenter final : Presenter {
         return awaiting_generated_submission||(inflight_id&&inflight_release_point==3u)||
             std::any_of(pending.begin(),pending.end(),[](const auto& job){return job->guides_valid&&job->guides.release_point==3u;});
     }
+    void mark_credit_deferred() noexcept {
+        // Hold mx. A missed clock tick is coalesced; measure the actual held duration.
+        if(!credit_deferred){++deferred_credits;credit_deferred=true;credit_deferred_since=TimingClock::now();}
+    }
     void release_deferred_credit() noexcept {
         // Hold mx. Coalesce missed ticks rather than bursting queued renders.
         if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()&&!release_gate_active()) {
-            credits=std::min(2u,credits+1);credit_deferred=false;++released_deferred_credits;changed.notify_all();
+            credits=std::min(2u,credits+1);credit_deferred=false;++released_deferred_credits;
+            if(credit_deferred_since!=TimingClock::time_point{})credit_deferral.add(elapsed_ms(credit_deferred_since));
+            credit_deferred_since={};changed.notify_all();
         }
     }
     void inference_submitted() noexcept {
@@ -1270,6 +1300,7 @@ struct BufferedPresenter final : Presenter {
         CHEEKY_FG_SUBMISSION_OBSERVER(generated);
 #endif
         result=runtime_end_frame(&end);
+        {std::lock_guard lock(mx);(generated?generated_xr_end:native_xr_end).add(elapsed_ms(submitted_at));}
         if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);note_frame_age(pair,generated,repeated,submitted_at);
             if(generated){note_gpu_ready_age(pair,submitted_cpu,display_cpu);finish_generated_gate(pair.current_id,true);}}
         return XR_SUCCEEDED(result);
@@ -1286,7 +1317,10 @@ struct BufferedPresenter final : Presenter {
     }
     bool await_content(const Pair& active,bool have_active,bool generated_phase,double position,bool& allow_repeats) {
         std::unique_lock lock(mx);
+        bool waited_for_content=false;
+        const auto started_wait=TimingClock::now();
         while(!stopping&&!raw&&!submit_repeat_frames&&!(direct_request&&!direct_request->decided)&&!fresh_content(active,have_active,generated_phase,position)) {
+            waited_for_content=true;
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
@@ -1295,6 +1329,7 @@ struct BufferedPresenter final : Presenter {
             if(producer_pending)changed.wait_for(lock,std::chrono::milliseconds(1));
             else changed.wait(lock);
         }
+        if(waited_for_content)presenter_content_wait.add(elapsed_ms(started_wait));
         allow_repeats=submit_repeat_frames;return !stopping;
     }
     void presentation_loop() noexcept {
@@ -1376,9 +1411,9 @@ struct BufferedPresenter final : Presenter {
                 result=runtime_end_frame(&empty);
             }
             measure_presenter_memory();
-            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{};
+            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{};
             {std::lock_guard lock(mx);
-                if(is_generated&&submitted)++generated_count;
+                if(is_generated&&submitted){++generated_count;last_generated_submit_tick=GetTickCount64();}
                 if(submitted&&!is_generated&&!raw_frame){if(repeated)++repeated_presentations;else ++distinct_native;}
                 present_cpu.add(elapsed_ms(present_start));
                 if(XR_SUCCEEDED(result)){++runtime_submissions;
@@ -1399,6 +1434,11 @@ struct BufferedPresenter final : Presenter {
                         generation_stages[0].count,generation_stages[0].mean(),generation_stages[1].mean(),generation_stages[2].mean(),
                         generation_stages[3].mean(),generation_stages[0].mean()+generation_stages[1].mean()+generation_stages[2].mean()+generation_stages[3].mean(),
                         static_cast<unsigned long long>(deferred_credits),static_cast<unsigned long long>(released_deferred_credits),unsigned(credit_deferred));
+                    const auto time=pacing_timeline();
+                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu",
+                        time.clock_late_ms,time.credit_deferred_ms,time.game_wait_credit_ms,time.game_begin_gate_ms,
+                        time.presenter_content_ms,time.native_xr_end_ms,time.generated_xr_end_ms,
+                        time.fg_submit_to_complete_ms,time.deferred_events,time.deferred_releases);
                     sprintf_s(gpu_age_log,"FG GPU-ready latency ms: samples=%llu native_tail_excluded=%.3f generated_submit=%.3f predicted_display=%.3f predicted_samples=%llu late_targets=%llu gate_released=%llu gate_skipped=%llu",
                         gpu_ready_samples,gpu_ready_samples?gpu_ready_ages[0].mean():-1.,gpu_ready_samples?gpu_ready_ages[1].mean():-1.,
                         predicted_samples?gpu_ready_ages[2].mean():-1.,predicted_samples,prediction_late,
@@ -1417,6 +1457,7 @@ struct BufferedPresenter final : Presenter {
             if(stage_log[0])trace(stage_log);
             if(cadence_log[0])trace(cadence_log);
             if(gpu_age_log[0])trace(gpu_age_log);
+            if(pacing_log[0])trace(pacing_log);
         }}catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
 };
