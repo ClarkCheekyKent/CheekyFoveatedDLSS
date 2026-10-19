@@ -145,3 +145,21 @@ Missing or ambiguous nested DLSS routes pass through to ordinary DLSS. Unknown w
 Hogwarts Legacy compatibility and overlapping fixed coverage have been tested in a headset. Automated tests cover native/Streamline/OTA routing, SR/NR histories, real copy hooks and GPU composites, gaze/fallback transitions and the Lua menu. Those tests substitute NVIDIA inference; additional games and real eye tracking still need headset testing.
 
 For final testing, compare SR off/on with peripheral DLAA, check both eyes during head and object motion, then exercise NR Before/After and gaze modes. Include loading screens, game-resolution changes and switching AFW off/on. If something fails, use **Report an issue...** to collect a support ZIP. Nothing is uploaded automatically. Restore a previous complete Cheeky package and restart the game to roll back.
+
+## FG GPU queue comparison
+
+The Lua **FG GPU queue** dropdown selects **Separate HIGH queue** (the unchanged
+default), **Separate NORMAL queue**, or **Shared game queue**. The saved key
+remains `FgQueuePriority`: 1, 0, and 2 respectively. Switching applies live after
+the current FG job retires and recreates NGX histories. FG processing, calibrated
+latency, source-age, pacing-wait, and FPS windows restart for the new queue.
+Capture/upload overhead measurements are not reset. Support logs identify
+both the requested and actual queue, including unavailable-priority fallback.
+
+For an A/B test, keep the scene, release policy, quality settings, and repeats
+unchanged; use repeats OFF. Allow 10 seconds to settle after each switch and
+record about 20 seconds per mode. Compare native and unique FPS as well as GPU
+queue entry, capture dependency, and FG GPU work. Shared queue markers reach the
+GPU after preceding work on the game queue, so dependency time may move into
+queue-entry time; compare their sum rather than expecting both fields to fall.
+These are scheduling experiments, not an established fix for gameplay slowdown.

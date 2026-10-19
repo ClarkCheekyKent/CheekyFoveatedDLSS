@@ -512,9 +512,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
                 end
                 if draft.FgQueuePriority ~= nil then
-                    combo("FG GPU queue priority", "FgQueuePriority", {
-                        [0]="Separate NORMAL queue", [1]="Separate HIGH queue"})
-                    text("Switches live after the previous FG job retires; recreates NGX histories and resets timings.")
+                    combo("FG GPU queue", "FgQueuePriority", {
+                        [0]="Separate NORMAL queue", [1]="Separate HIGH queue", [2]="Shared game queue"})
+                    text("Switches live after the previous FG job retires; recreates NGX histories and resets FG timings and FPS averages.")
+                    if draft.FgQueuePriority == 2 then text("FG runs in order on the game's GPU queue. Capture and OpenXR uploads keep using that queue in every mode.") end
                 end
                 if draft.FgReleasePoint ~= nil then
                     combo("Release game rendering", "FgReleasePoint", {

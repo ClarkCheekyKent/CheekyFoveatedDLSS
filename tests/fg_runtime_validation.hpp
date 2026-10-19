@@ -87,6 +87,7 @@ void fg_runtime_frame_validation(HMODULE runtime,const std::filesystem::path& bi
     require(!acquire(&pair),"Matching evaluation counters cannot override a different RHI frame identity");
     pair.render_frame=77;require(acquire(&pair)&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,"Both guides belong to the color's RHI frame");
     require(pair.release_point==3&&pair.submit_repeats==0,"Lua generated-submission gate reaches the real captured stereo pair");
+    require(pair.fg_queue_priority==2,"Lua shared GPU queue selection survives the actual captured-pair ABI");
     require(pair.eyes[0].depth_inverted&&pair.eyes[1].depth_inverted&&pair.eyes[0].motion_jittered&&pair.eyes[1].motion_jittered,
         "Signed creation flags survive a separate evaluation parameter object");release(&pair);
     begin();copy();submit();require(stamp(output.Get(),&s)&&s.render_frame==78,"Next color uses its own RHI frame");

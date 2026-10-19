@@ -315,7 +315,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     if(!snapshots().acquire(*out))return false;
     out->diagnostic_mode=mode;
     out->enable_frame_id=settings.backbuffer_frame_id ? 1u : 0u;
-    out->fg_queue_priority=settings.queue_priority == 0u ? 0u : 1u;
+    out->fg_queue_priority=settings.queue_priority <= 2u ? settings.queue_priority : 1u;
     out->release_point=settings.release_point<=3u?settings.release_point:0u;
     out->submit_repeats=settings.submit_repeats?1u:0u;
     return true;

@@ -67,13 +67,17 @@ struct BufferedPresenter final : Presenter {
     std::mutex capture_mutex;
     std::thread presentation_thread,generation_thread,pacing_thread;
     Transport producer,output,uploads;
-    // Dedicated HIGH-priority queue for inference only. The OpenXR binding,
-    // guide capture and swapchain uploads must keep using the application's
-    // original queue; D3D12 GPU fences order work across the two queues.
+    // Default: dedicated HIGH-priority inference queue. Lua can also select a
+    // separate NORMAL queue or share the application's original queue. The
+    // OpenXR binding, guide capture and uploads always retain the original queue.
     ComPtr<ID3D12CommandQueue> generation_queue;
     ComPtr<ID3D12CommandQueue> fg_high_queue,fg_normal_queue;
     unsigned last_fg_priority_requested{UINT32_MAX};
+    unsigned reported_queue_mode{1}; // Published under mx for presentation diagnostics.
     bool generation_high_priority{};
+    static const char* queue_mode_name(unsigned mode) noexcept {
+        return mode==2u?"shared-game":mode==0u?"separate-NORMAL":"separate-HIGH";
+    }
     std::unordered_map<XrSwapchain,Image> captured;
     std::unordered_map<XrSwapchain,DirectCapture> direct_captures;
     std::unordered_map<XrSwapchain,CapturePlan> capture_plans;
@@ -156,10 +160,11 @@ struct BufferedPresenter final : Presenter {
         const HRESULT high_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_high_queue));
         fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
         const HRESULT normal_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_normal_queue));
-        // The default remains HIGH. NORMAL is a separate queue, not a return to
-        // the game's capture queue (which regressed guide preparation).
+        // The default remains HIGH; the shared game queue is an explicit A/B
+        // choice alongside separate NORMAL. Missing priorities fall back here.
         generation_queue=fg_high_queue.Get() ? fg_high_queue.Get() : fg_normal_queue.Get() ? fg_normal_queue.Get() : q;
         generation_high_priority=fg_high_queue.Get()!=nullptr&&generation_queue.Get()==fg_high_queue.Get();
+        reported_queue_mode=generation_queue.Get()==q?2u:generation_high_priority?1u:0u;
         last_fg_priority_requested=UINT32_MAX;
         if(trace) {
             char message[240]{};
@@ -650,23 +655,27 @@ struct BufferedPresenter final : Presenter {
                 // only on the single generation worker after the previous fence
                 // has retired; recreating NGX handles prevents cross-queue history
                 // hazards and makes the A/B measurements independent.
-                const unsigned requested_priority=job->guides.fg_queue_priority==0u?0u:1u;
-                ID3D12CommandQueue* requested=requested_priority==0u?fg_normal_queue.Get():fg_high_queue.Get();
+                const unsigned requested_priority=job->guides.fg_queue_priority<=2u?job->guides.fg_queue_priority:1u;
+                ID3D12CommandQueue* requested=requested_priority==2u?queue.Get():requested_priority==0u?fg_normal_queue.Get():fg_high_queue.Get();
                 ID3D12CommandQueue* selected=requested ? requested : (fg_high_queue.Get()?fg_high_queue.Get():fg_normal_queue.Get()?fg_normal_queue.Get():queue.Get());
                 if(selected!=generation_queue.Get()) {
                     worker.wait_idle();worker.reset();generation_queue=selected;
                     generation_high_priority=fg_high_queue.Get()!=nullptr&&selected==fg_high_queue.Get();
-                    reset_history=true;
+                    reset_history=true;logged_samples=0;
+                    {std::lock_guard lock(mx);cadence_window={};gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
+                        generation_stages={};capture_to_completion={};completion_to_native={};completion_to_generated={};
+                        frame_ages={};age_samples={};pacing_wait={};producer_cpu={};}
                     if(trace)trace(generation_high_priority?"DLSS-FG queue mode=HIGH (Lua; NGX histories reset)":
                         selected==fg_normal_queue.Get()?"DLSS-FG queue mode=separate NORMAL (Lua; NGX histories reset)":
-                        "DLSS-FG queue mode=game fallback (Lua; NGX histories reset)");
+                        "DLSS-FG queue mode=shared game queue (Lua; NGX histories reset)");
                 }
+                {std::lock_guard lock(mx);reported_queue_mode=selected==queue.Get()?2u:generation_high_priority?1u:0u;}
                 if(last_fg_priority_requested!=requested_priority) {
                     last_fg_priority_requested=requested_priority;
                     if(trace) {
                         char msg[176]{};
                         sprintf_s(msg,"DLSS-FG queue request=%s selected=%s fallback=%u",
-                            requested_priority==0u?"NORMAL":"HIGH",
+                            queue_mode_name(requested_priority),
                             generation_queue.Get()==fg_high_queue.Get()&&fg_high_queue.Get()?"HIGH":
                             generation_queue.Get()==fg_normal_queue.Get()&&fg_normal_queue.Get()?"separate NORMAL":"game queue",
                             selected!=requested?1u:0u);
@@ -726,8 +735,8 @@ struct BufferedPresenter final : Presenter {
                 if(trace&&experiment_state.latency_valid&&experiment_state.latency_samples!=logged_samples){
                     logged_samples=experiment_state.latency_samples;
                     const auto& d=experiment_state;char message[768]{};
-                    sprintf_s(message,"FG calibrated latency sample=%llu rejected=%llu color=%u uploads=%u release=%u repeats=%u mean_ms: queue_entry=%.3f capture_dependency=%.3f ready_to_fg=%.3f gpu_work=%.3f gpu_to_observed=%.3f enqueue_total=%.3f submit_total=%.3f; copies(full/direct/crop)=%llu/%llu/%llu uploads(copies/batches)=%llu/%llu",
-                        d.latency_samples,d.latency_rejected,job->capture_mode,job->upload_mode,active_release_point,submit_repeat_frames?1u:0u,
+                    sprintf_s(message,"FG calibrated latency sample=%llu rejected=%llu color=%u uploads=%u release=%u repeats=%u queue=%s mean_ms: queue_entry=%.3f capture_dependency=%.3f ready_to_fg=%.3f gpu_work=%.3f gpu_to_observed=%.3f enqueue_total=%.3f submit_total=%.3f; copies(full/direct/crop)=%llu/%llu/%llu uploads(copies/batches)=%llu/%llu",
+                        d.latency_samples,d.latency_rejected,job->capture_mode,job->upload_mode,active_release_point,submit_repeat_frames?1u:0u,queue_mode_name(reported_queue_mode),
                         d.queue_entry.mean,d.capture_dependency.mean,d.ready_to_fg.mean,d.gpu_work.mean,d.gpu_to_observed.mean,d.enqueue_to_observed.mean,d.submit_to_observed.mean,
                         producer.full_copies.load(),direct_eye_copies.load(),eye_crop_copies.load(),uploads.upload_copies.load(),uploads.submissions.load());trace(message);
                 }
@@ -1096,9 +1105,9 @@ struct BufferedPresenter final : Presenter {
                     cadence_window.add(now_ms,{native_count,distinct_native,generated_count,repeated_presentations,runtime_submissions});}
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
                     const auto c=cadence();
-                    sprintf_s(cadence_log,"FG experiment cadence: release=%s repeats=%s clock=independent valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f repeated=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f",
+                    sprintf_s(cadence_log,"FG experiment cadence: release=%s repeats=%s queue=%s clock=independent valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f repeated=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f",
                         active_release_point==3u?"generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":"submission",
-                        submit_repeat_frames?"ON":"OFF",c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.repeat_fps,c.submission_fps,
+                        submit_repeat_frames?"ON":"OFF",queue_mode_name(reported_queue_mode),c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.repeat_fps,c.submission_fps,
                         xr_wait.mean(),runtime_end.mean(),present_cpu.mean());
                     sprintf_s(age_log,"FG source-age CPU ms: generated_samples=%llu latest_capture_to_complete=%.3f complete_to_generated_submit=%.3f newest_input_age=%.3f complete_to_native_submit=%.3f; late_waits=%llu arrivals=%llu timeouts=%llu ready_skips=%llu idle_skips=%llu",
                         static_cast<unsigned long long>(generated_count),capture_to_completion.mean(),completion_to_generated.mean(),

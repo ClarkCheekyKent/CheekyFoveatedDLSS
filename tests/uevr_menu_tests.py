@@ -166,6 +166,15 @@ def run(engine):
     assert g["values"]["Submit repeat frames"] is False
     assert g["values"]["FG color capture"] == 1
     assert g["values"]["FG OpenXR uploads"] == 1
+    assert g.combos["FG GPU queue"][2] == "Shared game queue"
+    for option in (2, 0, 1):
+        draw(changes={"FG GPU queue": option})
+        assert "FgQueuePriority=" + str(option) in last()
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"]["FgQueuePriority"] = option
+        receive(state)
+        draw()
+        assert g["values"]["FG GPU queue"] == option
     for point in (1, 2, 3, 0):
         draw(changes={"Release game rendering": point})
         assert "FgReleasePoint=" + str(point) in last()

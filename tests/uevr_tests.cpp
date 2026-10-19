@@ -105,6 +105,10 @@ void settings_tests(const std::filesystem::path& root) {
             set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","4")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
             set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
+        require(fg.fg.queue_priority==1&&set_named_setting(fg,"FgQueuePriority","0")&&
+            set_named_setting(fg,"FgQueuePriority","1")&&set_named_setting(fg,"FgQueuePriority","2")&&
+            !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
+            "Shared game and separate GPU queues validate without changing the HIGH default");
         require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==1,"Transport defaults use direct eyes and batched uploads");
         for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics"})
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
@@ -118,11 +122,11 @@ void settings_tests(const std::filesystem::path& root) {
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
             restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
             restored.fg.release_point==3&&!restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&
-            restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1,"FG settings survive restart");
+            restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
             !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
-            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1,"FG reset restores the tested preset and opt-out");
+            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==1,"FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
         require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&
@@ -441,7 +445,7 @@ int main(int argc, char** argv) {
             control.abi=999;
             require(!control_fn(&control),"FG control rejects ABI mismatch");
             control=CheekyFgControl{};
-            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=3\nFgSubmitRepeats=false\nFgColorCaptureMode=1\nFgUploadMode=1\nFgLatencyDiagnostics=0");
+            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=3\nFgSubmitRepeats=false\nFgColorCaptureMode=1\nFgUploadMode=1\nFgLatencyDiagnostics=0\nFgQueuePriority=2");
             const auto transport_fn=reinterpret_cast<CheekyFgTransportOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetTransportOptionsV1"));
             CheekyFgTransportOptions options;require(transport_fn&&transport_fn(&options)&&options.color_capture_mode==1&&
                 options.upload_mode==1&&options.latency_diagnostics==0,"Lua transport options reach real runtime bridge");
