@@ -41,14 +41,16 @@ struct Settings {
     struct FrameGeneration {
         bool enabled{false};
         bool foveated{true};
-        std::uint32_t resolution_percent{100},peripheral_percent{50};
-        std::uint32_t peripheral_method{2},depth_bits{32},motion_bits{32};
+        std::uint32_t resolution_percent{100},peripheral_percent{25};
+        std::uint32_t peripheral_method{1},depth_bits{32},motion_bits{32};
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F};
         std::uint32_t diagnostic_mode{}; // UEVR Lua: normal, prepare-first, left-only, right-only, split-lists.
         bool backbuffer_frame_id{true}; // Native render-frame identity shared by both NGX stereo evaluations.
         std::uint32_t queue_priority{1}; // 0 separate NORMAL queue; 1 separate HIGH queue.
-        std::uint32_t release_point{}; // 0 submission, 1 both eyes prepared on GPU, 2 stereo completion.
-        bool submit_repeats{true}; // Diagnostic: keep prior runtime submission behavior by default.
+        std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission.
+        bool submit_repeats{false}; // Runtime handles repeated display content.
+        std::uint32_t color_capture_mode{1},upload_mode{1}; // Proven Joey-run defaults; 0 retains each baseline for A/B testing.
+        std::uint32_t latency_diagnostics{1}; // Sparse calibrated GPU/CPU timeline; independently switchable.
     } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.

@@ -66,7 +66,7 @@ void Worker::reset_features() noexcept {
 }
 void Worker::reset() noexcept {
     std::lock_guard lock(ngx_mutex);wait_idle();reset_features();
-    gpu_timings.reset();completion_wait={};submitted_at={};
+    latency.reset();gpu_timings.reset();completion_wait={};submitted_at={};
     if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();split_allocator.Reset();list.Reset();split_list.Reset();fence.Reset();
     allocate=nullptr;destroy=nullptr;create=nullptr;evaluate=nullptr;release=nullptr;
     configured=false;serial=prepared_serial=0;width=height=0;diagnostic_mode=DiagnosticMode::Normal;frame_id_enabled=true;last_frame_id_logged=false;last_frame_id_sample=0;init=nullptr;capabilities=nullptr;
@@ -245,7 +245,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // A mode switch is safe because the previous job was fully retired above.
     ID3D12GraphicsCommandList* commands=list.Get();
     bool cut_to_second_list=false;
-    gpu_timings.begin(commands);
+    latency.begin(commands);gpu_timings.begin(commands);
     bool good=true;unsigned focused{};
     auto scaled=[](unsigned dimension,unsigned percent){return std::max(32u,(dimension*percent+50u)/100u);};
     // A foveated/scaled frame already has a final composition dispatch. Write
@@ -469,7 +469,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(good&&copies&&!direct&&!record_output_copies(commands,outputs,*copies)) {
         report("FG immutable output copy",unsigned(E_INVALIDARG));failed=true;good=false;
     }
-    if(good){gpu_timings.stamp(commands,15);gpu_timings.resolve(commands);}
+    if(good){gpu_timings.stamp(commands,15);gpu_timings.resolve(commands);latency.end(commands);}
     // No list is submitted on failure. That guarantees the caller may safely
     // release captured resources without an untracked in-flight GPU packet.
     const HRESULT close_result=commands->Close();
@@ -499,7 +499,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     if(copies)for(auto& copy:*copies)copy.state=D3D12_RESOURCE_STATE_GENERIC_READ;
     if(FAILED(queue->Signal(fence.Get(),++serial)))return false;
-    submitted_at=TimingClock::now();
+    submitted_at=TimingClock::now();latency.submitted(fence.Get(),serial);
     // Notify only after commands AND their completion fence are queued. The
     // presenter may release the next native render without waiting for FG to
     // finish, but must not let it overtake a still-unsubmitted FG job.
@@ -509,7 +509,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(!wait_fence(prepared_serial))return false;
         if(on_prepared)on_prepared(submitted_context);
     }
-    const bool complete=wait_idle();completion_wait.add(elapsed_ms(wait_begin));if(!complete)return false;
+    const bool complete=wait_idle();const auto observed_cpu=LatencyProbe::cpu_now();
+    completion_wait.add(elapsed_ms(wait_begin));if(!complete)return false;
+    latency.collect(queue.Get(),observed_cpu);
     direct_publication=direct;gpu_timings.collect(focused,copies&&!direct);
     // Existing timestamp data only: distinguish consistently expensive work
     // from occasional long elapsed intervals without changing the GPU schedule.

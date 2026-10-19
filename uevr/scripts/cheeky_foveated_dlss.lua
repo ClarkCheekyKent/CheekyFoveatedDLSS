@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -518,8 +518,9 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgReleasePoint ~= nil then
                     combo("Release game rendering", "FgReleasePoint", {
-                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion"})
+                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission"})
                     text("Preparation waits for both eyes' GPU input preparation, then overlaps native rendering with NGX.")
+                    if draft.FgReleasePoint == 3 then text("Holds the next native frame through generated-frame uploads and OpenXR submission.") end
                 elseif draft.FgWaitForCompletion ~= nil then
                     check("Wait for FG completion before next frame", "FgWaitForCompletion")
                     text("A/B test: holds the next native frame until both FG eyes finish. May reduce FPS.")
@@ -527,6 +528,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgSubmitRepeats ~= nil then
                     check("Submit repeat frames", "FgSubmitRepeats")
                     text("OFF submits fresh content only; the runtime handles repeats. Native pacing continues independently.")
+                end
+                if draft.FgColorCaptureMode ~= nil then
+                    combo("FG color capture", "FgColorCaptureMode", {[0]="Full snapshot + eye crops (baseline)", [1]="Direct eye capture"})
+                    text("Direct capture learns the eye layout; layout changes use a native fallback frame.")
+                end
+                if draft.FgUploadMode ~= nil then
+                    combo("FG OpenXR uploads", "FgUploadMode", {[0]="Per-image submissions (baseline)", [1]="Batch stereo and UI uploads"})
+                end
+                if draft.FgLatencyDiagnostics ~= nil then
+                    combo("FG latency diagnostics", "FgLatencyDiagnostics", {[0]="Off", [1]="Calibrated timeline (1 in 17 jobs)"})
                 end
                 if draft.FgResolutionPercent ~= nil then
                     combo("FG scale", "FgResolutionPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
@@ -579,11 +590,15 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         {"Repeated frame age",age(presentation.repeat_samples,presentation.repeat_age_ms,presentation.repeat_age_last_ms)}})
                     text("Age starts at color capture; generated content uses the input-time midpoint.")
                     text("Excludes earlier game rendering and runtime/display latency.")
-                    rows("fg_late_wait", {
+                    if draft.FgSubmitRepeats == false then
+                        text("Late FG selection wait disabled: repeat submissions are OFF.")
+                    else
+                        rows("fg_late_wait", {
                         {"Late FG wait (CPU)",age(presentation.wait_samples,presentation.late_wait_ms,presentation.late_wait_last_ms)},
                         {"Late FG wait budget",string.format("%.3f ms (10 ms maximum)",presentation.wait_budget_ms or 0)},
                         {"New pairs / wait timeouts",string.format("%.0f / %.0f",presentation.wait_arrivals or 0,presentation.wait_timeouts or 0)}})
-                    text("Wait ends on a new pair; reserves 4 ms of the headset period for submission.")
+                        text("Wait ends on a new pair; reserves 4 ms of the headset period for submission.")
+                    end
                 end
                 if fg.frame_source then
                     rows("fg_source", {{"Frame ID source",fg.frame_source},
@@ -643,6 +658,51 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         {"Headset frame period", string.format("%.3f ms", p.xr_period_ms or 0)}})
                     text("CPU waits overlap GPU work; do not add them.")
                     text("GPU timings are elapsed intervals; contention can increase them.")
+                    local exp = fg.experiments
+                    if exp and exp.supported then
+                        text("FG delay from GPU native-color capture: average / last (ms)")
+                        if exp.latency_enabled and (exp.gpu_ready_samples or 0)>0 then
+                            local function corrected(key)
+                                local value=exp[key] or {}
+                                return gpu_ms(value.mean,value.last)
+                            end
+                            rows("fg_gpu_ready_delay", {
+                                {"Native GPU tail (excluded)",corrected("native_gpu_tail")},
+                                {"GPU color-ready to generated submit",corrected("gpu_ready_to_submit")},
+                                {"GPU color-ready to predicted display",(exp.predicted_samples or 0)>0 and corrected("gpu_ready_to_display") or
+                                    (exp.display_time_supported and "Waiting for a usable display target" or "Runtime clock conversion unavailable")},
+                                {"GPU-ready samples / late display targets",string.format("%.0f / %.0f",exp.gpu_ready_samples or 0,exp.prediction_late or 0)}})
+                            text("Starts when the GPU reaches color capture, after queued native rendering. Latest input, not the content midpoint.")
+                            text("Submit is measured; display is the runtime's predicted target, not confirmed physical display.")
+                        elseif not exp.latency_enabled then text("GPU-ready latency diagnostics OFF.")
+                        else text("Waiting for calibrated color timestamps on a generated submission.") end
+                        text("FG latency breakdown: average / last (ms), sampled 1 in 17 jobs")
+                        if exp.latency_enabled and exp.latency_valid then
+                            local function latency(key)
+                                local value = exp[key] or {}
+                                return gpu_ms(value.mean, value.last)
+                            end
+                            rows("fg_latency_breakdown", {
+                                {"Queue entry delay",latency("queue_entry")},
+                                {"Capture-fence dependency",latency("capture_dependency")},
+                                {"Capture ready to FG start",latency("ready_to_fg")},
+                                {"FG GPU work + publication",latency("gpu_work")},
+                                {"GPU end to CPU observation",latency("gpu_to_observed")},
+                                {"Enqueue to CPU observation",latency("enqueue_to_observed")},
+                                {"FG submit to CPU observation",latency("submit_to_observed")}})
+                            text("First five stages sum to enqueue time. Submit time starts later, after CPU recording.")
+                            text("GPU end to CPU observation includes the query/fence tail and CPU wakeup.")
+                        elseif not exp.latency_enabled then text("FG latency diagnostics OFF.")
+                        else text("Waiting for a valid calibrated timeline sample.") end
+                        rows("fg_transport_counts", {
+                            {"Timeline samples / rejected",string.format("%.0f / %.0f",exp.latency_samples or 0,exp.latency_rejected or 0)},
+                            {"Color copies (full / direct eye / crop)",string.format("%.0f / %.0f / %.0f",exp.full_color_copies or 0,exp.direct_eye_copies or 0,exp.eye_crop_copies or 0)},
+                            {"Direct-capture fallbacks",string.format("%.0f",exp.capture_fallbacks or 0)},
+                            {"XR upload copies / GPU batches",string.format("%.0f / %.0f",exp.upload_copies or 0,exp.upload_batches or 0)}})
+                        if draft.FgReleasePoint == 3 then rows("fg_generated_gate", {
+                            {"Generated-submission gate releases / fallbacks",string.format("%.0f / %.0f",exp.generated_gate_releases or 0,exp.generated_gate_skips or 0)}}) end
+                        text("Copy counters are cumulative for this session; latency windows reset when options change.")
+                    end
                     if cadence and cadence.supported then
                         rows("fg_runtime_waits", {{"Game image wait / call",string.format("%.3f ms",cadence.app_image_wait_ms or 0)},
                             {"Game begin / end calls",string.format("%.3f / %.3f ms",cadence.app_begin_ms or 0,cadence.app_end_ms or 0)},

@@ -95,6 +95,7 @@ std::string snapshot_locked(State& s) {
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
     CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
     CheekyFgPresentation fg_present;fg_presentation(fg_present);
+    CheekyFgExperimentDiagnostics fg_exp;fg_experiment_diagnostics(fg_exp);
     CheekyFgCaptureHealth fg_capture;
     if(auto self=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"))
         if(auto query=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(self,"CheekyFG_GetCaptureHealth")))query(&fg_capture);
@@ -176,6 +177,25 @@ std::string snapshot_locked(State& s) {
         << ",\"capture_ms\":" << fg_extra.capture_ms << ",\"capture_last_ms\":" << fg_extra.capture_last_ms
         << ",\"publication_ms\":" << fg_extra.publication_ms << ",\"publication_last_ms\":" << fg_extra.publication_last_ms
         << ",\"upload_ms\":" << fg_extra.upload_ms << ",\"upload_last_ms\":" << fg_extra.upload_last_ms << "}"
+        << ",\"experiments\":{\"supported\":" << bool(fg_exp.supported)
+        << ",\"color_capture_mode\":" << fg_exp.color_capture_mode << ",\"upload_mode\":" << fg_exp.upload_mode
+        << ",\"latency_enabled\":" << bool(fg_exp.latency_enabled) << ",\"latency_valid\":" << bool(fg_exp.latency_valid)
+        << ",\"full_color_copies\":" << fg_exp.full_color_copies << ",\"direct_eye_copies\":" << fg_exp.direct_eye_copies
+        << ",\"eye_crop_copies\":" << fg_exp.eye_crop_copies << ",\"capture_fallbacks\":" << fg_exp.capture_fallbacks
+        << ",\"upload_copies\":" << fg_exp.upload_copies << ",\"upload_batches\":" << fg_exp.upload_batches
+        << ",\"latency_samples\":" << fg_exp.latency_samples << ",\"latency_rejected\":" << fg_exp.latency_rejected
+        << ",\"display_time_supported\":" << bool(fg_exp.display_time_supported)
+        << ",\"gpu_ready_samples\":" << fg_exp.gpu_ready_samples << ",\"predicted_samples\":" << fg_exp.predicted_samples
+        << ",\"prediction_late\":" << fg_exp.prediction_late << ",\"generated_gate_releases\":" << fg_exp.generated_gate_releases
+        << ",\"generated_gate_skips\":" << fg_exp.generated_gate_skips;
+    const auto timing=[&](const char* name,const CheekyFgTimingValue& value){out << ",\"" << name << "\":{\"mean\":" << value.mean << ",\"last\":" << value.last << "}";};
+    timing("queue_entry",fg_exp.queue_entry);timing("capture_dependency",fg_exp.capture_dependency);
+    timing("ready_to_fg",fg_exp.ready_to_fg);timing("gpu_work",fg_exp.gpu_work);
+    timing("gpu_to_observed",fg_exp.gpu_to_observed);timing("enqueue_to_observed",fg_exp.enqueue_to_observed);
+    timing("submit_to_observed",fg_exp.submit_to_observed);
+    timing("native_gpu_tail",fg_exp.native_gpu_tail);timing("gpu_ready_to_submit",fg_exp.gpu_ready_to_submit);
+    timing("gpu_ready_to_display",fg_exp.gpu_ready_to_display);
+    out << "}"
         << ",\"presentation\":{\"supported\":" << bool(fg_present.supported)
         << ",\"native_samples\":" << fg_present.native_samples << ",\"generated_samples\":" << fg_present.generated_samples
         << ",\"repeat_samples\":" << fg_present.repeat_samples << ",\"wait_samples\":" << fg_present.wait_samples

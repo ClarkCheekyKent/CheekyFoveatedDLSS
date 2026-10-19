@@ -292,6 +292,13 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     }
     return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(CheekyFgTransportOptions* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    const auto settings=cheeky::foveated_dlss::current_settings().fg;
+    out->color_capture_mode=settings.color_capture_mode==1u?1u:0u;
+    out->upload_mode=settings.upload_mode==1u?1u:0u;
+    out->latency_diagnostics=settings.latency_diagnostics==1u?1u:0u;return true;
+}
 extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(ID3D12Resource* color) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!enabled())return 0;
@@ -309,7 +316,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     out->diagnostic_mode=mode;
     out->enable_frame_id=settings.backbuffer_frame_id ? 1u : 0u;
     out->fg_queue_priority=settings.queue_priority == 0u ? 0u : 1u;
-    out->release_point=settings.release_point<=2u?settings.release_point:0u;
+    out->release_point=settings.release_point<=3u?settings.release_point:0u;
     out->submit_repeats=settings.submit_repeats?1u:0u;
     return true;
 }
@@ -378,6 +385,11 @@ bool fg_overhead(CheekyFgOverhead& out) noexcept {
 bool fg_presentation(CheekyFgPresentation& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
     const auto query=layer?reinterpret_cast<CheekyFgPresentationFn>(GetProcAddress(layer,"CheekyFG_GetPresentationV1")):nullptr;
+    return query&&query(&out);
+}
+bool fg_experiment_diagnostics(CheekyFgExperimentDiagnostics& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgExperimentDiagnosticsFn>(GetProcAddress(layer,"CheekyFG_GetExperimentDiagnosticsV1")):nullptr;
     return query&&query(&out);
 }
 }

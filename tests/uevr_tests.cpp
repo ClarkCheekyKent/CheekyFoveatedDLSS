@@ -93,16 +93,21 @@ void settings_tests(const std::filesystem::path& root) {
         Settings fg;
         require(!fg.fg.enabled && set_named_setting(fg,"FgEnabled","true") && fg.fg.enabled,
             "FG is opt-in and configurable");
-        require(fg.fg.release_point==0&&set_named_setting(fg,"FgWaitForCompletion","true")&&
+        require(fg.fg.release_point==3&&!fg.fg.submit_repeats&&fg.fg.resolution_percent==100&&
+            fg.fg.peripheral_percent==25&&fg.fg.peripheral_method==1,"FG uses the tested generated-submission/fresh-only and quality defaults");
+        require(set_named_setting(fg,"FgWaitForCompletion","false")&&fg.fg.release_point==0&&set_named_setting(fg,"FgWaitForCompletion","true")&&
             fg.fg.release_point==2&&!set_named_setting(fg,"FgWaitForCompletion","invalid"),
-            "FG completion gate is opt-in and validates boolean values");
+            "Legacy completion checkbox still selects both policies and validates boolean values");
         require(set_named_setting(fg,"FgWidth","0.37") && set_named_setting(fg,"FgYOffset","-0.12") &&
             !set_named_setting(fg,"FgEnabled","invalid") && !set_named_setting(fg,"FgWidth","nan"),
             "FG settings validate types");
         require(set_named_setting(fg,"FgReleasePoint","1")&&fg.fg.release_point==1&&
-            !set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
+            set_named_setting(fg,"FgReleasePoint","3")&&!set_named_setting(fg,"FgReleasePoint","4")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
             set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
-        require(set_named_setting(fg,"FgReleasePoint","2"),"Select completion for persistence");
+        require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
+        require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==1,"Transport defaults use direct eyes and batched uploads");
+        for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics"})
+            require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","3")&&set_named_setting(fg,"FgDepthBits","16")&&
@@ -112,14 +117,18 @@ void settings_tests(const std::filesystem::path& root) {
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
             restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
-            restored.fg.release_point==2&&!restored.fg.submit_repeats,"FG settings survive restart");
+            restored.fg.release_point==3&&!restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&
+            restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
-        require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==0,"FG reset restores opt-out");
+        require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
+            !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
+            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1,"FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
-        require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==0,"Old profiles default FG off");
+        require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&
+            !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1,"Old profiles inherit the tested FG preset and default FG off");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgWaitForCompletion=1\n";}
-        require(read_settings_file(path,restored,error)&&restored.fg.release_point==2&&restored.fg.submit_repeats,"Migrate old completion checkbox");
+        require(read_settings_file(path,restored,error)&&restored.fg.release_point==2&&!restored.fg.submit_repeats,"Migrate old completion checkbox with fresh-only default");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgReleasePoint=1\nFgWaitForCompletion=1\n";}
         require(read_settings_file(path,restored,error)&&restored.fg.release_point==1,"Explicit release point overrides legacy key");
         fg.fg.width=5;fg.fg.height=-1;fg.fg.feather=3;
@@ -432,7 +441,11 @@ int main(int argc, char** argv) {
             control.abi=999;
             require(!control_fn(&control),"FG control rejects ABI mismatch");
             control=CheekyFgControl{};
-            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=2\nFgSubmitRepeats=false");
+            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=3\nFgSubmitRepeats=false\nFgColorCaptureMode=1\nFgUploadMode=1\nFgLatencyDiagnostics=0");
+            const auto transport_fn=reinterpret_cast<CheekyFgTransportOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetTransportOptionsV1"));
+            CheekyFgTransportOptions options;require(transport_fn&&transport_fn(&options)&&options.color_capture_mode==1&&
+                options.upload_mode==1&&options.latency_diagnostics==0,"Lua transport options reach real runtime bridge");
+            options.size=0;require(!transport_fn(&options),"Transport options reject incorrect ABI size");
             require(control_fn(&control) && control.enabled && std::abs(field(snapshot(get),"FgWidth")-0.37)<0.00001,
                 "Lua protocol controls real FG runtime");
             command("1\n903\nset\nEnabled=false");
@@ -448,6 +461,9 @@ int main(int argc, char** argv) {
             require(fg_test_hook_installs==4&&fg_test_hook_targets.size()==2,"Reload restores the plugin frame hooks");
             require(control_fn(&control) && control.enabled,"Host re-enable restores FG preference");
             command("1\n902\ndefaults_fg");
+            options=CheekyFgTransportOptions{};require(transport_fn(&options)&&options.color_capture_mode==1&&
+                options.upload_mode==1&&options.latency_diagnostics==1&&snapshot(get).find("\"FgReleasePoint\":3")!=std::string::npos&&
+                snapshot(get).find("\"FgSubmitRepeats\":false")!=std::string::npos,"Tested defaults reset live settings");
             require(control_fn(&control) && !control.enabled,"FG reset restores live opt-out");
             std::puts("PASS FG protocol, control ABI, host detach/re-enable and FG group reset");
             return 0;

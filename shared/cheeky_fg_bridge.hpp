@@ -39,7 +39,7 @@ struct CheekyFgPair {
     std::uint32_t diagnostic_mode{}; // 0 normal, 1 prepare-first, 2 left-only, 3 right-only, 4 split-lists.
     std::uint32_t enable_frame_id{1}; // Optional NGX BackbufferFrameID A/B; applied to each feature.
     std::uint32_t fg_queue_priority{1}; // 0 separate NORMAL queue; 1 separate HIGH queue.
-    std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 stereo completion.
+    std::uint32_t release_point{}; // 0 FG submission, 1 GPU preparation, 2 stereo completion, 3 generated XR submission.
     std::uint32_t submit_repeats{1}; // Resubmit unchanged scene content at runtime frame opportunities.
 };
 using CheekyFgAcquireFn=bool(__cdecl*)(CheekyFgPair*);
@@ -140,3 +140,22 @@ struct CheekyFgPresentation {
     double late_wait_ms{},late_wait_last_ms{},wait_budget_ms{};
 };
 using CheekyFgPresentationFn=bool(__cdecl*)(CheekyFgPresentation*);
+
+// Additive experiments API: preserve the existing pair/status layouts.
+struct CheekyFgTransportOptions {
+    std::uint32_t abi{1},size{sizeof(CheekyFgTransportOptions)};
+    std::uint32_t color_capture_mode{},upload_mode{},latency_diagnostics{1};
+};
+using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
+struct CheekyFgTimingValue {double mean{},last{};};
+struct CheekyFgExperimentDiagnostics {
+    std::uint32_t abi{1},size{sizeof(CheekyFgExperimentDiagnostics)},supported{};
+    std::uint32_t color_capture_mode{},upload_mode{},latency_enabled{},latency_valid{};
+    std::uint64_t full_color_copies{},direct_eye_copies{},eye_crop_copies{},capture_fallbacks{};
+    std::uint64_t upload_copies{},upload_batches{},latency_samples{},latency_rejected{};
+    CheekyFgTimingValue queue_entry,capture_dependency,ready_to_fg,gpu_work,gpu_to_observed,enqueue_to_observed,submit_to_observed;
+    std::uint32_t display_time_supported{};
+    std::uint64_t gpu_ready_samples{},predicted_samples{},prediction_late{},generated_gate_releases{},generated_gate_skips{};
+    CheekyFgTimingValue native_gpu_tail,gpu_ready_to_submit,gpu_ready_to_display;
+};
+using CheekyFgExperimentDiagnosticsFn=bool(__cdecl*)(CheekyFgExperimentDiagnostics*);

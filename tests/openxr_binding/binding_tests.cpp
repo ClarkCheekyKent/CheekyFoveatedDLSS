@@ -213,6 +213,35 @@ void startup_test() {
         check(instances.at(instance).extension_enabled, "gaze extension disabled");
     }
 }
+bool clock_advertised{},clock_requested{};
+XrResult XRAPI_CALL clock_extensions(const char*,std::uint32_t capacity,std::uint32_t* count,XrExtensionProperties* props){
+    *count=clock_advertised?1u:0u;
+    if(capacity&&*count){strcpy_s(props[0].extensionName,XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);props[0].extensionVersion=1;}
+    return XR_SUCCESS;
+}
+XrResult XRAPI_CALL clock_convert(XrInstance,XrTime time,LARGE_INTEGER* qpc){qpc->QuadPart=time;return XR_SUCCESS;}
+XrResult XRAPI_CALL clock_gipa(XrInstance,const char* name,PFN_xrVoidFunction* out){
+    *out=nullptr;
+    if(!std::strcmp(name,"xrEnumerateInstanceExtensionProperties"))*out=reinterpret_cast<PFN_xrVoidFunction>(clock_extensions);
+    if(!std::strcmp(name,"xrConvertTimeToWin32PerformanceCounterKHR"))*out=reinterpret_cast<PFN_xrVoidFunction>(clock_convert);
+    return *out?XR_SUCCESS:XR_ERROR_FUNCTION_UNSUPPORTED;
+}
+XrResult XRAPI_CALL clock_create(const XrInstanceCreateInfo* info,const XrApiLayerCreateInfo*,XrInstance* out){
+    clock_requested=false;
+    for(unsigned i=0;i<info->enabledExtensionCount;++i)clock_requested|=!std::strcmp(info->enabledExtensionNames[i],XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
+    *out=h<XrInstance>(999);return XR_SUCCESS;
+}
+void clock_extension_test(){
+    for(bool supported:{false,true}){
+        instances.clear();sessions.clear();clock_advertised=supported;
+        XrApiLayerNextInfo next{};next.nextGetInstanceProcAddr=clock_gipa;next.nextCreateApiLayerInstance=clock_create;
+        XrApiLayerCreateInfo layer{};layer.nextInfo=&next;XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};XrInstance created{};
+        check(XR_SUCCEEDED(cheeky_xrCreateApiLayerInstance(&info,&layer,&created)),"Clock extension instance creation");
+        check(clock_requested==supported&&bool(instances.at(created).dispatch.time_to_qpc)==supported,
+            "Predicted display conversion is enabled only with confirmed extension support; a stray function pointer is insufficient");
+    }
+    std::cout<<"PASS optional display clock extension: confirmed support only; unavailable runtimes retain measured submission latency\n";
+}
 void menu_policy_test() {
     cheeky::standalone::MenuPointerQueue queue;
     queue.push({10, 20, true, true});
@@ -416,6 +445,11 @@ void fg_toggle_test() {
     presentation.abi=999;check(!CheekyFG_GetPresentationV1(&presentation),"Reject mismatched presentation telemetry ABI");
     presentation={};--presentation.size;
     check(!CheekyFG_GetPresentationV1(&presentation)&&!CheekyFG_GetPresentationV1(nullptr),"Reject invalid presentation size/pointer");
+    CheekyFgExperimentDiagnostics experiments;
+    check(CheekyFG_GetExperimentDiagnosticsV1(&experiments)&&experiments.supported,"Optional transport diagnostics export");
+    experiments.abi=999;check(!CheekyFG_GetExperimentDiagnosticsV1(&experiments),"Reject mismatched experiment ABI");
+    experiments={};--experiments.size;
+    check(!CheekyFG_GetExperimentDiagnosticsV1(&experiments)&&!CheekyFG_GetExperimentDiagnosticsV1(nullptr),"Reject invalid experiment size/pointer");
     auto retired=update_fg_at_frame_boundary(live,d,false);
     check(!live.fg && retired==first,"Disable must retire the presenter at the frame boundary");
     first.reset();retired.reset();
@@ -745,7 +779,7 @@ int main(int argc,char** argv) {
             throw std::runtime_error("No NVIDIA adapter found");
         }
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
-        run(); startup_test(); menu_policy_test(); custom_binding_menu_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
+        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

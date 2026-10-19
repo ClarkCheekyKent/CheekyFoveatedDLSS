@@ -162,9 +162,11 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
-    assert g["values"]["Release game rendering"] == 0
-    assert g["values"]["Submit repeat frames"] is True
-    for point in (1, 2, 0):
+    assert g["values"]["Release game rendering"] == 3
+    assert g["values"]["Submit repeat frames"] is False
+    assert g["values"]["FG color capture"] == 1
+    assert g["values"]["FG OpenXR uploads"] == 1
+    for point in (1, 2, 3, 0):
         draw(changes={"Release game rendering": point})
         assert "FgReleasePoint=" + str(point) in last()
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
@@ -181,6 +183,15 @@ def run(engine):
         draw()
         assert g["values"]["Submit repeat frames"] is enabled
     assert any("Generating frames" in t for t in g.drawn.values())
+    for label, key in (("FG color capture","FgColorCaptureMode"),("FG OpenXR uploads","FgUploadMode"),("FG latency diagnostics","FgLatencyDiagnostics")):
+        for option in (1,0):
+            draw(changes={label:option})
+            assert key + "=" + str(option) in last()
+            state["request"] = state["applied_request"] = int(last().splitlines()[1])
+            state["settings"][key] = option
+            receive(state)
+            draw()
+            assert g["values"][label] == option
     assert "Frame ID source" in list(g.drawn.values()) and "20 / 38" in list(g.drawn.values())
     for text in ("Captured frame (color / guides)","80 / 79","Matching guides (ready / pending)","0 / 2","No guides with the color frame ID"):
         assert text in list(g.drawn.values()), "Missing precise match diagnostic: " + text
@@ -200,6 +211,28 @@ def run(engine):
                  "FG GPU total", "4.200 ms", "18.200 ms", "11.111 ms", "280 x 232", "256 x 256", "512 x 512"):
         assert text in list(g.drawn.values()), "Missing FG timing: " + text
     assert len(g.sent) == count, "Reading FG performance must not change settings"
+    state["fg"]["experiments"] = {"supported":True,"latency_enabled":True,"latency_valid":True,
+        "latency_samples":12,"latency_rejected":1,"full_color_copies":5,"direct_eye_copies":20,
+        "eye_crop_copies":10,"upload_copies":30,"upload_batches":10,
+        "capture_dependency":{"mean":9.5,"last":9.0},"gpu_work":{"mean":3.18,"last":3.1}}
+    state["fg"]["experiments"].update({"gpu_ready_samples":10,"native_gpu_tail":{"mean":10,"last":9.5},
+        "gpu_ready_to_submit":{"mean":3.4,"last":3.2},"display_time_supported":False})
+    receive(state)
+    draw()
+    for label in ("Capture-fence dependency","9.500 / 9.000","GPU end to CPU observation","3.180 / 3.100","30 / 10",
+                  "Native GPU tail (excluded)","GPU color-ready to generated submit","3.400 / 3.200","Runtime clock conversion unavailable"):
+        assert label in list(g.drawn.values()), "Missing calibrated latency: " + label
+    state["fg"]["experiments"].update({"display_time_supported":True,"predicted_samples":10,
+        "gpu_ready_to_display":{"mean":11.7,"last":11.5}})
+    receive(state)
+    draw()
+    assert "11.700 / 11.500" in list(g.drawn.values())
+    assert "Submit is measured; display is the runtime's predicted target, not confirmed physical display." in list(g.drawn.values())
+    state["fg"]["experiments"]["latency_valid"] = False
+    receive(state)
+    draw()
+    assert "Waiting for a valid calibrated timeline sample." in list(g.drawn.values())
+    assert "9.500 / 9.000" not in list(g.drawn.values()), "Invalid calibration cannot display stale timings"
     state["fg"]["overhead"] = {"supported":True,"guide_samples":10,"capture_samples":10,
         "publication_samples":10,"upload_samples":20,"guide_ms":.2,"guide_last_ms":.1,
         "capture_ms":1.3,"capture_last_ms":1.2,"publication_ms":.3,"publication_last_ms":.2,
@@ -254,6 +287,12 @@ def run(engine):
                   "New pairs / wait timeouts","12 / 8"):
         assert label in list(g.drawn.values()), "Missing frame age or bounded-wait telemetry: " + label
     assert len(g.sent) == count, "Frame-age telemetry must never apply settings"
+    state["settings"]["FgSubmitRepeats"] = False
+    receive(state)
+    draw()
+    assert "Late FG selection wait disabled: repeat submissions are OFF." in list(g.drawn.values())
+    assert "Late FG wait (CPU)" not in list(g.drawn.values()), "Frozen historical waits must not appear active when repeats are OFF"
+    state["settings"]["FgSubmitRepeats"] = True
     state["fg"]["presentation"]["repeat_samples"] = 0
     receive(state)
     draw()

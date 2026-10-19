@@ -39,12 +39,19 @@ std::string_view trim(std::string_view s) {
 }
 }
 bool set_named_setting(Settings& s, std::string_view key, std::string_view value) {
+    if (key == "FgColorCaptureMode" || key == "FgUploadMode" || key == "FgLatencyDiagnostics") {
+        std::uint32_t mode{}; if (!parse(value, mode) || mode > 1U) return false;
+        if(key == "FgColorCaptureMode") s.fg.color_capture_mode=mode;
+        else if(key == "FgUploadMode") s.fg.upload_mode=mode;
+        else s.fg.latency_diagnostics=mode;
+        return true;
+    }
     if (key == "FgWaitForCompletion") { // Migrate the previous diagnostic checkbox.
         bool hold{}; if (!parse(value, hold)) return false;
         s.fg.release_point = hold ? 2U : 0U; return true;
     }
     if (key == "FgReleasePoint") {
-        std::uint32_t point{}; if (!parse(value, point) || point > 2U) return false;
+        std::uint32_t point{}; if (!parse(value, point) || point > 3U) return false;
         s.fg.release_point = point; return true;
     }
 #define CHEEKY_SETTING(name, field) if (key == name) return parse(value, s.field);

@@ -12,12 +12,20 @@ struct Runtime {
     static inline DWORD owner{};
     static inline unsigned phase{},next_chain{};
     static inline ID3D12Resource* last_native{};
+    static inline const std::uint64_t* upload_serial{};
+    static inline std::uint64_t required_upload_serial{};
+    static inline unsigned image_releases{};
     static inline CheekyFgPair guides;
+    static inline CheekyFgTransportOptions options;
+    static inline std::uint64_t predicted_qpc{};
+    static inline std::atomic<bool> block_generated_end{},generated_end_entered{},allow_generated_end{};
+    static bool __cdecl transport_options(CheekyFgTransportOptions* out){*out=options;return true;}
     static inline std::uint64_t capture_token{};
     static inline cheeky::foveated_dlss::FgSnapshots* snapshots{};
     static XrResult XRAPI_PTR wait(XrSession,const XrFrameWaitInfo*,XrFrameState* state) {
         Sleep(8);while(paused)Sleep(1);if(!owner)owner=GetCurrentThreadId();if(owner!=GetCurrentThreadId()||phase)++errors;
         phase=1;const auto tick=++waits;state->shouldRender=XR_TRUE;
+        predicted_qpc=cheeky::fg::LatencyProbe::cpu_now()+std::uint64_t(cheeky::fg::LatencyProbe::cpu_frequency()/120.);
         state->predictedDisplayTime=XrTime(tick)*8333333;state->predictedDisplayPeriod=8333333;return XR_SUCCESS;
     }
     static XrResult XRAPI_PTR begin(XrSession,const XrFrameBeginInfo*) {
@@ -34,7 +42,9 @@ struct Runtime {
             if(!chains.contains(sc)||quad->size.width!=1||quad->subImage.swapchain==h<XrSwapchain>(201))++errors;
             else {
                 ++scenes;auto* tex=chains.at(sc).Get();
-                if(tex->GetDesc().Format==DXGI_FORMAT_R16G16B16A16_FLOAT||tex->GetDesc().Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)++generated;
+                if(tex->GetDesc().Format==DXGI_FORMAT_R16G16B16A16_FLOAT||tex->GetDesc().Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB){
+                    ++generated;if(block_generated_end){generated_end_entered=true;while(!allow_generated_end)Sleep(1);}
+                }
                 else last_native=tex;
             }
         }
@@ -72,12 +82,16 @@ struct Runtime {
     }
     static cheeky::fg::XrFns functions() {
         cheeky::fg::XrFns f;f.wait_frame=wait;f.begin_frame=begin;f.end_frame=end;f.create=create;f.enumerate=enumerate;
+        f.time_instance=h<XrInstance>(1);f.time_to_qpc=[](XrInstance,XrTime,LARGE_INTEGER* qpc){qpc->QuadPart=predicted_qpc;return XR_SUCCESS;};
         f.destroy=[](XrSwapchain sc){chains.erase(sc);return XR_SUCCESS;};
         f.acquire=[](XrSwapchain,const XrSwapchainImageAcquireInfo*,unsigned* i){*i=0;return XR_SUCCESS;};
         f.wait_image=[](XrSwapchain,const XrSwapchainImageWaitInfo*){return XR_SUCCESS;};
-        f.release=[](XrSwapchain,const XrSwapchainImageReleaseInfo*){return XR_SUCCESS;};return f;
+        f.release=[](XrSwapchain,const XrSwapchainImageReleaseInfo*){
+            if(upload_serial&&*upload_serial<required_upload_serial)++errors;
+            ++image_releases;return XR_SUCCESS;};return f;
     }
     static void trace(const char* message) noexcept {
+        if(std::strstr(message,"FG calibrated latency"))std::cout<<message<<'\n';
         if(std::strstr(message,"FG source-age CPU ms:")){++age_logs;std::cout<<message<<'\n';}
         if(std::strstr(message,"FG capture-path CPU ms:")){++path_logs;std::cout<<message<<'\n';}
     }
@@ -141,7 +155,8 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
     commands->ClearRenderTargetView(rtv->GetCPUDescriptorHandleForHeapStart(),blue,0,nullptr);execute();
     auto read_pixel=[&](unsigned b,unsigned r){
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
-        device->GetCopyableFootprints(&d,0,1,0,&footprint,nullptr,nullptr,&bytes);
+        const auto actual=chain.images[0].texture->GetDesc();
+        device->GetCopyableFootprints(&actual,0,1,0,&footprint,nullptr,nullptr,&bytes);
         D3D12_RESOURCE_DESC bd{};bd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;bd.Width=bytes;bd.Height=1;
         bd.DepthOrArraySize=1;bd.MipLevels=1;bd.SampleDesc.Count=1;bd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_HEAP_PROPERTIES read_heap{};read_heap.Type=D3D12_HEAP_TYPE_READBACK;ComPtr<ID3D12Resource> rb;
@@ -183,16 +198,119 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
     check(cheeky::fg::Worker::record_output_copies(commands.Get(),generated,copies),"Reuse retired GENERIC_READ publication allocations");execute();
     check(p.upload_image(chain,published[0]),"Reused left publication");read_pixel(255,0);
     check(p.upload_image(chain,published[1]),"Reused right publication");read_pixel(0,255);
+    // Batch both eyes and UI, then change just one image. Unchanged content
+    // must issue neither copies nor a new ExecuteCommandLists call.
+    cheeky::fg::BufferedPresenter::Chain right_chain,ui_chain;
+    auto before=p.uploads.serial;
+    Runtime::upload_serial=&p.uploads.serial;Runtime::required_upload_serial=before+1;
+    const auto released_before=Runtime::image_releases;
+    check(p.upload_batch({{&chain,old},{&right_chain,next},{&ui_chain,old}})&&p.uploads.serial==before+1,
+        "Stereo and UI uploads share exactly one GPU batch");read_pixel(0,255);
+    check(Runtime::errors==0&&Runtime::image_releases==released_before+3,"All copies are submitted before each acquired stereo/UI image is released");
+    Runtime::upload_serial=nullptr;Runtime::required_upload_serial=0;
+    std::swap(chain,right_chain);read_pixel(255,0);std::swap(chain,right_chain);
+    before=p.uploads.serial;
+    check(p.upload_batch({{&chain,old},{&right_chain,next},{&ui_chain,old}})&&p.uploads.serial==before,
+        "Unchanged batched stereo/UI issues no GPU work");
+    check(p.upload_batch({{&chain,next},{&right_chain,next},{&ui_chain,old}})&&p.uploads.serial==before+1,
+        "One changed image creates only one upload batch");read_pixel(255,0);
+    p.uploads.drain();p.xr.destroy(right_chain.handle);p.xr.destroy(ui_chain.handle);right_chain={};ui_chain={};
+
+    // The game really uses side-by-side color. Copy distinct halves directly
+    // from its reused render target and verify both eye pixels on the GPU.
+    const D3D12_RECT left_rect{0,0,8,16},right_rect{8,0,16,16};
+    commands->ClearRenderTargetView(rtv->GetCPUDescriptorHandleForHeapStart(),red,1,&left_rect);
+    commands->ClearRenderTargetView(rtv->GetCPUDescriptorHandleForHeapStart(),blue,1,&right_rect);execute();
+    const auto scene=h<XrSwapchain>(500);
+    cheeky::fg::BufferedPresenter::CapturePlan plan;plan.desc=source->GetDesc();
+    plan.slices={{{{0,0},{8,16}},0},{{{8,0},{8,16}},0}};p.capture_plans[scene]=plan;p.color_capture_mode=1;
+    const auto full_before=p.producer.full_copies.load();
+    check(p.capture(scene,0,source.Get(),16,16,1,DXGI_FORMAT_B8G8R8A8_UNORM),"Direct side-by-side capture");
+    p.producer.drain();check(p.capture_ready.at(scene)&&p.capture_ready.at(scene)->ready_qpc>0,
+        "Existing capture GPU timestamp resolves into calibrated QPC without an extra GPU query");
+    auto eyes=p.direct_captures.at(scene).eyes;
+    check(eyes.size()==2&&p.direct_eye_copies==2&&p.producer.full_copies==full_before&&
+        eyes[0].second->texture->GetDesc().Width==8,"Direct eyes eliminate the full color snapshot");
+    check(p.upload_image(chain,eyes[0].second),"Direct left upload");read_pixel(0,255);
+    check(p.upload_image(chain,eyes[1].second),"Direct right upload");read_pixel(255,0);
+    commands->ClearRenderTargetView(rtv->GetCPUDescriptorHandleForHeapStart(),red,0,nullptr);execute();
+    check(p.upload_image(chain,eyes[1].second),"Immutable direct capture survives engine reuse");read_pixel(255,0);
+    p.capture_plans[scene].desc.Width=99;
+    check(p.capture(scene,0,source.Get(),16,16,1,DXGI_FORMAT_B8G8R8A8_UNORM)&&
+        !p.direct_captures.contains(scene)&&p.captured.contains(scene)&&p.capture_fallbacks>0,
+        "Changed source layout safely falls back to the full snapshot");
     commands->Close();p.xr.destroy(chain.handle);chain={};old.reset();next.reset();p.reset();
     check(Runtime::chains.empty(),"Repeat test must release private swapchains and source leases");
     std::cout<<"PASS repeat upload reuse: unchanged images enqueue zero copies, reused engine source preserves old red/new blue GPU pixels\n";
     std::cout<<"PASS inference-batch publication: distinct red/blue stereo output pixels, source restoration, retired allocation reuse and alias rejection\n";
+    std::cout<<"PASS direct side-by-side eye capture: distinct pixels, no full snapshot, immutable engine reuse and layout fallback; batched stereo/UI uploads and unchanged-image skipping\n";
+}
+
+void fg_latency_validation(ID3D12Device* device) {
+    using Microsoft::WRL::ComPtr;using cheeky::fg::LatencyProbe;
+    ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC desc{};
+    check(SUCCEEDED(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue))),"Latency test queue");
+    LatencyProbe probe;check(probe.initialize(device,queue.Get()),"Latency query resources");
+    ComPtr<ID3D12Fence> dependency,completion;ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&dependency)))&&
+        SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&completion)))&&
+        SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))&&
+        SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))),"Latency test objects");
+    for(unsigned pass=0;pass<2;++pass){
+        if(pass){check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Latency test reset");probe.clear_statistics();}
+        // Simulate an upstream render dependency, and independently simulate
+        // delay before the worker observes an already completed GPU fence.
+        std::thread release;
+        if(!pass)release=std::thread([dependency]{Sleep(80);dependency->Signal(1);});
+        const auto result=probe.enqueue_wait(device,queue.Get(),dependency.Get(),1,true);
+        if(release.joinable())release.join();
+        check(SUCCEEDED(result)&&probe.active,"Calibrated probe around producer dependency");
+        probe.begin(list.Get());probe.end(list.Get());check(SUCCEEDED(list->Close()),"Latency work close");
+        ID3D12CommandList* commands[]{list.Get()};queue->ExecuteCommandLists(1,commands);
+        check(SUCCEEDED(queue->Signal(completion.Get(),pass+1)),"Latency final signal");probe.submitted(completion.Get(),pass+1);
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        const bool complete=event&&SUCCEEDED(completion->SetEventOnCompletion(pass+1,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0;
+        if(event)CloseHandle(event);check(complete,"Latency final fence");if(pass)Sleep(20);
+        const auto observed=LatencyProbe::cpu_now();check(probe.collect(queue.Get(),observed),"Valid GPU/QPC calibration");
+        CheekyFgExperimentDiagnostics timing;probe.snapshot(timing);
+        const double sum=timing.queue_entry.last+timing.capture_dependency.last+timing.ready_to_fg.last+timing.gpu_work.last+timing.gpu_to_observed.last;
+        check(timing.latency_samples==1&&std::abs(sum-timing.enqueue_to_observed.last)<.25,
+            "Calibrated stages account for the same end-to-end interval");
+        if(!pass)check(timing.capture_dependency.last>50&&timing.gpu_work.last<20,
+            "Upstream GPU dependency is separated from actual FG work");
+        else check(timing.gpu_to_observed.last>=15&&timing.capture_dependency.last<10,
+            "CPU observation delay is separated from capture dependency");
+        std::cout<<"PASS calibrated timeline: dependency="<<timing.capture_dependency.last<<" GPU="<<timing.gpu_work.last
+            <<" observed="<<timing.gpu_to_observed.last<<" total="<<timing.enqueue_to_observed.last<<" ms\n";
+    }
+    check(SUCCEEDED(probe.enqueue_wait(device,queue.Get(),dependency.Get(),1,false))&&!probe.active&&!probe.enabled,
+        "Diagnostics OFF retains only the original GPU dependency wait");probe.reset();
 }
 
 void fg_presentation_timing_validation(ID3D12Device* device) {
     using P=cheeky::fg::BufferedPresenter;using Clock=cheeky::fg::TimingClock;
     using namespace std::chrono;
     const auto now=Clock::now();
+    {
+        P corrected;P::Pair sampled;const auto cpu=cheeky::fg::LatencyProbe::cpu_now();
+        const auto tick=std::uint64_t(cheeky::fg::LatencyProbe::cpu_frequency()/1000.);
+        for(auto& stamp:sampled.current_color_ready){stamp=std::make_shared<cheeky::fg::ColorReadyStamp>();
+            stamp->captured_cpu=cpu-50*tick;stamp->ready_qpc=cpu-20*tick;}
+        corrected.note_gpu_ready_age(sampled,cpu,cpu+10*tick);auto exp=corrected.experiments();
+        check(exp.gpu_ready_samples==1&&exp.predicted_samples==1&&std::abs(exp.native_gpu_tail.last-30)<.05&&
+            std::abs(exp.gpu_ready_to_submit.last-20)<.05&&std::abs(exp.gpu_ready_to_display.last-30)<.05,
+            "GPU-ready latency excludes the native GPU tail and distinguishes measured submission from predicted display");
+        sampled.current_color_ready[1]->ready_qpc=cpu-15*tick;
+        corrected.note_gpu_ready_age(sampled,cpu,cpu-tick);exp=corrected.experiments();
+        check(exp.gpu_ready_samples==2&&exp.predicted_samples==1&&exp.prediction_late==1&&std::abs(exp.gpu_ready_to_submit.last-15)<.05,
+            "Use the latest of both native eyes; missed prediction targets cannot become claimed display measurements");
+        corrected.pacing_active=true;corrected.ticks=2;corrected.awaiting_generated_submission=7;corrected.submitted_native_id=7;
+        corrected.wake_producer();check(corrected.release_gate_active()&&corrected.credits==0&&corrected.credit_deferred,
+            "Generated submission gate holds native credits after FG GPU retirement");
+        corrected.finish_generated_gate(6,true);check(corrected.credits==0,"An older generated submission cannot release a newer native gate");
+        corrected.finish_generated_gate(7,true);check(corrected.credits==1&&corrected.generated_gate_releases==1&&!corrected.release_gate_active(),
+            "Matching generated OpenXR submission releases exactly one coalesced native credit");
+    }
     check(P::pair_wait_deadline(now,8333333)-now==nanoseconds(4333333)&&
         P::pair_wait_deadline(now,10000000)-now==milliseconds(6)&&
         P::pair_wait_deadline(now,16666667)-now==milliseconds(10)&&
@@ -347,7 +465,7 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
 void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,unsigned method=2) {
     using namespace buffered_probe;
     using Microsoft::WRL::ComPtr;
-    fg_presentation_timing_validation(device);
+    fg_presentation_timing_validation(device);fg_latency_validation(device);
     {
         cheeky::gpu::Groups groups;
         groups.add(1,.2);groups.commit();check(groups.summary().samples==0,"Do not publish partially measured capture batches");
@@ -405,6 +523,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     auto depth=texture(1,DXGI_FORMAT_R32_TYPELESS,DXGI_FORMAT_R32_FLOAT,z);
     auto motion=texture(2,DXGI_FORMAT_R16G16_FLOAT,DXGI_FORMAT_R16G16_FLOAT,zero);execute();
     cheeky::fg::BufferedPresenter p;check(p.setup(h<XrSession>(2),Runtime::functions(),device,queue.Get()),"Buffered presenter setup");
+    Runtime::options={};p.transport_options_query=Runtime::transport_options;
     cheeky::foveated_dlss::FgSnapshots snapshots;
     if(models) {
         p.trace=Runtime::trace;
@@ -482,6 +601,53 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         {std::lock_guard lock(p.mx);p.submit_repeat_frames=true;p.changed.notify_all();}
         Sleep(40);check(Runtime::ends>submitted,"Repeat submissions can resume live");
         std::cout<<"PASS no-repeat native fallback: fresh images advance; stalled content produces zero XR submissions; live re-enable\n";
+    }
+    for(unsigned capture_mode:{0u,1u})for(unsigned upload_mode:{0u,1u}){
+        Runtime::options.color_capture_mode=capture_mode;Runtime::options.upload_mode=upload_mode;
+        const auto direct_before=p.direct_eye_copies.load();
+        for(unsigned frame=0;frame<(models?36u:8u);++frame){
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Live transport dropdown frame");
+            end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
+            check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Live optimized capture/upload handoff");
+        }
+        {std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return p.inflight_id==0&&p.pending.empty();}),"Transport experiment retirement");
+            const auto exp=p.experiments();check(exp.color_capture_mode==capture_mode&&exp.upload_mode==upload_mode,"Dropdown modes reach actual presenter");
+            if(models)check(exp.latency_enabled&&exp.latency_valid&&exp.latency_samples>0&&exp.gpu_ready_samples>0&&exp.predicted_samples>0,
+                "Physical FG records valid GPU-ready ages and calibrated timelines in every transport mode");}
+        check(!capture_mode||p.direct_eye_copies>direct_before,"Live projection learns direct eye capture layout");
+        std::cout<<"PASS live transport experiment: capture="<<capture_mode<<" upload="<<upload_mode<<"\n";
+    }
+    if(models)for(bool diagnostics:{false,true}){
+        Runtime::options.latency_diagnostics=diagnostics?1u:0u;
+        for(unsigned frame=0;frame<6;++frame){
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Live diagnostic overhead toggle");
+            end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
+            check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Diagnostic toggle keeps generating");
+        }
+        std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return p.inflight_id==0&&p.pending.empty();}),"Diagnostic-toggle retirement");
+        const auto exp=p.experiments();check(bool(exp.latency_enabled)==diagnostics&&bool(p.worker.latency.enabled)==diagnostics&&
+            (!diagnostics?!exp.latency_valid:(exp.latency_valid&&exp.latency_samples>0)),"Diagnostic OFF/ON applies to real FG without stale timings");
+    }
+    if(!models){
+        const auto raw_before=Runtime::raw_frames.load();
+        views[1].subImage.imageRect.extent.width=int(width/2);
+        check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Changed-layout frame");
+        check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+            p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+            XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Changed projection uses original native passthrough safely");
+        check(Runtime::raw_frames>raw_before,"Uncaptured eye viewport never displays stale pixels");
+        views[1].subImage.imageRect.extent.width=int(width);
+        // First restored frame also falls back, then the learned layout works.
+        for(unsigned frame=0;frame<3;++frame){
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Restored-layout frame");
+            check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Restored projection layout recovers direct capture");
+        }
     }
     if(models) {
         p.guide_stamp=Runtime::missing_stamp;
@@ -563,7 +729,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             Runtime::guides.release_point=0;
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Disable live completion hold");
             submit_native();
-            for(unsigned point:{0u,1u,2u})for(bool repeats:{true,false}) {
+            for(unsigned point:{0u,1u,2u,3u})for(bool repeats:{true,false}) {
                 Runtime::guides.release_point=point;Runtime::guides.submit_repeats=repeats?1u:0u;
                 std::uint64_t repeat_baseline{};
                 for(unsigned frame=0;frame<40;++frame){
@@ -577,6 +743,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                     if(point==1)check(p.worker.prepared_serial>0&&p.worker.prepared_serial<p.worker.serial&&
                         p.worker.fence->GetCompletedValue()>=p.worker.serial,"Both-eye GPU preparation fence precedes final stereo fence");
                     if(!repeats)check(p.repeated_presentations==repeat_baseline,"Fresh-only mode must skip duplicate native prefixes before generated frames too");
+                    if(point==3)check(p.generated_gate_releases>0,"Generated submission policy reaches actual OpenXR presentation");
                 }
                 if(!repeats){
                     Sleep(50);const auto submitted=Runtime::ends.load();Sleep(40);
@@ -584,7 +751,23 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                 }
                 std::cout<<"PASS physical experiment: release="<<point<<" repeat_submissions="<<repeats<<"\n";
             }
-            Runtime::guides.release_point=0;Runtime::guides.submit_repeats=1;
+            // Prove that GPU completion alone cannot release policy 3: stall
+            // the real presenter's generated xrEndFrame after copies queued.
+            Runtime::guides.release_point=3;Runtime::guides.submit_repeats=0;
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Prepare generated submission gate");
+            Runtime::allow_generated_end=false;Runtime::generated_end_entered=false;Runtime::block_generated_end=true;
+            submit_native();std::atomic<bool> next_returned{};XrResult next_result=XR_ERROR_RUNTIME_FAILURE;
+            std::thread next_wait([&]{next_result=p.wait_frame(&wait,&state);next_returned=true;});
+            const auto until=GetTickCount64()+3000;
+            while(!Runtime::generated_end_entered&&GetTickCount64()<until)Sleep(1);
+            bool fence_complete{},gate_holding{};
+            {std::lock_guard lock(p.mx);fence_complete=p.worker.fence&&p.worker.fence->GetCompletedValue()>=p.worker.serial;
+                gate_holding=p.awaiting_generated_submission>0&&p.inflight_id==0&&!next_returned;}
+            Runtime::allow_generated_end=true;Runtime::block_generated_end=false;next_wait.join();
+            check(Runtime::generated_end_entered&&fence_complete&&gate_holding&&XR_SUCCEEDED(next_result),
+                "After generated submission must hold past GPU completion until generated xrEndFrame returns");
+            check(XR_SUCCEEDED(p.begin_frame(&begin)),"Resume game after generated submission");
+            Runtime::guides.release_point=0;Runtime::guides.submit_repeats=1;submit_native();
             // Policy changes clear GPU timing windows. Refill both alternating
             // execution orders and the 17-frame detailed sampling cadence.
             for(unsigned frame=0;frame<36;++frame){
@@ -592,6 +775,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                 submit_native();
             }
             std::cout<<"PASS physical GPU completion gate: live ON/OFF, blocked FG fence holds the next native frame until stereo work retires\n";
+            std::cout<<"PASS physical generated-submission gate: GPU finished, generated xrEndFrame held, next game frame blocked until submission returned\n";
         }
     }
     Sleep(40);

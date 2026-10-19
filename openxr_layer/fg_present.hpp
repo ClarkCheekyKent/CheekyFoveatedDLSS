@@ -25,6 +25,8 @@ inline void color_transition(ID3D12GraphicsCommandList* list,ID3D12Resource* tex
     b.Transition.StateBefore=from;b.Transition.StateAfter=to;list->ResourceBarrier(1,&b);
 }
 struct XrFns {
+    XrInstance time_instance{XR_NULL_HANDLE};
+    PFN_xrConvertTimeToWin32PerformanceCounterKHR time_to_qpc{};
     PFN_xrCreateSwapchain create{};
     PFN_xrDestroySwapchain destroy{};
     PFN_xrEnumerateSwapchainImages enumerate{};
@@ -64,6 +66,7 @@ struct Presenter {
     virtual CheekyFgCadence cadence() const noexcept {return {};}
     virtual CheekyFgOverhead overhead() const noexcept {return {};}
     virtual CheekyFgPresentation presentation() const noexcept {return {};}
+    virtual CheekyFgExperimentDiagnostics experiments() const noexcept {return {};}
     virtual void note_app_image_wait(double) noexcept {}
     virtual void note_app_call(unsigned,double) noexcept {}
     double copy_wait_accumulator{},xr_period_ms{};

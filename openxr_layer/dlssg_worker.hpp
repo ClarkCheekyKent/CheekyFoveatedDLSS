@@ -3,6 +3,7 @@
 #include "fg_matrices.hpp"
 #include "fg_focus.hpp"
 #include "fg_timing.hpp"
+#include "fg_latency.hpp"
 #include <Windows.h>
 #include <d3d12.h>
 #include "../third_party/ngx-sdk/include/nvsdk_ngx.h"
@@ -43,6 +44,7 @@ struct Worker {
     bool direct_publication{};
     void reset_features() noexcept;
     GpuTimings gpu_timings;
+    LatencyProbe latency;
     TimingAverage completion_wait;
     TimingClock::time_point submitted_at{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};unsigned width{},height{};
