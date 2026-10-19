@@ -33,7 +33,9 @@ struct FocusPipeline {
         GpuTimings* timings=nullptr);
     bool generate_periphery(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* previous,ID3D12Resource* current,const CheekyFgEye&,const Camera&,
-        D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON);
+        D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
+        ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON,
+        const CompactLayout* destination_layout=nullptr);
     bool compose_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect&,unsigned width,unsigned height,
         ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON);

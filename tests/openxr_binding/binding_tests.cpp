@@ -781,7 +781,8 @@ int main(int argc,char** argv) {
                     argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
                     argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&(std::string(argv[8])=="game-guides"||std::string(argv[8])=="full-guides"),
                     argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u,
-                    false,argc>8&&std::string(argv[8])=="full-guides",argc>12&&std::string(argv[12])=="compact",argc>13&&std::string(argv[13])=="prepared");
+                    false,argc>8&&std::string(argv[8])=="full-guides",argc>12&&std::string(argv[12])=="compact",argc>13&&std::string(argv[13])=="prepared",
+                    argc>14&&std::string(argv[14])=="periphery-baseline");
                 return ready?0:2;
             }
             throw std::runtime_error("No NVIDIA adapter found");

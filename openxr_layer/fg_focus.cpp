@@ -16,8 +16,11 @@ SamplerState LinearClamp:register(s0);
 float4 samplePacked(Texture2D<float4> image,float2 uv,float4 crop,float4 spans,float4 texel){
  if(spans.x<=0)return image.SampleLevel(LinearClamp,uv,0);
  uint sw,sh;image.GetDimensions(sw,sh);texel.xy=.5/float2(sw,sh);
- return lerp(image.SampleLevel(LinearClamp,contextUV(uv,spans,texel),0),
- image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0),centerFade(uv,crop,texel));}
+ float fade=centerFade(uv,crop,texel);
+ [branch]if(fade>=1)return image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0);
+ float4 base=image.SampleLevel(LinearClamp,contextUV(uv,spans,texel),0);
+ [branch]if(fade<=0)return base;
+ return lerp(base,image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0),fade);}
 float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));return c;}
 [numthreads(8,8,1)] void Main(uint3 id:SV_DispatchThreadID){
  uint w,h;
@@ -45,16 +48,24 @@ SamplerState LinearClamp:register(s0);
 float4 samplePacked(Texture2D<float4> image,float2 uv,float4 crop,float4 spans,float4 texel){
  if(spans.x<=0)return image.SampleLevel(LinearClamp,uv,0);
  uint sw,sh;image.GetDimensions(sw,sh);texel.xy=.5/float2(sw,sh);
- return lerp(image.SampleLevel(LinearClamp,contextUV(uv,spans,texel),0),
- image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0),centerFade(uv,crop,texel));}
+ float fade=centerFade(uv,crop,texel);
+ [branch]if(fade>=1)return image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0);
+ float4 base=image.SampleLevel(LinearClamp,contextUV(uv,spans,texel),0);
+ [branch]if(fade<=0)return base;
+ return lerp(base,image.SampleLevel(LinearClamp,centerUV(uv,crop,spans,texel),0),fade);}
 float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));return c;}
 bool inside(float2 p){return all(isfinite(p))&&all(p>=0)&&all(p<=1);}
 bool motionAt(float2 uv,out float2 mv){uint w,h;Motion.GetDimensions(w,h);mv=Motion.Load(int3(min(uint2(saturate(uv)*float2(w,h)),uint2(w,h)-1),0));return all(isfinite(mv))&&all(abs(mv)<=2);}
 [numthreads(8,8,1)] void Main(uint3 id:SV_DispatchThreadID){
- uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
+ uint w=uint(Dimensions.x),h=uint(Dimensions.y);if(id.x>=w||id.y>=h)return;
+ uint2 outputPixel=id.xy+uint2(Dimensions.zw);
  float2 uv=(float2(id.xy)+.5)/float2(w,h);
- if(Options.z<.5){Output[id.xy]=encodeColor(samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel));return;}
- if(Options.x<.5){Output[id.xy]=encodeColor(samplePacked(Previous,uv,PriorCrop,PriorSpans,AtlasTexel));return;}
+ // A full bilinear support margin stays valid around the feather transition.
+ // Native source contexts remain complete; only unused generated output is skipped.
+ if(JitterCorrection.z>.5){float2 edge=min(uv-Rect.xy,Rect.xy+Rect.zw-uv);
+  [branch]if(all(edge>JitterCorrection.xy))return;}
+ if(Options.z<.5){Output[outputPixel]=encodeColor(samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel));return;}
+ if(Options.x<.5){Output[outputPixel]=encodeColor(samplePacked(Previous,uv,PriorCrop,PriorSpans,AtlasTexel));return;}
  float2 cuv=uv,mv=0;bool valid=true;
  [unroll]for(uint i=0;i<4;++i){if(!inside(cuv)||!motionAt(cuv,mv)){valid=false;break;}cuv=uv-(1-Options.y)*mv;}
  valid=valid&&inside(cuv)&&motionAt(cuv,mv);float2 puv=cuv+mv;
@@ -70,7 +81,7 @@ bool motionAt(float2 uv,out float2 mv){uint w,h;Motion.GetDimensions(w,h);mv=Mot
     result=agrees?lerp(a,b,Options.y):b;}
   }else if(Options.x>=1.5)result=b;
  }
- Output[id.xy]=encodeColor(result);
+ Output[outputPixel]=encodeColor(result);
 })HLSL";
 constexpr char compose_shader[]=R"HLSL(
 Texture2D<float4> Periphery:register(t0);Texture2D<float4> Center:register(t1);RWTexture2D<float4> Output:register(u0);
@@ -226,12 +237,19 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  return true;
 }
 bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,
- ID3D12Resource* previous,ID3D12Resource* current,const CheekyFgEye& g,const Camera& camera,D3D12_RESOURCE_STATES color_state){
+ ID3D12Resource* previous,ID3D12Resource* current,const CheekyFgEye& g,const Camera& camera,D3D12_RESOURCE_STATES color_state,
+ ID3D12Resource* destination,D3D12_RESOURCE_STATES destination_state,const CompactLayout* layout){
  if(eye>1)return false;auto& s=inputs[eye][1];
  if(!s.output_width||!s.output_height||!previous||!current||g.peripheral_method>2)return false;
  const bool need_motion=g.peripheral_method!=0,need_depth=g.peripheral_method==2;
  if((need_motion&&!s.motion)||(need_depth&&!s.depth))return false;
- if(!allocate(dev,s.output_width,s.output_height,color_format,peripheral_output[eye]))return false;
+ if(destination){
+  const auto d=destination->GetDesc();
+  if(!layout||!layout->packed()||d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||d.DepthOrArraySize!=1||d.MipLevels!=1||
+     d.Width!=layout->stored_width()||d.Height!=layout->stored_height()||d.Format!=color_format||
+     !(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)||layout->context_width!=s.output_width||layout->context_height!=s.output_height||
+     destination==previous||destination==current||destination==s.depth.Get()||destination==s.motion.Get()||destination==previous_depth[eye].Get())return false;
+ }else if(!allocate(dev,s.output_width,s.output_height,color_format,peripheral_output[eye]))return false;
  if(need_depth&&(!previous_depth[eye]||previous_depth[eye]->GetDesc().Width!=s.depth->GetDesc().Width||
      previous_depth[eye]->GetDesc().Height!=s.depth->GetDesc().Height))history[eye]=false;
  Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);float unused[4];previous_layouts[eye].constants(c.prior_crop,c.prior_spans,unused);c.options[0]=float(g.peripheral_method);c.options[1]=.5f;
@@ -239,7 +257,15 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  c.options[3]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
  auto* mv=need_motion?s.motion.Get():nullptr;auto* depth=need_depth?s.depth.Get():nullptr;
  auto* old=need_depth?(history[eye]?previous_depth[eye].Get():depth):nullptr;
- auto* output=peripheral_output[eye].Get();transition(list,output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ c.dimensions[0]=float(s.output_width);c.dimensions[1]=float(s.output_height);
+ if(destination){
+  c.dimensions[3]=float(layout->center_height);
+  c.rect[0]=float(layout->x)/layout->width;c.rect[1]=float(layout->y)/layout->height;
+  c.rect[2]=float(layout->w)/layout->width;c.rect[3]=float(layout->h)/layout->height;
+  c.jitter[0]=layout->feather+1.5f/s.output_width;c.jitter[1]=layout->feather+1.5f/s.output_height;c.jitter[2]=1.f;
+ }
+ auto* output=destination?destination:peripheral_output[eye].Get();
+ transition(list,output,destination?destination_state:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
  for(auto* source:{mv,depth})transition(list,source,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
  if(color_state==D3D12_RESOURCE_STATE_COMMON){transition(list,previous,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   if(current!=previous)transition(list,current,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);}
@@ -279,7 +305,28 @@ bool FocusPipeline::compose_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* l
 bool FocusPipeline::pack_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,ID3D12Resource* center,ID3D12Resource* context,
  ID3D12Resource* destination,D3D12_RESOURCE_STATES state,const CompactLayout& layout,bool center_direct,bool context_direct){
  if(!layout.packed()||!destination||eye>=2||(!center_direct&&!center)||(!context_direct&&!context))return false;
+ const auto target=destination->GetDesc();
+ if(target.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||target.Width!=layout.stored_width()||target.Height!=layout.stored_height()||
+    target.DepthOrArraySize!=1||target.MipLevels!=1||target.SampleDesc.Count!=1||target.Format!=color_format||
+    (!center_direct&&center==destination)||(!context_direct&&context==destination))return false;
  if(center_direct&&context_direct)return true;
+ auto exact=[&](ID3D12Resource* source,unsigned w,unsigned h){const auto d=source->GetDesc();
+  return d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&d.Width==w&&d.Height==h&&d.DepthOrArraySize==1&&
+   d.MipLevels==1&&d.SampleDesc.Count==1&&d.Format==target.Format;};
+ if((center_direct||exact(center,layout.center_width,layout.center_height))&&
+    (context_direct||exact(context,layout.context_width,layout.context_height))){
+  // No filtering is needed when NGX/context dimensions already match the atlas.
+  transition(list,destination,state,D3D12_RESOURCE_STATE_COPY_DEST);
+  auto copy=[&](ID3D12Resource* source,unsigned y){
+   transition(list,source,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+   D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=source;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+   to.pResource=destination;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+   list->CopyTextureRegion(&to,0,y,0,&from,nullptr);
+   transition(list,source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);};
+  if(!center_direct)copy(center,0);if(!context_direct)copy(context,layout.center_height);
+  transition(list,destination,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);return true;
+ }
+ if(!(target.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))return false;
  Constants c;c.dimensions[0]=float(layout.center_width);c.dimensions[1]=float(layout.center_height);
  c.dimensions[2]=float(layout.context_width);c.dimensions[3]=float(layout.context_height);
  c.options[0]=center_direct?1.f:0.f;c.options[1]=context_direct?1.f:0.f;

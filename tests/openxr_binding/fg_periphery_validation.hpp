@@ -155,6 +155,55 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
             reused->texture.Get(),reused->state),"Rewrite a retired GENERIC_READ output via UAV");execute();
         reused->state=D3D12_RESOURCE_STATE_GENERIC_READ;verify_publication(reused,true);
     }
+    // Compare the actual XR reconstruction with a complete-context reference.
+    // Poison the skipped area with HDR NaNs so an accidental sample is visible.
+    cheeky::fg::ColorDraw draw;cheeky::fg::ColorDrawBindings bindings;
+    cheeky::fg::CompactLayout layout{64,64,13,9,32,32,32,32,32,32,.04f};
+    auto make_output=[&](unsigned w,unsigned h,D3D12_RESOURCE_FLAGS flags){
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};
+        d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;d.DepthOrArraySize=d.MipLevels=1;
+        d.SampleDesc.Count=1;d.Format=pipeline.color_format;d.Flags=flags;ComPtr<ID3D12Resource> out;
+        check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out))),"Compact periphery output");return out;};
+    auto reference=make_output(32,64,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto direct=make_output(32,64,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    auto reconstructed=make_output(64,64,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes{};const auto desc=reconstructed->GetDesc();
+    device->GetCopyableFootprints(&desc,0,1,0,&fp,nullptr,nullptr,&bytes);
+    D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;D3D12_RESOURCE_DESC rd{};
+    rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=bytes;rd.Height=rd.DepthOrArraySize=rd.MipLevels=1;rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback))),"Compact reconstruction readback");
+    auto reconstruct=[&](ID3D12Resource* atlas){begin();bindings.used=0;
+        cheeky::fg::color_transition(list.Get(),atlas,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cheeky::fg::color_transition(list.Get(),reconstructed.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cheeky::fg::ColorDraw::Constants c;layout.constants(c.crop,c.spans,c.texel);D3D12_VIEWPORT viewport{0,0,64,64,0,1};
+        check(draw.record(device,list.Get(),bindings,atlas,pipeline.color_format,0,reconstructed.Get(),pipeline.color_format,viewport,c),"Production XR compact reconstruction");
+        cheeky::fg::color_transition(list.Get(),atlas,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        cheeky::fg::color_transition(list.Get(),reconstructed.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=reconstructed.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        cheeky::fg::color_transition(list.Get(),reconstructed.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);execute();
+        void* data{};check(SUCCEEDED(readback->Map(0,nullptr,&data)),"Compact reconstruction map");std::vector<unsigned short> pixels(64*64*4);
+        for(unsigned y=0;y<64;++y)memcpy(pixels.data()+y*64*4,static_cast<unsigned char*>(data)+fp.Offset+y*fp.Footprint.RowPitch,64*8);
+        readback->Unmap(0,nullptr);return pixels;};
+    for(unsigned method=0;method<3;++method)for(float feather:{0.f,.04f,.16f}){
+        layout.feather=feather;guides.peripheral_method=method;guides.depth=depth.Get();guides.motion=motion.Get();begin();
+        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Compact periphery preparation");
+        check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera),"Complete context reference");
+        auto* compact_center=pipeline.inputs[0][0].color.Get();
+        check(pipeline.pack_frame(device,list.Get(),0,compact_center,pipeline.peripheral_output[0].Get(),reference.Get(),D3D12_RESOURCE_STATE_COMMON,layout,false,false),"Exact region copy packing");execute();
+        const auto expected=reconstruct(reference.Get());begin();
+        auto handle=rtvs->GetCPUDescriptorHandleForHeapStart();handle.ptr+=stride*2;
+        device->CreateRenderTargetView(direct.Get(),nullptr,handle);
+        cheeky::fg::color_transition(list.Get(),direct.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const float poison[]{NAN,NAN,NAN,NAN};list->ClearRenderTargetView(handle,poison,0,nullptr);
+        cheeky::fg::color_transition(list.Get(),direct.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
+        check(!pipeline.pack_frame(device,list.Get(),0,direct.Get(),reference.Get(),direct.Get(),D3D12_RESOURCE_STATE_COMMON,layout,false,false),"Reject atlas/source alias");
+        check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera,D3D12_RESOURCE_STATE_COMMON,direct.Get(),D3D12_RESOURCE_STATE_COMMON,&layout),"Direct compact periphery");
+        check(pipeline.pack_frame(device,list.Get(),0,compact_center,direct.Get(),direct.Get(),D3D12_RESOURCE_STATE_COMMON,layout,false,true),"Copy center without touching direct context");execute();
+        const auto actual=reconstruct(direct.Get());check(actual==expected,"Direct compact periphery must match all reconstructed HDR pixels, including feather/filter boundary and NaN-poisoned interior");
+        for(auto v:actual)check((v&0x7c00)!=0x7c00,"No HDR NaNs from covered context");
+    }
+    std::cout<<"PASS direct compact periphery: all three custom modes, asymmetric crop, three feather widths, exact center/context copies, XR reconstruction matches every reference pixel with NaN-poisoned interior\n";
     check(SUCCEEDED(device->GetDeviceRemovedReason()),"Periphery pipeline device removal");
     std::cout << "PASS actual periphery pixels: previous/simple red, bidirectional purple, independent green center; source-sized guide crop and nonzero UV motion; unused inputs omitted\n";
     std::cout << "PASS direct composition: original pixels retained through a newer output, distinct UAV/copy pools, retired GENERIC_READ reuse and alias rejection\n";

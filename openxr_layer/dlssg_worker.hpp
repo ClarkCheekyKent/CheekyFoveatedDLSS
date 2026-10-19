@@ -46,6 +46,7 @@ struct Worker {
     unsigned center_width{},center_height{},peripheral_width{},peripheral_height{},peripheral_method{};
     unsigned source_depth_format{},source_motion_format{};
     bool direct_publication{};
+    bool direct_periphery{true}; // Test A/B override; custom compact output needs no periphery intermediate.
     void reset_features() noexcept;
     GpuTimings gpu_timings;
     LatencyProbe latency;

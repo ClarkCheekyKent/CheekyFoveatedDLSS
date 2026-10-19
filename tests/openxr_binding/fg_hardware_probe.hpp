@@ -25,7 +25,7 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
 // real NVIDIA inference, without starting a game or an OpenXR session.
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
     unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
-    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false) {
+    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Hardware probe queue");
@@ -59,6 +59,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(SUCCEEDED(fence->SetEventOnCompletion(1,event)),"Probe completion event");
     const auto waited=WaitForSingleObject(event,10000);CloseHandle(event);check(waited==WAIT_OBJECT_0,"Probe initialization completion");
     check(worker.initialize(device,queue.Get(),width,height,color_format),worker.diagnostic);
+    worker.direct_periphery=!periphery_baseline;
     fg_probe_real_evaluate=worker.evaluate;worker.evaluate=fg_probe_evaluate;fg_probe_native_depth=fg_probe_sdr=false;
     CheekyFgPair guides{};guides.producer_queue=queue.Get();
     for(auto& eye:guides.eyes) {
@@ -169,6 +170,8 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(center_input.depth->GetDesc().Width==guide_width&&center_input.motion->GetDesc().Width==guide_width,
         "NGX must accept cropped source-resolution guides independently of output color");
     if(foveated){const auto& input=worker.focus.inputs[0][1];
+        if(compact&&method<=2&&!periphery_baseline)check(!worker.focus.peripheral_output[0]&&!worker.focus.peripheral_output[1],
+            "Custom compact output must eliminate both private periphery textures");
         check(bool(input.color)==(method==3)&&bool(input.depth)==(method>=2)&&bool(input.motion)==(method!=0),
             "Only resources used by the periphery algorithm may be prepared");
         check(bool(worker.focus.previous_depth[0])==(method==2),"Only bidirectional warp may copy depth history");}

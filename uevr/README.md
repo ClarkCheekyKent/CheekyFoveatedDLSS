@@ -241,3 +241,13 @@ snapshot is not a promise that every such byte will be reclaimed: some textures
 are reused in the next frames. Compare settled resource counts and DXGI usage.
 Completed native lease slots also drop color/guide/UI references once the slot
 is their only owner; this prevents unused slots from pinning older allocations.
+
+Custom periphery modes now write directly into the generated compact atlas,
+skipping the fully center-covered interior while retaining the feather and
+bilinear-filter border. Native input contexts stay complete for motion sampling;
+the NVIDIA periphery mode still evaluates its full reduced-resolution image.
+Matching center/context regions use texture copies instead of an atlas-wide
+resampling dispatch. Final feather blending happens during XR upload and avoids
+sampling the unused context interior. The **Periphery + output assembly** timer
+sums both eyes' generation, packing and optional depth-history work; compact
+feather blending belongs to **OpenXR uploads / presentation**.

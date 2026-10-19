@@ -31,8 +31,13 @@ V VS(uint id:SV_VertexID){V v;v.uv=float2((id<<1)&2,id&2);v.position=float4(v.uv
 float4 PS(V v):SV_Target{
  float2 uv=Region.xy+v.uv*Region.zw;
  float4 c;
- if(Spans.x>0){float4 b=Source.SampleLevel(LinearClamp,float3(contextUV(uv,Spans,Texel),0),0);
-  c=lerp(b,Source.SampleLevel(LinearClamp,float3(centerUV(uv,Crop,Spans,Texel),0),0),centerFade(uv,Crop,Texel));}
+ if(Spans.x>0){float fade=centerFade(uv,Crop,Texel);
+  // The covered context interior can be unwritten. Select the center before
+  // sampling context: lerp(NaN,center,1) would still propagate NaN in HDR.
+  [branch]if(fade>=1)c=Source.SampleLevel(LinearClamp,float3(centerUV(uv,Crop,Spans,Texel),0),0);
+  else{float4 b=Source.SampleLevel(LinearClamp,float3(contextUV(uv,Spans,Texel),0),0);
+   [branch]if(fade<=0)c=b;
+   else c=lerp(b,Source.SampleLevel(LinearClamp,float3(centerUV(uv,Crop,Spans,Texel),0),0),fade);}}
  else c=Source.SampleLevel(LinearClamp,float3(uv,0),0);
  // SDR FG uses gamma-encoded UNORM. A typed sRGB source was decoded by its SRV;
  // re-encode only when the render target itself is not sRGB.

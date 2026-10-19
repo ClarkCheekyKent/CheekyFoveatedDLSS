@@ -721,7 +721,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         end
                         rows("fg_gpu_timings", {
                             {focused and "DLSS-FG center" or "DLSS-FG full frame", gpu_ms(p.center_ms, p.center_last_ms)},
-                            {resized and "Output resize" or "Periphery + blending", (focused or resized) and
+                            {resized and "Output resize" or "Periphery + output assembly", (focused or resized) and
                                 gpu_ms(p.periphery_ms,p.periphery_last_ms) or "Not used (full-frame FG)"},
                             {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)},
                             {extra and extra.supported and "FG processing subtotal" or "FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}})
@@ -737,6 +737,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                                 {"Generated output copy / generated",stage(extra.publication_samples,extra.publication_ms,extra.publication_last_ms)},
                                 {"OpenXR uploads / presentation",stage(extra.upload_samples,extra.upload_ms,extra.upload_last_ms)}})
                             text("Color / guide preparation above is already in the subtotal.")
+                            if focused then text("Periphery includes both eyes' output assembly/history; compact feather blending is in OpenXR uploads.") end
                             text("Runtime compositor GPU work is outside these application timers.")
                         end
                     elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then

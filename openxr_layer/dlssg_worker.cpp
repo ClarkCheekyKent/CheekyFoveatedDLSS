@@ -266,6 +266,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 (*copies)[eye].texture!=guides.eyes[source].depth&&(*copies)[eye].texture!=guides.eyes[source].motion;
     }
     if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed())){list->Close();if(two_lists)split_list->Close();return false;}
+    // wait_idle above retired every earlier use of these private scratch images.
+    if(direct&&direct_periphery)for(unsigned eye=0;eye<2;++eye)
+        if((*copies)[eye].layout.packed()&&guides.eyes[eye].peripheral_method<=2)focus.peripheral_output[eye].Reset();
     auto transpose=[](Matrix m){Matrix result{};for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)result.m[r*4+c]=m.m[c*4+r];return result;};
     auto configure_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect,unsigned eye=0,bool center_pass=true) {
         const auto desc=input.color->GetDesc();const auto tw=unsigned(desc.Width),th=desc.Height;
@@ -464,6 +467,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             gpu_timings.stamp(commands,query+4);
             auto* center=evaluate_center?features[eye].target:focus.inputs[eye][0].color.Get();
             auto* base=center;
+            bool custom_context_direct=false;
             if(rect.active) {
                 if(g.peripheral_method==3) {
                     if(evaluate_center) {
@@ -471,13 +475,18 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                         base=peripheral_features[eye].target;
                     } else base=focus.inputs[eye][1].color.Get();
                 }else {
-                    good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state);
-                    base=focus.peripheral_output[eye].Get();
+                    custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed();
+                    auto* target=custom_context_direct?(*copies)[eye].texture:nullptr;
+                    good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
+                        target,custom_context_direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON,
+                        custom_context_direct?&(*copies)[eye].layout:nullptr);
+                    base=custom_context_direct?target:focus.peripheral_output[eye].Get();
+                    if(good&&custom_context_direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
                 }
             }
             if(good&&copies&&(*copies)[eye].layout.packed()) {
                 const bool center_direct=evaluate_center&&features[eye].direct;
-                const bool context_direct=evaluate_center&&g.peripheral_method==3&&peripheral_features[eye].direct;
+                const bool context_direct=custom_context_direct||(evaluate_center&&g.peripheral_method==3&&peripheral_features[eye].direct);
                 good=focus.pack_frame(device.Get(),commands,eye,center,base,(*copies)[eye].texture,(*copies)[eye].state,
                     (*copies)[eye].layout,center_direct,context_direct);
                 outputs[eye]=(*copies)[eye].texture;(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
