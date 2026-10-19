@@ -41,6 +41,9 @@ inline bool typeless_color(DXGI_FORMAT format) noexcept {
 inline bool compatible_color(DXGI_FORMAT a,DXGI_FORMAT b) noexcept {
     return a!=DXGI_FORMAT_UNKNOWN && b!=DXGI_FORMAT_UNKNOWN && color_family(a)==color_family(b);
 }
+inline bool writable_color(DXGI_FORMAT resource,DXGI_FORMAT view) noexcept {
+    return resource==view||(typeless_color(resource)&&!typeless_color(view)&&compatible_color(resource,view));
+}
 inline DXGI_FORMAT capture_format(DXGI_FORMAT resource,DXGI_FORMAT declared) noexcept {
     if(declared==DXGI_FORMAT_UNKNOWN)return typeless_color(resource)?DXGI_FORMAT_UNKNOWN:resource;
     return !typeless_color(declared)&&compatible_color(resource,declared)?declared:DXGI_FORMAT_UNKNOWN;

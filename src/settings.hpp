@@ -53,6 +53,8 @@ struct Settings {
         std::uint32_t latency_diagnostics{1}; // Sparse calibrated GPU/CPU timeline; independently switchable.
         std::uint32_t compact_storage{1}; // Native-density center plus reduced peripheral context, reconstructed at XR upload.
         std::uint32_t guide_capture_mode{1}; // 0 raw snapshots; 1 capture directly into prepared FG guide grids.
+        std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.
+        std::uint32_t direct_peripheral_shading{1}; // 0 full rate, 1 coarse blocks, 2 filtered coarse grid.
     } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.

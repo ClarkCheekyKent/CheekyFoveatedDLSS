@@ -306,6 +306,15 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
     out->compact=s.compact_storage==1u&&s.foveated;out->peripheral_percent=s.peripheral_percent;
     out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectOutputOptionsV1(CheekyFgDirectOutput* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    const auto settings=cheeky::foveated_dlss::current_settings().fg;
+    out->requested=settings.enabled&&settings.direct_xr_output==1u;return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectShadingOptionsV1(CheekyFgDirectShading* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    out->requested_mode=cheeky::foveated_dlss::current_settings().fg.direct_peripheral_shading;return true;
+}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFgMemory* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
     using namespace cheeky::foveated_dlss;
@@ -424,5 +433,20 @@ bool fg_memory_diagnostics(CheekyFgMemory& out) noexcept {
     out.categories[fg_memory::guide_depth]=guides.categories[fg_memory::guide_depth];
     out.categories[fg_memory::guide_motion]=guides.categories[fg_memory::guide_motion];
     out.guides_supported=guides.guides_supported;out.guide_tick=guides.guide_tick;return supported;
+}
+bool fg_direct_output_diagnostics(CheekyFgDirectOutput& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgDirectOutputFn>(GetProcAddress(layer,"CheekyFG_GetDirectOutputDiagnosticsV1")):nullptr;
+    return query&&query(&out);
+}
+bool fg_direct_output_details(CheekyFgDirectOutputDetails& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgDirectOutputDetailsFn>(GetProcAddress(layer,"CheekyFG_GetDirectOutputDetailsV1")):nullptr;
+    return query&&query(&out);
+}
+bool fg_direct_shading_diagnostics(CheekyFgDirectShading& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgDirectShadingFn>(GetProcAddress(layer,"CheekyFG_GetDirectShadingDiagnosticsV1")):nullptr;
+    return query&&query(&out);
 }
 }

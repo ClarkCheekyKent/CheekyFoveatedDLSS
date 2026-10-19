@@ -454,6 +454,14 @@ void fg_toggle_test() {
     experiments.abi=999;check(!CheekyFG_GetExperimentDiagnosticsV1(&experiments),"Reject mismatched experiment ABI");
     experiments={};--experiments.size;
     check(!CheekyFG_GetExperimentDiagnosticsV1(&experiments)&&!CheekyFG_GetExperimentDiagnosticsV1(nullptr),"Reject invalid experiment size/pointer");
+    CheekyFgDirectOutput direct;
+    check(CheekyFG_GetDirectOutputDiagnosticsV1(&direct)&&direct.supported,"Direct output diagnostics export");
+    direct.abi=999;check(!CheekyFG_GetDirectOutputDiagnosticsV1(&direct),"Reject mismatched direct output ABI");
+    direct={};--direct.size;
+    check(!CheekyFG_GetDirectOutputDiagnosticsV1(&direct)&&!CheekyFG_GetDirectOutputDiagnosticsV1(nullptr),"Reject invalid direct output size/pointer");
+    CheekyFgDirectOutputDetails details;
+    check(CheekyFG_GetDirectOutputDetailsV1(&details)&&details.supported,"Detailed direct-output rejection export");
+    details.abi=999;check(!CheekyFG_GetDirectOutputDetailsV1(&details),"Reject mismatched direct detail ABI");
     auto retired=update_fg_at_frame_boundary(live,d,false);
     check(!live.fg && retired==first,"Disable must retire the presenter at the frame boundary");
     first.reset();retired.reset();
@@ -782,7 +790,8 @@ int main(int argc,char** argv) {
                     argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&(std::string(argv[8])=="game-guides"||std::string(argv[8])=="full-guides"),
                     argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u,
                     false,argc>8&&std::string(argv[8])=="full-guides",argc>12&&std::string(argv[12])=="compact",argc>13&&std::string(argv[13])=="prepared",
-                    argc>14&&std::string(argv[14])=="periphery-baseline");
+                    argc>14&&std::string(argv[14])=="periphery-baseline",argc>14&&(std::string(argv[14])=="final-xr"||std::string(argv[14])=="final-xr-typeless"),
+                    argc>14&&std::string(argv[14])=="final-xr-typeless",argc>15&&std::string(argv[15])=="full-rate"?0u:argc>15&&std::string(argv[15])=="filtered"?2u:1u);
                 return ready?0:2;
             }
             throw std::runtime_error("No NVIDIA adapter found");

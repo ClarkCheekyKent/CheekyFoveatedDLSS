@@ -251,3 +251,38 @@ resampling dispatch. Final feather blending happens during XR upload and avoids
 sampling the unused context interior. The **Periphery + output assembly** timer
 sums both eyes' generation, packing and optional depth-history work; compact
 feather blending belongs to **OpenXR uploads / presentation**.
+
+**FG output destination** offers an opt-in **Direct OpenXR image** experiment.
+It acquires the existing shared scene images only after the preceding native
+frame was displayed, then lets NGX write its center subrectangle and custom
+periphery fill/blend the final image in place. No extra generated swapchain or
+generated atlas/upload is needed for successful direct jobs. A rejected NGX
+destination or scaled center uses center scratch with direct final assembly;
+unsupported periphery modes/runtime images use the existing compact path.
+The default remains **Compact intermediate**. Settings persist and apply live.
+
+Direct output waits for generation on the presentation thread. **Direct periphery
+shading** offers three live A/B modes: full-resolution warping, coarse blocks
+(default), and a coarse grid with bilinear filtering. Coarse modes evaluate the
+expensive motion/depth work at **FG periphery scale**, then expand into the final
+XR image without an intermediate texture. Blocks replicate one warped color;
+bilinear filtering shares a tile of coarse samples and smooths between them.
+Final pixel stores and center feather blending remain at output resolution.
+At 100% periphery scale all modes use full-resolution warping. Lua/support JSON
+report the last successful direct mode, shading grid, output extent and coarse/
+full-rate frame counts. Compact fallback keeps its existing low-resolution path.
+SDR uses writable linear UNORM XR images with gamma conversion in final assembly;
+check dark gradients as linear 8-bit storage has less shadow precision than sRGB.
+Lua and support diagnostics show direct/fallback frames, direct/scratch NGX eyes,
+unsupported/native-not-ready cases, and the presentation wait. Existing stage
+timers still include both eyes; direct final blending is in output assembly.
+The NGX direct-write paths now set UpdateOnlyInsideExtents, preserving pixels
+outside the requested center/context rectangle when destinations are shared.
+
+Direct output also accepts compatible typeless XR backing images, using a typed
+UAV for final assembly. Rejection details report the exact stage, requested and
+actual formats/extents, resource flags and API error in Lua, support JSON and
+the layer log. Unsupported backing images are cached by size/format so fallback
+does not add an acquisition handshake every native frame; toggle the output
+mode off/on to retry. A fallback wake never enables repeated native submissions
+when the repeat setting is off.

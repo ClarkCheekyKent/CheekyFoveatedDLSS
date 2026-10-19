@@ -3424,6 +3424,27 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetMemoryV1(CheekyFgMemor
         std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->memory();return true;}
     return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectOutputDiagnosticsV1(CheekyFgDirectOutput* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgDirectOutput{};std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->direct_output();return true;}
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectOutputDetailsV1(CheekyFgDirectOutputDetails* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgDirectOutputDetails{};std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->direct_output_details();return true;}
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectShadingDiagnosticsV1(CheekyFgDirectShading* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgDirectShading{};std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->direct_shading();return true;}
+    return true;
+}
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
     const XrSession session, const XrFrameBeginInfo* info) {

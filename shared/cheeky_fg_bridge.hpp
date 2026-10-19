@@ -150,6 +150,40 @@ struct CheekyFgTransportOptions {
     std::uint32_t color_capture_mode{},upload_mode{},latency_diagnostics{1};
 };
 using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
+// Independent export: older transport/pair layouts remain compatible.
+struct CheekyFgDirectOutput {
+    std::uint32_t abi{1},size{sizeof(CheekyFgDirectOutput)},supported{},requested{};
+    std::uint32_t last_path{}; // 0 baseline, 1 direct NGX+assembly, 2 NGX scratch+direct assembly, 3 fallback.
+    std::uint64_t attempts{},frames{},ngx_direct_eyes{},ngx_scratch_eyes{},fallbacks{},unsupported{},not_ready{};
+    double wait_ms{},last_wait_ms{};
+};
+using CheekyFgDirectOutputFn=bool(__cdecl*)(CheekyFgDirectOutput*);
+// Kept separate from the existing direct-output counters/options ABI.
+enum class CheekyFgDirectReason : std::uint32_t {none,configuration,chain_missing,chain_usage,chain_extent,chain_format,
+    native_not_ready,acquire,wait,image_format,image_usage,image_extent,cancelled,generation,queue_wait,release};
+inline const char* cheeky_fg_direct_reason_name(CheekyFgDirectReason reason) noexcept {
+    constexpr const char* names[]{"None","Requires foveated custom periphery","Scene swapchain missing","Scene swapchain is not writable",
+        "Scene dimensions differ","Scene format differs","Preceding native frame not ready","XR image acquire failed","XR image wait failed",
+        "XR backing format incompatible","XR backing image lacks writable flags","XR backing dimensions unsupported","Cancelled or hidden",
+        "Generation unavailable","Binding queue wait failed","XR image release failed"};
+    const auto n=static_cast<std::uint32_t>(reason);return n<sizeof(names)/sizeof(*names)?names[n]:"Unknown";
+}
+struct CheekyFgDirectOutputDetails {
+    std::uint32_t abi{1},size{sizeof(CheekyFgDirectOutputDetails)},supported{};
+    CheekyFgDirectReason reason{};
+    std::uint32_t eye{},expected_format{},chain_format{},image_format{},image_flags{};
+    std::uint32_t expected_width{},expected_height{},chain_width{},chain_height{},image_width{},image_height{};
+    std::int32_t xr_result{};
+    std::uint64_t rejections{};
+};
+using CheekyFgDirectOutputDetailsFn=bool(__cdecl*)(CheekyFgDirectOutputDetails*);
+// Optional shading controls/telemetry; keep the existing direct-output ABI stable.
+struct CheekyFgDirectShading {
+    std::uint32_t abi{1},size{sizeof(CheekyFgDirectShading)},supported{},requested_mode{1},active_mode{},valid{};
+    std::uint32_t grid_width{},grid_height{},output_width{},output_height{};
+    std::uint64_t coarse_frames{},full_frames{};
+};
+using CheekyFgDirectShadingFn=bool(__cdecl*)(CheekyFgDirectShading*);
 struct CheekyFgStorageOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgStorageOptions)};
     std::uint32_t compact{},peripheral_percent{25};

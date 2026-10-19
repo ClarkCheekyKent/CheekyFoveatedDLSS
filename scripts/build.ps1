@@ -45,11 +45,17 @@ $toolset = if ($availableToolsets -contains "v143") {
     $availableToolsets[0]
 }
 
+# SkipTests also avoids building test executables, including any still open
+# from a local diagnostic run. Production payloads are built normally.
+$buildTarget = if ($SkipTests) {
+    '/t:CheekyFoveatedDLSS;CheekyOpenXRLayer;CheekyFoveatedDLSSRuntime;CheekyFoveatedDLSSUEVR;CheekyFoveatedDLSSHost;CheekyStandaloneProxy;CheekyOptiScaler;CheekyVulkanLayer;CheekyVersionProxy'
+} else { '/t:Build' }
 & $msbuild `
     (Join-Path $projectRoot "CheekyFoveatedDLSS.sln") `
     /m `
     /nologo `
     /verbosity:minimal `
+    $buildTarget `
     "/p:Configuration=$Configuration" `
     /p:Platform=x64 `
     "/p:PlatformToolset=$toolset"

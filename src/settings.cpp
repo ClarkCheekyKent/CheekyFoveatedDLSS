@@ -246,6 +246,7 @@ Settings current_settings() noexcept {
 void update_settings(const Settings& settings) noexcept {
     std::lock_guard lock(settings_mutex);
     fg_settings = settings.fg;
+    fg_settings.direct_peripheral_shading=std::min(fg_settings.direct_peripheral_shading,2u);
     const auto bounded = [](float value, float lo, float hi, float fallback) {
         return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
     };

@@ -125,6 +125,9 @@ std::string snapshot_locked(State& s) {
     CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
     CheekyFgPresentation fg_present;fg_presentation(fg_present);
     CheekyFgExperimentDiagnostics fg_exp;fg_experiment_diagnostics(fg_exp);
+    CheekyFgDirectOutput fg_direct;fg_direct_output_diagnostics(fg_direct);
+    CheekyFgDirectOutputDetails fg_direct_details;fg_direct_output_details(fg_direct_details);
+    CheekyFgDirectShading fg_shading;fg_direct_shading_diagnostics(fg_shading);
     CheekyFgCaptureHealth fg_capture;
     if(auto self=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"))
         if(auto query=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(self,"CheekyFG_GetCaptureHealth")))query(&fg_capture);
@@ -224,6 +227,24 @@ std::string snapshot_locked(State& s) {
         << ",\"capture_ms\":" << fg_extra.capture_ms << ",\"capture_last_ms\":" << fg_extra.capture_last_ms
         << ",\"publication_ms\":" << fg_extra.publication_ms << ",\"publication_last_ms\":" << fg_extra.publication_last_ms
         << ",\"upload_ms\":" << fg_extra.upload_ms << ",\"upload_last_ms\":" << fg_extra.upload_last_ms << "}"
+        << ",\"direct_output\":{\"supported\":" << bool(fg_direct.supported) << ",\"requested\":" << bool(fg_direct.requested)
+        << ",\"last_path\":" << fg_direct.last_path << ",\"attempts\":" << fg_direct.attempts << ",\"frames\":" << fg_direct.frames
+        << ",\"ngx_direct_eyes\":" << fg_direct.ngx_direct_eyes << ",\"ngx_scratch_eyes\":" << fg_direct.ngx_scratch_eyes
+        << ",\"fallbacks\":" << fg_direct.fallbacks << ",\"unsupported\":" << fg_direct.unsupported << ",\"not_ready\":" << fg_direct.not_ready
+        << ",\"wait_ms\":" << fg_direct.wait_ms << ",\"last_wait_ms\":" << fg_direct.last_wait_ms
+        << ",\"details_supported\":" << bool(fg_direct_details.supported) << ",\"reason\":" << unsigned(fg_direct_details.reason)
+        << ",\"reason_text\":\"" << cheeky_fg_direct_reason_name(fg_direct_details.reason) << "\",\"eye\":" << fg_direct_details.eye
+        << ",\"expected_format\":" << fg_direct_details.expected_format << ",\"chain_format\":" << fg_direct_details.chain_format
+        << ",\"image_format\":" << fg_direct_details.image_format << ",\"image_flags\":" << fg_direct_details.image_flags
+        << ",\"expected_width\":" << fg_direct_details.expected_width << ",\"expected_height\":" << fg_direct_details.expected_height
+        << ",\"chain_width\":" << fg_direct_details.chain_width << ",\"chain_height\":" << fg_direct_details.chain_height
+        << ",\"image_width\":" << fg_direct_details.image_width << ",\"image_height\":" << fg_direct_details.image_height
+        << ",\"api_result\":" << fg_direct_details.xr_result
+        << ",\"shading\":{\"supported\":" << bool(fg_shading.supported) << ",\"valid\":" << bool(fg_shading.valid)
+        << ",\"requested_mode\":" << fg_shading.requested_mode << ",\"active_mode\":" << fg_shading.active_mode
+        << ",\"grid_width\":" << fg_shading.grid_width << ",\"grid_height\":" << fg_shading.grid_height
+        << ",\"output_width\":" << fg_shading.output_width << ",\"output_height\":" << fg_shading.output_height
+        << ",\"coarse_frames\":" << fg_shading.coarse_frames << ",\"full_frames\":" << fg_shading.full_frames << "}}"
         << ",\"experiments\":{\"supported\":" << bool(fg_exp.supported)
         << ",\"color_capture_mode\":" << fg_exp.color_capture_mode << ",\"upload_mode\":" << fg_exp.upload_mode
         << ",\"latency_enabled\":" << bool(fg_exp.latency_enabled) << ",\"latency_valid\":" << bool(fg_exp.latency_valid)

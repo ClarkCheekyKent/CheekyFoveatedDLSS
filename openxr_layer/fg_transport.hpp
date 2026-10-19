@@ -210,18 +210,18 @@ struct Transport {
         c.images.push_back(destination);c.borrowed.emplace_back(source);++region_copies;
         return good?destination:Image{};
     }
-    bool record_upload(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN) {
+    bool record_upload(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false) {
         if(!source||!target||target==source->texture.Get())return false;
         const auto a=source->texture->GetDesc(),b=target->GetDesc();
         if(target_format==DXGI_FORMAT_UNKNOWN)target_format=b.Format;
         const auto sf=source->presentation_format==DXGI_FORMAT_UNKNOWN?a.Format:source->presentation_format;
-        if(source->layout.packed()||!compatible_color(b.Format,a.Format)){
+        if(linear_target||source->layout.packed()||!compatible_color(b.Format,a.Format)){
             const unsigned width=source->layout.width?source->layout.width:unsigned(a.Width),height=source->layout.height?source->layout.height:a.Height;
             if(b.Width!=width||b.Height!=height||a.DepthOrArraySize!=1||b.DepthOrArraySize!=1)return false;
             const auto readable=(source->state&D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)?source->state:D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             color_transition(c.list.Get(),source->texture.Get(),source->state,readable);
             ColorDraw::Constants constants;source->layout.constants(constants.crop,constants.spans,constants.texel);
-            constants.options[0]=srgb_color(sf)&&!srgb_color(target_format)?1.f:0.f;
+            constants.options[0]=!linear_target&&srgb_color(sf)&&!srgb_color(target_format)?1.f:0.f;
             const bool good=draw.record(device.Get(),c.list.Get(),c.bindings,source->texture.Get(),sf,0,target,target_format,
                 D3D12_VIEWPORT{0,0,float(width),float(height),0,1},constants);
             color_transition(c.list.Get(),source->texture.Get(),readable,source->state);
@@ -236,14 +236,14 @@ struct Transport {
         color_transition(c.list.Get(),source->texture.Get(),read_state,source->state);
         c.images.push_back(source);c.borrowed.emplace_back(target);return true;
     }
-    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN) {
+    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false) {
         if(!source)return false;
         auto* c=begin(frame);
         // Only the background presenter uses upload(). Allocator pressure here
         // may wait for retirement without turning a transient busy ring into a
         // permanent presentation failure. Producer begin() remains nonblocking.
         if(!c){drain();c=begin(frame);}if(!c)return false;
-        if(!record_upload(*c,source,target,target_format)){c->list->Close();return false;}
+        if(!record_upload(*c,source,target,target_format,linear_target)){c->list->Close();return false;}
         std::uint64_t ticket{};return execute(*c,ticket);
     }
     void freeze(Context& c,const Image& image) {

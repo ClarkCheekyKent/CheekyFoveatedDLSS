@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -617,6 +617,40 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgGuideCaptureMode ~= nil then
                     combo("FG guide capture", "FgGuideCaptureMode", {[0]="Raw snapshots (baseline)", [1]="Prepared FG layouts"})
                     text("Prepared capture stores only the center/periphery depth and motion grids. Restart for a clean VRAM A/B baseline.")
+                end
+                if draft.FgDirectXrOutput ~= nil then
+                    combo("FG output destination", "FgDirectXrOutput", {[0]="Compact intermediate (baseline)", [1]="Direct OpenXR image (experimental)"})
+                    text("Direct output waits for FG at presentation; avoids the generated atlas/upload. Periphery shading rate is selectable below.")
+                    text("Uses custom periphery modes. Unsupported images/configurations fall back automatically.")
+                    text("SDR direct output uses linear 8-bit XR storage; check shadow gradients when comparing.")
+                    if draft.FgDirectPeripheralShading ~= nil then
+                        combo("Direct periphery shading", "FgDirectPeripheralShading", {
+                            [0]="Full-resolution warp (baseline)", [1]="Coarse blocks (VRS style)", [2]="Coarse grid + bilinear filtering"})
+                        text("Coarse modes follow Periphery scale; final writes and the center feather remain full resolution.")
+                        text("Blocks reuse one warped color per block. Bilinear filtering smooths between coarse samples.")
+                    end
+                    local direct = status and status.fg and status.fg.direct_output
+                    if direct and direct.supported then
+                        local paths = {[0]="Baseline / waiting", [1]="NGX + assembly direct to XR", [2]="NGX scratch; assembly direct to XR", [3]="Compact fallback"}
+                        rows("fg_direct_output", {{"Last output path", paths[direct.last_path] or "Waiting"},
+                            {"Direct frames / fallback jobs",string.format("%.0f / %.0f",direct.frames or 0,direct.fallbacks or 0)},
+                            {"NGX direct / scratch eyes",string.format("%.0f / %.0f",direct.ngx_direct_eyes or 0,direct.ngx_scratch_eyes or 0)},
+                            {"Unsupported / native not ready",string.format("%.0f / %.0f",direct.unsupported or 0,direct.not_ready or 0)},
+                            {"Direct presentation wait: avg / last",string.format("%.3f / %.3f ms",direct.wait_ms or 0,direct.last_wait_ms or 0)}})
+                        local shading = direct.shading
+                        if shading and shading.supported and shading.valid then
+                            local modes = {[0]="Full resolution", [1]="Coarse blocks", [2]="Coarse bilinear"}
+                            rows("fg_direct_shading", {{"Last direct shading mode",modes[shading.active_mode] or "Unknown"},
+                                {"Periphery shading grid / output",string.format("%dx%d / %dx%d",shading.grid_width or 0,shading.grid_height or 0,shading.output_width or 0,shading.output_height or 0)},
+                                {"Coarse / full-rate direct frames",string.format("%.0f / %.0f",shading.coarse_frames or 0,shading.full_frames or 0)}})
+                        end
+                        if direct.details_supported then
+                            rows("fg_direct_output_failure", {{"Last fallback reason",direct.reason_text or "None"},
+                                {"Requested / XR / backing formats",string.format("%d / %d / %d",direct.expected_format or 0,direct.chain_format or 0,direct.image_format or 0)},
+                                {"Backing flags / API result",string.format("0x%X / %d",direct.image_flags or 0,direct.api_result or 0)},
+                                {"Expected / backing extent",string.format("%dx%d / %dx%d",direct.expected_width or 0,direct.expected_height or 0,direct.image_width or 0,direct.image_height or 0)}})
+                        end
+                    end
                 end
                 if draft.FgCompactStorage ~= nil then
                     combo("FG frame storage", "FgCompactStorage", {[0]="Full-resolution frames", [1]="Compact center + periphery"})

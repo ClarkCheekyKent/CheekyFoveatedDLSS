@@ -25,7 +25,7 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
 // real NVIDIA inference, without starting a game or an OpenXR session.
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
     unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
-    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false) {
+    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false,bool final_xr=false,bool typeless_output=false,unsigned shading_mode=1) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Hardware probe queue");
@@ -92,9 +92,12 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
             worker.color_layouts[eye]=worker.previous_layouts[eye]=layout;colors[eye]=compact_inputs[eye]->texture.Get();
             output_layout=cheeky::fg::compact_layout(width,height,true,g.focus_width,g.focus_height,g.focus_x,g.focus_y,peripheral_scale,g.focus_feather,scale);
             auto d=colors[eye]->GetDesc();d.Width=output_layout.stored_width();d.Height=output_layout.stored_height();d.Format=worker.focus.color_format;
-            compact_outputs[eye]=compact_transport.image(d,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            if(final_xr){d.Width=width;d.Height=height;}
+            if(typeless_output)d.Format=cheeky::fg::color_family(d.Format);
+            compact_outputs[eye]=compact_transport.image(d,final_xr?D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET:D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
             check(bool(compact_outputs[eye]),"Compact physical NGX destination");
-            compact_copies[eye]={compact_outputs[eye]->texture.Get(),compact_outputs[eye]->state,output_layout};
+            compact_copies[eye]={compact_outputs[eye]->texture.Get(),compact_outputs[eye]->state,final_xr?cheeky::fg::CompactLayout{}:output_layout,final_xr};
+            compact_copies[eye].shading_mode=shading_mode;
         }
         std::uint64_t ticket{};check(compact_transport.execute(*context,ticket),"Compact physical capture submission");compact_transport.drain();
         worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
@@ -178,6 +181,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     std::cout << "Actual inputs: center=" << worker.center_width << 'x' << worker.center_height
         << " periphery=" << worker.peripheral_width << 'x' << worker.peripheral_height
         << " method=" << method << " source-depth=" << worker.source_depth_format << " source-motion=" << worker.source_motion_format << '\n';
+    if(final_xr)std::cout<<"Direct periphery shading="<<(worker.focus.coarse_output[0]?(shading_mode==1?"coarse blocks":"coarse filtered"):"full rate")<<'\n';
     std::cout << "Actual center guides=" << center_input.depth->GetDesc().Width << 'x' << center_input.depth->GetDesc().Height;
     if(worker.focus.inputs[0][1].motion)std::cout << " periphery guides=" << worker.focus.inputs[0][1].motion->GetDesc().Width << 'x' << worker.focus.inputs[0][1].motion->GetDesc().Height;
     std::cout << '\n';
@@ -200,7 +204,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(timing.order_samples[0]>0&&timing.order_samples[1]>0,"Both eye execution orders must be exercised");
     // Verify the interpolated texture actually contains the non-black scene.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
-    const auto output_state=compact?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_COMMON;
+    const auto output_state=final_xr?D3D12_RESOURCE_STATE_RENDER_TARGET:compact?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_COMMON;
     const auto desc=outputs[0]->GetDesc();device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT right_footprint{};UINT64 right_bytes{};
     const UINT64 right_offset=(bytes+511)&~UINT64(511);
@@ -226,8 +230,8 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(SUCCEEDED(fence->SetEventOnCompletion(2,event)),"Probe readback completion");
     const auto completed=WaitForSingleObject(event,10000);CloseHandle(event);check(completed==WAIT_OBJECT_0,"Probe readback wait");
     void* data{};check(SUCCEEDED(readback->Map(0,nullptr,&data)),"Probe map");
-    const bool floating=desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const unsigned pixel_x=compact?output_layout.center_width/2:width/2,pixel_y=compact?output_layout.center_height/2:height/2;
+    const bool floating=worker.focus.color_format==DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const unsigned pixel_x=compact&&!final_xr?output_layout.center_width/2:width/2,pixel_y=compact&&!final_xr?output_layout.center_height/2:height/2;
     const auto* pixel=static_cast<const unsigned char*>(data)+footprint.Offset+pixel_y*footprint.Footprint.RowPitch+pixel_x*(floating?8:4);
     if(motion_test){
         double sum{},weight{};const auto* row=static_cast<const unsigned char*>(data)+footprint.Offset+height/2*footprint.Footprint.RowPitch;
@@ -239,9 +243,11 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     std::cout << "Generated center format=" << unsigned(desc.Format) << " bytes: " << unsigned(pixel[0]) << ',' << unsigned(pixel[1]) << ',' << unsigned(pixel[2]) << ',' << unsigned(pixel[3]) << '\n';
     const bool nonblack=floating?(*reinterpret_cast<const unsigned short*>(pixel)>=0x3800):
         (pixel[0]>128&&pixel[0]>pixel[1]*2);
-    if(bgra&&!floating)check(std::abs(int(pixel[1])-89)<=5&&std::abs(int(pixel[2])-63)<=5,
+    if(bgra&&!floating)check(std::abs(int(pixel[1])-(final_xr?26:89))<=5&&std::abs(int(pixel[2])-(final_xr?13:63))<=5,
         "sRGB source must retain encoded colors when converted to RGBA8 inference/output");
-    const auto* edge=static_cast<const unsigned char*>(data)+footprint.Offset+(compact?output_layout.center_height+2:2)*footprint.Footprint.RowPitch+2*(floating?8:4);
+    if(final_xr&&!floating&&!bgra)check(std::abs(int(pixel[1])-26)<=5&&std::abs(int(pixel[2])-13)<=5,
+        "Linear UNORM input must not be gamma-decoded a second time in direct XR output");
+    const auto* edge=static_cast<const unsigned char*>(data)+footprint.Offset+(compact&&!final_xr?output_layout.center_height+2:2)*footprint.Footprint.RowPitch+2*(floating?8:4);
     const bool edge_nonblack=floating?(*reinterpret_cast<const unsigned short*>(edge)>=0x3800):edge[0]>128;
     const auto* right_pixel=static_cast<const unsigned char*>(data)+right_footprint.Offset+pixel_y*right_footprint.Footprint.RowPitch+pixel_x*(floating?8:4);
     const bool right_blue=floating?reinterpret_cast<const unsigned short*>(right_pixel)[2]>=0x3800:

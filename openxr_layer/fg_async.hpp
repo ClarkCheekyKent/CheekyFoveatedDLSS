@@ -22,7 +22,7 @@ struct BufferedPresenter final : Presenter {
     struct Auxiliary {XrSwapchain source{};Image image;};
     struct Native {
         std::uint64_t id{},ready{},epoch{};
-        unsigned capture_mode{},upload_mode{};bool latency_diagnostics{};
+        unsigned capture_mode{},upload_mode{},direct_output_mode{},direct_shading_mode{1};bool latency_diagnostics{};
         TimingClock::time_point captured_at{},handed_off_at{};
         std::array<Image,2> color;
         std::array<ColorReady,2> color_ready;
@@ -59,11 +59,36 @@ struct BufferedPresenter final : Presenter {
         FrameLayers layers;
         std::vector<Auxiliary> auxiliary;
         XrSpace space{};XrEnvironmentBlendMode blend{};
-        bool interpolated{};
+        bool interpolated{},direct_xr{};
     };
+    struct DirectRequest {
+        std::uint64_t epoch{},native_id{};
+        std::array<Image,2> previous;
+        std::array<Worker::OutputCopy,2> targets;
+        DXGI_FORMAT format{};unsigned width{},height{};
+        bool decided{},allowed{},complete{},success{};
+        unsigned deferred_ticks{};
+        ComPtr<ID3D12Fence> fence;std::uint64_t serial{};
+        Pair result;
+    };
+    std::shared_ptr<DirectRequest> direct_request; // Handshake guarded by mx; only presenter calls XR.
+    CheekyFgDirectOutput direct_stats;
+    CheekyFgDirectOutputDetails direct_details;
+    CheekyFgDirectShading shading_stats;
+    CheekyFgDirectOutputDetails logged_direct_details;
+    TimingAverage direct_wait;
+    std::atomic<unsigned> direct_output_mode{};
+    std::atomic<unsigned> direct_shading_mode{1};
+    std::atomic<std::uint64_t> direct_blocked_target{};
+    static std::uint64_t direct_target_key(unsigned w,unsigned h,DXGI_FORMAT format) noexcept {
+        return (std::uint64_t(w)<<32)|(std::uint64_t(h)<<8)|unsigned(format);
+    }
+    CheekyFgDirectOutputFn direct_output_query{};
+    CheekyFgDirectShadingFn direct_shading_query{};
     struct Chain {
         XrSwapchain handle{};std::vector<XrSwapchainImageD3D12KHR> images;D3D12_RESOURCE_DESC desc{};
         std::uint64_t uploaded{}; // Content identity; GPU contexts retain sources only until their upload fence.
+        bool direct_writable{},linear_color{};
     };
     std::condition_variable_any changed;
     std::mutex capture_mutex;
@@ -234,10 +259,16 @@ struct BufferedPresenter final : Presenter {
     CheekyFgMemory memory() const noexcept override {
         auto out=memory_state;out.supported=out.presenter_present=1;return out;
     }
+    CheekyFgDirectOutput direct_output() const noexcept override {
+        auto out=direct_stats;out.supported=1;out.requested=direct_output_mode;return out;
+    }
+    CheekyFgDirectOutputDetails direct_output_details() const noexcept override {auto out=direct_details;out.supported=1;return out;}
+    CheekyFgDirectShading direct_shading() const noexcept override {auto out=shading_stats;out.supported=1;out.requested_mode=direct_shading_mode;return out;}
     void measure_worker_memory() {
         // Single generation worker, after the prior GPU fence retired. Publish
         // only integer snapshots; diagnostic readers never walk live resources.
         const auto now=GetTickCount64();if(now<next_worker_memory)return;
+        output.trim_unused(now);
         CheekyFgMemory value;fg_memory::Collector collect(device.Get());
         value.categories[fg_memory::generated]=output.memory(collect);
         for(const auto& eye:worker.focus.inputs)for(const auto& input:eye){
@@ -369,7 +400,9 @@ struct BufferedPresenter final : Presenter {
         late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
         late_ready_skips=late_idle_skips=0;capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
-        gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;experiment_state={};
+        gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;experiment_state={};direct_request.reset();direct_stats={};direct_wait={};
+        direct_details={};logged_direct_details={};
+        direct_blocked_target=0;
         awaiting_generated_submission=generated_gate_releases=generated_gate_skips=0;
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
@@ -419,6 +452,17 @@ struct BufferedPresenter final : Presenter {
         const auto query=transport_options_query?transport_options_query:runtime?
             reinterpret_cast<CheekyFgTransportOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetTransportOptionsV1")):nullptr;
         CheekyFgTransportOptions options;
+        const auto output_query=direct_output_query?direct_output_query:runtime?
+            reinterpret_cast<CheekyFgDirectOutputFn>(GetProcAddress(runtime,"CheekyFG_GetDirectOutputOptionsV1")):nullptr;
+        CheekyFgDirectOutput direct_options;
+        const auto shading_query=direct_shading_query?direct_shading_query:runtime?
+            reinterpret_cast<CheekyFgDirectShadingFn>(GetProcAddress(runtime,"CheekyFG_GetDirectShadingOptionsV1")):nullptr;
+        CheekyFgDirectShading shading_options;
+        if(shading_query&&shading_query(&shading_options))direct_shading_mode=std::min(shading_options.requested_mode,2u);
+        if(output_query&&output_query(&direct_options)){
+            const unsigned mode=direct_options.requested==1u;
+            if(direct_output_mode.exchange(mode)!=mode)direct_blocked_target=0;
+        }
         if(query&&query(&options)){
             const auto old_color=color_capture_mode.exchange(options.color_capture_mode==1u?1u:0u);
             const auto old_upload=upload_mode.exchange(options.upload_mode==1u?1u:0u);
@@ -555,6 +599,8 @@ struct BufferedPresenter final : Presenter {
             subimages(job->layers,[&](XrSwapchainSubImage& sub){next_plans[sub.swapchain].full_required=true;return true;});
             capture_plans=std::move(next_plans);
             job->capture_mode=color_capture_mode.load();job->upload_mode=upload_mode.load();job->latency_diagnostics=latency_diagnostics!=0;
+            job->direct_output_mode=direct_output_mode.load();
+            job->direct_shading_mode=direct_shading_mode.load();
             auto* c=producer.begin(id,true);
             if(!c){std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;}
             bool good=true;std::uint64_t expected_token{},expected_frame{};bool tokens_match=true;
@@ -717,6 +763,9 @@ struct BufferedPresenter final : Presenter {
                 release_policy_known=true;
             }
             Pair pair;pair.upload_mode=job->upload_mode;pair.native_id=pair.current_id=job->id;pair.native=pair.current=job->color;
+            std::shared_ptr<DirectRequest> direct_job;
+            struct CompleteRequest {BufferedPresenter& owner;std::shared_ptr<DirectRequest>& request;
+                ~CompleteRequest(){if(request){std::lock_guard lock(owner.mx);request->complete=true;owner.changed.notify_all();}}} complete_request{*this,direct_job};
             pair.current_color_ready=job->color_ready;
             pair.native_captured=pair.current_captured=job->captured_at;
             pair.handed_off_at=job->handed_off_at;pair.worker_started_at=TimingClock::now();
@@ -780,7 +829,23 @@ struct BufferedPresenter final : Presenter {
                     auto publication=d;publication.Format=worker.focus.color_format;
                     std::array<Worker::OutputCopy,2> copies;
                     bool available=true;
-                    for(unsigned eye=0;eye<2;++eye) {
+                    const bool blocked_direct=job->direct_output_mode&&direct_blocked_target==direct_target_key(worker.width,worker.height,worker.focus.color_format);
+                    if(blocked_direct){std::lock_guard lock(mx);++direct_stats.fallbacks;++direct_stats.unsupported;direct_stats.last_path=3;}
+                    if(job->direct_output_mode&&!blocked_direct){
+                        const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
+                            return g.peripheral_method<=2&&(g.focus_width<.999f||g.focus_height<.999f);});
+                        if(supported){
+                            direct_job=std::make_shared<DirectRequest>();direct_job->epoch=job->epoch;direct_job->native_id=previous->id;
+                            direct_job->previous=previous->color;direct_job->format=worker.focus.color_format;direct_job->width=worker.width;direct_job->height=worker.height;
+                            std::unique_lock lock(mx);++direct_stats.attempts;direct_request=direct_job;changed.notify_all();
+                            changed.wait(lock,[&]{return stopping||job->epoch!=epoch||direct_job->decided;});
+                            if(direct_job->allowed){copies=direct_job->targets;pair.direct_xr=true;
+                                for(unsigned eye=0;eye<2;++eye){copies[eye].shading_mode=job->direct_shading_mode;pair.generated[eye]=std::make_shared<TransportImage>();
+                                    pair.generated[eye]->texture=copies[eye].texture;pair.generated[eye]->state=copies[eye].state;}}
+                        }else{std::lock_guard lock(mx);++direct_stats.unsupported;++direct_stats.fallbacks;direct_stats.last_path=3;
+                            note_direct_failure_locked(CheekyFgDirectReason::configuration);}
+                    }
+                    for(unsigned eye=0;eye<2&&!pair.direct_xr;++eye) {
                         const auto& g=guides.eyes[eye];
                         const auto layout=compact_layout(worker.width,worker.height,job->color[eye]->layout.packed(),g.focus_width,g.focus_height,
                             g.focus_x,g.focus_y,g.peripheral_percent,g.focus_feather,g.resolution_percent);
@@ -802,6 +867,16 @@ struct BufferedPresenter final : Presenter {
                             pair.generated[eye]->presentation_format=srgb_color(d.Format)&&publication.Format==DXGI_FORMAT_R8G8B8A8_UNORM?
                                 DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:publication.Format;
                         }
+                        if(pair.direct_xr){std::lock_guard lock(mx);
+                            direct_job->fence=worker.fence;direct_job->serial=worker.serial;
+                            if(success){const bool coarse=worker.focus.coarse_output[0]&&worker.focus.coarse_output[1];
+                                shading_stats.valid=1;shading_stats.active_mode=coarse?job->direct_shading_mode:0u;
+                                shading_stats.grid_width=coarse?worker.peripheral_width:worker.width;
+                                shading_stats.grid_height=coarse?worker.peripheral_height:worker.height;
+                                shading_stats.output_width=worker.width;shading_stats.output_height=worker.height;
+                                if(coarse)++shading_stats.coarse_frames;else ++shading_stats.full_frames;}
+                            for(const auto& f:worker.features)if(f.direct)++direct_stats.ngx_direct_eyes;else ++direct_stats.ngx_scratch_eyes;
+                            direct_stats.last_path=worker.features[0].direct&&worker.features[1].direct?1u:2u;}
                     }
                 }
             }
@@ -830,7 +905,9 @@ struct BufferedPresenter final : Presenter {
                 }
                 release_deferred_credit();
                 if(job->epoch!=epoch||degraded){previous.reset();reset_history=true;continue;}
-                ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();
+                if(pair.direct_xr){direct_job->success=success;if(success){++direct_stats.frames;direct_job->result=std::move(pair);}
+                    else{++direct_stats.fallbacks;direct_stats.last_path=3;note_direct_failure_locked(CheekyFgDirectReason::generation);}}
+                else{ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();}
                 if(success)completed_pair_id=job->id;
                 // Once real interpolation is available, briefly stop the
                 // speculative native mailbox from running ahead of its first
@@ -872,19 +949,30 @@ struct BufferedPresenter final : Presenter {
             const bool srgb=srgb_color(d.Format);d.Format=inference_color_format(d.Format);
             if(srgb&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM)d.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         }
-        if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.DepthOrArraySize)) {
+        const auto target_key=direct_target_key(unsigned(d.Width),d.Height,inference_color_format(d.Format));
+        const bool writable=scene&&direct_output_mode==1u&&direct_blocked_target!=target_key;
+        if(writable)d.Format=inference_color_format(d.Format);
+        if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.DepthOrArraySize||chain.direct_writable!=writable)) {
             uploads.drain();xr.destroy(chain.handle);chain={};
         }
         if(chain.handle)return true;
         XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        if(writable)create.usageFlags|=XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
         create.format=d.Format;create.width=unsigned(d.Width);create.height=d.Height;create.arraySize=d.DepthOrArraySize;
         create.sampleCount=create.faceCount=create.mipCount=1;
-        if(XR_FAILED(xr.create(session,&create,&chain.handle)))return false;
+        const auto created=xr.create(session,&create,&chain.handle);
+        if(XR_FAILED(created)){
+            if(!writable)return false;chain.handle={};direct_blocked_target=target_key;
+            {std::lock_guard lock(mx);DirectRequest request;request.width=unsigned(d.Width);request.height=d.Height;request.format=d.Format;
+                note_direct_failure_locked(CheekyFgDirectReason::chain_usage,0,&request,&chain,nullptr,created);}
+            if(trace)trace("FG direct XR: runtime rejected writable scene image; falling back to compact uploads");
+            return ensure_chain(chain,image,scene);
+        }
         unsigned count{};if(XR_FAILED(xr.enumerate(chain.handle,0,&count,nullptr))||!count)return false;
         chain.images.resize(count);for(auto& i:chain.images)i={XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR};
         if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images.data()))))return false;
         next_presenter_memory=0; // Publish newly allocated chains on this presentation, including during startup.
-        chain.desc=d;return true;
+        chain.desc=d;chain.direct_writable=writable;chain.linear_color=writable&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM;return true;
     }
     bool upload_image(Chain& chain,const Image& source,bool scene=false) {
         if(!ensure_chain(chain,source,scene))return false;
@@ -899,7 +987,7 @@ struct BufferedPresenter final : Presenter {
         const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
         {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
         const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images.size()&&
-            uploads.upload(source,chain.images[index].texture,ticks,chain.desc.Format);
+            uploads.upload(source,chain.images[index].texture,ticks,chain.desc.Format,chain.linear_color);
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         const bool released=XR_SUCCEEDED(xr.release(chain.handle,&release));
         if(released&&copied)chain.uploaded=source->identity;
@@ -928,7 +1016,7 @@ struct BufferedPresenter final : Presenter {
             auto* c=uploads.begin(ticks);if(!c){uploads.drain();c=uploads.begin(ticks);}
             good=c!=nullptr;
             if(c){
-                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format)){good=false;break;}
+                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format,item.chain->linear_color)){good=false;break;}
                 if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);}
                 else c->list->Close();
             }
@@ -944,6 +1032,7 @@ struct BufferedPresenter final : Presenter {
         }
         return good;
     }
+    #include "fg_direct_xr.inl"
     void wake_producer_locked() {
         if(clock_pacing_active){changed.notify_all();return;}
         // Early late-selection wake and ordinary submission share one credit.
@@ -1053,7 +1142,7 @@ struct BufferedPresenter final : Presenter {
             waited==ended&&!(credits&&app_waiters)){++late_idle_skips;return;}
         const auto waiting=TimingClock::now();if(waiting>=deadline)return;
         changed.wait_until(lock,deadline,[&]{return stopping||raw||degraded||epoch!=generation||
-            state!=CheekyFgState::generating||completed_pair_id>baseline;});
+            state!=CheekyFgState::generating||completed_pair_id>baseline||(direct_request&&!direct_request->decided);});
         late_pair_wait.add(elapsed_ms(waiting));++late_wait_samples;
         if(completed_pair_id>baseline&&epoch==generation)++late_wait_arrivals;
         else if(!stopping&&!raw&&!degraded&&epoch==generation&&TimingClock::now()>=deadline)++late_wait_timeouts;
@@ -1070,7 +1159,7 @@ struct BufferedPresenter final : Presenter {
         std::vector<std::pair<Chain*,Image>> batch;
         for(unsigned eye=0;eye<2;++eye) {
             auto& chain=scene_chains[eye];
-            if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
+            if(generated&&pair.direct_xr){}else if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
             else if(!upload_image(chain,images[eye],true))return false;
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
             views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
@@ -1112,7 +1201,7 @@ struct BufferedPresenter final : Presenter {
     }
     bool await_content(const Pair& active,bool have_active,bool generated_phase,double position,bool& allow_repeats) {
         std::unique_lock lock(mx);
-        while(!stopping&&!raw&&!submit_repeat_frames&&!fresh_content(active,have_active,generated_phase,position)) {
+        while(!stopping&&!raw&&!submit_repeat_frames&&!(direct_request&&!direct_request->decided)&&!fresh_content(active,have_active,generated_phase,position)) {
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
@@ -1140,12 +1229,19 @@ struct BufferedPresenter final : Presenter {
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(awaiting_generated_submission&&(last_position>=double(awaiting_generated_submission)||frame.shouldRender!=XR_TRUE))
                     finish_generated_gate(awaiting_generated_submission,false);
+                if(frame.shouldRender!=XR_TRUE&&direct_request&&!direct_request->decided){
+                    note_direct_failure_locked(CheekyFgDirectReason::cancelled,0,direct_request.get());
+                    direct_request->decided=true;direct_request.reset();++direct_stats.fallbacks;direct_stats.last_path=3;changed.notify_all();}
                 predicted=frame;telemetry.xr_period_ms=double(frame.predictedDisplayPeriod)/1000000.;
                 xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;changed.notify_all();
             }
             if(allow_repeats&&!generated_phase&&frame.shouldRender==XR_TRUE)wait_for_new_pair(present_start,frame.predictedDisplayPeriod,last_position);
+            Pair direct_pair;
+            const bool have_direct=frame.shouldRender==XR_TRUE&&service_direct_output(last_position,direct_pair);
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
-                if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
+                if(have_direct&&!raw_frame&&!stop_now&&!degraded){active=std::move(direct_pair);have_active=true;generated_phase=true;fg_active=pacing_active=true;
+                    while(!ready.empty()&&ready.front().current_id<=active.current_id)ready.pop_front();}
+                else if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
                     auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {
                         active=std::move(*selected);ready.erase(ready.begin(),std::next(selected));have_active=true;
@@ -1178,7 +1274,9 @@ struct BufferedPresenter final : Presenter {
                 const auto& images=is_generated?active.generated:active.native;
                 const auto& views=is_generated?active.generated_views:active.native_views;
                 repeated=!is_generated&&double(active.native_id)==last_position;
-                submitted=render(active,images,views,is_generated,repeated,frame.predictedDisplayTime,result,closed);
+                // A direct request may wake a tick only to fall back. Fresh-only
+                // mode must not use that wake to resubmit the preceding native.
+                if(allow_repeats||!repeated)submitted=render(active,images,views,is_generated,repeated,frame.predictedDisplayTime,result,closed);
                 if(submitted) {
                     last_position=double(active.native_id)+(is_generated?.5:0.);
                     if(is_generated){active.native=active.current;active.native_views=active.current_views;active.native_id=active.current_id;
@@ -1221,7 +1319,7 @@ struct BufferedPresenter final : Presenter {
                         predicted_samples?gpu_ready_ages[2].mean():-1.,predicted_samples,prediction_late,
                         generated_gate_releases,generated_gate_skips);
                 }
-                if(have_active&&!submitted&&!stop_now&&frame.shouldRender==XR_TRUE){++fallback_count;state=CheekyFgState::presentation_failed;
+                if(have_active&&!submitted&&!stop_now&&frame.shouldRender==XR_TRUE&&(allow_repeats||!repeated)){++fallback_count;state=CheekyFgState::presentation_failed;
                     degraded=true;fg_active=pacing_active=false;awaiting_generated_submission=0;discard_pending();ready.clear();latest_native.reset();have_active=false;generated_phase=false;++epoch;
                     strcpy_s(diagnostic,"Private presentation failed; using coordinated original native submissions");}
                 // Bounded semaphore-equivalent credits. Two prime credits let

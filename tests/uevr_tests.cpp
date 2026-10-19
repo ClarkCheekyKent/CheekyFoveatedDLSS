@@ -111,7 +111,11 @@ void settings_tests(const std::filesystem::path& root) {
             !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
             "Shared game queue is the default; separate GPU queues remain selectable");
         require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==1,"Transport defaults use direct eyes and batched uploads");
-        for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics","FgGuideCaptureMode"})
+        require(fg.fg.direct_xr_output==0,"Direct XR experiment defaults off");
+        require(fg.fg.direct_peripheral_shading==1&&set_named_setting(fg,"FgDirectPeripheralShading","0")&&
+            set_named_setting(fg,"FgDirectPeripheralShading","1")&&set_named_setting(fg,"FgDirectPeripheralShading","2")&&
+            !set_named_setting(fg,"FgDirectPeripheralShading","3")&&!set_named_setting(fg,"FgDirectPeripheralShading","-1"),"Direct periphery shading default and dropdown bounds");
+        for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics","FgGuideCaptureMode","FgDirectXrOutput"})
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
@@ -123,11 +127,12 @@ void settings_tests(const std::filesystem::path& root) {
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
             restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
             restored.fg.release_point==3&&!restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&
-            restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2,"FG settings survive restart");
+            restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1&&
+            restored.fg.direct_peripheral_shading==2,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
             !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
-            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,"FG reset restores the tested preset and opt-out");
+            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2&&restored.fg.direct_peripheral_shading==1,"FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
         require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&
@@ -465,7 +470,16 @@ int main(int argc, char** argv) {
             control.abi=999;
             require(!control_fn(&control),"FG control rejects ABI mismatch");
             control=CheekyFgControl{};
-            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=3\nFgSubmitRepeats=false\nFgColorCaptureMode=1\nFgUploadMode=1\nFgLatencyDiagnostics=0\nFgQueuePriority=2");
+            command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=3\nFgSubmitRepeats=false\nFgColorCaptureMode=1\nFgUploadMode=1\nFgLatencyDiagnostics=0\nFgQueuePriority=2\nFgDirectXrOutput=1");
+            const auto direct_fn=reinterpret_cast<CheekyFgDirectOutputFn>(GetProcAddress(runtime,"CheekyFG_GetDirectOutputOptionsV1"));
+            CheekyFgDirectOutput direct;require(direct_fn&&direct_fn(&direct)&&direct.requested&&
+                snapshot(get).find("\"direct_output\":{")!=std::string::npos,"Direct XR Lua option reaches runtime export and diagnostics");
+            direct.abi=999;require(!direct_fn(&direct)&&!direct_fn(nullptr),"Direct output options validate ABI and pointer");
+            command("1\n906\nset\nFgDirectPeripheralShading=2");
+            const auto shading_fn=reinterpret_cast<CheekyFgDirectShadingFn>(GetProcAddress(runtime,"CheekyFG_GetDirectShadingOptionsV1"));
+            CheekyFgDirectShading shading;require(shading_fn&&shading_fn(&shading)&&shading.requested_mode==2&&
+                snapshot(get).find("\"FgDirectPeripheralShading\":2")!=std::string::npos,"Lua shading mode reaches runtime options");
+            shading.size=0;require(!shading_fn(&shading)&&!shading_fn(nullptr),"Shading options validate ABI size and pointer");
             const auto transport_fn=reinterpret_cast<CheekyFgTransportOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetTransportOptionsV1"));
             CheekyFgTransportOptions options;require(transport_fn&&transport_fn(&options)&&options.color_capture_mode==1&&
                 options.upload_mode==1&&options.latency_diagnostics==0,"Lua transport options reach real runtime bridge");
@@ -485,6 +499,9 @@ int main(int argc, char** argv) {
             require(fg_test_hook_installs==4&&fg_test_hook_targets.size()==2,"Reload restores the plugin frame hooks");
             require(control_fn(&control) && control.enabled,"Host re-enable restores FG preference");
             command("1\n902\ndefaults_fg");
+            direct=CheekyFgDirectOutput{};require(direct_fn(&direct)&&!direct.requested&&
+                snapshot(get).find("\"FgDirectXrOutput\":0")!=std::string::npos,"FG reset disables the direct XR experiment");
+            shading=CheekyFgDirectShading{};require(shading_fn(&shading)&&shading.requested_mode==1,"FG reset restores coarse block shading");
             options=CheekyFgTransportOptions{};require(transport_fn(&options)&&options.color_capture_mode==1&&
                 options.upload_mode==1&&options.latency_diagnostics==1&&snapshot(get).find("\"FgReleasePoint\":3")!=std::string::npos&&
                 snapshot(get).find("\"FgSubmitRepeats\":false")!=std::string::npos,"Tested defaults reset live settings");

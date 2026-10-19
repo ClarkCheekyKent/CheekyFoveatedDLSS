@@ -8,6 +8,9 @@ bool fg_cadence(CheekyFgCadence&) noexcept;
 bool fg_overhead(CheekyFgOverhead&) noexcept;
 bool fg_presentation(CheekyFgPresentation&) noexcept;
 bool fg_experiment_diagnostics(CheekyFgExperimentDiagnostics&) noexcept;
+bool fg_direct_output_diagnostics(CheekyFgDirectOutput&) noexcept;
+bool fg_direct_output_details(CheekyFgDirectOutputDetails&) noexcept;
+bool fg_direct_shading_diagnostics(CheekyFgDirectShading&) noexcept;
 bool fg_memory_diagnostics(CheekyFgMemory&) noexcept;
 const char* fg_state_name(CheekyFgState state) noexcept;
 }

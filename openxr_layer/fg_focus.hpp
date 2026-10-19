@@ -17,9 +17,11 @@ struct FocusInput {
     bool borrowed_guides{};
 };
 struct FocusPipeline {
+    struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};unsigned shading_mode{1};};
     DXGI_FORMAT color_format{DXGI_FORMAT_R16G16B16A16_FLOAT};
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> prepare,peripheral,compose,pack;
+    ComPtr<ID3D12PipelineState> prepare,peripheral,peripheral_coarse,peripheral_coarse2,peripheral_coarse4,peripheral_blocks,peripheral_blocks2,peripheral_blocks4,compose,pack;
+    std::array<bool,2> coarse_output{};
     ComPtr<ID3D12DescriptorHeap> descriptors;
     unsigned stride{};
     FocusInput inputs[2][2]; // eye, center/full or periphery
@@ -35,7 +37,7 @@ struct FocusPipeline {
         ID3D12Resource* previous,ID3D12Resource* current,const CheekyFgEye&,const Camera&,
         D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
         ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON,
-        const CompactLayout* destination_layout=nullptr);
+        const CompactLayout* destination_layout=nullptr,const FinalOutput* final_output=nullptr);
     bool compose_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect&,unsigned width,unsigned height,
         ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON);

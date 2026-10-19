@@ -16,10 +16,10 @@ using Microsoft::WRL::ComPtr;
 using NgxParameters=NVSDK_NGX_Parameter;
 struct Worker {
     struct Feature {NVSDK_NGX_Handle* handle{}; NgxParameters* params{};ComPtr<ID3D12Resource> output,disable,readback;
-        ID3D12Resource* target{};unsigned width{},height{},eye{},offset_y{};bool direct{},direct_rejected{};
+        ID3D12Resource* target{};unsigned width{},height{},eye{},offset_x{},offset_y{};bool direct{},direct_rejected{},xr_direct_rejected{};
         Matrix view_to_clip,clip_to_camera,clip_to_prev,prev_clip_to_clip,lens;
     };
-    struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;};
+    struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;bool final_xr{};unsigned shading_mode{1};};
     using Init=decltype(&NVSDK_NGX_D3D12_Init_with_ProjectID);
     using Caps=decltype(&NVSDK_NGX_D3D12_GetCapabilityParameters);
     Init init{}; Caps capabilities{};

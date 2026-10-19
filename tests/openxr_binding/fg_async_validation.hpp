@@ -17,6 +17,13 @@ struct Runtime {
     static inline unsigned image_releases{};
     static inline CheekyFgPair guides;
     static inline CheekyFgTransportOptions options;
+    static inline std::atomic<unsigned> direct_mode{};
+    static inline std::atomic<unsigned> shading_mode{1};
+    static inline std::atomic<bool> reject_writable{};
+    static inline std::atomic<bool> typeless_writable{},omit_writable_flag{};
+    static inline std::unordered_map<XrSwapchain,unsigned> direct_states;
+    static bool __cdecl direct_options(CheekyFgDirectOutput* out){out->requested=direct_mode.load();return true;}
+    static bool __cdecl shading_options(CheekyFgDirectShading* out){out->requested_mode=shading_mode.load();return true;}
     static inline std::uint64_t predicted_qpc{};
     static inline std::atomic<bool> block_generated_end{},generated_end_entered{},allow_generated_end{};
     static bool __cdecl transport_options(CheekyFgTransportOptions* out){*out=options;return true;}
@@ -52,12 +59,18 @@ struct Runtime {
     }
     static XrResult XRAPI_PTR create(XrSession,const XrSwapchainCreateInfo* info,XrSwapchain* handle) {
         if(reject_private)return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+        if(reject_writable&&(info->usageFlags&XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT))return XR_ERROR_FEATURE_UNSUPPORTED;
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=info->width;d.Height=info->height;
         d.DepthOrArraySize=UINT16(info->arraySize);d.MipLevels=1;d.SampleDesc.Count=1;d.Format=DXGI_FORMAT(info->format);
         d.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        if(info->usageFlags&XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT){
+            if(!omit_writable_flag)d.Flags|=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if(typeless_writable)d.Format=cheeky::fg::color_family(d.Format);
+        }
         ComPtr<ID3D12Resource> texture;
         if(FAILED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&texture))))return XR_ERROR_RUNTIME_FAILURE;
-        *handle=h<XrSwapchain>(1000+next_chain++);chains[*handle]=std::move(texture);return XR_SUCCESS;
+        *handle=h<XrSwapchain>(1000+next_chain++);chains[*handle]=std::move(texture);
+        if(info->usageFlags&XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT)direct_states[*handle]=0;return XR_SUCCESS;
     }
     static XrResult XRAPI_PTR enumerate(XrSwapchain sc,unsigned capacity,unsigned* count,XrSwapchainImageBaseHeader* data) {
         *count=1;if(capacity)reinterpret_cast<XrSwapchainImageD3D12KHR*>(data)[0].texture=chains.at(sc).Get();return XR_SUCCESS;
@@ -84,10 +97,18 @@ struct Runtime {
     static cheeky::fg::XrFns functions() {
         cheeky::fg::XrFns f;f.wait_frame=wait;f.begin_frame=begin;f.end_frame=end;f.create=create;f.enumerate=enumerate;
         f.time_instance=h<XrInstance>(1);f.time_to_qpc=[](XrInstance,XrTime,LARGE_INTEGER* qpc){qpc->QuadPart=predicted_qpc;return XR_SUCCESS;};
-        f.destroy=[](XrSwapchain sc){chains.erase(sc);return XR_SUCCESS;};
-        f.acquire=[](XrSwapchain,const XrSwapchainImageAcquireInfo*,unsigned* i){*i=0;return XR_SUCCESS;};
-        f.wait_image=[](XrSwapchain,const XrSwapchainImageWaitInfo*){return XR_SUCCESS;};
-        f.release=[](XrSwapchain,const XrSwapchainImageReleaseInfo*){
+        f.destroy=[](XrSwapchain sc){direct_states.erase(sc);chains.erase(sc);return XR_SUCCESS;};
+        f.acquire=[](XrSwapchain sc,const XrSwapchainImageAcquireInfo*,unsigned* i){
+            if(auto state=direct_states.find(sc);state!=direct_states.end()){
+                if(state->second||owner!=GetCurrentThreadId())++errors;state->second=1;}
+            *i=0;return XR_SUCCESS;};
+        f.wait_image=[](XrSwapchain sc,const XrSwapchainImageWaitInfo*){
+            if(auto state=direct_states.find(sc);state!=direct_states.end()){
+                if(state->second!=1||owner!=GetCurrentThreadId())++errors;state->second=2;}
+            return XR_SUCCESS;};
+        f.release=[](XrSwapchain sc,const XrSwapchainImageReleaseInfo*){
+            if(auto state=direct_states.find(sc);state!=direct_states.end()){
+                if(state->second!=2||owner!=GetCurrentThreadId())++errors;state->second=0;}
             if(upload_serial&&*upload_serial<required_upload_serial)++errors;
             ++image_releases;return XR_SUCCESS;};return f;
     }
@@ -558,7 +579,8 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     auto depth=texture(1,DXGI_FORMAT_R32_TYPELESS,DXGI_FORMAT_R32_FLOAT,z);
     auto motion=texture(2,DXGI_FORMAT_R16G16_FLOAT,DXGI_FORMAT_R16G16_FLOAT,zero);execute();
     cheeky::fg::BufferedPresenter p;check(p.setup(h<XrSession>(2),Runtime::functions(),device,queue.Get()),"Buffered presenter setup");
-    Runtime::options={};p.transport_options_query=Runtime::transport_options;
+    Runtime::options={};Runtime::direct_mode=0;Runtime::reject_writable=false;Runtime::typeless_writable=Runtime::omit_writable_flag=false;
+    p.transport_options_query=Runtime::transport_options;p.direct_output_query=Runtime::direct_options;p.direct_shading_query=Runtime::shading_options;Runtime::shading_mode=1;
     cheeky::foveated_dlss::FgSnapshots snapshots;
     if(models) {
         p.trace=Runtime::trace;
@@ -653,6 +675,46 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                 "Physical FG records valid GPU-ready ages and calibrated timelines in every transport mode");}
         check(!capture_mode||p.direct_eye_copies>direct_before,"Live projection learns direct eye capture layout");
         std::cout<<"PASS live transport experiment: capture="<<capture_mode<<" upload="<<upload_mode<<"\n";
+    }
+    if(models&&method<=2){
+        Runtime::guides.release_point=3;Runtime::guides.submit_repeats=0;
+        auto frames=[&](unsigned count){for(unsigned frame=0;frame<count;++frame){
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Direct XR toggle frame");
+            end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
+            check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
+                XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Direct XR output keeps presenting");}};
+        Runtime::direct_mode=1;frames(40);
+        {std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return !p.inflight_id&&p.pending.empty();}),"Direct XR retirement");
+            const auto direct=p.direct_output();std::cout<<"Direct XR: frames="<<direct.frames<<" attempts="<<direct.attempts<<" fallback="<<direct.fallbacks<<" unsupported="<<direct.unsupported<<" not_ready="<<direct.not_ready<<" NGX direct/scratch="<<direct.ngx_direct_eyes<<'/'<<direct.ngx_scratch_eyes<<'\n';
+            check(direct.requested&&direct.frames>0&&direct.ngx_direct_eyes+direct.ngx_scratch_eyes>=direct.frames*2,"Direct XR toggle must change the actual generated destination");}
+        for(unsigned point:{0u,1u,2u,3u}){Runtime::guides.release_point=point;frames(8);}
+        for(unsigned mode:{0u,2u,1u}){Runtime::shading_mode=mode;frames(10);
+            std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return !p.inflight_id&&p.pending.empty();}),"Shading toggle retirement");
+            const auto shading=p.direct_shading();
+            check(shading.valid&&shading.requested_mode==mode&&shading.active_mode==mode&&shading.output_width==width&&
+                shading.grid_width==(mode?p.worker.peripheral_width:width),"Live shading toggle must change actual GPU grid and mode");}
+        Runtime::direct_mode=0;frames(6);
+        std::uint64_t direct_before{},repeats_before{};{std::lock_guard lock(p.mx);direct_before=p.direct_stats.frames;}
+        Runtime::typeless_writable=true;Runtime::direct_mode=1;frames(24);
+        {std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return !p.inflight_id&&p.pending.empty();}),"Typeless direct XR retirement");
+            check(p.direct_stats.frames>direct_before+10,"Compatible typeless XR images must use actual direct generation");}
+        Runtime::direct_mode=0;frames(6);Runtime::omit_writable_flag=true;Runtime::direct_mode=1;
+        {std::lock_guard lock(p.mx);repeats_before=p.repeated_presentations;}
+        frames(12);
+        {std::lock_guard lock(p.mx);const auto d=p.direct_output_details();
+            check(d.reason==CheekyFgDirectReason::image_usage&&d.expected_format==28&&d.image_format==27&&!(d.image_flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                "Real backing-image rejection must report missing UAV flags and compatible typeless format");
+            check(p.repeated_presentations==repeats_before,"A failed direct-output request must not bypass fresh-only policy");}
+        std::uint64_t blocked_attempts{};{std::lock_guard lock(p.mx);blocked_attempts=p.direct_stats.attempts;}
+        frames(6);{std::lock_guard lock(p.mx);check(p.direct_stats.attempts==blocked_attempts,
+            "Unsupported backing images must use cached fallback without another XR acquisition handshake per native frame");}
+        Runtime::direct_mode=0;frames(6);Runtime::omit_writable_flag=false;Runtime::typeless_writable=false;
+        Runtime::reject_writable=true;Runtime::direct_mode=1;frames(12);
+        {std::lock_guard lock(p.mx);check(p.direct_output().unsupported>0,"Unsupported writable swapchain falls back");}
+        Runtime::direct_mode=0;Runtime::reject_writable=false;frames(6);
+        std::cout<<"PASS typeless direct XR generation, detailed backing-flags rejection and zero repeat submissions during fallback\n";
+        std::cout<<"PASS physical direct XR output: live ON/OFF, shared native/generated chains, unsupported writable image fallback\n";
     }
     if(models)for(bool diagnostics:{false,true}){
         Runtime::options.latency_diagnostics=diagnostics?1u:0u;
