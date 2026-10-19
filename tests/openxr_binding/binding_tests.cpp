@@ -1,7 +1,9 @@
 // Exercise production interceptors with a downstream runtime; no headset needed.
 #include <d3d12.h>
 void fg_barrier_observer(ID3D12Resource*,D3D12_RESOURCE_STATES,D3D12_RESOURCE_STATES);
+void fg_submission_observer(bool);
 #define CHEEKY_FG_BARRIER_OBSERVER fg_barrier_observer
+#define CHEEKY_FG_SUBMISSION_OBSERVER fg_submission_observer
 #include "../../openxr_layer/openxr_layer.cpp"
 #include <iostream>
 #include <stdexcept>
@@ -11,9 +13,11 @@ void fg_barrier_observer(ID3D12Resource*,D3D12_RESOURCE_STATES,D3D12_RESOURCE_ST
 #include "../../src/fg_snapshot.hpp"
 namespace {
 bool observe_fg_barriers{};
+bool fg_observed_generated{};
 unsigned fg_barrier_errors{};
 std::unordered_map<ID3D12Resource*,D3D12_RESOURCE_STATES> fg_expected_states;
 }
+void fg_submission_observer(bool generated) {fg_observed_generated=generated;}
 void fg_barrier_observer(ID3D12Resource* texture,D3D12_RESOURCE_STATES from,D3D12_RESOURCE_STATES to) {
     if(!observe_fg_barriers)return;
     auto [it,inserted]=fg_expected_states.try_emplace(texture,D3D12_RESOURCE_STATE_COMMON);
@@ -468,6 +472,7 @@ void fg_toggle_test() {
 #include "fg_periphery_validation.hpp"
 #include "fg_async_validation.hpp"
 #include "fg_compact_validation.hpp"
+#include "fg_prepared_validation.hpp"
 #include "fg_snapshot_validation.hpp"
 void fg_copy_validation_test() {
     using Microsoft::WRL::ComPtr;
@@ -729,6 +734,7 @@ void fg_copy_validation_test() {
     observe_fg_barriers=false;
     fg_snapshot_validation(device.Get());
     fg_compact_validation(device.Get());
+    fg_prepared_validation(device.Get());
     fg_buffered_validation(device.Get());
     for(auto* texture:{source.Get(),targets[0].Get(),targets[1].Get()})
         check(fg_expected_states[texture]==D3D12_RESOURCE_STATE_RENDER_TARGET,"OpenXR image must be restored to RENDER_TARGET");
@@ -769,13 +775,13 @@ int main(int argc,char** argv) {
                 fg_probe_legacy_mvec=argc>3&&std::string(argv[3])=="identity-mv";
                 const bool ready=worker.probe(device.Get(),directory.c_str());
                 std::cout << "Frame generation capability: " << (ready?"AVAILABLE":"UNAVAILABLE") << '\n';
-                if(ready&&std::string(argv[1])=="--fg-buffered")fg_buffered_validation(device.Get(),directory.c_str(),argc>3?unsigned(std::stoul(argv[3])):2u);
+                if(ready&&std::string(argv[1])=="--fg-buffered")fg_buffered_validation(device.Get(),directory.c_str(),argc>3?unsigned(std::stoul(argv[3])):2u,argc>4&&std::string(argv[4])=="prepared");
                 if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,false,2,100,50,false,512,512,true);
                 if(ready&&std::string(argv[1])=="--fg-generate")fg_hardware_probe(worker,device.Get(),argc>3&&std::string(argv[3])=="bgra",argc>4&&std::string(argv[4])=="foveated",
                     argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
                     argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&(std::string(argv[8])=="game-guides"||std::string(argv[8])=="full-guides"),
                     argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u,
-                    false,argc>8&&std::string(argv[8])=="full-guides");
+                    false,argc>8&&std::string(argv[8])=="full-guides",argc>12&&std::string(argv[12])=="compact",argc>13&&std::string(argv[13])=="prepared");
                 return ready?0:2;
             }
             throw std::runtime_error("No NVIDIA adapter found");

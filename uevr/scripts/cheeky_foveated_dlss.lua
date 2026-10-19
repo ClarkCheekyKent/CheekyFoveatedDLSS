@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -238,11 +238,11 @@ local function fg_resource_memory(id, r)
     item("Native color / capture pool","capture",capture)
     item("Generated output pool","generated",worker)
     item("Upload transport pool","upload_pool",presenter)
-    item("Captured depth guides","guide_depth",r.guides_supported)
-    item("Captured motion guides","guide_motion",r.guides_supported)
+    item("Captured depth guides (raw/prepared)","guide_depth",r.guides_supported)
+    item("Captured motion guides (raw/prepared)","guide_motion",r.guides_supported)
     item("Prepared FG color","prepared_color",worker)
-    item("Prepared FG depth","prepared_depth",worker)
-    item("Prepared FG motion","prepared_motion",worker)
+    item("Worker-owned prepared depth","prepared_depth",worker)
+    item("Worker-owned prepared motion","prepared_motion",worker)
     item("NGX output textures + flags","ngx_outputs",worker)
     item("Periphery + depth history","periphery",worker)
     item("Composition scratch","composition",worker)
@@ -260,6 +260,7 @@ local function fg_resource_memory(id, r)
     if not r.layer_supported then text("Partial breakdown: update OpenXR support for presenter resources.") end
     if (r.unknown_resources or 0)>0 then text("Some resource sizes are unavailable; totals omit those sizes.") end
     text("Unique resource allocation sizes, not resident VRAM. XR images are estimates; borrowed game textures are excluded.")
+    text("Prepared guide captures are counted in captured rows; borrowed guides add no worker-owned allocation.")
     text("Reusable pools are a subset of the totals. They are retained allocations, not extra copies per reference.")
     text("Does not measure NVIDIA internal workspace, command/descriptor storage or driver overhead; do not subtract from DXGI usage to infer NVIDIA's share.")
     imgui.tree_pop()
@@ -613,6 +614,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     check("Submit repeat frames", "FgSubmitRepeats")
                     text("OFF submits fresh content only; the runtime handles repeats. Native pacing continues independently.")
                 end
+                if draft.FgGuideCaptureMode ~= nil then
+                    combo("FG guide capture", "FgGuideCaptureMode", {[0]="Raw snapshots (baseline)", [1]="Prepared FG layouts"})
+                    text("Prepared capture stores only the center/periphery depth and motion grids. Restart for a clean VRAM A/B baseline.")
+                end
                 if draft.FgCompactStorage ~= nil then
                     combo("FG frame storage", "FgCompactStorage", {[0]="Full-resolution frames", [1]="Compact center + periphery"})
                     text("Compact storage keeps a sharp native center; native and generated peripheral detail follows Periphery scale.")
@@ -727,7 +732,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             end
                             text("Additional GPU stages outside the processing subtotal:")
                             rows("fg_transport_gpu", {
-                                {"Guide snapshot copies / native",stage(extra.guide_samples,extra.guide_ms,extra.guide_last_ms)},
+                                {"Guide capture / preparation / native",stage(extra.guide_samples,extra.guide_ms,extra.guide_last_ms)},
                                 {"Capture + guide handoff / native",stage(extra.capture_samples,extra.capture_ms,extra.capture_last_ms)},
                                 {"Generated output copy / generated",stage(extra.publication_samples,extra.publication_ms,extra.publication_last_ms)},
                                 {"OpenXR uploads / presentation",stage(extra.upload_samples,extra.upload_ms,extra.upload_last_ms)}})

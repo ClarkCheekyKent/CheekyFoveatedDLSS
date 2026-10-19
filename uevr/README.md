@@ -164,6 +164,32 @@ GPU after preceding work on the game queue, so dependency time may move into
 queue-entry time; compare their sum rather than expecting both fields to fall.
 These are scheduling experiments, not an established fix for gameplay slowdown.
 
+## Prepared FG guide capture
+
+**FG guide capture** selects **Prepared FG layouts** (default) or **Raw snapshots
+(baseline)**. Prepared capture normalizes depth and motion immediately after the
+native DLSS evaluation, retaining only the center and required peripheral guide
+grids. Inference borrows those exact allocations under the stereo frame lease;
+it does not allocate or normalize another guide set. Center guides keep 32-bit
+precision; peripheral guides retain the selected precision and algorithm.
+
+Install the matching plugin/runtime/Lua files and OpenXR installer, then restart
+the game. This changes the guide-pair ABI. For clean memory comparisons, restart
+after changing modes and keep the same scene and quality settings. Captured guide
+rows include producer-prepared allocations; worker-owned depth/motion should
+show zero in prepared mode. An unsupported source layout falls back to raw
+capture. Logs report prepared/raw/fallback eye counts, allocated and leased eye
+slots, actual bytes and equivalent raw snapshot bytes. Cold, unleased snapshots
+are reclaimed after their producer fence completes; no game-thread wait is added.
+
+Savings depend on the number of live eye slots and guide dimensions. For the
+reported 198.8 MiB raw snapshots plus 53.2 MiB worker guide preparation, four
+prepared eye slots would require about 106.4 MiB, a provisional 145.6 MiB saving.
+Larger in-flight pools reduce that saving; allocation counters establish the
+actual result. GPU pixel comparisons cover all periphery methods, 16/32-bit
+guides, source crops, jitter, invalid vectors and reused engine textures. Real
+NGX generation and sustained queue/release-policy checks also pass.
+
 ## GPU memory diagnostics
 
 Lua's FG diagnostics and Performance section report the render adapter/node's

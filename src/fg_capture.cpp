@@ -92,7 +92,7 @@ bool enabled() noexcept {
 }
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{unsigned(s.foveated),s.compact_storage,s.resolution_percent,s.peripheral_percent,
+    for(const auto n:{unsigned(s.foveated),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
         s.peripheral_method,s.depth_bits,s.motion_bits,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
@@ -198,6 +198,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
+    m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
     m.configuration=configuration(settings.fg);
     std::lock_guard lock(mutex);
     if(snapshots().record(cmd,m)){++captured_guides;last_guide_frame=render_frame;}
@@ -310,6 +311,14 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFg
     using namespace cheeky::foveated_dlss;
     *out=CheekyFgMemory{};std::lock_guard lock(mutex);cheeky::fg_memory::Collector collect;
     for(const auto& generation:store().generations)generation->memory(*out,collect);
+    static std::uint64_t next_diagnostic{};const auto now=GetTickCount64();
+    if(now>=next_diagnostic){
+        std::uint64_t prepared{},raw{},fallbacks{},equivalent{};unsigned slots{},leased{};
+        for(const auto& generation:store().generations)generation->guide_diagnostics(prepared,raw,fallbacks,slots,leased,equivalent);
+        const auto actual=out->categories[cheeky::fg_memory::guide_depth].bytes+out->categories[cheeky::fg_memory::guide_motion].bytes;
+        trace_event("FG guide capture prepared_eyes=%llu raw_eyes=%llu fallbacks=%llu allocated_eye_slots=%u consumer_leased_eyes=%u actual_bytes=%llu equivalent_raw_snapshot_bytes=%llu (worker prepared rows exclude borrowed guides)",
+            prepared,raw,fallbacks,slots,leased,actual,equivalent);next_diagnostic=now+1000;
+    }
     out->guides_supported=1;out->guide_tick=GetTickCount64();return true;
 }
 extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(ID3D12Resource* color) noexcept {
@@ -335,7 +344,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
 }
 extern "C" __declspec(dllexport) void __cdecl CheekyFG_ReleasePair(CheekyFgPair* p) noexcept {
     if(!p||p->abi!=CHEEKY_FG_PAIR_ABI)return;
-    for(auto& eye:p->eyes){if(eye.depth)eye.depth->Release();if(eye.motion)eye.motion->Release();eye={};}
+    for(auto& eye:p->eyes){for(auto* resource:{eye.depth,eye.motion,eye.peripheral_depth,eye.peripheral_motion})if(resource)resource->Release();eye={};}
     if(p->producer_queue)p->producer_queue->Release();p->producer_queue=nullptr;
     if(p->lease)p->lease->Release();p->lease=nullptr;
 }

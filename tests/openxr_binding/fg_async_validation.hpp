@@ -42,7 +42,7 @@ struct Runtime {
             if(!chains.contains(sc)||quad->size.width!=1||quad->subImage.swapchain==h<XrSwapchain>(201))++errors;
             else {
                 ++scenes;auto* tex=chains.at(sc).Get();
-                if(tex->GetDesc().Format==DXGI_FORMAT_R16G16B16A16_FLOAT||tex->GetDesc().Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB){
+                if(fg_observed_generated){
                     ++generated;if(block_generated_end){generated_end_entered=true;while(!allow_generated_end)Sleep(1);}
                 }
                 else last_native=tex;
@@ -79,7 +79,7 @@ struct Runtime {
         for(auto& eye:out->eyes)eye.render_frame=out->render_frame;return true;
     }
     static void __cdecl release_guides(CheekyFgPair* pair) {
-        if(pair->lease){for(auto& eye:pair->eyes){eye.depth->Release();eye.motion->Release();}pair->producer_queue->Release();pair->lease->Release();}
+        if(pair->lease){for(auto& eye:pair->eyes)for(auto* resource:{eye.depth,eye.motion,eye.peripheral_depth,eye.peripheral_motion})if(resource)resource->Release();pair->producer_queue->Release();pair->lease->Release();}
     }
     static cheeky::fg::XrFns functions() {
         cheeky::fg::XrFns f;f.wait_frame=wait;f.begin_frame=begin;f.end_frame=end;f.create=create;f.enumerate=enumerate;
@@ -497,7 +497,7 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
     std::cout<<"PASS FG preparation milestone and independent native clock without XR submissions\n";
 }
 
-void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,unsigned method=2) {
+void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,unsigned method=2,bool prepared_capture=false) {
     using namespace buffered_probe;
     using Microsoft::WRL::ComPtr;
     fg_presentation_timing_validation(device);fg_latency_validation(device);
@@ -566,7 +566,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         Runtime::guides={};Runtime::guides.producer_queue=queue.Get();
         for(auto& eye:Runtime::guides.eyes){eye.depth=depth.Get();eye.motion=motion.Get();eye.width=eye.height=width;
             eye.depth_width=eye.depth_height=eye.motion_width=eye.motion_height=width/2;
-            eye.focus_width=.55f;eye.focus_height=.45f;eye.peripheral_method=method;eye.configuration=123;}
+            eye.focus_width=.55f;eye.focus_height=.45f;eye.peripheral_method=method;eye.configuration=123;eye.guide_capture_mode=prepared_capture?1u:0u;}
         p.guide_acquire=Runtime::acquire_guides;p.guide_release=Runtime::release_guides;p.guide_stamp=Runtime::stamp;
         check(snapshots.initialize(queue.Get()),"Real FG guide snapshot queue");Runtime::snapshots=&snapshots;
     }
@@ -852,7 +852,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             "Actual buffered capture and XR images publish independent resource memory categories");
         if(models)check(memory.worker_tick&&memory.categories[cheeky::fg_memory::generated].bytes>0&&
             memory.categories[cheeky::fg_memory::prepared_color].bytes>0&&memory.categories[cheeky::fg_memory::ngx_outputs].bytes>0&&
-            memory.categories[cheeky::fg_memory::composition].bytes==0&&memory.categories[cheeky::fg_memory::swapchain_generated].bytes>0,
+            memory.categories[cheeky::fg_memory::composition].bytes==0&&memory.categories[cheeky::fg_memory::swapchain_generated].bytes==0,
             "Real NGX reports output/preparation memory with zero duplicate direct-publication composition scratch");
         check(extra.supported&&extra.capture_samples>0&&extra.upload_samples>0&&extra.capture_ms>0&&extra.upload_ms>0,
             "Actual capture/handoff and presentation-upload GPU queries must retire without adding CPU waits");
@@ -860,6 +860,17 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             "Foveated FG must compose directly into its leased output without a second full-frame publication copy");
         std::cout<<"GPU stages: capture/handoff="<<extra.capture_ms<<" ms/native, OpenXR upload="<<extra.upload_ms
             <<" ms/presentation, generated copy="<<extra.publication_ms<<" ms/generated\n";
+        if(prepared_capture){
+            check(memory.categories[cheeky::fg_memory::prepared_depth].bytes==0&&memory.categories[cheeky::fg_memory::prepared_motion].bytes==0,
+                "Borrowed producer guides must not remain allocated/countable as worker-owned preparation");
+            CheekyFgMemory inventory;cheeky::fg_memory::Collector collect(device);snapshots.memory(inventory,collect);
+            std::uint64_t prepared{},raw{},fallbacks{},equivalent{};unsigned slots{},leased{};
+            snapshots.guide_diagnostics(prepared,raw,fallbacks,slots,leased,equivalent);
+            const auto actual=inventory.categories[cheeky::fg_memory::guide_depth].bytes+inventory.categories[cheeky::fg_memory::guide_motion].bytes;
+            check(prepared>0&&raw==0&&fallbacks==0&&actual>0,"Sustained physical capture must prepare every eye without raw fallback");
+            std::cout<<"Prepared guide inventory: eye_slots="<<slots<<" leased="<<leased<<" actual_bytes="<<actual
+                <<" equivalent_raw_bytes="<<equivalent<<" worker_guide_bytes=0\n";
+        }
         const auto age=p.presentation();
         check(age.native_samples>0&&age.native_age_ms>0,"Real immutable native captures must retain their timestamps until runtime submission");
         if(models)check(age.generated_samples>0&&age.generated_age_ms>=age.newest_input_age_ms&&p.late_ready_skips>0&&
@@ -892,8 +903,8 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         check(timing.order_samples[0]>0&&timing.order_samples[1]>0&&
             timing.order_detail_samples[0]>0&&timing.order_detail_samples[1]>0,
             "Buffered comparison must sample both left-first and right-first execution orders");
-        check(p.worker.source_depth_format==unsigned(depth->GetDesc().Format)&&
-              p.worker.source_motion_format==unsigned(motion->GetDesc().Format),
+        check(p.worker.source_depth_format==unsigned(prepared_capture?DXGI_FORMAT_R32_FLOAT:depth->GetDesc().Format)&&
+              p.worker.source_motion_format==unsigned(prepared_capture?DXGI_FORMAT_R32G32_FLOAT:motion->GetDesc().Format),
             "Buffered FG must consume the original leased guide snapshots without an intermediate full-guide conversion");
     }
     // Read a runtime image after the asynchronous upload queue has drained.
@@ -911,7 +922,9 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     commands->CopyTextureRegion(&to,0,0,0,&from,nullptr);
     cheeky::fg::color_transition(commands.Get(),image,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_RENDER_TARGET);execute();
     void* data{};readback->Map(0,nullptr,&data);const auto* pixel=static_cast<unsigned char*>(data)+footprint.Offset;
-    const bool red_image=pixel[0]==0&&pixel[1]==0&&pixel[2]==255;readback->Unmap(0,nullptr);check(red_image,"Asynchronous native upload must preserve actual scene pixels");
+    const bool rgba=cheeky::fg::color_family(desc.Format)==DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    const bool red_image=rgba?(pixel[0]==255&&pixel[1]==0&&pixel[2]==0):(pixel[0]==0&&pixel[1]==0&&pixel[2]==255);
+    readback->Unmap(0,nullptr);check(red_image,"Asynchronous native upload must preserve actual scene pixels");
     std::cout<<"PASS buffered "<<(models?"physical NGX":"WARP native")<<": independent frame owner, blocked-GPU handoff max "<<maximum_handoff
         <<" ms, native submissions="<<Runtime::scenes<<" generated="<<Runtime::generated<<" skipped="<<p.skipped<<"; owned helper/UI and native pixels\n";
     // Occupy every inference lease. Native presentation must keep advancing

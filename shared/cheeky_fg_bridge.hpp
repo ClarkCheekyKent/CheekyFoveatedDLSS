@@ -6,7 +6,7 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464739; // CFG9: release milestones and repeat-submission experiment
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473A; // CFG10: leased, producer-prepared center/peripheral guides.
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -27,6 +27,9 @@ struct CheekyFgEye {
     std::uint32_t resolution_percent{100},peripheral_percent{50};
     std::uint32_t peripheral_method{2},depth_bits{32},motion_bits{32};
     std::uint64_t configuration{};
+    std::uint32_t guide_capture_mode{},prepared_guides{}; // Requested mode / actual immutable representation.
+    ID3D12Resource* peripheral_depth{};
+    ID3D12Resource* peripheral_motion{};
 };
 struct CheekyFgPair {
     std::uint32_t abi{CHEEKY_FG_PAIR_ABI};

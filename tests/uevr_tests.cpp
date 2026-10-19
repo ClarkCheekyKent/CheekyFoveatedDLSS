@@ -111,7 +111,7 @@ void settings_tests(const std::filesystem::path& root) {
             !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
             "Shared game queue is the default; separate GPU queues remain selectable");
         require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==1,"Transport defaults use direct eyes and batched uploads");
-        for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics"})
+        for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics","FgGuideCaptureMode"})
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&

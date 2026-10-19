@@ -17,13 +17,15 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
     if(fg_probe_legacy_mvec){
         auto* editable=const_cast<NVSDK_NGX_Parameter*>(params);
         editable->Set("DLSSG.MvecScaleX",1.f);editable->Set("DLSSG.MvecScaleY",1.f);}
+    ID3D12Resource* output{};params->Get("DLSSG.OutputInterpolated",&output);
+    if(output)std::cout<<"NGX output destination="<<output->GetDesc().Width<<'x'<<output->GetDesc().Height<<'\n';
     return fg_probe_real_evaluate(commands,feature,params,callback);
 }
 // Opt-in integration probe. Uses the production worker, the physical GPU and
 // real NVIDIA inference, without starting a game or an OpenXR session.
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
     unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
-    bool motion_test=false,bool full_guides=false) {
+    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Hardware probe queue");
@@ -74,6 +76,48 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     const auto camera=cheeky::fg::camera(view,&view,true);
     std::array<cheeky::fg::Camera,2> cameras{camera,camera};
     std::array<ID3D12Resource*,2> colors{color.Get(),motion_test?color.Get():right_color.Get()},outputs{};
+    cheeky::fg::Transport compact_transport;
+    std::array<cheeky::fg::Image,2> compact_inputs,compact_outputs;
+    std::array<cheeky::fg::Worker::OutputCopy,2> compact_copies;
+    cheeky::fg::CompactLayout output_layout;
+    if(compact){
+        check(foveated&&!motion_test,"Compact probe requires foveated static stereo");
+        check(compact_transport.initialize(device,queue.Get()),"Compact hardware transport");
+        auto* context=compact_transport.begin();check(context!=nullptr,"Compact hardware capture context");
+        for(unsigned eye=0;eye<2;++eye){const auto& g=guides.eyes[eye];
+            auto layout=cheeky::fg::compact_layout(width,height,true,g.focus_width,g.focus_height,g.focus_x,g.focus_y,peripheral_scale,g.focus_feather);
+            compact_inputs[eye]=compact_transport.packed_region(*context,colors[eye],D3D12_RESOURCE_STATE_COMMON,{{0,0},{int(width),int(height)}},0,color_format,layout);
+            check(bool(compact_inputs[eye]),"Compact physical native capture");compact_transport.freeze(*context,compact_inputs[eye]);
+            worker.color_layouts[eye]=worker.previous_layouts[eye]=layout;colors[eye]=compact_inputs[eye]->texture.Get();
+            output_layout=cheeky::fg::compact_layout(width,height,true,g.focus_width,g.focus_height,g.focus_x,g.focus_y,peripheral_scale,g.focus_feather,scale);
+            auto d=colors[eye]->GetDesc();d.Width=output_layout.stored_width();d.Height=output_layout.stored_height();d.Format=worker.focus.color_format;
+            compact_outputs[eye]=compact_transport.image(d,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            check(bool(compact_outputs[eye]),"Compact physical NGX destination");
+            compact_copies[eye]={compact_outputs[eye]->texture.Get(),compact_outputs[eye]->state,output_layout};
+        }
+        std::uint64_t ticket{};check(compact_transport.execute(*context,ticket),"Compact physical capture submission");compact_transport.drain();
+        worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
+    }
+    cheeky::foveated_dlss::FgSnapshots prepared_snapshots;
+    CheekyFgPair prepared_pair;
+    struct PairRelease {CheekyFgPair& pair;~PairRelease(){if(!pair.lease)return;
+        for(auto& eye:pair.eyes)for(auto* resource:{eye.depth,eye.motion,eye.peripheral_depth,eye.peripheral_motion})if(resource)resource->Release();
+        pair.producer_queue->Release();pair.lease->Release();}} prepared_release{prepared_pair};
+    if(prepared_capture){
+        check(!motion_test&&prepared_snapshots.initialize(queue.Get()),"Prepared physical capture queue");
+        allocator->Reset();list->Reset(allocator.Get(),nullptr);
+        for(auto g:guides.eyes){g.guide_capture_mode=1;g.render_frame=77;
+            for(auto* resource:{g.depth,g.motion})cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            check(prepared_snapshots.record(list.Get(),g),"Prepared physical capture record");
+            for(auto* resource:{g.depth,g.motion})cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        }
+        check(SUCCEEDED(list->Close()),"Prepared physical capture close");queue->ExecuteCommandLists(1,commands);prepared_snapshots.submitted(queue.Get(),list.Get());
+        prepared_pair.capture_token=prepared_snapshots.token(77);prepared_pair.render_frame=77;
+        check(prepared_snapshots.acquire(prepared_pair),"Prepared physical guide lease");
+        guides.eyes[0]=prepared_pair.eyes[0];guides.eyes[1]=prepared_pair.eyes[1];
+        check(guides.eyes[0].prepared_guides&&guides.eyes[1].prepared_guides,"Physical capture must use prepared buffers");
+    }
+    auto generate=[&]{return worker.generate(guides,colors,colors,cameras,outputs,compact?&compact_copies:nullptr);};
     ComPtr<ID3D12Resource> upload;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT upload_footprint{};UINT64 upload_bytes{};
     if(motion_test){
@@ -103,14 +147,14 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     for(unsigned frame=0;frame<6&&!worker.failed;++frame) {
         for(auto& eye:guides.eyes)eye.reset=frame==0;
         if(motion_test)move_scene(frame);
-        generated=worker.generate(guides,colors,colors,cameras,outputs);
+        generated=generate();
         std::cout << "Hardware evaluation " << frame << ": " << (generated?"generated":"warmup/failure") << '\n';
         if(generated)break;
     }
     check(generated,worker.diagnostic);
     check(fg_probe_native_depth&&(worker.force_fp16||fg_probe_sdr),"Actual SDK camera/HDR parameters match the native depth and color formats");
-    if(motion_test)for(unsigned frame=last_frame+1;frame<=12;++frame){move_scene(frame);check(worker.generate(guides,colors,colors,cameras,outputs),"Moving-scene interpolation");}
-    else if(width>512)for(unsigned frame=0;frame<128;++frame)check(worker.generate(guides,colors,colors,cameras,outputs),"Steady benchmark generation");
+    if(motion_test)for(unsigned frame=last_frame+1;frame<=12;++frame){move_scene(frame);check(generate(),"Moving-scene interpolation");}
+    else if(width>512)for(unsigned frame=0;frame<128;++frame)check(generate(),"Steady benchmark generation");
     const auto& timing=worker.gpu_timings;
     check(timing.supported()&&timing.valid&&timing.samples>0,"Physical GPU timing sample must resolve after the ordinary fence wait");
     check(timing.center.last>0&&timing.total.last>=timing.center.last&&
@@ -119,6 +163,8 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(bool(worker.peripheral_features[0].handle)==(foveated&&method==3),"DLSS periphery must run its own NGX feature; custom modes must not");
     check(worker.center_width==std::max(32u,(unsigned(std::round(width*(foveated?.55f:1.f)))*scale+50u)/100u),"FG scale must change actual inference dimensions");
     const auto& center_input=worker.focus.inputs[0][0];
+    if(prepared_capture)check(center_input.borrowed_guides&&center_input.depth.Get()==guides.eyes[0].depth&&
+        center_input.motion.Get()==guides.eyes[0].motion,"Real NGX must consume producer-prepared guides directly");
     const auto guide_width=unsigned(std::round(double(guides.eyes[0].depth_width)*worker.center_width/width));
     check(center_input.depth->GetDesc().Width==guide_width&&center_input.motion->GetDesc().Width==guide_width,
         "NGX must accept cropped source-resolution guides independently of output color");
@@ -151,6 +197,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(timing.order_samples[0]>0&&timing.order_samples[1]>0,"Both eye execution orders must be exercised");
     // Verify the interpolated texture actually contains the non-black scene.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
+    const auto output_state=compact?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_COMMON;
     const auto desc=outputs[0]->GetDesc();device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT right_footprint{};UINT64 right_bytes{};
     const UINT64 right_offset=(bytes+511)&~UINT64(511);
@@ -161,15 +208,15 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     ComPtr<ID3D12Resource> readback;
     check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&rb,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback))),"Probe readback");
     check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Probe readback recording");
-    cheeky::fg::color_transition(list.Get(),outputs[0],D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cheeky::fg::color_transition(list.Get(),outputs[0],output_state,D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=outputs[0];from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
     list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
-    cheeky::fg::color_transition(list.Get(),outputs[0],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
-    cheeky::fg::color_transition(list.Get(),outputs[1],D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cheeky::fg::color_transition(list.Get(),outputs[0],D3D12_RESOURCE_STATE_COPY_SOURCE,output_state);
+    cheeky::fg::color_transition(list.Get(),outputs[1],output_state,D3D12_RESOURCE_STATE_COPY_SOURCE);
     from.pResource=outputs[1];to.PlacedFootprint=right_footprint;
     list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
-    cheeky::fg::color_transition(list.Get(),outputs[1],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    cheeky::fg::color_transition(list.Get(),outputs[1],D3D12_RESOURCE_STATE_COPY_SOURCE,output_state);
     check(SUCCEEDED(list->Close()),"Probe readback close");queue->ExecuteCommandLists(1,commands);
     check(SUCCEEDED(queue->Signal(fence.Get(),2)),"Probe readback signal");
     event=CreateEventW(nullptr,FALSE,FALSE,nullptr);check(event!=nullptr,"Probe readback event");
@@ -177,7 +224,8 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     const auto completed=WaitForSingleObject(event,10000);CloseHandle(event);check(completed==WAIT_OBJECT_0,"Probe readback wait");
     void* data{};check(SUCCEEDED(readback->Map(0,nullptr,&data)),"Probe map");
     const bool floating=desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const auto* pixel=static_cast<const unsigned char*>(data)+footprint.Offset+height/2*footprint.Footprint.RowPitch+width/2*(floating?8:4);
+    const unsigned pixel_x=compact?output_layout.center_width/2:width/2,pixel_y=compact?output_layout.center_height/2:height/2;
+    const auto* pixel=static_cast<const unsigned char*>(data)+footprint.Offset+pixel_y*footprint.Footprint.RowPitch+pixel_x*(floating?8:4);
     if(motion_test){
         double sum{},weight{};const auto* row=static_cast<const unsigned char*>(data)+footprint.Offset+height/2*footprint.Footprint.RowPitch;
         for(unsigned x=0;x<width;++x){const auto value=row[x*4];sum+=(x+.5)*value;weight+=value;}
@@ -190,13 +238,16 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         (pixel[0]>128&&pixel[0]>pixel[1]*2);
     if(bgra&&!floating)check(std::abs(int(pixel[1])-89)<=5&&std::abs(int(pixel[2])-63)<=5,
         "sRGB source must retain encoded colors when converted to RGBA8 inference/output");
-    const auto* edge=static_cast<const unsigned char*>(data)+footprint.Offset+2*footprint.Footprint.RowPitch+2*(floating?8:4);
+    const auto* edge=static_cast<const unsigned char*>(data)+footprint.Offset+(compact?output_layout.center_height+2:2)*footprint.Footprint.RowPitch+2*(floating?8:4);
     const bool edge_nonblack=floating?(*reinterpret_cast<const unsigned short*>(edge)>=0x3800):edge[0]>128;
-    const auto* right_pixel=static_cast<const unsigned char*>(data)+right_footprint.Offset+height/2*right_footprint.Footprint.RowPitch+width/2*(floating?8:4);
+    const auto* right_pixel=static_cast<const unsigned char*>(data)+right_footprint.Offset+pixel_y*right_footprint.Footprint.RowPitch+pixel_x*(floating?8:4);
     const bool right_blue=floating?reinterpret_cast<const unsigned short*>(right_pixel)[2]>=0x3800:
         right_pixel[2]>128&&right_pixel[2]>right_pixel[0]*2;
     check(right_blue,"Alternating execution order must preserve the distinct blue right-eye output");
     readback->Unmap(0,nullptr);check(nonblack&&edge_nonblack,"Actual NGX output and generated periphery must contain the red scene");
     std::cout << "PASS alternating eye processing retains red left / blue right output pixels\n";
+    if(compact)std::cout<<"Compact NGX: direct="<<worker.features[0].direct<<" rejected="<<worker.features[0].direct_rejected
+        <<" scratch="<<bool(worker.features[0].output)<<" stored="<<desc.Width<<'x'<<desc.Height<<" native="<<width<<'x'<<height<<'\n';
+    if(prepared_capture)std::cout<<"PASS physical NGX consumes leased producer-prepared guides without worker normalization or guide copies\n";
     std::cout << "PASS physical GPU NGX inference and non-black generated pixels\n";
 }

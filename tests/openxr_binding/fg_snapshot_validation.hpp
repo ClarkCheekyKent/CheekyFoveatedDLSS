@@ -138,6 +138,8 @@ void fg_snapshot_validation(ID3D12Device* device) {
     FgSnapshots aliased;check(aliased.initialize(queue.Get()),"Alias snapshot queue");
     TimingListAlias alias(list.Get());CheekyFgEye meta;meta.depth=depth.Get();meta.motion=motion.Get();
     meta.width=meta.height=32;meta.render_frame=909;
+    meta.depth_base_x=2;meta.depth_base_y=3;meta.depth_width=7;meta.depth_height=9;
+    meta.motion_base_x=4;meta.motion_base_y=5;meta.motion_width=8;meta.motion_height=6;
     check(aliased.record(alias.get(),meta)&&aliased.record(alias.get(),meta),"Capture through opaque command-list facade");
     cheeky::foveated_dlss::FgColorProvenance alias_color;alias_color.token(depth.Get());
     alias_color.observe(alias.get(),depth.Get(),aliased,909);
@@ -145,7 +147,11 @@ void fg_snapshot_validation(ID3D12Device* device) {
     aliased.submitted(queue.Get(),list.Get());alias_color.submitted(queue.Get(),list.Get(),aliased);wait();
     check(alias_color.token(depth.Get())==2,"Native submission must commit guides/color recorded through an opaque alias");
     CheekyFgPair alias_pair;alias_pair.capture_token=2;alias_pair.render_frame=909;
-    check(aliased.acquire(alias_pair),"Opaque alias must preserve the exact native frame's guide lease");release(alias_pair);
+    check(aliased.acquire(alias_pair),"Opaque alias must preserve the exact native frame's guide lease");
+    check(alias_pair.eyes[0].depth->GetDesc().Width==7&&alias_pair.eyes[0].depth->GetDesc().Height==9&&
+        alias_pair.eyes[0].motion->GetDesc().Width==8&&alias_pair.eyes[0].motion->GetDesc().Height==6&&
+        alias_pair.eyes[0].depth_base_x==0&&alias_pair.eyes[0].motion_base_y==0,
+        "Snapshots retain only each active guide rectangle and rebase offsets without changing the logical frame");release(alias_pair);
     check(alias.references==0,"Alias guide/color command references retire after native enqueue");
     aliased.retire();const auto guide_gpu=aliased.capture_gpu();
     check(guide_gpu.samples==1&&guide_gpu.mean>0,"Both completed eye snapshots must contribute one measured stereo guide-copy sample");

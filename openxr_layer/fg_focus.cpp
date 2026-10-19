@@ -1,6 +1,7 @@
 #include "fg_focus.hpp"
 #include "fg_color_format.hpp"
 #include "fg_timing.hpp"
+#include "../shared/fg_guide_layout.hpp"
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
@@ -125,17 +126,8 @@ void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,uns
  list->SetComputeRoot32BitConstants(1,sizeof(Constants)/4,&constants,0);
 }
 }
-DXGI_FORMAT depth_srv_format(DXGI_FORMAT f) noexcept {
- switch(f){case DXGI_FORMAT_R32_TYPELESS:return DXGI_FORMAT_R32_FLOAT;case DXGI_FORMAT_R16_TYPELESS:return DXGI_FORMAT_R16_UNORM;
- case DXGI_FORMAT_R24G8_TYPELESS:return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;case DXGI_FORMAT_R32G8X24_TYPELESS:return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
- case DXGI_FORMAT_R32_FLOAT:case DXGI_FORMAT_R16_FLOAT:case DXGI_FORMAT_R16_UNORM:case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:return f;
- default:return DXGI_FORMAT_UNKNOWN;}
-}
-DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {
- switch(f){case DXGI_FORMAT_R16G16_TYPELESS:return DXGI_FORMAT_R16G16_FLOAT;case DXGI_FORMAT_R32G32_TYPELESS:return DXGI_FORMAT_R32G32_FLOAT;
- case DXGI_FORMAT_R16G16_FLOAT:case DXGI_FORMAT_R32G32_FLOAT:case DXGI_FORMAT_R16G16_SNORM:case DXGI_FORMAT_R16G16B16A16_FLOAT:case DXGI_FORMAT_R32G32B32A32_FLOAT:return f;
- default:return DXGI_FORMAT_UNKNOWN;}
-}
+DXGI_FORMAT depth_srv_format(DXGI_FORMAT f) noexcept {return guide_depth_format(f);}
+DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {return guide_motion_format(f);}
 void FocusPipeline::reset() noexcept {
  root.Reset();prepare.Reset();peripheral.Reset();compose.Reset();pack.Reset();descriptors.Reset();stride=0;
  for(auto& eye:inputs)for(auto& input:eye)input={};
@@ -167,53 +159,68 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  const bool need_color=pass==0||g.peripheral_method==3;
  const bool need_motion=need_color||g.peripheral_method!=0;
  const bool need_depth=need_color||g.peripheral_method==2;
+ const bool prepared=g.prepared_guides!=0;
  auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;
+ if(s.borrowed_guides!=prepared){s.depth.Reset();s.motion.Reset();}
+ s.borrowed_guides=prepared;
  if(!need_color)s.color.Reset();if(!need_depth)s.depth.Reset();if(!need_motion)s.motion.Reset();
- // Custom periphery samples the original color frames directly. Previous-frame
- // mode needs no guides at all; simple warp needs motion only.
  if(!need_color&&!need_motion){
   if(timings)for(unsigned phase=0;phase<4;++phase)timings->preparation_stamp(list,eye,pass,phase);
   return true;
  }
- if((need_depth&&!g.depth)||(need_motion&&!g.motion))return false;
- auto df=need_depth?depth_srv_format(g.depth->GetDesc().Format):DXGI_FORMAT_R32_FLOAT;
- auto mf=need_motion?motion_srv_format(g.motion->GetDesc().Format):DXGI_FORMAT_R32G32_FLOAT;
- if(df==DXGI_FORMAT_UNKNOWN||mf==DXGI_FORMAT_UNKNOWN)return false;
  auto cd=color->GetDesc();if(color_layouts[eye].width){cd.Width=color_layouts[eye].width;cd.Height=color_layouts[eye].height;}
- auto active=[](ID3D12Resource* resource,unsigned bw,unsigned bh,unsigned aw,unsigned ah,unsigned& ow,unsigned& oh){
-  if(!resource){ow=oh=0;return true;}const auto d=resource->GetDesc();
-  if(bw>=d.Width||bh>=d.Height)return false;
-  ow=std::min(aw?aw:unsigned(d.Width),unsigned(d.Width)-bw);oh=std::min(ah?ah:d.Height,d.Height-bh);return ow&&oh;
- };
- unsigned dw{},dh{},mw{},mh{};
- if(!active(need_depth?g.depth:nullptr,g.depth_base_x,g.depth_base_y,g.depth_width,g.depth_height,dw,dh)||
-    !active(need_motion?g.motion:nullptr,g.motion_base_x,g.motion_base_y,g.motion_width,g.motion_height,mw,mh))return false;
- // Scale from the active source guide grid, independently of output color.
- // Depth and motion share a UV grid, using the smaller source if they differ.
- const unsigned source_w=need_depth?std::min(dw,mw):mw,source_h=need_depth?std::min(dh,mh):mh;
- const unsigned gw=std::clamp(unsigned(std::round(double(source_w)*r.w/cd.Width*std::min(1.,double(w)/r.w))),1u,w);
- const unsigned gh=std::clamp(unsigned(std::round(double(source_h)*r.h/cd.Height*std::min(1.,double(h)/r.h))),1u,h);
+ unsigned dw{},dh{},mw{},mh{},gw{},gh{};
+ DXGI_FORMAT df=DXGI_FORMAT_R32_FLOAT,mf=DXGI_FORMAT_R32G32_FLOAT;
+ if(prepared){
+  s.depth=need_depth?(pass?g.peripheral_depth:g.depth):nullptr;
+  s.motion=need_motion?(pass?g.peripheral_motion:g.motion):nullptr;
+  if((need_depth&&!s.depth)||(need_motion&&!s.motion))return false;
+  const auto grid=guide_grid(g,g.depth_width,g.depth_height,g.motion_width,g.motion_height,pass);
+  gw=grid.width;gh=grid.height;
+  auto valid=[&](ID3D12Resource* resource,DXGI_FORMAT format){if(!resource)return true;const auto d=resource->GetDesc();
+   return d.Width==gw&&d.Height==gh&&d.Format==format;};
+  if(!valid(s.depth.Get(),depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT)||
+     !valid(s.motion.Get(),motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT))return false;
+ }else{
+  if((need_depth&&!g.depth)||(need_motion&&!g.motion))return false;
+  df=need_depth?depth_srv_format(g.depth->GetDesc().Format):DXGI_FORMAT_R32_FLOAT;
+  mf=need_motion?motion_srv_format(g.motion->GetDesc().Format):DXGI_FORMAT_R32G32_FLOAT;
+  if(df==DXGI_FORMAT_UNKNOWN||mf==DXGI_FORMAT_UNKNOWN)return false;
+  auto active=[](ID3D12Resource* resource,unsigned bx,unsigned by,unsigned aw,unsigned ah,unsigned& ow,unsigned& oh){
+   if(!resource){ow=oh=0;return true;}const auto d=resource->GetDesc();if(bx>=d.Width||by>=d.Height)return false;
+   ow=std::min(aw?aw:unsigned(d.Width),unsigned(d.Width)-bx);oh=std::min(ah?ah:d.Height,d.Height-by);return ow&&oh;
+  };
+  if(!active(need_depth?g.depth:nullptr,g.depth_base_x,g.depth_base_y,g.depth_width,g.depth_height,dw,dh)||
+     !active(need_motion?g.motion:nullptr,g.motion_base_x,g.motion_base_y,g.motion_width,g.motion_height,mw,mh))return false;
+  const unsigned sw=need_depth?std::min(dw,mw):mw,sh=need_depth?std::min(dh,mh):mh;
+  gw=std::clamp(unsigned(std::round(double(sw)*r.w/cd.Width*std::min(1.,double(w)/r.w))),1u,w);
+  gh=std::clamp(unsigned(std::round(double(sh)*r.h/cd.Height*std::min(1.,double(h)/r.h))),1u,h);
+ }
  if((need_color&&!allocate(dev,w,h,color_format,s.color))||
-    (need_depth&&!allocate(dev,gw,gh,depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT,s.depth))||
-    (need_motion&&!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.motion)))return false;
- Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);c.rect[0]=float(r.x)/cd.Width;c.rect[1]=float(r.y)/cd.Height;c.rect[2]=float(r.w)/cd.Width;c.rect[3]=float(r.h)/cd.Height;
+    (!prepared&&need_depth&&!allocate(dev,gw,gh,depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT,s.depth))||
+    (!prepared&&need_motion&&!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.motion)))return false;
+ if(prepared&&!need_color){
+  if(timings)for(unsigned phase=0;phase<4;++phase)timings->preparation_stamp(list,eye,pass,phase);
+  return true;
+ }
+ Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);
+ c.rect[0]=float(r.x)/cd.Width;c.rect[1]=float(r.y)/cd.Height;c.rect[2]=float(r.w)/cd.Width;c.rect[3]=float(r.h)/cd.Height;
  c.offset[0]=float(g.depth_base_x);c.offset[1]=float(g.depth_base_y);c.offset[2]=float(g.motion_base_x);c.offset[3]=float(g.motion_base_y);
  c.dimensions[0]=float(dw);c.dimensions[1]=float(dh);c.dimensions[2]=float(mw);c.dimensions[3]=float(mh);
- c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);c.motion[2]=motion_bits==16?65504.f:3.402823466e38f;
- c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];
- c.options[0]=need_color?1.f:0.f;c.options[1]=need_depth?1.f:0.f;c.options[2]=need_motion?1.f:0.f;
+ if(!prepared){c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);
+  c.motion[2]=motion_bits==16?65504.f:3.402823466e38f;c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];}
+ c.options[0]=need_color?1.f:0.f;c.options[1]=!prepared&&need_depth?1.f:0.f;c.options[2]=!prepared&&need_motion?1.f:0.f;
  c.options[3]=srgb_color(cd.Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
+ auto* out_depth=prepared?nullptr:s.depth.Get();auto* out_motion=prepared?nullptr:s.motion.Get();
  if(timings)timings->preparation_stamp(list,eye,pass,0);
- for(auto* out:{s.color.Get(),s.depth.Get(),s.motion.Get()})transition(list,out,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ for(auto* out:{s.color.Get(),out_depth,out_motion})transition(list,out,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
  if(need_color&&color_state==D3D12_RESOURCE_STATE_COMMON)transition(list,color,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
- // Borrowed NGX guides retain the engine's shader-readable state. Our owned
- // copies begin in COMMON and are implicitly promoted for these read-only SRVs.
- bind(*this,dev,list,eye,pass,prepare.Get(),{need_color?color:nullptr,need_depth?g.depth:nullptr,need_motion?g.motion:nullptr,nullptr,nullptr},
-  {cd.Format,df,mf,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT},{s.color.Get(),s.depth.Get(),s.motion.Get()},c);
+ bind(*this,dev,list,eye,pass,prepare.Get(),{need_color?color:nullptr,!prepared&&need_depth?g.depth:nullptr,!prepared&&need_motion?g.motion:nullptr,nullptr,nullptr},
+  {cd.Format,df,mf,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT},{s.color.Get(),out_depth,out_motion},c);
  if(timings)timings->preparation_stamp(list,eye,pass,1);
- list->Dispatch((std::max(need_color?w:0u,gw)+7)/8,(std::max(need_color?h:0u,gh)+7)/8,1);
+ list->Dispatch((std::max(need_color?w:0u,prepared?0u:gw)+7)/8,(std::max(need_color?h:0u,prepared?0u:gh)+7)/8,1);
  if(timings)timings->preparation_stamp(list,eye,pass,2);
- for(auto* out:{s.color.Get(),s.depth.Get(),s.motion.Get()})transition(list,out,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+ for(auto* out:{s.color.Get(),out_depth,out_motion})transition(list,out,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
  if(need_color&&color_state==D3D12_RESOURCE_STATE_COMMON)transition(list,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  if(timings)timings->preparation_stamp(list,eye,pass,3);
  return true;

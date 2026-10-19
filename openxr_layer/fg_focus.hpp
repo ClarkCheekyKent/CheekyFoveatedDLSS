@@ -14,6 +14,7 @@ DXGI_FORMAT motion_srv_format(DXGI_FORMAT) noexcept;
 struct FocusInput {
     ComPtr<ID3D12Resource> color,depth,motion;
     unsigned output_width{},output_height{};
+    bool borrowed_guides{};
 };
 struct FocusPipeline {
     DXGI_FORMAT color_format{DXGI_FORMAT_R16G16B16A16_FLOAT};

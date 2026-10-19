@@ -304,9 +304,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         auto projection=multiply(crop,camera.view_to_clip),clip_prev=multiply(multiply(crop,camera.clip_to_prev),uncrop);
         Matrix unprojection{},prev_clip{};if(!inverse(projection,unprojection)||!inverse(clip_prev,prev_clip))return false;
         // SDK matrices use row vectors. Our camera math uses column vectors.
-        auto proj=transpose(projection),unproj=transpose(unprojection),cp=transpose(clip_prev),pc=transpose(prev_clip),lens=identity();
-        p->Set("DLSSG.CameraViewToClip",proj.m);p->Set("DLSSG.ClipToCameraView",unproj.m);
-        p->Set("DLSSG.ClipToLensClip",lens.m);p->Set("DLSSG.ClipToPrevClip",cp.m);p->Set("DLSSG.PrevClipToClip",pc.m);
+        // NGX parameter maps retain matrix pointers rather than copying their
+        // contents. Preparation and evaluation may be separate phases/lists.
+        f.view_to_clip=transpose(projection);f.clip_to_camera=transpose(unprojection);
+        f.clip_to_prev=transpose(clip_prev);f.prev_clip_to_clip=transpose(prev_clip);f.lens=identity();
+        p->Set("DLSSG.CameraViewToClip",f.view_to_clip.m);p->Set("DLSSG.ClipToCameraView",f.clip_to_camera.m);
+        p->Set("DLSSG.ClipToLensClip",f.lens.m);p->Set("DLSSG.ClipToPrevClip",f.clip_to_prev.m);p->Set("DLSSG.PrevClipToClip",f.prev_clip_to_clip.m);
         p->Set("DLSSG.CameraNear",.05f);p->Set("DLSSG.CameraFar",10000.f);
         p->Set("DLSSG.CameraFOV",2.f*std::atan(1.f/std::max(.001f,std::abs(projection.m[5]))));
         p->Set("DLSSG.CameraAspectRatio",std::abs(projection.m[5]/projection.m[0]));

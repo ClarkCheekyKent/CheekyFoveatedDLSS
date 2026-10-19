@@ -3,6 +3,7 @@
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "../shared/cheeky_gpu_span.hpp"
 #include "../shared/fg_resource_memory.hpp"
+#include "fg_prepared_guides.hpp"
 #include <memory>
 #include <vector>
 
@@ -14,10 +15,13 @@ class FgSnapshots {
     template<class T> using ComPtr=Microsoft::WRL::ComPtr<T>;
     struct Shot {
         ComPtr<ID3D12Resource> depth,motion,source_depth,source_motion;
+        FgPreparedGuides::Buffers prepared;
+        D3D12_RESOURCE_DESC raw_depth_desc{},raw_motion_desc{};
         ComPtr<ID3D12GraphicsCommandList> list;
         CheekyFgEye meta;
         std::uint64_t recording{};
         std::uint64_t retired{};
+        std::uint64_t last_used_tick{};
         bool submitted{},foreign{},cancelled{};
         cheeky::gpu::Span gpu_span;
     };
@@ -43,6 +47,9 @@ class FgSnapshots {
     std::uint64_t failed_record{};
     std::uint64_t timestamp_frequency{};
     cheeky::gpu::Groups gpu_cost;
+    FgPreparedGuides preparation;
+    std::uint64_t prepared_captures{},raw_captures{},preparation_fallbacks{};
+    std::uint64_t next_trim_tick{};
     CheekyFgEye previous_raw[2];
     static void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;v.Transition.pResource=r;
@@ -92,6 +99,18 @@ public:
                 (shot->retired&&shot->retired<=done&&shot->meta.evaluation+2<ordinal+1&&!shot->foreign));
             collect.add(out.categories[fg_memory::guide_depth],shot->depth.Get(),reusable);
             collect.add(out.categories[fg_memory::guide_motion],shot->motion.Get(),reusable);
+            for(const auto& p:shot->prepared.passes){
+                collect.add(out.categories[fg_memory::guide_depth],p.depth.Get(),reusable);
+                collect.add(out.categories[fg_memory::guide_motion],p.motion.Get(),reusable);
+            }
+        }
+    }
+    void guide_diagnostics(std::uint64_t& prepared,std::uint64_t& raw,std::uint64_t& fallbacks,unsigned& slots,unsigned& leased,std::uint64_t& raw_bytes) const {
+        prepared+=prepared_captures;raw+=raw_captures;fallbacks+=preparation_fallbacks;slots+=unsigned(shots.size());
+        for(const auto& s:shots){leased+=s.use_count()>1?1u:0u;
+            for(const auto& desc:{s->raw_depth_desc,s->raw_motion_desc})if(desc.Width){
+                const auto bytes=device->GetResourceAllocationInfo(0,1,&desc).SizeInBytes;if(bytes!=UINT64_MAX)raw_bytes+=bytes;
+            }
         }
     }
     cheeky::gpu::Summary capture_gpu() const {return gpu_cost.summary();}
@@ -168,17 +187,31 @@ public:
         const auto recording=tag_recording(commands);if(!recording){failed_record=id;return false;}
         std::shared_ptr<Shot> slot;
         const auto done=fence->GetCompletedValue();
+        const auto now=GetTickCount64();
+        if(now>=next_trim_tick){
+            // Reclaim high-water allocations after transient queue/frame
+            // pressure. Leases, pending recordings and the most recent stereo
+            // pair remain protected; no producer or consumer GPU wait is added.
+            collect_completed();
+            std::erase_if(shots,[&](const auto& s){return s.use_count()==1&&!s->foreign&&
+                (s->cancelled||(s->retired&&s->retired<=done))&&s->meta.evaluation+2<id&&
+                now>=s->last_used_tick&&now-s->last_used_tick>=3000;});
+            next_trim_tick=now+1000;
+        }
         // Keep the most recent stereo pair until a later color handoff, even
         // when its GPU work has already completed.
         for(auto& s:shots)if(s.use_count()==1&&(s->cancelled||(s->retired&&s->retired<=done&&s->meta.evaluation+2<id&&!s->foreign))){slot=s;break;}
         if(!slot){if(shots.size()>=24){failed_record=id;return false;}slot=std::make_shared<Shot>();shots.push_back(slot);}
+        slot->last_used_tick=now;
         if(slot->retired&&slot->retired<=done) {
             double ms{};if(slot->gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(slot->meta.render_frame,ms,false,2);
             gpu_cost.commit();
         }
         const auto dr=region(meta.depth,meta.depth_base_x,meta.depth_base_y,meta.depth_width,meta.depth_height),
                    mr=region(meta.motion,meta.motion_base_x,meta.motion_base_y,meta.motion_width,meta.motion_height);
-        if(!dr.w||!dr.h||!mr.w||!mr.h||!allocate(meta.depth,slot->depth,dr)||!allocate(meta.motion,slot->motion,mr)){failed_record=id;return false;}
+        if(!dr.w||!dr.h||!mr.w||!mr.h){failed_record=id;return false;}
+        slot->raw_depth_desc=meta.depth->GetDesc();slot->raw_depth_desc.Width=dr.w;slot->raw_depth_desc.Height=dr.h;slot->raw_depth_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+        slot->raw_motion_desc=meta.motion->GetDesc();slot->raw_motion_desc.Width=mr.w;slot->raw_motion_desc.Height=mr.h;slot->raw_motion_desc.Flags=D3D12_RESOURCE_FLAG_NONE;
         slot->source_depth=meta.depth;slot->source_motion=meta.motion;slot->list=native_d3d12_interface(commands);
         slot->recording=recording;
         slot->submitted=slot->foreign=slot->cancelled=false;slot->retired=0;
@@ -190,14 +223,24 @@ public:
                 meta.jitter_correction_y=(prior.jitter_y-meta.jitter_y)/std::max(1u,meta.motion_height);
             }else meta.reset=1;
         }
-        prior=meta;prior.depth=prior.motion=nullptr;
+        prior=meta;prior.depth=prior.motion=nullptr;prior.peripheral_depth=prior.peripheral_motion=nullptr;
         tag_recording(commands);
         if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
-        copy(commands,meta.depth,slot->depth.Get(),dr);copy(commands,meta.motion,slot->motion.Get(),mr);
+        const bool prepared=meta.guide_capture_mode==1u&&preparation.record(device.Get(),commands,meta,slot->prepared);
+        if(prepared){slot->depth.Reset();slot->motion.Reset();++prepared_captures;}
+        else {
+            if(meta.guide_capture_mode==1u)++preparation_fallbacks;
+            slot->prepared.clear();
+            if(!allocate(meta.depth,slot->depth,dr)||!allocate(meta.motion,slot->motion,mr)){failed_record=id;return false;}
+            copy(commands,meta.depth,slot->depth.Get(),dr);copy(commands,meta.motion,slot->motion.Get(),mr);++raw_captures;
+        }
         if(timestamp_frequency)slot->gpu_span.end(commands);
-        if(!dr.full){meta.depth_base_x=meta.depth_base_y=0;meta.depth_width=dr.w;meta.depth_height=dr.h;}
-        if(!mr.full){meta.motion_base_x=meta.motion_base_y=0;meta.motion_width=mr.w;meta.motion_height=mr.h;}
-        meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.evaluation=id;slot->meta=meta;return true;
+        if(!prepared){
+            if(!dr.full){meta.depth_base_x=meta.depth_base_y=0;meta.depth_width=dr.w;meta.depth_height=dr.h;}
+            if(!mr.full){meta.motion_base_x=meta.motion_base_y=0;meta.motion_width=mr.w;meta.motion_height=mr.h;}
+            meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.prepared_guides=0;
+        }
+        meta.evaluation=id;slot->meta=meta;return true;
     }
     void submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands) {
         const auto recording=recording_identity(commands);auto native=native_d3d12_interface(q);
@@ -244,7 +287,7 @@ public:
         // Stable native-stereo ordering is assumed. An interrupted pair or a
         // missing native publication invalidates NGX's temporal history.
         if(consumed&&expected!=consumed+2)for(auto& e:out.eyes)e.reset=1;
-        for(auto& e:out.eyes){e.depth->AddRef();e.motion->AddRef();}
+        for(auto& e:out.eyes)for(auto* resource:{e.depth,e.motion,e.peripheral_depth,e.peripheral_motion})if(resource)resource->AddRef();
         out.producer_queue=queue.Get();out.producer_queue->AddRef();out.lease=lease;
         consumed=expected;
         std::erase_if(latched,[&](const Latch& l){return l.token<=consumed;});return true;

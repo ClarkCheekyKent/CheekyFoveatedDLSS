@@ -33,14 +33,16 @@ struct BufferedPresenter final : Presenter {
         CheekyFgPair guides;
         ComPtr<IUnknown> guide_lease;
         std::array<ComPtr<ID3D12Resource>,2> guide_depth,guide_motion;
+        std::array<ComPtr<ID3D12Resource>,2> peripheral_depth,peripheral_motion;
         void retain_guides(const CheekyFgPair& source) noexcept {
             guides=source;guide_lease=source.lease;
-            for(unsigned eye=0;eye<2;++eye){guide_depth[eye]=source.eyes[eye].depth;guide_motion[eye]=source.eyes[eye].motion;}
+            for(unsigned eye=0;eye<2;++eye){guide_depth[eye]=source.eyes[eye].depth;guide_motion[eye]=source.eyes[eye].motion;
+                peripheral_depth[eye]=source.eyes[eye].peripheral_depth;peripheral_motion[eye]=source.eyes[eye].peripheral_motion;}
             // Explicit members own the returned references. The metadata copy
             // must never be passed to the bridge's ReleasePair function.
             guides.lease=nullptr;guides.producer_queue=nullptr;
         }
-        void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};guide_lease.Reset();}
+        void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};peripheral_depth={};peripheral_motion={};guide_lease.Reset();}
         bool guides_valid{};
         CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
         unsigned source_depth{},source_motion{};
@@ -240,8 +242,10 @@ struct BufferedPresenter final : Presenter {
         value.categories[fg_memory::generated]=output.memory(collect);
         for(const auto& eye:worker.focus.inputs)for(const auto& input:eye){
             collect.add(value.categories[fg_memory::prepared_color],input.color.Get());
-            collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());
-            collect.add(value.categories[fg_memory::prepared_motion],input.motion.Get());
+            // Prepared captures are owned/countable by the producer snapshot
+            // pool. These references are borrowed, not a second allocation.
+            if(!input.borrowed_guides){collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());
+                collect.add(value.categories[fg_memory::prepared_motion],input.motion.Get());}
         }
         for(const auto* features:{&worker.features,&worker.peripheral_features})for(const auto& f:*features){
             collect.add(value.categories[fg_memory::ngx_outputs],f.output.Get());
@@ -879,6 +883,7 @@ struct BufferedPresenter final : Presenter {
         unsigned count{};if(XR_FAILED(xr.enumerate(chain.handle,0,&count,nullptr))||!count)return false;
         chain.images.resize(count);for(auto& i:chain.images)i={XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR};
         if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images.data()))))return false;
+        next_presenter_memory=0; // Publish newly allocated chains on this presentation, including during startup.
         chain.desc=d;return true;
     }
     bool upload_image(Chain& chain,const Image& source,bool scene=false) {
@@ -1087,6 +1092,9 @@ struct BufferedPresenter final : Presenter {
         if(generated&&xr.time_to_qpc){LARGE_INTEGER qpc{};
             if(XR_SUCCEEDED(xr.time_to_qpc(xr.time_instance,time,&qpc))&&qpc.QuadPart>0)display_cpu=std::uint64_t(qpc.QuadPart);}
         wake_producer();closed=true;const auto submitted_at=TimingClock::now();const auto submitted_cpu=LatencyProbe::cpu_now();
+#ifdef CHEEKY_FG_SUBMISSION_OBSERVER
+        CHEEKY_FG_SUBMISSION_OBSERVER(generated);
+#endif
         result=runtime_end_frame(&end);
         if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);note_frame_age(pair,generated,repeated,submitted_at);
             if(generated){note_gpu_ready_age(pair,submitted_cpu,display_cpu);finish_generated_gate(pair.current_id,true);}}
