@@ -7,6 +7,7 @@
 #include "diagnostics.hpp"
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
+#include "fg_sr_region.hpp"
 #include "crop_motion.hpp"
 #include "motion_region.hpp"
 #include "runtime.hpp"
@@ -1126,6 +1127,9 @@ D3D12Evaluation* prepare_d3d12(
         mutable_parameters->Set("Reset", 1U);
     }
     diagnostic_note_crop(DiagnosticApi::d3d12, crop);
+    // Remember the actual SR pixel-aligned rectangle. FG must not call the
+    // gaze/crop solver a second time after SR already advanced its state.
+    fg_sr_prepared(view_id,crop,output_width,output_height,output_x,output_y);
     return evaluation;
 }
 
@@ -1294,6 +1298,7 @@ D3D12Evaluation* prepare_d3d12_streamline(
     device->Release();
 
     diagnostic_note_activation(DiagnosticApi::d3d12, crop);
+    fg_sr_prepared(view_id,crop,output_width,output_height,output_x,output_y);
     return evaluation;
 }
 

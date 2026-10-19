@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -695,18 +695,31 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 check("Foveated frame generation", "FgFoveated")
                 if draft.FgFoveated then
-                    slider("FG region width", "FgWidth", 0.2, 1)
-                    slider("FG region height", "FgHeight", 0.2, 1)
-                    slider("FG horizontal offset", "FgXOffset", -0.5, 0.5)
-                    slider("FG vertical offset", "FgYOffset", -1, 1)
-                    slider("FG transition width", "FgFeather", 0, 0.3)
+                    if draft.FgMatchSrRegion ~= nil then
+                        check("Match DLSS-SR foveation region", "FgMatchSrRegion")
+                        if draft.FgMatchSrRegion then
+                            text("Uses SR region size, transition and per-eye placement (including gaze when resolved).")
+                            text("FG manual region settings are preserved for when matching is disabled.")
+                        end
+                    end
+                    if not draft.FgMatchSrRegion then
+                        slider("FG region width", "FgWidth", 0.2, 1)
+                        slider("FG region height", "FgHeight", 0.2, 1)
+                        slider("FG horizontal offset", "FgXOffset", -0.5, 0.5)
+                        slider("FG vertical offset", "FgYOffset", -1, 1)
+                        slider("FG transition width", "FgFeather", 0, 0.3)
+                    end
+                    if draft.FgShowBorder ~= nil then
+                        check("Show blue FG region border", "FgShowBorder")
+                        text("Blue outline marks FG region on generated and subsequent native frames.")
+                    end
                     if draft.FgPeripheralPercent ~= nil then
                         combo("FG periphery scale", "FgPeripheralPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                         combo("FG periphery method", "FgPeripheralMethod", {[0]="None (previous frame)", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS"})
                         combo("FG periphery depth", "FgDepthBits", {[16]="16-bit", [32]="32-bit"})
                         combo("FG periphery motion", "FgMotionBits", {[16]="16-bit", [32]="32-bit"})
                     end
-                    text("Fixed center, independent of SR. FG scale controls center resolution.")
+                    text("FG scale controls center resolution; matching controls the center region only.")
                     text("Unsupported guides preserve native frames; see status.")
                 end
                 text("Target: 2x. Native cadence continues until generation succeeds.")

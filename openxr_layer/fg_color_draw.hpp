@@ -20,12 +20,12 @@ struct ColorDraw {
     Ptr<ID3DBlob> vertex,pixel;
     struct Pipeline {DXGI_FORMAT format;Ptr<ID3D12PipelineState> state;};
     std::vector<Pipeline> pipelines;
-    struct Constants {float region[4]{0,0,1,1},crop[4]{},spans[4]{},texel[4]{},options[4]{};};
+    struct Constants {float region[4]{0,0,1,1},crop[4]{},spans[4]{},texel[4]{},options[4]{},border[4]{};};
     bool initialize(ID3D12Device* d) {
         if(root&&vertex&&pixel)return true;
         constexpr char shader[]=CHEEKY_FG_COMPACT_HLSL R"HLSL(
 Texture2DArray<float4> Source:register(t0);SamplerState LinearClamp:register(s0);
-cbuffer Params:register(b0){float4 Region;float4 Crop;float4 Spans;float4 Texel;float4 Options;}
+cbuffer Params:register(b0){float4 Region;float4 Crop;float4 Spans;float4 Texel;float4 Options;float4 Border;}
 struct V {float4 position:SV_Position;float2 uv:TEXCOORD0;};
 V VS(uint id:SV_VertexID){V v;v.uv=float2((id<<1)&2,id&2);v.position=float4(v.uv*float2(2,-2)+float2(-1,1),0,1);return v;}
 float4 PS(V v):SV_Target{
@@ -42,6 +42,11 @@ float4 PS(V v):SV_Target{
  // SDR FG uses gamma-encoded UNORM. A typed sRGB source was decoded by its SRV;
  // re-encode only when the render target itself is not sRGB.
  if(Options.x>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));
+ if(Options.y>.5){
+  float2 edge=min(uv-Border.xy,Border.xy+Border.zw-uv);
+  float2 thickness=float2(Options.z,Options.w);
+  if(all(edge>=-thickness)&&any(abs(edge)<=thickness))c.rgb=float3(.04,.35,1.0);
+ }
  return c;
 })HLSL";
         Ptr<ID3DBlob> error;

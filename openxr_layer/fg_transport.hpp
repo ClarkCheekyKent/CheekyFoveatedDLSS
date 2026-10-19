@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_present.hpp"
 #include "fg_color_draw.hpp"
+#include "../shared/fg_border.hpp"
 #include "../shared/cheeky_gpu_span.hpp"
 #include "../shared/fg_resource_memory.hpp"
 #include <vector>
@@ -9,7 +10,7 @@
 namespace cheeky::fg {
 // Each command allocator and every referenced image stays leased until its
 // fence retires. The producer only polls for a free context; it never waits.
-struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;};
+struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;};
 using Image=std::shared_ptr<TransportImage>;
 struct ColorReadyStamp {
     std::atomic<std::uint64_t> ready_qpc{};
@@ -132,7 +133,7 @@ struct Transport {
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
             if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
-               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->identity=++next_identity;p->last_used_tick=now;return p;}
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->fg_border={};p->identity=++next_identity;p->last_used_tick=now;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
@@ -215,13 +216,18 @@ struct Transport {
         const auto a=source->texture->GetDesc(),b=target->GetDesc();
         if(target_format==DXGI_FORMAT_UNKNOWN)target_format=b.Format;
         const auto sf=source->presentation_format==DXGI_FORMAT_UNKNOWN?a.Format:source->presentation_format;
-        if(linear_target||source->layout.packed()||!compatible_color(b.Format,a.Format)){
+        if(linear_target||source->layout.packed()||source->fg_border.visible||!compatible_color(b.Format,a.Format)){
             const unsigned width=source->layout.width?source->layout.width:unsigned(a.Width),height=source->layout.height?source->layout.height:a.Height;
             if(b.Width!=width||b.Height!=height||a.DepthOrArraySize!=1||b.DepthOrArraySize!=1)return false;
             const auto readable=(source->state&D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)?source->state:D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             color_transition(c.list.Get(),source->texture.Get(),source->state,readable);
             ColorDraw::Constants constants;source->layout.constants(constants.crop,constants.spans,constants.texel);
             constants.options[0]=!linear_target&&srgb_color(sf)&&!srgb_color(target_format)?1.f:0.f;
+            if(source->fg_border.visible){
+                constants.border[0]=source->fg_border.x;constants.border[1]=source->fg_border.y;
+                constants.border[2]=source->fg_border.w;constants.border[3]=source->fg_border.h;
+                constants.options[1]=1.f;constants.options[2]=2.f/width;constants.options[3]=2.f/height;
+            }
             const bool good=draw.record(device.Get(),c.list.Get(),c.bindings,source->texture.Get(),sf,0,target,target_format,
                 D3D12_VIEWPORT{0,0,float(width),float(height),0,1},constants);
             color_transition(c.list.Get(),source->texture.Get(),readable,source->state);

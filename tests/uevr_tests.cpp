@@ -95,6 +95,15 @@ void settings_tests(const std::filesystem::path& root) {
         Settings fg;
         require(!fg.fg.enabled && set_named_setting(fg,"FgEnabled","true") && fg.fg.enabled,
             "FG is opt-in and configurable");
+        require(fg.fg.match_sr_region && !fg.fg.show_border &&
+            fg.fg.width == fg.width && fg.fg.height == fg.height,
+            "FG follows SR by default, uses matching manual dimensions, and hides debug border");
+        require(set_named_setting(fg,"FgMatchSrRegion","false") && !fg.fg.match_sr_region &&
+            set_named_setting(fg,"FgMatchSrRegion","true") && fg.fg.match_sr_region &&
+            set_named_setting(fg,"FgShowBorder","true") && fg.fg.show_border &&
+            set_named_setting(fg,"FgShowBorder","false") && !fg.fg.show_border &&
+            !set_named_setting(fg,"FgShowBorder","invalid"),
+            "FG match-SR and blue-border options parse independently");
         require(fg.fg.release_point==3&&!fg.fg.submit_repeats&&fg.fg.resolution_percent==100&&
             fg.fg.peripheral_percent==25&&fg.fg.peripheral_method==1,"FG uses the tested generated-submission/fresh-only and quality defaults");
         require(set_named_setting(fg,"FgWaitForCompletion","false")&&fg.fg.release_point==0&&set_named_setting(fg,"FgWaitForCompletion","true")&&

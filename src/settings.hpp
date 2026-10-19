@@ -41,9 +41,11 @@ struct Settings {
     struct FrameGeneration {
         bool enabled{false};
         bool foveated{true};
+        bool match_sr_region{true}; // Copy SR size and effective per-eye placement when enabled.
+        bool show_border{false}; // Blue FG debug outline, drawn after FG into OpenXR output.
         std::uint32_t resolution_percent{100},peripheral_percent{25};
         std::uint32_t peripheral_method{1},depth_bits{32},motion_bits{32};
-        float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F};
+        float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
         std::uint32_t diagnostic_mode{}; // UEVR Lua: normal, prepare-first, left-only, right-only, split-lists.
         bool backbuffer_frame_id{true}; // Native render-frame identity shared by both NGX stereo evaluations.
         std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.

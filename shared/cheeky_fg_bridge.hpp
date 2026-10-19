@@ -24,6 +24,7 @@ struct CheekyFgEye {
     std::uint32_t motion_jittered{};
     std::uint32_t depth_inverted{}, reset{}, low_res_mv{};
     float focus_width{1},focus_height{1},focus_x{},focus_y{},focus_feather{0.04f};
+    std::uint32_t show_foveation_border{}; // Blue border on FG generated output only (not history).
     std::uint32_t resolution_percent{100},peripheral_percent{50};
     std::uint32_t peripheral_method{2},depth_bits{32},motion_bits{32};
     std::uint64_t configuration{};

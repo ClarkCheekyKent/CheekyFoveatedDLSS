@@ -173,6 +173,7 @@ struct BufferedPresenter final : Presenter {
     std::deque<std::shared_ptr<Native>> pending;
     std::deque<Pair> ready;
     std::optional<Pair> latest_native;
+    std::array<BorderRect,2> last_fg_borders{}; // Protected by mx; latest FG region for native uploads.
     std::unordered_map<XrSwapchain,Chain> auxiliary_chains;
     Chain scene_chains[2]; // Native and generated presentations share each eye's destination.
     CheekyFgPerformance telemetry;
@@ -511,7 +512,7 @@ struct BufferedPresenter final : Presenter {
         if(pacing_thread.joinable())pacing_thread.join();
         std::lock_guard capture_lock(capture_mutex);
         producer.drain();output.drain();uploads.drain();worker.wait_idle();
-        std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();slots={};
+        std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
         captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;passthrough_events=0;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
@@ -866,6 +867,10 @@ struct BufferedPresenter final : Presenter {
             else {
                 job->space=projection->space;job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();
+                // Keep the debug overlay on native submissions too. Native
+                // snapshots are immutable once published; use the last proven
+                // FG region (one native frame behind for dynamic gaze).
+                for(unsigned eye=0;eye<2;++eye)job->color[eye]->fg_border=last_fg_borders[eye];
                 Pair native;native.upload_mode=job->upload_mode;native.native_id=native.current_id=id;native.ready=job->ready;
                 native.native_color_ready=native.current_color_ready=job->color_ready;
                 native.native_final_ready=native.current_final_ready=job->final_color_ready;
@@ -1024,7 +1029,10 @@ struct BufferedPresenter final : Presenter {
                     auto publication=d;publication.Format=worker.focus.color_format;
                     std::array<Worker::OutputCopy,2> copies;
                     bool available=true;
-                    const bool blocked_direct=job->direct_output_mode&&direct_blocked_target==direct_target_key(worker.width,worker.height,worker.focus.color_format);
+                    // Debug border is drawn by the final OpenXR upload. Avoid
+                    // bypassing that upload via experimental direct XR output.
+                    const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;});
+                    const bool blocked_direct=job->direct_output_mode&&(border_upload||direct_blocked_target==direct_target_key(worker.width,worker.height,worker.focus.color_format));
                     if(blocked_direct){std::lock_guard lock(mx);++direct_stats.fallbacks;++direct_stats.unsupported;direct_stats.last_path=3;}
                     if(job->direct_output_mode&&!blocked_direct){
                         const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
@@ -1048,6 +1056,8 @@ struct BufferedPresenter final : Presenter {
                         pair.generated[eye]=output.image(publication,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
                         if(!pair.generated[eye]){available=false;break;}
                         pair.generated[eye]->layout=layout;
+                        pair.generated[eye]->fg_border=fg_border_rect(worker.width,worker.height,g.focus_width,g.focus_height,
+                            g.focus_x,g.focus_y,g.show_foveation_border!=0);
                         copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};
                     }
                     if(available) {
@@ -1088,6 +1098,7 @@ struct BufferedPresenter final : Presenter {
                 // guides. Release completed leases now instead of pinning raw
                 // textures in reusable slots or temporal history indefinitely.
                 if(!worker.fence||worker.fence->GetCompletedValue()>=worker.serial)job->clear_guides();
+                if(success&&!pair.direct_xr)for(unsigned eye=0;eye<2;++eye)last_fg_borders[eye]=pair.generated[eye]->fg_border;
                 if(success&&active_release_point==3u&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
                 worker.latency.snapshot(experiment_state);

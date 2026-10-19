@@ -3,6 +3,8 @@
 #include "fg_snapshot.hpp"
 #include "fg_frame_phase.hpp"
 #include "fg_source_lifecycle.hpp"
+#include "gaze_foveation.hpp"
+#include "fg_sr_region.hpp"
 #include "uevr_frame_source.hpp"
 #include "runtime.hpp"
 #include <Windows.h>
@@ -107,7 +109,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // both NGX histories every time a release mode was changed live.
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{unsigned(s.foveated),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
+    for(const auto n:{unsigned(s.foveated),unsigned(s.match_sr_region),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
         s.peripheral_method,s.depth_bits,s.motion_bits,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
@@ -117,7 +119,16 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
 // both OpenXR capture geometry and the guide source used by DLSS-G. The
 // presenter uses this key to retire the old pipeline at the next xrWaitFrame.
 std::uint64_t configuration(const Settings& s) noexcept {
-    return fg_sr_mode_configuration(configuration(s.fg),s.enabled);
+    auto hash=fg_sr_mode_configuration(configuration(s.fg),s.enabled);
+    if(s.fg.match_sr_region&&s.fg.foveated){
+        // SR's static region can change independently of FG. Gaze placement is
+        // sampled per eye rather than hashed (it moves every frame).
+        for(const auto n:{std::bit_cast<unsigned>(s.width),std::bit_cast<unsigned>(s.height),
+                std::bit_cast<unsigned>(s.x_offset),std::bit_cast<unsigned>(s.height_offset),
+                std::bit_cast<unsigned>(s.transition_width),unsigned(s.center_mode),
+                unsigned(s.auto_stereo_alignment)})hash=(hash^n)*1099511628211ull;
+    }
+    return hash;
 }
 ID3D12Resource* read(const NgxParameters* p,const char* n) noexcept {
     ID3D12Resource* r{};if (p) p->Get(n,&r);return r;
@@ -245,9 +256,32 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.reset=ui(p,"Reset");
     m.focus_width=settings.fg.foveated ? settings.fg.width : 1.0f;
     m.focus_height=settings.fg.foveated ? settings.fg.height : 1.0f;
-    m.focus_x=settings.fg.x;
-    m.focus_y=settings.fg.y;
     m.focus_feather=settings.fg.feather;
+    m.show_foveation_border=settings.fg.foveated&&settings.fg.show_border?1u:0u;
+    // Each DLSS view maps to a different optical center. FG offsets are
+    // relative to that stereo-aligned center, even with SR-size matching OFF.
+    const auto view_id=static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle));
+    // Query the known calibration without changing SR eye-role counters.
+    const auto assignment=stereo_eye_assignment(view_id);
+    const float signed_sr_x=assignment.assigned&&!assignment.shared_source
+        ? ((bool(assignment.eye_index==1)!=settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
+        : 0.f;
+    const auto sr=fg_sr_prepared_for(view_id,w,h);
+    const float base_u=sr.valid ? sr.center_u : fg_fallback_center(settings.width,signed_sr_x);
+    const float base_v=sr.valid ? sr.center_v : fg_fallback_center(settings.height,settings.height_offset);
+    m.focus_x=base_u-.5f+settings.fg.x;
+    m.focus_y=base_v-.5f+settings.fg.y;
+    if(settings.fg.foveated&&settings.fg.match_sr_region){
+        // Use the exact SR crop that was actually prepared, including its
+        // pixel rounding. Never invoke the SR gaze solver again from FG:
+        // doing so advances the same temporal/crop state twice per eye.
+        m.focus_width=sr.valid ? sr.region_width : settings.width;
+        m.focus_height=sr.valid ? sr.region_height : settings.height;
+        m.focus_feather=settings.transition_width;
+        // Matching overrides manual FG offsets but retains stereo alignment.
+        m.focus_x=base_u-.5f;
+        m.focus_y=base_v-.5f;
+    }
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
