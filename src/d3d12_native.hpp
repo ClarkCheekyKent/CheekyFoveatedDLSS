@@ -91,3 +91,63 @@ inline bool same_d3d12_device(ID3D12Device* a, ID3D12Device* b) noexcept {
     return first_token && second_token && first_token.Get() == second_token.Get();
 }
 }
+
+namespace cheeky::foveated_dlss {
+namespace d3d12_queue_detail {
+inline constexpr GUID identity_key{0x35424d8c,0x958b,0x42e4,{0x93,0x62,0x21,0x78,0x3f,0xd5,0xba,0x91}};
+class Identity final : public IUnknown {
+    std::atomic<ULONG> refs{1};
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override {
+        if(!out)return E_POINTER;*out=nullptr;
+        if(id!=__uuidof(IUnknown))return E_NOINTERFACE;
+        *out=this;AddRef();return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override{return ++refs;}
+    ULONG STDMETHODCALLTYPE Release() override{const auto n=--refs;if(!n)delete this;return n;}
+};
+inline Microsoft::WRL::ComPtr<IUnknown> token(ID3D12CommandQueue* q) noexcept {
+    Microsoft::WRL::ComPtr<IUnknown> found;
+    UINT size=sizeof(IUnknown*);
+    if(SUCCEEDED(q->GetPrivateData(identity_key,&size,found.GetAddressOf()))&&found)return found;
+    // The metadata lifetime can exceed the plugin's UI DLL lifetime.
+    HMODULE resident{};
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(&token),&resident))return {};
+    found.Attach(new(std::nothrow) Identity);
+    if(!found||FAILED(q->SetPrivateDataInterface(identity_key,found.Get())))return {};
+    return found;
+}
+}
+// Do not treat same-device queues as identical. This only accepts COM identity,
+// public native unwrapping, or a proven shared queue-private identity token.
+// Opaque interposers that do not share metadata deliberately fail closed.
+inline bool same_d3d12_queue(ID3D12CommandQueue* left,ID3D12CommandQueue* right) noexcept {
+    if(!left||!right)return false;
+    const auto a=native_d3d12_interface(left),b=native_d3d12_interface(right);
+    if(!a||!b)return false;
+    if(a.Get()==b.Get())return true;
+    Microsoft::WRL::ComPtr<IUnknown> ai,bi;
+    if(SUCCEEDED(a.As(&ai))&&SUCCEEDED(b.As(&bi))&&ai.Get()==bi.Get())return true;
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    auto at=d3d12_queue_detail::token(a.Get()),bt=d3d12_queue_detail::token(b.Get());
+    return at&&bt&&at.Get()==bt.Get();
+}
+} // namespace cheeky::foveated_dlss
+
+namespace cheeky::foveated_dlss {
+// Prove two graphics-list interfaces identify the same live COM recording.
+// Never match by device, command-list type, or timing alone.
+inline bool same_d3d12_list(ID3D12GraphicsCommandList* a,ID3D12GraphicsCommandList* b) noexcept {
+    if(!a||!b)return false;
+    if(a==b)return true;
+    const auto na=native_d3d12_interface(a),nb=native_d3d12_interface(b);
+    if(na&&nb&&na.Get()==nb.Get())return true;
+    Microsoft::WRL::ComPtr<IUnknown> ai,bi;
+    if(SUCCEEDED(a->QueryInterface(IID_PPV_ARGS(&ai)))&&
+       SUCCEEDED(b->QueryInterface(IID_PPV_ARGS(&bi)))&&ai.Get()==bi.Get())return true;
+    ai.Reset();bi.Reset();
+    return na&&nb&&SUCCEEDED(na.As(&ai))&&SUCCEEDED(nb.As(&bi))&&ai.Get()==bi.Get();
+}
+} // namespace cheeky::foveated_dlss

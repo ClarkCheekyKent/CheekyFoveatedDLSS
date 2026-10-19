@@ -265,13 +265,37 @@ bool any_tracked(UINT count, ID3D12CommandList* const* lists) noexcept {
 }
 void execute(ExecuteFn real_execute, ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
     ObservationScope scope;
-    if (calibration12_internal_work() || !scope.outer || !ready || !lists) {
+    if (calibration12_internal_work() || !ready || !lists) {
         real_execute(queue, count, lists);
+        return;
+    }
+    if (!scope.outer) {
+        // Opaque UEVR queue wrappers may forward into a separately-hooked
+        // native ExecuteCommandLists, invisible to the outer probe. Observe
+        // the actual native enqueue as well, without touching the non-FG
+        // observer's non-reentrant calibration/NR/gaze bookkeeping.
+        real_execute(queue, count, lists);
+        if (fg_has_pending_submissions()) for (UINT i = 0; i < count; ++i) {
+            ComPtr<ID3D12GraphicsCommandList> graphics;
+            if (lists[i] && SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&graphics))))
+                fg_note_submission(queue, graphics.Get());
+        }
         return;
     }
     const bool tracked_submission = any_tracked(count, lists);
     if (!tracked_submission) {
         real_execute(queue, count, lists);
+        // An opaque UEVR command-list forwarding layer may hide a guide's
+        // private-data tag from the pre-execute QueryInterface probe. Check
+        // actual submissions even when that probe says "untracked". The
+        // pending flag avoids locking on unrelated game/OpenXR command lists.
+        if (fg_has_pending_submissions()) {
+            for (UINT i = 0; i < count; ++i) {
+                ComPtr<ID3D12GraphicsCommandList> graphics;
+                if (lists[i] && SUCCEEDED(lists[i]->QueryInterface(IID_PPV_ARGS(&graphics))))
+                    fg_note_submission(queue, graphics.Get());
+            }
+        }
     } else {
         std::lock_guard execution_lock(calibration12_execution_mutex());
         real_execute(queue, count, lists);

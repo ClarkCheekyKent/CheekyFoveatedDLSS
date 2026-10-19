@@ -34,6 +34,10 @@ struct BufferedPresenter final : Presenter {
         ComPtr<IUnknown> guide_lease;
         std::array<ComPtr<ID3D12Resource>,2> guide_depth,guide_motion;
         std::array<ComPtr<ID3D12Resource>,2> peripheral_depth,peripheral_motion;
+        // Only hook-free split-queue captures use this GPU-side dependency.
+        // The producer queue signals it after the NGX guide command lists.
+        ComPtr<ID3D12Fence> guide_sync_fence;
+        std::uint64_t guide_sync_value{};
         void retain_guides(const CheekyFgPair& source) noexcept {
             guides=source;guide_lease=source.lease;
             for(unsigned eye=0;eye<2;++eye){guide_depth[eye]=source.eyes[eye].depth;guide_motion[eye]=source.eyes[eye].motion;
@@ -42,7 +46,8 @@ struct BufferedPresenter final : Presenter {
             // must never be passed to the bridge's ReleasePair function.
             guides.lease=nullptr;guides.producer_queue=nullptr;
         }
-        void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};peripheral_depth={};peripheral_motion={};guide_lease.Reset();}
+        void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};peripheral_depth={};peripheral_motion={};
+            guide_lease.Reset();guide_sync_fence.Reset();guide_sync_value=0;}
         bool guides_valid{};
         CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
         unsigned source_depth{},source_motion{};
@@ -99,6 +104,36 @@ struct BufferedPresenter final : Presenter {
     // OpenXR binding, guide capture and uploads always retain the original queue.
     ComPtr<ID3D12CommandQueue> generation_queue;
     ComPtr<ID3D12CommandQueue> fg_high_queue,fg_normal_queue;
+    // Single monotonically increasing fence shared across hook-free frames.
+    // It bridges a verified NGX execution queue to the OpenXR/FG queues
+    // without depending on UEVR's private renderer/vtable layout.
+    ComPtr<ID3D12Fence> guide_sync_fence;
+    std::uint64_t guide_sync_serial{};
+    bool guide_sync_reported{};
+    bool accept_guide_queue(const CheekyFgPair& guides,Native& job,bool hookless) noexcept {
+        if(cheeky::foveated_dlss::same_d3d12_queue(guides.producer_queue,queue.Get()))return true;
+        // Legacy modes intentionally retain their established same-queue contract.
+        if(!hookless||guides.release_point!=3u||!guide_sync_fence||!device||!queue)return false;
+        auto actual=cheeky::foveated_dlss::native_d3d12_interface(guides.producer_queue);
+        if(!actual||actual->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT||
+           queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return false;
+        ComPtr<ID3D12Device> executing_device;
+        if(FAILED(actual->GetDevice(IID_PPV_ARGS(&executing_device)))||
+           !cheeky::foveated_dlss::same_d3d12_device(device.Get(),executing_device.Get()))return false;
+        // The guide command lists were already observed as submitted on
+        // `actual`. Its signal is ordered after those writes. The worker
+        // enqueues Queue::Wait on its OWN queue before accessing their data.
+        const auto value=guide_sync_serial+1;
+        if(FAILED(actual->Signal(guide_sync_fence.Get(),value)))return false;
+        guide_sync_serial=value;
+        job.guide_sync_fence=guide_sync_fence;
+        job.guide_sync_value=value;
+        if(!guide_sync_reported&&trace){
+            trace("DLSS-FG hook-free guide queue differs from OpenXR queue: validated same-device cross-queue GPU fence enabled");
+            guide_sync_reported=true;
+        }
+        return true;
+    }
     unsigned last_fg_priority_requested{UINT32_MAX};
     unsigned reported_queue_mode{1}; // Published under mx for presentation diagnostics.
     bool generation_high_priority{};
@@ -210,6 +245,10 @@ struct BufferedPresenter final : Presenter {
         generation_high_priority=fg_high_queue.Get()!=nullptr&&generation_queue.Get()==fg_high_queue.Get();
         reported_queue_mode=generation_queue.Get()==q?2u:generation_high_priority?1u:0u;
         last_fg_priority_requested=UINT32_MAX;
+        guide_sync_fence.Reset();guide_sync_serial=0;guide_sync_reported=false;
+        // Failure merely disables split-queue FG; the native OpenXR path
+        // remains usable, and matching queues need no additional fence.
+        dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&guide_sync_fence));
         if(trace) {
             char message[240]{};
             sprintf_s(message,"DLSS-FG queue A/B: HIGH=%s(0x%08lx), separate NORMAL=%s(0x%08lx); active=%s; capture remains game queue",
@@ -403,6 +442,7 @@ struct BufferedPresenter final : Presenter {
         gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;experiment_state={};direct_request.reset();direct_stats={};direct_wait={};
         direct_details={};logged_direct_details={};
         direct_blocked_target=0;
+        guide_sync_fence.Reset();guide_sync_serial=0;guide_sync_reported=false;
         awaiting_generated_submission=generated_gate_releases=generated_gate_skips=0;
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
@@ -571,8 +611,15 @@ struct BufferedPresenter final : Presenter {
         std::uint64_t id{};bool use_raw{};
         {std::lock_guard lock(mx);if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;
             if(!started||begun==ended)return XR_ERROR_CALL_ORDER_INVALID;++native_count;id=++next_id;use_raw=degraded;}
-        if(use_raw){const auto result=passthrough(end);std::lock_guard lock(mx);++ended;changed.notify_all();return result;}
+        const auto fg_runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+        const auto hookless_complete=fg_runtime?reinterpret_cast<CheekyFgCompleteHooklessFrameFn>(
+            GetProcAddress(fg_runtime,"CheekyFG_CompleteHooklessFrameV1")):nullptr;
+        if(use_raw){
+            if(hookless_complete)hookless_complete(0);
+            const auto result=passthrough(end);std::lock_guard lock(mx);++ended;changed.notify_all();return result;
+        }
         {std::lock_guard capture_lock(capture_mutex);if(capture_overflow){
+            if(hookless_complete)hookless_complete(0);
             capture_overflow=false;std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;}}
         XrResult result=XR_SUCCESS;
         std::shared_ptr<Native> job;
@@ -584,10 +631,17 @@ struct BufferedPresenter final : Presenter {
             }
         }
         const bool inference_slot=bool(job);
+        // CaptureStamp is per-image. Some UEVR versions release a left/right
+        // image separately or execute the final copy through opaque wrappers.
+        // In hook-free mode only the completed xrEndFrame can claim a pair.
+        if(!inference_slot&&hookless_complete)hookless_complete(0);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
         job->color={};job->color_ready={};job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
-        if(!projection||!job->layers.prepare(end,projection))result=passthrough(end);
+        if(!projection||!job->layers.prepare(end,projection)){
+            if(inference_slot&&hookless_complete)hookless_complete(0);
+            result=passthrough(end);
+        }
         else {
             std::lock_guard capture_lock(capture_mutex);
             std::unordered_map<XrSwapchain,CapturePlan> next_plans;
@@ -602,7 +656,10 @@ struct BufferedPresenter final : Presenter {
             job->direct_output_mode=direct_output_mode.load();
             job->direct_shading_mode=direct_shading_mode.load();
             auto* c=producer.begin(id,true);
-            if(!c){std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;}
+            if(!c){
+                if(inference_slot&&hookless_complete)hookless_complete(0);
+                std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;
+            }
             bool good=true;std::uint64_t expected_token{},expected_frame{};bool tokens_match=true;
             if(good)for(unsigned eye=0;eye<2;++eye) {
                 const auto& sub=projection->views[eye].subImage;
@@ -643,6 +700,14 @@ struct BufferedPresenter final : Presenter {
                     job->auxiliary.push_back({sub.swapchain,found->second});return true;
             });
             if(good) {
+                if(inference_slot&&hookless_complete){
+                    // Both final stereo colors are now captured. The strict
+                    // mode-3 scheduler gates the next native frame until FG
+                    // submission. No UEVR private frame ID/color hook needed.
+                    const auto completed=hookless_complete(1);
+                    if(completed){expected_token=completed;expected_frame=0;tokens_match=true;}
+                    else if(!expected_frame){expected_token=0;tokens_match=false;}
+                }
                 auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
                 auto acquire=guide_acquire?guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
                 auto release=guide_release?guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
@@ -651,8 +716,11 @@ struct BufferedPresenter final : Presenter {
                 // The nonzero color token still identifies the immutable pair.
                 if(inference_slot&&(!tokens_match||!expected_token))job->guide_state=CheekyFgState::guide_frame_mismatch;
                 if(inference_slot&&tokens_match&&expected_token&&acquire&&release&&acquire(&guides)) {
-                    job->guides_valid=cheeky::foveated_dlss::native_d3d12_interface(guides.producer_queue)==
-                        cheeky::foveated_dlss::native_d3d12_interface(queue.Get());
+                    // Hook-free mode 3 can work with a different *verified*
+                    // native guide queue. Explicit Signal/Wait orders the
+                    // guide writes before FG reads; same-device alone is NOT
+                    // sufficient. Other release modes still require one queue.
+                    job->guides_valid=accept_guide_queue(guides,*job,expected_frame==0);
                     if(!job->guides_valid)job->guide_state=CheekyFgState::queue_mismatch;
                     if(guides.capture_token!=expected_token||guides.eyes[1].evaluation!=expected_token||
                        guides.eyes[0].evaluation+1!=expected_token||guides.eyes[0].render_frame!=expected_frame||
@@ -680,7 +748,9 @@ struct BufferedPresenter final : Presenter {
                     telemetry.color_render_frame=expected_frame;telemetry.guide_render_frame=job->guides_valid?expected_frame:0;
                     if(inference_slot&&job->guide_state==CheekyFgState::guide_frame_mismatch)++telemetry.mismatched_guides;}
                 good=producer.execute(*c,job->ready);
+                if(!good&&inference_slot&&hookless_complete)hookless_complete(0);
             }else if(c){
+                if(inference_slot&&hookless_complete)hookless_complete(0);
                 // A changed layout can fail after one eye was recorded. Queue
                 // those valid partial transitions so tracked pool states stay
                 // consistent before falling back to the original native frame.
@@ -819,6 +889,13 @@ struct BufferedPresenter final : Presenter {
                 const auto& color_layout=job->color[0]->layout;
                 if(worker.initialize(device.Get(),generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format)) {
                     for(unsigned eye=0;eye<2;++eye){worker.color_layouts[eye]=job->color[eye]->layout;worker.previous_layouts[eye]=previous->color[eye]->layout;}
+                    // The OpenXR capture has its own producer.fence, but it
+                    // does not cover guide writes on a DIFFERENT game queue.
+                    // Bridge that dependency before DLSS-G prepares the guides.
+                    const auto guides_ready=job->guide_sync_value ?
+                        generation_queue->Wait(job->guide_sync_fence.Get(),job->guide_sync_value) : S_OK;
+                    if(FAILED(guides_ready)){worker.failed=true;worker.report("FG guide cross-queue GPU wait",unsigned(guides_ready));
+                        throw std::runtime_error("FG guide cross-queue GPU wait failed");}
                     const auto ready_result=worker.latency.enqueue_wait(device.Get(),generation_queue.Get(),producer.fence.Get(),job->ready,job->latency_diagnostics);
                     if(FAILED(ready_result)){worker.failed=true;worker.report("FG capture dependency queue wait",unsigned(ready_result));}
                     if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");

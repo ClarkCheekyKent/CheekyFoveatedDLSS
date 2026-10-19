@@ -120,6 +120,37 @@ struct Runtime {
 };
 }
 
+void fg_hookless_crossqueue_validation(ID3D12Device* device) {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D12CommandQueue> xr_queue,ngx_queue;
+    D3D12_COMMAND_QUEUE_DESC desc{};desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+    check(SUCCEEDED(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&xr_queue)))&&
+          SUCCEEDED(device->CreateCommandQueue(&desc,IID_PPV_ARGS(&ngx_queue))),"Split NGX/OpenXR test queues");
+    cheeky::fg::BufferedPresenter presenter;
+    check(presenter.setup(h<XrSession>(31),buffered_probe::Runtime::functions(),device,xr_queue.Get()),
+        "Split NGX/OpenXR presenter setup");
+    check(presenter.guide_sync_fence.Get()!=nullptr,"Hook-free GPU bridge fence allocated");
+    cheeky::fg::BufferedPresenter::Native job;
+    CheekyFgPair guides{};guides.producer_queue=ngx_queue.Get();guides.release_point=3;
+    check(!presenter.accept_guide_queue(guides,job,false),"Legacy path rejects distinct queues");
+    check(presenter.accept_guide_queue(guides,job,true),"Hook-free mode accepts synchronized distinct queues");
+    check(job.guide_sync_fence&&job.guide_sync_value==1,"Bridge publishes first GPU dependency");
+    ComPtr<ID3D12Fence> done;
+    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&done)))&&
+          SUCCEEDED(presenter.generation_queue->Wait(job.guide_sync_fence.Get(),job.guide_sync_value))&&
+          SUCCEEDED(presenter.generation_queue->Signal(done.Get(),1)),"Worker waits for NGX queue");
+    HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+    check(event&&SUCCEEDED(done->SetEventOnCompletion(1,event))&&
+          WaitForSingleObject(event,10000)==WAIT_OBJECT_0,"Split-queue GPU wait completes");
+    CloseHandle(event);
+    job.clear_guides();
+    check(presenter.accept_guide_queue(guides,job,true)&&job.guide_sync_value==2,
+        "Guide GPU bridge advances serial on second native frame");
+    guides.release_point=2;
+    check(!presenter.accept_guide_queue(guides,job,true),"Only hook-free release mode 3 bridges distinct queues");
+    presenter.stop();
+}
+
 void fg_repeat_upload_validation(ID3D12Device* device) {
     using namespace buffered_probe;using Microsoft::WRL::ComPtr;
     Runtime::device=device;
@@ -1042,5 +1073,6 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     failed.reset();Runtime::reject_private=false;
     Runtime::snapshots=nullptr;
     std::cout<<"PASS buffered private-swapchain failure recovery, restart, blocked application wait cancellation and balanced shutdown\n";
+    fg_hookless_crossqueue_validation(device);
     fg_repeat_upload_validation(device);
 }

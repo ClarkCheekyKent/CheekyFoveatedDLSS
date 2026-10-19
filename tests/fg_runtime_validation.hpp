@@ -202,21 +202,56 @@ void fg_runtime_frame_validation(HMODULE runtime,const std::filesystem::path& bi
         health(&status)&&!status.plugin_hook&&std::string(status.source).find("Hook-free")!=std::string::npos,
         "Live Lua setting detaches both UEVR hooks and no longer depends on the private backend layout");
     set_frame(0); // No frame identity; guide grouping is capture-order only.
+    auto complete_hookless=reinterpret_cast<CheekyFgCompleteHooklessFrameFn>(
+        GetProcAddress(runtime,"CheekyFG_CompleteHooklessFrameV1"));
+    require(complete_hookless,"Hook-free end-frame stereo-pair export");
+    auto handoff=[&]{
+        require(stamp(output.Get(),&s)&&!s.token&&!s.render_frame,
+            "Hook-free per-image releases are not independently frame-tagged");
+        s.token=complete_hookless(1);
+        return s.token;
+    };
     auto untagged_guides=[&](unsigned count){
         for(unsigned i=0;i<count;++i)require(ngx_succeeded(evaluate(list.Get(),handle,&p,nullptr)),"Hook-free native NGX guide evaluation");
     };
     begin();untagged_guides(2);copy();submit();
-    require(stamp(output.Get(),&s)&&s.token&&s.render_frame==0,"Mode-3 same-list color resolves a frame-ID-free stereo pair");
+    require(handoff()&&s.render_frame==0,"Mode-3 xrEndFrame resolves a frame-ID-free stereo pair");
     pair={};pair.capture_token=s.token;pair.render_frame=0;
     require(acquire(&pair)&&!pair.render_frame&&!pair.eyes[0].render_frame&&!pair.eyes[1].render_frame&&
         !pair.enable_frame_id&&pair.release_point==3&&pair.eyes[0].evaluation+1==pair.eyes[1].evaluation,
         "Hook-free guide pair has no native tags/NGX frame ID, but preserves evaluation and capture identity");release(&pair);
     begin();untagged_guides(3);copy();submit();
-    require(stamp(output.Get(),&s)&&!s.token,"Three unticketed eyes must not silently use the newest two");
+    require(!handoff(),"Three unticketed eyes must not silently use the newest two");
     begin();untagged_guides(2);submit();begin();copy();submit();
-    require(stamp(output.Get(),&s)&&s.token&&!s.render_frame,"After an ambiguous pair the next clean split-list stereo interval recovers");
+    require(handoff()&&!s.render_frame,"After an ambiguous pair the next clean split-list stereo interval recovers");
     pair={};pair.capture_token=s.token;require(acquire(&pair)&&!pair.enable_frame_id,"Split-list hookless guide lease");release(&pair);
     begin();copy();submit();
-    require(stamp(output.Get(),&s)&&!s.token,"Color with no fresh guide pair cannot reuse consumed frames");
-    std::puts("PASS mode-3 hook-free live transition, strict stereo matching, split-list handoff, rejection and resynchronization");
+    require(!handoff(),"Color with no fresh guide pair cannot reuse consumed frames");
+    // Multiple color copies may occur before the frame's second eye. Only the
+    // OpenXR color handoff, never an intermediate copy submission, may reject
+    // the partial pair. This is the failing older-UEVR capture ordering.
+    begin();untagged_guides(1);copy();submit();
+    begin();untagged_guides(1);copy();submit();
+    require(handoff()&&!s.render_frame,
+        "Intermediate first-eye color copy must not discard its unfinished native pair");
+    pair={};pair.capture_token=s.token;
+    require(acquire(&pair)&&pair.eyes[0].evaluation+1==pair.eyes[1].evaluation,
+        "Final handoff retains the two submitted eye recordings");release(&pair);
+    // Long enough to exhaust the previous hard 24-shot pool if submissions
+    // are not tracked/retired, without increasing the allocation cap.
+    for(unsigned n=0;n<32;++n){
+        begin();untagged_guides(2);copy();submit();
+        require(handoff(),"Repeated hookless native frame must retain its guide pairing");
+        pair={};pair.capture_token=s.token;
+        require(acquire(&pair),"Guide snapshots must retire and recycle beyond 24 captures");release(&pair);
+    }
+    // An unused native frame must not leave stale guides behind.
+    begin();untagged_guides(2);submit();
+    require(!complete_hookless(0),"Skipped native xrEndFrame discards its guide interval");
+    // Some UEVR builds do not expose their OpenXR image copies to the observer.
+    begin();untagged_guides(2);submit();
+    require(handoff(),"End-frame association does not depend on color-copy observers");
+    pair={};pair.capture_token=s.token;
+    require(acquire(&pair),"End-frame-only hook-free pair can be leased");release(&pair);
+    std::puts("PASS mode-3 hook-free xrEndFrame stereo matching, skipped frames and 32-frame snapshot retirement");
 }

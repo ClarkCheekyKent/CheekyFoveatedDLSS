@@ -53,6 +53,10 @@ struct CheekyFgCaptureStamp {
     std::uint64_t token{},render_frame{};
 };
 using CheekyFgCaptureStampFn=bool(__cdecl*)(ID3D12Resource*,CheekyFgCaptureStamp*);
+// Hook-free mode 3: once per native xrEndFrame, AFTER both eye releases.
+// True claims one complete stereo pair; false retires an unused/failed frame.
+// Unlike per-image capture stamps, this needs no UEVR frame ticket or color-copy hook.
+using CheekyFgCompleteHooklessFrameFn=std::uint64_t(__cdecl*)(std::uint32_t use_for_fg);
 using CheekyFgRegisterHookFn=int(*)(void*,void*,void**);
 using CheekyFgUnregisterHookFn=void(*)(int);
 using CheekyFgAttachFrameSourceFn=bool(__cdecl*)(void*,CheekyFgRegisterHookFn,CheekyFgUnregisterHookFn);

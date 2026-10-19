@@ -6,6 +6,7 @@
 #include "fg_prepared_guides.hpp"
 #include <memory>
 #include <vector>
+#include <algorithm>
 
 namespace cheeky::foveated_dlss {
 // Copies are recorded beside the original DLSS evaluation, before either eye's
@@ -40,6 +41,10 @@ class FgSnapshots {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
+    // A UEVR build may return a command-queue facade (or a different queue)
+    // from its renderer accessor. The first *matching guide recording* proves
+    // which queue executed the captured GPU commands.
+    bool submission_queue_discovered{};
     std::vector<std::shared_ptr<Shot>> shots;
     struct Latch {std::uint64_t token;std::shared_ptr<Shot> a,b;};
     std::vector<Latch> latched;
@@ -141,11 +146,50 @@ public:
         __except(GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION||GetExceptionCode()==EXCEPTION_IN_PAGE_ERROR?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH){return 0;}
     }
     static std::uint64_t tag_recording(ID3D12GraphicsCommandList* list){
-        auto id=recording_identity(list);if(id)return id;static std::atomic<std::uint64_t> next{};id=++next;
-        return SUCCEEDED(list->SetPrivateData(recording_key,sizeof(id),&id))?id:0;
+        if(!list)return 0;
+        // NGX can receive a forwarding D3D12 list whereas ExecuteCommandLists
+        // receives a different interface for the same underlying recording.
+        // Stamp both only when their existing identities agree. Never overwrite
+        // another live recording's ID or infer equality from an adapter/device.
+        auto native=native_d3d12_interface(list);
+        const auto a=recording_identity(list),b=native?recording_identity(native.Get()):0;
+        if(a&&b&&a!=b)return 0;
+        static std::atomic<std::uint64_t> next{};
+        const auto id=a?a:b?b:++next;
+        if(!a&&FAILED(list->SetPrivateData(recording_key,sizeof(id),&id)))return 0;
+        if(native&&native.Get()!=list&&!b&&
+           FAILED(native->SetPrivateData(recording_key,sizeof(id),&id)))return 0;
+        return id;
     }
-    static bool tagged(ID3D12GraphicsCommandList* list) noexcept {return recording_identity(list)!=0;}
-    bool matches(ID3D12CommandQueue* q) const{return queue==native_d3d12_interface(q);}
+    static bool tagged(ID3D12GraphicsCommandList* list) noexcept {
+        if(recording_identity(list))return true;
+        auto native=native_d3d12_interface(list);
+        return native&&native.Get()!=list&&recording_identity(native.Get())!=0;
+    }
+    bool matches(ID3D12CommandQueue* q) const{return same_d3d12_queue(queue.Get(),q);}
+    bool has_discovered_submission_queue() const noexcept {return submission_queue_discovered;}
+    bool same_queue_device(ID3D12CommandQueue* q) const noexcept {
+        auto native=native_d3d12_interface(q);
+        Microsoft::WRL::ComPtr<ID3D12Device> candidate;
+        return device&&native&&SUCCEEDED(native->GetDevice(IID_PPV_ARGS(&candidate)))&&
+            same_d3d12_device(device.Get(),candidate.Get());
+    }
+    bool pending_submissions() const {
+        for(const auto& s:shots)if(!s->submitted&&!s->cancelled)return true;
+        return false;
+    }
+    struct SubmissionStats {unsigned pending{},submitted{},foreign{},retired{},cancelled{};std::uint64_t pending_id{},pending_recording{};};
+    SubmissionStats submission_stats() const {
+        SubmissionStats d;
+        for(const auto& s:shots){
+            if(s->cancelled)++d.cancelled;
+            else if(s->foreign)++d.foreign;
+            else if(!s->submitted){++d.pending;d.pending_id=s->meta.evaluation;d.pending_recording=s->recording;}
+            else if(!s->retired)++d.submitted;
+            else ++d.retired;
+        }
+        return d;
+    }
     void invalidate(){consumed=ordinal;latched.clear();previous_raw[0]={};previous_raw[1]={};}
     bool idle() const {
         const auto done=fence?fence->GetCompletedValue():0;
@@ -160,6 +204,7 @@ public:
         // This object is process-resident; retain old generations until exit.
         if(!shots.empty())return false;
         queue=native;device.Reset();fence.Reset();ordinal=serial=consumed=0;timestamp_frequency=0;
+        submission_queue_discovered=false;
         if(queue)queue->GetTimestampFrequency(&timestamp_frequency);
         return queue&&SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device)))&&
             SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
@@ -248,15 +293,42 @@ public:
         }
         slot->meta=meta;return true;
     }
-    void submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands) {
-        const auto recording=recording_identity(commands);auto native=native_d3d12_interface(q);
-        for(auto& s:shots)if(!s->submitted&&recording&&s->recording==recording) {
-            s->submitted=true;s->foreign=native!=queue;s->list.Reset();
+    unsigned submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands,bool discover_queue=false) {
+        unsigned found{};
+        const auto native_list=native_d3d12_interface(commands);
+        const auto recording=recording_identity(commands);
+        const auto native_recording=native_list?recording_identity(native_list.Get()):0;
+        for(auto& s:shots)if(!s->submitted&&
+            ((recording&&s->recording==recording)||(native_recording&&s->recording==native_recording)||
+             (!recording&&!native_recording&&same_d3d12_list(s->list.Get(),commands)))) {
+            if(discover_queue&&!submission_queue_discovered){
+                // Only this explicitly recognized NGX recording may select the
+                // executing queue. Mere same-device, timing, or queue priority
+                // NEVER proves that a command list was submitted here.
+                // Fence resources are per-device, so the existing unsignaled
+                // fence may safely be signaled by this queue instead.
+                // Do not move a queue once any earlier guide was submitted:
+                // it could otherwise signal before that earlier GPU work.
+                const bool previous_submits=std::any_of(shots.begin(),shots.end(),
+                    [](const auto& shot){return shot->submitted&&!shot->cancelled;});
+                if(!previous_submits&&same_queue_device(q)){
+                    auto executing=native_d3d12_interface(q);
+                    if(executing){
+                        queue=std::move(executing);
+                        timestamp_frequency=0;
+                        queue->GetTimestampFrequency(&timestamp_frequency);
+                        submission_queue_discovered=true;
+                    }
+                }
+            }
+            s->submitted=true;s->foreign=!matches(q);s->list.Reset();++found;
         }
+        return found;
     }
     void reset(ID3D12GraphicsCommandList* commands) {
         const auto recording=recording_identity(commands);
-        for(auto& s:shots)if(!s->submitted&&recording&&s->recording==recording){
+        for(auto& s:shots)if(!s->submitted&&
+            (recording?s->recording==recording:same_d3d12_list(s->list.Get(),commands))){
             s->cancelled=true;s->submitted=true;s->list.Reset();s->source_depth.Reset();s->source_motion.Reset();
             s->gpu_span.pending=false;
             failed_record=std::max(failed_record,s->meta.evaluation);
@@ -342,6 +414,10 @@ class FgColorProvenance {
     struct Pending {ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> color;Tag tag;std::uint64_t recording{};bool conflicted{},hookless{};};
     static inline constexpr GUID key{0x41c548c2,0x8d8a,0x4f23,{0x83,0x24,0x90,0xbe,0xa5,0xf8,0x22,0x7d}};
     std::vector<Pending> pending;
+    // In mode 3, color can be copied multiple times during one native frame.
+    // Queue submission only establishes provenance; choose a stereo token at
+    // the FINAL OpenXR color handoff, not at each intermediate copy.
+    std::vector<ComPtr<ID3D12Resource>> hookless_submitted;
     std::uint64_t generation{1};
     static bool read(ID3D12Resource* color,Tag& tag) {
         if(!color)return false;UINT size=sizeof(tag);
@@ -352,11 +428,35 @@ public:
     static bool registered(ID3D12Resource* color) {
         Tag tag;return read(color,tag);
     }
-    void invalidate(){++generation;pending.clear();}
-    std::uint64_t token(ID3D12Resource* color) {
+    void invalidate(){++generation;pending.clear();hookless_submitted.clear();}
+    bool has_pending() const {return !pending.empty();}
+    std::uint64_t token(ID3D12Resource* color,FgSnapshots* guides=nullptr,bool hookless=false) {
         if(!color)return 0;Tag tag;
         if(!read(color,tag)||tag.generation!=generation){
             tag={generation,0};color->SetPrivateData(key,sizeof(tag),&tag);return 0;
+        }
+        if(hookless&&guides){
+            const auto it=std::find_if(hookless_submitted.begin(),hookless_submitted.end(),
+                [&](const auto& r){return r.Get()==color;});
+            if(it!=hookless_submitted.end()){
+                // Only a submitted copy of THIS OpenXR color image authorizes
+                // pairing. token() refuses incomplete/extra/pending guides.
+                const auto matched=guides->token(0,true);
+                if(!matched){
+                    // The OpenXR handoff is the sole rejection boundary.
+                    // Incomplete/extra work cannot poison subsequent frames.
+                    guides->discard_hookless_interval();
+                    hookless_submitted.erase(it);
+                    return 0;
+                }
+                tag={generation,matched,0};
+                if(FAILED(color->SetPrivateData(key,sizeof(tag),&tag))){
+                    guides->discard_hookless_interval();
+                    hookless_submitted.erase(it);
+                    return 0;
+                }
+                hookless_submitted.erase(it); // latch pins snapshots until acquire
+            }
         }
         return tag.token;
     }
@@ -365,7 +465,7 @@ public:
                  std::uint64_t render_frame=0,bool hookless=false) {
         if(!registered(color))return;
         auto native=native_d3d12_interface(list);
-        const Tag tag{generation,hookless?guides.token(0,true):render_frame?guides.token(render_frame):0,render_frame};
+        const Tag tag{generation,hookless?0:render_frame?guides.token(render_frame):0,render_frame};
         const auto recording=FgSnapshots::tag_recording(list);if(!recording)return;
         for(auto& p:pending)if(p.recording==recording&&p.color.Get()==color){
             if(p.hookless!=hookless||p.tag.render_frame!=tag.render_frame||
@@ -380,28 +480,35 @@ public:
     void submitted(ID3D12CommandQueue* queue,ID3D12GraphicsCommandList* list,FgSnapshots& guides) {
         const auto recording=FgSnapshots::recording_identity(list);
         std::erase_if(pending,[&](Pending& p){
-            if(!recording||p.recording!=recording)return false;
+            if(recording?p.recording!=recording:!same_d3d12_list(p.list.Get(),list))return false;
             if(p.tag.generation!=generation||!guides.matches(queue))p.tag={generation,0};
             else if(!p.conflicted){
-                if(p.hookless){
-                    // Recheck even an early-observed token: a third NGX
-                    // evaluation between color recording and queue submission
-                    // makes the untagged interval ambiguous.
-                    const auto matched=guides.token(0,true);
-                    if(!matched|| (p.tag.token&&p.tag.token!=matched))p.tag.token=0;
-                    else p.tag.token=matched;
-                }else if(!p.tag.token&&p.tag.render_frame)
+                if(!p.hookless&&!p.tag.token&&p.tag.render_frame)
                     // Guides and final color can be recorded in the SAME command
                     // list. They become eligible only after this enqueue.
                     p.tag.token=guides.token(p.tag.render_frame);
             }
-            if(p.hookless&&!p.tag.token)guides.discard_hookless_interval();
-            p.color->SetPrivateData(key,sizeof(p.tag),&p.tag);return true;
+            if(p.hookless){
+                // A previous frame's token must not survive a new color copy.
+                // Preserve the unconsumed guide interval until the OpenXR
+                // handoff. Intermediate copies no longer destroy a stereo pair.
+                p.tag={generation,0,0};
+                if(SUCCEEDED(p.color->SetPrivateData(key,sizeof(p.tag),&p.tag)) &&
+                   !p.conflicted&&guides.matches(queue)){
+                    if(std::none_of(hookless_submitted.begin(),hookless_submitted.end(),
+                       [&](const auto& r){return r.Get()==p.color.Get();})){
+                        if(hookless_submitted.size()>=16)hookless_submitted.erase(hookless_submitted.begin());
+                        hookless_submitted.push_back(p.color);
+                    }
+                }
+            }else p.color->SetPrivateData(key,sizeof(p.tag),&p.tag);
+            return true;
         });
     }
     void reset(ID3D12GraphicsCommandList* list) {
         const auto recording=FgSnapshots::recording_identity(list);
-        std::erase_if(pending,[&](Pending& p){return recording&&p.recording==recording;});
+        std::erase_if(pending,[&](Pending& p){return recording?p.recording==recording:
+            same_d3d12_list(p.list.Get(),list);});
     }
 };
 }

@@ -18,6 +18,8 @@ using Microsoft::WRL::ComPtr;
 namespace cheeky::foveated_dlss {
 namespace {
 std::mutex mutex;
+std::atomic<bool> pending_submissions{};
+std::atomic<std::uint64_t> observed_fg_lists{},recognized_fg_guides{};
 // Set by UEVR's executing RHI command, not by an engine-tick/global counter.
 thread_local std::uint64_t render_frame{};
 std::atomic<std::uint64_t> source_epoch{1};
@@ -116,6 +118,12 @@ void fg_set_uevr_queue(ID3D12CommandQueue* q) noexcept try {
     std::lock_guard lock(mutex);
     if(!q){snapshots().invalidate();store().colors.invalidate();return;}
     store().collect();
+    // In hook-free mode 3 the UEVR renderer accessor is only the provisional
+    // queue. Once a real NGX guide submission identified its executing queue,
+    // do not overwrite that proof on the next (per-frame) UEVR runtime tick.
+    // A different device still forces the normal queue-generation transition.
+    if(hookless_selected()&&snapshots().has_discovered_submission_queue()&&
+       snapshots().same_queue_device(q))return;
     if(!snapshots().initialize(q)&&store().generations.size()<8){
         snapshots().invalidate();
         store().colors.invalidate();
@@ -124,27 +132,38 @@ void fg_set_uevr_queue(ID3D12CommandQueue* q) noexcept try {
     }
 } catch(...) {}
 void fg_note_submission(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* list) noexcept try {
-    std::lock_guard lock(mutex);for(auto& p:store().generations)p->submitted(q,list);
-    store().colors.submitted(q,list,snapshots());
+    std::lock_guard lock(mutex);++observed_fg_lists;
+    const bool hookless=hookless_selected();
+    for(auto& p:store().generations)
+        recognized_fg_guides+=p->submitted(q,list,hookless&&p.get()==store().active);
+    if(!hookless)store().colors.submitted(q,list,snapshots());
+    pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
+        [](const auto& p){return p->pending_submissions();})||store().colors.has_pending();
 } catch(...) {}
 void fg_retire_snapshots() noexcept try {std::lock_guard lock(mutex);store().collect();} catch(...) {}
 void fg_note_reset(ID3D12GraphicsCommandList* list) noexcept try {
     std::lock_guard lock(mutex);for(auto& p:store().generations)p->reset(list);
     store().colors.reset(list);
+    pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
+        [](const auto& p){return p->pending_submissions();})||store().colors.has_pending();
 } catch(...) {}
 void fg_note_color_copy(ID3D12GraphicsCommandList* list,ID3D12Resource* color) noexcept try {
     // Most copies (including our guide snapshots) are unrelated. Inspect the
     // registration before taking the mutex; snapshot recording already owns it.
-    if(!enabled()||!FgColorProvenance::registered(color))return;
-    const bool hookless=hookless_selected();
+    // Mode 3 matches at xrEndFrame, after the complete stereo submission.
+    // Do not require private UEVR color-copy queues or resource identities.
+    if(!enabled()||hookless_selected()||!FgColorProvenance::registered(color))return;
+    const bool hookless=false;
     const auto color_frame=hookless?0:ticket_epoch!=source_epoch.load()?0:rhi_ticket?frame_phase.color():render_frame;
     ++color_copies;
     std::lock_guard lock(mutex);store().colors.observe(list,color,snapshots(),color_frame,hookless);
+    pending_submissions=true;
     if(!hookless&&rhi_ticket&&phase_traces.fetch_add(1)<48)
         trace_event("FG color phase copy=%p command=%p render_entry=%llu color_content=%llu evaluations=%u previous_complete=%llu",
             color,list,render_frame,color_frame,frame_phase.evaluations,frame_phase.previous);
 } catch(...) {}
 bool fg_recording_tagged(ID3D12GraphicsCommandList* list) noexcept{return FgSnapshots::tagged(list);}
+bool fg_has_pending_submissions() noexcept{return pending_submissions.load(std::memory_order_relaxed);}
 void fg_abandon_frame_source() noexcept {source_abandoned=true;++source_epoch;}
 void fg_remember_feature(const NgxHandle* handle,const NgxParameters* p) noexcept try {
     std::uint32_t flags{};if(!handle||!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags))return;
@@ -207,7 +226,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
     m.configuration=configuration(settings.fg);
     std::lock_guard lock(mutex);
-    if(snapshots().record(cmd,m)){++captured_guides;last_guide_frame=m.render_frame;}
+    if(snapshots().record(cmd,m)){pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;}
 } catch(...) {}
 }
 // Called by the adapter before installing any UEVR-private inline hooks and
@@ -281,8 +300,14 @@ extern "C" __declspec(dllexport) void __cdecl CheekyFG_SetRenderFrameV1(std::uin
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureStamp(ID3D12Resource* color,CheekyFgCaptureStamp* out) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!out||out->abi!=1||out->size!=sizeof(*out)||!enabled())return false;
-    std::lock_guard lock(mutex);out->token=store().colors.token(color);out->render_frame=store().colors.frame(color);
     const bool hookless=hookless_selected();
+    if(hookless){
+        // Each eye may release its OpenXR image independently. The authoritative
+        // association is the single xrEndFrame AFTER both releases, not here.
+        out->token=out->render_frame=0;
+        return true;
+    }
+    std::lock_guard lock(mutex);out->token=store().colors.token(color,&snapshots(),false);out->render_frame=store().colors.frame(color);
     last_color_frame=out->render_frame;
     last_color_match=hookless?snapshots().last_match:snapshots().inspect(out->render_frame);
     if(out->token)last_color_match.reason="Matched";
@@ -292,6 +317,25 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureStamp(ID3D12Res
         trace_event("FG match color_frame=%llu token=%llu last_guide_frame=%llu latest_frame=%llu eligible=%u pending=%u foreign=%u cancelled=%u latest_eval=%llu consumed=%llu failed=%llu reason=%s",
             out->render_frame,out->token,last_guide_frame.load(),m.latest_frame,m.eligible,m.pending,m.foreign,m.cancelled,m.latest,m.consumed,m.failed,m.reason);}
     return true;
+}
+extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHooklessFrameV1(
+    std::uint32_t use_for_fg) noexcept {
+    using namespace cheeky::foveated_dlss;
+    if(!enabled()||!hookless_selected())return 0;
+    std::lock_guard lock(mutex);
+    auto& guides=snapshots();
+    const auto token=use_for_fg?guides.token(0,true):0;
+    if(!token)guides.discard_hookless_interval();
+    last_color_frame=0;
+    last_color_match=guides.last_match;
+    if(!use_for_fg)last_color_match.reason="Hook-free native frame skipped at xrEndFrame";
+    else if(token)last_color_match.reason="Matched at xrEndFrame";
+    static ULONGLONG next_trace{};const auto now=GetTickCount64();
+    if(now>=next_trace){next_trace=now+2000;const auto& m=last_color_match;
+        trace_event("FG end-frame match token=%llu eligible=%u pending=%u foreign=%u cancelled=%u latest_eval=%llu consumed=%llu failed=%llu reason=%s",
+            token,m.eligible,m.pending,m.foreign,m.cancelled,m.latest,m.consumed,m.failed,m.reason);
+    }
+    return token;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgControl* out) noexcept {
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
@@ -343,15 +387,18 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFg
         std::uint64_t prepared{},raw{},fallbacks{},equivalent{};unsigned slots{},leased{};
         for(const auto& generation:store().generations)generation->guide_diagnostics(prepared,raw,fallbacks,slots,leased,equivalent);
         const auto actual=out->categories[cheeky::fg_memory::guide_depth].bytes+out->categories[cheeky::fg_memory::guide_motion].bytes;
-        trace_event("FG guide capture prepared_eyes=%llu raw_eyes=%llu fallbacks=%llu allocated_eye_slots=%u consumer_leased_eyes=%u actual_bytes=%llu equivalent_raw_snapshot_bytes=%llu (worker prepared rows exclude borrowed guides)",
-            prepared,raw,fallbacks,slots,leased,actual,equivalent);next_diagnostic=now+1000;
+        const auto d=snapshots().submission_stats();
+        trace_event("FG guide capture prepared_eyes=%llu raw_eyes=%llu fallbacks=%llu allocated_eye_slots=%u consumer_leased_eyes=%u actual_bytes=%llu equivalent_raw_snapshot_bytes=%llu pending_submissions=%u submitted_unretired=%u retired=%u foreign=%u cancelled=%u latest_pending_eval=%llu latest_pending_recording=%llu observed_submit_lists=%llu recognized_guide_submits=%llu execution_queue_discovered=%u (worker prepared rows exclude borrowed guides)",
+            prepared,raw,fallbacks,slots,leased,actual,equivalent,d.pending,d.submitted,d.retired,d.foreign,d.cancelled,d.pending_id,d.pending_recording,observed_fg_lists.load(),recognized_fg_guides.load(),
+            unsigned(snapshots().has_discovered_submission_queue()));next_diagnostic=now+1000;
     }
     out->guides_supported=1;out->guide_tick=GetTickCount64();return true;
 }
 extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(ID3D12Resource* color) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!enabled())return 0;
-    std::lock_guard lock(mutex);return store().colors.token(color);
+    if(hookless_selected())return 0; // Only xrEndFrame may claim a mode-3 pair.
+    std::lock_guard lock(mutex);return store().colors.token(color,&snapshots(),false);
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair* out) noexcept {
     using namespace cheeky::foveated_dlss;

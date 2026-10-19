@@ -26,5 +26,6 @@ void fg_retire_snapshots() noexcept;
 void fg_note_reset(ID3D12GraphicsCommandList*) noexcept;
 void fg_note_color_copy(ID3D12GraphicsCommandList*,ID3D12Resource*) noexcept;
 bool fg_recording_tagged(ID3D12GraphicsCommandList*) noexcept;
+bool fg_has_pending_submissions() noexcept;
 void fg_abandon_frame_source() noexcept; // Loader-lock-safe; UEVR owns hook cleanup on plugin unload.
 }
