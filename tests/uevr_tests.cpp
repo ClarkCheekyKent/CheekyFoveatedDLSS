@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include "../src/uevr_frame_source.hpp"
+#include "../src/fg_source_lifecycle.hpp"
 #include "uevr_frame_source_fixture.hpp"
 
 using namespace cheeky::foveated_dlss;
@@ -258,6 +259,12 @@ void settings_tests(const std::filesystem::path& root) {
 }
 }
 int main(int argc, char** argv) {
+    // A live release-mode switch retains the source revision. A DLSS-SR
+    // quality change (new source revision) cannot interpolate from old guides.
+    constexpr auto a=fg_source_configuration(0xabcdu,2u);
+    constexpr auto b=fg_source_configuration(0xabcdu,3u);
+    static_assert(a!=b && fg_same_source_history(a,a) &&
+        !fg_same_source_history(a,b) && !fg_same_source_history(0,a));
     try {
         if(argc>2&&std::string(argv[1])=="--fg-frame-source-pe"){
             auto path=std::filesystem::path(argv[2]);auto module=LoadLibraryExW(path.c_str(),nullptr,DONT_RESOLVE_DLL_REFERENCES);

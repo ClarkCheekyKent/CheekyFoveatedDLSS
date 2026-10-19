@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_transport.hpp"
 #include "../src/d3d12_native.hpp"
+#include "../src/fg_source_lifecycle.hpp"
 #include <condition_variable>
 #include <thread>
 #include <atomic>
@@ -52,6 +53,7 @@ struct BufferedPresenter final : Presenter {
         CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
         unsigned source_depth{},source_motion{};
         std::uint64_t guide_token{};
+        std::uint64_t source_configuration{}; // Survives release of guide textures.
         std::uint64_t render_frame{};
     };
     struct Pair {
@@ -661,7 +663,7 @@ struct BufferedPresenter final : Presenter {
         // In hook-free mode only the completed xrEndFrame can claim a pair.
         if(!inference_slot&&hookless_complete)hookless_complete(0);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
-        job->color={};job->color_ready={};job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->render_frame=0;job->captured_at={};
+        job->color={};job->color_ready={};job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         if(!projection||!job->layers.prepare(end,projection)){
             if(inference_slot&&hookless_complete)hookless_complete(0);
@@ -764,7 +766,8 @@ struct BufferedPresenter final : Presenter {
                         // converting another full guide set at handoff.
                         // Worker preparation now crops/normalizes once using
                         // the original offsets, scales and jitter correction.
-                        job->retain_guides(guides);job->guide_token=expected_token;job->render_frame=expected_frame;
+                        job->retain_guides(guides);job->guide_token=expected_token;
+                        job->source_configuration=guides.eyes[0].configuration;job->render_frame=expected_frame;
                     }
                     release(&guides);
                 }else if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
@@ -873,6 +876,7 @@ struct BufferedPresenter final : Presenter {
             bool success{};
             bool attempted{};
             if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
+               cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)&&
                previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
                previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height) {
                 // The snapshot is recorded on the game queue. Queue::Wait is

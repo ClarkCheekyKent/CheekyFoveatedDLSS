@@ -2,6 +2,7 @@
 #include "settings.hpp"
 #include "fg_snapshot.hpp"
 #include "fg_frame_phase.hpp"
+#include "fg_source_lifecycle.hpp"
 #include "uevr_frame_source.hpp"
 #include "runtime.hpp"
 #include <Windows.h>
@@ -78,6 +79,10 @@ void enqueue_render_poses(void* runtime,std::uint32_t frame) {
 // Creation and evaluation need not use the same parameter object. In
 // particular, reversed depth and jittered motion are feature creation flags.
 std::unordered_map<const NgxHandle*,std::uint32_t> feature_flags;
+// Guarded by mutex. This is *not* the UEVR RHI frame-source epoch.
+// Bump only for tracked game NGX-SR feature create/release, never for FG's
+// internal features or for a live pacing-mode switch.
+std::uint64_t game_sr_revision{1};
 // GPU recordings can outlive a runtime detach. Keep queue generations until
 // their recorded work and every consumer lease have retired.
 struct SnapshotStore {
@@ -171,10 +176,23 @@ bool fg_has_pending_submissions() noexcept{return pending_submissions.load(std::
 void fg_abandon_frame_source() noexcept {source_abandoned=true;++source_epoch;}
 void fg_remember_feature(const NgxHandle* handle,const NgxParameters* p) noexcept try {
     std::uint32_t flags{};if(!handle||!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags))return;
-    std::lock_guard lock(mutex);feature_flags[handle]=flags;
+    std::uint64_t revision{};
+    {
+        std::lock_guard lock(mutex);
+        feature_flags[handle]=flags;
+        revision=++game_sr_revision;
+    }
+    trace_event("FG game DLSS-SR feature created: handle=%p revision=%llu (FG history refresh on next complete stereo pair)",
+        static_cast<const void*>(handle),static_cast<unsigned long long>(revision));
 } catch(...) {}
 void fg_forget_feature(const NgxHandle* handle) noexcept try {
-    std::lock_guard lock(mutex);feature_flags.erase(handle);
+    std::uint64_t revision{};
+    {
+        std::lock_guard lock(mutex);
+        if(feature_flags.erase(handle))revision=++game_sr_revision;
+    }
+    if(revision)trace_event("FG game DLSS-SR feature released: handle=%p revision=%llu (awaiting recreated guides)",
+        static_cast<const void*>(handle),static_cast<unsigned long long>(revision));
 } catch(...) {}
 void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
                     const NgxParameters* p,NgxResult result) noexcept try {
@@ -228,8 +246,12 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
     m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
-    m.configuration=configuration(settings.fg);
+    const auto settings_configuration=configuration(settings.fg);
     std::lock_guard lock(mutex);
+    // Capture the source revision under the SAME lock as release/create and
+    // snapshot recording. A stereo pair spanning a DLSS quality change is
+    // rejected by FgSnapshots::acquire rather than mixing old/new guides.
+    m.configuration=fg_source_configuration(settings_configuration,game_sr_revision);
     if(snapshots().record(cmd,m)){pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;}
 } catch(...) {}
 }

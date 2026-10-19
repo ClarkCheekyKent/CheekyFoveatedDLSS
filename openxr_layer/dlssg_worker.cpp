@@ -201,7 +201,18 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             "FG BackbufferFrameID=OFF (parameter absent; NGX histories reset)");
     }
     if(configuration!=guides.eyes[0].configuration) {
+        const bool previously_failed=failed;
         reset_features();configuration=guides.eyes[0].configuration;gpu_timings.initialize(device.Get(),queue.Get());completion_wait={};
+        // A quality-mode transition can briefly invalidate the game's guides.
+        // A new, validated stereo pair is a safe point to recreate FG features
+        // and clear a previous transient NGX error. Do not mask device removal.
+        if(device&&SUCCEEDED(device->GetDeviceRemovedReason()))failed=false;
+        if(trace) {
+            char message[192]{};
+            sprintf_s(message,"FG NGX source/configuration changed: rebuilding FG features, transient_error_cleared=%u",
+                unsigned(previously_failed&&!failed));
+            trace(message);
+        }
     }
     focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
     if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
