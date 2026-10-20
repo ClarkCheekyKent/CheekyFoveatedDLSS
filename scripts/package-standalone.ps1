@@ -32,6 +32,7 @@ foreach ($packageMode in $modes) {
     $loaderName = if ($packageMode -eq "OptiScaler") { "CheekyFoveatedDLSS.asi" } else { "dxgi.dll" }
     $loaderInput = if ($packageMode -eq "OptiScaler") { $loaderName } else { "standalone-loader\dxgi.dll" }
     $files = [ordered]@{}
+    $files["README.md"] = Join-Path $projectRoot "standalone\README.md"
     $files[$prefix + $loaderName] = Join-Path $BinaryRoot $loaderInput
     if ($packageMode -eq "Standalone") {
         $files["version.dll"] = Join-Path $BinaryRoot "version-loader\version.dll"

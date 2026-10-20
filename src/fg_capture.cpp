@@ -23,6 +23,7 @@ namespace cheeky::foveated_dlss {
 namespace {
 std::mutex mutex;
 std::atomic<bool> pending_submissions{};
+std::atomic<bool> standalone_host{};
 // Two different concepts: desired FG setting vs. whether the current UEVR
 // rendering method can supply native stereo. Never overwrite FgEnabled.
 std::atomic<int> uevr_fg_rendering_mode{cheeky::fg::no_uevr_host};
@@ -130,7 +131,7 @@ bool enabled() noexcept {
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
 bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
-    return s.hookless_mode3;
+    return standalone_host.load(std::memory_order_acquire) || s.hookless_mode3;
 }
 bool hookless_selected() noexcept {return hookless_selected(current_settings().fg);}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
@@ -173,6 +174,7 @@ float f(const NgxParameters* p,const char* n,float fallback=0) noexcept {
 // A mode transition is also a producer-lifecycle transition. Retire the
 // previous immutable snapshot generation when leaving native stereo; the
 // old generation remains alive until GPU submissions and leases retire.
+void fg_set_standalone_host(bool value) noexcept { standalone_host.store(value,std::memory_order_release); }
 void fg_uevr_mode_attached() noexcept { fg_uevr_mode_published(0xFFFFFFFFu); }
 void fg_uevr_mode_published(std::uint32_t mode) noexcept try {
     const int next=cheeky::fg::uevr_mode_value(mode);
@@ -191,7 +193,12 @@ void fg_set_uevr_queue(ID3D12CommandQueue* q) noexcept try {
     std::lock_guard lock(mutex);
     synchronize_capture_enabled_locked(enabled());
     if(!enabled()){store().collect();return;}
-    if(!q){snapshots().invalidate();store().colors.invalidate();return;}
+    if(!q){
+        // D3D11/OpenComposite has no D3D12 presentation queue. Its private
+        // transport publishes the actual guide queue on each evaluation.
+        if(hookless_selected())return;
+        snapshots().invalidate();store().colors.invalidate();return;
+    }
     store().collect();
     // In hook-free mode 3 the UEVR renderer accessor is only the provisional
     // queue. Once a real NGX guide submission identified its executing queue,

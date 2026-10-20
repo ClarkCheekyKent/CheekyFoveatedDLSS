@@ -23,6 +23,8 @@ void fg_publish_ngx(ID3D12GraphicsCommandList*,const NgxHandle*,const NgxParamet
 void fg_remember_feature(const NgxHandle*,const NgxParameters*) noexcept;
 void fg_forget_feature(const NgxHandle*) noexcept;
 void fg_set_uevr_queue(ID3D12CommandQueue*) noexcept;
+// Standalone hosts have no UEVR render tickets. Match submitted guides at xrEndFrame.
+void fg_set_standalone_host(bool) noexcept;
 // Published by the existing UEVR plugin rendering-method observer; never
 // derived from an FG frame number, NGX eval order or a private vtable hook.
 void fg_uevr_mode_attached() noexcept;

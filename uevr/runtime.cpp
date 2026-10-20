@@ -12,6 +12,7 @@
 #include "runtime.hpp"
 #include "diagnostics.hpp"
 #include "d3d11_peripheral_dlaa.hpp"
+#include "d3d11_d3d12_transport.hpp"
 #include "eye_calibration.hpp"
 #include "gaze_foveation.hpp"
 #include "openvr_gaze.hpp"
@@ -575,6 +576,7 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
         if (!s.started) {
             set_processing_allowed(false);
             s.host = input->host;
+            fg_set_standalone_host(s.host != CheekyRuntimeHost::uevr);
             s.directory = input->config_directory;
             std::filesystem::create_directories(s.directory);
             s.config = s.directory / L"CheekyFoveatedDLSS.ini";
@@ -674,6 +676,7 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
         if (!attachment || !adapter_attached.load() || attachment != active_attachment.load()) return;
         configure_graphics(s, renderer, device, queue);
         fg_set_uevr_queue(renderer == 1 ? static_cast<ID3D12CommandQueue*>(queue) : nullptr);
+        if(!current_settings().fg.enabled)retire_d3d11_fg_transport();
         if (!s.graphics_ready || renderer != 1) {
             const float empty[2][16]{};
             publish_afw_stereo_projection(empty, 0, 0, false);

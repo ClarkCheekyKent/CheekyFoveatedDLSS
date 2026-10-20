@@ -400,7 +400,7 @@ void fg_toggle_test() {
     SessionState owner{};owner.session=session;owner.instance=instance;
     owner.running=true;owner.graphics_api=11;owner.view_configuration=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     update_fg_at_frame_boundary(owner,d,true);
-    check(!owner.fg && owner.fg_state==CheekyFgState::waiting_for_stereo,"FG must reject DX11");
+    check(!owner.fg && owner.fg_state==CheekyFgState::presenter_failed,"DX11 without a usable graphics device must preserve native presentation");
     owner.graphics_api=12;
     update_fg_at_frame_boundary(owner,d,true);
     check(!owner.fg && owner.fg_state==CheekyFgState::presenter_failed,"Presenter failure must be reported");
@@ -497,6 +497,7 @@ void fg_toggle_test() {
 #include "fg_compact_validation.hpp"
 #include "fg_prepared_validation.hpp"
 #include "fg_snapshot_validation.hpp"
+#include "fg_d3d11_validation.hpp"
 void fg_copy_validation_test() {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12Debug> debug;
@@ -759,6 +760,7 @@ void fg_copy_validation_test() {
     fg_compact_validation(device.Get());
     fg_prepared_validation(device.Get());
     fg_buffered_validation(device.Get());
+    fg_d3d11_validation();
     for(auto* texture:{source.Get(),targets[0].Get(),targets[1].Get()})
         check(fg_expected_states[texture]==D3D12_RESOURCE_STATE_RENDER_TARGET,"OpenXR image must be restored to RENDER_TARGET");
     check(!fg_barrier_errors,"FG copy path violated known OpenXR resource-state contracts");
@@ -811,6 +813,7 @@ int main(int argc,char** argv) {
             }
             throw std::runtime_error("No NVIDIA adapter found");
         }
+        if(argc>1 && std::string(argv[1])=="--fg-d3d11") {fg_d3d11_validation();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
         run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }

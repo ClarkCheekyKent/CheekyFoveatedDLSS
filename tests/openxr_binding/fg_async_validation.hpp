@@ -146,8 +146,12 @@ void fg_hookless_crossqueue_validation(ID3D12Device* device) {
     job.clear_guides();
     check(presenter.accept_guide_queue(guides,job,true)&&job.guide_sync_value==2,
         "Guide GPU bridge advances serial on second native frame");
-    guides.release_point=2;
-    check(!presenter.accept_guide_queue(guides,job,true),"Only hook-free release mode 3 bridges distinct queues");
+    for(unsigned point : {0u,1u,2u,3u,4u}) {
+        guides.release_point=point;
+        check(presenter.accept_guide_queue(guides,job,true)&&job.guide_sync_value==3+point,
+            "Hook-free queue synchronization is independent of CPU release policy");
+        check(!presenter.accept_guide_queue(guides,job,false),"Legacy mode keeps its same-queue contract");
+    }
     presenter.stop();
 }
 

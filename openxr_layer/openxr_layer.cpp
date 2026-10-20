@@ -3057,7 +3057,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
             publish_snapshot_locked(&session_it->second);
         }
     }
-    if(fg_to_invalidate)fg_to_invalidate->invalidate_temporal();
+    if(fg_to_invalidate) {
+        fg_to_invalidate->invalidate_temporal();
+        if(fg_to_invalidate->interop11)fg_to_invalidate->interop11->forget(swapchain);
+    }
     return next == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
         : next(swapchain);
@@ -3227,6 +3230,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
     // Copy the completed OpenXR color image before giving its ownership back.
     // The GPU-owned copy remains stable while UEVR renders another frame.
     ID3D12Resource* fg_source{};
+    ID3D11Texture2D* fg_source11{};
     unsigned fg_width{}, fg_height{}, fg_array{};
     DXGI_FORMAT fg_format{DXGI_FORMAT_UNKNOWN};
     {
@@ -3237,7 +3241,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
             (chain->second.create_info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
             has_acquired && acquired_index < chain->second.calibration_images.size()) {
             fg_presenter=owner->second.fg;
-            fg_source=static_cast<ID3D12Resource*>(chain->second.calibration_images[acquired_index]);
+            if(owner->second.graphics_api==11) {
+                fg_source11=static_cast<ID3D11Texture2D*>(chain->second.calibration_images[acquired_index]);
+                if(fg_source11)fg_source11->AddRef();
+            } else fg_source=static_cast<ID3D12Resource*>(chain->second.calibration_images[acquired_index]);
             if (fg_source) fg_source->AddRef();
             fg_width=chain->second.create_info.width;
             fg_height=chain->second.create_info.height;
@@ -3248,6 +3255,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
     if (fg_presenter && fg_source) {
         fg_presenter->capture(swapchain,acquired_index,fg_source,fg_width,fg_height,fg_array,fg_format);
         fg_source->Release();
+    }
+    if (fg_presenter && fg_source11) {
+        fg_presenter->capture11(swapchain,acquired_index,fg_source11,fg_width,fg_height,fg_array,fg_format);
+        fg_source11->Release();
     }
     const auto result = next(swapchain, release_info);
     {
@@ -3279,7 +3290,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
 // Caller holds state_mutex; returned resources retire outside that lock.
 std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
     SessionState& owner, const Dispatch& d, bool requested) {
-    const bool supported=owner.running && owner.graphics_api==12 &&
+    const bool supported=owner.running && (owner.graphics_api==12 || owner.graphics_api==11) &&
         owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     if (!requested || !supported) {
         if(owner.fg)log_startup("DLSS-FG disabling session=%p; draining private GPU work\n",owner.session);
@@ -3299,8 +3310,16 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
         fn.wait_frame=d.wait_frame;fn.begin_frame=d.begin_frame;fn.end_frame=d.end_frame;
         auto candidate=std::make_shared<cheeky::fg::BufferedPresenter>();
         candidate->trace=[](const char* message) noexcept {log_startup("%s\n",message);};
-        if (candidate->setup(owner.session,fn,static_cast<ID3D12Device*>(owner.graphics_device),
-            static_cast<ID3D12CommandQueue*>(owner.graphics_queue))) {
+        auto* device12=owner.graphics_api==12?static_cast<ID3D12Device*>(owner.graphics_device):nullptr;
+        auto* queue12=owner.graphics_api==12?static_cast<ID3D12CommandQueue*>(owner.graphics_queue):nullptr;
+        if(owner.graphics_api==11) {
+            auto bridge=std::make_shared<cheeky::fg::D3D11Bridge>();
+            if(bridge->initialize(static_cast<ID3D11Device*>(owner.graphics_device))) {
+                device12=bridge->device12.Get();queue12=bridge->queue.Get();
+                candidate->interop11=std::move(bridge);
+            }
+        }
+        if (candidate->setup(owner.session,fn,device12,queue12)) {
             owner.fg=std::move(candidate);
             owner.fg_state=CheekyFgState::waiting_for_history;
             log_startup("DLSS-FG presenter initialized session=%p\n",owner.session);
@@ -3425,7 +3444,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStatus(CheekyFgStatus*
     status.layer_present=1;status.controls_supported=1;
     std::lock_guard lock(state_mutex);
     for (const auto& [handle,owner]:sessions) {
-        if (owner.graphics_api!=12 || !owner.running ||
+        if ((owner.graphics_api!=12 && owner.graphics_api!=11) || !owner.running ||
             owner.view_configuration!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) continue;
         status.compatible_session=1;
         status.state=owner.fg_state;

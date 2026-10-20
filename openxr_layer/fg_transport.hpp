@@ -211,7 +211,7 @@ struct Transport {
         c.images.push_back(destination);c.borrowed.emplace_back(source);++region_copies;
         return good?destination:Image{};
     }
-    bool record_upload(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false) {
+    bool record_upload(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false,D3D12_RESOURCE_STATES target_state=D3D12_RESOURCE_STATE_RENDER_TARGET) {
         if(!source||!target||target==source->texture.Get())return false;
         const auto a=source->texture->GetDesc(),b=target->GetDesc();
         if(target_format==DXGI_FORMAT_UNKNOWN)target_format=b.Format;
@@ -228,28 +228,30 @@ struct Transport {
                 constants.border[2]=source->fg_border.w;constants.border[3]=source->fg_border.h;
                 constants.options[1]=1.f;constants.options[2]=2.f/width;constants.options[3]=2.f/height;
             }
+            color_transition(c.list.Get(),target,target_state,D3D12_RESOURCE_STATE_RENDER_TARGET);
             const bool good=draw.record(device.Get(),c.list.Get(),c.bindings,source->texture.Get(),sf,0,target,target_format,
                 D3D12_VIEWPORT{0,0,float(width),float(height),0,1},constants);
+            color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_RENDER_TARGET,target_state);
             color_transition(c.list.Get(),source->texture.Get(),readable,source->state);
             c.images.push_back(source);c.borrowed.emplace_back(target);++upload_copies;return good;
         }
         if(a.Width!=b.Width||a.Height!=b.Height||a.DepthOrArraySize!=b.DepthOrArraySize||a.MipLevels!=b.MipLevels)return false;
         const auto read_state=(source->state&D3D12_RESOURCE_STATE_COPY_SOURCE)?source->state:D3D12_RESOURCE_STATE_COPY_SOURCE;
         color_transition(c.list.Get(),source->texture.Get(),source->state,read_state);
-        color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_DEST);
+        color_transition(c.list.Get(),target,target_state,D3D12_RESOURCE_STATE_COPY_DEST);
         c.list->CopyResource(target,source->texture.Get());++upload_copies;
-        color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_COPY_DEST,target_state);
         color_transition(c.list.Get(),source->texture.Get(),read_state,source->state);
         c.images.push_back(source);c.borrowed.emplace_back(target);return true;
     }
-    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false) {
+    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false,D3D12_RESOURCE_STATES target_state=D3D12_RESOURCE_STATE_RENDER_TARGET) {
         if(!source)return false;
         auto* c=begin(frame);
         // Only the background presenter uses upload(). Allocator pressure here
         // may wait for retirement without turning a transient busy ring into a
         // permanent presentation failure. Producer begin() remains nonblocking.
         if(!c){drain();c=begin(frame);}if(!c)return false;
-        if(!record_upload(*c,source,target,target_format,linear_target)){c->list->Close();return false;}
+        if(!record_upload(*c,source,target,target_format,linear_target,target_state)){c->list->Close();return false;}
         std::uint64_t ticket{};return execute(*c,ticket);
     }
     void freeze(Context& c,const Image& image) {

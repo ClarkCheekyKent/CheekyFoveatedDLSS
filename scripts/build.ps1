@@ -160,7 +160,7 @@ foreach ($abi in @('022','027','028','029')) {
     if ($LASTEXITCODE -ne 0) { throw "OptiScaler cached OpenVR compositor failed: $abi" }
 }
 foreach ($hostKind in @('standalone','optiscaler')) {
-    foreach ($mode in @('dx11','dx11-c','dx12','dx12-c','streamline','streamline-dx11')) {
+    foreach ($mode in @('dx11','dx11-c','dx12','dx12-c','streamline','streamline-dx11','fg','fg-dx11')) {
         & $standaloneHostTest $mode $hostKind
         if ($LASTEXITCODE -ne 0) { throw "Standalone host tests failed: $hostKind $mode" }
     }

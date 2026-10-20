@@ -536,8 +536,8 @@ struct BufferedPresenter final : Presenter {
         distinct_native=repeated_presentations=runtime_submissions=0;
     }
     void destroy_chains() noexcept {
-        for(auto& c:scene_chains){if(c.handle)xr.destroy(c.handle);c={};}
-        for(auto& [key,c]:auxiliary_chains)if(c.handle)xr.destroy(c.handle);
+        for(auto& c:scene_chains){if(c.handle)destroy_chain(c.handle);c={};}
+        for(auto& [key,c]:auxiliary_chains)if(c.handle)destroy_chain(c.handle);
         auxiliary_chains.clear();
     }
     void reset() noexcept override {
@@ -590,7 +590,7 @@ struct BufferedPresenter final : Presenter {
         CheekyFgDirectShading shading_options;
         if(shading_query&&shading_query(&shading_options))direct_shading_mode=std::min(shading_options.requested_mode,2u);
         if(output_query&&output_query(&direct_options)){
-            const unsigned mode=direct_options.requested==1u;
+            const unsigned mode=!interop11 && direct_options.requested==1u;
             if(direct_output_mode.exchange(mode)!=mode)direct_blocked_target=0;
         }
         if(query&&query(&options)){
@@ -666,13 +666,13 @@ struct BufferedPresenter final : Presenter {
             for(auto slice:plan->second.slices){
                 const auto& s=storage_options;
                 const auto layout=compact_layout(slice.rect.extent.width,slice.rect.extent.height,s.compact!=0,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
-                auto image=layout.packed()?producer.packed_region(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,slice.rect,slice.layer,format,layout):
-                    producer.region_copy(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,slice.rect,slice.layer,format);
+                auto image=layout.packed()?producer.packed_region(*c,original,xr_image_state(),slice.rect,slice.layer,format,layout):
+                    producer.region_copy(*c,original,xr_image_state(),slice.rect,slice.layer,format);
                 if(!image){capture_overflow=true;std::uint64_t discarded{};producer.execute(*c,discarded);return false;}
                 eyes.eyes.push_back({slice,std::move(image)});++direct_eye_copies;
             }
         }else {
-            copy=producer.copy(*c,original,D3D12_RESOURCE_STATE_RENDER_TARGET,format);
+            copy=producer.copy(*c,original,xr_image_state(),format);
             if(color_capture_mode==1u&&(plan==capture_plans.end()||!plan->second.full_required))++capture_fallbacks;
             if(!copy){capture_overflow=true;c->list->Close();return false;}
         }
@@ -1161,7 +1161,7 @@ struct BufferedPresenter final : Presenter {
         const bool writable=scene&&direct_output_mode==1u&&direct_blocked_target!=target_key;
         if(writable)d.Format=inference_color_format(d.Format);
         if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.DepthOrArraySize||chain.direct_writable!=writable)) {
-            uploads.drain();xr.destroy(chain.handle);chain={};
+            uploads.drain();destroy_chain(chain.handle);chain={};
         }
         if(chain.handle)return true;
         XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -1176,9 +1176,7 @@ struct BufferedPresenter final : Presenter {
             if(trace)trace("FG direct XR: runtime rejected writable scene image; falling back to compact uploads");
             return ensure_chain(chain,image,scene);
         }
-        unsigned count{};if(XR_FAILED(xr.enumerate(chain.handle,0,&count,nullptr))||!count)return false;
-        chain.images.resize(count);for(auto& i:chain.images)i={XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR};
-        if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images.data()))))return false;
+        if(!enumerate_images(chain.handle,chain.images))return false;
         next_presenter_memory=0; // Publish newly allocated chains on this presentation, including during startup.
         chain.desc=d;chain.direct_writable=writable;chain.linear_color=writable&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM;return true;
     }
@@ -1195,9 +1193,9 @@ struct BufferedPresenter final : Presenter {
         const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
         {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
         const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images.size()&&
-            uploads.upload(source,chain.images[index].texture,ticks,chain.desc.Format,chain.linear_color);
+            uploads.upload(source,chain.images[index].texture,ticks,chain.desc.Format,chain.linear_color,xr_image_state());
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        const bool released=XR_SUCCEEDED(xr.release(chain.handle,&release));
+        const bool released=XR_SUCCEEDED(release_image(chain.handle,index,&release));
         if(released&&copied)chain.uploaded=source->identity;
         return released&&copied;
     }
@@ -1224,7 +1222,7 @@ struct BufferedPresenter final : Presenter {
             auto* c=uploads.begin(ticks);if(!c){uploads.drain();c=uploads.begin(ticks);}
             good=c!=nullptr;
             if(c){
-                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format,item.chain->linear_color)){good=false;break;}
+                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format,item.chain->linear_color,xr_image_state())){good=false;break;}
                 if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);}
                 else c->list->Close();
             }
@@ -1234,7 +1232,7 @@ struct BufferedPresenter final : Presenter {
         // may insert its own fence at ReleaseSwapchainImage.
         for(auto& item:items)if(item.acquired&&item.waited){
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            const bool released=XR_SUCCEEDED(xr.release(item.chain->handle,&release));
+            const bool released=XR_SUCCEEDED(release_image(item.chain->handle,item.index,&release));
             if(submitted&&released)item.chain->uploaded=item.source->identity;
             good&=released;
         }

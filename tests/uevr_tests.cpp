@@ -560,8 +560,11 @@ int main(int argc, char** argv) {
                 "Lua protocol restores overlapping native rendering");
             CheekyFgCaptureHealth resumed;
             auto capture_health=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureHealth"));
+            require(capture_health&&capture_health(&resumed)&&!resumed.plugin_hook&&fg_test_hook_targets.empty(),
+                "Hook-free UEVR preference remains effective across release modes");
+            command("1\n906\nset\nFgHooklessMode3=false");
             require(capture_health&&capture_health(&resumed)&&resumed.plugin_hook&&fg_test_hook_installs==4&&
-                fg_test_hook_targets.size()==2,"Non-mode-3 releases reactivate the legacy UEVR hooks even if toggle stays set");
+                fg_test_hook_targets.size()==2,"Disabling hook-free matching reactivates the legacy UEVR hooks");
             custom("cheeky.foveated_dlss.load.v1","false");present();
             require(fg_test_hook_removals==4&&fg_test_hook_targets.empty(),"Unload removes the plugin-owned frame hooks");
             require(control_fn(&control) && !control.enabled && snapshot(get).find("\"FgEnabled\":true")!=std::string::npos,

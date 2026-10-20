@@ -8,6 +8,9 @@
 #include "peripheral_dlaa.hpp"
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
+#include "fg_capture.hpp"
+#include "fg_sr_region.hpp"
+#include "ngx_parameter_overlay.hpp"
 
 #include <d3d11_4.h>
 #include "d3d_shaders.hpp"
@@ -158,6 +161,7 @@ struct SharedTexture {
 };
 
 struct TransportSlot {
+    SharedTexture fg_depth, fg_motion;
     SharedTexture color;
     SharedTexture depth;
     SharedTexture motion_vectors;
@@ -263,6 +267,8 @@ void release_shared_texture(SharedTexture& texture) noexcept {
 }
 
 void release_slot(TransportSlot& slot) noexcept {
+    release_shared_texture(slot.fg_depth);
+    release_shared_texture(slot.fg_motion);
     release(slot.dlss_timing_readback);
     release(slot.dlss_timing_heap);
     release(slot.timing_end);
@@ -1466,7 +1472,7 @@ bool evaluate_d3d11_via_d3d12(
     // re-enter the backend while its non-recursive view mutex is held.
     D3D12NgxInterceptionScope private_dx12_scope;
     result = 0xBAD00005U;
-    if ((!settings.enabled && !settings.nr_enabled) || context == nullptr ||
+    if ((!settings.enabled && !settings.nr_enabled && !settings.fg.enabled) || context == nullptr ||
         game_handle == nullptr ||
         parameters == nullptr) {
         return reject_transport(D3D11TransportStatus::unsupported_context);
@@ -1487,7 +1493,7 @@ bool evaluate_d3d11_via_d3d12(
         }
     } nr_attempt{settings, view_id};
     auto transport_settings = settings;
-    if (!transport_settings.enabled && transport_settings.nr_enabled) {
+    if (!transport_settings.enabled && (transport_settings.nr_enabled || transport_settings.fg.enabled)) {
         // NR-only mode still runs the game's SR feature through transport.
         // Use a full-frame SR crop; NR follows its selected processing order.
         transport_settings.enabled = true;
@@ -1706,7 +1712,7 @@ bool evaluate_d3d11_via_d3d12(
         ? scaled_capacity(nr_geometry.height, nr_motion_height, nr_processing_height) : 0U;
     if (!in_bounds(mv_x + mv_crop_x, mv_width, motion_desc.Width) ||
         !in_bounds(mv_y + mv_crop_y, mv_height, motion_desc.Height) ||
-        (settings.peripheral_dlaa_enabled && (
+        ((settings.peripheral_dlaa_enabled || settings.fg.enabled) && (
             !in_bounds(mv_x, nr_motion_width, motion_desc.Width) ||
             !in_bounds(mv_y, nr_motion_height, motion_desc.Height)
         )) ||
@@ -1828,6 +1834,24 @@ bool evaluate_d3d11_via_d3d12(
         );
     }
     TimingScope timing{context, slot};
+    bool fg_guides_ready{};
+    if(settings.fg.enabled) {
+        auto ensure_fg=[&](SharedTexture& texture,const char* name,unsigned w,unsigned h,DXGI_FORMAT format) {
+            if(texture.resource12 && (texture.width!=w || texture.height!=h || texture.format!=format))
+                release_shared_texture(texture); // Slot has retired before reuse.
+            const auto flags=format==DXGI_FORMAT_R32_FLOAT?D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS:D3D12_RESOURCE_FLAG_NONE;
+            return texture.resource12 || create_shared_texture(*device,name,w,h,format,flags,texture);
+        };
+        fg_guides_ready=ensure_fg(slot.fg_depth,"FG full depth",render_width,render_height,DXGI_FORMAT_R32_FLOAT) &&
+            ensure_fg(slot.fg_motion,"FG full motion",nr_motion_width,nr_motion_height,motion_desc.Format) &&
+            convert_depth_crop(*device,context,depth,depth_desc.Format,depth_x,depth_y,render_width,render_height,slot.fg_depth);
+        if(fg_guides_ready) {
+            const D3D11_BOX full_mv{mv_x,mv_y,0,mv_x+nr_motion_width,mv_y+nr_motion_height,1};
+            context->CopySubresourceRegion(slot.fg_motion.texture11,0,0,0,0,motion,0,&full_mv);
+        }
+    } else {
+        release_shared_texture(slot.fg_depth);release_shared_texture(slot.fg_motion);
+    }
 
     D3D11_BOX color_box{
         color_x + crop.input_base_x, color_y + crop.input_base_y, 0U,
@@ -1917,6 +1941,7 @@ bool evaluate_d3d11_via_d3d12(
         context->CopySubresourceRegion(slot.nr_color.texture11, 0U, 0U, 0U, 0U, color, 0U, &nr_box);
     }
 
+    fg_note_reset(device->command_list12);
     const auto ready_value = device->next_fence_value++;
     if (FAILED(context4->Signal(device->fence11, ready_value)) ||
         FAILED(device->queue12->Wait(device->fence12, ready_value)) ||
@@ -2156,6 +2181,25 @@ bool evaluate_d3d11_via_d3d12(
             nr_before ? 6U : slot.dlss_peripheral_timing_recorded ? 4U : 2U;
     }
 
+    if(fg_guides_ready && ngx_succeeded(result)) {
+        fg_set_uevr_queue(device->queue12);
+        fg_sr_begin_evaluation(view_id);
+        if(settings.enabled)fg_sr_prepared(view_id,crop,out_width,out_height,output_x,output_y);
+        NgxParameterOverlay guides(parameters);
+        guides.Set("Depth",slot.fg_depth.resource12);guides.Set("MotionVectors",slot.fg_motion.resource12);
+        guides.Set("Width",render_width);guides.Set("Height",render_height);
+        guides.Set("OutWidth",out_width);guides.Set("OutHeight",out_height);
+        guides.Set("DLSS.Render.Subrect.Dimensions.Width",render_width);
+        guides.Set("DLSS.Render.Subrect.Dimensions.Height",render_height);
+        guides.Set("DLSS.Input.Depth.Subrect.Base.X",0u);guides.Set("DLSS.Input.Depth.Subrect.Base.Y",0u);
+        guides.Set("DLSS.Input.MV.Subrect.Base.X",0u);guides.Set("DLSS.Input.MV.Subrect.Base.Y",0u);
+        guides.Set("DLSS.Feature.Create.Flags",create_flags);
+        transition(device->command_list12,slot.fg_depth.resource12,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(device->command_list12,slot.fg_motion.resource12,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        fg_publish_ngx(device->command_list12,game_handle,&guides,result);
+        transition(device->command_list12,slot.fg_depth.resource12,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        transition(device->command_list12,slot.fg_motion.resource12,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    }
     transition(device->command_list12, slot.output.resource12,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     transition(device->command_list12, slot.motion_vectors.resource12,
@@ -2172,6 +2216,7 @@ bool evaluate_d3d11_via_d3d12(
     }
     ID3D12CommandList* lists[]{device->command_list12};
     device->queue12->ExecuteCommandLists(1U, lists);
+    fg_note_submission(device->queue12,device->command_list12);
     crop_motion12_submitted(device->queue12, 1U, lists);
     collect_crop_motion12();
     slot.done_value = device->next_fence_value++;
@@ -2412,6 +2457,16 @@ void release_d3d11_transport_view(const NgxHandle* const game_handle) noexcept {
     }
 }
 
+void retire_d3d11_fg_transport() noexcept {
+    std::lock_guard lock(transport_mutex);
+    for(auto& device:transport_devices) {
+        if(!device.fence12)continue;
+        const auto done=device.fence12->GetCompletedValue();
+        for(auto& view:device.views)for(auto& slot:view.slots)if(slot.done_value<=done) {
+            release_shared_texture(slot.fg_depth);release_shared_texture(slot.fg_motion);
+        }
+    }
+}
 void release_d3d11_d3d12_transport() noexcept {
     D3D12NgxInterceptionScope private_dx12_scope;
     std::lock_guard lock(transport_mutex);

@@ -1,5 +1,7 @@
 #include "host_api.hpp"
 #include "late_attach_tests.hpp"
+#include "mock_ngx_parameters.hpp"
+#include "../shared/cheeky_fg_bridge.hpp"
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -33,12 +35,156 @@ void frame() { check(chain->Present(0,0),"Host presentation callback"); }
 std::string snapshot(CheekyHostSnapshotFn get) {
     std::array<char,32768> out{}; require(get(out.data(),static_cast<std::uint32_t>(out.size())),"Host snapshot"); return out.data();
 }
+void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    using namespace cheeky::foveated_dlss;
+    const auto runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+    const auto needs_hook = proc<bool(*)()>(runtime,"CheekyFG_NeedsUEVRFrameSourceV1");
+    const auto complete = proc<CheekyFgCompleteHooklessFrameFn>(runtime,"CheekyFG_CompleteHooklessFrameV1");
+    const auto acquire = proc<CheekyFgAcquireFn>(runtime,"CheekyFG_AcquirePair");
+    const auto release = proc<CheekyFgReleaseFn>(runtime,"CheekyFG_ReleasePair");
+    command("1\n200\nset\nEnabled=false\nNrEnabled=false\nFgEnabled=true\nFgHooklessMode3=false\nFgGuideCaptureMode=0");
+    require(!needs_hook(),"Standalone automatically selects hook-free FG despite saved UEVR preference");
+    frame();
+    ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> list;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"FG allocator");
+    check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"FG list");
+    auto texture = [&](DXGI_FORMAT format) {
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width=desc.Height=64; desc.DepthOrArraySize=desc.MipLevels=1; desc.SampleDesc.Count=1; desc.Format=format;
+        ComPtr<ID3D12Resource> result;
+        check(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&result)),"FG texture");
+        return result;
+    };
+    auto depth=texture(DXGI_FORMAT_R32_FLOAT), motion=texture(DXGI_FORMAT_R32G32_FLOAT);
+    auto color=texture(DXGI_FORMAT_R8G8B8A8_UNORM), output=texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+    MockNgxParameters p;
+    p.Set("Width",64u); p.Set("Height",64u); p.Set("OutWidth",64u); p.Set("OutHeight",64u);
+    p.Set("DLSS.Feature.Create.Flags",14u); p.Set("Depth",depth.Get()); p.Set("MotionVectors",motion.Get());
+    p.Set("Color",color.Get()); p.Set("Output",output.Get());
+    const auto ngx=GetModuleHandleW(L"nvngx_dlss.dll");
+    using Create=NgxResult(*)(ID3D12GraphicsCommandList*,unsigned,NgxParameters*,NgxHandle**);
+    using Evaluate=NgxResult(*)(ID3D12GraphicsCommandList*,const NgxHandle*,const NgxParameters*,NgxProgressCallback);
+    const auto evaluate=proc<Evaluate>(ngx,"NVSDK_NGX_D3D12_EvaluateFeature");
+    NgxHandle* handle{}; require(ngx_succeeded(proc<Create>(ngx,"NVSDK_NGX_D3D12_CreateFeature")(list.Get(),1,&p,&handle)),"FG native feature");
+    ComPtr<ID3D12Fence> fence; check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"FG fence");
+    std::uint64_t serial{};
+    auto guides = [&](unsigned eyes) {
+        for(unsigned i=0;i<eyes;++i) require(ngx_succeeded(evaluate(list.Get(),handle,&p,nullptr)),"Intercepted FG guide evaluation");
+        check(list->Close(),"FG list close"); ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1,lists);
+        check(queue->Signal(fence.Get(),++serial),"FG signal");
+        const auto deadline=GetTickCount64()+10000;
+        while(fence->GetCompletedValue()<serial && GetTickCount64()<deadline) Sleep(1);
+        require(fence->GetCompletedValue()>=serial,"FG GPU completion");
+        check(allocator->Reset(),"FG allocator reset"); check(list->Reset(allocator.Get(),nullptr),"FG list reset");
+    };
+    auto pair = [&] {
+        const auto token=complete(1); require(token!=0,"Standalone xrEndFrame claims a submitted stereo interval");
+        CheekyFgPair value; value.capture_token=token;
+        require(acquire(&value)&&!value.enable_frame_id&&!value.render_frame&&value.release_point==3&&
+            value.eyes[0].evaluation+1==value.eyes[1].evaluation,"Standalone frame-free stereo pair preserves scheduling");
+        release(&value);
+    };
+    guides(2); pair(); require(!complete(1),"Consumed stereo guides cannot repeat");
+    guides(1); require(!complete(1),"Partial stereo frame falls back");
+    guides(3); require(!complete(1),"Ambiguous stereo frame falls back");
+    guides(2); pair();
+    command("1\n201\nset\nFgEnabled=false"); frame();
+    guides(2); require(!complete(1),"Disabled FG cannot capture guides");
+    command("1\n202\nset\nFgEnabled=true"); frame();
+    guides(2); pair();
+    command("1\n203\ndefaults_fg\n"); frame();
+    require(!needs_hook()&&!complete(1),"FG defaults retain automatic standalone matching and disable generation");
+    require(ngx_succeeded(proc<NgxResult(*)(NgxHandle*)>(ngx,"NVSDK_NGX_D3D12_ReleaseFeature")(handle)),"FG release feature");
+    check(list->Close(),"Close unused FG recording");
+    std::puts("PASS: standalone FG capture without UEVR hooks, stereo rejection/recovery, disable/re-enable and defaults");
+}
+void verify_fg11(ID3D11Device* device) {
+    using namespace cheeky::foveated_dlss;
+    const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+    const auto complete=proc<CheekyFgCompleteHooklessFrameFn>(runtime,"CheekyFG_CompleteHooklessFrameV1");
+    const auto acquire=proc<CheekyFgAcquireFn>(runtime,"CheekyFG_AcquirePair");
+    const auto release=proc<CheekyFgReleaseFn>(runtime,"CheekyFG_ReleasePair");
+    command("1\n300\nset\nFgEnabled=true\nFgHooklessMode3=false\nFgGuideCaptureMode=0\nD3D11D3D12Transport=false\nEnabled=true\nWidth=0.5\nHeight=0.5\nNrEnabled=false\nPeripheralDlaa=false");
+    ComPtr<ID3D11DeviceContext> context;device->GetImmediateContext(&context);
+    auto texture=[&](DXGI_FORMAT format) {
+        D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=128;desc.ArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;
+        desc.Format=format;desc.Usage=D3D11_USAGE_DEFAULT;desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> result;check(device->CreateTexture2D(&desc,nullptr,&result),"DX11 FG texture");return result;
+    };
+    auto color=texture(DXGI_FORMAT_R8G8B8A8_UNORM),output=texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto depth=texture(DXGI_FORMAT_R32_FLOAT),motion=texture(DXGI_FORMAT_R16G16_FLOAT);
+    MockNgxParameters p;p.Set("Width",128u);p.Set("Height",128u);p.Set("OutWidth",128u);p.Set("OutHeight",128u);
+    p.Set("DLSS.Feature.Create.Flags",14u);p.Set("PerfQualityValue",2u);
+    p.Set("MV.Scale.X",1.f);p.Set("MV.Scale.Y",1.f);p.Set("Color",static_cast<ID3D11Resource*>(color.Get()));
+    p.Set("Output",static_cast<ID3D11Resource*>(output.Get()));p.Set("Depth",static_cast<ID3D11Resource*>(depth.Get()));
+    p.Set("MotionVectors",static_cast<ID3D11Resource*>(motion.Get()));
+    const auto ngx=GetModuleHandleW(L"nvngx_dlss.dll");
+    using Create=NgxResult(*)(ID3D11DeviceContext*,unsigned,NgxParameters*,NgxHandle**);
+    using Evaluate=NgxResult(*)(ID3D11DeviceContext*,const NgxHandle*,const NgxParameters*,NgxProgressCallback);
+    using Init=NgxResult(*)(unsigned long long,const wchar_t*,ID3D11Device*,const void*,unsigned);
+    require(ngx_succeeded(proc<Init>(ngx,"NVSDK_NGX_D3D11_Init")(42,L".",device,nullptr,1)),"Observe DX11 NGX initialization for private transport");
+    NgxHandle* handle{};require(ngx_succeeded(proc<Create>(ngx,"NVSDK_NGX_D3D11_CreateFeature")(context.Get(),1,&p,&handle)),"DX11 FG game feature");
+    const auto evaluate=proc<Evaluate>(ngx,"NVSDK_NGX_D3D11_EvaluateFeature");
+    ComPtr<ID3D11RenderTargetView> depth_rtv;
+    check(device->CreateRenderTargetView(depth.Get(),nullptr,&depth_rtv),"DX11 FG depth fixture RTV");
+    auto eyes=[&](unsigned count) {
+        for(unsigned i=0;i<count;++i) {
+            const float depth_value[]{i%2?.75f:.25f,0,0,0};context->ClearRenderTargetView(depth_rtv.Get(),depth_value);
+            require(ngx_succeeded(evaluate(context.Get(),handle,&p,nullptr)),"DX11 transported FG evaluation");
+        }
+        context->Flush();frame(); // A desktop DX11 tick must retain the private guide queue.
+    };
+    auto pair=[&] {
+        CheekyFgPair value;value.capture_token=complete(1);
+        require(value.capture_token&&acquire(&value),"DX11 native evaluations provide an OpenXR stereo guide pair");
+        require(value.eyes[0].depth_width==128&&value.eyes[1].motion_width==128&&!value.enable_frame_id,
+            "DX11 FG keeps full-eye guides independently of the cropped SR resolution");
+        ComPtr<ID3D12Device> gpu;check(value.producer_queue->GetDevice(IID_PPV_ARGS(&gpu)),"DX11 FG snapshot device");
+        ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+        check(gpu->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"DX11 FG read allocator");
+        check(gpu->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"DX11 FG read commands");
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_READBACK;
+        auto desc=value.eyes[0].depth->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
+        gpu->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
+        D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;buffer.Width=bytes*2;
+        buffer.Height=buffer.DepthOrArraySize=buffer.MipLevels=1;buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> read;check(gpu->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&read)),"DX11 FG readback");
+        for(unsigned eye=0;eye<2;++eye) {
+            auto* source=value.eyes[eye].depth;D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource=source;barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_COMMON;barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list->ResourceBarrier(1,&barrier);D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=source;
+            to.pResource=read.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;to.PlacedFootprint.Offset=eye*bytes;
+            list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);list->ResourceBarrier(1,&barrier);
+        }
+        check(list->Close(),"DX11 FG close readback");ID3D12CommandList* commands[]{list.Get()};value.producer_queue->ExecuteCommandLists(1,commands);
+        ComPtr<ID3D12Fence> fence;check(gpu->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"DX11 FG read fence");
+        check(value.producer_queue->Signal(fence.Get(),1),"DX11 FG read signal");
+        while(fence->GetCompletedValue()<1)Sleep(1);
+        void* mapped{};D3D12_RANGE range{0,static_cast<SIZE_T>(bytes*2)};check(read->Map(0,&range,&mapped),"DX11 FG map depth snapshots");
+        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,127u})for(unsigned x:{0u,127u}) {
+            const auto* pixel=reinterpret_cast<const float*>(static_cast<const unsigned char*>(mapped)+eye*bytes+y*footprint.Footprint.RowPitch+x*4);
+            require(*pixel==(eye?.75f:.25f),"DX11 FG full-depth corner pixels preserve each eye beyond the SR crop");
+        }
+        read->Unmap(0,nullptr);
+        release(&value);
+    };
+    eyes(2);pair();eyes(1);require(!complete(1),"DX11 incomplete stereo falls back");eyes(2);pair();
+    command("1\n301\nset\nEnabled=false");eyes(2);pair();
+    command("1\n302\nset\nFgEnabled=false");eyes(2);require(!complete(1),"DX11 FG disabled capture");
+    command("1\n303\nset\nFgEnabled=true");eyes(2);pair();
+    command("1\n304\ndefaults_fg\n");frame();
+    require(ngx_succeeded(proc<NgxResult(*)(NgxHandle*)>(ngx,"NVSDK_NGX_D3D11_ReleaseFeature")(handle)),"DX11 FG game feature release");
+    std::puts("PASS: DX11 FG automatic transport, full-eye guides, native stereo matching, SR off and disabled capture");
+}
 }
 int main(int argc,char** argv) {
     try {
         const std::string mode=argc>1 ? argv[1] : "dx12";
         const bool dx11=mode.find("dx11")!=std::string::npos;
         const bool realvr=mode.starts_with("realvr-");
+        const bool fg=mode=="fg",fg11=mode=="fg-dx11";
         const bool chained_table=mode.find("method-chain")!=std::string::npos;
         const bool streamline=mode.find("streamline")!=std::string::npos;
         const bool c_callback=mode.ends_with("-c");
@@ -62,7 +208,12 @@ int main(int argc,char** argv) {
             check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)),"DX12");
             D3D12_COMMAND_QUEUE_DESC desc{}; check(d12->CreateCommandQueue(&desc,IID_PPV_ARGS(&queue)),"Queue");
         }
+        if(fg11) {
+            std::filesystem::copy_file(bin/"test-fixtures/nvngx_dlss.dll",root/"_nvngx.dll");
+            require(LoadLibraryW((root/"_nvngx.dll").c_str())!=nullptr,"DX11 transport NGX core fixture");
+        }
         if(realvr) prepare_afw_test(bin,root,d12.Get(),queue.Get(),"--"+mode);
+        else if(fg) require(LoadLibraryW((bin/"test-fixtures/nvngx_dlss.dll").c_str())!=nullptr,"FG fixture library");
         else if(!chained_table)prepare_late_attach_test(bin,d11.Get(),d12.Get(),queue.Get(),c_callback,streamline);
         auto dll=LoadLibraryExW((root/L"CheekyFoveatedDLSSHost.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
         require(dll!=nullptr,"Load actual standalone host");
@@ -102,7 +253,9 @@ int main(int argc,char** argv) {
         command("1\n2\nset\nEnabled=true\nPeripheralDlaa=false\nAutoStereoAlignment=false\nCenterMode=0\nNrEnabled=false");
         // Let discovery's bounded late-load stability window expire.
         Sleep(300);
-        if(realvr) verify_realvr_test(get,command);
+        if(fg11) verify_fg11(d11.Get());
+        else if(fg) verify_fg(d12.Get(),queue.Get());
+        else if(realvr) verify_realvr_test(get,command);
         else verify_late_attach_test(get,command,frame);
         check(chain->ResizeBuffers(2,400,300,DXGI_FORMAT_UNKNOWN,0),"Resize without retained backbuffers"); frame();
         ComPtr<IDXGISwapChain3> chain3;

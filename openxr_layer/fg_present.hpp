@@ -2,6 +2,7 @@
 #include "dlssg_worker.hpp"
 #include "fg_layers.hpp"
 #include "fg_color_format.hpp"
+#include "fg_d3d11.hpp"
 #include <openxr/openxr_platform.h>
 #include <algorithm>
 #include <array>
@@ -48,6 +49,32 @@ struct Presenter {
     XrSession session{XR_NULL_HANDLE};
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
+    std::shared_ptr<D3D11Bridge> interop11;
+    D3D12_RESOURCE_STATES xr_image_state() const noexcept {
+        return interop11 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    bool enumerate_images(XrSwapchain chain, std::vector<XrSwapchainImageD3D12KHR>& images) {
+        if (interop11) return interop11->enumerate(xr.enumerate, chain, images);
+        unsigned count{};
+        if (XR_FAILED(xr.enumerate(chain,0,&count,nullptr)) || !count) return false;
+        images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+        return XR_SUCCEEDED(xr.enumerate(chain,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data())));
+    }
+    XrResult release_image(XrSwapchain chain, unsigned index, const XrSwapchainImageReleaseInfo* info) {
+        const bool copied = !interop11 || interop11->upload(chain,index);
+        const auto result = xr.release(chain,info);
+        return copied || XR_FAILED(result) ? result : XR_ERROR_RUNTIME_FAILURE;
+    }
+    void destroy_chain(XrSwapchain chain) {
+        if (interop11) interop11->forget(chain);
+        if (xr.destroy) xr.destroy(chain);
+    }
+    bool capture11(XrSwapchain chain, unsigned index, ID3D11Texture2D* source,
+        unsigned width, unsigned height, unsigned array, DXGI_FORMAT format) {
+        return interop11 && interop11->capture(chain,source,[&](ID3D12Resource* shared) {
+            return capture(chain,index,shared,width,height,array,format);
+        });
+    }
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence; HANDLE event{};std::uint64_t serial{};
@@ -148,7 +175,7 @@ struct Presenter {
         std::lock_guard lock(mx);
         if(fence&&serial)wait_copy();
         worker.reset();
-        for(auto* a:{&real_chains,&fg_chains})for(auto& chain:*a)if(chain&&xr.destroy)xr.destroy(chain);
+        for(auto* a:{&real_chains,&fg_chains})for(auto& chain:*a)if(chain)destroy_chain(chain);
         real_chains={XR_NULL_HANDLE,XR_NULL_HANDLE};fg_chains=real_chains;
         real_images={};fg_images={};held={};generated={};fallback={};copies.clear();
         frame_layers.clear();

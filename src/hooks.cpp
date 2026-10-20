@@ -4054,6 +4054,7 @@ NgxResult runtime_create_d3d11(const D3D11RuntimeCallbacks& runtime,
     const auto result = traced_feature_create(original, context, feature, parameters, handle, 0);
     if (ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
         feature == 1U) {
+        fg_remember_feature(*handle,parameters);
         register_d3d11_game_feature(
             *handle,
             feature,
@@ -4082,6 +4083,7 @@ NgxResult hook_core_create_d3d11(
     const auto result = traced_feature_create(original, context, feature, parameters, handle, 1);
     if (ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
         feature == 1U) {
+        fg_remember_feature(*handle,parameters);
         register_d3d11_game_feature(
             *handle,
             feature,
@@ -4115,7 +4117,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
     }
     const auto settings = current_settings();
 
-    if (!settings.enabled &&
+    if (!settings.enabled && !settings.fg.enabled &&
         !(settings.nr_enabled && settings.d3d11_use_d3d12_transport)) {
         diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::disabled);
         diagnostic_note_d3d11_execution_path(
@@ -4133,12 +4135,12 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
     }
 
     NgxResult transport_result{};
-    if (!settings.d3d11_use_d3d12_transport) {
+    if (!settings.d3d11_use_d3d12_transport && !settings.fg.enabled) {
         diagnostic_note_d3d11_transport_status(
             D3D11TransportStatus::not_attempted
         );
     }
-    if (settings.d3d11_use_d3d12_transport) {
+    if (settings.d3d11_use_d3d12_transport || settings.fg.enabled) {
         NgxPresetOverrideScope center_preset{
             parameters, settings.center_preset
         };
@@ -4258,7 +4260,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
     }
     const auto settings = current_settings();
 
-    if (!settings.enabled &&
+    if (!settings.enabled && !settings.fg.enabled &&
         !(settings.nr_enabled && settings.d3d11_use_d3d12_transport)) {
         diagnostic_note_state(DiagnosticApi::d3d11, DiagnosticState::disabled);
         diagnostic_note_d3d11_execution_path(
@@ -4276,12 +4278,12 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
     }
 
     NgxResult transport_result{};
-    if (!settings.d3d11_use_d3d12_transport) {
+    if (!settings.d3d11_use_d3d12_transport && !settings.fg.enabled) {
         diagnostic_note_d3d11_transport_status(
             D3D11TransportStatus::not_attempted
         );
     }
-    if (settings.d3d11_use_d3d12_transport) {
+    if (settings.d3d11_use_d3d12_transport || settings.fg.enabled) {
         NgxPresetOverrideScope center_preset{
             parameters, settings.center_preset
         };
@@ -4424,6 +4426,7 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
     return result;
 }
 NgxResult runtime_release_d3d11(const D3D11RuntimeCallbacks& runtime, NgxHandle* const handle) {
+    fg_forget_feature(handle);
     const auto original = runtime.release.load(std::memory_order_acquire);
     release_d3d11_transport_view(handle);
     release_d3d11_peripheral_dlaa_view(handle);
@@ -4496,6 +4499,7 @@ NgxResult hook_release_d3d11(NgxHandle* handle) {
 }
 
 NgxResult hook_core_release_d3d11(NgxHandle* const handle) {
+    fg_forget_feature(handle);
     const auto original = real_core_release_d3d11.load(std::memory_order_acquire);
     release_d3d11_transport_view(handle);
     release_d3d11_peripheral_dlaa_view(handle);

@@ -197,6 +197,20 @@ test-only focus adapter supplies foreground state for headless CI; production
 builds use Windows foreground state. `--capture=<absolute.bmp>` saves an SDR
 frame for visual inspection.
 
+`CheekyStandaloneHostTests.exe fg standalone` (also `fg optiscaler`) exercises
+the actual host, runtime, NGX hooks and GPU guide snapshots without UEVR frame
+hooks. It checks automatic hook-free pairing, partial/ambiguous guide rejection,
+recovery, FG disable/re-enable and defaults. `CheekyOverlayTests.exe --ui` also
+checks the FG tab's compatibility status, presented counters, unique FPS and GPU
+timings. `fg-dx11 standalone` and `fg-dx11 optiscaler` exercise automatic DX12
+transport from DX11 evaluations, full-eye guides with cropped SR, SR-off capture
+and private queue preservation across desktop ticks. `CheekyOpenXRBindingTests.exe
+--fg-d3d11` checks D3D11 OpenXR session setup, non-shareable stereo arrays,
+RGBA and typeless BGRA/sRGB, immutable capture, compact output reconstruction
+with GPU pixel readback, and shutdown. It also runs in `--fg-gpu-validation`.
+These tests use fake NGX inference; real NVIDIA inference and headset pacing
+still require a supported D3D11 or D3D12 OpenXR game, including ACC/OpenComposite.
+
 Bootstrap tests stage isolated layouts, validate DXGI exports and ordinals,
 exercise recursive factory creation, concurrent ASI initialization and missing
 host pass-through. Chaining fixtures exercise missing/unloadable second DLLs,

@@ -110,7 +110,7 @@ swap-chain creation.
 
 Press **F8** by default to open or close Cheeky's desktop overlay. The **General** tab
 lets you change the menu key and shows compatibility controls and runtime status.
-Its other tabs provide DLSS-SR, gaze/stereo, DLSS-NR and diagnostics controls.
+Its other tabs provide DLSS-SR, gaze/stereo, DLSS-FG, DLSS-NR and diagnostics controls.
 Changes are saved automatically. The menu key is saved in `CheekyOverlay.ini`
 beside the host DLL; use **Reset to F8** in General to restore the default.
 Pause the game when changing settings if it continues to react to keys while
@@ -184,6 +184,44 @@ it does not require the OpenXR layer. LibOVR games, including R.E.A.L. VR with
 for Pimax eye tracking, its existing PVR session; see
 [LibOVR games and Pimax eye tracking](../USAGE.md#libovr-games-and-pimax-eye-tracking).
 
+## Experimental OpenXR DLSS Frame Generation
+
+Standalone and OptiScaler expose the same 2x DLSS-FG processing and OpenXR
+presenter as the UEVR package. Install the matching **Cheeky OpenXR support**
+from the package's `OpenXR/CheekyOpenXRSetup.exe`, restart the game, and use a
+**D3D11 or D3D12 OpenXR stereo** session with native DLSS depth and motion-vector guides.
+In F8, open **DLSS-FG** and enable **DLSS Frame Generation (2x)**. FG is off by
+default and does not require the Cheeky UEVR plugin or its Lua script.
+
+For **ACC in DX11 through OpenComposite**, keep the game in DX11 and enable its
+DLSS upscaler. FG automatically uses Cheeky's private DX12 transport while
+enabled, including when foveated SR is off. Full-eye depth and motion guides
+are captured independently of the SR crop. The OpenXR session remains D3D11;
+shared textures and GPU fences carry scene captures and generated output
+between APIs. The matching updated OpenXR installer is required. The direct-XR
+output experiment uses compact intermediates on D3D11. This path has GPU
+integration coverage; ACC and headset compatibility still require game testing.
+
+Standalone automatically uses hook-free guide matching at `xrEndFrame`; the
+UEVR-specific `FgHooklessMode3` and `FgBackbufferFrameId` preferences do not
+override that behavior. Each native frame must supply exactly two submitted
+eye evaluations. Missing, partial or ambiguous guide intervals retain native
+presentation and recover on a later complete stereo frame. Keep **Release game
+rendering** at **After generated frame submission** (the default) for serialized
+matching. Other release modes allow experimental overlap without native frame
+identity proof.
+
+The tab includes full/foveated FG, matching the SR region and gaze placement,
+manual region controls, center/peripheral scales, peripheral methods and guide
+precision, queue scheduling, capture/storage/output experiments, and reset to FG
+defaults. Status, generated frame counts, measured unique output FPS and GPU
+timings use the shared presenter diagnostics. Unique FPS excludes repeats.
+
+This path requires the same NVIDIA DLSS-G capability as UEVR. Vulkan,
+OpenVR, LibOVR, alternate-eye rendering and flat-screen FG presentation are not
+supported. A game that supplies a different guide layout may remain on native
+frames; actual NVIDIA inference and headset pacing need game testing.
+
 ## Loader behavior and current limits
 
 - The DXGI loader forwards the five public entry points described above through
@@ -212,13 +250,20 @@ Exit the game first. Remove the **Cheeky** loader you installed (`dxgi.dll`,
 `CheekyFoveatedDLSS` directory. Keep that directory's INI if you want your settings
 for a later install. Leave OptiScaler's loader and configuration in place.
 
-Build packages from the repository with:
+Build and package standalone in one command, including the matching OpenXR
+installer:
 
 ```powershell
-.\scripts\build.ps1 -Configuration Release
-.\scripts\package-standalone.ps1 -Configuration Release -Mode Both -Label my-build
+.\scripts\build-standalone-package.ps1 -Label my-build
 ```
 
+This builds Release, runs the tests, builds the OpenXR installer, and creates
+the verified ZIP in `bin/Release`. Use `-Mode OptiScaler` or `-Mode Both` for
+the ASI package or both packages. Like the UEVR wrapper, it accepts `-SkipTests`
+and `-IsccPath` for a custom Inno Setup compiler location.
+
+To package binaries that have already been built, use
+`.\scripts\package-standalone.ps1 -Configuration Release -Mode Standalone -Label my-build`.
 Packaging verifies each ZIP entry against its staged SHA-256 hash and refuses
 to overwrite an existing archive. `-BinaryRoot` can point to a CMake output
 directory. `-IncludeOpenXRSetup` includes the separately built matching OpenXR

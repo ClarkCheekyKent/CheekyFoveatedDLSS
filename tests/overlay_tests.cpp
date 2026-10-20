@@ -116,6 +116,7 @@ void test_ui_diagnostics() {
     InputState input;
     state.draft.center_mode = FoveationCenterMode::openxr_gaze;
     const OverlayRuntime runtime{};
+    const char* render_api="D3D12";
     auto render = [&](const char* tab, bool expand_details = true) {
         if (context->TabBars.GetAliveCount()) {
             auto* bar = context->TabBars.GetByIndex(0);
@@ -126,7 +127,7 @@ void test_ui_diagnostics() {
         ImGui::NewFrame();
         ImGui::Begin("Diagnostic capture");
         ImGui::LogToBuffer(expand_details ? 8 : 0);
-        draw_overlay_ui(state, runtime, input, "D3D12", "Ready", open);
+        draw_overlay_ui(state, runtime, input, render_api, "Ready", open);
         const std::string text = context->LogBuffer.c_str();
         ImGui::LogFinish();
         ImGui::End();
@@ -138,9 +139,30 @@ void test_ui_diagnostics() {
     auto text = render("Stereo / Gaze");
     auto* bar = context->TabBars.GetByIndex(0);
     require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "General") == 0, "General should be the first tab");
-    require(bar->Tabs.Size == 6, "General should join the existing five tabs");
+    require(bar->Tabs.Size == 7, "Standalone tabs include DLSS-FG");
     require(text.find("no active OpenXR layer") != text.npos, "Missing gaze adapter warning");
     require(text.find("manual fallback placement") != text.npos, "Missing stereo fallback warning");
+    state.draft.fg.enabled = true;
+    state.snapshot = R"({"fg":{"layer_present":false}})";
+    render("DLSS-FG"); text = render("DLSS-FG");
+    require(text.find("Enable DLSS Frame Generation (2x)") != text.npos &&
+        text.find("OpenXR layer not loaded") != text.npos, "FG enable and missing presenter diagnostics");
+    state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":false}})";
+    require(render("DLSS-FG").find("Waiting for a running D3D11 or D3D12 OpenXR stereo session") != text.npos,
+        "FG does not report an incompatible session as generating");
+    state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":true,
+        "state":"Generating frames","generated_frames":17,"cadence":{"valid":true,"unique_fps":90},
+        "performance":{"gpu_valid":true,"total_ms":2.5}}})";
+    text = render("DLSS-FG");
+    require(text.find("Generating frames") != text.npos && text.find("Generated frames presented: 17") != text.npos &&
+        text.find("Unique output: 90.0 FPS") != text.npos && text.find("FG total GPU: 2.500 ms") != text.npos,
+        "FG reports actual presented frames, unique cadence and GPU cost");
+    render_api="D3D11";
+    text=render("DLSS-FG");
+    require(text.find("FG uses DX12 transport automatically")!=text.npos && text.find("FG output destination")==text.npos,
+        "DX11 FG explains automatic transport and omits the unavailable direct-XR experiment");
+    render_api="D3D12";
+    state.draft.fg.enabled = false;
     state.draft.center_mode = FoveationCenterMode::fixed;
     state.snapshot = R"({"gaze":{"layer":false,"views":1,"alignment":0}})";
     require(render("Stereo / Gaze").find("manual fallback placement") == std::string::npos, "Flat games do not require stereo alignment");

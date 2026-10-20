@@ -53,6 +53,8 @@ void remember_d3d11_ngx_init(
 ) noexcept;
 
 void release_d3d11_transport_view(const NgxHandle* game_handle) noexcept;
+// Poll retired FG-only staging even after evaluation returns to native DX11.
+void retire_d3d11_fg_transport() noexcept;
 void release_d3d11_d3d12_transport() noexcept;
 
 }  // namespace cheeky::foveated_dlss
