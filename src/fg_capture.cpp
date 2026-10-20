@@ -569,6 +569,25 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
     out->peripheral_percent=s.peripheral_percent;
     out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
 }
+// Read the unconsumed, actually submitted stereo guides for the current native
+// interval. No "last good" crop is allowed here: a 2-pixel SR movement is
+// enough to make compact color and NGX motion/depth spatially disagree.
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_PeekCaptureCropsV2(CheekyFgCaptureCropsV2* out) noexcept {
+    using namespace cheeky::foveated_dlss;
+    if(!out||out->abi!=2||out->size<sizeof(*out)||!enabled())return false;
+    std::lock_guard lock(mutex);
+    const auto settings=current_settings();
+    if(settings.center_mode!=FoveationCenterMode::fixed||!settings.fg.enabled||!settings.fg.foveated)
+        return false;
+    CheekyFgCaptureCropsV2 sample;
+    sample.token=out->token;
+    sample.render_frame=out->render_frame;
+    // Reject any pending guide whose SR/FG settings revision is stale.
+    const auto desired=fg_source_configuration(configuration(settings),game_sr_revision);
+    if(!snapshots().peek_current_crops(sample,desired)||!sample.width||!sample.height)return false;
+    *out=sample;
+    return true;
+}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStaticEyeCropsV1(CheekyFgStaticEyeCropsV1* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
     std::lock_guard lock(cheeky::foveated_dlss::mutex);

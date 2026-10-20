@@ -157,17 +157,22 @@ struct BufferedPresenter final : Presenter {
     std::atomic<unsigned> color_capture_mode{},upload_mode{},latency_diagnostics{1};
     CheekyFgTransportOptionsFn transport_options_query{};
     CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
-    CheekyFgStaticEyeCropsV1 static_eye_crops; // Last verified per-eye geometry, latched at WaitFrame.
+    CheekyFgStaticEyeCropsV1 static_eye_crops; // Diagnostic only; NEVER used to pack a later native frame.
+    // Protected by capture_mutex, like the captured images and their stamps.
+    std::unordered_map<XrSwapchain,std::uint64_t> capture_crop_tokens;
+    std::uint64_t compact_current_lookups{},compact_current_misses{};
     std::uint64_t pose_sample_count{};
-    CompactLayout eye_color_layout(unsigned eye,unsigned width,unsigned height) const noexcept {
+    CompactLayout eye_color_layout(unsigned eye,unsigned width,unsigned height,
+                                   const CheekyFgCaptureCropsV2& current) const noexcept {
         const auto& s=storage_options;
-        // Never fall back to the global offsets for a physical eye: those are
-        // not stereo-aligned and may put low-resolution context inside FG crop.
-        if(s.compact&&eye<2&&(static_eye_crops.valid_mask&(1u<<eye))){
-            const auto& r=static_eye_crops.eye[eye];
+        // Compact packing requires an exact pending stereo guide pair from
+        // THIS capture interval. No cached previous-frame or global offset.
+        if(s.compact&&eye<2&&(current.valid_mask&(1u<<eye))&&
+            current.width==width&&current.height==height&&current.token){
+            const auto& r=current.eye[eye];
             return compact_layout(width,height,true,r.width,r.height,r.x,r.y,s.peripheral_percent,s.feather);
         }
-        return compact_layout(width,height,false,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
+        return {}; // Missing current geometry: one ordinary full-eye copy.
     }
     std::atomic<std::uint64_t> direct_eye_copies{},eye_crop_copies{},capture_fallbacks{};
     CheekyFgExperimentDiagnostics experiment_state;
@@ -675,7 +680,7 @@ struct BufferedPresenter final : Presenter {
         if(discarded){
             ended=begun;++skipped;++epoch;discard_pending();ready.clear();latest_native.reset();
             awaiting_generated_submission=0;
-            captured.clear();direct_captures.clear();capture_tokens.clear();capture_frames.clear();
+            captured.clear();direct_captures.clear();capture_tokens.clear();capture_frames.clear();capture_crop_tokens.clear();
             capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;
             if(trace)trace("FG xrBeginFrame discarded the preceding unended application frame");
             changed.notify_all();
@@ -704,6 +709,28 @@ struct BufferedPresenter final : Presenter {
         // requires the RHI frame identity returned with the color stamp.
         if(guide_token&&!stamp_fn){stamp.token=guide_token(original);stamp.render_frame=stamp.token/2;}
         const auto token=stamp.token;
+        // Look up the *current* unconsumed, submitted guide pair at color
+        // release, rather than using the preceding WaitFrame's crop cache.
+        // No GPU work and no lease/consumption is performed by this query.
+        CheekyFgCaptureCropsV2 current_crops;
+        current_crops.token=token;
+        current_crops.render_frame=stamp.render_frame;
+        const auto peek=runtime?reinterpret_cast<CheekyFgCaptureCropsFn>(
+            GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
+        if(storage_options.compact){
+            if(!peek||!peek(&current_crops))current_crops.valid_mask=0;
+            if(current_crops.valid_mask)++compact_current_lookups;
+            else ++compact_current_misses;
+            const auto total=compact_current_lookups+compact_current_misses;
+            if(trace&&(total<=2||total%240==0)){
+                char message[224]{};
+                sprintf_s(message,"FG same-interval crop lookup ok=%llu fallback=%llu token=%llu eye_mask=0x%x (no prior-frame crop reuse)",
+                    static_cast<unsigned long long>(compact_current_lookups),
+                    static_cast<unsigned long long>(compact_current_misses),
+                    static_cast<unsigned long long>(current_crops.token),current_crops.valid_mask);
+                trace(message);
+            }
+        }
         const auto format=capture_format(original->GetDesc().Format,declared);if(format==DXGI_FORMAT_UNKNOWN)return false;
         std::uint64_t profile_frame{};{std::lock_guard lock(mx);profile_frame=next_id+1;}
         auto* c=producer.begin(profile_frame);if(!c){capture_overflow=true;return false;}
@@ -718,7 +745,7 @@ struct BufferedPresenter final : Presenter {
             for(std::size_t n=0;n<plan->second.slices.size();++n){
                 const auto slice=plan->second.slices[n];
                 const unsigned eye=n<plan->second.physical_eyes.size()?plan->second.physical_eyes[n]:2u;
-                const auto layout=eye_color_layout(eye,slice.rect.extent.width,slice.rect.extent.height);
+                const auto layout=eye_color_layout(eye,slice.rect.extent.width,slice.rect.extent.height,current_crops);
                 auto image=layout.packed()?producer.packed_region(*c,original,xr_image_state(),slice.rect,slice.layer,format,layout):
                     producer.region_copy(*c,original,xr_image_state(),slice.rect,slice.layer,format);
                 if(!image){capture_overflow=true;std::uint64_t discarded{};producer.execute(*c,discarded);return false;}
@@ -732,6 +759,9 @@ struct BufferedPresenter final : Presenter {
         std::uint64_t ticket{};if(!producer.execute(*c,ticket))return false;
         if(direct){captured.erase(sc);direct_captures[sc]=std::move(eyes);}
         else {direct_captures.erase(sc);captured[sc]=std::move(copy);}
+        // A compact image only belongs to the exact guide interval returned
+        // by PeekCaptureCrops. Full-eye fallback has no crop-token dependency.
+        capture_crop_tokens[sc]=direct&&current_crops.valid_mask?current_crops.token:0;
         capture_tokens[sc]=token;capture_frames[sc]=stamp.render_frame;capture_times[sc]=captured_at;capture_ready[sc]=ready_stamp;return true;
     }
     template<class Fn> static bool subimages(FrameLayers& layers,Fn&& visit) {
@@ -837,11 +867,10 @@ struct BufferedPresenter final : Presenter {
                 }else {
                     const auto found=captured.find(sub.swapchain);
                     if(found!=captured.end()){
-                        const auto layout=eye_color_layout(eye,sub.imageRect.extent.width,sub.imageRect.extent.height);
-                        if(layout.packed()){
-                            job->color[eye]=producer.packed_region(*c,found->second->texture.Get(),found->second->state,sub.imageRect,sub.imageArrayIndex,
-                                found->second->texture->GetDesc().Format,layout);c->images.push_back(found->second);
-                        }else job->color[eye]=producer.crop(*c,found->second,sub.imageRect,sub.imageArrayIndex);
+                        // Full-swapchain capture is an ordinary full-eye
+                        // fallback, never repack it using stale cached crop.
+                        // The FG worker samples its full resolution directly.
+                        job->color[eye]=producer.crop(*c,found->second,sub.imageRect,sub.imageArrayIndex);
                     }
                     if(job->color[eye])++eye_crop_copies;
                 }
@@ -871,6 +900,24 @@ struct BufferedPresenter final : Presenter {
                     const auto completed=hookless_complete(1);
                     if(completed){expected_token=completed;expected_frame=0;tokens_match=true;}
                     else if(!expected_frame){expected_token=0;tokens_match=false;}
+                }
+                // When a guide interval changed between xrReleaseSwapchainImage
+                // and xrEndFrame, never evaluate FG with the now-wrong packed
+                // crop. Full-eye copies are unaffected and remain eligible.
+                if(tokens_match&&expected_token)for(unsigned eye=0;eye<2;++eye){
+                    if(!job->color[eye]||!job->color[eye]->layout.packed())continue;
+                    const auto sc=projection->views[eye].subImage.swapchain;
+                    if(capture_crop_tokens[sc]!=expected_token){
+                        tokens_match=false;
+                        if(trace){
+                            char message[224]{};
+                            sprintf_s(message,"FG compact capture interval changed eye=%u packed_guide=%llu matched_guide=%llu; skipping FG pair",
+                                eye,static_cast<unsigned long long>(capture_crop_tokens[sc]),
+                                static_cast<unsigned long long>(expected_token));
+                            trace(message);
+                        }
+                        break;
+                    }
                 }
                 auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
                 auto acquire=guide_acquire?guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;

@@ -4,6 +4,7 @@
 #include "../shared/cheeky_gpu_span.hpp"
 #include "../shared/fg_resource_memory.hpp"
 #include "fg_prepared_guides.hpp"
+#include "../shared/fg_capture_pair_token.hpp"
 #include <memory>
 #include <vector>
 #include <algorithm>
@@ -155,6 +156,38 @@ public:
             result.cancelled?"Guide command list was reset":result.eligible!=2?(result.eligible?"Frame does not contain exactly two guides":"No guides with the color frame ID"):
             result.latest<=consumed?"Guide pair was already consumed":result.latest<=failed_record?"Guide capture failed before this pair":"Guides ready; color copy has no matching token";
         return result;
+    }
+    // Peek only the UNCONSUMED capture interval (no latch/consume). A first
+    // eye may be released before the second eye has been evaluated. In
+    // hook-free mode only, predict the completed pair token as ordinal+1;
+    // xrEndFrame MUST verify the actual token and the final crop geometry.
+    bool peek_current_crops(CheekyFgCaptureCropsV2& out,std::uint64_t expected_configuration) const noexcept {
+        if(failed_record>consumed)return false;
+        const auto token=cheeky::fg::pending_stereo_crop_token(ordinal,consumed,!out.render_frame);
+        if(!token)return false;
+        const auto count=ordinal-consumed;
+        if(count==1&&(out.render_frame||out.token))return false;
+        const Shot* a=nullptr;const Shot* b=nullptr;
+        for(const auto& shot:shots)if(shot->meta.evaluation>consumed){
+            if(!shot->submitted||shot->foreign||shot->cancelled)return false;
+            if(shot->meta.evaluation==ordinal-1&&count==2)a=shot.get();
+            else if(shot->meta.evaluation==ordinal)b=shot.get();
+            else return false;
+        }
+        if(!b||b->identity.eye>=2||b->meta.configuration!=expected_configuration||
+           b->meta.render_frame!=out.render_frame)return false;
+        if(count==2&&(!a||!compatible_eyes(*a,*b)||a->identity.eye>=2||
+           a->meta.configuration!=expected_configuration||a->meta.width!=b->meta.width||
+           a->meta.height!=b->meta.height||a->meta.render_frame!=out.render_frame))return false;
+        if(out.token&&out.token!=token)return false;
+        out.token=token;out.width=b->meta.width;out.height=b->meta.height;
+        out.valid_mask=1u<<b->identity.eye;
+        out.eye[b->identity.eye]={b->meta.focus_width,b->meta.focus_height,b->meta.focus_x,b->meta.focus_y};
+        if(a){
+            out.valid_mask|=1u<<a->identity.eye;
+            out.eye[a->identity.eye]={a->meta.focus_width,a->meta.focus_height,a->meta.focus_x,a->meta.focus_y};
+        }
+        return true;
     }
     static inline constexpr GUID recording_key{0xf654ab8c,0x35ac,0x4b73,{0x95,0x23,0x7c,0x55,0x78,0x41,0x87,0xe9}};
     static std::uint64_t recording_identity(ID3D12GraphicsCommandList* list) noexcept {

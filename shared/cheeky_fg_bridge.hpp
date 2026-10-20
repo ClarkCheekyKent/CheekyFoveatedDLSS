@@ -253,6 +253,18 @@ struct CheekyFgStaticEyeCropsV1 {
     CheekyFgStaticEyeCrop eye[2]{};
 };
 using CheekyFgStaticEyeCropsFn=bool(__cdecl*)(CheekyFgStaticEyeCropsV1*);
+// The guides belonging to ONE unconsumed native interval, not a cache of
+// the preceding frame. The lookup can return the first physical eye before
+// the second submits; it does not consume/lease either guide.
+// The returned token must still match CompleteHooklessFrame/AcquirePair at
+// xrEndFrame: capture can race submission on another thread.
+struct CheekyFgCaptureCropsV2 {
+    std::uint32_t abi{2},size{sizeof(CheekyFgCaptureCropsV2)};
+    std::uint64_t token{},render_frame{}; // render_frame=0 in hook-free mode.
+    std::uint32_t width{},height{},valid_mask{};
+    CheekyFgStaticEyeCrop eye[2]{};
+};
+using CheekyFgCaptureCropsFn=bool(__cdecl*)(CheekyFgCaptureCropsV2*);
 struct CheekyFgTimingValue {double mean{},last{};};
 struct CheekyFgExperimentDiagnostics {
     std::uint32_t abi{1},size{sizeof(CheekyFgExperimentDiagnostics)},supported{};
