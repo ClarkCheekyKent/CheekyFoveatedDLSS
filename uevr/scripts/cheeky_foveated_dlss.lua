@@ -408,8 +408,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     local fg_state = status.fg or {}
     local fg_timeline = fg_state.pacing_timeline or {}
     local fg_cadence = fg_state.cadence or {}
+    local native_fg_mode = afw.rendering_mode_known and afw.rendering_mode == 0
     local fg_status_text = "Disabled"
-    if draft.FgEnabled then
+    if not native_fg_mode then
+        fg_status_text = afw.rendering_mode_known and "Paused - Native Stereo required" or "Waiting for UEVR rendering mode"
+    elseif draft.FgEnabled then
         fg_status_text = (fg_timeline.supported and fg_timeline.recent_generated) and
             string.format("Generating (%.1f FG FPS)",fg_cadence.generated_fps or 0) or "No recent generated frames"
     end
@@ -563,10 +566,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     if imgui.tree_node("DLSS-FG (experimental)") then
         if draft.FgEnabled == nil then
             text("Install the matching DLSS-FG plugin, runtime and Lua script.")
+        elseif not native_fg_mode then
+            text("DLSS-FG controls are available only in UEVR Native Stereo.")
+            text("The enable preference is preserved and FG will resume automatically on return to Native Stereo.")
         else
             check("Enable DLSS Frame Generation (2x)", "FgEnabled")
             text("Applies at the next OpenXR frame and saves automatically.")
-            text("Requires D3D12 OpenXR, native stereo DLSS and NVIDIA frame generation support.")
+            text("Runs only in UEVR Native Stereo. AER, sequential and AFW pause FG automatically; the checkbox stays enabled.")
             local fg = status.fg or {}
             if not fg.layer_present then
                 text("OpenXR layer not loaded. Install the updated OpenXR support and restart the game.")

@@ -612,6 +612,7 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
         active_attachment = ++s.attachment_sequence;
         *input->attachment = s.attachment_sequence;
         adapter_attached = true;
+        if(s.host == CheekyRuntimeHost::uevr)fg_uevr_mode_attached();
         allow_afw_stereo_projection(s.host == CheekyRuntimeHost::uevr);
         eye_calibration_enable(!configured_settings().manual_stereo_mapping);
         s.cadence.reset();
@@ -632,6 +633,7 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Detach(std::uint64_t attachm
     if (!attachment || active_attachment.load(std::memory_order_acquire) != attachment) return;
     adapter_attached.store(false, std::memory_order_release);
     fg_abandon_frame_source();
+    if(state().host == CheekyRuntimeHost::uevr)fg_uevr_mode_detached();
     allow_afw_stereo_projection(false);
     eye_calibration_suspend();
     set_processing_allowed(false);
@@ -659,7 +661,9 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_PublishRenderingMode(std::uint6
     try {
         auto& s = state(); std::lock_guard lock(s.mutex);
         if (!attachment || !adapter_attached.load() || attachment != active_attachment.load() || s.host != CheekyRuntimeHost::uevr) return false;
-        publish_afw_rendering_mode(s.graphics_ready && s.renderer == 1 ? mode : UINT32_MAX);
+        const auto effective_mode=s.graphics_ready && s.renderer == 1 ? mode : UINT32_MAX;
+        publish_afw_rendering_mode(effective_mode);
+        fg_uevr_mode_published(effective_mode);
         return true;
     } catch (...) { return false; }
 }

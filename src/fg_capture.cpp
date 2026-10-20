@@ -3,6 +3,7 @@
 #include "fg_snapshot.hpp"
 #include "fg_frame_phase.hpp"
 #include "fg_source_lifecycle.hpp"
+#include "../shared/fg_uevr_mode.hpp"
 #include "gaze_foveation.hpp"
 #include "fg_sr_region.hpp"
 #include "uevr_frame_source.hpp"
@@ -22,6 +23,10 @@ namespace cheeky::foveated_dlss {
 namespace {
 std::mutex mutex;
 std::atomic<bool> pending_submissions{};
+// Two different concepts: desired FG setting vs. whether the current UEVR
+// rendering method can supply native stereo. Never overwrite FgEnabled.
+std::atomic<int> uevr_fg_rendering_mode{cheeky::fg::no_uevr_host};
+std::atomic<std::uint64_t> uevr_fg_mode_epoch{1};
 std::atomic<std::uint64_t> observed_fg_lists{},recognized_fg_guides{};
 // Set by UEVR's executing RHI command, not by an engine-tick/global counter.
 thread_local std::uint64_t render_frame{};
@@ -91,13 +96,38 @@ struct SnapshotStore {
     FgColorProvenance colors;
     std::vector<std::unique_ptr<FgSnapshots>> generations;
     FgSnapshots* active{};
+    bool capture_was_enabled{};
     SnapshotStore(){generations.push_back(std::make_unique<FgSnapshots>());active=generations.back().get();}
     void collect(){std::erase_if(generations,[&](auto& p){p->retire();return p.get()!=active&&p->idle();});}
 };
 SnapshotStore& store(){static auto* value=new SnapshotStore;return *value;}
 FgSnapshots& snapshots(){return *store().active;}
+// FG-off is a producer lifecycle boundary, not just a presentation toggle.
+// Move the old generation aside so its snapshot textures can be destroyed
+// once the executing command lists and any consumers have retired. Never
+// release in-flight D3D12 resources synchronously at a Lua toggle.
+void synchronize_capture_enabled_locked(bool requested) {
+    auto& state=store();
+    if(state.capture_was_enabled==requested)return;
+    state.capture_was_enabled=requested;
+    state.active->invalidate();
+    state.colors.invalidate();
+    last_color_match={};
+    last_color_frame=0;
+    if(!requested){
+        state.generations.push_back(std::make_unique<FgSnapshots>());
+        state.active=state.generations.back().get();
+        trace_event("FG producer disabled: retiring prior guide generation; new captures blocked");
+    } else {
+        trace_event("FG producer enabled: starting fresh guide generation");
+    }
+    state.collect();
+    pending_submissions=std::any_of(state.generations.begin(),state.generations.end(),
+        [](const auto& p){return p->pending_submissions();})||state.colors.has_pending();
+}
 bool enabled() noexcept {
-    return current_settings().fg.enabled;
+    return current_settings().fg.enabled &&
+        cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
 bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
     return s.hookless_mode3;
@@ -140,8 +170,27 @@ float f(const NgxParameters* p,const char* n,float fallback=0) noexcept {
     float v{};return p && ngx_succeeded(p->Get(n,&v))?v:fallback;
 }
 }
+// A mode transition is also a producer-lifecycle transition. Retire the
+// previous immutable snapshot generation when leaving native stereo; the
+// old generation remains alive until GPU submissions and leases retire.
+void fg_uevr_mode_attached() noexcept { fg_uevr_mode_published(0xFFFFFFFFu); }
+void fg_uevr_mode_published(std::uint32_t mode) noexcept try {
+    const int next=cheeky::fg::uevr_mode_value(mode);
+    const int previous=uevr_fg_rendering_mode.exchange(next,std::memory_order_acq_rel);
+    if(previous==next)return;
+    // A monotonic counter, unlike current mode, records transitions that the
+    // OpenXR presenter may not have observed while it was not being called.
+    const auto epoch=uevr_fg_mode_epoch.fetch_add(1,std::memory_order_acq_rel)+1;
+    std::lock_guard lock(mutex);
+    synchronize_capture_enabled_locked(enabled());
+    trace_event("FG UEVR rendering mode changed %d -> %d epoch=%llu: %s (FgEnabled preference preserved)",
+        previous,next,static_cast<unsigned long long>(epoch),cheeky::fg::uevr_mode_supports_fg(next)?"Native Stereo / FG allowed":"FG paused; non-native/unknown mode");
+} catch(...) {}
+void fg_uevr_mode_detached() noexcept { fg_uevr_mode_published(0xFFFFFFFFu); }
 void fg_set_uevr_queue(ID3D12CommandQueue* q) noexcept try {
     std::lock_guard lock(mutex);
+    synchronize_capture_enabled_locked(enabled());
+    if(!enabled()){store().collect();return;}
     if(!q){snapshots().invalidate();store().colors.invalidate();return;}
     store().collect();
     // In hook-free mode 3 the UEVR renderer accessor is only the provisional
@@ -166,7 +215,7 @@ void fg_note_submission(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* list) n
     pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
         [](const auto& p){return p->pending_submissions();})||store().colors.has_pending();
 } catch(...) {}
-void fg_retire_snapshots() noexcept try {std::lock_guard lock(mutex);store().collect();} catch(...) {}
+void fg_retire_snapshots() noexcept try {std::lock_guard lock(mutex);synchronize_capture_enabled_locked(enabled());store().collect();} catch(...) {}
 void fg_note_reset(ID3D12GraphicsCommandList* list) noexcept try {
     std::lock_guard lock(mutex);for(auto& p:store().generations)p->reset(list);
     store().colors.reset(list);
@@ -290,6 +339,8 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     // both NGX-SR feature handles alive while the mod changes rendering paths.
     const auto settings_configuration=configuration(settings);
     std::lock_guard lock(mutex);
+    synchronize_capture_enabled_locked(settings.fg.enabled);
+    if(!settings.fg.enabled)return;
     // Capture the source revision under the SAME lock as release/create and
     // snapshot recording. A stereo pair spanning a DLSS quality change is
     // rejected by FgSnapshots::acquire rather than mixing old/new guides.
@@ -409,7 +460,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
     using namespace cheeky::foveated_dlss;
     const auto settings=current_settings();
-    out->enabled=settings.fg.enabled;
+    out->enabled=settings.fg.enabled && cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
     out->configuration=configuration(settings);
     // This transition does not require users to uncheck/recheck FG. The
     // OpenXR layer observes the changed key on its next xrWaitFrame and
@@ -423,6 +474,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     {
         using namespace cheeky::foveated_dlss;
         std::lock_guard lock(mutex);
+        synchronize_capture_enabled_locked(bool(out->enabled));
         static bool previous{};
         static std::uint64_t previous_configuration{};
         if (previous != bool(out->enabled)||previous_configuration!=out->configuration) {
@@ -432,6 +484,35 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
             previous_configuration=out->configuration;
         }
     }
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetUevrModeV1(CheekyFgUevrModeV1* out) noexcept {
+    if(!out || out->abi!=1 || out->size!=sizeof(*out))return false;
+    const int mode=cheeky::foveated_dlss::uevr_fg_rendering_mode.load(std::memory_order_acquire);
+    out->attached=mode!=cheeky::fg::no_uevr_host;
+    out->known=mode>=0;
+    out->mode=mode>=0?static_cast<std::uint32_t>(mode):0xFFFFFFFFu;
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetUevrModeV2(CheekyFgUevrModeV2* out) noexcept {
+    if(!out || out->abi!=2 || out->size!=sizeof(*out))return false;
+    using namespace cheeky::foveated_dlss;
+    // Snapshot both mode and epoch in a consistent order. The mode publisher
+    // updates the epoch immediately after changing the mode.
+    for(unsigned n=0;n<4;++n){
+        const auto before=uevr_fg_mode_epoch.load(std::memory_order_acquire);
+        const auto mode=uevr_fg_rendering_mode.load(std::memory_order_acquire);
+        const auto after=uevr_fg_mode_epoch.load(std::memory_order_acquire);
+        if(before!=after)continue;
+        out->attached=mode!=cheeky::fg::no_uevr_host;
+        out->known=mode>=0;
+        out->mode=mode>=0?static_cast<std::uint32_t>(mode):0xFFFFFFFFu;
+        out->transition_epoch=after;
+        return true;
+    }
+    // Fail closed on an unstable concurrent rendering-mode transition.
+    out->attached=1;out->known=0;out->mode=0xFFFFFFFFu;
+    out->transition_epoch=uevr_fg_mode_epoch.load(std::memory_order_acquire);
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(CheekyFgTransportOptions* out) noexcept {
@@ -459,7 +540,10 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectShadingOptionsV1
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFgMemory* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
     using namespace cheeky::foveated_dlss;
-    *out=CheekyFgMemory{};std::lock_guard lock(mutex);cheeky::fg_memory::Collector collect;
+    *out=CheekyFgMemory{};std::lock_guard lock(mutex);
+    synchronize_capture_enabled_locked(enabled());
+    store().collect();
+    cheeky::fg_memory::Collector collect;
     for(const auto& generation:store().generations)generation->memory(*out,collect);
     static std::uint64_t next_diagnostic{};const auto now=GetTickCount64();
     if(now>=next_diagnostic){
@@ -526,6 +610,7 @@ const char* fg_state_name(CheekyFgState value) noexcept {
     case CheekyFgState::presenter_failed: return "Could not initialize the D3D12 presenter";
     case CheekyFgState::presentation_failed: return "FG presentation unavailable; displaying native frames";
     case CheekyFgState::guide_frame_mismatch: return "Waiting for matching color and guide frames";
+    case CheekyFgState::paused_rendering_mode: return "Paused - UEVR Native Stereo required";
     }
     return "Unknown";
 }

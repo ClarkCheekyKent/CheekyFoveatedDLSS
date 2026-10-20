@@ -386,7 +386,7 @@ int main(int argc, char** argv) {
         vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
         vr_api.get_mod_value = get_mod_value;
         vr_api.get_hmd_width = vr_api.get_hmd_height = hmd_extent;
-        if (afw || inactive_afw) api.vr = &vr_api;
+        if (afw || inactive_afw || mode == "--fg-controls") api.vr = &vr_api;
         if (inactive_afw) rendering_mode = "0";
         UEVR_OpenVRData openvr_api{}; openvr_api.get_vr_compositor = get_compositor;
         void* original_wait{};
@@ -490,6 +490,8 @@ int main(int argc, char** argv) {
             control.abi=999;
             require(!control_fn(&control),"FG control rejects ABI mismatch");
             control=CheekyFgControl{};
+            // FG only activates in UEVR Native Stereo (VR_RenderingMethod=0).
+            rendering_mode="0"; present();
             command("1\n901\nset\nFgEnabled=true\nFgWidth=0.37\nFgFeather=0.08\nFgReleasePoint=3\nFgSubmitRepeats=false\nFgColorCaptureMode=1\nFgUploadMode=1\nFgLatencyDiagnostics=0\nFgQueuePriority=2\nFgDirectXrOutput=1");
             const auto direct_fn=reinterpret_cast<CheekyFgDirectOutputFn>(GetProcAddress(runtime,"CheekyFG_GetDirectOutputOptionsV1"));
             CheekyFgDirectOutput direct;require(direct_fn&&direct_fn(&direct)&&direct.requested&&
@@ -506,6 +508,42 @@ int main(int argc, char** argv) {
             options.size=0;require(!transport_fn(&options),"Transport options reject incorrect ABI size");
             require(control_fn(&control) && control.enabled && std::abs(field(snapshot(get),"FgWidth")-0.37)<0.00001,
                 "Lua protocol controls real FG runtime");
+            const auto mode_fn=reinterpret_cast<CheekyFgUevrModeFn>(GetProcAddress(runtime,"CheekyFG_GetUevrModeV1"));
+            CheekyFgUevrModeV1 mode_status;
+            require(mode_fn && mode_fn(&mode_status) && mode_status.attached && mode_status.known && mode_status.mode==0,
+                "FG mode reports Native Stereo before mode transitions");
+            const auto mode_v2_fn=reinterpret_cast<CheekyFgUevrModeV2Fn>(
+                GetProcAddress(runtime,"CheekyFG_GetUevrModeV2"));
+            CheekyFgUevrModeV2 mode_v2;
+            require(mode_v2_fn && mode_v2_fn(&mode_v2) && mode_v2.mode==0 &&
+                mode_v2.transition_epoch!=0,"FG mode V2 exports the transition epoch");
+            const auto initial_mode_epoch=mode_v2.transition_epoch;
+            // Native -> AFW -> Native can occur without any OpenXR xrWaitFrame.
+            rendering_mode="3";present();
+            rendering_mode="0";present();
+            require(mode_v2_fn(&mode_v2) && mode_v2.mode==0 &&
+                mode_v2.transition_epoch>=initial_mode_epoch+2,
+                "Native -> AFW -> Native leaves a detectable transition epoch");
+            for(const auto method : {1U,2U,3U}){
+                rendering_mode=std::to_string(method);present();
+                require(control_fn(&control) && !control.enabled && mode_fn(&mode_status) &&
+                    mode_status.known && mode_status.mode==method &&
+                    snapshot(get).find("\"FgEnabled\":true")!=std::string::npos,
+                    "Non-native rendering modes pause producer without changing saved FG preference");
+                require(mode_v2_fn(&mode_v2) && mode_v2.mode==method,
+                    "FG mode V2 observes paused method");
+                const auto previous_epoch=mode_v2.transition_epoch;
+                rendering_mode="0";present();
+                require(control_fn(&control) && control.enabled && mode_fn(&mode_status) && mode_status.mode==0,
+                    "Returning to Native Stereo automatically reactivates FG");
+                require(mode_v2_fn(&mode_v2) && mode_v2.transition_epoch>previous_epoch,
+                    "Returning to Native Stereo advances the presenter epoch");
+            }
+            rendering_mode="garbage";present();
+            require(control_fn(&control)&&!control.enabled&&mode_fn(&mode_status)&&!mode_status.known,
+                "Unknown UEVR rendering mode fails closed");
+            rendering_mode="0";present();
+            require(control_fn(&control)&&control.enabled,"Native Stereo recovers from unknown mode");
             // Release policy is scheduling-only: do not restart FG or invalidate NGX history.
             const auto before_release_configuration=control.configuration;
             command("1\n907\nset\nFgReleasePoint=4");

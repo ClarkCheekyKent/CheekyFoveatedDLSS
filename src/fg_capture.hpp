@@ -23,6 +23,11 @@ void fg_publish_ngx(ID3D12GraphicsCommandList*,const NgxHandle*,const NgxParamet
 void fg_remember_feature(const NgxHandle*,const NgxParameters*) noexcept;
 void fg_forget_feature(const NgxHandle*) noexcept;
 void fg_set_uevr_queue(ID3D12CommandQueue*) noexcept;
+// Published by the existing UEVR plugin rendering-method observer; never
+// derived from an FG frame number, NGX eval order or a private vtable hook.
+void fg_uevr_mode_attached() noexcept;
+void fg_uevr_mode_published(std::uint32_t mode) noexcept;
+void fg_uevr_mode_detached() noexcept;
 void fg_note_submission(ID3D12CommandQueue*,ID3D12GraphicsCommandList*) noexcept;
 void fg_retire_snapshots() noexcept;
 void fg_note_reset(ID3D12GraphicsCommandList*) noexcept;

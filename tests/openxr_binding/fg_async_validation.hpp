@@ -540,8 +540,8 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         check(soft.release_gate_active(),"Soft release must hold before FG queue submission");
         soft.inference_submitted();
         check(soft.release_gate_active()&&soft.credits==0&&soft.credit_deferred&&
-            soft.release_delay_until>TimingClock::now(),"4ms release must defer credit, not wait for a GPU fence");
-        soft.release_delay_until=TimingClock::now()-std::chrono::milliseconds(1);
+            soft.release_delay_until>cheeky::fg::TimingClock::now(),"4ms release must defer credit, not wait for a GPU fence");
+        soft.release_delay_until=cheeky::fg::TimingClock::now()-std::chrono::milliseconds(1);
         check(!soft.release_gate_active(),"Expired soft release must not hold the game");
         soft.release_deferred_credit();
         check(soft.credits==1&&!soft.credit_deferred,"Soft release must issue the deferred game credit once");
@@ -550,7 +550,7 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=100.;
         clock.inflight_id=12;clock.inflight_release_point=4;clock.submitted_native_id=12;
         clock.credit_deferred=true;
-        clock.release_delay_until=TimingClock::now()+std::chrono::milliseconds(4);
+        clock.release_delay_until=cheeky::fg::TimingClock::now()+std::chrono::milliseconds(4);
         std::thread pacer([&]{clock.pacing_loop();});
         bool delivered{};{std::unique_lock lock(clock.mx);delivered=clock.changed.wait_for(lock,std::chrono::milliseconds(100),[&]{return clock.credits>0;});
             clock.stopping=true;clock.changed.notify_all();}

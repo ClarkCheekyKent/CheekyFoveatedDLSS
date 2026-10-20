@@ -79,10 +79,25 @@ struct CheekyFgControl {
     std::uint64_t configuration{};
 };
 using CheekyFgControlFn = bool(__cdecl*)(CheekyFgControl*);
+// Optional status extension. Keeps the existing FG control/status ABI intact.
+struct CheekyFgUevrModeV1 {
+    std::uint32_t abi{1}, size{sizeof(CheekyFgUevrModeV1)};
+    std::uint32_t attached{}, known{}, mode{0xFFFFFFFFu};
+};
+using CheekyFgUevrModeFn = bool(__cdecl*)(CheekyFgUevrModeV1*);
+// Optional V2: monotonic mode-change epoch. The OpenXR layer can detect a
+// Native -> non-native -> Native transition even if no xrWaitFrame occurred
+// while the non-native mode was selected. V1 remains ABI-compatible.
+struct CheekyFgUevrModeV2 {
+    std::uint32_t abi{2}, size{sizeof(CheekyFgUevrModeV2)};
+    std::uint32_t attached{}, known{}, mode{0xFFFFFFFFu};
+    std::uint64_t transition_epoch{};
+};
+using CheekyFgUevrModeV2Fn = bool(__cdecl*)(CheekyFgUevrModeV2*);
 enum class CheekyFgState : std::uint32_t {
     off, waiting_for_stereo, starting, waiting_for_history, waiting_for_guides,
     queue_mismatch, ngx_unavailable, generation_failed, generating, unsupported_submission,
-    presenter_failed, presentation_failed, guide_frame_mismatch
+    presenter_failed, presentation_failed, guide_frame_mismatch, paused_rendering_mode
 };
 struct CheekyFgStatus {
     std::uint32_t abi{CHEEKY_FG_CONTROL_ABI}, size{sizeof(CheekyFgStatus)};

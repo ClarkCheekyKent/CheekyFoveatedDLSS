@@ -272,6 +272,7 @@ struct SessionState {
     std::shared_ptr<cheeky::fg::Presenter> fg;
     CheekyFgState fg_state{CheekyFgState::off};
     bool fg_requested{};
+    std::uint64_t fg_uevr_mode_epoch{}; // Last observed UEVR mode-transition epoch.
     std::uint32_t gaze_location_flags{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_u{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_v{};
@@ -3324,6 +3325,25 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
     const auto get_control=runtime?reinterpret_cast<CheekyFgControlFn>(GetProcAddress(runtime,"CheekyFG_GetControl")):nullptr;
     const bool requested=get_control && get_control(&control) && control.enabled;
+    CheekyFgUevrModeV1 uevr_mode{};
+    const auto get_uevr_mode=runtime?reinterpret_cast<CheekyFgUevrModeFn>(
+        GetProcAddress(runtime,"CheekyFG_GetUevrModeV1")):nullptr;
+    const bool paused_for_uevr_mode=get_uevr_mode && get_uevr_mode(&uevr_mode) &&
+        uevr_mode.attached && (!uevr_mode.known || uevr_mode.mode!=0);
+    CheekyFgUevrModeV2 uevr_mode_v2{};
+    const auto get_uevr_mode_v2=runtime?reinterpret_cast<CheekyFgUevrModeV2Fn>(
+        GetProcAddress(runtime,"CheekyFG_GetUevrModeV2")):nullptr;
+    const bool mode_epoch_valid=get_uevr_mode_v2 && get_uevr_mode_v2(&uevr_mode_v2) &&
+        uevr_mode_v2.attached && uevr_mode_v2.transition_epoch!=0;
+    // Also gate on V2, in case V1 and V2 were read during a transition.
+    const bool mode_allows_fg=!mode_epoch_valid ||
+        (uevr_mode_v2.known && uevr_mode_v2.mode==0);
+    const bool fg_requested_now=requested && mode_allows_fg;
+    static bool warned_missing_mode_epoch{};
+    if(get_uevr_mode && !get_uevr_mode_v2 && !warned_missing_mode_epoch){
+        warned_missing_mode_epoch=true;
+        log_startup("DLSS-FG UEVR transition counter unavailable; update CheekyFoveatedDLSSRuntime.dll to enable automatic mode reactivation\n");
+    }
     {
         std::lock_guard lock(state_mutex);
         const auto* instance=find_instance_for_session_locked(session);
@@ -3332,7 +3352,28 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
         auto it=sessions.find(session);
         if (it!=sessions.end()) {
             auto& owner=it->second;
-            if (state && requested && owner.fg) {
+            // UEVR can switch Native -> AFW/AER/Sequential -> Native while
+            // the game stops calling xrWaitFrame. Merely checking the *current*
+            // mode misses that transition and leaves the old presenter alive.
+            // The producer records every published mode transition in V2.
+            if(state && mode_epoch_valid){
+                const auto next_epoch=uevr_mode_v2.transition_epoch;
+                if(owner.fg_uevr_mode_epoch==0)
+                    log_startup("DLSS-FG UEVR mode epoch tracking active epoch=%llu mode=%u\n",
+                        static_cast<unsigned long long>(next_epoch),uevr_mode_v2.mode);
+                if(owner.fg && owner.fg_uevr_mode_epoch!=0 &&
+                   owner.fg_uevr_mode_epoch!=next_epoch){
+                    log_startup("DLSS-FG UEVR mode transition epoch %llu -> %llu (mode=%u): replacing presenter at xrWaitFrame; FgEnabled preserved\n",
+                        static_cast<unsigned long long>(owner.fg_uevr_mode_epoch),
+                        static_cast<unsigned long long>(next_epoch),uevr_mode_v2.mode);
+                    retired=std::move(owner.fg);
+                    owner.fg_requested=false;
+                    owner.fg_state=CheekyFgState::waiting_for_history;
+                    replacing_source_presenter=true;
+                }
+                owner.fg_uevr_mode_epoch=next_epoch;
+            }
+            if (state && fg_requested_now && owner.fg) {
                 // A foveated-SR toggle changes both the capture layout and the
                 // guide history.  An in-place temporal reset stops the threads,
                 // but does NOT run BufferedPresenter::setup() again. The user
@@ -3357,8 +3398,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
                 }
             }
             if (state) {
-                auto disabled=update_fg_at_frame_boundary(owner,instance->dispatch,requested);
-                if(disabled)retired=std::move(disabled);
+                auto disabled=update_fg_at_frame_boundary(owner,instance->dispatch,fg_requested_now);
+                if(disabled && !retired)retired=std::move(disabled);
+                if((paused_for_uevr_mode || (mode_epoch_valid && !mode_allows_fg)) && !fg_requested_now)
+                    owner.fg_state=CheekyFgState::paused_rendering_mode;
             }
             if (owner.running && state) presenter=owner.fg;
         }
