@@ -66,7 +66,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         eye.depth=depth.Get();eye.motion=motion.Get();eye.width=width;eye.height=height;
         eye.depth_width=eye.motion_width=game_guides&&!full_guides?width/2:width;
         eye.depth_height=eye.motion_height=game_guides&&!full_guides?height/2:height;
-        if(foveated) {eye.focus_width=.55f;eye.focus_height=.45f;}
+        if(foveated) {eye.focus_width=.55f;eye.focus_height=.45f;if(motion_test)eye.focus_x=.12f;}
         eye.peripheral_method=method;eye.resolution_percent=scale;eye.peripheral_percent=peripheral_scale;
         eye.depth_inverted=1;
         if(motion_test){eye.motion_scale_x=float(width);eye.motion_scale_y=float(height);}

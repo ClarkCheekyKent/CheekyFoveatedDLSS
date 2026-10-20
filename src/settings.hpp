@@ -183,6 +183,8 @@ struct StereoEyeAssignment {
     bool vertical_flip{}; // Verified source-to-submission transform, never a game heuristic.
     bool shared_source{}; // One verified source supplies both submitted eyes.
     std::array<StereoSourceCrop, 2> source_crops{}; // Indexed by physical eye.
+    // Changes only when the identity/transform changes, not on verification.
+    std::uint64_t mapping_revision{};
 };
 
 // A registration generation distinguishes a released/recreated NGX handle at

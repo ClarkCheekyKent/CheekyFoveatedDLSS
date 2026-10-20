@@ -526,6 +526,18 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
             "Shutdown must wake completion-held frames without consuming a credit");
     }
     {
+        P discarded;discarded.started=true;discarded.waited=2;discarded.begun=1;discarded.ended=0;
+        std::atomic<bool> returned{};XrResult result{};
+        std::thread begin([&]{result=discarded.begin_frame(nullptr);returned=true;});
+        for(unsigned i=0;i<1000&&!returned;++i)Sleep(1);
+        const bool completed=returned;
+        if(!completed){std::lock_guard lock(discarded.mx);discarded.stopping=true;discarded.changed.notify_all();}
+        begin.join();
+        check(completed&&result==XR_FRAME_DISCARDED&&discarded.begun==2&&discarded.ended==1,
+            "OpenComposite startup may begin a new waited frame without ending its discarded predecessor");
+        std::cout<<"PASS OpenXR discarded application frame: BeginFrame returns without waiting for missing EndFrame\n";
+    }
+    {
         P prepared;prepared.inflight_id=9;prepared.inflight_release_point=1;
         prepared.credits=0;prepared.credit_deferred=true;
         check(prepared.release_gate_active(),"Preparation gate blocks before submission");

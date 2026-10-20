@@ -629,16 +629,21 @@ int main(int argc, char** argv) {
             using Wait = int (*)(void*, void*, unsigned, void*, unsigned);
             require(reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0) == 0, "Original WaitGetPoses return preserved");
             auto observed = snapshot(get);
-            require(observed.find("\"backend\":\"OpenVR\"") != observed.npos && field(observed, "frames") == 1,
+            const auto calibration_frames=[&](const std::string& json){
+                const auto start=json.find("\"eye_calibration\":{");
+                require(start!=json.npos,"OpenVR calibration diagnostics present");
+                return field(json.substr(start,json.find('}',start)-start),"frames");
+            };
+            require(observed.find("\"backend\":\"OpenVR\"") != observed.npos && calibration_frames(observed) == 1,
                 "Cached WaitGetPoses activates OpenVR calibration exactly once");
             for (unsigned i = 0; i < 5; ++i) present();
             require((*static_cast<void***>(cached_compositor))[2] == hooked_wait, "Repeated host ticks do not stack hooks");
             reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0);
-            require(field(snapshot(get), "frames") == 2, "No duplicate observation after repeated ticks");
+            require(calibration_frames(snapshot(get)) == 2, "No duplicate observation after repeated ticks");
             reset(); present();
             require((*static_cast<void***>(cached_compositor))[2] == hooked_wait, "Device reset can reattach without stacking hooks");
             reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0);
-            require(field(snapshot(get), "frames") == 3, "Observation continues after device reset");
+            require(calibration_frames(snapshot(get)) == 3, "Observation continues after device reset");
             puts("PASS: cached OpenVR compositor late attachment");
             return 0;
         }

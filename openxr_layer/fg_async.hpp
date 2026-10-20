@@ -627,15 +627,28 @@ struct BufferedPresenter final : Presenter {
     XrResult begin_frame(const XrFrameBeginInfo* info) noexcept override {
         if(bypass)return xr.begin_frame(session,info);
         if(info&&info->next)return XR_ERROR_VALIDATION_FAILURE;
+        std::unique_lock capture_lock(capture_mutex);
         std::unique_lock lock(mx);
         if(waited==begun)return XR_ERROR_CALL_ORDER_INVALID;
+        // A host may forfeit an in-progress frame (OpenComposite does this at
+        // startup). Waiting for its missing EndFrame deadlocks the render thread.
+        const bool discarded=begun!=ended;
+        if(discarded){
+            ended=begun;++skipped;++epoch;discard_pending();ready.clear();latest_native.reset();
+            awaiting_generated_submission=0;
+            captured.clear();direct_captures.clear();capture_tokens.clear();capture_frames.clear();
+            capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;
+            if(trace)trace("FG xrBeginFrame discarded the preceding unended application frame");
+            changed.notify_all();
+        }
+        capture_lock.unlock();
         // A pipelined xrWaitFrame may already have consumed a credit before
         // the previous end_frame enqueues its FG job. Gate begin_frame too.
         const auto gate_started=TimingClock::now();
-        changed.wait(lock,[&]{return stopping||(begun==ended&&!release_gate_active());});
+        changed.wait(lock,[&]{return stopping||!release_gate_active();});
         begin_gate_wait.add(elapsed_ms(gate_started));
         if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;
-        ++begun;changed.notify_all();return XR_SUCCESS;
+        ++begun;changed.notify_all();return discarded?XR_FRAME_DISCARDED:XR_SUCCESS;
     }
     bool capture(XrSwapchain sc,unsigned,ID3D12Resource* original,unsigned,unsigned,unsigned,
                  DXGI_FORMAT declared=DXGI_FORMAT_UNKNOWN) noexcept override {
@@ -826,9 +839,7 @@ struct BufferedPresenter final : Presenter {
                     // sufficient. Other release modes still require one queue.
                     job->guides_valid=accept_guide_queue(guides,*job,expected_frame==0);
                     if(!job->guides_valid)job->guide_state=CheekyFgState::queue_mismatch;
-                    if(guides.capture_token!=expected_token||guides.eyes[1].evaluation!=expected_token||
-                       guides.eyes[0].evaluation+1!=expected_token||guides.eyes[0].render_frame!=expected_frame||
-                       guides.eyes[1].render_frame!=expected_frame){
+                    if(!cheeky_fg_pair_matches_color(guides,expected_token,expected_frame)){
                         job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;
                     }
                     for(unsigned eye=0;eye<2&&job->guides_valid;++eye) {

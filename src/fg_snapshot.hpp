@@ -9,6 +9,13 @@
 #include <algorithm>
 
 namespace cheeky::foveated_dlss {
+// Producer-private metadata: physical eye identities never depend on NGX call
+// order once calibration is available. No change to the layer's leased ABI.
+struct FgGuideIdentity {
+    static constexpr unsigned unknown=~0u;
+    unsigned eye{unknown};
+    std::uint64_t mapping_revision{};
+};
 // Copies are recorded beside the original DLSS evaluation, before either eye's
 // engine textures can be reused. Submission observation, not CPU record order,
 // determines which evaluations are eligible for a released OpenXR color image.
@@ -20,6 +27,7 @@ class FgSnapshots {
         D3D12_RESOURCE_DESC raw_depth_desc{},raw_motion_desc{};
         ComPtr<ID3D12GraphicsCommandList> list;
         CheekyFgEye meta;
+        FgGuideIdentity identity;
         std::uint64_t recording{};
         std::uint64_t retired{};
         std::uint64_t last_used_tick{};
@@ -56,6 +64,15 @@ class FgSnapshots {
     std::uint64_t prepared_captures{},raw_captures{},preparation_fallbacks{};
     std::uint64_t next_trim_tick{};
     CheekyFgEye previous_raw[2];
+    FgGuideIdentity previous_identity[2];
+    bool history_valid{};
+    std::uint64_t history_mapping{},history_features[2]{};
+    unsigned history_first_eye{FgGuideIdentity::unknown};
+    static bool compatible_eyes(const Shot& a,const Shot& b) {
+        return a.identity.mapping_revision==b.identity.mapping_revision &&
+            ((a.identity.eye==FgGuideIdentity::unknown&&b.identity.eye==FgGuideIdentity::unknown)||
+             (a.identity.eye<2&&b.identity.eye<2&&a.identity.eye!=b.identity.eye));
+    }
     static void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;v.Transition.pResource=r;
         v.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;v.Transition.StateBefore=a;v.Transition.StateAfter=b;list->ResourceBarrier(1,&v);
@@ -190,7 +207,7 @@ public:
         }
         return d;
     }
-    void invalidate(){consumed=ordinal;latched.clear();previous_raw[0]={};previous_raw[1]={};}
+    void invalidate(){consumed=ordinal;latched.clear();previous_raw[0]={};previous_raw[1]={};history_valid=false;}
     bool idle() const {
         const auto done=fence?fence->GetCompletedValue():0;
         for(auto& s:shots)if(s.use_count()!=1||(!s->cancelled&&(!s->retired||s->retired>done)))return false;
@@ -226,7 +243,7 @@ public:
         }
         gpu_cost.commit();
     }
-    bool record(ID3D12GraphicsCommandList* commands,CheekyFgEye meta) {
+    bool record(ID3D12GraphicsCommandList* commands,CheekyFgEye meta,FgGuideIdentity identity={}) {
         const auto id=++ordinal; // Failed/dropped captures must leave a gap.
         if(!queue||!fence||!commands||!meta.depth||!meta.motion){failed_record=id;return false;}
         const auto recording=tag_recording(commands);if(!recording){failed_record=id;return false;}
@@ -260,20 +277,24 @@ public:
         slot->source_depth=meta.depth;slot->source_motion=meta.motion;slot->list=native_d3d12_interface(commands);
         slot->recording=recording;
         slot->submitted=slot->foreign=slot->cancelled=false;slot->retired=0;
-        auto& prior=previous_raw[(id-1)%2];
+        const auto history_eye=identity.eye<2?identity.eye:unsigned((id-1)%2);
+        auto& prior=previous_raw[history_eye];
+        const auto prior_identity=previous_identity[history_eye];
         if(meta.motion_jittered){
             // Without a UEVR frame ticket, the consecutive left/right
             // evaluation ordinal is the same-eye temporal identity. Never
             // compare two identical zero frame IDs as native frame numbers.
             const bool previous_eye=meta.render_frame ? prior.render_frame+1==meta.render_frame :
                 prior.render_frame==0 && prior.evaluation+2==id;
-            if(previous_eye&&prior.feature==meta.feature&&prior.motion_width==meta.motion_width&&
+            if(previous_eye&&prior.motion_jittered&&prior_identity.eye==identity.eye&&prior_identity.mapping_revision==identity.mapping_revision&&
+               prior.feature==meta.feature&&prior.motion_width==meta.motion_width&&
                prior.motion_height==meta.motion_height&&!meta.reset){
                 meta.jitter_correction_x=(prior.jitter_x-meta.jitter_x)/std::max(1u,meta.motion_width);
                 meta.jitter_correction_y=(prior.jitter_y-meta.jitter_y)/std::max(1u,meta.motion_height);
             }else meta.reset=1;
         }
         meta.evaluation=id;
+        slot->identity=identity;previous_identity[history_eye]=identity;
         prior=meta;prior.depth=prior.motion=nullptr;prior.peripheral_depth=prior.peripheral_motion=nullptr;
         tag_recording(commands);
         if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
@@ -373,6 +394,7 @@ public:
         for(auto& s:shots)if(s->submitted&&!s->foreign&&!s->cancelled){if(s->meta.evaluation==latest-1)a=s;if(s->meta.evaluation==latest)b=s;}
         if(!a||!b||(render_frame&&(a->meta.render_frame!=render_frame||b->meta.render_frame!=render_frame))||
             (hookless&&(a->meta.render_frame||b->meta.render_frame))){last_match.reason="Guide pair is interrupted";return 0;}
+        if(!compatible_eyes(*a,*b)){last_match.reason="Guide eye mapping changed or stereo identities are ambiguous";return 0;}
         // Pin guides at COLOR release, not later at EndFrame. A future DLSS
         // recording must not recycle either snapshot while color awaits submit.
         if(latched.size()>=4)latched.erase(latched.begin());
@@ -383,6 +405,7 @@ public:
         // generating FG. Start fresh with the next native stereo pair rather
         // than permanently starving on an extra or failed evaluation.
         consumed=ordinal;
+        history_valid=false;
         std::erase_if(latched,[&](const Latch& l){return l.token<=consumed;});
     }
     bool acquire(CheekyFgPair& out) {
@@ -392,11 +415,19 @@ public:
         for(auto& latch:latched)if(latch.token==expected){a=latch.a;b=latch.b;break;}
         if(!a||!b||a->meta.width!=b->meta.width||a->meta.height!=b->meta.height||a->meta.configuration!=b->meta.configuration)return false;
         if(out.render_frame&&(a->meta.render_frame!=out.render_frame||b->meta.render_frame!=out.render_frame))return false;
+        if(!compatible_eyes(*a,*b))return false;
+        const auto first_eye=a->identity.eye;
+        if(first_eye==1)std::swap(a,b);
         auto* lease=new(std::nothrow) Lease(a,b);if(!lease)return false;
         out.eyes[0]=a->meta;out.eyes[1]=b->meta;
-        // Stable native-stereo ordering is assumed. An interrupted pair or a
-        // missing native publication invalidates NGX's temporal history.
-        if(consumed&&expected!=consumed+2)for(auto& e:out.eyes)e.reset=1;
+        // Keep both NGX and peripheral histories tied to physical eyes. Even
+        // unjittered native motion must reset after a calibration/order switch.
+        const bool reset=!history_valid||history_mapping!=a->identity.mapping_revision||history_first_eye!=first_eye||
+            history_features[0]!=a->meta.feature||history_features[1]!=b->meta.feature||
+            (consumed&&expected!=consumed+2)||out.eyes[0].reset||out.eyes[1].reset;
+        if(reset)for(auto& e:out.eyes)e.reset=1;
+        history_valid=true;history_mapping=a->identity.mapping_revision;history_first_eye=first_eye;
+        history_features[0]=a->meta.feature;history_features[1]=b->meta.feature;
         for(auto& e:out.eyes)for(auto* resource:{e.depth,e.motion,e.peripheral_depth,e.peripheral_motion})if(resource)resource->AddRef();
         out.producer_queue=queue.Get();out.producer_queue->AddRef();out.lease=lease;
         consumed=expected;

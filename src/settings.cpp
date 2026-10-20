@@ -106,6 +106,7 @@ struct EyeRole {
 EyeRole eye_roles[2]{};
 std::uint64_t stereo_evaluation_sequence{};
 std::uint64_t registration_generation{};
+std::uint64_t stereo_mapping_revision{1};
 struct Calibration {
     std::uint64_t left{}, right{}, sequence{}, session_generation{};
     bool vertical_flip{};
@@ -126,8 +127,8 @@ StereoEyeAssignment calibrated_assignment(std::uint64_t view) {
         (now < calibration.verified_ms || now - calibration.verified_ms > 2500))
         for (auto& crop : crops) crop.valid = false;
     if (view == calibration.left) return {0, true, true, calibration.session_generation, calibration.vertical_flip,
-        calibration.left == calibration.right, crops};
-    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip, false, crops};
+        calibration.left == calibration.right, crops, stereo_mapping_revision};
+    if (view == calibration.right) return {1, true, true, calibration.session_generation, calibration.vertical_flip, false, crops, stereo_mapping_revision};
     return {};
 }
 
@@ -451,7 +452,7 @@ void register_stereo_view(const std::uint64_t view_id) noexcept {
 void unregister_stereo_view(const std::uint64_t view_id) noexcept {
     if (view_id == 0U) return;
     std::lock_guard lock(stereo_views_mutex);
-    if (view_id == calibration.left || view_id == calibration.right) calibration = {};
+    if (view_id == calibration.left || view_id == calibration.right) { calibration = {}; ++stereo_mapping_revision; }
     for (auto iterator = stereo_views.begin();
          iterator != stereo_views.end(); ++iterator) {
         if (iterator->view_id != view_id) continue;
@@ -475,11 +476,12 @@ StereoEyeAssignment stereo_eye_assignment(
     std::lock_guard lock(stereo_views_mutex);
     const auto corrected = calibrated_assignment(view_id);
     if (corrected.assigned) return corrected;
-    if (eye_roles[0].view_id == 0U || eye_roles[1].view_id == 0U) return {};
+    StereoEyeAssignment fallback;fallback.mapping_revision=stereo_mapping_revision;
+    if (eye_roles[0].view_id == 0U || eye_roles[1].view_id == 0U) return fallback;
     for (std::uint32_t index{}; index < 2U; ++index) {
-        if (eye_roles[index].view_id == view_id) return {index, true};
+        if (eye_roles[index].view_id == view_id) { fallback.eye_index=index;fallback.assigned=true;return fallback; }
     }
-    return {};
+    return fallback;
 }
 
 StereoViewStatistics stereo_view_statistics() noexcept {
@@ -532,6 +534,8 @@ bool publish_stereo_calibration(std::uint64_t left, std::uint64_t right,
             (calibration.left && calibration.left == calibration.right) || (previous_left >= 0 && previous_left != 0) ||
             (previous_right >= 0 && previous_right != 1);
     }
+    if (calibration.left!=left || calibration.right!=right || calibration.session_generation!=session_generation ||
+        calibration.vertical_flip!=vertical_flip) ++stereo_mapping_revision;
     calibration = {left, right, sequence, session_generation, vertical_flip};
     calibration.method = method;
     if (source_crops) { calibration.source_crops = *source_crops; calibration.verified_ms = captured_ms; }
@@ -558,6 +562,7 @@ bool eye_calibration_continuous_validation(EyeCalibrationMethod method) noexcept
 }
 void clear_stereo_calibration() noexcept {
     std::lock_guard lock(stereo_views_mutex);
+    ++stereo_mapping_revision;
     calibration = {};
 }
 

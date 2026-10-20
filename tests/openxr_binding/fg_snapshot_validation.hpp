@@ -120,6 +120,69 @@ void fg_snapshot_validation(ID3D12Device* device) {
     check(!retained.guide_lease&&!retained.guide_depth[0]&&!retained.guide_motion[1],"Retired native job releases guide leases and resources");
     capture.invalidate();check(capture.token()==0,"Configuration/session reset rejects previous-frame guides");
     provenance.invalidate();check(provenance.token(depth.Get())==0,"Session reset clears color provenance");
+    // Exercise physical eye identity with different GPU pixels while call order
+    // and calibration change independently, as they can across ACC scenes.
+    using cheeky::foveated_dlss::FgGuideIdentity;
+    FgSnapshots mapped;check(mapped.initialize(queue.Get()),"Calibrated snapshot queue");
+    auto start_mapped=[&]{allocator->Reset();list->Reset(allocator.Get(),nullptr);mapped.reset(list.Get());};
+    auto record_mapped=[&](unsigned eye,std::uint64_t revision,std::uint64_t feature=0) {
+        clear(eye==0?.25f:.75f);
+        CheekyFgEye meta;meta.depth=depth.Get();meta.motion=motion.Get();meta.width=meta.height=32;
+        meta.depth_width=meta.depth_height=meta.motion_width=meta.motion_height=16;
+        meta.feature=feature?feature:101+eye;
+        check(mapped.record(list.Get(),meta,{eye,revision}),"Record calibrated physical-eye guides");
+    };
+    auto submit_mapped=[&]{list->Close();queue->ExecuteCommandLists(1,lists);mapped.submitted(queue.Get(),list.Get());wait();};
+    auto acquire_mapped=[&](bool reset) {
+        pair={};pair.capture_token=mapped.token(0,true);
+        check(pair.capture_token&&mapped.acquire(pair),"Acquire a complete calibrated stereo pair");
+        check(cheeky_fg_pair_matches_color(pair,pair.capture_token,0),
+            "The OpenXR handoff must accept physical eye order with either evaluation order");
+        auto invalid=pair;invalid.eyes[0].evaluation=invalid.eyes[1].evaluation;
+        check(!cheeky_fg_pair_matches_color(invalid,pair.capture_token,0)&&
+            !cheeky_fg_pair_matches_color(pair,pair.capture_token,1),
+            "Reordering must not weaken exact evaluation/color-frame validation");
+        check(pair.eyes[0].reset==unsigned(reset)&&pair.eyes[1].reset==unsigned(reset),
+            "Both physical-eye histories reset together only on discontinuities");
+        // This checks GPU depth AND motion pixels, not just metadata ordering.
+        read_retained();release(pair);mapped.retire();wait();
+    };
+    start_mapped();record_mapped(0,11);record_mapped(1,11);submit_mapped();acquire_mapped(true);
+    start_mapped();record_mapped(0,11);record_mapped(1,11);submit_mapped();acquire_mapped(false);
+    start_mapped();record_mapped(1,11);record_mapped(0,11);submit_mapped();acquire_mapped(true);
+    start_mapped();record_mapped(1,11);record_mapped(0,11);submit_mapped();acquire_mapped(false);
+    // Same evaluation order but the handles now represent opposite eyes.
+    start_mapped();record_mapped(1,12,101);record_mapped(0,12,102);submit_mapped();acquire_mapped(true);
+    start_mapped();record_mapped(0,12);record_mapped(1,13);submit_mapped();
+    check(!mapped.token(0,true),"A calibration switch between evaluations rejects the whole stereo pair");
+    mapped.discard_hookless_interval();
+    start_mapped();record_mapped(0,13);record_mapped(1,13);submit_mapped();acquire_mapped(true);
+    start_mapped();record_mapped(0,13);record_mapped(0,13);submit_mapped();
+    check(!mapped.token(0,true),"Two guides for one physical eye cannot masquerade as stereo");
+    mapped.discard_hookless_interval();
+    start_mapped();record_mapped(0,13);record_mapped(1,13);submit_mapped();acquire_mapped(true);
+    start_mapped();record_mapped(FgGuideIdentity::unknown,13);record_mapped(1,13);submit_mapped();
+    check(!mapped.token(0,true),"A partial calibrated/unknown pair cannot use ordinal fallback");
+    mapped.discard_hookless_interval();
+    start_mapped();record_mapped(1,14);record_mapped(0,14);submit_mapped();acquire_mapped(true);
+    // Physical-eye jitter must not cross a changed mapping, even when native
+    // frame IDs, dimensions and the NGX handle address are unchanged.
+    auto record_jitter=[&](unsigned eye,std::uint64_t revision,float jitter) {
+        CheekyFgEye meta;meta.depth=depth.Get();meta.motion=motion.Get();meta.width=meta.height=32;
+        meta.depth_width=meta.depth_height=meta.motion_width=meta.motion_height=16;
+        meta.feature=101+eye;meta.motion_jittered=1;meta.jitter_x=jitter;
+        check(mapped.record(list.Get(),meta,{eye,revision}),"Record physical-eye jitter history");
+    };
+    for(unsigned frame=0;frame<3;++frame) {
+        start_mapped();record_jitter(1,frame<2?14:15,.25f+.5f*frame);record_jitter(0,frame<2?14:15,.25f+.5f*frame);submit_mapped();
+        CheekyFgPair jitter_pair;jitter_pair.capture_token=mapped.token(0,true);
+        check(jitter_pair.capture_token&&mapped.acquire(jitter_pair),"Calibrated jitter pair");
+        for(auto& eye:jitter_pair.eyes)
+            check(std::abs(eye.jitter_correction_x-(frame==1?-.5f/16:0.f))<.00001f,
+                "Jitter history follows physical eyes and clears on mapping changes");
+        release(jitter_pair);mapped.retire();wait();
+    }
+    std::cout<<"PASS calibrated FG eye-order switches, mixed-mapping rejection, GPU eye pixels and history resets\n";
     allocator->Reset();list->Reset(allocator.Get(),nullptr);
     unsigned accepted{};for(unsigned i=0;i<32;++i){
         CheekyFgEye eye;eye.depth=depth.Get();eye.motion=motion.Get();eye.width=eye.height=32;

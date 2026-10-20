@@ -801,7 +801,7 @@ int main(int argc,char** argv) {
                 const bool ready=worker.probe(device.Get(),directory.c_str());
                 std::cout << "Frame generation capability: " << (ready?"AVAILABLE":"UNAVAILABLE") << '\n';
                 if(ready&&std::string(argv[1])=="--fg-buffered")fg_buffered_validation(device.Get(),directory.c_str(),argc>3?unsigned(std::stoul(argv[3])):2u,argc>4&&std::string(argv[4])=="prepared");
-                if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,false,2,100,50,false,512,512,true);
+                if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,argc>3&&std::string(argv[3])=="foveated",1,100,50,false,512,512,true);
                 if(ready&&std::string(argv[1])=="--fg-generate")fg_hardware_probe(worker,device.Get(),argc>3&&std::string(argv[3])=="bgra",argc>4&&std::string(argv[4])=="foveated",
                     argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
                     argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&(std::string(argv[8])=="game-guides"||std::string(argv[8])=="full-guides"),

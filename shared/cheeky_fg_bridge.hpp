@@ -46,6 +46,13 @@ struct CheekyFgPair {
     std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
     std::uint32_t submit_repeats{1}; // Resubmit unchanged scene content at runtime frame opportunities.
 };
+// eyes[] is in physical OpenXR order. Evaluation ordinals retain capture order,
+// so either eye may own the final evaluation identified by the color token.
+inline bool cheeky_fg_pair_matches_color(const CheekyFgPair& pair,std::uint64_t token,std::uint64_t frame) noexcept {
+    return token>=2&&pair.capture_token==token&&pair.eyes[0].render_frame==frame&&pair.eyes[1].render_frame==frame&&
+        ((pair.eyes[0].evaluation==token-1&&pair.eyes[1].evaluation==token)||
+         (pair.eyes[1].evaluation==token-1&&pair.eyes[0].evaluation==token));
+}
 using CheekyFgAcquireFn=bool(__cdecl*)(CheekyFgPair*);
 using CheekyFgReleaseFn=void(__cdecl*)(CheekyFgPair*);
 using CheekyFgCaptureTokenFn=std::uint64_t(__cdecl*)(ID3D12Resource*);

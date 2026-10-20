@@ -40,6 +40,26 @@ void fg_d3d11_validation() {
     auto p=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner.fg);
     check(p&&p->interop11&&p->queue&&p->device,"D3D11 OpenXR session creates a D3D12 FG bridge");
     const auto source_chain=h<XrSwapchain>(99999);
+    {
+        auto& bridge=*p->interop11;
+        D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=8;desc.ArraySize=desc.MipLevels=1;
+        desc.SampleDesc.Count=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.BindFlags=D3D11_BIND_RENDER_TARGET;
+        ComPtr<ID3D11Texture2D> source;check(SUCCEEDED(d11->CreateTexture2D(&desc,nullptr,&source)),"Interop cycle source");
+        ComPtr<ID3D12Fence> blocked;check(SUCCEEDED(bridge.device12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&blocked))),"Interop cycle gate");
+        check(bridge.capture(source_chain,source.Get(),[&](ID3D12Resource*){return SUCCEEDED(bridge.queue->Wait(blocked.Get(),1));}),
+            "Capture may enqueue private reads while their queue is blocked");
+        bool reused{};
+        const bool busy=bridge.capture(source_chain,source.Get(),[&](ID3D12Resource*){reused=true;return true;});
+        ComPtr<ID3D11Fence> progress;check(SUCCEEDED(bridge.device11->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&progress))),"D3D11 progress fence");
+        check(SUCCEEDED(bridge.context->Signal(progress.Get(),1)),"Game context submits work independently of FG");bridge.context->Flush();
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        const bool independent=event&&SUCCEEDED(progress->SetEventOnCompletion(1,event))&&WaitForSingleObject(event,1000)==WAIT_OBJECT_0;
+        if(event)CloseHandle(event);
+        blocked->Signal(1);bridge.drain();bridge.forget(source_chain);
+        check(!busy&&!reused,"A busy shared source skips capture without overwriting an in-flight read");
+        check(independent,"Blocked FG work must never stall later commands on the game's D3D11 context");
+        std::cout<<"PASS DX11 interop dependency cycle: game context progresses while private FG queue is blocked\n";
+    }
     for(const auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B8G8R8A8_TYPELESS}) {
         D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=64;desc.ArraySize=2;desc.MipLevels=1;
         desc.SampleDesc.Count=1;desc.Format=format;desc.Usage=D3D11_USAGE_DEFAULT;

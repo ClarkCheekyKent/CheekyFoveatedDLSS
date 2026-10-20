@@ -319,6 +319,10 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const auto view_id=static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle));
     // Query the known calibration without changing SR eye-role counters.
     const auto assignment=stereo_eye_assignment(view_id);
+    // Preserve the existing ordinal fallback before calibration. Once known,
+    // use physical eyes; a verified shared source cannot form two FG guides.
+    const FgGuideIdentity identity{assignment.calibrated ? (assignment.shared_source?2u:assignment.eye_index) :
+        FgGuideIdentity::unknown,assignment.mapping_revision};
     const float signed_sr_x=assignment.assigned&&!assignment.shared_source
         ? ((bool(assignment.eye_index==1)!=settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
         : 0.f;
@@ -352,7 +356,13 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     // snapshot recording. A stereo pair spanning a DLSS quality change is
     // rejected by FgSnapshots::acquire rather than mixing old/new guides.
     m.configuration=fg_source_configuration(settings_configuration,game_sr_revision);
-    if(snapshots().record(cmd,m)){pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;}
+    static std::uint64_t logged_mapping{};
+    if(logged_mapping!=identity.mapping_revision){
+        logged_mapping=identity.mapping_revision;
+        trace_event("FG stereo identity revision=%llu calibrated=%u view=%llu physical_eye=%u (next complete pair resets history)",
+            identity.mapping_revision,unsigned(assignment.calibrated),static_cast<unsigned long long>(view_id),identity.eye);
+    }
+    if(snapshots().record(cmd,m,identity)){pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;}
 } catch(...) {}
 }
 // Called by the adapter before installing any UEVR-private inline hooks and

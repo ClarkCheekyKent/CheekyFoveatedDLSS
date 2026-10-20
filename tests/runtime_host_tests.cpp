@@ -762,7 +762,10 @@ int main(int argc, char** argv) {
             require(openvr_init_calls() == 0, "Recovery never initializes OpenVR");
             using Wait = int (*)(void*, void*, unsigned, void*, unsigned);
             require(reinterpret_cast<Wait>(hooked_wait)(cached_compositor, nullptr, 0, nullptr, 0) == 0, "Recovered compositor forwards original WaitGetPoses");
-            require(contains(snapshot(get), "\"backend\":\"OpenVR\"") && field(snapshot(get), "frames") == 1,
+            const auto observed=snapshot(get);const auto calibration_start=observed.find("\"eye_calibration\":{");
+            require(calibration_start!=observed.npos,"Native recovered OpenVR calibration diagnostics");
+            const auto calibration=observed.substr(calibration_start,observed.find('}',calibration_start)-calibration_start);
+            require(contains(calibration, "\"backend\":\"OpenVR\"") && field(calibration, "frames") == 1,
                 "Native recovered WaitGetPoses activates calibration exactly once");
             detach(attachment);
             puts("PASS: native OpenVR cached compositor recovery without initialization");

@@ -107,15 +107,15 @@ void verify_fg11(ID3D11Device* device) {
     const auto release=proc<CheekyFgReleaseFn>(runtime,"CheekyFG_ReleasePair");
     command("1\n300\nset\nFgEnabled=true\nFgHooklessMode3=false\nFgGuideCaptureMode=0\nD3D11D3D12Transport=false\nEnabled=true\nWidth=0.5\nHeight=0.5\nNrEnabled=false\nPeripheralDlaa=false");
     ComPtr<ID3D11DeviceContext> context;device->GetImmediateContext(&context);
-    auto texture=[&](DXGI_FORMAT format) {
-        D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=128;desc.ArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;
+    auto texture=[&](DXGI_FORMAT format,unsigned size=128) {
+        D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=size;desc.ArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;
         desc.Format=format;desc.Usage=D3D11_USAGE_DEFAULT;desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
         ComPtr<ID3D11Texture2D> result;check(device->CreateTexture2D(&desc,nullptr,&result),"DX11 FG texture");return result;
     };
-    auto color=texture(DXGI_FORMAT_R8G8B8A8_UNORM),output=texture(DXGI_FORMAT_R8G8B8A8_UNORM);
-    auto depth=texture(DXGI_FORMAT_R32_FLOAT),motion=texture(DXGI_FORMAT_R16G16_FLOAT);
-    MockNgxParameters p;p.Set("Width",128u);p.Set("Height",128u);p.Set("OutWidth",128u);p.Set("OutHeight",128u);
-    p.Set("DLSS.Feature.Create.Flags",14u);p.Set("PerfQualityValue",2u);
+    auto color=texture(DXGI_FORMAT_R8G8B8A8_UNORM,64),output=texture(DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto depth=texture(DXGI_FORMAT_R32_FLOAT,64),motion=texture(DXGI_FORMAT_R16G16_FLOAT);
+    MockNgxParameters p;p.Set("Width",64u);p.Set("Height",64u);p.Set("OutWidth",128u);p.Set("OutHeight",128u);
+    p.Set("DLSS.Feature.Create.Flags",0x49u);p.Set("PerfQualityValue",2u); // ACC: input depth, output-resolution MV.
     p.Set("MV.Scale.X",1.f);p.Set("MV.Scale.Y",1.f);p.Set("Color",static_cast<ID3D11Resource*>(color.Get()));
     p.Set("Output",static_cast<ID3D11Resource*>(output.Get()));p.Set("Depth",static_cast<ID3D11Resource*>(depth.Get()));
     p.Set("MotionVectors",static_cast<ID3D11Resource*>(motion.Get()));
@@ -126,11 +126,13 @@ void verify_fg11(ID3D11Device* device) {
     require(ngx_succeeded(proc<Init>(ngx,"NVSDK_NGX_D3D11_Init")(42,L".",device,nullptr,1)),"Observe DX11 NGX initialization for private transport");
     NgxHandle* handle{};require(ngx_succeeded(proc<Create>(ngx,"NVSDK_NGX_D3D11_CreateFeature")(context.Get(),1,&p,&handle)),"DX11 FG game feature");
     const auto evaluate=proc<Evaluate>(ngx,"NVSDK_NGX_D3D11_EvaluateFeature");
-    ComPtr<ID3D11RenderTargetView> depth_rtv;
+    ComPtr<ID3D11RenderTargetView> depth_rtv,motion_rtv;
     check(device->CreateRenderTargetView(depth.Get(),nullptr,&depth_rtv),"DX11 FG depth fixture RTV");
+    check(device->CreateRenderTargetView(motion.Get(),nullptr,&motion_rtv),"DX11 FG output-resolution motion RTV");
     auto eyes=[&](unsigned count) {
         for(unsigned i=0;i<count;++i) {
             const float depth_value[]{i%2?.75f:.25f,0,0,0};context->ClearRenderTargetView(depth_rtv.Get(),depth_value);
+            const float motion_value[]{i%2?-16.f:8.f,i%2?2.f:-4.f,0,0};context->ClearRenderTargetView(motion_rtv.Get(),motion_value);
             require(ngx_succeeded(evaluate(context.Get(),handle,&p,nullptr)),"DX11 transported FG evaluation");
         }
         context->Flush();frame(); // A desktop DX11 tick must retain the private guide queue.
@@ -138,7 +140,7 @@ void verify_fg11(ID3D11Device* device) {
     auto pair=[&] {
         CheekyFgPair value;value.capture_token=complete(1);
         require(value.capture_token&&acquire(&value),"DX11 native evaluations provide an OpenXR stereo guide pair");
-        require(value.eyes[0].depth_width==128&&value.eyes[1].motion_width==128&&!value.enable_frame_id,
+        require(value.eyes[0].depth_width==64&&value.eyes[1].motion_width==128&&!value.enable_frame_id,
             "DX11 FG keeps full-eye guides independently of the cropped SR resolution");
         ComPtr<ID3D12Device> gpu;check(value.producer_queue->GetDevice(IID_PPV_ARGS(&gpu)),"DX11 FG snapshot device");
         ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
@@ -150,6 +152,10 @@ void verify_fg11(ID3D11Device* device) {
         D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;buffer.Width=bytes*2;
         buffer.Height=buffer.DepthOrArraySize=buffer.MipLevels=1;buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         ComPtr<ID3D12Resource> read;check(gpu->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&read)),"DX11 FG readback");
+        auto motion_desc=value.eyes[0].motion->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT motion_footprint{};UINT64 motion_bytes{};
+        gpu->GetCopyableFootprints(&motion_desc,0,1,0,&motion_footprint,nullptr,nullptr,&motion_bytes);
+        buffer.Width=motion_bytes*2;ComPtr<ID3D12Resource> motion_read;
+        check(gpu->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&motion_read)),"DX11 FG motion readback");
         for(unsigned eye=0;eye<2;++eye) {
             auto* source=value.eyes[eye].depth;D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barrier.Transition.pResource=source;barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -157,17 +163,29 @@ void verify_fg11(ID3D11Device* device) {
             list->ResourceBarrier(1,&barrier);D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=source;
             to.pResource=read.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;to.PlacedFootprint.Offset=eye*bytes;
             list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);list->ResourceBarrier(1,&barrier);
+            source=value.eyes[eye].motion;barrier.Transition.pResource=source;
+            std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);list->ResourceBarrier(1,&barrier);
+            from.pResource=source;to.pResource=motion_read.Get();to.PlacedFootprint=motion_footprint;to.PlacedFootprint.Offset=eye*motion_bytes;
+            list->CopyTextureRegion(&to,0,0,0,&from,nullptr);std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);list->ResourceBarrier(1,&barrier);
         }
         check(list->Close(),"DX11 FG close readback");ID3D12CommandList* commands[]{list.Get()};value.producer_queue->ExecuteCommandLists(1,commands);
         ComPtr<ID3D12Fence> fence;check(gpu->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"DX11 FG read fence");
         check(value.producer_queue->Signal(fence.Get(),1),"DX11 FG read signal");
         while(fence->GetCompletedValue()<1)Sleep(1);
         void* mapped{};D3D12_RANGE range{0,static_cast<SIZE_T>(bytes*2)};check(read->Map(0,&range,&mapped),"DX11 FG map depth snapshots");
-        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,127u})for(unsigned x:{0u,127u}) {
+        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,63u})for(unsigned x:{0u,63u}) {
             const auto* pixel=reinterpret_cast<const float*>(static_cast<const unsigned char*>(mapped)+eye*bytes+y*footprint.Footprint.RowPitch+x*4);
             require(*pixel==(eye?.75f:.25f),"DX11 FG full-depth corner pixels preserve each eye beyond the SR crop");
         }
         read->Unmap(0,nullptr);
+        D3D12_RANGE motion_range{0,static_cast<SIZE_T>(motion_bytes*2)};
+        check(motion_read->Map(0,&motion_range,&mapped),"DX11 FG motion map");
+        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,127u})for(unsigned x:{0u,127u}) {
+            const auto* pixel=reinterpret_cast<const std::uint16_t*>(static_cast<const unsigned char*>(mapped)+eye*motion_bytes+y*motion_footprint.Footprint.RowPitch+x*4);
+            require(pixel[0]==(eye?0xcc00:0x4800)&&pixel[1]==(eye?0x4000:0xc400),
+                "ACC-style output-resolution motion keeps each eye's full signed vectors independently of SR/depth crop");
+        }
+        motion_read->Unmap(0,nullptr);
         release(&value);
     };
     eyes(2);pair();eyes(1);require(!complete(1),"DX11 incomplete stereo falls back");eyes(2);pair();

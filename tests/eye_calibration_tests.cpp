@@ -715,10 +715,15 @@ void run_calibration_policy() {
     bool corrected{};
     require(publish_stereo_calibration(8002, 8001, b, a, 10, GetTickCount64(), &corrected) && corrected,
             "Reversed pair must be accepted and counted as a correction");
+    const auto reversed_revision=stereo_eye_assignment(8001).mapping_revision;
+    require(reversed_revision&&stereo_eye_assignment(8002).mapping_revision==reversed_revision,
+            "Both calibrated eyes share one atomic identity revision");
     require(settings_for_view(settings, 8001).x_offset < 0 && settings_for_view(settings, 8002).x_offset > 0,
             "Manual fixed offsets must follow the calibrated anatomical eye");
     require(publish_stereo_calibration(8002, 8001, b, a, 11, GetTickCount64(), &corrected) && !corrected,
             "Confirmation must not count as another correction");
+    require(stereo_eye_assignment(8001).mapping_revision==reversed_revision,
+            "Continuous verification must not reset FG history every frame");
     require(!publish_stereo_calibration(8001, 8002, a, b, 9, GetTickCount64()),
             "Out-of-order result must be rejected");
     require(!publish_stereo_calibration(8001, 8001, a, a, 12, GetTickCount64()),
@@ -732,9 +737,14 @@ void run_calibration_policy() {
     require(publish_stereo_calibration(8001, 8002, a, b, 12, GetTickCount64(), &corrected) && corrected &&
                 stereo_eye_assignment(8001).eye_index == 0,
             "Fresh marker evidence must replace the retained identity");
+    const auto corrected_revision=stereo_eye_assignment(8001).mapping_revision;
+    require(corrected_revision>reversed_revision&&stereo_eye_assignment(8002).mapping_revision==corrected_revision,
+            "A scene eye-order correction advances the shared FG identity revision");
     unregister_stereo_view(8001);
     register_stereo_view(8001);
     require(!stereo_eye_assignment(8002).calibrated, "Releasing a member must invalidate the pair");
+    require(stereo_eye_assignment(8002).mapping_revision>corrected_revision,
+            "Invalidating a calibrated member must invalidate its FG identity revision");
     require(!publish_stereo_calibration(8002, 8001, b, a, 12, GetTickCount64()),
             "Reused handle address must not accept old-generation data");
     clear_stereo_calibration();

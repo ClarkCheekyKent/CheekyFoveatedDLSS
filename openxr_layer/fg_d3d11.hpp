@@ -11,20 +11,22 @@
 
 namespace cheeky::fg {
 // The application and OpenXR keep their D3D11 device. Only private processing
-// uses D3D12. Each shared image crosses APIs in COMMON, with GPU fence ordering
-// in both directions; no staging readback or CPU frame wait is involved.
+// uses D3D12. Never enqueue a D3D12 wait on the application's D3D11 context:
+// SR's private D3D12 queue may still need later D3D11 signals from that context.
 struct D3D11Bridge {
     using MicrosoftDevice = Microsoft::WRL::ComPtr<ID3D11Device5>;
     template<class T> using Ptr = Microsoft::WRL::ComPtr<T>;
-    struct Image { Ptr<ID3D11Texture2D> original, shared11; Ptr<ID3D12Resource> shared12; };
+    struct Image { Ptr<ID3D11Texture2D> original, shared11; Ptr<ID3D12Resource> shared12; std::uint64_t last_read{}; };
     MicrosoftDevice device11;
     Ptr<ID3D11DeviceContext4> context;
     Ptr<ID3D12Device> device12;
     Ptr<ID3D12CommandQueue> queue;
     Ptr<ID3D12Fence> fence12;
     Ptr<ID3D11Fence> fence11;
+    Ptr<ID3D12Fence> completion;
     std::recursive_mutex mutex;
     std::uint64_t serial{};
+    std::uint64_t completion_serial{};
     std::unordered_map<XrSwapchain, std::unordered_map<ID3D11Texture2D*, Image>> sources;
     std::unordered_map<XrSwapchain, std::vector<Image>> outputs;
     bool initialize(ID3D11Device* device) {
@@ -39,7 +41,8 @@ struct D3D11Bridge {
             FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12)))) return false;
         D3D12_COMMAND_QUEUE_DESC desc{};
         if (FAILED(device12->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))) ||
-            FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence12)))) return false;
+            FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence12))) ||
+            FAILED(device12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&completion)))) return false;
         HANDLE handle{};
         auto hr = device12->CreateSharedHandle(fence12.Get(), nullptr, GENERIC_ALL, nullptr, &handle);
         if (SUCCEEDED(hr)) hr = device11->OpenSharedFence(handle, IID_PPV_ARGS(&fence11));
@@ -82,11 +85,17 @@ struct D3D11Bridge {
         serial = value; context->Flush();
         return SUCCEEDED(queue->Wait(fence12.Get(), value));
     }
-    bool to11() {
-        const auto value = serial + 1;
-        if (FAILED(queue->Signal(fence12.Get(), value))) return false;
-        serial = value;
-        return SUCCEEDED(context->Wait(fence11.Get(), value));
+    bool mark_complete(std::uint64_t& value) {
+        value=completion_serial+1;
+        if(FAILED(queue->Signal(completion.Get(),value)))return false;
+        completion_serial=value;return true;
+    }
+    bool wait_complete(std::uint64_t value) {
+        if(!value||completion->GetCompletedValue()>=value)return true;
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!event)return false;
+        const bool good=SUCCEEDED(completion->SetEventOnCompletion(value,event))&&
+            WaitForSingleObject(event,5000)==WAIT_OBJECT_0;
+        CloseHandle(event);return good&&SUCCEEDED(device12->GetDeviceRemovedReason());
     }
     template<class Capture> bool capture(XrSwapchain chain, ID3D11Texture2D* original, Capture&& consume) {
         std::lock_guard lock(mutex);
@@ -96,11 +105,14 @@ struct D3D11Bridge {
             Image shared; if (!image(original, shared)) return false;
             it = images.emplace(original, std::move(shared)).first;
         }
+        // Reuse only after the private copy has read this shared source. A busy
+        // slot skips FG capture, leaving native rendering and its context free.
+        if(it->second.last_read&&completion->GetCompletedValue()<it->second.last_read)return false;
         context->CopyResource(it->second.shared11.Get(), original);
         if (!from11()) return false;
         const bool good = consume(it->second.shared12.Get());
         // Even a rejected capture may have enqueued reads. Protect reuse.
-        const bool ordered = to11(); context->Flush();
+        const bool ordered = mark_complete(it->second.last_read);
         return good && ordered;
     }
     bool enumerate(PFN_xrEnumerateSwapchainImages fn, XrSwapchain chain,
@@ -122,16 +134,21 @@ struct D3D11Bridge {
     bool upload(XrSwapchain chain, unsigned index) {
         std::lock_guard lock(mutex);
         const auto it = outputs.find(chain);
-        if (it == outputs.end() || index >= it->second.size() || !to11()) return false;
+        if (it == outputs.end() || index >= it->second.size()) return false;
+        std::uint64_t ready{};
+        // This runs on the presenter thread, outside the D3D11 context lock.
+        // The game can submit the SR signals needed by this private GPU work.
+        if(!mark_complete(ready)||!wait_complete(ready))return false;
         auto& shared = it->second[index];
         context->CopyResource(shared.original.Get(), shared.shared11.Get());
         // Also protect the shared image from the next private D3D12 upload.
         return from11();
     }
     void drain() noexcept {
-        if (!fence12 || !serial) return;
+        if (!completion || !completion_serial) return;
         context->Flush();
-        while (fence12->GetCompletedValue() < serial && SUCCEEDED(device12->GetDeviceRemovedReason())) Sleep(1);
+        std::uint64_t retired{};if(!mark_complete(retired))return;
+        while (completion->GetCompletedValue() < retired && SUCCEEDED(device12->GetDeviceRemovedReason())) Sleep(1);
     }
     void forget(XrSwapchain chain) {
         std::lock_guard lock(mutex); drain(); outputs.erase(chain); sources.erase(chain);
