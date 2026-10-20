@@ -37,7 +37,7 @@ float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(ma
  uint2 m=min(uint2(uv*Dimensions.zw+GuideOffset.zw),uint2(mw,mh)-1);
  float2 mv=Motion.Load(int3(m,0));
  bool good=all(isfinite(mv))&&all(abs(mv)<65504.0);
- mv=clamp(mv*MotionAdjust.xy-JitterCorrection.xy,-MotionAdjust.z,MotionAdjust.z);
+ mv=clamp(mv*MotionAdjust.xy-JitterCorrection.xy+JitterCorrection.zw,-MotionAdjust.z,MotionAdjust.z);
  OutMotion[id.xy]=good?mv:float2(MotionAdjust.z,MotionAdjust.z);
 })HLSL";
 constexpr char peripheral_shader[]=CHEEKY_FG_COMPACT_HLSL R"HLSL(
@@ -227,6 +227,23 @@ SamplerState LinearClamp:register(s0);
   Output[id.xy]=Periphery.SampleLevel(LinearClamp,(float2(id.x,id.y-Dimensions.y)+.5)/Dimensions.zw,0);
  }
 })HLSL";
+constexpr char recenter_shader[]=R"HLSL(
+Texture2D<float4> Generated:register(t0);Texture2D<float4> Native:register(t1);RWTexture2D<float4> Output:register(u0);
+cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;
+ float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
+SamplerState LinearClamp:register(s0);
+[numthreads(8,8,1)]void Main(uint3 id:SV_DispatchThreadID){
+ uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
+ float2 uv=(float2(id.xy)+.5)/float2(w,h),source=uv+MotionAdjust.xy;
+ // Never stretch the last FG pixel across a newly exposed strip. Fade the
+ // last texel into the current native crop, which covers the whole window.
+ float2 edge=min(source,1-source)*float2(w,h)-.5;
+ float weight=saturate(min(edge.x,edge.y));
+ [branch]if(weight<=0){Output[id.xy]=Native.SampleLevel(LinearClamp,uv,0);return;}
+ float4 c=Generated.SampleLevel(LinearClamp,source,0);
+ [branch]if(weight>=1){Output[id.xy]=c;return;}
+ Output[id.xy]=lerp(Native.SampleLevel(LinearClamp,uv,0),c,weight);
+})HLSL";
 void transition(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
  if(!r||a==b)return;D3D12_RESOURCE_BARRIER t{};t.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;t.Transition.pResource=r;
  t.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;t.Transition.StateBefore=a;t.Transition.StateAfter=b;l->ResourceBarrier(1,&t);
@@ -242,7 +259,7 @@ struct Constants {float rect[4]{},offset[4]{},dimensions[4]{},motion[4]{},option
 void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,unsigned operation,
  ID3D12PipelineState* state,const std::array<ID3D12Resource*,5>& in,const std::array<DXGI_FORMAT,5>& formats,
  const std::array<ID3D12Resource*,3>& out,const Constants& constants,ID3D12Resource* center=nullptr){
- const unsigned base=(eye*4+operation)*9;auto cpu=p.descriptors->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=base*p.stride;
+ const unsigned base=(eye*6+operation)*9;auto cpu=p.descriptors->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=base*p.stride;
  for(unsigned i=0;i<5;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=formats[i];v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
   v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;dev->CreateShaderResourceView(in[i],&v,cpu);cpu.ptr+=p.stride;}
  D3D12_SHADER_RESOURCE_VIEW_DESC cv{};cv.Format=center?center->GetDesc().Format:p.color_format;cv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -261,12 +278,12 @@ void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,uns
 DXGI_FORMAT depth_srv_format(DXGI_FORMAT f) noexcept {return guide_depth_format(f);}
 DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {return guide_motion_format(f);}
 void FocusPipeline::reset() noexcept {
- root.Reset();prepare.Reset();peripheral.Reset();peripheral_coarse.Reset();peripheral_coarse2.Reset();peripheral_coarse4.Reset();peripheral_blocks.Reset();peripheral_blocks2.Reset();peripheral_blocks4.Reset();compose.Reset();pack.Reset();descriptors.Reset();stride=0;coarse_output={};
+ root.Reset();prepare.Reset();peripheral.Reset();peripheral_coarse.Reset();peripheral_coarse2.Reset();peripheral_coarse4.Reset();peripheral_blocks.Reset();peripheral_blocks2.Reset();peripheral_blocks4.Reset();compose.Reset();pack.Reset();recenter.Reset();descriptors.Reset();stride=0;coarse_output={};
  for(auto& eye:inputs)for(auto& input:eye)input={};
  for(unsigned i=0;i<2;++i){peripheral_output[i].Reset();full[i].Reset();previous_depth[i].Reset();history[i]=false;}
 }
 bool FocusPipeline::initialize(ID3D12Device* dev){
- if(root&&prepare&&peripheral&&peripheral_coarse&&peripheral_coarse2&&peripheral_coarse4&&peripheral_blocks&&peripheral_blocks2&&peripheral_blocks4&&compose&&pack&&descriptors)return true;
+ if(root&&prepare&&peripheral&&peripheral_coarse&&peripheral_coarse2&&peripheral_coarse4&&peripheral_blocks&&peripheral_blocks2&&peripheral_blocks4&&compose&&pack&&recenter&&descriptors)return true;
  D3D12_DESCRIPTOR_RANGE ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,6,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,3,0,0,6}};
  D3D12_ROOT_PARAMETER params[2]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable={2,ranges};
  params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;params[1].Constants={0,0,sizeof(Constants)/4};
@@ -280,21 +297,22 @@ bool FocusPipeline::initialize(ID3D12Device* dev){
   if(FAILED(D3DCompile(source,strlen(source),nullptr,nullptr,nullptr,entry,"cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors))){
    if(errors)std::fprintf(stderr,"FG shader %s: %s\n",entry,static_cast<const char*>(errors->GetBufferPointer()));return false;}
   D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};return SUCCEEDED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(&target)));};
- if(!compile(prepare_shader,prepare)||!compile(peripheral_shader,peripheral)||!compile(peripheral_shader,peripheral_coarse,"Coarse")||!compile(compose_shader,compose)||!compile(pack_shader,pack))return false;
+ if(!compile(prepare_shader,prepare)||!compile(peripheral_shader,peripheral)||!compile(peripheral_shader,peripheral_coarse,"Coarse")||!compile(compose_shader,compose)||!compile(pack_shader,pack)||!compile(recenter_shader,recenter))return false;
  if(!compile(peripheral_shader,peripheral_coarse2,"Coarse2")||!compile(peripheral_shader,peripheral_coarse4,"Coarse4"))return false;
  if(!compile(peripheral_shader,peripheral_blocks,"Blocks")||!compile(peripheral_shader,peripheral_blocks2,"Blocks2")||!compile(peripheral_shader,peripheral_blocks4,"Blocks4"))return false;
- D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=72;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+ D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=108;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
  if(FAILED(dev->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&descriptors))))return false;
  stride=dev->GetDescriptorHandleIncrementSize(heap.Type);return true;
 }
 bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,unsigned pass,
  ID3D12Resource* color,const CheekyFgEye& g,const FocusRect& r,unsigned w,unsigned h,unsigned depth_bits,unsigned motion_bits,
- D3D12_RESOURCE_STATES color_state,GpuTimings* timings){
+ D3D12_RESOURCE_STATES color_state,GpuTimings* timings,float crop_motion_dx,float crop_motion_dy){
  if(eye>1||pass>1||!color||!w||!h||!r.w||!r.h||!initialize(dev))return false;
  const bool need_color=pass==0||g.peripheral_method==3;
  const bool need_motion=need_color||g.peripheral_method!=0;
  const bool need_depth=need_color||g.peripheral_method==2;
  const bool prepared=g.prepared_guides!=0;
+ const bool adjust_motion=pass==0&&(crop_motion_dx!=0.f||crop_motion_dy!=0.f);
  auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;
  if(s.borrowed_guides!=prepared){s.depth.Reset();s.motion.Reset();}
  s.borrowed_guides=prepared;
@@ -331,6 +349,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
   gw=std::clamp(unsigned(std::round(double(sw)*r.w/cd.Width*std::min(1.,double(w)/r.w))),1u,w);
   gh=std::clamp(unsigned(std::round(double(sh)*r.h/cd.Height*std::min(1.,double(h)/r.h))),1u,h);
  }
+ if(prepared&&adjust_motion&&(!need_motion||!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.corrected_motion)))return false;
  if((need_color&&!allocate(dev,w,h,color_format,s.color))||
     (!prepared&&need_depth&&!allocate(dev,gw,gh,depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT,s.depth))||
     (!prepared&&need_motion&&!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.motion)))return false;
@@ -344,6 +363,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  c.dimensions[0]=float(dw);c.dimensions[1]=float(dh);c.dimensions[2]=float(mw);c.dimensions[3]=float(mh);
  if(!prepared){c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);
   c.motion[2]=motion_bits==16?65504.f:3.402823466e38f;c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];}
+ c.jitter[2]=crop_motion_dx;c.jitter[3]=crop_motion_dy;
  c.options[0]=need_color?1.f:0.f;c.options[1]=!prepared&&need_depth?1.f:0.f;c.options[2]=!prepared&&need_motion?1.f:0.f;
  c.options[3]=srgb_color(cd.Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
  auto* out_depth=prepared?nullptr:s.depth.Get();auto* out_motion=prepared?nullptr:s.motion.Get();
@@ -357,7 +377,46 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  if(timings)timings->preparation_stamp(list,eye,pass,2);
  for(auto* out:{s.color.Get(),out_depth,out_motion})transition(list,out,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
  if(need_color&&color_state==D3D12_RESOURCE_STATE_COMMON)transition(list,color,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+ if(prepared&&adjust_motion){
+  // Prepared NGX guides are immutable leased input resources. Correct a
+  // worker-owned copy, never modify the producer's captured motion texture.
+  Constants adjusted{};
+  adjusted.rect[2]=adjusted.rect[3]=1.f;
+  adjusted.dimensions[2]=float(gw);adjusted.dimensions[3]=float(gh);
+  adjusted.motion[0]=adjusted.motion[1]=1.f;
+  adjusted.motion[2]=motion_bits==16?65504.f:3.402823466e38f;
+  adjusted.jitter[2]=crop_motion_dx;adjusted.jitter[3]=crop_motion_dy;
+  adjusted.options[2]=1.f;
+  transition(list,s.corrected_motion.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  bind(*this,dev,list,eye,4,prepare.Get(),{nullptr,nullptr,g.motion,nullptr,nullptr},
+   {cd.Format,df,mf,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT},
+   {nullptr,nullptr,s.corrected_motion.Get()},adjusted);
+  list->Dispatch((gw+7)/8,(gh+7)/8,1);
+  transition(list,s.corrected_motion.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+  s.motion=s.corrected_motion;
+ }
  if(timings)timings->preparation_stamp(list,eye,pass,3);
+ return true;
+}
+bool FocusPipeline::recenter_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,
+ ID3D12Resource* generated,float shift_x,float shift_y){
+ if(eye>1||!generated||!std::isfinite(shift_x)||!std::isfinite(shift_y))return false;
+ auto& s=inputs[eye][0];if(!s.color||!initialize(dev))return false;
+ const auto d=generated->GetDesc(),native=s.color->GetDesc();
+ if(d.Width!=native.Width||d.Height!=native.Height||d.Format!=color_format||native.Format!=color_format||
+    !allocate(dev,unsigned(d.Width),d.Height,color_format,s.recentered_color))return false;
+ Constants c{};c.motion[0]=shift_x;c.motion[1]=shift_y;
+ transition(list,generated,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+ if(s.color.Get()!=generated)transition(list,s.color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+ transition(list,s.recentered_color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+ // Dedicated descriptor slots: prepared-guide correction can also be recorded
+ // on this list, and descriptors must survive until the whole list executes.
+ bind(*this,dev,list,eye,5,recenter.Get(),{generated,s.color.Get(),nullptr,nullptr,nullptr},
+  {color_format,color_format,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R32_FLOAT},{s.recentered_color.Get(),nullptr,nullptr},c);
+ list->Dispatch((unsigned(d.Width)+7)/8,(d.Height+7)/8,1);
+ transition(list,s.recentered_color.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+ transition(list,generated,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+ if(s.color.Get()!=generated)transition(list,s.color.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  return true;
 }
 bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,

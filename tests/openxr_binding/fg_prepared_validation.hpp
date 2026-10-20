@@ -88,6 +88,22 @@ void fg_prepared_validation(ID3D12Device* device) {
                 const auto a=resources.first->GetDesc(),b=resources.second->GetDesc();check(a.Width==b.Width&&a.Height==b.Height&&a.Format==b.Format,"Prepared grid/precision parity");
                 check(read(resources.first)==read(resources.second),"Prepared capture exactly matches legacy guide pixels, offsets, jitter and invalid-vector encoding");}
         }
+        const auto original_motion=read(pair.eyes[0].motion);
+        const auto center_grid=guide_grid(pair.eyes[0],256,192,384,256,0);
+        FocusRect center_rect{center_grid.x,center_grid.y,center_grid.w,center_grid.h,0,true};
+        check(consumer.prepare_inputs(device,list.Get(),0,0,color.Get(),pair.eyes[0],center_rect,
+            center_grid.color_width,center_grid.color_height,32,32,D3D12_RESOURCE_STATE_COMMON,nullptr,.03125f,-.015625f),
+            "Moving-crop correction on producer-prepared guides");execute();
+        const auto corrected_motion=read(consumer.inputs[0][0].motion.Get());
+        check(consumer.inputs[0][0].motion.Get()!=pair.eyes[0].motion&&read(pair.eyes[0].motion)==original_motion,
+            "Moving-crop correction must leave the producer's leased vectors immutable");
+        for(std::size_t at=0;at<original_motion.size();at+=8){float original[2]{},actual[2]{};
+            std::memcpy(original,original_motion.data()+at,8);std::memcpy(actual,corrected_motion.data()+at,8);
+            const bool valid=std::isfinite(original[0])&&std::isfinite(original[1])&&std::abs(original[0])<65504.f&&std::abs(original[1])<65504.f;
+            if(valid)check(std::abs(actual[0]-original[0]-.03125f)<1.e-6f&&std::abs(actual[1]-original[1]+.015625f)<1.e-6f,
+                "Prepared crop vectors retain native motion and add the crop displacement exactly once");
+            else check(actual[0]==original[0]&&actual[1]==original[1],"Prepared crop correction preserves invalid-vector sentinels");
+        }
         CheekyFgMemory memory;cheeky::fg_memory::Collector collector(device);snapshots.memory(memory,collector);
         check(memory.categories[cheeky::fg_memory::guide_depth].resources>=2&&memory.categories[cheeky::fg_memory::guide_motion].resources>=2,"Capture inventory owns prepared resources");
         for(auto& eye:pair.eyes)for(auto* resource:{eye.depth,eye.motion,eye.peripheral_depth,eye.peripheral_motion})if(resource)resource->Release();

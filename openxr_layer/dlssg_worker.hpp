@@ -18,6 +18,9 @@ struct Worker {
     struct Feature {NVSDK_NGX_Handle* handle{}; NgxParameters* params{};ComPtr<ID3D12Resource> output,disable,readback;
         ID3D12Resource* target{};unsigned width{},height{},eye{},offset_x{},offset_y{};bool direct{},direct_rejected{},xr_direct_rejected{};
         Matrix view_to_clip,clip_to_camera,clip_to_prev,prev_clip_to_clip,lens;
+        FocusRect evaluated_crop{}; // Coordinates of the most recent submitted NGX evaluation.
+        std::uint64_t evaluated_frame{};
+        bool evaluated_crop_valid{};
     };
     struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;bool final_xr{};unsigned shading_mode{1};};
     using Init=decltype(&NVSDK_NGX_D3D12_Init_with_ProjectID);

@@ -26,3 +26,4 @@ set_target_properties(CheekyOpenXRBindingTests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 add_test(NAME OpenXRHostBindings COMMAND CheekyOpenXRBindingTests)
 add_test(NAME OpenXRFGCopyStates COMMAND CheekyOpenXRBindingTests --fg-gpu-validation)
+add_test(NAME OpenXRFGCropRecenter COMMAND CheekyOpenXRBindingTests --fg-crop-gpu-validation)

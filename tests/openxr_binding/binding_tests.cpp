@@ -498,7 +498,7 @@ void fg_toggle_test() {
 #include "fg_prepared_validation.hpp"
 #include "fg_snapshot_validation.hpp"
 #include "fg_d3d11_validation.hpp"
-void fg_copy_validation_test() {
+void fg_copy_validation_test(bool include_buffered=true) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12Debug> debug;
     const auto debug_result=D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
@@ -759,7 +759,7 @@ void fg_copy_validation_test() {
     fg_snapshot_validation(device.Get());
     fg_compact_validation(device.Get());
     fg_prepared_validation(device.Get());
-    fg_buffered_validation(device.Get());
+    if(include_buffered)fg_buffered_validation(device.Get());
     fg_d3d11_validation();
     for(auto* texture:{source.Get(),targets[0].Get(),targets[1].Get()})
         check(fg_expected_states[texture]==D3D12_RESOURCE_STATE_RENDER_TARGET,"OpenXR image must be restored to RENDER_TARGET");
@@ -782,7 +782,7 @@ void fg_copy_validation_test() {
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
-        if(argc>2 && (std::string(argv[1])=="--fg-capability" || std::string(argv[1])=="--fg-generate" || std::string(argv[1])=="--fg-buffered"||std::string(argv[1])=="--fg-motion")) {
+        if(argc>2 && (std::string(argv[1])=="--fg-capability" || std::string(argv[1])=="--fg-generate" || std::string(argv[1])=="--fg-buffered"||std::string(argv[1])=="--fg-motion"||std::string(argv[1])=="--fg-crop-motion")) {
             Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
             check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))),"DXGI factory");
             for(UINT i=0;;++i) {
@@ -802,6 +802,10 @@ int main(int argc,char** argv) {
                 std::cout << "Frame generation capability: " << (ready?"AVAILABLE":"UNAVAILABLE") << '\n';
                 if(ready&&std::string(argv[1])=="--fg-buffered")fg_buffered_validation(device.Get(),directory.c_str(),argc>3?unsigned(std::stoul(argv[3])):2u,argc>4&&std::string(argv[4])=="prepared");
                 if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,argc>3&&std::string(argv[3])=="foveated",1,100,50,false,512,512,true);
+                if(ready&&std::string(argv[1])=="--fg-crop-motion")fg_hardware_probe(worker,device.Get(),false,true,1,
+                    argc>3?unsigned(std::stoul(argv[3])):100u,50,false,512,512,true,false,
+                    argc>5&&std::string(argv[5])=="atlas",false,false,argc>5&&std::string(argv[5])=="xr",false,1,
+                    true,argc>4?unsigned(std::stoul(argv[4])):0u,argc>6&&std::string(argv[6])=="scene");
                 if(ready&&std::string(argv[1])=="--fg-generate")fg_hardware_probe(worker,device.Get(),argc>3&&std::string(argv[3])=="bgra",argc>4&&std::string(argv[4])=="foveated",
                     argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
                     argc>7?unsigned(std::stoul(argv[7])):50u,argc>8&&(std::string(argv[8])=="game-guides"||std::string(argv[8])=="full-guides"),
@@ -815,6 +819,7 @@ int main(int argc,char** argv) {
         }
         if(argc>1 && std::string(argv[1])=="--fg-d3d11") {fg_d3d11_validation();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
+        if(argc>1 && std::string(argv[1])=="--fg-crop-gpu-validation") {fg_copy_validation_test(false);return 0;}
         run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

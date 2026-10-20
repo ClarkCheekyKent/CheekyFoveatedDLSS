@@ -1,3 +1,28 @@
+# Moving DLSS-G crop output
+
+`CheekyOpenXRBindingTests --fg-crop-gpu-validation` runs the WARP capture,
+composition, prepared-guide and DX11 bridge checks without the buffered
+presenter fixture. It includes recentering in both directions on both axes,
+half-pixel sampling, native fallback in uncovered strips, and immutable
+producer-prepared motion vectors with the crop displacement added once.
+
+On an NVIDIA FG-capable GPU, use an installed production runtime directory:
+
+```powershell
+./bin/Release/CheekyOpenXRBindingTests.exe --fg-crop-motion '<directory containing nvngx_dlssg.dll>' 75 2 atlas
+./bin/Release/CheekyOpenXRBindingTests.exe --fg-crop-motion '<directory containing nvngx_dlssg.dll>' 50 2 xr scene
+```
+
+Arguments after the runtime directory select scale percentage and crop axis (`0` horizontal,
+`1` vertical, `2` both), and publication (`composed`, `atlas`, `xr`). Optional
+`scene` also moves the rendered object and camera: the output must preserve
+actual scene interpolation while cancelling crop-induced displacement. The
+eyes move their crops in opposite directions. These tests use real NVIDIA
+inference and measure generated pixels; they do not require a game or headset.
+The moving-crop atlas/XR cases use full-eye native inputs to isolate output
+publication from capture packing. The regular compact/prepared tests cover
+those input representations separately.
+
 # OpenXR menu regressions
 
 The normal MSBuild script and top-level CTest suite include the OpenXR binding

@@ -286,6 +286,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(direct&&direct_periphery)for(unsigned eye=0;eye<2;++eye)
         if(((*copies)[eye].layout.packed()||(*copies)[eye].final_xr)&&guides.eyes[eye].peripheral_method<=2){
             focus.peripheral_output[eye].Reset();if((*copies)[eye].final_xr)focus.full[eye].Reset();}
+    std::array<bool,2> moving_crop_reset{};
+    std::array<FocusRect,2> previous_center_crops{};
+    std::array<float,2> motion_crop_dx{},motion_crop_dy{};
     auto transpose=[](Matrix m){Matrix result{};for(unsigned r=0;r<4;++r)for(unsigned c=0;c<4;++c)result.m[r*4+c]=m.m[c*4+r];return result;};
     auto configure_pass=[&](Feature& f,const FocusInput& input,const Camera& camera,const CheekyFgEye& g,const FocusRect& rect,unsigned eye=0,bool center_pass=true) {
         const auto desc=input.color->GetDesc();const auto tw=unsigned(desc.Width),th=desc.Height;
@@ -295,7 +298,11 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         }
         f.eye=eye;f.offset_x=f.offset_y=0;f.direct=false;
         const bool final_xr=direct&&copies&&(*copies)[eye].final_xr;
-        if(direct&&copies&&((*copies)[eye].layout.packed()||final_xr)&&!(final_xr?f.xr_direct_rejected:f.direct_rejected)){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
+        // With crop motion, NGX produces a view between the two crop origins.
+        // It must be resampled before publication, so it cannot write directly
+        // into the atlas/XR destination that represents the current origin.
+        const bool recenter_output=center_pass&&(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f);
+        if(!recenter_output&&direct&&copies&&((*copies)[eye].layout.packed()||final_xr)&&!(final_xr?f.xr_direct_rejected:f.direct_rejected)){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
             const auto& layout=destination.layout;
             f.offset_x=final_xr?rect.x:0;f.offset_y=final_xr?rect.y:layout.packed()&&!center_pass?layout.center_height:0;
             f.direct=writable_color(d.Format,desc.Format)&&(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)&&
@@ -317,13 +324,20 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             const auto result=create(commands,NVSDK_NGX_Feature_FrameGeneration,p,&f.handle);report("NGX FG CreateFeature",result);
             if(!ok(result)||!f.handle){failed=true;return false;}created=true;
         }
-        Matrix crop=identity(),uncrop=identity();
+        Matrix crop=identity(),uncrop=identity(),previous_crop=identity();
         if(rect.active) {
             crop.m[0]=float(width)/rect.w;crop.m[5]=float(height)/rect.h;
             crop.m[3]=(float(width)-2*rect.x-rect.w)/rect.w;crop.m[7]=-(float(height)-2*rect.y-rect.h)/rect.h;
             if(!inverse(crop,uncrop))return false;
+            if(center_pass&&!moving_crop_reset[eye]){
+                const auto& before=previous_center_crops[eye];
+                previous_crop.m[0]=float(width)/before.w;
+                previous_crop.m[5]=float(height)/before.h;
+                previous_crop.m[3]=(float(width)-2*before.x-before.w)/before.w;
+                previous_crop.m[7]=-(float(height)-2*before.y-before.h)/before.h;
+            }else previous_crop=crop;
         }
-        auto projection=multiply(crop,camera.view_to_clip),clip_prev=multiply(multiply(crop,camera.clip_to_prev),uncrop);
+        auto projection=multiply(crop,camera.view_to_clip),clip_prev=multiply(multiply(previous_crop,camera.clip_to_prev),uncrop);
         if(center_pass&&crop_diagnostic){
             char message[640]{};
             sprintf_s(message,"FG CROP-DIAG frame=%llu eye=%u active=%u eye_wh=%ux%u crop_xywh=%u,%u,%u,%u "
@@ -357,7 +371,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         p->Set("DLSSG.DepthInverted",g.depth_inverted);p->Set("DLSSG.CameraMotionIncluded",1u);
         p->Set("DLSSG.ColorBuffersHDR",desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?1u:0u);p->Set("DLSSG.MvecDilated",0u);
         p->Set("DLSSG.MvecInvalidValue",input.motion->GetDesc().Format==DXGI_FORMAT_R16G16_FLOAT?65504.f:(std::numeric_limits<float>::max)());
-        p->Set("DLSSG.Reset",g.reset||created?1u:0u);p->Set("DLSSG.MultiFrameCount",1u);p->Set("DLSSG.MultiFrameIndex",1u);
+        p->Set("DLSSG.Reset",g.reset||created||(center_pass&&moving_crop_reset[eye])?1u:0u);p->Set("DLSSG.MultiFrameCount",1u);p->Set("DLSSG.MultiFrameIndex",1u);
         // NVIDIA defines BackbufferFrameID as uint64_t, incremented once per *real*
         // rendered frame (even while FG is disabled). Use the matched UEVR frame
         // identity, not serial (FG submission), capture token, or eye evaluation.
@@ -460,13 +474,28 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                     ++focused;
                 }
                 center_rects[eye]=rect;foveated[eye]=rect.active;peripheral_method=g.peripheral_method;
+                const auto& last=features[eye];
+                // An evaluation that skipped NGX cannot provide a previous crop.
+                // A non-overlapping jump has no useful temporal pixels to reuse.
+                const bool compatible=last.evaluated_crop_valid&&last.evaluated_crop.active==rect.active&&
+                    last.evaluated_crop.w==rect.w&&last.evaluated_crop.h==rect.h&&
+                    (!rect.active||(std::abs(double(rect.x)-last.evaluated_crop.x)<rect.w&&
+                                    std::abs(double(rect.y)-last.evaluated_crop.y)<rect.h));
+                const bool frame_backwards=guides.render_frame&&last.evaluated_frame&&
+                    guides.render_frame<=last.evaluated_frame;
+                moving_crop_reset[eye]=g.reset||!compatible||frame_backwards;
+                if(!moving_crop_reset[eye]&&rect.active){
+                    previous_center_crops[eye]=last.evaluated_crop;
+                    motion_crop_dx[eye]=(float(rect.x)-last.evaluated_crop.x)/rect.w;
+                    motion_crop_dy[eye]=(float(rect.y)-last.evaluated_crop.y)/rect.h;
+                }
                 center_output_width[eye]=scaled(rect.w,g.resolution_percent);
                 center_output_height[eye]=scaled(rect.h,g.resolution_percent);
                 center_width=center_output_width[eye];center_height=center_output_height[eye];
                 peripheral_width=rect.active?scaled(width,g.peripheral_percent):0;
                 peripheral_height=rect.active?scaled(height,g.peripheral_percent):0;
                 auto* detail=gpu_timings.record_preparation?&gpu_timings:nullptr;
-                if(!focus.prepare_inputs(device.Get(),commands,eye,0,colors[eye],g,rect,center_width,center_height,32,32,input_color_state,detail)) {
+                if(!focus.prepare_inputs(device.Get(),commands,eye,0,colors[eye],g,rect,center_width,center_height,32,32,input_color_state,detail,motion_crop_dx[eye],motion_crop_dy[eye])) {
                     report("FG center guide conversion",unsigned(E_FAIL));failed=true;good=false;break;
                 }
                 if(rect.active&&!focus.prepare_inputs(device.Get(),commands,eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,g.depth_bits,g.motion_bits,input_color_state,detail)) {
@@ -509,6 +538,16 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(prepare_first&&phase==1)continue;
             gpu_timings.stamp(commands,query+4);
             auto* center=evaluate_center?features[eye].target:focus.inputs[eye][0].color.Get();
+            if(evaluate_center&&(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f)){
+                // For a static full-eye point P and crop origins A -> B, NGX
+                // interpolates (P-A)/size -> (P-B)/size. Its midpoint belongs
+                // at (A+B)/2. Sampling at uv+(B-A)/(2*size) re-expresses that
+                // image in B without changing the real scene's interpolation.
+                if(!focus.recenter_frame(device.Get(),commands,eye,center,.5f*motion_crop_dx[eye],.5f*motion_crop_dy[eye])){
+                    report("FG moving-crop output recenter",unsigned(E_FAIL));failed=true;good=false;break;
+                }
+                center=focus.inputs[eye][0].recentered_color.Get();
+            }
             auto* base=center;
             bool custom_context_direct=false;
             const bool final_xr=direct&&(*copies)[eye].final_xr;
@@ -603,6 +642,14 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(copies)for(auto& copy:*copies)copy.state=copy.final_xr?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_GENERIC_READ;
     if(FAILED(queue->Signal(fence.Get(),++serial))){ngx_burst.abandon();return false;}
     ngx_burst.commit(fence.Get(),serial);
+    // Only submitted evaluations advance NGX history. The pair can fail after
+    // recording EvaluateFeature (e.g. during final composition), in which case
+    // the command list is discarded and these crops must not be published.
+    for(unsigned eye=0;eye<2;++eye)if((active_mask&(1u<<eye))!=0){
+        auto& done=features[eye];
+        done.evaluated_crop=center_rects[eye];done.evaluated_crop_valid=true;
+        done.evaluated_frame=guides.render_frame;
+    }
     submitted_at=TimingClock::now();latency.submitted(fence.Get(),serial);
     // Notify only after commands AND their completion fence are queued. The
     // presenter may release the next native render without waiting for FG to

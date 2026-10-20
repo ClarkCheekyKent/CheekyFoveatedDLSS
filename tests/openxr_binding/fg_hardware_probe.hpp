@@ -25,7 +25,8 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
 // real NVIDIA inference, without starting a game or an OpenXR session.
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
     unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
-    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false,bool final_xr=false,bool typeless_output=false,unsigned shading_mode=1) {
+    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false,bool final_xr=false,bool typeless_output=false,unsigned shading_mode=1,
+    bool crop_motion=false,unsigned crop_axis=0,bool crop_scene_motion=false) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Hardware probe queue");
@@ -47,7 +48,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         device->CreateRenderTargetView(texture.Get(),&view,slot);list->ClearRenderTargetView(slot,clear,0,nullptr);
         cheeky::fg::color_transition(list.Get(),texture.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
     };
-    const float red[]{1,.1f,.05f,1},z[]{motion_test?.04999525f:.5f,0,0,0},zero[]{motion_test?-16.f/width:0.f,0,0,0};
+    const float red[]{1,.1f,.05f,1},z[]{motion_test?.04999525f:.5f,0,0,0},zero[]{crop_scene_motion?-4.f/width:motion_test&&!crop_motion?-16.f/width:0.f,0,0,0};
     const float blue[]{.05f,.1f,1,1};
     const auto color_format=bgra?DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:DXGI_FORMAT_R8G8B8A8_UNORM;
     make(color_format,0,red,color);make(DXGI_FORMAT_R32_FLOAT,1,z,depth);make(game_guides?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,2,zero,motion);
@@ -81,15 +82,19 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     std::array<cheeky::fg::Image,2> compact_inputs,compact_outputs;
     std::array<cheeky::fg::Worker::OutputCopy,2> compact_copies;
     cheeky::fg::CompactLayout output_layout;
-    if(compact){
-        check(foveated&&!motion_test,"Compact probe requires foveated static stereo");
+    if(compact||final_xr){
+        check(foveated&&(!motion_test||crop_motion),"Compact probe requires foveated stereo");
         check(compact_transport.initialize(device,queue.Get()),"Compact hardware transport");
         auto* context=compact_transport.begin();check(context!=nullptr,"Compact hardware capture context");
         for(unsigned eye=0;eye<2;++eye){const auto& g=guides.eyes[eye];
             auto layout=cheeky::fg::compact_layout(width,height,true,g.focus_width,g.focus_height,g.focus_x,g.focus_y,peripheral_scale,g.focus_feather);
-            compact_inputs[eye]=compact_transport.packed_region(*context,colors[eye],D3D12_RESOURCE_STATE_COMMON,{{0,0},{int(width),int(height)}},0,color_format,layout);
-            check(bool(compact_inputs[eye]),"Compact physical native capture");compact_transport.freeze(*context,compact_inputs[eye]);
-            worker.color_layouts[eye]=worker.previous_layouts[eye]=layout;colors[eye]=compact_inputs[eye]->texture.Get();
+            // The moving-window probe uses dynamic full-eye inputs and checks
+            // atlas/direct-XR publication independently of source packing.
+            if(!crop_motion){
+                compact_inputs[eye]=compact_transport.packed_region(*context,colors[eye],D3D12_RESOURCE_STATE_COMMON,{{0,0},{int(width),int(height)}},0,color_format,layout);
+                check(bool(compact_inputs[eye]),"Compact physical native capture");compact_transport.freeze(*context,compact_inputs[eye]);
+                worker.color_layouts[eye]=worker.previous_layouts[eye]=layout;colors[eye]=compact_inputs[eye]->texture.Get();
+            }
             output_layout=cheeky::fg::compact_layout(width,height,true,g.focus_width,g.focus_height,g.focus_x,g.focus_y,peripheral_scale,g.focus_feather,scale);
             auto d=colors[eye]->GetDesc();d.Width=output_layout.stored_width();d.Height=output_layout.stored_height();d.Format=worker.focus.color_format;
             if(final_xr){d.Width=width;d.Height=height;}
@@ -100,7 +105,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
             compact_copies[eye].shading_mode=shading_mode;
         }
         std::uint64_t ticket{};check(compact_transport.execute(*context,ticket),"Compact physical capture submission");compact_transport.drain();
-        worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
+        if(!crop_motion)worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
     }
     cheeky::foveated_dlss::FgSnapshots prepared_snapshots;
     CheekyFgPair prepared_pair;
@@ -121,7 +126,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         guides.eyes[0]=prepared_pair.eyes[0];guides.eyes[1]=prepared_pair.eyes[1];
         check(guides.eyes[0].prepared_guides&&guides.eyes[1].prepared_guides,"Physical capture must use prepared buffers");
     }
-    auto generate=[&]{return worker.generate(guides,colors,colors,cameras,outputs,compact?&compact_copies:nullptr);};
+    auto generate=[&]{return worker.generate(guides,colors,colors,cameras,outputs,compact||final_xr?&compact_copies:nullptr);};
     ComPtr<ID3D12Resource> upload;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT upload_footprint{};UINT64 upload_bytes{};
     if(motion_test){
@@ -135,7 +140,8 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         last_frame=frame;void* mapped{};D3D12_RANGE empty{};check(SUCCEEDED(upload->Map(0,&empty,&mapped)),"Moving-scene map");
         for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x){
             auto* pixel=static_cast<unsigned char*>(mapped)+upload_footprint.Offset+y*upload_footprint.Footprint.RowPitch+x*4;
-            const bool bar=x>=96+frame*16&&x<144+frame*16;
+            const unsigned left=crop_motion?width/2-24+(crop_scene_motion?frame*4:0):96+frame*16;
+            const bool bar=x>=left&&x<left+48&&(!crop_motion||(y>=height/2-24&&y<height/2+24));
             pixel[0]=pixel[1]=pixel[2]=bar?255:0;pixel[3]=255;
         }upload->Unmap(0,nullptr);allocator->Reset();list->Reset(allocator.Get(),nullptr);
         cheeky::fg::color_transition(list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
@@ -143,8 +149,18 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         to.pResource=color.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
         cheeky::fg::color_transition(list.Get(),color.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
         list->Close();queue->ExecuteCommandLists(1,commands);
-        auto now=view,previous_view=view;const float step=2*std::tan(.7f)*16/width;
+        auto now=view,previous_view=view;const float step=2*std::tan(.7f)*(crop_scene_motion?4:16)/width;
         now.pose.position.x=-float(frame)*step;previous_view.pose.position.x=-float(frame?frame-1:0)*step;
+        if(crop_motion){
+            // Static scene, zero native vectors, identical poses: only the
+            // foveal window moves. A generated object must stay in place.
+            if(!crop_scene_motion)now=previous_view=view;guides.render_frame=frame+1;
+            for(unsigned i=0;i<2;++i){auto& eye=guides.eyes[i];const float direction=(frame%2?1.f:-1.f)*(i?-1.f:1.f);
+                eye.focus_x=crop_axis==1?0.f:direction*.03125f;
+                eye.focus_y=crop_axis==0?0.f:direction*.015625f;
+                if(compact&&!final_xr)compact_copies[i].layout=cheeky::fg::compact_layout(width,height,true,eye.focus_width,eye.focus_height,eye.focus_x,eye.focus_y,peripheral_scale,eye.focus_feather,scale);
+            }
+        }
         cameras.fill(cheeky::fg::camera(now,&previous_view,true));
     };
     bool generated{};
@@ -233,12 +249,33 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     const bool floating=worker.focus.color_format==DXGI_FORMAT_R16G16B16A16_FLOAT;
     const unsigned pixel_x=compact&&!final_xr?output_layout.center_width/2:width/2,pixel_y=compact&&!final_xr?output_layout.center_height/2:height/2;
     const auto* pixel=static_cast<const unsigned char*>(data)+footprint.Offset+pixel_y*footprint.Footprint.RowPitch+pixel_x*(floating?8:4);
+    if(crop_motion){
+        for(unsigned eye=0;eye<2;++eye){const auto& fp=eye?right_footprint:footprint;
+            const auto& layout=compact_copies[eye].layout;const bool packed=compact&&!final_xr;
+            const unsigned sw=packed?layout.center_width:width,sh=packed?layout.center_height:height;
+            double weight{},sx{},sy{};
+            for(unsigned y=0;y<sh;++y)for(unsigned x=0;x<sw;++x){
+                const auto value=*(static_cast<const unsigned char*>(data)+fp.Offset+y*fp.Footprint.RowPitch+x*4);
+                weight+=value;sx+=(x+.5)*value;sy+=(y+.5)*value;
+            }
+            const double measured_x=packed?layout.x+sx/std::max(1.,weight)*layout.w/sw:sx/std::max(1.,weight);
+            const double measured_y=packed?layout.y+sy/std::max(1.,weight)*layout.h/sh:sy/std::max(1.,weight);
+            const double expected_x=width/2.+(crop_scene_motion?last_frame*4.-2:0.);
+            std::cout<<"Moving-crop "<<(crop_scene_motion?"moving":"stationary")<<" object eye="<<eye<<" expected="<<expected_x<<','<<height/2.
+                <<" actual="<<measured_x<<','<<measured_y<<" error="<<measured_x-expected_x<<','<<measured_y-height/2.
+                <<" scale="<<scale<<" path="<<(final_xr?"XR":packed?"atlas":"composed")<<'\n';
+            check(weight>1000&&std::abs(measured_x-expected_x)<.5&&std::abs(measured_y-height/2.)<.5,
+                "Moving FG crop must preserve the scene's interpolated position");
+        }
+        readback->Unmap(0,nullptr);return;
+    }
     if(motion_test){
         double sum{},weight{};const auto* row=static_cast<const unsigned char*>(data)+footprint.Offset+height/2*footprint.Footprint.RowPitch;
         for(unsigned x=0;x<width;++x){const auto value=row[x*4];sum+=(x+.5)*value;weight+=value;}
         const double midpoint=120+last_frame*16-8,measured=sum/std::max(1.,weight);
         std::cout<<"Moving-head reprojection: NGX scale="<<(fg_probe_legacy_mvec?"legacy identity":"guide dimensions")<<" expected center="<<midpoint<<" actual="<<measured<<" error="<<std::abs(measured-midpoint)<<" pixels\n";
-        readback->Unmap(0,nullptr);check(weight>1000&&std::abs(measured-midpoint)<(fg_probe_legacy_mvec?3.:.25),"Generated scene must lie at the midpoint of the two rendered head poses");return;
+        readback->Unmap(0,nullptr);check(weight>1000&&std::abs(measured-midpoint)<(fg_probe_legacy_mvec?3.:.25),
+            "Generated scene must lie at the midpoint of the two rendered head poses");return;
     }
     std::cout << "Generated center format=" << unsigned(desc.Format) << " bytes: " << unsigned(pixel[0]) << ',' << unsigned(pixel[1]) << ',' << unsigned(pixel[2]) << ',' << unsigned(pixel[3]) << '\n';
     const bool nonblack=floating?(*reinterpret_cast<const unsigned short*>(pixel)>=0x3800):

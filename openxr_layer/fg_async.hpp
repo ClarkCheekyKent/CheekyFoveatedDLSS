@@ -420,6 +420,8 @@ struct BufferedPresenter final : Presenter {
         value.categories[fg_memory::generated]=output.memory(collect);
         for(const auto& eye:worker.focus.inputs)for(const auto& input:eye){
             collect.add(value.categories[fg_memory::prepared_color],input.color.Get());
+            collect.add(value.categories[fg_memory::prepared_color],input.recentered_color.Get());
+            collect.add(value.categories[fg_memory::prepared_motion],input.corrected_motion.Get());
             // Prepared captures are owned/countable by the producer snapshot
             // pool. These references are borrowed, not a second allocation.
             if(!input.borrowed_guides){collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());

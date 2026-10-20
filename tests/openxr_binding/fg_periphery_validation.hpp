@@ -15,7 +15,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         const auto result=WaitForSingleObject(event,10000);CloseHandle(event);check(result==WAIT_OBJECT_0,"Periphery wait");
     };
     auto begin=[&] {check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Periphery reset");};
-    ComPtr<ID3D12DescriptorHeap> rtvs;D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=5;
+    ComPtr<ID3D12DescriptorHeap> rtvs;D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=6;
     check(SUCCEEDED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtvs))),"Periphery RTV heap");
     const unsigned stride=device->GetDescriptorHandleIncrementSize(hd.Type);
     auto texture=[&](DXGI_FORMAT format,DXGI_FORMAT view,unsigned index,const float* clear) {
@@ -35,6 +35,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     auto center=texture(DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM,2,green);
     auto depth=texture(DXGI_FORMAT_R32_TYPELESS,DXGI_FORMAT_R32_FLOAT,3,z);
     auto motion=texture(DXGI_FORMAT_R16G16_FLOAT,DXGI_FORMAT_R16G16_FLOAT,4,zero);
+    auto generated=texture(DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R16G16B16A16_FLOAT,5,green);
     // A guide patch catches wrong crop coordinates or motion normalization even
     // when uniform endpoint colors would conceal the error in final pixels.
     const D3D12_RECT patch{8,8,16,16};const float patch_depth[]{.75f,0,0,0},patch_motion[]{2,-4,0,0};
@@ -45,6 +46,10 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
     };
     paint(depth.Get(),3,patch_depth);paint(motion.Get(),4,patch_motion);
+    cheeky::fg::color_transition(list.Get(),generated.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto generated_rtv=rtvs->GetCPUDescriptorHandleForHeapStart();generated_rtv.ptr+=5*stride;
+    const D3D12_RECT object{16,12,20,16};list->ClearRenderTargetView(generated_rtv,red,1,&object);
+    cheeky::fg::color_transition(list.Get(),generated.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
     execute();begin();
     CheekyFgEye guides{};guides.depth=depth.Get();guides.motion=motion.Get();
     guides.width=guides.height=64;
@@ -88,6 +93,32 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(vector[0]==.125f&&vector[1]==-.25f&&outside[0]==0&&outside[1]==0,
         "Cropped motion must retain normalized UV displacement instead of scaling with destination grid size");
     guide_readback->Unmap(0,nullptr);
+    // Check the actual recenter shader on WARP: independent signs/axes,
+    // fractional-pixel sampling, and native fallback in the uncovered strips.
+    for(const auto shift:std::array<std::array<float,2>,6>{{{.25f,0},{-.25f,0},{0,.25f},{0,-.25f},{.5f/32,0},{-.5f/32,0}}}){
+        begin();check(pipeline.recenter_frame(device,list.Get(),0,generated.Get(),shift[0],shift[1]),"Recenter moving-crop output");
+        auto* recentered=pipeline.inputs[0][0].recentered_color.Get();const auto d=recentered->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes{};device->GetCopyableFootprints(&d,0,1,0,&fp,nullptr,nullptr,&bytes);
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_READBACK;D3D12_RESOURCE_DESC rd{};
+        rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=bytes;rd.Height=rd.DepthOrArraySize=rd.MipLevels=rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ComPtr<ID3D12Resource> rb;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&rb))),"Recenter readback");
+        cheeky::fg::color_transition(list.Get(),recentered,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=recentered;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=fp;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        cheeky::fg::color_transition(list.Get(),recentered,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);execute();
+        void* data{};check(SUCCEEDED(rb->Map(0,nullptr,&data)),"Map recentered output");
+        auto pixel=[&](unsigned x,unsigned y){return reinterpret_cast<const unsigned short*>(static_cast<const char*>(data)+fp.Offset+y*fp.Footprint.RowPitch+x*8);};
+        if(std::abs(shift[0])<.1f&&shift[1]==0){const auto* p=pixel(shift[0]>0?15u:16u,14);
+            check(p[0]==0x3800&&p[1]==0x3800&&p[2]==0,"Recenter preserves half-pixel crop motion");
+        }else{
+            const auto* p=pixel(unsigned(18-shift[0]*32),unsigned(14-shift[1]*32));
+            check(p[0]==0x3c00&&p[1]==0&&p[2]==0,"Recenter uses the correct sign on each axis");
+            const auto* edge=pixel(shift[0]>0?31u:shift[0]<0?0u:16u,shift[1]>0?31u:shift[1]<0?0u:16u);
+            check(edge[0]==0&&edge[1]==0&&edge[2]==0x3c00,"Uncovered crop strips use native pixels without edge stretching");
+        }
+        rb->Unmap(0,nullptr);
+    }
+    std::cout<<"PASS moving-crop output recenter: both axes/signs, half-pixel sampling and native edge fallback\n";
     cheeky::fg::Camera camera{};camera.clip_to_prev=cheeky::fg::identity();
     cheeky::fg::Transport publication;check(publication.initialize(device,queue),"Direct composition publication pool");
     for(unsigned method=0;method<3;++method) {
