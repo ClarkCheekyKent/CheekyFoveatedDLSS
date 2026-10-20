@@ -176,6 +176,9 @@ void blockPixel(uint2 p,float4 peripheral){
  float fade=centerFade(uv,Rect,texel);
  [branch]if(fade<=0){Output[p]=peripheral;return;}
  float4 c;[branch]if(JitterCorrection.z>.5)c=Output[p];else c=Center.SampleLevel(LinearClamp,saturate((uv-Rect.xy)/Rect.zw),0);
+ // Avoid reading an invalid/undefined periphery contribution when this
+ // pixel is entirely within the center, including direct XR shading paths.
+ [branch]if(fade>=1){Output[p]=finalColor(c);return;}
  Output[p]=lerp(peripheral,finalColor(c),fade);
 }
 void shadeBlock(uint2 q,uint rate){
@@ -200,11 +203,15 @@ SamplerState LinearClamp:register(s0);
 [numthreads(8,8,1)]void Main(uint3 id:SV_DispatchThreadID){
  uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
  float2 uv=(float2(id.xy)+.5)/float2(w,h);
- float4 base=Periphery.SampleLevel(LinearClamp,uv,0);
- if(Options.z<.5){Output[id.xy]=base;return;}
+ if(Options.z<.5){Output[id.xy]=Periphery.SampleLevel(LinearClamp,uv,0);return;}
  float2 local=(uv-Rect.xy)/Rect.zw;
  float2 edge=min(uv-Rect.xy,Rect.xy+Rect.zw-uv);
  float fade=Options.w>0?saturate(min(edge.x,edge.y)/Options.w):(all(local>=0)&&all(local<=1)?1:0);
+ // Fully covered fovea must never access the periphery. Sampling it first
+ // can propagate NaNs even when lerp's center weight is exactly one.
+ [branch]if(fade>=1){Output[id.xy]=Center.SampleLevel(LinearClamp,saturate(local),0);return;}
+ float4 base=Periphery.SampleLevel(LinearClamp,uv,0);
+ [branch]if(fade<=0){Output[id.xy]=base;return;}
  Output[id.xy]=lerp(base,Center.SampleLevel(LinearClamp,saturate(local),0),fade);
 })HLSL";
 constexpr char pack_shader[]=R"HLSL(

@@ -1,4 +1,5 @@
 #include "dlssg_worker.hpp"
+#include "fg_ngx_capture.hpp"
 #include "fg_color_format.hpp"
 #include <algorithm>
 #include <limits>
@@ -14,6 +15,7 @@ namespace cheeky::fg {
 namespace {
 using namespace Microsoft::WRL;
 std::recursive_mutex ngx_mutex;
+NgxEvalBurst ngx_burst;
 // NGX can retain the initialization info. Keep it and its strings alive for
 // the lifetime of this resident addon; never shut down the game's NGX context.
 struct RuntimeInfo {
@@ -171,6 +173,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     std::lock_guard lock(ngx_mutex);
     if(!configured||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!wait_idle())return false;
+    ngx_burst.trace=trace;
+    ngx_burst.start(guides.render_frame,guides.capture_token);
     // This code runs on the FG generation worker, after the previous dispatch
     // has completed. No other thread writes diagnostic_mode or GPU statistics.
     const auto new_mode=static_cast<DiagnosticMode>(guides.diagnostic_mode<=4u?guides.diagnostic_mode:0u);
@@ -259,6 +263,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     bool cut_to_second_list=false;
     latency.begin(commands);gpu_timings.begin(commands);
     bool good=true;unsigned focused{};
+    const bool crop_diagnostic=trace&&((++crop_diagnostic_frame%60u)==1u);
     auto scaled=[](unsigned dimension,unsigned percent){return std::max(32u,(dimension*percent+50u)/100u);};
     // A foveated/scaled frame already has a final composition dispatch. Write
     // it into a leased publication image instead of a private scratch image
@@ -319,6 +324,17 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(!inverse(crop,uncrop))return false;
         }
         auto projection=multiply(crop,camera.view_to_clip),clip_prev=multiply(multiply(crop,camera.clip_to_prev),uncrop);
+        if(center_pass&&crop_diagnostic){
+            char message[640]{};
+            sprintf_s(message,"FG CROP-DIAG frame=%llu eye=%u active=%u eye_wh=%ux%u crop_xywh=%u,%u,%u,%u "
+                "color_in=%ux%u mv=%ux%u depth=%ux%u jitter=%.5f,%.5f "
+                "crop_scale=%.5f,%.5f crop_shift=%.5f,%.5f clip_prev_shift=%.5f,%.5f reset=%u",
+                static_cast<unsigned long long>(guides.render_frame),eye,unsigned(rect.active),
+                width,height,rect.x,rect.y,rect.w,rect.h,tw,th,g.motion_width,g.motion_height,
+                g.depth_width,g.depth_height,g.jitter_x,g.jitter_y,
+                crop.m[0],crop.m[5],crop.m[3],crop.m[7],clip_prev.m[3],clip_prev.m[7],g.reset);
+            trace(message);
+        }
         Matrix unprojection{},prev_clip{};if(!inverse(projection,unprojection)||!inverse(clip_prev,prev_clip))return false;
         // SDK matrices use row vectors. Our camera math uses column vectors.
         // NGX parameter maps retain matrix pointers rather than copying their
@@ -368,6 +384,13 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         barrier(commands,f.target,f.direct?(*copies)[f.eye].state:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         if(center_pass)gpu_timings.ngx_stamp(commands,eye,1);
+        if(ngx_burst.active){
+            const unsigned pass=center_pass?0u:1u;
+            const auto& inputs=focus.inputs[eye][pass];
+            ngx_burst.record(device.Get(),commands,inputs.color.Get(),D3D12_RESOURCE_STATE_COMMON,"input_color",eye,pass);
+            ngx_burst.record(device.Get(),commands,inputs.depth.Get(),D3D12_RESOURCE_STATE_COMMON,"input_depth",eye,pass);
+            ngx_burst.record(device.Get(),commands,inputs.motion.Get(),D3D12_RESOURCE_STATE_COMMON,"input_motion",eye,pass);
+        }
         auto result=evaluate(commands,f.handle,f.params,nullptr);
         if(!ok(result)&&f.direct){
             // Some NGX versions reject subrect/shared destinations. Keep only a
@@ -389,6 +412,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(!ok(result)){report("NGX FG EvaluateFeature",result);failed=true;return false;}
         barrier(commands,f.target,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         if(f.direct)(*copies)[f.eye].state=D3D12_RESOURCE_STATE_COMMON;
+        if(ngx_burst.active)
+            ngx_burst.record(device.Get(),commands,f.target,D3D12_RESOURCE_STATE_COMMON,
+                "output_interpolated",eye,center_pass?0u:1u,f.offset_x,f.offset_y,f.width,f.height,f.direct);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->CopyBufferRegion(f.readback.Get(),0,f.disable.Get(),0,4);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
@@ -549,6 +575,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // release captured resources without an untracked in-flight GPU packet.
     const HRESULT close_result=commands->Close();
     if(FAILED(close_result)||!good) {
+        ngx_burst.abandon();
         if(FAILED(close_result))report("FG command list close",unsigned(close_result));
         // A split-mode failure before the cut leaves list B recording. Close
         // it too before reusing its allocator on the next frame. Neither list
@@ -574,7 +601,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         ID3D12CommandList* lists[]{commands};queue->ExecuteCommandLists(1,lists);
     }
     if(copies)for(auto& copy:*copies)copy.state=copy.final_xr?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_GENERIC_READ;
-    if(FAILED(queue->Signal(fence.Get(),++serial)))return false;
+    if(FAILED(queue->Signal(fence.Get(),++serial))){ngx_burst.abandon();return false;}
+    ngx_burst.commit(fence.Get(),serial);
     submitted_at=TimingClock::now();latency.submitted(fence.Get(),serial);
     // Notify only after commands AND their completion fence are queued. The
     // presenter may release the next native render without waiting for FG to

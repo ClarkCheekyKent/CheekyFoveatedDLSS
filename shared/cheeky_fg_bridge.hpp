@@ -245,6 +245,14 @@ struct CheekyFgStorageOptions {
     float width{.55f},height{.45f},x{},y{},feather{.04f};
 };
 using CheekyFgStorageOptionsFn=bool(__cdecl*)(CheekyFgStorageOptions*);
+// Snapshot of the actual per-physical-eye NGX crop, published by the guide
+// producer. A missing eye must use full-color fallback, never global offsets.
+struct CheekyFgStaticEyeCrop {float width{},height{},x{},y{};};
+struct CheekyFgStaticEyeCropsV1 {
+    std::uint32_t abi{1},size{sizeof(CheekyFgStaticEyeCropsV1)},valid_mask{};
+    CheekyFgStaticEyeCrop eye[2]{};
+};
+using CheekyFgStaticEyeCropsFn=bool(__cdecl*)(CheekyFgStaticEyeCropsV1*);
 struct CheekyFgTimingValue {double mean{},last{};};
 struct CheekyFgExperimentDiagnostics {
     std::uint32_t abi{1},size{sizeof(CheekyFgExperimentDiagnostics)},supported{};

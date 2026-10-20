@@ -91,6 +91,11 @@ std::unordered_map<const NgxHandle*,std::uint32_t> feature_flags;
 // Bump only for tracked game NGX-SR feature create/release, never for FG's
 // internal features or for a live pacing-mode switch.
 std::uint64_t game_sr_revision{1};
+// No resource is retained here. This is only geometry from the last valid
+// physical-eye NGX evaluation. Guarded by `mutex`.
+CheekyFgStaticEyeCropsV1 static_eye_crops;
+std::uint64_t static_eye_crop_configuration{},static_eye_crop_mapping{};
+
 // GPU recordings can outlive a runtime detach. Keep queue generations until
 // their recorded work and every consumer lease have retired.
 struct SnapshotStore {
@@ -151,6 +156,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
 // presenter uses this key to retire the old pipeline at the next xrWaitFrame.
 std::uint64_t configuration(const Settings& s) noexcept {
     auto hash=fg_sr_mode_configuration(configuration(s.fg),s.enabled);
+    if(s.fg.foveated)hash=(hash^unsigned(s.center_mode))*1099511628211ull;
     if(s.fg.match_sr_region&&s.fg.foveated){
         // SR's static region can change independently of FG. Gaze placement is
         // sampled per eye rather than hashed (it moves every frame).
@@ -362,7 +368,19 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
         trace_event("FG stereo identity revision=%llu calibrated=%u view=%llu physical_eye=%u (next complete pair resets history)",
             identity.mapping_revision,unsigned(assignment.calibrated),static_cast<unsigned long long>(view_id),identity.eye);
     }
-    if(snapshots().record(cmd,m,identity)){pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;}
+    if(snapshots().record(cmd,m,identity)){
+        pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;
+        if(static_eye_crop_configuration!=m.configuration||static_eye_crop_mapping!=identity.mapping_revision){
+            static_eye_crops.valid_mask=0;
+            static_eye_crop_configuration=m.configuration;
+            static_eye_crop_mapping=identity.mapping_revision;
+        }
+        // Only a verified physical-eye assignment can become a compact crop.
+        if(identity.eye<2){
+            static_eye_crops.eye[identity.eye]={m.focus_width,m.focus_height,m.focus_x,m.focus_y};
+            static_eye_crops.valid_mask|=(1u<<identity.eye);
+        }
+    }
 } catch(...) {}
 }
 // Called by the adapter before installing any UEVR-private inline hooks and
@@ -541,9 +559,28 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(Che
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(CheekyFgStorageOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
-    const auto& s=cheeky::foveated_dlss::current_settings().fg;
-    out->compact=s.compact_storage==1u&&s.foveated;out->peripheral_percent=s.peripheral_percent;
+    const auto settings=cheeky::foveated_dlss::current_settings();
+    const auto& s=settings.fg;
+    // Dynamic gaze uses existing full-eye native captures as previous/current
+    // color history. No additional full-resolution history copy is allocated.
+    out->compact=s.compact_storage==1u&&s.foveated&&
+        settings.center_mode==cheeky::foveated_dlss::FoveationCenterMode::fixed &&
+        !settings.eye_calibration_continuous;
+    out->peripheral_percent=s.peripheral_percent;
     out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStaticEyeCropsV1(CheekyFgStaticEyeCropsV1* out) noexcept {
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    std::lock_guard lock(cheeky::foveated_dlss::mutex);
+    const auto settings=cheeky::foveated_dlss::current_settings();
+    const auto desired=cheeky::foveated_dlss::fg_source_configuration(
+        cheeky::foveated_dlss::configuration(settings),cheeky::foveated_dlss::game_sr_revision);
+    *out=cheeky::foveated_dlss::static_eye_crops;
+    // Cache is unavailable immediately after a configuration/calibration
+    // transition. Full-eye fallback is safe during those startup frames.
+    if(settings.center_mode!=cheeky::foveated_dlss::FoveationCenterMode::fixed||
+       desired!=cheeky::foveated_dlss::static_eye_crop_configuration)out->valid_mask=0;
+    return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectOutputOptionsV1(CheekyFgDirectOutput* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;

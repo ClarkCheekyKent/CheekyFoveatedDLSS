@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_transport.hpp"
+#include "fg_burst_capture.hpp"
 #include "fg_native_submission_math.hpp"
 #include "../src/d3d12_native.hpp"
 #include "../src/fg_source_lifecycle.hpp"
@@ -15,7 +16,7 @@ namespace cheeky::fg {
 // Three native leases and two ready pairs bound latency and texture ownership.
 struct BufferedPresenter final : Presenter {
     struct Slice {XrRect2Di rect{};unsigned layer{};};
-    struct CapturePlan {D3D12_RESOURCE_DESC desc{};std::vector<Slice> slices;bool full_required{};};
+    struct CapturePlan {D3D12_RESOURCE_DESC desc{};std::vector<Slice> slices;std::vector<unsigned> physical_eyes;bool full_required{};};
     struct DirectCapture {std::vector<std::pair<Slice,Image>> eyes;};
     static bool same_slice(const Slice& a,const Slice& b) noexcept {
         return a.layer==b.layer&&a.rect.offset.x==b.rect.offset.x&&a.rect.offset.y==b.rect.offset.y&&
@@ -98,12 +99,16 @@ struct BufferedPresenter final : Presenter {
     struct Chain {
         XrSwapchain handle{};std::vector<XrSwapchainImageD3D12KHR> images;D3D12_RESOURCE_DESC desc{};
         std::uint64_t uploaded{}; // Content identity; GPU contexts retain sources only until their upload fence.
+        unsigned last_uploaded_index{UINT32_MAX}; // Last image released to OpenXR for this chain.
         bool direct_writable{},linear_color{};
     };
     std::condition_variable_any changed;
     std::mutex capture_mutex;
     std::thread presentation_thread,generation_thread,pacing_thread;
     Transport producer,output,uploads;
+    FgBurstCapture burst;
+    std::uint64_t burst_native{},burst_current{},burst_presentation{};
+    bool burst_generated{};
     // Default: dedicated HIGH-priority inference queue. Lua can also select a
     // separate NORMAL queue or share the application's original queue. The
     // OpenXR binding, guide capture and uploads always retain the original queue.
@@ -152,6 +157,18 @@ struct BufferedPresenter final : Presenter {
     std::atomic<unsigned> color_capture_mode{},upload_mode{},latency_diagnostics{1};
     CheekyFgTransportOptionsFn transport_options_query{};
     CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
+    CheekyFgStaticEyeCropsV1 static_eye_crops; // Last verified per-eye geometry, latched at WaitFrame.
+    std::uint64_t pose_sample_count{};
+    CompactLayout eye_color_layout(unsigned eye,unsigned width,unsigned height) const noexcept {
+        const auto& s=storage_options;
+        // Never fall back to the global offsets for a physical eye: those are
+        // not stereo-aligned and may put low-resolution context inside FG crop.
+        if(s.compact&&eye<2&&(static_eye_crops.valid_mask&(1u<<eye))){
+            const auto& r=static_eye_crops.eye[eye];
+            return compact_layout(width,height,true,r.width,r.height,r.x,r.y,s.peripheral_percent,s.feather);
+        }
+        return compact_layout(width,height,false,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
+    }
     std::atomic<std::uint64_t> direct_eye_copies{},eye_crop_copies{},capture_fallbacks{};
     CheekyFgExperimentDiagnostics experiment_state;
     CheekyFgMemory memory_state;
@@ -246,6 +263,11 @@ struct BufferedPresenter final : Presenter {
     std::array<TimingAverage,3> app_calls;
     CadenceWindow cadence_window;
     std::uint64_t distinct_native{},repeated_presentations{},runtime_submissions{};
+    // Debug-only application->OpenXR submission trace. Monotonicity here only
+    // proves what Cheeky handed to xrEndFrame, NOT what the headset displayed.
+    XrTime presentation_trace_last_time{};
+    double presentation_trace_last_position{-1.};
+    std::uint64_t presentation_trace_events{},presentation_trace_anomalies{};
     double capture_cpu_accumulator{};
     struct ProducerElapsed {
         BufferedPresenter& owner;TimingClock::time_point begin{TimingClock::now()};
@@ -534,6 +556,8 @@ struct BufferedPresenter final : Presenter {
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
         distinct_native=repeated_presentations=runtime_submissions=0;
+        presentation_trace_last_time=0;presentation_trace_last_position=-1.;
+        presentation_trace_events=presentation_trace_anomalies=0;
     }
     void destroy_chains() noexcept {
         for(auto& c:scene_chains){if(c.handle)destroy_chain(c.handle);c={};}
@@ -578,7 +602,22 @@ struct BufferedPresenter final : Presenter {
         const auto storage_query=runtime?reinterpret_cast<CheekyFgStorageOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetStorageOptionsV1")):nullptr;
         CheekyFgStorageOptions storage;
         if(storage_query)storage_query(&storage);
-        {std::lock_guard capture_lock(capture_mutex);storage_options=storage;}
+        const auto crop_query=runtime?reinterpret_cast<CheekyFgStaticEyeCropsFn>(
+            GetProcAddress(runtime,"CheekyFG_GetStaticEyeCropsV1")):nullptr;
+        CheekyFgStaticEyeCropsV1 crops;
+        if(!crop_query||!crop_query(&crops))crops.valid_mask=0;
+        unsigned old_compact{},old_mask{};
+        {std::lock_guard capture_lock(capture_mutex);
+            old_compact=storage_options.compact;old_mask=static_eye_crops.valid_mask;
+            storage_options=storage;static_eye_crops=crops;
+        }
+        if(trace&&(old_compact!=storage.compact||old_mask!=crops.valid_mask)){
+            char message[180]{};
+            sprintf_s(message,"FG native color storage compact=%u valid_physical_eyes=0x%x "
+                "(dynamic gaze/continuous calibration uses existing full-eye color history)",
+                storage.compact,crops.valid_mask);
+            trace(message);
+        }
         const auto query=transport_options_query?transport_options_query:runtime?
             reinterpret_cast<CheekyFgTransportOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetTransportOptionsV1")):nullptr;
         CheekyFgTransportOptions options;
@@ -676,9 +715,10 @@ struct BufferedPresenter final : Presenter {
             plan->second.desc.DepthOrArraySize==desc.DepthOrArraySize&&plan->second.desc.Format==desc.Format;
         DirectCapture eyes;Image copy;
         if(direct){
-            for(auto slice:plan->second.slices){
-                const auto& s=storage_options;
-                const auto layout=compact_layout(slice.rect.extent.width,slice.rect.extent.height,s.compact!=0,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
+            for(std::size_t n=0;n<plan->second.slices.size();++n){
+                const auto slice=plan->second.slices[n];
+                const unsigned eye=n<plan->second.physical_eyes.size()?plan->second.physical_eyes[n]:2u;
+                const auto layout=eye_color_layout(eye,slice.rect.extent.width,slice.rect.extent.height);
                 auto image=layout.packed()?producer.packed_region(*c,original,xr_image_state(),slice.rect,slice.layer,format,layout):
                     producer.region_copy(*c,original,xr_image_state(),slice.rect,slice.layer,format);
                 if(!image){capture_overflow=true;std::uint64_t discarded{};producer.execute(*c,discarded);return false;}
@@ -766,7 +806,15 @@ struct BufferedPresenter final : Presenter {
             for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
                 auto& plan=next_plans[sub.swapchain];plan.desc=captured_descs[sub.swapchain];
                 Slice slice{sub.imageRect,sub.imageArrayIndex};
-                if(std::none_of(plan.slices.begin(),plan.slices.end(),[&](const auto& x){return same_slice(x,slice);}))plan.slices.push_back(slice);
+                auto existing=std::find_if(plan.slices.begin(),plan.slices.end(),
+                    [&](const auto& x){return same_slice(x,slice);});
+                if(existing==plan.slices.end()){
+                    plan.slices.push_back(slice);plan.physical_eyes.push_back(eye);
+                }else if(plan.physical_eyes[std::size_t(existing-plan.slices.begin())]!=eye){
+                    // Same image subrect is used for both eyes; cannot give it
+                    // two different packed layouts. Copy the full texture.
+                    plan.full_required=true;
+                }
             }
             subimages(job->layers,[&](XrSwapchainSubImage& sub){next_plans[sub.swapchain].full_required=true;return true;});
             capture_plans=std::move(next_plans);
@@ -789,8 +837,7 @@ struct BufferedPresenter final : Presenter {
                 }else {
                     const auto found=captured.find(sub.swapchain);
                     if(found!=captured.end()){
-                        const auto& s=storage_options;const auto layout=compact_layout(sub.imageRect.extent.width,sub.imageRect.extent.height,
-                            s.compact!=0,s.width,s.height,s.x,s.y,s.peripheral_percent,s.feather);
+                        const auto layout=eye_color_layout(eye,sub.imageRect.extent.width,sub.imageRect.extent.height);
                         if(layout.packed()){
                             job->color[eye]=producer.packed_region(*c,found->second->texture.Get(),found->second->state,sub.imageRect,sub.imageArrayIndex,
                                 found->second->texture->GetDesc().Format,layout);c->images.push_back(found->second);
@@ -848,6 +895,28 @@ struct BufferedPresenter final : Presenter {
                         job->source_depth=unsigned(g.depth->GetDesc().Format);job->source_motion=unsigned(g.motion->GetDesc().Format);
                         const auto& layout=job->color[eye]->layout;
                         if(g.width!=(layout.width?layout.width:d.Width)||g.height!=(layout.height?layout.height:d.Height)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
+                        if(layout.packed()){
+                            // Metadata is published on the preceding guide evaluations.
+                            // If geometry changed since capture, do not feed NGX a high-
+                            // resolution crop partly supplied by low-res context.
+                            const auto expected=compact_layout(layout.width,layout.height,true,
+                                g.focus_width,g.focus_height,g.focus_x,g.focus_y,
+                                g.peripheral_percent,layout.feather);
+                            if(!expected.packed()||layout.x!=expected.x||layout.y!=expected.y||
+                               layout.w!=expected.w||layout.h!=expected.h){
+                                job->guides_valid=false;
+                                job->guide_state=CheekyFgState::generation_failed;
+                                if(trace){
+                                    char message[250]{};
+                                    sprintf_s(message,"FG compact capture/guide crop disagreement eye=%u "
+                                        "packed=%u,%u,%u,%u matched=%u,%u,%u,%u; skipping FG pair",
+                                        eye,layout.x,layout.y,layout.w,layout.h,
+                                        expected.x,expected.y,expected.w,expected.h);
+                                    trace(message);
+                                }
+                                break;
+                            }
+                        }
                     }
                     if(job->guides_valid){
                         // The plugin has ALREADY captured immutable guides.
@@ -971,7 +1040,7 @@ struct BufferedPresenter final : Presenter {
             pair.native_views=pair.current_views=job->views;pair.layers=job->layers;pair.auxiliary=job->auxiliary;
             pair.space=job->space;pair.blend=job->blend;pair.ready=job->ready;
             bool success{};
-            bool attempted{};
+            bool attempted{},history_was_reset{};
             if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
                cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)&&
                previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
@@ -1032,7 +1101,27 @@ struct BufferedPresenter final : Presenter {
                     // reset on any transition between tagged and untagged mode.
                     if((previous->render_frame||job->render_frame)&&
                        previous->render_frame+1!=job->render_frame)reset_history=true;
+                    history_was_reset=reset_history;
                     if(reset_history)for(auto& eye:guides.eyes)eye.reset=1;
+                    if(trace && ((++pose_sample_count%60u)==1u)) {
+                        auto angle=[](const XrQuaternionf& a,const XrQuaternionf& b){
+                            const double dot=std::abs(double(a.x)*b.x+double(a.y)*b.y+double(a.z)*b.z+double(a.w)*b.w);
+                            return 2.0*180.0/3.141592653589793*std::acos(std::clamp(dot,0.0,1.0));
+                        };
+                        for(unsigned eye=0;eye<2;++eye){
+                            const auto& a=previous->views[eye].pose;
+                            const auto& b=job->views[eye].pose;
+                            const double dx=b.position.x-a.position.x,dy=b.position.y-a.position.y,dz=b.position.z-a.position.z;
+                            char message[360]{};
+                            sprintf_s(message,"FG POSE-DELTA native_prev=%llu native_next=%llu eye=%u "
+                                "source_dt_ms=%.3f position_delta_m=%.6f angle_deg=%.5f "
+                                "current_pose_xyz=%.4f,%.4f,%.4f (OpenXR submitted poses, not game render poses)",
+                                static_cast<unsigned long long>(previous->id),static_cast<unsigned long long>(job->id),eye,
+                                std::chrono::duration<double,std::milli>(job->captured_at-previous->captured_at).count(),std::sqrt(dx*dx+dy*dy+dz),
+                                angle(a.orientation,b.orientation),b.position.x,b.position.y,b.position.z);
+                            trace(message);
+                        }
+                    }
                     std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)
                         cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.eyes[eye].depth_inverted!=0);
                     std::array<ID3D12Resource*,2> input{job->color[0]->texture.Get(),job->color[1]->texture.Get()},
@@ -1126,7 +1215,24 @@ struct BufferedPresenter final : Presenter {
                 if(job->epoch!=epoch||degraded){previous.reset();reset_history=true;continue;}
                 if(pair.direct_xr){direct_job->success=success;if(success){++direct_stats.frames;direct_job->result=std::move(pair);}
                     else{++direct_stats.fallbacks;direct_stats.last_path=3;note_direct_failure_locked(CheekyFgDirectReason::generation);}}
-                else{ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();}
+                else{
+                    if(trace&&job->latency_diagnostics){
+                        char publication[420]{};
+                        sprintf_s(publication,
+                            "FG XR-PAIR epoch=%llu native=%llu current=%llu interpolated=%u "
+                            "render_frame=%llu guide_token=%llu reset=%u success=%u worker_serial=%llu",
+                            static_cast<unsigned long long>(epoch),
+                            static_cast<unsigned long long>(pair.native_id),
+                            static_cast<unsigned long long>(pair.current_id),
+                            pair.interpolated?1u:0u,
+                            static_cast<unsigned long long>(job->render_frame),
+                            static_cast<unsigned long long>(job->guide_token),
+                            history_was_reset?1u:0u,success?1u:0u,
+                            static_cast<unsigned long long>(worker.serial));
+                        trace(publication);
+                    }
+                    ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();
+                }
                 if(success)completed_pair_id=job->id;
                 // Once real interpolation is available, briefly stop the
                 // speculative native mailbox from running ahead of its first
@@ -1203,11 +1309,31 @@ struct BufferedPresenter final : Presenter {
         XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
         const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
         {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-        const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images.size()&&
-            uploads.upload(source,chain.images[index].texture,ticks,chain.desc.Format,chain.linear_color,xr_image_state());
+        bool copied=false;
+        if(XR_SUCCEEDED(wait_result)&&index<chain.images.size()){
+            auto* target=chain.images[index].texture;
+            if(!burst.recording_frame&&!burst.strict)
+                copied=uploads.upload(source,target,ticks,chain.desc.Format,chain.linear_color,xr_image_state());
+            else {
+                auto* context=uploads.begin(ticks);
+                if(!context){uploads.drain();context=uploads.begin(ticks);}
+                if(context&&uploads.record_upload(*context,source,target,chain.desc.Format,chain.linear_color,xr_image_state())){
+                    if(scene&&burst.recording_frame){
+                        const unsigned eye=&chain==&scene_chains[0]?0u:1u;
+                        burst.record(device.Get(),context->list.Get(),source->texture.Get(),source->state,
+                            "source",eye,index,burst_native,burst_current,burst_generated,burst_presentation);
+                        burst.record(device.Get(),context->list.Get(),target,xr_image_state(),
+                            "openxr",eye,index,burst_native,burst_current,burst_generated,burst_presentation);
+                    }
+                    std::uint64_t ticket{};copied=uploads.execute(*context,ticket);
+                    if(copied){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
+                    else burst.abandon();
+                }else {if(context)context->list->Close();burst.abandon();}
+            }
+        }
         XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         const bool released=XR_SUCCEEDED(release_image(chain.handle,index,&release));
-        if(released&&copied)chain.uploaded=source->identity;
+        if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
         return released&&copied;
     }
     bool upload_batch(const std::vector<std::pair<Chain*,Image>>& requests) {
@@ -1234,8 +1360,18 @@ struct BufferedPresenter final : Presenter {
             good=c!=nullptr;
             if(c){
                 for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format,item.chain->linear_color,xr_image_state())){good=false;break;}
-                if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);}
-                else c->list->Close();
+                if(good&&burst.recording_frame)for(auto& item:items){
+                    if(item.chain!=&scene_chains[0]&&item.chain!=&scene_chains[1])continue;
+                    const unsigned eye=item.chain==&scene_chains[0]?0u:1u;
+                    burst.record(device.Get(),c->list.Get(),item.source->texture.Get(),item.source->state,
+                        "source",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
+                    burst.record(device.Get(),c->list.Get(),item.chain->images[item.index].texture,xr_image_state(),
+                        "openxr",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
+                }
+                if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
+                    if(good){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
+                    else burst.abandon();}
+                else {c->list->Close();burst.abandon();}
             }
         }
         const bool submitted=good;
@@ -1244,7 +1380,7 @@ struct BufferedPresenter final : Presenter {
         for(auto& item:items)if(item.acquired&&item.waited){
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             const bool released=XR_SUCCEEDED(release_image(item.chain->handle,item.index,&release));
-            if(submitted&&released)item.chain->uploaded=item.source->identity;
+            if(submitted&&released){item.chain->uploaded=item.source->identity;item.chain->last_uploaded_index=item.index;}
             good&=released;
         }
         return good;
@@ -1393,6 +1529,9 @@ struct BufferedPresenter final : Presenter {
         // inference + immutable-copy fence completes. Native pairs retain the
         // producer fence; both paths therefore refer to the original job here.
         if(!producer.completed(pair.ready))return false;
+        burst_native=pair.native_id;burst_current=pair.current_id;burst_generated=generated;
+        burst_presentation=ticks;
+        burst.begin_submission();
         if(latency_diagnostics.load()!=0)collect_native_submission_probes();
         auto views=original_views;
         std::vector<std::pair<Chain*,Image>> batch;
@@ -1474,6 +1613,7 @@ struct BufferedPresenter final : Presenter {
             const auto start=TimingClock::now();auto result=xr.wait_frame(session,&wait,&frame);const auto waited_ms=elapsed_ms(start);
             if(XR_FAILED(result)){std::lock_guard lock(mx);terminal=result;stopping=true;changed.notify_all();break;}
             const auto present_start=TimingClock::now();
+            burst.log=trace;burst.poll_keys();
             XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=xr.begin_frame(session,&begin);
             {std::lock_guard lock(mx);runtime_begin.add(elapsed_ms(present_start));}
             if(XR_FAILED(result)){std::lock_guard lock(mx);terminal=result;stopping=true;changed.notify_all();break;}
@@ -1515,17 +1655,29 @@ struct BufferedPresenter final : Presenter {
                 }
             }
             bool submitted{},is_generated{},closed{},repeated{};
+            std::uint64_t trace_native_id{},trace_current_id{},trace_source_left{},trace_source_right{};
+            bool trace_direct{};
+            double trace_source_position{-1.};
             if(raw_frame&&!stop_now) {
                 auto end=*raw_frame;end.displayTime=frame.predictedDisplayTime;
                 result=runtime_end_frame(&end);submitted=closed=true;
                 {std::lock_guard lock(mx);raw_result=result;raw=nullptr;raw_done=true;have_active=false;
                     generated_phase=false;last_position=0;changed.notify_all();}
+                presentation_trace_last_time=0;presentation_trace_last_position=-1.;
                 wake_producer();
             }else if(have_active&&!stop_now&&frame.shouldRender==XR_TRUE) {
                 is_generated=generated_phase&&active.interpolated;
                 const auto& images=is_generated?active.generated:active.native;
                 const auto& views=is_generated?active.generated_views:active.native_views;
                 repeated=!is_generated&&double(active.native_id)==last_position;
+                // Snapshot identity BEFORE the generated submission advances
+                // active.native_id/current_views to the next real frame.
+                trace_native_id=active.native_id;
+                trace_current_id=active.current_id;
+                trace_source_position=double(active.native_id)+(is_generated?.5:0.);
+                trace_source_left=images[0]?images[0]->identity:0;
+                trace_source_right=images[1]?images[1]->identity:0;
+                trace_direct=is_generated&&active.direct_xr;
                 // A direct request may wake a tick only to fall back. Fresh-only
                 // mode must not use that wake to resubmit the preceding native.
                 if(allow_repeats||!repeated)submitted=render(active,images,views,is_generated,repeated,frame.predictedDisplayTime,result,closed);
@@ -1543,6 +1695,76 @@ struct BufferedPresenter final : Presenter {
                 empty.environmentBlendMode=have_active?active.blend:XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                 wake_producer();
                 result=runtime_end_frame(&empty);
+            }
+            // Capture each runtime frame, including empty submissions, so
+            // silent skips cannot masquerade as a clean N/G/N cadence.
+            // Use the existing FG Latency Diagnostics switch to avoid any
+            // additional output or locking in ordinary gameplay.
+            if(trace&&latency_diagnostics.load()!=0&&!raw_frame) {
+                const bool valid=XR_SUCCEEDED(result);
+                const bool backward_time=valid&&presentation_trace_last_time!=0&&
+                    frame.predictedDisplayTime<=presentation_trace_last_time;
+                const bool backward_content=valid&&submitted&&!repeated&&
+                    trace_source_position<=presentation_trace_last_position;
+                const bool gap=valid&&submitted&&!repeated&&
+                    presentation_trace_last_position>=0&&trace_source_position>presentation_trace_last_position+1.01;
+                const bool wrong_upload=valid&&submitted&&!trace_direct&&
+                    (scene_chains[0].uploaded!=trace_source_left||
+                     scene_chains[1].uploaded!=trace_source_right);
+                if(backward_time||backward_content||wrong_upload)++presentation_trace_anomalies;
+                if(valid){
+                    presentation_trace_last_time=frame.predictedDisplayTime;
+                    if(submitted&&!repeated)presentation_trace_last_position=trace_source_position;
+                }
+                ++presentation_trace_events;
+                // Complete first 3,000 events (~25-40 s), then sample every
+                // fourth event indefinitely. ALWAYS log anomalies and skips.
+                const bool write=presentation_trace_events<=3000||
+                    (presentation_trace_events%4)==0||backward_time||backward_content||
+                    gap||wrong_upload||!submitted||repeated||!valid;
+                if(write){
+                    // The expected headset deadline is a prediction, not proof
+                    // of compositor display. Negative lead means submitted late.
+                    double predicted_lead_ms{-1.};
+                    if(xr.time_to_qpc){
+                        LARGE_INTEGER display_qpc{};
+                        if(XR_SUCCEEDED(xr.time_to_qpc(xr.time_instance,frame.predictedDisplayTime,&display_qpc))&&
+                           display_qpc.QuadPart>0){
+                            const auto submit_qpc=LatencyProbe::cpu_now();
+                            predicted_lead_ms=(double(display_qpc.QuadPart)-double(submit_qpc))*
+                                1000./LatencyProbe::cpu_frequency();
+                        }
+                    }
+                    // Generation publishes ready pairs under mx. Snapshot the
+                    // queue and epoch rather than racing the producer thread.
+                    std::uint64_t trace_epoch{},trace_ready{},trace_generated{};
+                    {std::lock_guard lock(mx);
+                        trace_epoch=epoch;trace_ready=ready.size();trace_generated=generated_count;}
+                    char timeline[680]{};
+                    sprintf_s(timeline,
+                        "FG XR-TIMELINE event=%llu epoch=%llu xr_tick=%llu kind=%s native=%llu current=%llu "
+                        "position=%.1f left_tex=%llu right_tex=%llu xr_left=%u xr_right=%u "
+                        "upload_match=%u display_ns=%lld period_ns=%lld "
+                        "should_render=%u xr_result=%ld forward=%u time_forward=%u gap=%u repeats=%u "
+                        "predicted_lead_ms=%.3f ready_pairs=%llu generated_total=%llu anomalies=%llu",
+                        static_cast<unsigned long long>(presentation_trace_events),
+                        static_cast<unsigned long long>(trace_epoch),static_cast<unsigned long long>(ticks),
+                        submitted?(is_generated?"GEN":repeated?"REPEAT":"NATIVE"):"EMPTY",
+                        static_cast<unsigned long long>(trace_native_id),
+                        static_cast<unsigned long long>(trace_current_id),trace_source_position,
+                        static_cast<unsigned long long>(trace_source_left),
+                        static_cast<unsigned long long>(trace_source_right),
+                        scene_chains[0].last_uploaded_index,scene_chains[1].last_uploaded_index,
+                        wrong_upload?0u:1u,
+                        static_cast<long long>(frame.predictedDisplayTime),
+                        static_cast<long long>(frame.predictedDisplayPeriod),
+                        frame.shouldRender==XR_TRUE?1u:0u,static_cast<long>(result),
+                        backward_content?0u:1u,backward_time?0u:1u,gap?1u:0u,
+                        repeated?1u:0u,predicted_lead_ms,static_cast<unsigned long long>(trace_ready),
+                        static_cast<unsigned long long>(trace_generated),
+                        static_cast<unsigned long long>(presentation_trace_anomalies));
+                    trace(timeline);
+                }
             }
             measure_presenter_memory();
             char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{},native_latency_log[512]{};
