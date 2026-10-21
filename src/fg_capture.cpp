@@ -350,8 +350,10 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
         // Use the exact SR crop that was actually prepared, including its
         // pixel rounding. Never invoke the SR gaze solver again from FG:
         // doing so advances the same temporal/crop state twice per eye.
-        m.focus_width=sr.valid ? sr.region_width : settings.width;
-        m.focus_height=sr.valid ? sr.region_height : settings.height;
+        const auto size=sr.valid ? std::pair{sr.region_width,sr.region_height} :
+            fg_sr_fallback_size(settings.width,settings.height,m.depth_width,m.depth_height,w,h);
+        m.focus_width=size.first;
+        m.focus_height=size.second;
         m.focus_feather=settings.transition_width;
         // Matching overrides manual FG offsets but retains stereo alignment.
         m.focus_x=base_u-.5f;

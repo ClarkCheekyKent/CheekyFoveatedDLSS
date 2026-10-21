@@ -12,6 +12,7 @@
 #include "diagnostics.hpp"
 #include "dlss_nr_contract.hpp"
 #include "foveation.hpp"
+#include "fg_sr_region.hpp"
 #include "gaze_foveation.hpp"
 #include "gaze_math.hpp"
 #include "gaze_policy.hpp"
@@ -1082,6 +1083,34 @@ void test_nr_only_center(bool openvr) {
     test_openvr_snapshot = nullptr;
     unregister_stereo_view(1901); unregister_stereo_view(1902);
     clear_stereo_calibration(); reset_gaze_foveation();
+}
+
+void test_fg_sr_matching_size() {
+    using namespace cheeky::foveated_dlss;
+    const auto fallback=fg_sr_fallback_size(.55F,.45F,1308,1226,2616,2452);
+    expect(std::lround(2616*fallback.first)==1438&&std::lround(2452*fallback.second)==1104,
+        "FG fallback must match SR pixel rounding rather than the raw percentage");
+    expect(std::lround(2616*.55F)==1439&&std::lround(2452*.45F)==1103,
+        "Fixture reproduces the captured off-by-one fallback dimensions");
+    FoveationGeometry crop{};crop.output_base_x=272;crop.output_base_y=437;
+    crop.output_width=1438;crop.output_height=1104;
+    for(unsigned i=0;i<12;++i) {
+        fg_sr_begin_evaluation(8711);
+        if(i%2)fg_sr_prepared(8711,crop,2616,2452,0,0);
+        const auto prepared=fg_sr_prepared_for(8711,2616,2452);
+        const auto width=prepared.valid?prepared.region_width:fallback.first;
+        const auto height=prepared.valid?prepared.region_height:fallback.second;
+        expect(std::lround(2616*width)==1438&&std::lround(2452*height)==1104,
+            "Prepared/missing SR metadata must not change the 100-percent FG feature extent");
+        expect(std::lround(2616*width*.5F)==719&&std::lround(2452*height*.5F)==552,
+            "Prepared/missing SR metadata must not change the 50-percent FG feature extent");
+    }
+    fg_sr_begin_evaluation(8712);
+    expect(!fg_sr_prepared_for(8711,2616,2452).valid,
+        "Size fallback must not restore a stale prior-evaluation placement");
+    const auto unknown=fg_sr_fallback_size(.55F,.45F,0,0,2616,2452);
+    expect(unknown.first==.55F&&unknown.second==.45F,"Unknown render extent retains the existing fallback");
+    std::cout<<"PASS FG matching-size fallback agrees with SR and preserves feature extents across missing metadata\n";
 }
 
 void test_manual_stereo_mapping() {
@@ -2785,7 +2814,11 @@ int main(int argc, char** argv) {
         extern int run_openxr_independent_option_tests(bool);
         return run_openxr_independent_option_tests(std::strcmp(argv[1], "--openxr-independent-on") == 0);
     }
+    if (argc == 2 && std::strcmp(argv[1], "--fg-sr-region") == 0) {
+        test_fg_sr_matching_size();return failures ? 1 : 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--manual-gaze") == 0) {
+        test_fg_sr_matching_size();
         test_manual_stereo_mapping();
         test_packed_alignment_coordinator(false); test_packed_alignment_coordinator(true);
         test_libovr_coordinator(); test_mono_gaze_coordinator();
@@ -2876,6 +2909,7 @@ int main(int argc, char** argv) {
         failures += run_motion_resample_tests();
         return failures ? 1 : 0;
     }
+    test_fg_sr_matching_size();
     test_manual_stereo_mapping();
     test_center_supersampling();
     test_nr_only_center(false);

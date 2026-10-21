@@ -1220,7 +1220,7 @@ struct BufferedPresenter final : Presenter {
                                 "source_dt_ms=%.3f position_delta_m=%.6f angle_deg=%.5f "
                                 "current_pose_xyz=%.4f,%.4f,%.4f (OpenXR submitted poses, not game render poses)",
                                 static_cast<unsigned long long>(previous->id),static_cast<unsigned long long>(job->id),eye,
-                                std::chrono::duration<double,std::milli>(job->captured_at-previous->captured_at).count(),std::sqrt(dx*dx+dy*dy+dz),
+                                std::chrono::duration<double,std::milli>(job->captured_at-previous->captured_at).count(),std::sqrt(dx*dx+dy*dy+dz*dz),
                                 angle(a.orientation,b.orientation),b.position.x,b.position.y,b.position.z);
                             trace(message);
                         }

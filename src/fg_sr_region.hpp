@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 namespace cheeky::foveated_dlss {
 // Captured by the actual SR preparation, not by calling the gaze/crop solver
@@ -42,6 +43,18 @@ inline void fg_sr_prepared(std::uint64_t view, const FoveationGeometry& crop,
 inline FgSrRegion fg_sr_prepared_for(std::uint64_t view,unsigned width,unsigned height) noexcept {
     const auto s=current_fg_sr_region;
     return s.valid && s.view==view && s.width==width && s.height==height ? s : FgSrRegion{};
+}
+// The fallback must use SR's input-pixel rounding and output scaling too.
+// Rounding the saved percentage directly in output pixels can differ by one
+// pixel, repeatedly recreating NGX features as prepared metadata comes/goes.
+// This calculates size only; it neither advances gaze nor reuses an old crop.
+inline std::pair<float,float> fg_sr_fallback_size(float width,float height,
+    unsigned render_width,unsigned render_height,unsigned output_width,unsigned output_height) noexcept {
+    FoveationParameters parameters{};parameters.width=width;parameters.height=height;
+    FoveationGeometry crop{};
+    if(!calculate_foveation_geometry(parameters,render_width,render_height,
+        output_width,output_height,0,0,crop))return {width,height};
+    return {float(crop.output_width)/output_width,float(crop.output_height)/output_height};
 }
 // When SR itself is bypassed (but FG remains enabled), honor the known stereo
 // eye assignment rather than putting both FG rectangles at screen center.
