@@ -334,6 +334,10 @@ std::mutex menu_mutex;
 std::unordered_map<XrInstance, InstanceState> instances;
 std::unordered_map<XrSession, SessionState> sessions;
 std::unordered_map<XrSwapchain, SwapchainState> swapchains;
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+struct TracedSpace { XrSession session{}; XrInstance instance{}; PFN_xrDestroySpace destroy{}; };
+std::unordered_map<XrSpace, TracedSpace> traced_spaces;
+#endif
 std::atomic<std::uint64_t> next_session_generation{1U};
 std::atomic<std::uint64_t> swapchain_generation{1U};
 
@@ -1841,6 +1845,11 @@ XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     XrInstance, const XrSessionCreateInfo*, XrSession*
 );
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(XrSession);
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateReferenceSpace(XrSession, const XrReferenceSpaceCreateInfo*, XrSpace*);
+XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateActionSpace(XrSession, const XrActionSpaceCreateInfo*, XrSpace*);
+XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySpace(XrSpace);
+#endif
 XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrPollEvent(
     XrInstance, XrEventDataBuffer*
 );
@@ -1902,6 +1911,11 @@ namespace {
     CHEEKY_INTERCEPT("xrGetSystemProperties", cheeky_xrGetSystemProperties)
     CHEEKY_INTERCEPT("xrCreateSession", cheeky_xrCreateSession)
     CHEEKY_INTERCEPT("xrDestroySession", cheeky_xrDestroySession)
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+    CHEEKY_INTERCEPT("xrCreateReferenceSpace", cheeky_xrCreateReferenceSpace)
+    CHEEKY_INTERCEPT("xrCreateActionSpace", cheeky_xrCreateActionSpace)
+    CHEEKY_INTERCEPT("xrDestroySpace", cheeky_xrDestroySpace)
+#endif
     CHEEKY_INTERCEPT("xrPollEvent", cheeky_xrPollEvent)
     CHEEKY_INTERCEPT("xrCreateActionSet", cheeky_xrCreateActionSet)
     CHEEKY_INTERCEPT("xrBeginSession", cheeky_xrBeginSession)
@@ -1966,6 +1980,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
     XrInstance* const instance
 ) {
     log_startup("instance_create begin thread=%lu\n", GetCurrentThreadId());
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+    log_startup("FG-LIFETIME diagnostic build active: space lifecycle, failed EndFrame handles, FG feature dimensions\n");
+#endif
     if (info == nullptr || layer_info == nullptr || instance == nullptr ||
         layer_info->nextInfo == nullptr ||
         layer_info->nextInfo->nextGetInstanceProcAddr == nullptr ||
@@ -2088,6 +2105,47 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
     return result;
 }
 
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateReferenceSpace(
+    XrSession session, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
+    Dispatch d{}; XrInstance instance{};
+    { std::lock_guard lock(state_mutex); const auto* owner=find_instance_for_session_locked(session);
+      if(!owner)return XR_ERROR_HANDLE_INVALID; d=owner->dispatch;instance=owner->instance; }
+    if(!d.create_reference_space)return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result=d.create_reference_space(session,info,space);
+    if(XR_SUCCEEDED(result)&&space){std::lock_guard lock(state_mutex);traced_spaces[*space]={session,instance,d.destroy_space};}
+    log_startup("FG-LIFETIME create_reference_space session=%p space=%p type=%d result=%d\n",
+        session,XR_SUCCEEDED(result)&&space?*space:XR_NULL_HANDLE,info?int(info->referenceSpaceType):-1,int(result));
+    return result;
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateActionSpace(
+    XrSession session, const XrActionSpaceCreateInfo* info, XrSpace* space) {
+    Dispatch d{}; XrInstance instance{};
+    { std::lock_guard lock(state_mutex); const auto* owner=find_instance_for_session_locked(session);
+      if(!owner)return XR_ERROR_HANDLE_INVALID; d=owner->dispatch;instance=owner->instance; }
+    if(!d.create_action_space)return XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result=d.create_action_space(session,info,space);
+    if(XR_SUCCEEDED(result)&&space){std::lock_guard lock(state_mutex);traced_spaces[*space]={session,instance,d.destroy_space};}
+    log_startup("FG-LIFETIME create_action_space session=%p space=%p result=%d\n",
+        session,XR_SUCCEEDED(result)&&space?*space:XR_NULL_HANDLE,int(result));
+    return result;
+}
+extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySpace(XrSpace space) {
+    TracedSpace owner{};
+    { std::lock_guard lock(state_mutex);const auto found=traced_spaces.find(space);
+      if(found!=traced_spaces.end())owner=found->second;
+      // Extension-created spaces may not pass either create hook. The runtime
+      // function consumes the space handle; retain downstream forwarding.
+      else for(const auto& entry:instances)if(entry.second.dispatch.destroy_space){owner.destroy=entry.second.dispatch.destroy_space;break;} }
+    if(!owner.destroy)return XR_ERROR_FUNCTION_UNSUPPORTED;
+    log_startup("FG-LIFETIME destroy_space ENTER session=%p space=%p tracked=%u\n",owner.session,space,unsigned(owner.session!=XR_NULL_HANDLE));
+    const auto result=owner.destroy(space);
+    if(XR_SUCCEEDED(result)){std::lock_guard lock(state_mutex);traced_spaces.erase(space);}
+    log_startup("FG-LIFETIME destroy_space RETURN space=%p result=%d\n",space,int(result));
+    return result;
+}
+#endif
+
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
     const XrInstance instance
 ) {
@@ -2127,6 +2185,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
                 ++swapchain_it;
             }
         }
+        #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+        std::erase_if(traced_spaces,[&](const auto& entry){return entry.second.instance==instance;});
+#endif
         instances.erase(iterator);
         publish_snapshot_locked(nullptr);
     }
@@ -2292,6 +2353,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         for (unsigned hand = 0; hand < 2; ++hand) host_menu_spaces[hand] = session_it->second.host_menu_hands[hand].space;
         session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
         retired_fg=std::move(session_it->second.fg);
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+        std::erase_if(traced_spaces,[&](const auto& entry){return entry.second.session==session;});
+#endif
         sessions.erase(session_it);
         for (auto iterator = swapchains.begin(); iterator != swapchains.end();) {
             if (iterator->second.session == session) {
@@ -2335,6 +2399,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrPollEvent(
     if (result == XR_SUCCESS && event_data &&
         event_data->type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
         const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(event_data);
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+        log_startup("FG-LIFETIME reference_space_change session=%p type=%d time=%lld pose_valid=%u\n",
+            changed->session,int(changed->referenceSpaceType),static_cast<long long>(changed->changeTime),unsigned(changed->poseValid));
+#endif
         if (changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL) {
             std::lock_guard menu_lock(menu_mutex);
             std::lock_guard state_lock(state_mutex);
@@ -3321,7 +3389,7 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
         log_startup("DLSS-FG enabling session=%p device=%p queue=%p; OpenXR color state=RENDER_TARGET\n",
             owner.session,owner.graphics_device,owner.graphics_queue);
         cheeky::fg::XrFns fn{};
-        fn.time_instance=owner.instance;fn.time_to_qpc=d.time_to_qpc;
+        fn.time_instance=owner.instance;fn.time_to_qpc=d.time_to_qpc;fn.locate_space=d.locate_space;
         fn.create=d.create_swapchain;fn.destroy=d.destroy_swapchain;
         fn.enumerate=d.enumerate_swapchain_images;fn.acquire=d.acquire_swapchain_image;
         fn.wait_image=d.wait_swapchain_image;fn.release=d.release_swapchain_image;

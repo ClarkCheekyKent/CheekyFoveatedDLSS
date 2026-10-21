@@ -946,9 +946,43 @@ void fg_copy_validation_test(bool include_buffered=true) {
 }
 #include "fg_hardware_probe.hpp"
 #include "fg_hardening_validation.hpp"
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+void diagnostic_lifetime_test() {
+    reset();traced_spaces.clear();
+    const auto session=h<XrSession>(9001);SessionState owner{};owner.instance=instance;owner.session=session;sessions.emplace(session,std::move(owner));
+    auto& d=instances.at(instance).dispatch;
+    d.create_reference_space=[](XrSession,const XrReferenceSpaceCreateInfo*,XrSpace* out)->XrResult{*out=h<XrSpace>(9002);return XR_SUCCESS;};
+    d.create_action_space=[](XrSession,const XrActionSpaceCreateInfo*,XrSpace* out)->XrResult{*out=h<XrSpace>(9003);return XR_SUCCESS;};
+    d.destroy_space=[](XrSpace space)->XrResult{return space==h<XrSpace>(9002)?XR_ERROR_RUNTIME_FAILURE:XR_SUCCESS;};
+    XrSpace space{};XrReferenceSpaceCreateInfo reference{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&space)==XR_SUCCESS&&traced_spaces.contains(space),"Diagnostic reference create forwards and tracks");
+    check(cheeky_xrDestroySpace(space)==XR_ERROR_RUNTIME_FAILURE&&traced_spaces.contains(space),"Failed destroy preserves tracking and result");
+    XrActionSpaceCreateInfo action{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+    check(cheeky_xrCreateActionSpace(session,&action,&space)==XR_SUCCESS&&traced_spaces.contains(space),"Diagnostic action create forwards and tracks");
+    check(cheeky_xrDestroySpace(space)==XR_SUCCESS&&!traced_spaces.contains(space),"Successful destroy removes tracking");
+    check(cheeky_xrDestroySpace(h<XrSpace>(9004))==XR_SUCCESS,"Untracked extension space still forwards");
+    cheeky::fg::BufferedPresenter p;static std::string log;log.clear();
+    p.trace=[](const char* text) noexcept {log+=text;log+='\n';};
+    p.xr.end_frame=[](XrSession,const XrFrameEndInfo*)->XrResult{return XR_ERROR_HANDLE_INVALID;};
+    p.xr.locate_space=[](XrSpace,XrSpace,XrTime,XrSpaceLocation*)->XrResult{return XR_ERROR_HANDLE_INVALID;};
+    p.xr.enumerate=[](XrSwapchain,unsigned,unsigned* count,XrSwapchainImageBaseHeader*)->XrResult{*count=3;return XR_SUCCESS;};
+    XrCompositionLayerProjectionView view{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};view.subImage.swapchain=h<XrSwapchain>(9005);
+    XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=space;projection.views=&view;projection.viewCount=1;
+    const auto* header=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.layers=&header;end.layerCount=1;
+    check(p.runtime_end_frame(&end)==XR_ERROR_HANDLE_INVALID,"Diagnostic probes preserve original EndFrame result");
+    check(log.find("self_locate_result=-12")!=log.npos&&log.find("enumerate_result=0")!=log.npos,"Failure log distinguishes invalid space from live chain");
+    sessions.clear();traced_spaces.clear();
+    std::cout<<"PASS diagnostic space lifecycle forwarding and EndFrame handle probes\n";
+}
+#endif
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+        diagnostic_lifetime_test();
+        if(argc>1&&std::string(argv[1])=="--fg-lifetime")return 0;
+#endif
         if(argc>1&&std::string(argv[1])=="--fg-native-handoff") {fg_native_handoff_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-lifecycle") {fg_lifecycle_retirement_test();fg_borrowed_frame_shutdown_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-borrowed-shutdown") {fg_borrowed_frame_shutdown_test();return 0;}

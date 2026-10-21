@@ -538,6 +538,42 @@ struct BufferedPresenter final : Presenter {
     void note_app_call(unsigned stage,double ms) noexcept override {std::lock_guard lock(mx);if(stage<app_calls.size())app_calls[stage].add(ms);}
     XrResult runtime_end_frame(const XrFrameEndInfo* end) {
         const auto start=TimingClock::now();const auto result=xr.end_frame(session,end);
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+        if(XR_FAILED(result)&&trace&&end) {
+            char message[384]{};
+            sprintf_s(message,"FG-LIFETIME end_frame FAILED session=%p result=%d display_time=%lld layers=%u native=%llu current=%llu generated=%u",
+                session,int(result),static_cast<long long>(end->displayTime),end->layerCount,
+                static_cast<unsigned long long>(burst_native),static_cast<unsigned long long>(burst_current),unsigned(burst_generated));
+            trace(message);
+            // Only probe on failure: these read-only calls distinguish a dead
+            // space from a dead swapchain without adding steady-state XR work.
+            const auto chain=[&](XrSwapchain handle,unsigned layer,unsigned eye) {
+                unsigned count{};const auto status=xr.enumerate?xr.enumerate(handle,0,&count,nullptr):XR_ERROR_FUNCTION_UNSUPPORTED;
+                sprintf_s(message,"FG-LIFETIME submitted_chain layer=%u eye=%u chain=%p enumerate_result=%d images=%u",
+                    layer,eye,handle,int(status),count);trace(message);
+            };
+            for(unsigned i=0;end->layers&&i<end->layerCount;++i) {
+                const auto* layer=end->layers[i];if(!layer)continue;
+                XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+                const auto status=xr.locate_space&&layer->space?xr.locate_space(layer->space,layer->space,end->displayTime,&location):XR_ERROR_FUNCTION_UNSUPPORTED;
+                sprintf_s(message,"FG-LIFETIME submitted_layer index=%u type=%d space=%p self_locate_result=%d",
+                    i,int(layer->type),layer->space,int(status));trace(message);
+                switch(layer->type) {
+                case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+                    const auto* p=reinterpret_cast<const XrCompositionLayerProjection*>(layer);
+                    for(unsigned eye=0;p->views&&eye<p->viewCount;++eye)chain(p->views[eye].subImage.swapchain,i,eye);
+                    break;
+                }
+                case XR_TYPE_COMPOSITION_LAYER_QUAD:chain(reinterpret_cast<const XrCompositionLayerQuad*>(layer)->subImage.swapchain,i,0);break;
+                case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:chain(reinterpret_cast<const XrCompositionLayerCylinderKHR*>(layer)->subImage.swapchain,i,0);break;
+                case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:chain(reinterpret_cast<const XrCompositionLayerCubeKHR*>(layer)->swapchain,i,0);break;
+                case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:chain(reinterpret_cast<const XrCompositionLayerEquirectKHR*>(layer)->subImage.swapchain,i,0);break;
+                case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:chain(reinterpret_cast<const XrCompositionLayerEquirect2KHR*>(layer)->subImage.swapchain,i,0);break;
+                default:break;
+                }
+            }
+        }
+#endif
         std::lock_guard lock(mx);runtime_end.add(elapsed_ms(start));return result;
     }
     const char* diagnostic_text() const noexcept override {return diagnostic;}

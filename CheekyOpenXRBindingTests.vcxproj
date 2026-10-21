@@ -10,5 +10,8 @@
     <ClCompile Include="openxr_layer\dlssg_worker.cpp" />
     <ClCompile Include="openxr_layer\fg_focus.cpp" />
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(CheekyFgLifetimeDiagnostics)'=='true'">
+    <ClCompile><PreprocessorDefinitions>CHEEKY_FG_LIFETIME_DIAGNOSTICS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

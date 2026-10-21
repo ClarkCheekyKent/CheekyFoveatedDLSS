@@ -65,5 +65,8 @@
       DestinationFolder="$(OutDir)"
     />
   </Target>
+  <ItemDefinitionGroup Condition="'$(CheekyFgLifetimeDiagnostics)'=='true'">
+    <ClCompile><PreprocessorDefinitions>CHEEKY_FG_LIFETIME_DIAGNOSTICS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

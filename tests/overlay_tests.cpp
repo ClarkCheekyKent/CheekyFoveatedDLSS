@@ -157,6 +157,9 @@ void test_ui_diagnostics() {
     require(text.find("Generating frames") != text.npos && text.find("Generated frames presented: 17") != text.npos &&
         text.find("Unique output: 90.0 FPS") != text.npos && text.find("FG total GPU: 2.500 ms") != text.npos,
         "FG reports actual presented frames, unique cadence and GPU cost");
+    require(text.find("CPU waits and pacing") != text.npos && text.find("Frame age at submission") != text.npos &&
+        text.find("Copy FG diagnostic JSON") != text.npos && text.find("{\"layer_present\"") == text.npos,
+        "FG diagnostics must use readable groups without dumping raw JSON");
     render_api="D3D11";
     text=render("DLSS-FG");
     require(text.find("FG uses DX12 transport automatically")!=text.npos && text.find("FG output destination")==text.npos,

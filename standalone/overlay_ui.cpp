@@ -800,7 +800,57 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         diagnostic_line(fg, "Captured guides", "captured_guides");
         diagnostic_line(fg, "Guide matching", "match_reason");
         diagnostic_line(member(fg,"direct_output"), "Direct output fallback", "reason_text");
-        ImGui::TextWrapped("%s", std::string(fg).c_str());
+        const auto rows = [](std::string_view object,
+            std::initializer_list<std::pair<const char*, const char*>> fields, bool milliseconds = false) {
+            if (ImGui::BeginTable("values", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("Metric", ImGuiTableColumnFlags_WidthStretch, 1.4F);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.F);
+                for (const auto& [label, key] : fields) {
+                    ImGui::TableNextRow(); ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s", label); ImGui::TableNextColumn();
+                    if (member(object, key).empty()) ImGui::TextUnformatted("Unavailable");
+                    else if (milliseconds) ImGui::Text("%.2f ms", number(object, key));
+                    else { auto value = plain(member(object, key));
+                        if (value == "true") value = "Yes"; else if (value == "false") value = "No";
+                        ImGui::TextWrapped("%s", value.c_str()); }
+                }
+                ImGui::EndTable();
+            }
+        };
+        if (ImGui::TreeNode("Frame matching")) {
+            rows(fg, {{"Eligible guides", "eligible_guides"}, {"Pending guides", "pending_guides"},
+                {"Foreign guides", "foreign_guides"}});
+            ImGui::PushID("matching");
+            rows(gpu, {{"Color token", "color_token"}, {"Guide token", "guide_token"},
+                {"Mismatched guide intervals", "mismatched_guides"}});
+            ImGui::PopID(); ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("CPU waits and pacing")) {
+            ImGui::TextWrapped("Rolling averages; separate stages can overlap.");
+            rows(member(fg, "pacing_timeline"), {{"Game waits for credit", "game_wait_credit_ms"},
+                {"Game BeginFrame gate", "game_begin_gate_ms"}, {"Presenter waits for content", "presenter_content_ms"},
+                {"Deferred game credit", "credit_deferred_ms"}, {"Clock lateness", "clock_late_ms"},
+                {"Native xrEndFrame", "native_xr_end_ms"}, {"Generated xrEndFrame", "generated_xr_end_ms"},
+                {"FG submit to completion", "fg_submit_to_complete_ms"}}, true);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Frame age at submission")) {
+            rows(member(fg, "presentation"), {{"Native frame age", "native_age_ms"},
+                {"Generated frame age", "generated_age_ms"}, {"Newest input age", "newest_input_age_ms"},
+                {"Repeat frame age", "repeat_age_ms"}}, true);
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("GPU workload and transport")) {
+            rows(gpu, {{"Shared game queue", "shared_gpu_queue"}, {"Foveated eyes", "foveated_eyes"},
+                {"Center width", "center_width"}, {"Center height", "center_height"},
+                {"Periphery width", "peripheral_width"}, {"Periphery height", "peripheral_height"},
+                {"Output width", "output_width"}, {"Output height", "output_height"}});
+            ImGui::PushID("transport");
+            rows(member(fg, "overhead"), {{"Capture CPU time", "capture_ms"}, {"Upload CPU time", "upload_ms"}}, true);
+            ImGui::PopID(); ImGui::TreePop();
+        }
+        if (ImGui::Button("Copy FG diagnostic JSON")) ImGui::SetClipboardText(std::string(fg).c_str());
+        ImGui::TextWrapped("The support bundle includes the complete diagnostic snapshot.");
         ImGui::TreePop();
     }
 }

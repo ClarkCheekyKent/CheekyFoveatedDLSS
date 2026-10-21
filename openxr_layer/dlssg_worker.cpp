@@ -295,6 +295,15 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         const auto desc=input.color->GetDesc();const auto tw=unsigned(desc.Width),th=desc.Height;
         const auto guide_desc=input.depth->GetDesc();const auto gw=unsigned(guide_desc.Width),gh=guide_desc.Height;
         if(f.width!=tw||f.height!=th) {
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+            if(trace) {
+                char message[384]{};
+                sprintf_s(message,"FG-FEATURE resize worker=%p feature=%p eye=%u pass=%s old=%ux%u new=%ux%u old_handle=%p format=%u guide=%ux%u config=%llu crop=%u,%u,%u,%u",
+                    this,&f,eye,center_pass?"center":"periphery",f.width,f.height,tw,th,f.handle,unsigned(desc.Format),gw,gh,
+                    static_cast<unsigned long long>(configuration),rect.x,rect.y,rect.w,rect.h);
+                trace(message);
+            }
+#endif
             if(f.handle)release(f.handle);if(f.params)destroy(f.params);f={};f.width=tw;f.height=th;
         }
         f.eye=eye;f.offset_x=f.offset_y=0;f.direct=false;
@@ -323,6 +332,13 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);p->Set("Width",tw);p->Set("Height",th);
             p->Set("DLSSG.BackbufferFormat",unsigned(desc.Format));p->Set("DLSSG.InternalWidth",gw);p->Set("DLSSG.InternalHeight",gh);p->Set("DLSSG.DynamicResolution",1u);
             const auto result=create(commands,NVSDK_NGX_Feature_FrameGeneration,p,&f.handle);report("NGX FG CreateFeature",result);
+#ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
+            if(trace) {
+                char message[256]{};
+                sprintf_s(message,"FG-FEATURE create worker=%p feature=%p eye=%u pass=%s size=%ux%u handle=%p result=0x%08X",
+                    this,&f,eye,center_pass?"center":"periphery",tw,th,f.handle,unsigned(result));trace(message);
+            }
+#endif
             if(!ok(result)||!f.handle){failed=true;return false;}created=true;
         }
         Matrix crop=identity(),uncrop=identity(),previous_crop=identity();
