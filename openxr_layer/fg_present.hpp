@@ -450,7 +450,9 @@ struct Presenter {
                 state=CheekyFgState::generation_failed;
                 const bool log_generate=trace&&!generation_logged;
                 if(log_generate) {trace("DLSS-FG first generation starting");generation_logged=true;}
-                const bool success=worker.generate(guides,input,prev,cameras,output);
+                const bool valid_cameras=std::all_of(cameras.begin(),cameras.end(),[](const auto& c){return c.valid;});
+                if(!valid_cameras){worker.wait_idle();worker.reset_features();}
+                const bool success=valid_cameras&&worker.generate(guides,input,prev,cameras,output);
                 if(log_generate)trace(success?"DLSS-FG first generation succeeded":"DLSS-FG first generation failed");
                 if(success){
                     for(unsigned i=0;i<2;++i){

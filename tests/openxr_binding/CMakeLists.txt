@@ -27,3 +27,4 @@ set_target_properties(CheekyOpenXRBindingTests PROPERTIES
 add_test(NAME OpenXRHostBindings COMMAND CheekyOpenXRBindingTests)
 add_test(NAME OpenXRFGCopyStates COMMAND CheekyOpenXRBindingTests --fg-gpu-validation)
 add_test(NAME OpenXRFGCropRecenter COMMAND CheekyOpenXRBindingTests --fg-crop-gpu-validation)
+add_test(NAME OpenXRFGHardening COMMAND CheekyOpenXRBindingTests --fg-hardening)

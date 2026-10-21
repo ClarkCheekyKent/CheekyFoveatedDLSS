@@ -779,9 +779,11 @@ void fg_copy_validation_test(bool include_buffered=true) {
 }
 }
 #include "fg_hardware_probe.hpp"
+#include "fg_hardening_validation.hpp"
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--fg-hardening") {fg_hardening_validation();return 0;}
         if(argc>2 && (std::string(argv[1])=="--fg-capability" || std::string(argv[1])=="--fg-generate" || std::string(argv[1])=="--fg-buffered"||std::string(argv[1])=="--fg-motion"||std::string(argv[1])=="--fg-crop-motion")) {
             Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
             check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))),"DXGI factory");

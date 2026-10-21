@@ -61,6 +61,7 @@ bool Worker::wait_fence(std::uint64_t value) noexcept {
     return SUCCEEDED(device->GetDeviceRemovedReason());
 }
 void Worker::reset_features() noexcept {
+    temporal_evaluation_completed=false;
     for(auto* array:{&features,&peripheral_features})for(auto& f:*array){
         if(f.handle&&release)release(f.handle);if(f.params&&destroy)destroy(f.params);f={};
     }
@@ -169,7 +170,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     const std::array<ID3D12Resource*,2>& previous,const std::array<Camera,2>& cameras,
     std::array<ID3D12Resource*,2>& outputs,std::array<OutputCopy,2>* copies,
     void(*on_submitted)(void*) noexcept,void* submitted_context,void(*on_prepared)(void*) noexcept) noexcept {
-    submitted_at={};prepared_serial=0;
+    submitted_at={};prepared_serial=0;temporal_evaluation_completed=false;
     std::lock_guard lock(ngx_mutex);
     if(!configured||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!wait_idle())return false;
@@ -338,6 +339,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             }else previous_crop=crop;
         }
         auto projection=multiply(crop,camera.view_to_clip),clip_prev=multiply(multiply(previous_crop,camera.clip_to_prev),uncrop);
+        if(!finite_matrix(projection)||!finite_matrix(clip_prev))return false;
         if(center_pass&&crop_diagnostic){
             char message[640]{};
             sprintf_s(message,"FG CROP-DIAG frame=%llu eye=%u active=%u eye_wh=%ux%u crop_xywh=%u,%u,%u,%u "
@@ -776,6 +778,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             enabled&=*static_cast<const unsigned char*>(data)==0;const D3D12_RANGE written{0,0};f->readback->Unmap(0,&written);
         }
     }
+    temporal_evaluation_completed=true;
     return enabled;
 }
 }

@@ -44,6 +44,7 @@ struct Worker {
     DiagnosticMode diagnostic_mode{DiagnosticMode::Normal};
     bool frame_id_enabled{true},last_frame_id_logged{};
     std::uint64_t last_frame_id_sample{};
+    bool temporal_evaluation_completed{}; // Last generate() finished processing both eyes, even if output was suppressed.
     std::uint64_t crop_diagnostic_frame{};
     bool force_fp16{}; // Explicit A/B probe only; preserve SDR precision by default.
     std::uint64_t configuration{};

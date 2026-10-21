@@ -1173,6 +1173,8 @@ struct BufferedPresenter final : Presenter {
                     }
                     std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)
                         cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.eyes[eye].depth_inverted!=0);
+                    const bool camera_pair_valid=std::all_of(cameras.begin(),cameras.end(),[](const auto& c){return c.valid;});
+
                     std::array<ID3D12Resource*,2> input{job->color[0]->texture.Get(),job->color[1]->texture.Get()},
                         prior{previous->color[0]->texture.Get(),previous->color[1]->texture.Get()},result{};
                     auto publication=d;publication.Format=worker.focus.color_format;
@@ -1183,7 +1185,7 @@ struct BufferedPresenter final : Presenter {
                     const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;});
                     const bool blocked_direct=job->direct_output_mode&&(border_upload||direct_blocked_target==direct_target_key(worker.width,worker.height,worker.focus.color_format));
                     if(blocked_direct){std::lock_guard lock(mx);++direct_stats.fallbacks;++direct_stats.unsupported;direct_stats.last_path=3;}
-                    if(job->direct_output_mode&&!blocked_direct){
+                    if(camera_pair_valid&&job->direct_output_mode&&!blocked_direct){
                         const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
                             return g.peripheral_method<=2&&(g.focus_width<.999f||g.focus_height<.999f);});
                         if(supported){
@@ -1197,7 +1199,7 @@ struct BufferedPresenter final : Presenter {
                         }else{std::lock_guard lock(mx);++direct_stats.unsupported;++direct_stats.fallbacks;direct_stats.last_path=3;
                             note_direct_failure_locked(CheekyFgDirectReason::configuration);}
                     }
-                    for(unsigned eye=0;eye<2&&!pair.direct_xr;++eye) {
+                    for(unsigned eye=0;eye<2&&!pair.direct_xr&&camera_pair_valid;++eye) {
                         const auto& g=guides.eyes[eye];
                         const auto layout=compact_layout(worker.width,worker.height,job->color[eye]->layout.packed(),g.focus_width,g.focus_height,
                             g.focus_x,g.focus_y,g.peripheral_percent,g.focus_feather,g.resolution_percent);
@@ -1209,12 +1211,12 @@ struct BufferedPresenter final : Presenter {
                             g.focus_x,g.focus_y,g.show_foveation_border!=0);
                         copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};
                     }
-                    if(available) {
+                    if(available&&camera_pair_valid) {
                         success=worker.generate(guides,input,prior,cameras,result,&copies,[](void* context) noexcept {
                             static_cast<BufferedPresenter*>(context)->inference_submitted();
                         },this,[](void* context) noexcept {
                             static_cast<BufferedPresenter*>(context)->inference_prepared();
-                        });attempted=!worker.failed;
+                        });attempted=!worker.failed&&worker.temporal_evaluation_completed;
                         pair.submitted_at=worker.submitted_at;
                         for(unsigned eye=0;eye<2;++eye) {
                             pair.generated[eye]->state=copies[eye].state;
@@ -1240,6 +1242,8 @@ struct BufferedPresenter final : Presenter {
                 pair.native_captured=previous->captured_at;
                 pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views);
                 pair.completed_at=TimingClock::now();}
+            // Completed NGX warm-up advances history even when it supplies no
+            // interpolated output. An early return or failed batch does not.
             reset_history=!attempted;if(job->latency_diagnostics)collect_color_stamps();
             measure_worker_memory();
             {std::lock_guard lock(mx);if(stopping)break;

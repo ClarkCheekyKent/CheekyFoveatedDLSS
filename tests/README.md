@@ -1,3 +1,12 @@
+# FG camera and evaluation hardening
+
+`CheekyOpenXRBindingTests --fg-hardening` checks non-finite/singular camera
+inputs, both depth conventions, current and previous views, and the production
+worker with a deterministic NGX test backend on WARP. It covers suppressed
+output, resume, early input rejection, partially recorded pairs, failed NGX
+evaluation, failed publication, recovery and reset. No NVIDIA runtime or
+headset is required for these failure-path tests.
+
 # Moving DLSS-G crop output
 
 `CheekyOpenXRBindingTests --fg-crop-gpu-validation` runs the WARP capture,
