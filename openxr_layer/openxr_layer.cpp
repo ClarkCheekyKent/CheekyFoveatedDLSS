@@ -272,6 +272,10 @@ struct SessionState {
     std::shared_ptr<cheeky::fg::Presenter> fg;
     CheekyFgState fg_state{CheekyFgState::off};
     bool fg_requested{};
+    // A WaitFrame issued before activation still belongs to the runtime.
+    // Preserve that ownership through its matching BeginFrame and EndFrame.
+    std::uint64_t native_waits_pending{};
+    bool native_frame_begun{};
     std::uint64_t fg_uevr_mode_epoch{}; // Last observed UEVR mode-transition epoch.
     std::uint32_t gaze_location_flags{};
     std::array<float, CHEEKY_GAZE_MAX_VIEWS> center_u{};
@@ -2373,6 +2377,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
     const XrSessionBeginInfo* const info
 ) {
     PFN_xrBeginSession next{};
+    std::shared_ptr<cheeky::fg::Presenter> retired_fg;
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
@@ -2386,8 +2391,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
         if (iterator != sessions.end()) {
-            if(iterator->second.fg)iterator->second.fg->invalidate_temporal();
+            retired_fg=std::move(iterator->second.fg);
+            iterator->second.fg_requested=false;
+            iterator->second.fg_state=CheekyFgState::off;
             iterator->second.running = true;
+            iterator->second.native_waits_pending = 0;
+            iterator->second.native_frame_begun = false;
             iterator->second.last_fallback_sync_time = 0;
             iterator->second.view_configuration =
                 info->primaryViewConfigurationType;
@@ -2397,6 +2406,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
             publish_snapshot_locked(&iterator->second);
         }
     }
+    // Worker retirement can release resources through callbacks taking state_mutex.
+    // A restarted session needs setup() again, including its queue bridge fence.
+    if(retired_fg)retired_fg->invalidate_temporal();
     return result;
 }
 
@@ -2412,7 +2424,11 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndSession(
         next = instance->dispatch.end_session;
         auto& session_state = sessions.at(session);
         session_state.calibration.destroy(cheeky::openxr_calibration::bridge());
-        presenter=session_state.fg;
+        presenter=std::move(session_state.fg);
+        session_state.fg_requested=false;
+        session_state.fg_state=CheekyFgState::off;
+        session_state.native_waits_pending=0;
+        session_state.native_frame_begun=false;
         session_state.running = false;
         session_state.action_active = false;
         session_state.gaze_valid = false;
@@ -3039,7 +3055,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
         next = instance->dispatch.destroy_swapchain;
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
-            fg_to_invalidate=session_it->second.fg;
+            fg_to_invalidate=std::move(session_it->second.fg);
+            session_it->second.fg_requested=false;
+            session_it->second.fg_state=CheekyFgState::waiting_for_history;
             auto& calibration = session_it->second.calibration;
             for (const auto& region : calibration.history) {
                 if (region.swapchain == reinterpret_cast<std::uint64_t>(swapchain)) {
@@ -3320,6 +3338,7 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
             }
         }
         if (candidate->setup(owner.session,fn,device12,queue12)) {
+            candidate->set_native_frame_pending(owner.native_waits_pending!=0||owner.native_frame_begun);
             owner.fg=std::move(candidate);
             owner.fg_state=CheekyFgState::waiting_for_history;
             log_startup("DLSS-FG presenter initialized session=%p\n",owner.session);
@@ -3338,6 +3357,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     std::shared_ptr<cheeky::fg::Presenter> presenter;
     std::shared_ptr<cheeky::fg::Presenter> retired;
     bool replacing_source_presenter{};
+    bool native_wait_reserved{};
     // Read the runtime setting before taking the layer lock. Changes are
     // latched here, so one application frame keeps the same cadence throughout.
     CheekyFgControl control;
@@ -3423,6 +3443,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
                     owner.fg_state=CheekyFgState::paused_rendering_mode;
             }
             if (owner.running && state) presenter=owner.fg;
+            if (!presenter && downstream && state) {
+                ++owner.native_waits_pending;
+                native_wait_reserved=true;
+            }
         }
     }
     // Never drain GPU work under state_mutex: callbacks that release captured
@@ -3435,7 +3459,17 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     }
     retired.reset();
     if (presenter) {presenter->configure(control.configuration);return presenter->wait_frame(info,state);}
-    return downstream ? downstream(session,info,state) : XR_ERROR_FUNCTION_UNSUPPORTED;
+    const auto result=downstream ? downstream(session,info,state) : XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (native_wait_reserved && XR_FAILED(result)) {
+        std::lock_guard lock(state_mutex);
+        const auto owner=sessions.find(session);
+        if (owner!=sessions.end()) {
+            if(owner->second.native_waits_pending)--owner->second.native_waits_pending;
+            if(owner->second.fg)owner->second.fg->set_native_frame_pending(
+                owner->second.native_waits_pending!=0||owner->second.native_frame_begun);
+        }
+    }
+    return result;
 }
 
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStatus(CheekyFgStatus* out) noexcept {
@@ -3563,15 +3597,30 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginFrame(
     PFN_xrBeginFrame next{};
     std::shared_ptr<cheeky::fg::Presenter> presenter;
     cheeky::fg::AppFrameCallTimer app_timer{presenter,0};
+    bool native_begin{};
     { std::lock_guard lock(state_mutex);
       const auto* instance = find_instance_for_session_locked(session);
       if (!instance) return XR_ERROR_HANDLE_INVALID;
       next = instance->dispatch.begin_frame;
-      const auto owner=sessions.find(session);if(owner!=sessions.end())presenter=owner->second.fg; }
+      const auto owner=sessions.find(session);
+      if(owner!=sessions.end()) {
+          native_begin=owner->second.native_waits_pending!=0;
+          if(!native_begin)presenter=owner->second.fg;
+      } }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
     // Some hosts render DLSS before BeginFrame and call it just before submitting.
     // Preserve the source markers collected since the previous EndFrame.
-    return presenter?presenter->begin_frame(info):next(session, info);
+    const auto result=presenter?presenter->begin_frame(info):next(session, info);
+    if (native_begin && XR_SUCCEEDED(result)) {
+        std::lock_guard lock(state_mutex);
+        const auto owner=sessions.find(session);
+        if(owner!=sessions.end()) {
+            if(owner->second.native_waits_pending)--owner->second.native_waits_pending;
+            owner->second.native_frame_begun=true;
+            if(owner->second.fg)owner->second.fg->set_native_frame_pending(true);
+        }
+    }
+    return result;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
@@ -3605,10 +3654,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     std::array<unsigned,2> release_indices{};
     const XrCompositionLayerProjection* fg_projection{};
     bool fg_compatible{};
+    bool native_end{};
     {
         std::lock_guard fg_lock(state_mutex);
         const auto it=sessions.find(session);
-        if(it!=sessions.end() && it->second.running && it->second.fg &&
+        native_end=it!=sessions.end() && it->second.native_frame_begun;
+        if(!native_end && it!=sessions.end() && it->second.running && it->second.fg &&
             it->second.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO){
             presenter=it->second.fg;
             const auto selected=cheeky::openxr::select_projection(frame_end_info,[session](XrSwapchain sc){
@@ -3638,6 +3689,13 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
                        : next(session,frame_end_info);
     menu_lock.unlock();
     std::unique_lock lock(state_mutex);
+    if(native_end && XR_SUCCEEDED(result)) {
+        const auto owner=sessions.find(session);
+        if(owner!=sessions.end()) {
+            owner->second.native_frame_begun=false;
+            if(owner->second.fg)owner->second.fg->set_native_frame_pending(owner->second.native_waits_pending!=0);
+        }
+    }
     const auto selected = cheeky::openxr::select_projection(frame_end_info, [session](XrSwapchain handle) {
         const auto it = swapchains.find(handle);
         return it != swapchains.end() && it->second.session == session &&

@@ -287,6 +287,7 @@ struct BufferedPresenter final : Presenter {
     };
     char diagnostic[384]{"Buffered presenter waiting for stereo frames"};
     bool started{},stopping{},bypass{},fg_active{},pacing_active{},degraded{};
+    bool native_frame_pending{}; // Hold mx; the pre-activation frame still owns runtime Begin/End.
     unsigned credits{},app_waiters{};
     std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{};
     std::uint64_t last_credit_tick{},completed_pair_id{},inflight_id{};
@@ -299,6 +300,16 @@ struct BufferedPresenter final : Presenter {
     CheekyFgCaptureStampFn guide_stamp{};
 
     ~BufferedPresenter() override {reset();}
+    void set_native_frame_pending(bool pending_frame) noexcept override {
+        std::lock_guard lock(mx);native_frame_pending=pending_frame;changed.notify_all();
+    }
+    void runtime_failure(const char* stage,XrResult result) noexcept {
+        std::lock_guard lock(mx);
+        terminal=result;stopping=true;state=CheekyFgState::presentation_failed;
+        sprintf_s(diagnostic,"DLSS-FG %s failed: XrResult=%d; presenter stopped",stage,int(result));
+        if(trace)trace(diagnostic);
+        changed.notify_all();
+    }
     bool setup(XrSession s,const XrFns& f,ID3D12Device* dev,ID3D12CommandQueue* q) noexcept override {
         if(!Presenter::setup(s,f,dev,q))return false;
 
@@ -542,7 +553,9 @@ struct BufferedPresenter final : Presenter {
         std::lock_guard capture_lock(capture_mutex);
         producer.drain();output.drain();uploads.drain();worker.wait_idle();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
-        captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;raw=nullptr;raw_done=true;passthrough_events=0;
+        captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
+        if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
+        raw=nullptr;raw_done=true;passthrough_events=0;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
@@ -565,6 +578,7 @@ struct BufferedPresenter final : Presenter {
         distinct_native=repeated_presentations=runtime_submissions=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
+        changed.notify_all();
     }
     void destroy_chains() noexcept {
         for(auto& c:scene_chains){if(c.handle)destroy_chain(c.handle);c={};}
@@ -675,6 +689,7 @@ struct BufferedPresenter final : Presenter {
         if(info&&info->next)return XR_ERROR_VALIDATION_FAILURE;
         std::unique_lock capture_lock(capture_mutex);
         std::unique_lock lock(mx);
+        if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         if(waited==begun)return XR_ERROR_CALL_ORDER_INVALID;
         // A host may forfeit an in-progress frame (OpenComposite does this at
         // startup). Waiting for its missing EndFrame deadlocks the render thread.
@@ -693,7 +708,7 @@ struct BufferedPresenter final : Presenter {
         const auto gate_started=TimingClock::now();
         changed.wait(lock,[&]{return stopping||!release_gate_active();});
         begin_gate_wait.add(elapsed_ms(gate_started));
-        if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;
+        if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();return discarded?XR_FRAME_DISCARDED:XR_SUCCESS;
     }
     bool capture(XrSwapchain sc,unsigned,ID3D12Resource* original,unsigned,unsigned,unsigned,
@@ -779,6 +794,7 @@ struct BufferedPresenter final : Presenter {
     }
     XrResult passthrough(const XrFrameEndInfo* end,const char* reason) noexcept {
         std::unique_lock lock(mx);
+        if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++passthrough_events;
         if(trace&&(passthrough_events<=3||passthrough_events%120==0)) {
             char message[256]{};
@@ -790,8 +806,10 @@ struct BufferedPresenter final : Presenter {
         ++epoch;raw=end;raw_done=false;credits=0;credit_deferred=false;awaiting_generated_submission=0;discard_pending();ready.clear();latest_native.reset();fg_active=pacing_active=false;changed.notify_all();
         // Unknown next chains cannot be copied generically. Their application
         // storage remains alive until the owning thread submits this frame.
-        changed.wait(lock,[&]{return stopping||raw_done;});
-        return stopping?XR_ERROR_SESSION_NOT_RUNNING:raw_result;
+        // Stop wakes application waits immediately, but this caller lends its
+        // next/layers storage to the presentation thread until submission ends.
+        changed.wait(lock,[&]{return raw_done;});
+        return raw_result;
     }
     XrResult end_frame(const XrFrameEndInfo* end,const std::array<unsigned,2>&,
                        const XrCompositionLayerProjection* projection) noexcept override {
@@ -799,14 +817,14 @@ struct BufferedPresenter final : Presenter {
         if(!end)return XR_ERROR_VALIDATION_FAILURE;
         ProducerElapsed elapsed{*this};
         std::uint64_t id{};bool use_raw{};
-        {std::lock_guard lock(mx);if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;
+        {std::lock_guard lock(mx);if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
             if(!started||begun==ended)return XR_ERROR_CALL_ORDER_INVALID;++native_count;id=++next_id;use_raw=degraded;}
         const auto fg_runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
         const auto hookless_complete=fg_runtime?reinterpret_cast<CheekyFgCompleteHooklessFrameFn>(
             GetProcAddress(fg_runtime,"CheekyFG_CompleteHooklessFrameV1")):nullptr;
         if(use_raw){
             if(hookless_complete)hookless_complete(0);
-            const auto result=passthrough(end,"presenter degraded");std::lock_guard lock(mx);++ended;changed.notify_all();return result;
+            const auto result=passthrough(end,"presenter degraded");std::lock_guard lock(mx);if(!stopping)++ended;changed.notify_all();return result;
         }
         {std::lock_guard capture_lock(capture_mutex);if(capture_overflow){
             if(hookless_complete)hookless_complete(0);
@@ -1011,7 +1029,7 @@ struct BufferedPresenter final : Presenter {
                 ++frames;held_valid=true;changed.notify_all();
             }
         }
-        {std::lock_guard lock(mx);++ended;changed.notify_all();}
+        {std::lock_guard lock(mx);if(!stopping)++ended;changed.notify_all();}
         return result;
     }
     static std::array<XrCompositionLayerProjectionView,2> midpoint(
@@ -1658,18 +1676,34 @@ struct BufferedPresenter final : Presenter {
     }
     void presentation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky OpenXR presentation");
+        struct CompleteBorrowedFrame {
+            BufferedPresenter& owner;
+            ~CompleteBorrowedFrame() {
+                std::lock_guard lock(owner.mx);
+                if(owner.raw){owner.raw=nullptr;owner.raw_done=true;
+                    owner.raw_result=XR_FAILED(owner.terminal)?owner.terminal:XR_ERROR_SESSION_NOT_RUNNING;}
+                owner.changed.notify_all();
+            }
+        } complete_borrowed_frame{*this};
         Pair active;bool have_active{},generated_phase{};double last_position{};
         try {for(;;) {
+            // Runtime frame ownership cannot transfer midway through the old
+            // native frame. BeginFrame may discard an unfinished frame rather
+            // than wait for its EndFrame, which would race our own EndFrame.
+            // Wait before acquiring a runtime frame so stop cannot strand a wait.
+            {std::unique_lock lock(mx);
+                changed.wait(lock,[&]{return stopping||!native_frame_pending;});
+                if(stopping)break;}
             bool allow_repeats{};
             if(!await_content(active,have_active,generated_phase,last_position,allow_repeats))break;
             XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};XrFrameState frame{XR_TYPE_FRAME_STATE};
             const auto start=TimingClock::now();auto result=xr.wait_frame(session,&wait,&frame);const auto waited_ms=elapsed_ms(start);
-            if(XR_FAILED(result)){std::lock_guard lock(mx);terminal=result;stopping=true;changed.notify_all();break;}
+            if(XR_FAILED(result)){runtime_failure("runtime xrWaitFrame",result);break;}
             const auto present_start=TimingClock::now();
             burst.log=trace;burst.poll_keys();
             XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=xr.begin_frame(session,&begin);
             {std::lock_guard lock(mx);runtime_begin.add(elapsed_ms(present_start));}
-            if(XR_FAILED(result)){std::lock_guard lock(mx);terminal=result;stopping=true;changed.notify_all();break;}
+            if(XR_FAILED(result)){runtime_failure("runtime xrBeginFrame",result);break;}
             const XrFrameEndInfo* raw_frame{};bool stop_now{};
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(awaiting_generated_submission&&(last_position>=double(awaiting_generated_submission)||frame.shouldRender!=XR_TRUE))
@@ -1866,7 +1900,7 @@ struct BufferedPresenter final : Presenter {
                 // the game overlap production with prior FG/compositor work.
                 // GPU copies have been queued before the next game is woken.
                 changed.notify_all();
-                if(XR_FAILED(result)){terminal=result;stopping=true;changed.notify_all();break;}
+                if(XR_FAILED(result)){runtime_failure("runtime xrEndFrame",result);break;}
             }
             if(age_log[0])trace(age_log);
             if(stage_log[0])trace(stage_log);
@@ -1874,7 +1908,7 @@ struct BufferedPresenter final : Presenter {
             if(gpu_age_log[0])trace(gpu_age_log);
             if(pacing_log[0])trace(pacing_log);
             if(native_latency_log[0])trace(native_latency_log);
-        }}catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
+        }}catch(...) {runtime_failure("presentation exception",XR_ERROR_RUNTIME_FAILURE);}
     }
 };
 }

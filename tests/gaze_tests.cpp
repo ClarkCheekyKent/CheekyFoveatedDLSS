@@ -1120,6 +1120,23 @@ void test_manual_stereo_mapping() {
     expect(gaze_diagnostics().using_gaze && gaze_diagnostics().views[0].layout_mapping,
         "Explicit manual mapping activates the diagnosed fallback");
     expect_near(centers[0].u, .65F, .002F, "Left-first manual mapping uses left gaze");
+    // MSFS evaluates a desktop view between the two VR views. Previously it
+    // evicted an eye on every frame, reversing the roles at the next frame.
+    register_stereo_view(5299);
+    note_stereo_view_geometry(5201, 1200, 1000, 2400, 2000, {});
+    note_stereo_view_geometry(5202, 1200, 1000, 2400, 2000, {});
+    note_stereo_view_geometry(5299, 2560, 1440, 2560, 1440, {});
+    for (unsigned cycle = 0; cycle < 12; ++cycle) {
+        (void)settings_for_view(s, 5299);
+        frame();
+        expect(gaze_diagnostics().views[0].resource_mapped &&
+            gaze_diagnostics().views[1].resource_mapped,
+            "Interleaved desktop DLSS must not invalidate either manual eye mapping");
+        expect_near(centers[0].u, .65F, .002F, "Desktop evaluation preserves the left center");
+        expect_near(centers[1].u, .35F, .002F, "Desktop evaluation preserves the right center");
+        expect(!stereo_eye_assignment(5299).assigned, "Desktop view is excluded from the manual pair");
+    }
+    unregister_stereo_view(5299);
     s.manual_stereo_right_first = true; frame(); frame(); frame();
     expect_near(centers[0].u, .35F, .002F, "Right-first manual mapping swaps gaze");
     expect_near(centers[1].u, .65F, .002F, "Right-first maps the other eye independently");

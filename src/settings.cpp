@@ -91,6 +91,7 @@ struct StereoView {
     CropGeometry crop{};
     bool has_geometry{};
     std::uint64_t generation{};
+    std::uint64_t first_evaluation{};
 };
 
 std::mutex stereo_views_mutex;
@@ -640,6 +641,38 @@ Settings settings_for_view(
     }
 
     const auto sequence = ++stereo_evaluation_sequence;
+    if (!matched_view->first_evaluation) matched_view->first_evaluation = sequence;
+    // Manual eye order applies to a stereo pair, not every DLSS feature. A
+    // desktop/mirror view interleaved with the eyes must not rotate the two
+    // fallback roles through the LRU cache. Geometry selects the pair only;
+    // the user's manual policy still supplies its eye identity.
+    if (settings.manual_stereo_mapping && stereo_views.size() > 2U) {
+        StereoView* pair[2]{};
+        unsigned pairs{};
+        for (auto& first : stereo_views) {
+            if (!first.has_geometry || !first.output_width || !first.output_height ||
+                !first.first_evaluation) continue;
+            for (auto& second : stereo_views) {
+                if (second.generation <= first.generation || !second.has_geometry ||
+                    !second.first_evaluation || first.output_width != second.output_width ||
+                    first.output_height != second.output_height) continue;
+                pair[0] = &first; pair[1] = &second; ++pairs;
+            }
+        }
+        if (pairs == 1U) {
+            if (pair[1]->first_evaluation < pair[0]->first_evaluation) std::swap(pair[0], pair[1]);
+            for (unsigned eye = 0; eye < 2U; ++eye)
+                eye_roles[eye].view_id = pair[eye]->view_id;
+            for (auto& view : stereo_views) {
+                view.has_eye_assignment = &view == pair[0] || &view == pair[1];
+                view.second_eye = &view == pair[1];
+            }
+            if (!matched_view->has_eye_assignment) {
+                result.x_offset = 0.0F;
+                return result;
+            }
+        }
+    }
     std::size_t role_index = 2U;
     for (std::size_t index{}; index < 2U; ++index) {
         if (eye_roles[index].view_id == view_id) {

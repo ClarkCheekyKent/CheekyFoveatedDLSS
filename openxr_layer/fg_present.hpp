@@ -102,6 +102,7 @@ struct Presenter {
     virtual CheekyFgMemory memory() const noexcept {return {};}
     virtual void note_app_image_wait(double) noexcept {}
     virtual void note_app_call(unsigned,double) noexcept {}
+    virtual void set_native_frame_pending(bool) noexcept {}
     double copy_wait_accumulator{},xr_period_ms{};
     virtual CheekyFgPerformance performance() const noexcept {
         CheekyFgPerformance out;const auto& t=worker.gpu_timings;

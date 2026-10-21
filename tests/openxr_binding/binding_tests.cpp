@@ -378,6 +378,172 @@ void custom_binding_menu_test() {
     fallback_profile = profile; fallback_tracking = true;
     std::cout << "PASS custom SteamVR binding: host fallback aim, both triggers, release, ray loss, profile cleanup\n";
 }
+void fg_native_handoff_test() {
+    reset();swapchains.clear();
+    const auto session=h<XrSession>(2);
+    SessionState owner{};owner.session=session;owner.instance=instance;owner.running=true;
+    sessions.emplace(session,std::move(owner));
+    static std::mutex runtime_mx;
+    static std::condition_variable runtime_cv;
+    static unsigned waits,begins,ends,discarded;
+    static bool cancel,second_wait_entered,fail_begin,fail_end;
+    waits=begins=ends=discarded=0;cancel=second_wait_entered=false;fail_begin=fail_end=true;
+    auto& d=instances.at(instance).dispatch;
+    d.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState*) {return XR_ERROR_RUNTIME_FAILURE;};
+    XrFrameState failed_wait{XR_TYPE_FRAME_STATE};
+    check(cheeky_xrWaitFrame(session,nullptr,&failed_wait)==XR_ERROR_RUNTIME_FAILURE &&
+        sessions.at(session).native_waits_pending==0,"Failed native wait must not retain frame ownership");
+    d.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* frame) {
+        std::unique_lock lock(runtime_mx);
+        if(waits==1){second_wait_entered=true;runtime_cv.notify_all();}
+        if(!runtime_cv.wait_for(lock,std::chrono::seconds(2),[]{return cancel||waits==begins;})||cancel)
+            return XR_ERROR_RUNTIME_FAILURE;
+        ++waits;frame->predictedDisplayTime=1000+waits*100;frame->predictedDisplayPeriod=10000000;
+        frame->shouldRender=XR_FALSE;return XR_SUCCESS;
+    };
+    d.begin_frame=[](XrSession,const XrFrameBeginInfo*) {
+        std::unique_lock lock(runtime_mx);
+        if(fail_begin){fail_begin=false;return XR_ERROR_RUNTIME_FAILURE;}
+        // A runtime may discard the prior unended frame, rather than block.
+        // The presenter must not rely on BeginFrame waiting for native EndFrame.
+        if(cancel)return XR_ERROR_RUNTIME_FAILURE;
+        const bool discard=begins!=ends;
+        if(discard)++discarded;
+        ++begins;runtime_cv.notify_all();return discard?XR_FRAME_DISCARDED:XR_SUCCESS;
+    };
+    d.end_frame=[](XrSession,const XrFrameEndInfo*) {
+        std::lock_guard lock(runtime_mx);
+        if(fail_end){fail_end=false;return XR_ERROR_RUNTIME_FAILURE;}
+        ++ends;runtime_cv.notify_all();return XR_SUCCESS;
+    };
+    XrFrameState first{XR_TYPE_FRAME_STATE};
+    check(XR_SUCCEEDED(cheeky_xrWaitFrame(session,nullptr,&first)),"Native pre-activation wait");
+    auto presenter=std::make_shared<cheeky::fg::BufferedPresenter>();
+    presenter->session=session;presenter->xr.wait_frame=d.wait_frame;
+    presenter->xr.begin_frame=d.begin_frame;presenter->xr.end_frame=d.end_frame;
+    sessions.at(session).fg=presenter;
+    presenter->set_native_frame_pending(true);
+    XrResult result=XR_ERROR_RUNTIME_FAILURE;XrFrameState second{XR_TYPE_FRAME_STATE};
+    std::thread next_wait([&]{result=presenter->wait_frame(nullptr,&second);});
+    bool premature_wait{};
+    {std::unique_lock lock(runtime_mx);premature_wait=runtime_cv.wait_for(lock,std::chrono::milliseconds(50),[]{return second_wait_entered;});}
+    const auto failed_begin_result=cheeky_xrBeginFrame(session,nullptr);
+    const bool begin_owner_retained=sessions.at(session).native_waits_pending==1;
+    const auto begin_result=cheeky_xrBeginFrame(session,nullptr);
+    // Widen the handoff race: the native renderer is still working while
+    // the application's next WaitFrame is already inside the new presenter.
+    {std::unique_lock lock(runtime_mx);premature_wait|=runtime_cv.wait_for(lock,std::chrono::milliseconds(50),[]{return second_wait_entered;});}
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=first.predictedDisplayTime;
+    const auto failed_end_result=cheeky_xrEndFrame(session,&end);
+    const bool end_owner_retained=sessions.at(session).native_frame_begun;
+    {std::unique_lock lock(runtime_mx);premature_wait|=runtime_cv.wait_for(lock,std::chrono::milliseconds(50),[]{return second_wait_entered;});}
+    const auto end_result=cheeky_xrEndFrame(session,&end);
+    next_wait.join();
+    {std::lock_guard lock(runtime_mx);cancel=true;runtime_cv.notify_all();}
+    presenter->invalidate_temporal();
+    check(failed_begin_result==XR_ERROR_RUNTIME_FAILURE && begin_owner_retained,
+        "Failed native begin must retain ownership for retry after activation");
+    check(failed_end_result==XR_ERROR_RUNTIME_FAILURE && end_owner_retained,
+        "Failed native end must retain ownership for retry after activation");
+    check(!premature_wait,"Presenter must not acquire a runtime frame before native EndFrame completes");
+    check(second_wait_entered&&discarded==0,"Runtime frame handoff must not discard the older native frame");
+    check(XR_SUCCEEDED(begin_result)&&XR_SUCCEEDED(end_result),"Old native Begin/End must retain downstream ownership");
+    check(XR_SUCCEEDED(result),"Forwarding the old Begin/End must release the new presenter wait");
+    check(presenter->begun==0&&presenter->ended==0,"Old native frame must not consume presenter frame counters");
+    sessions.clear();presenter.reset();
+    std::cout<<"PASS pipelined native WaitFrame -> FG enable -> native BeginFrame/EndFrame handoff\n";
+}
+
+void fg_lifecycle_retirement_test() {
+    reset();swapchains.clear();
+    struct RetirementProbe final : cheeky::fg::Presenter {
+        bool retired{},outside_state_lock{};
+        void invalidate_temporal() noexcept override {
+            retired=true;
+            std::thread callback([&]{outside_state_lock=state_mutex.try_lock();
+                if(outside_state_lock)state_mutex.unlock();});
+            callback.join();
+        }
+    };
+    const auto session=h<XrSession>(2);
+    SessionState owner{};owner.session=session;owner.instance=instance;
+    owner.fg_requested=true;owner.native_waits_pending=1;owner.native_frame_begun=true;
+    auto first=std::make_shared<RetirementProbe>();owner.fg=first;
+    sessions.emplace(session,std::move(owner));
+    auto& dispatch=instances.at(instance).dispatch;
+    dispatch.begin_session=[](XrSession,const XrSessionBeginInfo*) {return XR_SUCCESS;};
+    dispatch.end_session=[](XrSession) {return XR_SUCCESS;};
+    dispatch.destroy_swapchain=[](XrSwapchain) {return XR_SUCCESS;};
+    XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};begin.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    check(XR_SUCCEEDED(cheeky_xrBeginSession(session,&begin)) && first->retired && first->outside_state_lock,
+        "Session restart must retire the old presenter outside the layer state lock");
+    auto& live=sessions.at(session);
+    check(live.running&&!live.fg&&!live.fg_requested&&!live.native_waits_pending&&!live.native_frame_begun,
+        "Session restart must reacquire presenter setup and clear old frame ownership");
+    auto second=std::make_shared<RetirementProbe>();live.fg=second;live.fg_requested=true;
+    check(XR_SUCCEEDED(cheeky_xrEndSession(session)) && second->retired && second->outside_state_lock &&
+        !live.fg&&!live.fg_requested&&!live.running,"Session end must detach the stopped presenter");
+    auto third=std::make_shared<RetirementProbe>();live.fg=third;live.fg_requested=true;live.running=true;
+    const auto chain=h<XrSwapchain>(70);SwapchainState swapchain;swapchain.session=session;
+    swapchains.emplace(chain,std::move(swapchain));
+    check(XR_SUCCEEDED(cheeky_xrDestroySwapchain(chain)) && third->retired && third->outside_state_lock &&
+        !live.fg&&!live.fg_requested,"Swapchain replacement must rebuild setup instead of reusing a stopped presenter");
+    sessions.clear();
+    std::cout<<"PASS FG session restart/end and swapchain retirement outside the state lock\n";
+}
+
+void fg_borrowed_frame_shutdown_test() {
+    static std::mutex runtime_mutex;
+    static std::condition_variable runtime_changed;
+    static bool in_end,release_end;
+    static std::atomic<unsigned> waits{};
+    in_end=release_end=false;waits=0;
+    cheeky::fg::BufferedPresenter presenter;
+    presenter.session=h<XrSession>(2);
+    presenter.xr.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* state) {
+        Sleep(1);state->predictedDisplayTime=1000+100*++waits;
+        state->predictedDisplayPeriod=10000000;state->shouldRender=XR_FALSE;return XR_SUCCESS;
+    };
+    presenter.xr.begin_frame=[](XrSession,const XrFrameBeginInfo*) {return XR_SUCCESS;};
+    presenter.xr.end_frame=[](XrSession,const XrFrameEndInfo* end) {
+        if(end->next==h<void*>(1)) {
+            std::unique_lock lock(runtime_mutex);in_end=true;runtime_changed.notify_all();
+            runtime_changed.wait(lock,[]{return release_end;});
+        }
+        return XR_SUCCESS;
+    };
+    XrFrameState frame{XR_TYPE_FRAME_STATE};
+    check(XR_SUCCEEDED(presenter.wait_frame(nullptr,&frame)),"Borrowed frame runtime bootstrap");
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.next=h<void*>(1);end.displayTime=frame.predictedDisplayTime;
+    std::atomic<bool> returned{};XrResult result=XR_ERROR_RUNTIME_FAILURE;
+    std::thread sender([&]{result=presenter.passthrough(&end,"test extension chain");returned=true;});
+    bool entered{};
+    {std::unique_lock lock(runtime_mutex);entered=runtime_changed.wait_for(lock,std::chrono::seconds(2),[]{return in_end;});}
+    std::thread stopper([&]{presenter.stop();});
+    bool stopping{};
+    for(unsigned i=0;i<2000&&!stopping;++i){
+        {std::lock_guard lock(presenter.mx);stopping=presenter.stopping;}
+        if(!stopping)Sleep(1);
+    }
+    Sleep(20);const bool returned_early=returned;
+    {std::lock_guard lock(runtime_mutex);release_end=true;runtime_changed.notify_all();}
+    stopper.join();sender.join();
+    check(entered&&stopping&&!returned_early&&result==XR_SUCCESS,
+        "Stop must retain borrowed next/layers storage until the runtime EndFrame returns");
+    cheeky::fg::BufferedPresenter gated;gated.xr=presenter.xr;gated.set_native_frame_pending(true);
+    const auto before=waits.load();bool started{};
+    {std::lock_guard lock(gated.mx);started=gated.start();}
+    gated.stop();
+    check(started&&waits==before,"Stopping a pending native handoff must not acquire or strand a runtime frame");
+    cheeky::fg::BufferedPresenter failed;failed.started=true;failed.stopping=true;
+    failed.terminal=XR_ERROR_CALL_ORDER_INVALID;
+    check(failed.wait_frame(nullptr,&frame)==XR_ERROR_CALL_ORDER_INVALID &&
+        failed.begin_frame(nullptr)==XR_ERROR_CALL_ORDER_INVALID &&
+        failed.end_frame(&end,{},nullptr)==XR_ERROR_CALL_ORDER_INVALID &&
+        failed.passthrough(&end,"late shutdown request")==XR_ERROR_CALL_ORDER_INVALID,
+        "All application frame entry points must preserve the terminal runtime error without publishing another borrowed frame");
+    std::cout<<"PASS borrowed OpenXR frame lifetime during shutdown and pending handoff cancellation\n";
+}
 
 void fg_toggle_test() {
     reset();
@@ -783,6 +949,9 @@ void fg_copy_validation_test(bool include_buffered=true) {
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--fg-native-handoff") {fg_native_handoff_test();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-lifecycle") {fg_lifecycle_retirement_test();fg_borrowed_frame_shutdown_test();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-borrowed-shutdown") {fg_borrowed_frame_shutdown_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-hardening") {fg_hardening_validation();return 0;}
         if(argc>2 && (std::string(argv[1])=="--fg-capability" || std::string(argv[1])=="--fg-generate" || std::string(argv[1])=="--fg-buffered"||std::string(argv[1])=="--fg-motion"||std::string(argv[1])=="--fg-crop-motion")) {
             Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
@@ -822,7 +991,7 @@ int main(int argc,char** argv) {
         if(argc>1 && std::string(argv[1])=="--fg-d3d11") {fg_d3d11_validation();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-crop-gpu-validation") {fg_copy_validation_test(false);return 0;}
-        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
+        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }
