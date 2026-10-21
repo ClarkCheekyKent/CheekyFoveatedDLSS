@@ -2,8 +2,10 @@
 #include <openxr/openxr.h>
 #include <array>
 #include <vector>
+#include <memory>
 
 namespace cheeky::fg {
+using RetainFrameSpace = std::shared_ptr<void> (*)(XrSession, XrSpace, XrSpace&);
 // EndFrame's structures are usually stack allocated. Own copies of the
 // auxiliary layer descriptions until the extra WaitFrame slot is submitted.
 // Their released swapchains remain valid until the app renders its next frame.
@@ -32,8 +34,25 @@ struct FrameLayers {
         }
     };
     std::vector<Layer> layers;
+    // Copies of queued layers share ownership of their independent XR spaces.
+    std::vector<std::shared_ptr<void>> space_leases;
     XrCompositionLayerFlags scene_flags{};
-    void clear() {layers.clear();scene_flags=0;}
+    void clear() {layers.clear();space_leases.clear();scene_flags=0;}
+    bool retain_spaces(XrSession session, RetainFrameSpace retain) {
+        if(!retain)return true; // Callers without asynchronous space ownership.
+        for(auto& layer:layers) {
+            auto* header=const_cast<XrCompositionLayerBaseHeader*>(layer.header());
+            if(!header)return false;
+            XrSpace replacement{};auto lease=retain(session,header->space,replacement);
+            if(!lease||!replacement){clear();return false;}
+            header->space=replacement;space_leases.push_back(std::move(lease));
+        }
+        return true;
+    }
+    XrSpace scene_space() const noexcept {
+        for(const auto& layer:layers)if(layer.scene)return layer.projection.space;
+        return XR_NULL_HANDLE;
+    }
     bool prepare(const XrFrameEndInfo* info,const XrCompositionLayerProjection* scene) {
         clear();
         if(!info||!scene||info->next||!info->layers||!info->layerCount||info->layerCount>32)return false;

@@ -38,6 +38,7 @@ struct XrFns {
     PFN_xrBeginFrame begin_frame{};
     PFN_xrEndFrame end_frame{};
     PFN_xrLocateSpace locate_space{};
+    RetainFrameSpace retain_space{};
 };
 struct ColorCopy {
     XrSwapchain source{XR_NULL_HANDLE};

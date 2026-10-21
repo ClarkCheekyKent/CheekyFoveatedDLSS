@@ -3,7 +3,8 @@
 Build the x64 Release OpenXR layer with `/p:CheekyFgLifetimeDiagnostics=true`.
 The same property on CheekyOpenXRBindingTests enables its diagnostic forwarding
 and invalid-handle probe regression (`--fg-lifetime`, also in the default run).
-Normal builds omit the extra hooks and probes.
+Normal builds include the frame-space ownership fix. They omit the extra
+lifetime logs and failure probes.
 
 The OpenXR startup log identifies instrumented builds with
 `FG-LIFETIME diagnostic build active`.

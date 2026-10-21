@@ -97,7 +97,7 @@ constexpr XrPath profile = 100;
 const XrInstance instance = h<XrInstance>(1);
 const XrAction host_action = h<XrAction>(201);
 void reset() {
-    sessions.clear(); instances.clear(); runtime_bindings.clear(); attached_sets.clear();
+    sessions.clear(); instances.clear(); frame_spaces.clear(); runtime_bindings.clear(); attached_sets.clear();
     suggestion_result = XR_SUCCESS; suggestion_calls = 0;
     InstanceState state{}; state.instance = instance;
     state.dispatch.suggest_bindings = suggest; state.dispatch.string_to_path = path;
@@ -946,20 +946,106 @@ void fg_copy_validation_test(bool include_buffered=true) {
 }
 #include "fg_hardware_probe.hpp"
 #include "fg_hardening_validation.hpp"
+void frame_space_lifetime_test() {
+    reset();const auto session=h<XrSession>(9100);
+    SessionState owner{};owner.instance=instance;owner.session=session;sessions.emplace(session,std::move(owner));
+    static std::unordered_map<XrSpace,unsigned> alive,destroyed;
+    static uintptr_t next_space;static bool fail_create;
+    alive.clear();destroyed.clear();next_space=10000;fail_create=false;
+    auto& d=instances.at(instance).dispatch;
+    d.create_reference_space=[](XrSession,const XrReferenceSpaceCreateInfo* info,XrSpace* out)->XrResult{
+        check(info->referenceSpaceType==XR_REFERENCE_SPACE_TYPE_LOCAL&&info->poseInReferenceSpace.position.x==.25F,
+            "Retained reference space must preserve type and origin pose");
+        if(fail_create)return XR_ERROR_RUNTIME_FAILURE;
+        *out=h<XrSpace>(next_space++);alive[*out]=1;return XR_SUCCESS;
+    };
+    d.create_action_space=[](XrSession,const XrActionSpaceCreateInfo* info,XrSpace* out)->XrResult{
+        check(info->action==h<XrAction>(77)&&info->subactionPath==88&&info->poseInActionSpace.position.z==.5F,
+            "Retained action space must preserve action, subaction and origin pose");
+        if(fail_create)return XR_ERROR_RUNTIME_FAILURE;
+        *out=h<XrSpace>(next_space++);alive[*out]=1;return XR_SUCCESS;
+    };
+    d.destroy_space=[](XrSpace space)->XrResult{
+        bool unlocked{};std::thread probe([&]{unlocked=state_mutex.try_lock();if(unlocked)state_mutex.unlock();});probe.join();
+        check(unlocked,"Space destruction must run outside the layer state mutex");
+        if(!alive.erase(space))return XR_ERROR_HANDLE_INVALID;++destroyed[space];return XR_SUCCESS;
+    };
+    XrReferenceSpaceCreateInfo reference{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    reference.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL;reference.poseInReferenceSpace.orientation.w=1;reference.poseInReferenceSpace.position.x=.25F;
+    XrActionSpaceCreateInfo action{XR_TYPE_ACTION_SPACE_CREATE_INFO};action.action=h<XrAction>(77);action.subactionPath=88;
+    action.poseInActionSpace.orientation.w=1;action.poseInActionSpace.position.z=.5F;
+    XrSpace source{},auxiliary{};
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&source)==XR_SUCCESS,"Create reference fixture");
+    check(cheeky_xrCreateActionSpace(session,&action,&auxiliary)==XR_SUCCESS,"Create action fixture");
+    XrCompositionLayerProjectionView views[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=source;projection.viewCount=2;projection.views=views;
+    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};quad.space=auxiliary;
+    const XrCompositionLayerBaseHeader* headers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection),reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)};
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.layers=headers;end.layerCount=2;
+    cheeky::fg::BufferedPresenter::Native native;
+    check(native.layers.prepare(&end,&projection)&&native.layers.retain_spaces(session,retain_frame_space),"Queue scene and auxiliary spaces");
+    native.space=native.layers.scene_space();
+    check(native.space!=source&&projection.space==source&&quad.space==auxiliary,"Ownership replaces only copied layer handles");
+    cheeky::fg::BufferedPresenter::Pair generated;generated.layers=native.layers;generated.space=native.space;
+    const auto owned_scene=native.space;const auto owned_aux=generated.layers.layers[1].quad.space;
+    XrSpace same{};auto extra=retain_frame_space(session,source,same);
+    check(same==owned_scene&&alive.size()==4,"Frames share one retained space per live application space");extra.reset();
+    check(cheeky_xrDestroySpace(source)==XR_SUCCESS&&cheeky_xrDestroySpace(auxiliary)==XR_SUCCESS&&
+        destroyed[source]==1&&destroyed[auxiliary]==1,"Application destruction forwards immediately");
+    native.layers.clear();
+    const auto submit=[&](const auto& layers) {
+        for(const auto* layer:layers)if(!alive.contains(layer->space))return XR_ERROR_HANDLE_INVALID;
+        return XR_SUCCESS;
+    };
+    check(submit(headers)==XR_ERROR_HANDLE_INVALID,"Original borrowed handles reproduce the captured invalid-space failure");
+    XrCompositionLayerProjection submitted=projection;submitted.space=generated.space;
+    auto queued=generated.layers.replace_scene(submitted);
+    check(submit(queued)==XR_SUCCESS,"Queued frame must submit successfully after recenter destroys original spaces");
+    // A reused application handle must get a fresh record, never the old origin.
+    next_space=reinterpret_cast<uintptr_t>(source);XrSpace recreated{};
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&recreated)==XR_SUCCESS&&recreated==source,"Recenter handle reuse fixture");
+    auto replacement=retain_frame_space(session,recreated,same);
+    check(replacement&&same!=owned_scene,"Reused handle must not inherit a prior frame's space");
+    const auto owned_replacement=same;const auto previous_destroys=destroyed[owned_replacement];
+    check(cheeky_xrDestroySpace(recreated)==XR_SUCCESS,"Destroy recreated application space");replacement.reset();
+    check(destroyed[owned_replacement]==previous_destroys+1,"Recreated space lease retires independently");
+    generated.layers.clear();
+    check(destroyed[owned_scene]==1&&destroyed[owned_aux]==1&&alive.empty(),"Last queued frame releases each owned space exactly once");
+    XrSpace unsupported{};next_space=11000;
+    XrBaseInStructure extension{};reference.next=&extension;
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&unsupported)==XR_SUCCESS,"Extended create still forwards");
+    check(!retain_frame_space(session,unsupported,same),"Unknown create extensions cannot be silently dropped from retained spaces");
+    check(cheeky_xrDestroySpace(unsupported)==XR_SUCCESS,"Extended space destruction still forwards");reference.next=nullptr;
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&source)==XR_SUCCESS,"Failed-retain fixture create");
+    fail_create=true;
+    check(!retain_frame_space(session,source,same)&&alive.contains(source),"Clone failure leaves the original available for native passthrough");fail_create=false;
+    check(cheeky_xrDestroySpace(source)==XR_SUCCESS&&alive.empty(),"Clone failure does not leak runtime handles");
+    // Exercise the actual presenter retirement path with a queued space lease.
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&source)==XR_SUCCESS,"Shutdown fixture create");
+    projection.space=source;end.layerCount=1;
+    cheeky::fg::BufferedPresenter presenter;
+    presenter.slots[0]=std::make_shared<cheeky::fg::BufferedPresenter::Native>();
+    auto& pending=presenter.slots[0]->layers;
+    check(pending.prepare(&end,&projection)&&pending.retain_spaces(session,retain_frame_space),"Shutdown retains a queued frame space");
+    check(cheeky_xrDestroySpace(source)==XR_SUCCESS&&alive.size()==1,"Only the queued frame's independent space remains");
+    presenter.stop();check(alive.empty(),"Presenter shutdown retires queued spaces before session destruction");
+    sessions.clear();frame_spaces.clear();
+    std::cout<<"PASS queued FG space ownership across recenter, auxiliary layers, handle reuse and clone failures\n";
+}
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
 void diagnostic_lifetime_test() {
-    reset();traced_spaces.clear();
+    reset();frame_spaces.clear();
     const auto session=h<XrSession>(9001);SessionState owner{};owner.instance=instance;owner.session=session;sessions.emplace(session,std::move(owner));
     auto& d=instances.at(instance).dispatch;
     d.create_reference_space=[](XrSession,const XrReferenceSpaceCreateInfo*,XrSpace* out)->XrResult{*out=h<XrSpace>(9002);return XR_SUCCESS;};
     d.create_action_space=[](XrSession,const XrActionSpaceCreateInfo*,XrSpace* out)->XrResult{*out=h<XrSpace>(9003);return XR_SUCCESS;};
     d.destroy_space=[](XrSpace space)->XrResult{return space==h<XrSpace>(9002)?XR_ERROR_RUNTIME_FAILURE:XR_SUCCESS;};
     XrSpace space{};XrReferenceSpaceCreateInfo reference{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-    check(cheeky_xrCreateReferenceSpace(session,&reference,&space)==XR_SUCCESS&&traced_spaces.contains(space),"Diagnostic reference create forwards and tracks");
-    check(cheeky_xrDestroySpace(space)==XR_ERROR_RUNTIME_FAILURE&&traced_spaces.contains(space),"Failed destroy preserves tracking and result");
+    check(cheeky_xrCreateReferenceSpace(session,&reference,&space)==XR_SUCCESS&&frame_spaces.contains(space),"Diagnostic reference create forwards and tracks");
+    check(cheeky_xrDestroySpace(space)==XR_ERROR_RUNTIME_FAILURE&&frame_spaces.contains(space),"Failed destroy preserves tracking and result");
     XrActionSpaceCreateInfo action{XR_TYPE_ACTION_SPACE_CREATE_INFO};
-    check(cheeky_xrCreateActionSpace(session,&action,&space)==XR_SUCCESS&&traced_spaces.contains(space),"Diagnostic action create forwards and tracks");
-    check(cheeky_xrDestroySpace(space)==XR_SUCCESS&&!traced_spaces.contains(space),"Successful destroy removes tracking");
+    check(cheeky_xrCreateActionSpace(session,&action,&space)==XR_SUCCESS&&frame_spaces.contains(space),"Diagnostic action create forwards and tracks");
+    check(cheeky_xrDestroySpace(space)==XR_SUCCESS&&!frame_spaces.contains(space),"Successful destroy removes tracking");
     check(cheeky_xrDestroySpace(h<XrSpace>(9004))==XR_SUCCESS,"Untracked extension space still forwards");
     cheeky::fg::BufferedPresenter p;static std::string log;log.clear();
     p.trace=[](const char* text) noexcept {log+=text;log+='\n';};
@@ -972,13 +1058,15 @@ void diagnostic_lifetime_test() {
     XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.layers=&header;end.layerCount=1;
     check(p.runtime_end_frame(&end)==XR_ERROR_HANDLE_INVALID,"Diagnostic probes preserve original EndFrame result");
     check(log.find("self_locate_result=-12")!=log.npos&&log.find("enumerate_result=0")!=log.npos,"Failure log distinguishes invalid space from live chain");
-    sessions.clear();traced_spaces.clear();
+    sessions.clear();frame_spaces.clear();
     std::cout<<"PASS diagnostic space lifecycle forwarding and EndFrame handle probes\n";
 }
 #endif
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        frame_space_lifetime_test();
+        if(argc>1&&std::string(argv[1])=="--fg-space-lifetime")return 0;
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
         diagnostic_lifetime_test();
         if(argc>1&&std::string(argv[1])=="--fg-lifetime")return 0;

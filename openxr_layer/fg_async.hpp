@@ -882,7 +882,7 @@ struct BufferedPresenter final : Presenter {
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
         job->color={};job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
-        if(!projection||!job->layers.prepare(end,projection)){
+        if(!projection||!job->layers.prepare(end,projection)||!job->layers.retain_spaces(session,xr.retain_space)){
             if(inference_slot&&hookless_complete)hookless_complete(0);
             result=passthrough(end,"unsupported OpenXR projection/layers");
         }
@@ -1048,7 +1048,7 @@ struct BufferedPresenter final : Presenter {
             }
             if(!good)result=passthrough(end,"incomplete native color capture / changed swapchain layout");
             else {
-                job->space=projection->space;job->blend=end->environmentBlendMode;
+                job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();
                 // Keep the debug overlay on native submissions too. Native
                 // snapshots are immutable once published; use the last proven
