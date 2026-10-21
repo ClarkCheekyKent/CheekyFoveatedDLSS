@@ -228,10 +228,21 @@ NgxResult dispatch_d3d12_ngx_evaluation(
 ) noexcept {
     if (original == nullptr) return 0xBAD00007U;
     if (protected_ngx_core_enabled() && call.route == D3D12NgxRoute::core_runtime) {
-        // Private lower-runtime features must not re-enter upstream hooks.
+        // Some titles call _nvngx.dll directly without going through the
+        // public/lower hook. Capture those independent calls, but never
+        // double-publish a core evaluation nested inside an upstream call.
         if (afw_reject_core_reentry()) return 0xBAD00007U;
+        const bool independent = !d3d12_ngx_interception_active();
         AfwCoreScope core(call);
-        return original(call.command_list, call.handle, call.parameters, call.callback);
+        const auto result = original(call.command_list, call.handle, call.parameters, call.callback);
+        if (independent && !core.seen) {
+            // MSFS also uses native NGX feature 11 (DLSS Frame Generation).
+            // Its EvaluateFeature is NOT an SR eye and must never be recorded
+            // as a guide: it may run on another queue and exhaust all 24 slots.
+            if (fg_is_registered_sr_feature(call.handle))
+                fg_publish_ngx(call.command_list, call.handle, call.parameters, result);
+        }
+        return result;
     }
     // An independent public call may itself forward to the core runtime. Do
     // not mark that ordinary full-frame passthrough as private interception.

@@ -22,19 +22,35 @@ struct FgPreparedGuides {
         void clear(){passes={};descriptors.Reset();}
     };
     Ptr<ID3D12RootSignature> root;
-    Ptr<ID3D12PipelineState> pipeline;
+    Ptr<ID3D12PipelineState> pipeline, pipeline_depth_array;
     struct Constants {float rect[4]{},offset[4]{},dimensions[4]{},motion[4]{},jitter[4]{},options[4]{};};
-    bool initialize(ID3D12Device* device) {
-        if(root&&pipeline)return true;
+    bool initialize(ID3D12Device* device,bool need_depth_array) {
+        if(root&&pipeline&&(!need_depth_array||pipeline_depth_array))return true;
         constexpr char shader[]=R"HLSL(
-Texture2D<float> Depth:register(t0);Texture2D<float2> Motion:register(t1);
+#if DEPTH_ARRAY
+Texture2DArray<float> Depth:register(t0);
+#else
+Texture2D<float> Depth:register(t0);
+#endif
+Texture2D<float2> Motion:register(t1);
 RWTexture2D<float> OutDepth:register(u0);RWTexture2D<float2> OutMotion:register(u1);
 cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 JitterCorrection;float4 Options;}
 [numthreads(8,8,1)]void Main(uint3 id:SV_DispatchThreadID){
  if(id.x>=uint(Options.z)||id.y>=uint(Options.w))return;
  float2 uv=Rect.xy+(float2(id.xy)+.5)/Options.zw*Rect.zw;
- if(Options.x>.5){uint dw,dh;Depth.GetDimensions(dw,dh);
-  uint2 p=min(uint2(uv*Dimensions.xy+GuideOffset.xy),uint2(dw,dh)-1);OutDepth[id.xy]=Depth.Load(int3(p,0));}
+ if(Options.x>.5){uint dw,dh;
+#if DEPTH_ARRAY
+  uint layerCount;Depth.GetDimensions(dw,dh,layerCount);
+#else
+  Depth.GetDimensions(dw,dh);
+#endif
+  uint2 p=min(uint2(uv*Dimensions.xy+GuideOffset.xy),uint2(dw,dh)-1);
+#if DEPTH_ARRAY
+  OutDepth[id.xy]=Depth.Load(int4(p,0,0)); // Array-compatible input: slice 0, mip 0.
+#else
+  OutDepth[id.xy]=Depth.Load(int3(p,0));
+#endif
+ }
  if(Options.y>.5){uint mw,mh;Motion.GetDimensions(mw,mh);
   uint2 p=min(uint2(uv*Dimensions.zw+GuideOffset.zw),uint2(mw,mh)-1);
   float2 mv=Motion.Load(int3(p,0));bool good=all(isfinite(mv))&&all(abs(mv)<65504.0);
@@ -48,15 +64,26 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         Ptr<ID3DBlob> blob,error,code;
         if(!root&&(FAILED(D3D12SerializeRootSignature(&desc,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error))||
             FAILED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)))))return false;
-        if(FAILED(D3DCompile(shader,strlen(shader),nullptr,nullptr,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return false;
-        D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};
-        return SUCCEEDED(device->CreateComputePipelineState(&ps,IID_PPV_ARGS(&pipeline)));
+        if(!pipeline){
+            const D3D_SHADER_MACRO defines[]={{"DEPTH_ARRAY","0"},{nullptr,nullptr}};
+            if(FAILED(D3DCompile(shader,strlen(shader),nullptr,defines,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return false;
+            D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};
+            if(FAILED(device->CreateComputePipelineState(&ps,IID_PPV_ARGS(&pipeline))))return false;
+        }
+        if(need_depth_array&&!pipeline_depth_array){
+            code.Reset();error.Reset();
+            const D3D_SHADER_MACRO defines[]={{"DEPTH_ARRAY","1"},{nullptr,nullptr}};
+            if(FAILED(D3DCompile(shader,strlen(shader),nullptr,defines,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return false;
+            D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};
+            if(FAILED(device->CreateComputePipelineState(&ps,IID_PPV_ARGS(&pipeline_depth_array))))return false;
+        }
+        return true;
     }
     static bool allocate(ID3D12Device* device,Ptr<ID3D12Resource>& out,unsigned w,unsigned h,DXGI_FORMAT format) {
         if(out){const auto d=out->GetDesc();if(d.Width==w&&d.Height==h&&d.Format==format)return true;}
         out.Reset();D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;desc.Width=w;desc.Height=h;
-        desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;desc.Format=format;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Format=format;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         return SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out)));
     }
     static void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* texture,D3D12_RESOURCE_STATES from,D3D12_RESOURCE_STATES to) {
@@ -69,7 +96,7 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         const auto dd=depth->GetDesc(),md=motion->GetDesc();
         const auto df=cheeky::fg::guide_depth_format(dd.Format),mf=cheeky::fg::guide_motion_format(md.Format);
         if(df==DXGI_FORMAT_UNKNOWN||mf==DXGI_FORMAT_UNKNOWN||
-           ((dd.Flags|md.Flags)&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)||!initialize(device))return false;
+           ((dd.Flags|md.Flags)&D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)||!initialize(device,dd.DepthOrArraySize>1))return false;
         auto active=[](unsigned total,unsigned base,unsigned requested){return base<total?std::min(requested?requested:total,total-base):0u;};
         const unsigned dw=active(unsigned(dd.Width),g.depth_base_x,g.depth_width),dh=active(dd.Height,g.depth_base_y,g.depth_height),
             mw=active(unsigned(md.Width),g.motion_base_x,g.motion_width),mh=active(md.Height,g.motion_base_y,g.motion_height);
@@ -87,14 +114,26 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         auto cpu=buffers.descriptors->GetCPUDescriptorHandleForHeapStart();
         for(unsigned pass=0;pass<2;++pass){const auto& p=buffers.passes[pass];
             for(unsigned input=0;input<2;++input){D3D12_SHADER_RESOURCE_VIEW_DESC view{};view.Format=input?mf:df;
-                view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;view.Texture2D.MipLevels=1;
+                view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                if(!input&&dd.DepthOrArraySize>1){
+                    // A one-slice SRV of mip zero: no implicit reinterpretation
+                    // as Texture2D and no dependence on additional depth mips.
+                    view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    view.Texture2DArray.MipLevels=1;
+                    view.Texture2DArray.FirstArraySlice=0;
+                    view.Texture2DArray.ArraySize=1;
+                }else{
+                    view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+                    view.Texture2D.MipLevels=1;
+                }
                 device->CreateShaderResourceView(input?motion.Get():depth.Get(),&view,cpu);cpu.ptr+=stride;}
             unsigned i{};for(auto* texture:{p.depth.Get(),p.motion.Get()}){D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
                 view.Format=texture?texture->GetDesc().Format:(i?DXGI_FORMAT_R32G32_FLOAT:DXGI_FORMAT_R32_FLOAT);++i;
                 view.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(texture,nullptr,&view,cpu);cpu.ptr+=stride;}
         }
         ID3D12DescriptorHeap* heaps[]{buffers.descriptors.Get()};list->SetDescriptorHeaps(1,heaps);
-        list->SetComputeRootSignature(root.Get());list->SetPipelineState(pipeline.Get());
+        list->SetComputeRootSignature(root.Get());
+        list->SetPipelineState(dd.DepthOrArraySize>1?pipeline_depth_array.Get():pipeline.Get());
         for(unsigned pass=0;pass<2;++pass){const auto& grid=grids[pass];const auto& p=buffers.passes[pass];if(!grid.motion&&!grid.depth)continue;
             Constants c;c.rect[0]=float(grid.x)/g.width;c.rect[1]=float(grid.y)/g.height;c.rect[2]=float(grid.w)/g.width;c.rect[3]=float(grid.h)/g.height;
             c.offset[0]=float(g.depth_base_x);c.offset[1]=float(g.depth_base_y);c.offset[2]=float(g.motion_base_x);c.offset[3]=float(g.motion_base_y);

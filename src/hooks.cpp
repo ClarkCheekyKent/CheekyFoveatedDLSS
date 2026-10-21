@@ -27,6 +27,7 @@
 #include "runtime.hpp"
 #include "settings.hpp"
 #include "fg_capture.hpp"
+#include "fg_sr_region.hpp"
 
 #include <Windows.h>
 #include <winver.h>
@@ -4547,7 +4548,7 @@ NgxResult runtime_create_d3d12(
     const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 2);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
-        if (is_dlss_feature(feature)) fg_remember_feature(*handle,parameters);
+        if (feature == 1U) fg_remember_feature(*handle,parameters);
     }
     return result;
 }
@@ -4592,7 +4593,7 @@ NgxResult hook_core_create_d3d12(
     const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 3);
     if (ngx_succeeded(result) && handle != nullptr) {
         remember_d3d12_game_view(*handle, feature, output_extent);
-        if (is_dlss_feature(feature)) fg_remember_feature(*handle,parameters);
+        if (feature == 1U) fg_remember_feature(*handle,parameters);
     }
     return result;
 }
@@ -5313,8 +5314,17 @@ NgxResult evaluate_d3d12_c_impl(
 NgxResult runtime_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallbackC callback) {
     const bool outer = !d3d12_ngx_interception_active();
+    // The regular EvaluateFeature path publishes FG guides in
+    // dispatch_d3d12_ngx_evaluation(). The _C ABI doesn't use that dispatcher:
+    // without this publication a title using both entrypoints loses an eye.
+    if (outer) fg_sr_begin_evaluation(reinterpret_cast<std::uintptr_t>(handle));
     const auto result = evaluate_d3d12_c_impl(list, handle, parameters, callback);
-    if (outer) stamp_d3d12_game_output(list, handle, parameters, result);
+    if (outer) {
+        stamp_d3d12_game_output(list, handle, parameters, result);
+        // Only feature 1 is an SR eye; feature 11 is native DLSS-G.
+        if (fg_is_registered_sr_feature(handle))
+            fg_publish_ngx(list, handle, parameters, result);
+    }
     return result;
 }
 

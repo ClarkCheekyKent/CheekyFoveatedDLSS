@@ -264,6 +264,11 @@ void fg_remember_feature(const NgxHandle* handle,const NgxParameters* p) noexcep
     trace_event("FG game DLSS-SR feature created: handle=%p revision=%llu (FG history refresh on next complete stereo pair)",
         static_cast<const void*>(handle),static_cast<unsigned long long>(revision));
 } catch(...) {}
+bool fg_is_registered_sr_feature(const NgxHandle* handle) noexcept try {
+    if (!handle) return false;
+    std::lock_guard lock(mutex);
+    return feature_flags.contains(handle);
+} catch (...) { return false; }
 void fg_forget_feature(const NgxHandle* handle) noexcept try {
     std::uint64_t revision{};
     {
@@ -290,8 +295,12 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     auto* depth=read(p,"Depth");auto* motion=read(p,"MotionVectors");
     if(!depth||!motion)return;
     const auto dd=depth->GetDesc(),md=motion->GetDesc();
+    // MSFS 2024 passes a two-slice, mipmapped depth texture for one stereo
+    // SR evaluation even when native quad-view foveation is disabled. The FG
+    // guide preparation path samples mip 0 of slice 0 explicitly.
     if(dd.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||md.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-       dd.DepthOrArraySize!=1||md.DepthOrArraySize!=1||dd.SampleDesc.Count!=1||md.SampleDesc.Count!=1)return;
+       (dd.DepthOrArraySize!=1&&dd.DepthOrArraySize!=2)||md.DepthOrArraySize!=1||
+       dd.SampleDesc.Count!=1||md.SampleDesc.Count!=1)return;
     const unsigned w=ui(p,"OutWidth"),h=ui(p,"OutHeight");
     if(!w||!h)return;
     CheekyFgEye m;

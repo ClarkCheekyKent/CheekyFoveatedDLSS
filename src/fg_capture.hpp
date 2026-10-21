@@ -21,6 +21,8 @@ const char* fg_state_name(CheekyFgState state) noexcept;
 namespace cheeky::foveated_dlss {
 void fg_publish_ngx(ID3D12GraphicsCommandList*,const NgxHandle*,const NgxParameters*,NgxResult) noexcept;
 void fg_remember_feature(const NgxHandle*,const NgxParameters*) noexcept;
+// Only feature=1 (Super Resolution) can provide stereo FG guides.
+bool fg_is_registered_sr_feature(const NgxHandle*) noexcept;
 void fg_forget_feature(const NgxHandle*) noexcept;
 void fg_set_uevr_queue(ID3D12CommandQueue*) noexcept;
 // Standalone hosts have no UEVR render tickets. Match submitted guides at xrEndFrame.

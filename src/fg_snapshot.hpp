@@ -334,6 +334,9 @@ public:
         const bool prepared=meta.guide_capture_mode==1u&&preparation.record(device.Get(),commands,meta,slot->prepared);
         if(prepared){slot->depth.Reset();slot->motion.Reset();++prepared_captures;}
         else {
+            // Never silently pass a multi-slice raw depth texture to the FG
+            // consumer, which expects one 2D guide per physical eye.
+            if(meta.depth->GetDesc().DepthOrArraySize>1){failed_record=id;return false;}
             if(meta.guide_capture_mode==1u)++preparation_fallbacks;
             slot->prepared.clear();
             if(!allocate(meta.depth,slot->depth,dr)||!allocate(meta.motion,slot->motion,mr)){failed_record=id;return false;}
