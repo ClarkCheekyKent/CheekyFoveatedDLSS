@@ -1,6 +1,7 @@
 #include "depth_formats.hpp"
 #include "peripheral_dlaa.hpp"
 #include "peripheral_shaders.hpp"
+#include "d3d12_output_contract.hpp"
 #include "d3d_shaders.hpp"
 #include "motion_region.hpp"
 #include "rr_contract.hpp"
@@ -393,7 +394,7 @@ void release_state(PeripheralViewState& state) noexcept {
         )) {
         return false;
     }
-    state.output->SetName(L"Cheeky Peripheral DLAA output");
+    state.output->SetName(L"Cheeky Peripheral DLSS output");
     return true;
 }
 
@@ -509,11 +510,7 @@ void release_state(PeripheralViewState& state) noexcept {
     auto cpu = state.converter_descriptors->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += descriptor_offset;
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = source_format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1U;
+    const auto srv=d3d12_composite_srv(source_format);
     state.device->CreateShaderResourceView(source, &srv, cpu);
     cpu.ptr += state.descriptor_size;
 
@@ -522,14 +519,10 @@ void release_state(PeripheralViewState& state) noexcept {
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     state.device->CreateUnorderedAccessView(destination, nullptr, &uav, cpu);
 
-    if (source_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
-        transition(
-            request.command_list,
-            source,
-            source_state,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-        );
-    }
+    // Only mip 0/slice 0 is read; other subresources can have different states.
+    D3D12_RESOURCE_BARRIER source_barrier{};source_barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    source_barrier.Transition={source,0,source_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    if(source_state!=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)request.command_list->ResourceBarrier(1,&source_barrier);
 
     ID3D12DescriptorHeap* heaps[]{state.converter_descriptors};
     request.command_list->SetDescriptorHeaps(1U, heaps);
@@ -568,12 +561,8 @@ void release_state(PeripheralViewState& state) noexcept {
     );
 
     if (source_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
-        transition(
-            request.command_list,
-            source,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            source_state
-        );
+        std::swap(source_barrier.Transition.StateBefore,source_barrier.Transition.StateAfter);
+        request.command_list->ResourceBarrier(1,&source_barrier);
     }
     return true;
 }

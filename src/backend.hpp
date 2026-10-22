@@ -128,6 +128,10 @@ void finish_d3d12(
 ) noexcept;
 
 void d3d12_align_reconstruction_grid(D3D12Evaluation*) noexcept;
+// Expand an already reconstructed peripheral image over its whole game view.
+[[nodiscard]] bool compose_d3d12_peripheral_view(ID3D12GraphicsCommandList*,
+    ID3D12Resource* source, ID3D12Resource* output, unsigned width, unsigned height,
+    unsigned x, unsigned y, DlssViewId, const Settings&) noexcept;
 [[nodiscard]] bool d3d12_set_composite_base(
     D3D12Evaluation* evaluation,
     ID3D12Resource* low_resolution_color,

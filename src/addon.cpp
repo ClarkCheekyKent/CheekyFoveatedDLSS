@@ -291,7 +291,7 @@ void draw_resolution_performance(
                 motion_vector_space_name(data.motion_vector_space)
             );
             diagnostic_row(
-                "Peripheral DLAA", "%s",
+                "Peripheral DLSS", "%s",
                 !live_settings.peripheral_dlaa_enabled
                     ? "Disabled"
                     : data.motion_vector_space == MotionVectorSpace::output
@@ -303,7 +303,7 @@ void draw_resolution_performance(
         } else {
             diagnostic_row("Motion vectors", "Not sampled yet");
             diagnostic_row(
-                "Peripheral DLAA", "%s",
+                "Peripheral DLSS", "%s",
                 live_settings.peripheral_dlaa_enabled
                     ? "Enabled (waiting for MV info)"
                     : "Disabled"
@@ -395,8 +395,10 @@ void draw_d3d11_gpu_performance(
 ) {
     ImGui::SeparatorText("DLSS GPU Timing (250 ms average)");
     if (DiagnosticTable table{"dlss_timing"}) {
-        timing_row("Full DLSS call", data.native_dlss_gpu_ms);
-        timing_row("Foveated DLSS call", data.foveated_dlss_gpu_ms);
+        const bool quad=quad_view_snapshot().active;
+        timing_row(quad?"Original DLSS":"Full DLSS", data.native_dlss_gpu_ms);
+        if(quad)timing_row("Original peripheral DLSS",data.native_peripheral_dlss_gpu_ms);
+        timing_row("Foveated DLSS", data.foveated_dlss_gpu_ms);
         if (settings.peripheral_dlaa_enabled) {
             const bool direct =
                 data.d3d11_execution_path == D3D11ExecutionPath::dx11_direct;
@@ -406,10 +408,10 @@ void draw_d3d11_gpu_performance(
                     d3d11_peripheral_dlaa_preparation_gpu_ms()
                 );
             }
-            timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
+            timing_row("Peripheral DLSS", data.peripheral_dlaa_gpu_ms);
             if (direct) {
                 timing_row(
-                    "Peripheral prep + DLAA total",
+                    "Peripheral prep + DLSS total",
                     d3d11_peripheral_dlaa_total_gpu_ms()
                 );
             }
@@ -473,10 +475,12 @@ void draw_d3d12_gpu_performance(
 ) {
     ImGui::SeparatorText("DLSS GPU Timing (250 ms average)");
     if (DiagnosticTable table{"d3d12_dlss_timing"}) {
-        timing_row("Foveated DLSS call", data.foveated_dlss_gpu_ms);
-        timing_row("Native DLSS call", data.native_dlss_gpu_ms);
+        const bool quad=quad_view_snapshot().active;
+        timing_row(quad?"Original DLSS":"Full DLSS", data.native_dlss_gpu_ms);
+        if(quad)timing_row("Original peripheral DLSS",data.native_peripheral_dlss_gpu_ms);
+        timing_row("Foveated DLSS", data.foveated_dlss_gpu_ms);
         if (settings.peripheral_dlaa_enabled) {
-            timing_row("Peripheral DLAA call", data.peripheral_dlaa_gpu_ms);
+            timing_row("Peripheral DLSS", data.peripheral_dlaa_gpu_ms);
         }
     }
 }
@@ -1210,7 +1214,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     ImGui::TextDisabled("Area downsampling; 1.00x is off");
 
     changed |= ImGui::Checkbox(
-        quad?"Override peripheral views":"Peripheral DLAA",
+        quad?"Override peripheral views":"Peripheral DLSS",
         &settings.peripheral_dlaa_enabled
     );
     if (!editing_peripheral_scale) {
@@ -1227,7 +1231,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
             &peripheral_scale_draft,
             0.20F,
             1.0F,
-            "%.2f",
+            "%.2fx",
             ImGuiSliderFlags_AlwaysClamp
         )) {
             editing_peripheral_scale = true;
@@ -1238,7 +1242,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
             changed = true;
         }
         ImGui::TextDisabled(
-            "Downscale periphery even more from original resolution"
+            "20%-100% of the game's DLSS input width and height; default 75%"
         );
     }
     if(quad){
@@ -1739,6 +1743,7 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         if(ImGui::Combo("Quad assignment mode",&quad_mode,"Automatic\0Manual\0")){settings.quad_manual_assignment=quad_mode==1;changed=true;}
         const auto quad=quad_view_snapshot();
         if(quad.active){
+            if(quad_is_app_snapshot(quad))ImGui::TextWrapped("The game composites four DLSS views before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right. Frame generation is disabled for this path.");
             ImGui::TextWrapped("Small numbers repeat across each view. Manual roles are saved by view number and restored when the source count matches. Check labels if the game's order changes.");
             for(const auto& source:quad.sources)if(source.dlss_view){const auto label="View "+std::to_string(source.number);int selected=int(source.manual_role);
                 if(!settings.quad_manual_assignment){unsigned role{};

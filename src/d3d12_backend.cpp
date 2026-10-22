@@ -556,7 +556,8 @@ void collect_resources() noexcept {
     ID3D12Device* const device,
     ID3D12Resource* const game_output,
     const std::uint32_t output_width,
-    const std::uint32_t output_height
+    const std::uint32_t output_height,
+    const std::size_t capacity = resource_cache_capacity
 ) noexcept {
     // Fail closed before allocating or recording work without reliable tracking.
     if (!ensure_dlss_nr_recording(command_list)) return nullptr;
@@ -589,8 +590,12 @@ void collect_resources() noexcept {
         if (current->lifetime.empty() && !current->active_evaluations &&
             (!oldest_link || current->last_used < (*oldest_link)->last_used)) oldest_link = link;
     }
-    if (count >= resource_cache_capacity) {
-        if (!oldest_link) return nullptr;
+    if (count >= capacity) {
+        if (!oldest_link) {
+            static std::atomic<unsigned> exhausted{};const auto n=++exhausted;
+            if(n<=8||n%300==0)trace_event("D3D12 composite pool exhausted entries=%zu capacity=%zu requested=%ux%u command=%p; keeping native DLSS",count,capacity,output_width,output_height,command_list);
+            return nullptr;
+        }
         auto* oldest = *oldest_link;
         *oldest_link = oldest->next;
         release_resources(oldest);
@@ -673,6 +678,7 @@ void insert_uav_barrier(
 }  // namespace
 
 struct D3D12Evaluation {
+    bool base_only{};
     D3D12Resources* resources{};
     ID3D12Resource* original_output{};
     ID3D12Resource* composite_color{};
@@ -931,7 +937,8 @@ D3D12Evaluation* prepare_d3d12(
         device,
         output,
         reconstruction.output_width,
-        reconstruction.output_height
+        reconstruction.output_height,
+        effective_settings.quad_view_mode?resource_cache_capacity*4:resource_cache_capacity
     );
     if (resources == nullptr) {
         device->Release();
@@ -1204,7 +1211,8 @@ D3D12Evaluation* prepare_d3d12_streamline(
         device,
         output,
         reconstruction.output_width,
-        reconstruction.output_height
+        reconstruction.output_height,
+        effective_settings.quad_view_mode?resource_cache_capacity*4:resource_cache_capacity
     );
     if (resources == nullptr) {
         device->Release();
@@ -1320,6 +1328,21 @@ ID3D12Resource* d3d12_private_output(
 
 void d3d12_align_reconstruction_grid(D3D12Evaluation* evaluation) noexcept {
     if (evaluation) evaluation->align_reconstruction_grid=true;
+}
+
+bool compose_d3d12_peripheral_view(ID3D12GraphicsCommandList* list, ID3D12Resource* source,
+    ID3D12Resource* output,unsigned width,unsigned height,unsigned x,unsigned y,
+    DlssViewId view,const Settings& settings) noexcept {
+    if(!source)return false;
+    const auto desc=source->GetDesc();
+    auto* evaluation=prepare_d3d12_streamline(list,source,output,unsigned(desc.Width),desc.Height,
+        width,height,0,0,x,y,view,settings,false,0);
+    if(!evaluation)return false;
+    // Reuse the tracked composite descriptors and bilinear expansion. A zero
+    // rectangle guarantees the shader never samples the unused center scratch.
+    evaluation->base_only=true;
+    finish_d3d12_streamline(list,evaluation,true);
+    return true;
 }
 
 bool d3d12_set_composite_base(
@@ -1516,6 +1539,7 @@ void finish_d3d12(
             evaluation->next_jump_width, evaluation->next_jump_height,
             evaluation->mask.count, evaluation->exposure.texture ? evaluation->exposure.pre / evaluation->exposure.scale : 0.F, {},
         };
+        if(evaluation->base_only)constants.rect_size[0]=constants.rect_size[1]=0;
         std::memcpy(constants.mask_bounds, evaluation->mask.bounds, sizeof(constants.mask_bounds));
         if (evaluation->align_reconstruction_grid) {
             // Map full-frame output pixel edges through the original render

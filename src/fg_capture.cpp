@@ -135,7 +135,7 @@ void synchronize_capture_enabled_locked(bool requested) {
         [](const auto& p){return p->pending_submissions();})||state.colors.has_pending();
 }
 bool enabled() noexcept {
-    return current_settings().fg.enabled &&
+    return !quad_view_blocks_fg() && current_settings().fg.enabled &&
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
 bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
@@ -539,7 +539,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
     using namespace cheeky::foveated_dlss;
     const auto settings=current_settings();
-    out->enabled=settings.fg.enabled && cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
+    out->enabled=!quad_view_blocks_fg() && settings.fg.enabled && cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
     out->configuration=configuration(settings);
     // This transition does not require users to uncheck/recheck FG. The
     // OpenXR layer observes the changed key on its next xrWaitFrame and

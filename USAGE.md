@@ -21,9 +21,9 @@ The main controls and their defaults are:
 | Enable foveated DLSS-SR | On | Enables the main foveated Super Resolution path. |
 | Center preset | Game/default | Preserves the game's DLSS preset or overrides it with E, K, L, or M. |
 | Center supersampling | `1.00x` | Scales the center DLSS output by 1-2x per dimension, then area-downsamples to its original size. Applies on slider release. Supports input- and output-resolution motion vectors. |
-| Peripheral DLAA | On | Enables the auxiliary DLAA pass for the area outside the fovea. |
-| Peripheral preset | E (Fastest) | Selects E, K, L, or M for the peripheral DLAA pass. |
-| Periphery scale | `0.75` | Downscales the periphery further from the original render resolution. |
+| Peripheral DLSS | On | Enables the auxiliary DLSS pass for the area outside the fovea. |
+| Peripheral preset | E (Fastest) | Selects E, K, L, or M for the peripheral DLSS pass. |
+| Periphery scale | `0.75` | Sets peripheral processing to 20%-100% of the game DLSS input width and height; 75% is the default. |
 | Fovea width / height | `0.55` / `0.45` | Sets the normalized size of the DLSS-processed region. |
 | Automatic stereo alignment | On | Uses OpenXR or usable Streamline projection data to align each eye without manual X adjustment. |
 | Stereo X offset | `0.00` | Manual horizontal placement; shown when two views are detected, Fixed is selected, and automatic alignment is off. |
@@ -173,7 +173,7 @@ NR or DX12 Transport.
 
 **Rendering order** defaults to **After upscaling**, preserving the existing
 post-SR processing. **Before upscaling** runs NR on a private copy of the active
-render-resolution color before center SR, peripheral DLAA, and composition.
+render-resolution color before center SR, peripheral DLSS, and composition.
 The option is implemented for native DX12, Streamline, and DX11 with **DX12
 Transport**, including when SR foveation is disabled. Game-owned color remains
 unchanged. Existing array-slice restrictions still apply.
@@ -199,7 +199,7 @@ NR, SR, peripheral work, and composition; DX11 totals include transport and its
 queue waits. These totals do not represent the entire game's GPU frame.
 
 In-game acceptance remains pending: test NR full/foveated, SR foveation on/off,
-peripheral DLAA on/off, live order switching, dynamic resolution/resizing, both
+peripheral DLSS on/off, live order switching, dynamic resolution/resizing, both
 eyes, and gaze movement. Record image quality, actual NR working dimensions,
 NR GPU time, and total pipeline GPU time for both orders. Support reports include
 the selected order, dimensions, skip state, and separate timing samples.
@@ -271,7 +271,7 @@ Cheeky detects native NGX Ray Reconstruction separately from Super Resolution,
 including NVIDIA OTA runtimes and calls nested below R.E.A.L. VR. The center and
 periphery use separate RR features and histories. RR guide textures follow the
 center crop and peripheral scale, keeping the periphery denoised. Turning off
-Peripheral DLAA uses input-resolution RR there instead of raw ray-traced color.
+Peripheral DLSS uses input-resolution RR there instead of raw ray-traced color.
 
 When RR is active, preset menus offer Game default, D, E and F. RR preferences
 are stored separately as `RrCenterPreset` and `RrPeripheralPreset`; SR preferences

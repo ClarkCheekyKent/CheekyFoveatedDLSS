@@ -22,15 +22,16 @@ SHADERS = [
     ("peripheral11_depth", "src/d3d11_peripheral_dlaa.cpp", "depth_downsample_shader_source", "Main", "cs_5_0", 3),
     ("peripheral11_motion", "src/d3d11_peripheral_dlaa.cpp", "motion_downsample_shader_source", "Main", "cs_5_0", 3),
     ("transport_depth11", "src/d3d11_d3d12_transport.cpp", "depth_shader_source", "Main", "cs_5_0", 3),
-    ("peripheral12_motion", "src/peripheral_shaders.hpp", "motion_convert_shader_source", "Main", "cs_5_1", 3),
-    ("peripheral12_color", "src/peripheral_shaders.hpp", "color_downsample_shader_source", "Main", "cs_5_1", 3),
-    ("peripheral12_depth", "src/peripheral_shaders.hpp", "depth_downsample_shader_source", "Main", "cs_5_1", 3),
-    ("peripheral12_rr", "src/peripheral_shaders.hpp", "rr_guide_downsample_shader_source", "Main", "cs_5_1", 3),
+    ("peripheral12_motion", "src/peripheral_array_shaders.hpp", "peripheral_array_motion", "Main", "cs_5_1", 3),
+    ("peripheral12_color", "src/peripheral_array_shaders.hpp", "peripheral_array_color", "Main", "cs_5_1", 3),
+    ("peripheral12_depth", "src/peripheral_array_shaders.hpp", "peripheral_array_depth", "Main", "cs_5_1", 3),
+    ("peripheral12_rr", "src/peripheral_array_shaders.hpp", "peripheral_array_rr", "Main", "cs_5_1", 3),
     ("nr_guides", "src/nr_guide_shader.hpp", "nr_guide_shader", "main", "cs_5_0", 1),
     ("nr_encode", "src/nr_codec_shader.hpp", "nr_codec_shader", "EncodeMain", "cs_5_1", 3),
     ("nr_decode", "src/nr_codec_shader.hpp", "nr_codec_shader", "DecodeMain", "cs_5_1", 3),
     ("nr_border", "src/nr_codec_shader.hpp", "nr_codec_shader", "BorderMain", "cs_5_0", 1),
     ("debug_marker12", "src/debug_marker12.hpp", "source", "main", "cs_5_0", 3),
+    ("debug_number12", "src/debug_number12.hpp", "debug_number12_source", "main", "cs_5_1", 3),
 ]
 
 

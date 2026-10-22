@@ -73,7 +73,7 @@ inline std::string support_summary(const std::string& system,
         out << "- " << api << ": " << (evaluations == "0" ? "no evaluations recorded" : get(api, "state_name")) << '\n';
     }
     out << "- DLSS-SR foveation: " << (setting("enabled") == "true" ? "enabled" : "disabled") << '\n'
-        << "- Peripheral DLAA: " << (setting("peripheral_dlaa_enabled") == "true" ? "enabled" : "disabled") << '\n'
+        << "- Peripheral DLSS: " << (setting("peripheral_dlaa_enabled") == "true" ? "enabled" : "disabled") << '\n'
         << "- DLSS-NR: " << (nr ? get("DLSS-NR", "state") : "disabled") << "\n\n";
     if (setting("center_mode") == "1" && get("OpenXR", "using_gaze") == "false")
         out << "**Check:** OpenXR gaze is selected, but gaze was not being used at capture time. This snapshot alone does not establish why.\n\n";
@@ -106,8 +106,10 @@ inline std::string support_summary(const std::string& system,
         row(api, "input_crop", "Input crop (x,y,w,h)");
         row(api, "output_crop", "Output crop (x,y,w,h)");
         timing(api, "foveated_dlss_gpu_ms", "Foveated DLSS GPU");
-        if (setting("peripheral_dlaa_enabled") == "true") timing(api, "peripheral_dlaa_gpu_ms", "Peripheral DLAA GPU");
-        timing(api, "native_dlss_gpu_ms", "Native DLSS GPU");
+        if (setting("peripheral_dlaa_enabled") == "true") timing(api, "peripheral_dlaa_gpu_ms", "Peripheral DLSS GPU");
+        timing(api, "native_dlss_gpu_ms", "Full DLSS GPU");
+        const auto original_peripheral=get(api,"native_peripheral_dlss_gpu_ms");
+        if(original_peripheral!="unavailable"&&original_peripheral!="0")timing(api,"native_peripheral_dlss_gpu_ms","Original peripheral DLSS GPU");
         if (nr) {
             timing(api, "before_full_nr_gpu_ms", "Before: full NR GPU");
             timing(api, "before_foveated_nr_gpu_ms", "Before: foveated NR GPU");

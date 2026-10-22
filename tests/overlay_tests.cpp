@@ -214,13 +214,19 @@ void test_ui_diagnostics() {
     render("DLSS-SR"); text = render("DLSS-SR");
     require(text.find("Use lower DLSS hook (DX12)") == text.npos, "Hook selector should live in General");
     require(text.find("Cosmetic only; no performance impact.") != text.npos, "SR roundness note missing");
-    require(text.find("Full DLSS call: 2.000 ms") != text.npos, "GPU timing from the second API object");
+    require(text.find("Full DLSS: 2.000 ms") != text.npos, "GPU timing from the second API object");
     require(text.find("Foveated FPS gain: +16.7 FPS (+20.0%)") != text.npos, "FPS gain must use the non-foveated FPS baseline");
     require(text.find("Frame-time change: -2.00 ms (-16.7%)") != text.npos, "Frame-time change must use the non-foveated frame time baseline");
     require(text.find("Foveated savings: 0.750 ms (37.5%)") != text.npos, "GPU savings must remain separate from FPS gain");
     require(text.find("DLSS input: 1000 x 800") != text.npos, "Nested crop dimensions leaked into input dimensions");
     require(text.find("Center input: 500 x 400 (25.0% of original) at 0,0") != text.npos, "Crop pixel percentage and origin missing");
-    require(text.find("Peripheral DLAA: Enabled (auto MV conversion)") != text.npos, "Motion-vector compatibility status missing");
+    require(text.find("Peripheral DLSS: Enabled (auto MV conversion)") != text.npos, "Motion-vector compatibility status missing");
+    require(text.find("Original peripheral DLSS") == text.npos,"Stereo must retain three DLSS timing rows");
+    state.snapshot=R"({"quad_views":{"active":true},"apis":[{"evaluations":0},{"evaluations":10,"native_ms":2,"native_peripheral_ms":0.8,"foveated_ms":1.25,"peripheral_ms":0.5}]})";
+    render("DLSS-SR");text=render("DLSS-SR");
+    require(text.find("Original DLSS: 2.000 ms")!=text.npos&&text.find("Original peripheral DLSS: 0.800 ms")!=text.npos&&
+        text.find("Foveated DLSS: 1.250 ms")!=text.npos&&text.find("Peripheral DLSS: 0.500 ms")!=text.npos,"Quad timing rows must use separate original/peripheral measurements");
+    state.snapshot=general_snapshot;
     require(text.find("Full DLSS-NR call") == text.npos, "NR timings should not appear in SR");
     render("DLSS-NR"); text = render("DLSS-NR");
     require(text.find("Cosmetic only; no performance impact.") != text.npos, "NR roundness note missing");

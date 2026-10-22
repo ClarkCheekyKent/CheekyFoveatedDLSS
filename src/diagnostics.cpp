@@ -42,6 +42,7 @@ struct RuntimeDiagnostics {
     std::atomic<std::uint32_t> full_dlss_nr_gpu_ms_bits{};
     std::atomic<std::uint32_t> foveated_dlss_nr_gpu_ms_bits{};
     std::atomic<std::uint32_t> native_dlss_gpu_ms_bits{};
+    std::atomic<std::uint32_t> native_peripheral_dlss_gpu_ms_bits{};
     std::atomic<std::uint32_t> foveated_frame_ms_bits{};
     std::atomic<std::uint32_t> native_frame_ms_bits{};
     std::atomic<bool> has_private_result{};
@@ -351,6 +352,10 @@ void diagnostic_note_native_dlss_gpu_time(
     );
 }
 
+void diagnostic_note_native_peripheral_dlss_gpu_time(DiagnosticApi api,float milliseconds) noexcept {
+    note_averaged_gpu_time(api==DiagnosticApi::d3d11?DiagnosticGpuTiming::native_peripheral_dlss:DiagnosticGpuTiming::d3d12_native_peripheral_dlss,
+        for_api(api).native_peripheral_dlss_gpu_ms_bits,milliseconds);
+}
 void diagnostic_note_d3d12_dlss_gpu_time(
     const float milliseconds, const bool foveated
 ) noexcept {
@@ -508,6 +513,7 @@ DiagnosticSnapshot diagnostic_snapshot(const DiagnosticApi api) noexcept {
         full_dlss_nr_gpu_ms,
         foveated_dlss_nr_gpu_ms,
         native_dlss_gpu_ms,
+        load_gpu_time(data.native_peripheral_dlss_gpu_ms_bits),
         foveated_frame_ms,
         native_frame_ms,
         data.has_private_result.load(std::memory_order_acquire),

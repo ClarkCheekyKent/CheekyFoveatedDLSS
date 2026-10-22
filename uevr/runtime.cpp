@@ -113,7 +113,8 @@ std::string snapshot_locked(State& s) {
     const auto gaze = gaze_diagnostics();
     const auto views = stereo_view_statistics();
     const auto details = stereo_view_details();
-    const auto quad=quad_view_snapshot();CheekyQuadFgStatsV1 quad_fg;const bool quad_guides=quad.active&&quad_fg_stats(quad_fg);
+    const auto quad=quad_view_snapshot();const bool app_quad=quad.active&&quad_is_app_snapshot(quad);
+    CheekyQuadFgStatsV1 quad_fg;const bool quad_guides=quad.active&&!app_quad&&quad_fg_stats(quad_fg);
     const auto receiving_views = std::count_if(details.begin(), details.end(),
         [](const auto& view) { return view.recently_evaluated; });
     const auto evaluated_views = std::count_if(details.begin(), details.end(),
@@ -175,7 +176,7 @@ std::string snapshot_locked(State& s) {
         << ",\"compatible_session\":" << bool(fg.compatible_session)
         << ",\"active\":" << bool(fg.active)
         << ",\"state\":\"" << fg_state_name(fg.state) << "\""
-        << ",\"diagnostic\":\"" << json_escape(fg_diagnostic().message) << "\""
+        << ",\"diagnostic\":\"" << json_escape(app_quad?"FG disabled: game composites four DLSS views before stereo OpenXR submission":fg_diagnostic().message) << "\""
         << ",\"native_frames\":" << fg.native_frames
         << ",\"generated_frames\":" << fg.generated_frames
         << ",\"fallback_frames\":" << fg.fallback_frames
@@ -409,6 +410,7 @@ std::string snapshot_locked(State& s) {
             << ",\"input_width\":" << d.received_input_width << ",\"input_height\":" << d.received_input_height
             << ",\"output_width\":" << d.received_output_width << ",\"output_height\":" << d.received_output_height
             << ",\"foveated_ms\":" << d.foveated_dlss_gpu_ms << ",\"native_ms\":" << d.native_dlss_gpu_ms
+            << ",\"native_peripheral_ms\":" << d.native_peripheral_dlss_gpu_ms
             << ",\"peripheral_ms\":" << d.peripheral_dlaa_gpu_ms << ",\"result\":" << d.last_result
             << ",\"transport_ms\":" << d.transport_gpu_ms
             << ",\"peripheral_preparation_ms\":" << (index ? 0.0F : d3d11_peripheral_dlaa_preparation_gpu_ms())
@@ -450,7 +452,7 @@ std::string snapshot_locked(State& s) {
             << ",\"activity\":\"" << (v.evaluation_calls ? (v.recently_evaluated ? "Receiving calls" : "Idle") : "Never evaluated") << '"'
             << ",\"last_evaluation_age_ms\":" << (v.evaluation_calls ? std::to_string(v.last_evaluation_age_ms) : "null")
             << ",\"api\":\"" << (v.graphics_api == 11 ? "DX11" : v.graphics_api == 12 ? "DX12" : v.graphics_api == 1 ? "Vulkan" : "Unknown") << '"'
-            << ",\"mapping\":\"" << (v.quad_region ? (v.quad_manual ? "Manual quad assignment" : "Verified quad submission") : v.calibrated ? "Calibrated" : v.has_eye_assignment ? "Unverified eye assignment" : "Unassigned") << '"'
+            << ",\"mapping\":\"" << (v.quad_region ? (v.quad_manual ? "Manual quad assignment" : app_quad?"Default quad order":"Verified quad submission") : v.calibrated ? "Calibrated" : v.has_eye_assignment ? "Unverified eye assignment" : "Unassigned") << '"'
             << ",\"region\":\"" << (v.quad_region==1?"Periphery":v.quad_region==2?"Center":"Unknown") << "\",\"has_geometry\":" << v.has_geometry
             << ",\"input_width\":" << v.evaluation_input_width << ",\"input_height\":" << v.evaluation_input_height
             << ",\"output_width\":" << v.evaluation_output_width << ",\"output_height\":" << v.evaluation_output_height

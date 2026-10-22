@@ -138,6 +138,14 @@ add_custom_command(
 )
 
 enable_testing()
+add_executable(CheekyAppQuadViewsTests tests/app_quad_views_tests.cpp)
+target_compile_features(CheekyAppQuadViewsTests PRIVATE cxx_std_20)
+add_test(NAME CheekyAppQuadViewsTests COMMAND CheekyAppQuadViewsTests)
+add_executable(CheekyQuadD3D12ShaderTests tests/quad_d3d12_shader_tests.cpp src/d3d12_output_contract.cpp)
+target_compile_features(CheekyQuadD3D12ShaderTests PRIVATE cxx_std_20)
+target_compile_definitions(CheekyQuadD3D12ShaderTests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(CheekyQuadD3D12ShaderTests PRIVATE d3d12 d3dcompiler dxgi)
+add_test(NAME CheekyQuadD3D12ShaderTests COMMAND CheekyQuadD3D12ShaderTests)
 add_subdirectory(tests/openxr_binding)
 add_executable(
     CheekyTests

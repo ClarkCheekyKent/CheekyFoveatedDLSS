@@ -2,7 +2,8 @@
 #include <stdint.h>
 #define CHEEKY_QUAD_VIEWS_VERSION 1U
 // Separate from the two-eye gaze ABI. View order is OpenXR peripheral L/R,
-// focus L/R; roles require pixel verification or an explicit manual layout.
+// focus L/R. Layer roles use pixel verification or a manual layout; the
+// application-side provider also permits an explicitly documented default order.
 typedef struct CheekyQuadViewV1 {
     uint64_t dlss_view, registration_generation, submitted_resource;
     uint32_t view_index, eye_index, focus, verified;

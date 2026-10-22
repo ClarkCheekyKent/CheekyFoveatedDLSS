@@ -27,6 +27,8 @@ struct Calibration12Readback {
 };
 std::shared_ptr<Calibration12Frame> calibration12_create(ID3D12Device*);
 bool calibration12_begin(Calibration12Frame&, std::uint64_t* allocations = nullptr) noexcept;
+bool calibration12_numbers(Calibration12Frame&, ID3D12GraphicsCommandList*, ID3D12Resource*,
+    unsigned number,unsigned x,unsigned y,unsigned width,unsigned height,D3D12_RESOURCE_STATES) noexcept;
 enum class Calibration12StampMode { source_proof, refresh, marker_only };
 bool calibration12_stamp(Calibration12Frame&, ID3D12GraphicsCommandList*, ID3D12Resource*, unsigned candidate,
                          unsigned x, unsigned y, D3D12_RESOURCE_STATES, std::uint64_t& allocations,

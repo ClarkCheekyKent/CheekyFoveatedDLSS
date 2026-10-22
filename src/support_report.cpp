@@ -189,6 +189,7 @@ std::string diagnostics_text() {
         out << "full_dlss_nr_gpu_ms=" << d.full_dlss_nr_gpu_ms << '\n';
         out << "foveated_dlss_nr_gpu_ms=" << d.foveated_dlss_nr_gpu_ms << '\n';
         out << "native_dlss_gpu_ms=" << d.native_dlss_gpu_ms << '\n';
+        out << "native_peripheral_dlss_gpu_ms=" << d.native_peripheral_dlss_gpu_ms << '\n';
         out << "foveated_frame_ms=" << d.foveated_frame_ms << '\n';
         out << "native_frame_ms=" << d.native_frame_ms << '\n';
         out << "has_private_result=" << d.has_private_result << '\n';

@@ -285,7 +285,7 @@ void update_settings(const Settings& settings) noexcept {
     );
     store_float(
         peripheral_dlaa_scale_bits,
-        std::clamp(settings.peripheral_dlaa_scale, 0.20F, 1.0F)
+        std::isfinite(settings.peripheral_dlaa_scale)?std::clamp(settings.peripheral_dlaa_scale, 0.20F, 1.0F):0.75F
     );
     const auto valid_preset = [](const std::uint32_t value) noexcept {
         return value == 5U || value == 10U || value == 11U || value == 12U || value == 13U;

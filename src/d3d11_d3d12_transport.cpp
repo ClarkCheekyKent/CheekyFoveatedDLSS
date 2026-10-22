@@ -1034,18 +1034,18 @@ void trace_format_support(
             crop.output_width, crop.output_height, output_format,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.output) ||
         (peripheral_enabled && (
-            !create_shared_texture(device, "peripheral DLAA color",
+            !create_shared_texture(device, "peripheral DLSS color",
                 peripheral_render_width, peripheral_render_height, color_format,
                 D3D12_RESOURCE_FLAG_NONE, slot.peripheral_color) ||
-            !create_shared_texture(device, "peripheral DLAA depth",
+            !create_shared_texture(device, "peripheral DLSS depth",
                 peripheral_render_width, peripheral_render_height,
                 DXGI_FORMAT_R32_FLOAT,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 slot.peripheral_depth) ||
-            !create_shared_texture(device, "peripheral DLAA motion vectors",
+            !create_shared_texture(device, "peripheral DLSS motion vectors",
                 peripheral_motion_width, peripheral_motion_height, motion_format,
                 D3D12_RESOURCE_FLAG_NONE, slot.peripheral_motion_vectors) ||
-            !create_shared_texture(device, "peripheral DLAA output",
+            !create_shared_texture(device, "peripheral DLSS output",
                 peripheral_output_width, peripheral_output_height, output_format,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 slot.peripheral_output)

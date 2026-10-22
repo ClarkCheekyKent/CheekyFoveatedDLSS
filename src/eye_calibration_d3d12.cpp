@@ -1,6 +1,7 @@
 #include "eye_calibration_d3d12.hpp"
 #include "eye_calibration_pixels.hpp"
 #include "debug_marker12.hpp"
+#include "debug_number12.hpp"
 #include "graphics_observer.hpp"
 #include "d3d12_native.hpp"
 #include <wrl/client.h>
@@ -148,6 +149,10 @@ struct Calibration12Frame {
     std::array<Segment, 12> segments;
     std::array<ComPtr<ID3D12Resource>, 2> markers;
     std::array<DXGI_FORMAT, 2> marker_formats{};
+    ComPtr<ID3D12Resource> number_upload,number_target;
+    DebugNumber12 number_gpu;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT number_footprint{};
+    DXGI_FORMAT number_format{};unsigned number_value{},number_cell{};
     std::array<std::uint32_t, 2> marker_codes{};
     std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> marker_footprints{};
     ComPtr<ID3D12QueryHeap> queries;
@@ -415,6 +420,8 @@ bool calibration12_begin(Calibration12Frame& f, std::uint64_t* allocations) noex
     if (!reusable(f))
         return false;
     f.invalid = false;
+    f.number_target.Reset();
+    f.number_gpu.output.Reset();f.number_gpu.exposure.Reset();
     f.failure = {};
     f.capture_counts = {};
     f.support = {}; // reusable() above includes retirement and all GPU fences.
@@ -430,6 +437,59 @@ bool calibration12_begin(Calibration12Frame& f, std::uint64_t* allocations) noex
             p.active = p.failed = false;
     }
     return true;
+}
+bool calibration12_numbers(Calibration12Frame& f,ID3D12GraphicsCommandList* list,ID3D12Resource* texture,
+    unsigned number,unsigned x,unsigned y,unsigned width,unsigned height,D3D12_RESOURCE_STATES state) noexcept {
+    try {
+        if(!list||!texture||number<1||number>8||list->GetType()!=D3D12_COMMAND_LIST_TYPE_DIRECT)return false;
+        const auto d=texture->GetDesc();const auto bpp=calibration_pixel_bytes(d.Format);
+        if(!texture_supported(d,0)||!bpp||!width||!height||uint64_t(x)+width>d.Width||uint64_t(y)+height>d.Height)return false;
+        std::lock_guard execution_lock(calibration12_execution_mutex());
+        ComPtr<ID3D12Device> device;list->GetDevice(IID_PPV_ARGS(&device));
+        if(!same_d3d12_device(device.Get(),f.device.Get())||!ensure_native_observer(list))return false;
+        const auto recording=list_id(list,true);if(!recording)return false;
+        std::lock_guard lock(f.mutex);if(f.segments[0].used)return false;
+        const unsigned cell=(std::max)(2u,(std::min)(width,height)/240u),w=5*cell+2,h=7*cell+2;
+        if(w>width||h>height)return false;
+        static constexpr const char* glyphs[]{"00100" "01100" "00100" "00100" "00100" "00100" "01110",
+            "01110" "10001" "00001" "00010" "00100" "01000" "11111",
+            "11110" "00001" "00001" "01110" "00001" "00001" "11110",
+            "00010" "00110" "01010" "10010" "11111" "00010" "00010",
+            "11111" "10000" "10000" "11110" "00001" "00001" "11110",
+            "01110" "10000" "10000" "11110" "10001" "10001" "01110",
+            "11111" "00001" "00010" "00100" "01000" "01000" "01000",
+            "01110" "10001" "10001" "01110" "10001" "10001" "01110"};
+        if(f.number_gpu.prepare(f.device.Get(),texture)){
+            auto& segment=f.segments[0];segment.used=true;segment.recording=recording;f.number_target=texture;
+            transition(list,texture,0,state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if(f.number_gpu.exposure)transition(list,f.number_gpu.exposure.Get(),0,debug_exposure.state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            f.number_gpu.draw(list,x,y,width,height,cell,glyphs[number-1]);
+            D3D12_RESOURCE_BARRIER order{};order.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;order.UAV.pResource=texture;list->ResourceBarrier(1,&order);
+            if(f.number_gpu.exposure)transition(list,f.number_gpu.exposure.Get(),0,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,debug_exposure.state);
+            transition(list,texture,0,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,state);return true;
+        }
+        if(!f.number_upload||f.number_value!=number||f.number_cell!=cell||f.number_format!=d.Format){
+            auto desc=d;desc.Width=w;desc.Height=h;desc.MipLevels=desc.DepthOrArraySize=1;
+            UINT64 bytes{};f.device->GetCopyableFootprints(&desc,0,1,0,&f.number_footprint,nullptr,nullptr,&bytes);
+            f.number_upload.Reset();if(!buffer(f.device.Get(),D3D12_HEAP_TYPE_UPLOAD,bytes,f.number_upload))return false;
+            void* data{};D3D12_RANGE empty{};if(FAILED(f.number_upload->Map(0,&empty,&data))){f.number_upload.Reset();return false;}
+            for(unsigned yy=0;yy<h;++yy)for(unsigned xx=0;xx<w;++xx){
+                const bool light=xx&&yy&&xx<w-1&&yy<h-1&&glyphs[number-1][((yy-1)/cell)*5+(xx-1)/cell]=='1';
+                calibration_encode_pattern(static_cast<unsigned char*>(data)+yy*f.number_footprint.Footprint.RowPitch+xx*bpp,d.Format,0,0,0,light?0x1ffffffU:2U);
+            }
+            f.number_upload->Unmap(0,nullptr);f.number_value=number;f.number_cell=cell;f.number_format=d.Format;
+        }
+        // Existing calibration recording tags and queue fences own this upload
+        // until both GPU completion and list reset/destruction are observed.
+        auto& segment=f.segments[0];segment.used=true;segment.recording=recording;f.number_target=texture;
+        D3D12_TEXTURE_COPY_LOCATION src{},dst{};src.pResource=f.number_upload.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint=f.number_footprint;dst.pResource=texture;dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        transition(list,texture,0,state,D3D12_RESOURCE_STATE_COPY_DEST);
+        for(unsigned row=0;row<5;++row)for(unsigned column=0;column<7;++column)
+            list->CopyTextureRegion(&dst,x+unsigned(uint64_t(width-w)*(2*column+1)/14),
+                y+unsigned(uint64_t(height-h)*(2*row+1)/10),0,&src,nullptr);
+        transition(list,texture,0,D3D12_RESOURCE_STATE_COPY_DEST,state);return true;
+    }catch(...){return false;}
 }
 bool calibration12_stamp(Calibration12Frame& f, ID3D12GraphicsCommandList* list, ID3D12Resource* texture,
                          unsigned candidate, unsigned x, unsigned y, D3D12_RESOURCE_STATES state,

@@ -27,6 +27,7 @@
 #include "runtime.hpp"
 #include "settings.hpp"
 #include "quad_view_bridge.hpp"
+#include "quad_views_d3d12.hpp"
 #include "fg_capture.hpp"
 #include "fg_sr_region.hpp"
 
@@ -1091,6 +1092,7 @@ constexpr std::size_t d3d11_dlss_timing_slot_count = 4U;
 enum class D3D11DlssTimingKind {
     foveated,
     native,
+    native_peripheral,
 };
 
 struct D3D11DlssTimingSlot {
@@ -1166,6 +1168,8 @@ void resolve_d3d11_dlss_timing(
     );
     if (slot.kind == D3D11DlssTimingKind::foveated) {
         diagnostic_note_foveated_dlss_gpu_time(milliseconds);
+    } else if(slot.kind==D3D11DlssTimingKind::native_peripheral){
+        diagnostic_note_native_peripheral_dlss_gpu_time(DiagnosticApi::d3d11,milliseconds);
     } else {
         diagnostic_note_native_dlss_gpu_time(milliseconds);
     }
@@ -1225,7 +1229,7 @@ struct D3D11DlssTimingScope {
         }
         const auto metric = kind == D3D11DlssTimingKind::foveated
             ? DiagnosticGpuTiming::foveated_dlss
-            : DiagnosticGpuTiming::native_dlss;
+            : kind==D3D11DlssTimingKind::native_peripheral?DiagnosticGpuTiming::native_peripheral_dlss:DiagnosticGpuTiming::native_dlss;
         if (!diagnostic_should_sample_gpu_time(metric)) return;
         std::lock_guard lock(d3d11_dlss_timing_mutex);
         auto* const timer = find_or_create_d3d11_dlss_timer(context);
@@ -1268,6 +1272,7 @@ enum class D3D12TimingKind : std::uint32_t {
     peripheral_dlaa,
     foveated_dlss,
     native_dlss,
+    native_peripheral_dlss,
 };
 
 struct D3D12NrTimingSlot {
@@ -1367,6 +1372,8 @@ void resolve_d3d12_nr_timing(
                 diagnostic_note_peripheral_dlaa_gpu_time(
                     DiagnosticApi::d3d12, milliseconds
                 );
+            } else if(slot.kind==D3D12TimingKind::native_peripheral_dlss){
+                diagnostic_note_native_peripheral_dlss_gpu_time(DiagnosticApi::d3d12,milliseconds);
             } else if (slot.kind == D3D12TimingKind::foveated_dlss ||
                        slot.kind == D3D12TimingKind::native_dlss) {
                 diagnostic_note_d3d12_dlss_gpu_time(
@@ -1548,7 +1555,8 @@ struct D3D12PeripheralTimingScope {
     ) noexcept : command_list(in_command_list) {
         if (command_list == nullptr ||
             !diagnostic_should_sample_gpu_time(
-                kind == D3D12TimingKind::before_pipeline ? DiagnosticGpuTiming::d3d12_before_pipeline
+                kind == D3D12TimingKind::native_peripheral_dlss ? DiagnosticGpuTiming::d3d12_native_peripheral_dlss
+                : kind == D3D12TimingKind::before_pipeline ? DiagnosticGpuTiming::d3d12_before_pipeline
                     : kind == D3D12TimingKind::after_pipeline ? DiagnosticGpuTiming::d3d12_after_pipeline
                     : kind == D3D12TimingKind::foveated_dlss
                     ? DiagnosticGpuTiming::d3d12_foveated_dlss
@@ -2275,7 +2283,7 @@ DebugExposure current_streamline_debug_exposure(const void* frame, const void* c
         static_cast<std::uint32_t>(tags.size()), command_list
     );
     if (tag_result != 0U) {
-        if (verbose) trace_event("SL eval=%llu peripheral DLAA tag submission failed result=0x%08X", static_cast<unsigned long long>(sequence), tag_result);
+        if (verbose) trace_event("SL eval=%llu peripheral DLSS tag submission failed result=0x%08X", static_cast<unsigned long long>(sequence), tag_result);
         cleanup();
         return false;
     }
@@ -2317,7 +2325,7 @@ DebugExposure current_streamline_debug_exposure(const void* frame, const void* c
         evaluation.peripheral = {};
         if (verbose) {
             trace_event(
-                "SL eval=%llu peripheral DLAA failed result=0x%08X",
+                "SL eval=%llu peripheral DLSS failed result=0x%08X",
                 static_cast<unsigned long long>(sequence),
                 peripheral_result
             );
@@ -2343,7 +2351,7 @@ DebugExposure current_streamline_debug_exposure(const void* frame, const void* c
     evaluation.peripheral_ready = true;
     if (verbose) {
         trace_event(
-            "SL eval=%llu peripheral DLAA ready size=%ux%u scale=%.2f convertedMV=%s",
+            "SL eval=%llu peripheral DLSS ready size=%ux%u scale=%.2f convertedMV=%s",
             static_cast<unsigned long long>(sequence),
             working_width,
             working_height,
@@ -3368,7 +3376,7 @@ std::uint32_t hook_sl_evaluate_feature(
     if(command_buffer && vulkan_command_device(static_cast<VkCommandBuffer>(command_buffer)))
         return original(feature,frame,inputs,input_count,command_buffer);
     detect_afw_runtime();
-    if (feature == sl_feature_dlss_rr || (d3d12_lower_hook_enabled() && feature == 0U)) {
+    if (feature == sl_feature_dlss_rr || ((d3d12_lower_hook_enabled() || quad_view_blocks_fg()) && feature == 0U)) {
         // Keep the game's viewport/tags/options intact through upstream hooks. The nested
         // native DX12 path owns lower-hook SR and all RR. RR must not enter
         // StreamlineEvaluationScope: that would suppress its nested NGX feature 13
@@ -3601,6 +3609,7 @@ std::uint32_t hook_sl_evaluate_feature(
     return result;
 }
 
+[[nodiscard]] std::uint32_t d3d12_game_feature(const NgxHandle*) noexcept;
 void note_evaluation_begin(
     const DiagnosticApi api,
     const NgxParameters* const parameters,
@@ -3628,6 +3637,17 @@ void note_evaluation_begin(
         api == DiagnosticApi::d3d11 ? 11U : 12U, input_width, input_height,
         get_ui(parameters, "OutWidth") ? get_ui(parameters, "OutWidth") : output.width,
         get_ui(parameters, "OutHeight") ? get_ui(parameters, "OutHeight") : output.height);
+    if(api==DiagnosticApi::d3d12&&!inside_streamline_evaluation&&
+        (d3d12_game_feature(handle)==1U||d3d12_game_feature(handle)==13U)) {
+        const auto id=reinterpret_cast<std::uintptr_t>(handle);
+        quad_view_observe12(id,stereo_view_generation(id),
+            get_ui(parameters,"OutWidth")?get_ui(parameters,"OutWidth"):output.width,
+            get_ui(parameters,"OutHeight")?get_ui(parameters,"OutHeight"):output.height);
+        static std::atomic<bool> previous_quad{};const bool active=quad_view_blocks_fg();
+        if(previous_quad.exchange(active)!=active)trace_event(active?
+            "DLSS QUAD application-composited mode: four recurring game views, default order=peripheral-left,center-left,peripheral-right,center-right; FG disabled":
+            "DLSS QUAD application-composited mode ended: returning to ordinary view processing");
+    }
 }
 
 [[nodiscard]] bool is_dlss_feature(const std::uint32_t feature) noexcept {
@@ -4037,7 +4057,7 @@ bool evaluate_d3d11_quad_periphery(const D3D11RuntimeCallbacks& runtime,
         diagnostic_note_result(DiagnosticApi::d3d11,1U);
     }else{
         static std::atomic<unsigned> failures{};
-        const auto n=++failures;if(n<=8||(n%300)==0)trace_event("Quad peripheral full-view DLAA rejected handle=%p; retaining game full-view DLSS preset=%u scale=%.3f",
+        const auto n=++failures;if(n<=8||(n%300)==0)trace_event("Quad peripheral full-view DLSS rejected handle=%p; retaining game full-view DLSS preset=%u scale=%.3f",
             handle,settings.peripheral_dlaa_preset,settings.peripheral_dlaa_scale);
     }
     return composed;
@@ -4158,7 +4178,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
             D3D11TransportStatus::not_attempted
         );
         D3D11DlssTimingScope timing{
-            context, D3D11DlssTimingKind::native
+            context, settings.quad_view_region==1?D3D11DlssTimingKind::native_peripheral:D3D11DlssTimingKind::native
         };
         const auto result = original(context, handle, parameters, callback);
         diagnostic_note_result(DiagnosticApi::d3d11, result);
@@ -4168,6 +4188,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
     if(settings.quad_view_region==1){
         if(evaluate_d3d11_quad_periphery(runtime,context,handle,parameters,settings))return 1U;
         NgxPresetOverrideScope preset{parameters,settings.peripheral_dlaa_preset};
+        D3D11DlssTimingScope native_timing{context,D3D11DlssTimingKind::native_peripheral};
         const auto result=original(context,handle,parameters,callback);
         diagnostic_note_state(DiagnosticApi::d3d11,DiagnosticState::prepare_rejected);
         diagnostic_note_d3d11_execution_path(D3D11ExecutionPath::game_fallback);
@@ -4234,7 +4255,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
             D3D11ExecutionPath::game_fallback
         );
         D3D11DlssTimingScope timing{
-            context, D3D11DlssTimingKind::native
+            context, settings.quad_view_region==1?D3D11DlssTimingKind::native_peripheral:D3D11DlssTimingKind::native
         };
         const auto result = original(context, handle, parameters, callback);
         diagnostic_note_result(DiagnosticApi::d3d11, result);
@@ -4263,7 +4284,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
             D3D11ExecutionPath::game_fallback
         );
         D3D11DlssTimingScope timing{
-            context, D3D11DlssTimingKind::native
+            context, settings.quad_view_region==1?D3D11DlssTimingKind::native_peripheral:D3D11DlssTimingKind::native
         };
         NgxPresetOverrideScope fallback_preset{settings.quad_view_mode?parameters:nullptr,settings.center_preset};
         result = original(context, handle, parameters, callback);
@@ -4310,7 +4331,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
             D3D11TransportStatus::not_attempted
         );
         D3D11DlssTimingScope timing{
-            context, D3D11DlssTimingKind::native
+            context, settings.quad_view_region==1?D3D11DlssTimingKind::native_peripheral:D3D11DlssTimingKind::native
         };
         const auto result = original(context, handle, parameters, callback);
         diagnostic_note_result(DiagnosticApi::d3d11, result);
@@ -4320,6 +4341,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
     if(settings.quad_view_region==1){
         if(evaluate_d3d11_quad_periphery(runtime,context,handle,parameters,settings))return 1U;
         NgxPresetOverrideScope preset{parameters,settings.peripheral_dlaa_preset};
+        D3D11DlssTimingScope native_timing{context,D3D11DlssTimingKind::native_peripheral};
         const auto result=original(context,handle,parameters,callback);
         diagnostic_note_state(DiagnosticApi::d3d11,DiagnosticState::prepare_rejected);
         diagnostic_note_d3d11_execution_path(D3D11ExecutionPath::game_fallback);
@@ -4386,7 +4408,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
             D3D11ExecutionPath::game_fallback
         );
         D3D11DlssTimingScope timing{
-            context, D3D11DlssTimingKind::native
+            context, settings.quad_view_region==1?D3D11DlssTimingKind::native_peripheral:D3D11DlssTimingKind::native
         };
         const auto result = original(context, handle, parameters, callback);
         diagnostic_note_result(DiagnosticApi::d3d11, result);
@@ -4411,7 +4433,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
             D3D11ExecutionPath::game_fallback
         );
         D3D11DlssTimingScope timing{
-            context, D3D11DlssTimingKind::native
+            context, settings.quad_view_region==1?D3D11DlssTimingKind::native_peripheral:D3D11DlssTimingKind::native
         };
         NgxPresetOverrideScope fallback_preset{settings.quad_view_mode?parameters:nullptr,settings.center_preset};
         result = original(context, handle, parameters, callback);
@@ -4865,6 +4887,7 @@ void evaluate_nr_after_native_d3d12(
     }
 
     const auto effective_settings = settings_for_view(settings, contract.view_id);
+    if(effective_settings.quad_view_region==1)skip_d3d12_history(contract.view_id);
 
     auto* const full_color = get_d3d12_parameter_resource(parameters, "Color");
     auto* const full_depth = get_d3d12_parameter_resource(parameters, "Depth");
@@ -4872,7 +4895,7 @@ void evaluate_nr_after_native_d3d12(
         get_d3d12_parameter_resource(parameters, "MotionVectors");
     auto* const full_output = get_d3d12_parameter_resource(parameters, "Output");
     if (!full_color || !full_depth || !full_motion || !full_output) return false;
-    // Check tracking before peripheral DLAA as well as center allocation. A
+    // Check tracking before peripheral DLSS as well as center allocation. A
     // rejected center must not leave private work recorded on an untracked list.
     if (!ensure_dlss_nr_recording(command_list)) {
         static std::atomic<unsigned> rejected{};
@@ -4891,7 +4914,8 @@ void evaluate_nr_after_native_d3d12(
 
     PeripheralDlaaResources peripheral{};
     bool peripheral_ready{};
-    if ((rr || effective_settings.peripheral_dlaa_enabled) &&
+    if ((effective_settings.quad_view_region==1 ||
+            (!effective_settings.quad_view_mode&&(rr || effective_settings.peripheral_dlaa_enabled))) &&
         (contract.feature_id == 1U || rr) &&
         full_color != nullptr && full_depth != nullptr &&
         full_motion != nullptr && full_output != nullptr) {
@@ -4938,8 +4962,21 @@ void evaluate_nr_after_native_d3d12(
         peripheral_timing.finish(peripheral_ready);
     }
 
+    if(effective_settings.quad_view_region==1){
+        private_attempted=true;
+        const bool composed=peripheral_ready&&compose_d3d12_peripheral_view(command_list,peripheral.output,full_output,
+            contract.output_width,contract.output_height,contract.output_base_x,contract.output_base_y,
+            contract.view_id,effective_settings);
+        if(peripheral_ready)restore_peripheral_dlaa_output(command_list,peripheral);
+        if(composed){result=1U;return true;}
+        static std::atomic<unsigned> failures{};const auto n=++failures;
+        if(n<=8||n%300==0)trace_event("Quad D3D12 peripheral full-view DLSS rejected view=%llu preset=%u scale=%.3f; retaining game DLSS",
+            contract.view_id,effective_settings.peripheral_dlaa_preset,effective_settings.peripheral_dlaa_scale);
+        return false;
+    }
+
     // No raw noisy ray-traced color may become the RR composite background.
-    if (rr && !peripheral_ready) return false;
+    if (rr && !effective_settings.quad_view_mode && !peripheral_ready) return false;
 
     // The periphery owns a separate temporal feature. Skipping it invalidates
     // that history even when the center continues to evaluate successfully.
@@ -5132,7 +5169,8 @@ NgxResult process_d3d12_evaluation_impl(
         return result;
     }
     auto settings = current_settings();
-    if (afw_coverage_enabled()) {
+    if(quad_view_snapshot().active)settings=settings_for_view(settings,reinterpret_cast<std::uintptr_t>(call.handle));
+    if (!settings.quad_view_mode && afw_coverage_enabled()) {
         settings.afw_source_eye = afw_current_source_eye();
         auto projection = afw_stereo_projection();
         projection.valid = afw_projection_matches_output(projection, get_ui(call.parameters, "OutWidth"), get_ui(call.parameters, "OutHeight"),
@@ -5140,6 +5178,7 @@ NgxResult process_d3d12_evaluation_impl(
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
     }
+    if(settings.quad_view_mode&&!settings.nr_enabled)skip_dlss_nr_history(reinterpret_cast<std::uintptr_t>(call.handle));
     NrPipelineTimingScope pipeline_timing{call.command_list, settings};
     NativeNrInputScope nr_input{call.command_list, call.handle, call.parameters, settings};
     ScopedCoordinatedCrop nr_crop{nr_input.crop_ready ? nr_input.frame.view_id : 0U,
@@ -5171,10 +5210,12 @@ NgxResult process_d3d12_evaluation_impl(
                             : DiagnosticState::prepare_rejected
     );
     D3D12PeripheralTimingScope sr_timing{
-        call.command_list, D3D12TimingKind::native_dlss
+        call.command_list, settings.quad_view_region==1?D3D12TimingKind::native_peripheral_dlss:D3D12TimingKind::native_dlss
     };
     sr_timing.begin();
     AfwNativeResetScope native_reset{call.handle, call.parameters};
+    NgxPresetOverrideScope quad_preset{call.parameters,settings.quad_view_mode&&settings.enabled?settings.center_preset:0U,
+        d3d12_game_feature(call.handle)==13U};
     result = original(
         call.command_list,
         call.handle,
@@ -5196,11 +5237,20 @@ NgxResult process_d3d12_evaluation_impl(
     return result;
 }
 
+DebugExposure native_d3d12_exposure(const NgxParameters* parameters) noexcept {
+    return {get_d3d12_parameter_resource(parameters,"ExposureTexture"),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        ngx_float(parameters,"DLSS.Pre.Exposure",1.F),ngx_float(parameters,"DLSS.Exposure.Scale",1.F)};
+}
 void stamp_d3d12_game_output(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxResult result) {
-    if (!eye_calibration_enabled() || calibration_evaluation_depth || inside_streamline_evaluation || !ngx_succeeded(result)) return;
+    if (calibration_evaluation_depth || inside_streamline_evaluation || !ngx_succeeded(result)) return;
     const D3D12NgxEvaluationCall call{D3D12NgxRoute::public_runtime, list, handle, parameters, nullptr};
     if (!recognizable_d3d12_dlss_evaluation(call) || !has_d3d12_game_view(handle)) return;
+    const DebugExposureScope exposure_scope{native_d3d12_exposure(parameters)};
+    if(quad_view_stamp12(list,get_d3d12_parameter_resource(parameters,"Output"),reinterpret_cast<uint64_t>(handle),
+        get_ui(parameters,"DLSS.Output.Subrect.Base.X"),get_ui(parameters,"DLSS.Output.Subrect.Base.Y"),
+        get_ui(parameters,"OutWidth"),get_ui(parameters,"OutHeight")))return;
+    if(!eye_calibration_enabled())return;
     eye_calibration_stamp12(list, get_d3d12_parameter_resource(parameters, "Output"), reinterpret_cast<std::uint64_t>(handle),
         get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
         get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"));
@@ -5212,6 +5262,7 @@ NgxResult process_d3d12_evaluation(const D3D12NgxEvaluationCall& call,
     const bool native_dlss = !inside_streamline_evaluation && recognizable_d3d12_dlss_evaluation(call);
     const NgxEvaluationExtentScope extent_scope(native_dlss ? call.parameters : nullptr,
         native_dlss ? d3d12_game_output_extent(call.handle) : NgxOutputExtent{});
+    const DebugExposureScope exposure_scope{native_d3d12_exposure(call.parameters)};
     const auto result = process_d3d12_evaluation_impl(call, original, context);
     stamp_d3d12_game_output(call.command_list, call.handle, call.parameters, result);
     return result;
@@ -5313,7 +5364,8 @@ NgxResult evaluate_d3d12_c_impl(
         return result;
     }
     auto settings = current_settings();
-    if (afw_coverage_enabled()) {
+    if(quad_view_snapshot().active)settings=settings_for_view(settings,reinterpret_cast<std::uintptr_t>(handle));
+    if (!settings.quad_view_mode && afw_coverage_enabled()) {
         settings.afw_source_eye = afw_current_source_eye();
         auto projection = afw_stereo_projection();
         projection.valid = afw_projection_matches_output(projection, get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"),
@@ -5321,6 +5373,7 @@ NgxResult evaluate_d3d12_c_impl(
         settings = afw_experiment_settings(settings, &projection);
         note_afw_coverage(settings, settings.afw_automatic_coverage && projection.valid);
     }
+    if(settings.quad_view_mode&&!settings.nr_enabled)skip_dlss_nr_history(reinterpret_cast<std::uintptr_t>(handle));
     NrPipelineTimingScope pipeline_timing{command_list, settings};
     NativeNrInputScope nr_input{command_list, handle, parameters, settings};
     ScopedCoordinatedCrop nr_crop{nr_input.crop_ready ? nr_input.frame.view_id : 0U,
@@ -5347,10 +5400,12 @@ NgxResult evaluate_d3d12_c_impl(
                             : DiagnosticState::prepare_rejected
     );
     D3D12PeripheralTimingScope sr_timing{
-        command_list, D3D12TimingKind::native_dlss
+        command_list, settings.quad_view_region==1?D3D12TimingKind::native_peripheral_dlss:D3D12TimingKind::native_dlss
     };
     sr_timing.begin();
     AfwNativeResetScope native_reset{handle, parameters};
+    NgxPresetOverrideScope quad_preset{parameters,settings.quad_view_mode&&settings.enabled?settings.center_preset:0U,
+        d3d12_game_feature(handle)==13U};
     result = original(command_list, handle, parameters, callback);
     native_reset.complete(result);
     sr_timing.finish(ngx_succeeded(result));
@@ -5369,6 +5424,7 @@ NgxResult evaluate_d3d12_c_impl(
 
 NgxResult runtime_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallbackC callback) {
+    const DebugExposureScope exposure_scope{native_d3d12_exposure(parameters)};
     const bool outer = !d3d12_ngx_interception_active();
     // The regular EvaluateFeature path publishes FG guides in
     // dispatch_d3d12_ngx_evaluation(). The _C ABI doesn't use that dispatcher:

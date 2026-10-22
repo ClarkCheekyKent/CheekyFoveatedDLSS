@@ -173,15 +173,16 @@ void draw_sr(Settings& s, bool rr, bool quad) {
         ImGui::TextDisabled("(Use if preset causes blurriness)");
     }
     slider("Center supersampling", s.center_supersampling, 1.0F, 2.0F, "%.2fx");
-    ImGui::Checkbox(quad?"Override peripheral views":"Peripheral DLAA", &s.peripheral_dlaa_enabled);
+    ImGui::Checkbox(quad?"Override peripheral views":"Peripheral DLSS", &s.peripheral_dlaa_enabled);
     if (s.peripheral_dlaa_enabled) {
         if (rr) rr_preset("Peripheral RR preset",s.rr_peripheral_preset);
         else preset("Peripheral preset", s.peripheral_dlaa_preset, false);
-        slider("Periphery scale", s.peripheral_dlaa_scale, .2F, 1.0F);
-        if(quad)ImGui::TextWrapped("Peripheral DLAA runs at this fraction of the game's input width and height, then expands over the full peripheral view. Off keeps the game's peripheral DLSS.");
+        slider("Periphery scale", s.peripheral_dlaa_scale, .2F, 1.0F,"%.2fx");
+        ImGui::TextWrapped("20%-100% of the game's DLSS input width and height; default 75%.");
+        if(quad)ImGui::TextWrapped("Peripheral DLSS uses this processing scale over the full peripheral view. Off keeps the game's original peripheral DLSS.");
     }
     if(quad)return;
-    if (rr) ImGui::TextWrapped("RR denoises both regions. Disabling peripheral DLAA uses input-resolution RR in the periphery.");
+    if (rr) ImGui::TextWrapped("RR denoises both regions. Disabling peripheral DLSS uses input-resolution RR in the periphery.");
     ImGui::SeparatorText("Size and shape");
     slider("Fovea width", s.width, .2F, 1.0F);
     slider("Fovea height", s.height, .2F, 1.0F);
@@ -514,6 +515,7 @@ bool draw_quad_controls(OverlayUiState& r,const OverlayRuntime& runtime) {
     int mode=r.draft.quad_manual_assignment?1:0;
     if(ImGui::Combo("Quad assignment mode",&mode,"Automatic\0Manual\0"))r.draft.quad_manual_assignment=mode==1;
     if(!active){ImGui::TextDisabled("Waiting for a running quad-view session.");return false;}
+    if(flag(quad,"app_composited"))ImGui::TextWrapped("Four DLSS views; the game composites them before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right. Use Manual to change it.");
     diagnostic_line(quad,"Assignment","status");
     const auto sources=member(quad,"sources");
     for(unsigned i=0;i<8;++i){const auto source=array_object(sources,i);if(source.empty())break;
@@ -696,19 +698,21 @@ void draw_sr_performance(std::string_view snapshot, const Settings& s) {
             resolution_line(api, "Motion vectors", "motion_width", "motion_height");
             diagnostic_line(api, "Motion-vector space", "motion_space");
             const auto motion_space = plain(member(api, "motion_space"));
-            ImGui::TextWrapped("Peripheral DLAA: %s", !s.peripheral_dlaa_enabled ? "Disabled" :
+            ImGui::TextWrapped("Peripheral DLSS: %s", !s.peripheral_dlaa_enabled ? "Disabled" :
                 motion_space == "Output-resolution" ? "Enabled (auto MV conversion)" :
                 motion_space == "Input-resolution" ? "Enabled (direct MVs)" : "Enabled (waiting for compatible MV info)");
             ImGui::SeparatorText("DLSS-SR GPU timing");
-            timing_line(api, "Full DLSS call", "native_ms");
+            const bool quad=flag(member(snapshot,"quad_views"),"active");
+            timing_line(api, quad?"Original DLSS":"Full DLSS", "native_ms");
+            if(quad)timing_line(api, "Original peripheral DLSS", "native_peripheral_ms");
             if (s.enabled && number(api, "native_ms") <= 0)
                 ImGui::TextWrapped("Turn off foveated DLSS-SR briefly to sample the full-frame baseline.");
-            timing_line(api, "Foveated DLSS call", "foveated_ms");
+            timing_line(api, "Foveated DLSS", "foveated_ms");
             if (s.peripheral_dlaa_enabled) {
-                timing_line(api, "Peripheral DLAA call", "peripheral_ms");
+                timing_line(api, "Peripheral DLSS", "peripheral_ms");
                 if (!i && plain(member(api, "execution_path")) == "DX11 Direct") {
                     timing_line(api, "Peripheral preparation", "peripheral_preparation_ms");
-                    timing_line(api, "Peripheral prep + DLAA total", "peripheral_total_ms");
+                    timing_line(api, "Peripheral prep + DLSS total", "peripheral_total_ms");
                 }
             }
             savings_line(api, "native_ms", "foveated_ms");
@@ -800,6 +804,11 @@ void fg_percent(const char* label, std::uint32_t& value) {
 
 void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const bool quad=flag(member(snapshot,"quad_views"),"active");
+    if(flag(member(snapshot,"quad_views"),"fg_blocked")){
+        bool off{};ImGui::BeginDisabled();ImGui::Checkbox("Enable DLSS Frame Generation (2x)",&off);test_control("FgEnabled");ImGui::EndDisabled();
+        ImGui::TextWrapped("Frame generation is disabled: four DLSS views are composited by the game before the stereo OpenXR submission. SR and center-only NR remain available.");
+        return;
+    }
     if(quad&&settings.fg.peripheral_method>2)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
     const auto fg = member(snapshot, "fg");

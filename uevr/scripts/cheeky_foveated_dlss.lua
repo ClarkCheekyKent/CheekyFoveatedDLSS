@@ -311,8 +311,11 @@ local function performance(d, f)
     text("Toggle SR in the same scene. These measure UEVR present callbacks; headset FPS may differ.")
 
     section("GPU time (250 ms average)")
-    local times = {{"Native DLSS", timing(d.native_ms)}, {"Foveated center DLSS", timing(d.foveated_ms)},
-        {"Peripheral DLAA", timing(d.peripheral_ms)}}
+    local quad = status.quad_views and status.quad_views.active
+    local times = {{quad and "Original DLSS" or "Full DLSS", timing(d.native_ms)}}
+    if quad then table.insert(times, {"Original peripheral DLSS", timing(d.native_peripheral_ms)}) end
+    table.insert(times, {"Foveated DLSS", timing(d.foveated_ms)})
+    table.insert(times, {"Peripheral DLSS", timing(d.peripheral_ms)})
     local settings = status.settings or {}
     if status.renderer == 1 and settings.NrEnabled then
         local before = settings.NrProcessingOrder == 1
@@ -552,7 +555,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             slider("Transition width", "TransitionWidth", 0, 0.3)
             check("Show red alignment border", "AlignmentBorder")
             section("Periphery")
-            check("Peripheral DLAA", "PeripheralDlaa")
+            check("Peripheral DLSS", "PeripheralDlaa")
             if draft.PeripheralDlaa then
                 if rr then combo("Peripheral RR preset", "RrPeripheralPreset", {[0]="Game/default",[4]="D",[5]="E",[6]="F"})
                 else combo("Peripheral preset", "PeripheralDlaaPreset", {[5]="E",[10]="J",[11]="K",[12]="L",[13]="M"}) end

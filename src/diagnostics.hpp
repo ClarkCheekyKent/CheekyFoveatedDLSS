@@ -34,6 +34,7 @@ enum class DiagnosticGpuTiming : std::uint32_t {
     d3d12_before_full_nr, d3d12_before_foveated_nr,
     d3d11_before_pipeline, d3d11_after_pipeline,
     d3d12_before_pipeline, d3d12_after_pipeline,
+    native_peripheral_dlss, d3d12_native_peripheral_dlss,
     count,
 };
 
@@ -106,6 +107,7 @@ struct DiagnosticSnapshot {
     float full_dlss_nr_gpu_ms{};
     float foveated_dlss_nr_gpu_ms{};
     float native_dlss_gpu_ms{};
+    float native_peripheral_dlss_gpu_ms{};
     float foveated_frame_ms{};
     float native_frame_ms{};
     bool has_private_result{};
@@ -173,6 +175,7 @@ void diagnostic_note_dlss_nr_gpu_time(
 ) noexcept;
 void diagnostic_note_pipeline_gpu_time(DiagnosticApi api, float milliseconds, bool before_upscaling) noexcept;
 void diagnostic_note_native_dlss_gpu_time(float milliseconds) noexcept;
+void diagnostic_note_native_peripheral_dlss_gpu_time(DiagnosticApi api,float milliseconds) noexcept;
 void diagnostic_note_d3d12_dlss_gpu_time(float milliseconds, bool foveated) noexcept;
 void diagnostic_note_frame_rate(
     float frames_per_second,
