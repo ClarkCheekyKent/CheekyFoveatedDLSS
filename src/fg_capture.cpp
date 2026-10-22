@@ -750,6 +750,10 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     // generated frame is submitted), like the D3D12 path.
     out->native11_release_point=fg.release_point<=4u?fg.release_point:3u;return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyQuad_GetComposeOptionsV1(CheekyQuadComposeOptions* out) noexcept {
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    out->wait_gpu=cheeky::foveated_dlss::current_settings().d3d12_quad_compose_wait?1u:0u;return true;
+}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(CheekyFgStorageOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
     const auto settings=cheeky::foveated_dlss::current_settings();

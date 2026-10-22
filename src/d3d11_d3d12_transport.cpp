@@ -216,6 +216,7 @@ struct TransportView {
     DlssViewId view_id{};
     std::array<TransportSlot, transport_slot_count> slots{};
     std::uint32_t next_slot{};
+    std::uint32_t texture_slot{transport_slot_count}; // Slot that last used its shared textures.
 };
 
 struct TransportDevice {
@@ -289,6 +290,43 @@ void release_slot(TransportSlot& slot) noexcept {
     release(slot.nr_allocator);
     release(slot.allocator);
     slot = {};
+}
+
+// Shared textures and the geometry slot_matches checks them against. Single
+// buffering moves these between ring slots; allocators, queries and fence
+// values stay with their slot.
+void release_slot_textures(TransportSlot& slot) noexcept {
+    for (auto* texture : {&slot.fg_depth, &slot.fg_motion, &slot.color, &slot.depth,
+            &slot.motion_vectors, &slot.output, &slot.peripheral_color, &slot.peripheral_depth,
+            &slot.peripheral_motion_vectors, &slot.peripheral_output, &slot.nr_color,
+            &slot.nr_depth, &slot.nr_motion_vectors}) release_shared_texture(*texture);
+}
+
+void swap_slot_textures(TransportSlot& a, TransportSlot& b) noexcept {
+    using std::swap;
+    swap(a.fg_depth, b.fg_depth); swap(a.fg_motion, b.fg_motion);
+    swap(a.color, b.color); swap(a.depth, b.depth);
+    swap(a.motion_vectors, b.motion_vectors); swap(a.output, b.output);
+    swap(a.peripheral_color, b.peripheral_color); swap(a.peripheral_depth, b.peripheral_depth);
+    swap(a.peripheral_motion_vectors, b.peripheral_motion_vectors);
+    swap(a.peripheral_output, b.peripheral_output);
+    swap(a.nr_before, b.nr_before); swap(a.nr_color, b.nr_color);
+    swap(a.nr_depth, b.nr_depth); swap(a.nr_motion_vectors, b.nr_motion_vectors);
+    swap(a.input_width, b.input_width); swap(a.input_height, b.input_height);
+    swap(a.sr_motion_width, b.sr_motion_width); swap(a.sr_motion_height, b.sr_motion_height);
+    swap(a.output_width, b.output_width); swap(a.output_height, b.output_height);
+    swap(a.peripheral_render_width, b.peripheral_render_width);
+    swap(a.peripheral_render_height, b.peripheral_render_height);
+    swap(a.peripheral_output_width, b.peripheral_output_width);
+    swap(a.peripheral_output_height, b.peripheral_output_height);
+    swap(a.peripheral_motion_width, b.peripheral_motion_width);
+    swap(a.peripheral_motion_height, b.peripheral_motion_height);
+    swap(a.peripheral_enabled, b.peripheral_enabled);
+    swap(a.nr_input_width, b.nr_input_width); swap(a.nr_input_height, b.nr_input_height);
+    swap(a.nr_output_width, b.nr_output_width); swap(a.nr_output_height, b.nr_output_height);
+    swap(a.nr_motion_width, b.nr_motion_width); swap(a.nr_motion_height, b.nr_motion_height);
+    swap(a.color_format, b.color_format); swap(a.motion_format, b.motion_format);
+    swap(a.output_format, b.output_format);
 }
 
 // Slots' allocators and textures, and the view's private DX12 features, may
@@ -1802,14 +1840,37 @@ bool evaluate_d3d11_via_d3d12(
     }
 
     auto* const view = find_or_create_view(*device, contract.view_id);
-    auto& slot = view->slots[view->next_slot++ % transport_slot_count];
+    const auto slot_index = view->next_slot++ % transport_slot_count;
+    auto& slot = view->slots[slot_index];
     if (!wait_for_slot(*device, context, slot)) {
         release(context4);
         return reject_transport(D3D11TransportStatus::transport_slot_busy);
     }
+    // Single buffering: one set of shared textures follows the view's latest
+    // slot. Every evaluation ends with a DX11 GPU wait on its DX12 work, so the
+    // next frame's DX11 copies are already ordered after it. The CPU waits on
+    // the previous slot only before releasing or resizing one of its textures.
+    bool textures_pending{};
+    if (settings.d3d11_transport_single_buffer && view->texture_slot < transport_slot_count &&
+            view->texture_slot != slot_index) {
+        auto& owner = view->slots[view->texture_slot];
+        release_slot_textures(slot); // This slot's own previous work has retired.
+        swap_slot_textures(slot, owner);
+        // The textures' last use moves with them; this slot's fence value is
+        // replaced by its own submission below.
+        slot.done_value = (std::max)(slot.done_value, owner.done_value);
+        textures_pending = true;
+    }
+    view->texture_slot = slot_index;
+    const auto textures_retired = [&] {
+        if (!textures_pending) return true;
+        if (!wait_for_slot(*device, context, slot)) return false;
+        textures_pending = false;
+        return true;
+    };
     resolve_timing(context, slot);
     resolve_dlss_timing(*device, slot);
-    if (!slot_matches(
+    const bool slot_ready = slot_matches(
             slot, reconstruction, mv_width, mv_height, nr_depth_capacity_x, nr_depth_capacity_y,
             nr_geometry.width, nr_geometry.height,
             nr_mv_capacity_x, nr_mv_capacity_y, settings.nr_enabled,
@@ -1818,7 +1879,12 @@ bool evaluate_d3d11_via_d3d12(
             nr_motion_width, nr_motion_height,
             settings.peripheral_dlaa_enabled,
             color_desc.Format, motion_desc.Format, output_desc.Format, nr_before
-        ) && !initialize_slot(
+        );
+    if (!slot_ready && !textures_retired()) {
+        release(context4);
+        return reject_transport(D3D11TransportStatus::transport_slot_busy);
+    }
+    if (!slot_ready && !initialize_slot(
             *device, slot, reconstruction, mv_width, mv_height, nr_depth_capacity_x, nr_depth_capacity_y,
             nr_geometry.width, nr_geometry.height,
             nr_mv_capacity_x, nr_mv_capacity_y,
@@ -1841,10 +1907,22 @@ bool evaluate_d3d11_via_d3d12(
     // this transport too (on with DLSS-NR) was pure overhead every frame.
     const bool dlss_fg=settings.fg.enabled&&
         !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated);
-    if(dlss_fg) {
+    // Shared guides: the peripheral DLAA full-frame depth/motion below are the
+    // same depth conversion and MV box as the FG (and NR-before) guides.
+    const bool share_guides=settings.d3d11_transport_shared_guides&&settings.peripheral_dlaa_enabled;
+    const auto release_fg=[&] {
+        if((slot.fg_depth.resource12||slot.fg_motion.resource12)&&textures_retired()) {
+            release_shared_texture(slot.fg_depth);release_shared_texture(slot.fg_motion);
+        }
+    };
+    if(dlss_fg&&share_guides) {
+        release_fg();fg_guides_ready=true;
+    } else if(dlss_fg) {
         auto ensure_fg=[&](SharedTexture& texture,const char* name,unsigned w,unsigned h,DXGI_FORMAT format) {
-            if(texture.resource12 && (texture.width!=w || texture.height!=h || texture.format!=format))
+            if(texture.resource12 && (texture.width!=w || texture.height!=h || texture.format!=format)) {
+                if(!textures_retired())return false;
                 release_shared_texture(texture); // Slot has retired before reuse.
+            }
             const auto flags=format==DXGI_FORMAT_R32_FLOAT?D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS:D3D12_RESOURCE_FLAG_NONE;
             return texture.resource12 || create_shared_texture(*device,name,w,h,format,flags,texture);
         };
@@ -1856,8 +1934,10 @@ bool evaluate_d3d11_via_d3d12(
             context->CopySubresourceRegion(slot.fg_motion.texture11,0,0,0,0,motion,0,&full_mv);
         }
     } else {
-        release_shared_texture(slot.fg_depth);release_shared_texture(slot.fg_motion);
+        release_fg();
     }
+    ID3D12Resource* const fg_depth12=share_guides?slot.peripheral_depth.resource12:slot.fg_depth.resource12;
+    ID3D12Resource* const fg_motion12=share_guides?slot.peripheral_motion_vectors.resource12:slot.fg_motion.resource12;
 
     D3D11_BOX color_box{
         color_x + crop.input_base_x, color_y + crop.input_base_y, 0U,
@@ -1913,7 +1993,28 @@ bool evaluate_d3d11_via_d3d12(
         );
     }
 
-    if (settings.nr_enabled) {
+    // NR before upscaling reads full-frame guides, identical to the peripheral ones.
+    const bool share_nr_guides = share_guides && nr_before;
+    if (share_nr_guides) {
+        if ((slot.nr_depth.resource12 || slot.nr_motion_vectors.resource12) && textures_retired()) {
+            release_shared_texture(slot.nr_depth);
+            release_shared_texture(slot.nr_motion_vectors);
+        }
+    } else if (settings.nr_enabled && (
+            (!slot.nr_depth.resource12 && !create_shared_texture(*device, "NR depth",
+                nr_depth_capacity_x, nr_depth_capacity_y, DXGI_FORMAT_R32_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, slot.nr_depth)) ||
+            (!slot.nr_motion_vectors.resource12 && !create_shared_texture(*device, "NR motion vectors",
+                nr_mv_capacity_x, nr_mv_capacity_y, motion_desc.Format,
+                D3D12_RESOURCE_FLAG_NONE, slot.nr_motion_vectors)))) {
+        release(context4);
+        return reject_transport(D3D11TransportStatus::resource_initialization_failed);
+    }
+    ID3D12Resource* const nr_depth12 = share_nr_guides
+        ? slot.peripheral_depth.resource12 : slot.nr_depth.resource12;
+    ID3D12Resource* const nr_motion12 = share_nr_guides
+        ? slot.peripheral_motion_vectors.resource12 : slot.nr_motion_vectors.resource12;
+    if (settings.nr_enabled && !share_nr_guides) {
         if (!convert_depth_crop(
                 *device, context, depth, depth_desc.Format,
                 depth_x + nr_depth_x.base,
@@ -1982,13 +2083,13 @@ bool evaluate_d3d11_via_d3d12(
         slot.dlss_nr_timing_foveated = settings.nr_foveated;
         transition(device->command_list12, slot.nr_color.resource12,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        transition(device->command_list12, slot.nr_depth.resource12,
+        transition(device->command_list12, nr_depth12,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transition(device->command_list12, slot.nr_motion_vectors.resource12,
+        transition(device->command_list12, nr_motion12,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         DlssNrFrame nr_frame{contract.view_id, DlssNrRoute::d3d11_transport,
             device->command_list12, slot.nr_color.resource12, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            slot.nr_depth.resource12, slot.nr_motion_vectors.resource12,
+            nr_depth12, nr_motion12,
             render_width, render_height, out_width, out_height,
             0U, 0U, render_width, render_height, 0U, 0U, nr_motion_width, nr_motion_height,
             dlss_nr_ngx_motion_uv_scale(contract.motion_vector_scale_x, render_width),
@@ -2008,9 +2109,9 @@ bool evaluate_d3d11_via_d3d12(
         processing_settings.nr_alignment_border_enabled = false;
         nr_attempt.attempted = true;
         nr_before_succeeded = evaluate_dlss_nr(nr_frame, processing_settings);
-        transition(device->command_list12, slot.nr_depth.resource12,
+        transition(device->command_list12, nr_depth12,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        transition(device->command_list12, slot.nr_motion_vectors.resource12,
+        transition(device->command_list12, nr_motion12,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         transition(device->command_list12, slot.nr_color.resource12,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2192,7 +2293,7 @@ bool evaluate_d3d11_via_d3d12(
         fg_sr_begin_evaluation(view_id);
         if(settings.enabled)fg_sr_prepared(view_id,crop,out_width,out_height,output_x,output_y);
         NgxParameterOverlay guides(parameters);
-        guides.Set("Depth",slot.fg_depth.resource12);guides.Set("MotionVectors",slot.fg_motion.resource12);
+        guides.Set("Depth",fg_depth12);guides.Set("MotionVectors",fg_motion12);
         guides.Set("Width",render_width);guides.Set("Height",render_height);
         guides.Set("OutWidth",out_width);guides.Set("OutHeight",out_height);
         guides.Set("DLSS.Render.Subrect.Dimensions.Width",render_width);
@@ -2200,11 +2301,11 @@ bool evaluate_d3d11_via_d3d12(
         guides.Set("DLSS.Input.Depth.Subrect.Base.X",0u);guides.Set("DLSS.Input.Depth.Subrect.Base.Y",0u);
         guides.Set("DLSS.Input.MV.Subrect.Base.X",0u);guides.Set("DLSS.Input.MV.Subrect.Base.Y",0u);
         guides.Set("DLSS.Feature.Create.Flags",create_flags);
-        transition(device->command_list12,slot.fg_depth.resource12,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        transition(device->command_list12,slot.fg_motion.resource12,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(device->command_list12,fg_depth12,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        transition(device->command_list12,fg_motion12,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         fg_publish_ngx(device->command_list12,game_handle,&guides,result);
-        transition(device->command_list12,slot.fg_depth.resource12,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
-        transition(device->command_list12,slot.fg_motion.resource12,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        transition(device->command_list12,fg_depth12,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        transition(device->command_list12,fg_motion12,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
     }
     transition(device->command_list12, slot.output.resource12,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);

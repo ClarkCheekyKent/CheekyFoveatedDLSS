@@ -245,6 +245,14 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
     layers[scene_index]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&replacement);
     auto forwarded=*info;forwarded.layers=layers.data();
     XrResult result=XR_SUCCESS;
+    if(!compositor->d3d11){
+        const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+        const auto query=runtime?reinterpret_cast<CheekyQuadComposeOptionsFn>(GetProcAddress(runtime,"CheekyQuad_GetComposeOptionsV1")):nullptr;
+        CheekyQuadComposeOptions compose;
+        const bool wait=!query||!query(&compose)||compose.wait_gpu!=0;
+        if(compositor->wait_gpu!=wait)log_startup("QUAD-CAPTURE D3D12 composition %s\n",wait?"waits for GPU completion":"returns after submission");
+        compositor->wait_gpu=wait;
+    }
     if(!presenter&&compositor->d3d11&&compositor->d3d11->fg_bridge){
         // Prove the four-view guide/sharing path while the application still
         // owns ordinary runtime frames. No color bridge or pacing takeover.

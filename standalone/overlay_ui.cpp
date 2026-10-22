@@ -1172,6 +1172,14 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     ImGui::SeparatorText("Compatibility");
                     ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
                     ImGui::TextWrapped("Required for DLSS-NR in DX11 games.");
+                    if (r.draft.d3d11_use_d3d12_transport || fg_requires_d3d12(r.draft)) {
+                        ImGui::Checkbox("Transport: share full-frame guides (experimental)", &r.draft.d3d11_transport_shared_guides);
+                        ImGui::TextWrapped("With peripheral DLAA on, DLSS-FG and NR before upscaling reuse its depth and motion copies instead of making their own.");
+                        ImGui::Checkbox("Transport: single-buffer textures (experimental)", &r.draft.d3d11_transport_single_buffer);
+                        ImGui::TextWrapped("Keeps one set of shared textures per eye instead of three. Saves VRAM; the GPU work is already serialized.");
+                    }
+                    ImGui::Checkbox("Wait for quad-view composition (DX12)", &r.draft.d3d12_quad_compose_wait);
+                    ImGui::TextWrapped("Off: DX12 quad-view games such as MSFS return from xrEndFrame once the four-view composition is submitted, instead of waiting for the GPU to finish it.");
                     ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
                     test_control("D3D12LowerHook");
                     ImGui::TextWrapped("Off selects the higher call. Restart the game after changing this.");

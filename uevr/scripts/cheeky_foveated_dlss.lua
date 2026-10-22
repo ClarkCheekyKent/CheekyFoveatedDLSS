@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgPacingClock", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgPacingClock", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -965,6 +965,14 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         if status.renderer == 0 then
             check("DX11 -> DX12 transport", "D3D11D3D12Transport")
             text("DLSS-NR on DX11 requires DX12 transport.")
+            if draft.D3D11D3D12Transport and draft.D3D11D3D12SharedGuides ~= nil then
+                check("Transport: share full-frame guides (experimental)", "D3D11D3D12SharedGuides")
+                text("With peripheral DLAA on, DLSS-FG and NR before upscaling reuse its depth and motion copies.")
+            end
+            if draft.D3D11D3D12Transport and draft.D3D11D3D12SingleBuffer ~= nil then
+                check("Transport: single-buffer textures (experimental)", "D3D11D3D12SingleBuffer")
+                text("One set of shared textures per eye instead of three. Saves VRAM.")
+            end
         end
         if status.renderer ~= 0 or draft.D3D11D3D12Transport then
             check("Enable DLSS-NR", "NrEnabled")

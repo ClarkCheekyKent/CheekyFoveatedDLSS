@@ -230,14 +230,24 @@ struct Compositor {
     PFN_xrAcquireSwapchainImage acquire{};PFN_xrWaitSwapchainImage wait{};PFN_xrReleaseSwapchainImage release{};
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D11Device> device11;std::unique_ptr<Compositor11> d3d11;
+    // One recording per in-flight composition; allocator/list/srvs alias the current one.
+    struct Recording {
+        ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+        ComPtr<ID3D12DescriptorHeap> srvs;uint64_t serial{};
+    };
+    std::array<Recording,3> recordings;unsigned recording{};
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
-    ComPtr<ID3D12Fence> fence;uint64_t serial{};
+    ComPtr<ID3D12Fence> fence;uint64_t serial{};HANDLE event{};
     ComPtr<ID3D12RootSignature> root;ComPtr<ID3DBlob> vs,ps;
     ComPtr<ID3D12DescriptorHeap> srvs,rtvs;
     std::array<Eye,2> eyes;
     std::array<XrViewConfigurationView,2> recommended{};
-    // D3D12 FG: receives each composed eye after its GPU work completes,
-    // before the image is released (still in RENDER_TARGET state).
+    // True: xrEndFrame waits until the composition has executed (baseline).
+    // False: only wait when reusing a recording that is still in flight; the
+    // runtime and FG capture are ordered behind it on the same queue.
+    bool wait_gpu{true};
+    // D3D12 FG: receives each composed eye after its GPU work is submitted on
+    // the session queue, before the image is released (still in RENDER_TARGET state).
     std::function<void(unsigned,XrSwapchain,unsigned,ID3D12Resource*,unsigned,unsigned,DXGI_FORMAT)> capture_output12;
     bool initialize() {
         if(device11){
@@ -248,9 +258,11 @@ struct Compositor {
         }
         if(root)return true;
         if(!device||!queue||!create||!destroy||!enumerate_images||!acquire||!wait||!release)return false;
-        if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||
-           FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)))||
-           FAILED(list->Close())||FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))))return false;
+        for(auto& r:recordings)
+            if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&r.allocator)))||
+               FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,r.allocator.Get(),nullptr,IID_PPV_ARGS(&r.list)))||
+               FAILED(r.list->Close()))return false;
+        if(FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))))return false;
         const auto& shader=shader_source;
         ComPtr<ID3DBlob> error,blob;
         if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"VS","vs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vs,&error))||
@@ -265,18 +277,19 @@ struct Compositor {
         if(FAILED(D3D12SerializeRootSignature(&signature,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)))return false;
         // Assign root last: its presence means every initialization step succeeded.
         D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=4;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if(FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&srvs))))return false;
+        for(auto& r:recordings)if(FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&r.srvs))))return false;
         heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;heap.NumDescriptors=2;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         return SUCCEEDED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&rtvs)))&&
             SUCCEEDED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)));
     }
-    bool idle() {
-        if(!fence||fence->GetCompletedValue()>=serial)return !device||SUCCEEDED(device->GetDeviceRemovedReason());
-        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!event)return false;
-        const bool ok=SUCCEEDED(fence->SetEventOnCompletion(serial,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0;
-        CloseHandle(event);return ok&&SUCCEEDED(device->GetDeviceRemovedReason());
+    bool wait_for(uint64_t value) {
+        if(!fence||fence->GetCompletedValue()>=value)return !device||SUCCEEDED(device->GetDeviceRemovedReason());
+        if(!event&&!(event=CreateEventW(nullptr,FALSE,FALSE,nullptr)))return false;
+        const bool ok=SUCCEEDED(fence->SetEventOnCompletion(value,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0;
+        return ok&&SUCCEEDED(device->GetDeviceRemovedReason());
     }
-    ~Compositor(){idle();for(auto& eye:eyes)if(eye.chain&&destroy)destroy(eye.chain);}
+    bool idle(){return wait_for(serial);}
+    ~Compositor(){idle();if(event)CloseHandle(event);for(auto& eye:eyes)if(eye.chain&&destroy)destroy(eye.chain);}
     bool output(unsigned eye,DXGI_FORMAT format) {
         auto& e=eyes[eye];if(e.chain)return e.format==format;
         e.width=recommended[eye].recommendedImageRectWidth;e.height=recommended[eye].recommendedImageRectHeight;e.format=format;
@@ -333,7 +346,10 @@ struct Compositor {
     }
     XrResult compose(const std::array<Input,4>& inputs,const XrCompositionLayerProjection& projection,std::array<XrCompositionLayerProjectionView,2>& views) {
         if(device11)return initialize()?d3d11->compose(inputs,projection,views):XR_ERROR_RUNTIME_FAILURE;
-        if(!initialize()||!idle())return XR_ERROR_RUNTIME_FAILURE;
+        if(!initialize())return XR_ERROR_RUNTIME_FAILURE;
+        recording=(recording+1)%recordings.size();auto& current=recordings[recording];
+        if(!(wait_gpu?idle():wait_for(current.serial)))return XR_ERROR_RUNTIME_FAILURE;
+        allocator=current.allocator;list=current.list;srvs=current.srvs;
         for(const auto& input:inputs)if(!input.valid())return XR_ERROR_VALIDATION_FAILURE;
         if(!output(0,inputs[0].format)||!output(1,inputs[1].format))return XR_ERROR_RUNTIME_FAILURE;
         if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return XR_ERROR_RUNTIME_FAILURE;
@@ -347,7 +363,8 @@ struct Compositor {
         const HRESULT closed=list->Close();
         if(XR_SUCCEEDED(result)&&FAILED(closed))result=XR_ERROR_RUNTIME_FAILURE;
         if(result==XR_SUCCESS){ID3D12CommandList* commands[]{list.Get()};queue->ExecuteCommandLists(1,commands);
-            if(FAILED(queue->Signal(fence.Get(),++serial))||!idle())result=XR_ERROR_RUNTIME_FAILURE;}
+            if(FAILED(queue->Signal(fence.Get(),++serial)))result=XR_ERROR_RUNTIME_FAILURE;
+            else{current.serial=serial;if(wait_gpu&&!idle())result=XR_ERROR_RUNTIME_FAILURE;}}
         for(unsigned eye=0;eye<2;++eye)if(acquired[eye]&&waited[eye]){
             if(result==XR_SUCCESS&&capture_output12)capture_output12(eye,eyes[eye].chain,indices[eye],eyes[eye].images[indices[eye]].texture,
                 eyes[eye].width,eyes[eye].height,eyes[eye].format);

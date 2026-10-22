@@ -218,6 +218,12 @@ struct CheekyFgPacingOptions {
     std::uint32_t native11_release_point{3}; // Shared release setting: 0 FG submission ... 3 generated frame submission, 4 submission + 4 ms.
 };
 using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
+// Independent export: D3D12 quad-view composition in xrEndFrame.
+struct CheekyQuadComposeOptions {
+    std::uint32_t abi{1},size{sizeof(CheekyQuadComposeOptions)};
+    std::uint32_t wait_gpu{1}; // 1 wait for the composition to execute (baseline); 0 only wait on an in-flight recording.
+};
+using CheekyQuadComposeOptionsFn=bool(__cdecl*)(CheekyQuadComposeOptions*);
 // Independent export: older transport/pair layouts remain compatible.
 struct CheekyFgDirectOutput {
     std::uint32_t abi{1},size{sizeof(CheekyFgDirectOutput)},supported{},requested{};

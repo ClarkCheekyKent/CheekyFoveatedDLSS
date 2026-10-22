@@ -65,6 +65,10 @@ struct Settings {
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
     bool d3d11_use_d3d12_transport{false};
+    // Experimental DX11 -> DX12 transport savings; both off keep the baseline copies and slots.
+    bool d3d11_transport_shared_guides{false}; // FG and NR-before reuse the peripheral full-frame depth/motion copies.
+    bool d3d11_transport_single_buffer{false}; // One set of shared textures instead of one per ring slot.
+    bool d3d12_quad_compose_wait{true}; // D3D12 quad views: xrEndFrame waits for the composition GPU work.
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
