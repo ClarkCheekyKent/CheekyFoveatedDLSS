@@ -348,7 +348,7 @@ inline bool BufferedPresenter::upload_batch(const std::vector<std::pair<Chain*,I
 struct BufferedBackend12 final : FrameBackend {
     using Native=BufferedNative;using Pair=BufferedPair;using Auxiliary=BufferedAuxiliary;
     using DirectRequest=BufferedDirectRequest;using Chain=BufferedChain;
-    using CapturePlan=BufferedGpuResources::CapturePlan;using Slice=BufferedGpuResources::Slice;
+    using CapturePlan=BufferedResources12::CapturePlan;using Slice=BufferedResources12::Slice;
     BufferedPresenter& owner;
     explicit BufferedBackend12(BufferedPresenter& host):owner(host){}
     bool ready(std::uint64_t ticket) const override {return owner.producer.completed(ticket);}
@@ -705,6 +705,9 @@ struct BufferedBackend12 final : FrameBackend {
     }
     void retire() override {
         owner.producer.drain();owner.output.drain();owner.uploads.drain();owner.worker.wait_idle();
+    }
+    void discard_captures(bool session) override {
+        owner.direct_captures.clear();if(session){owner.capture_plans.clear();owner.captured_descs.clear();}
     }
     void finish_generation() override {owner.worker.wait_idle();owner.output.drain();}
     void reset_generation() override {owner.worker.reset();owner.worker.failed=false;}

@@ -57,6 +57,9 @@ struct FrameBackend {
     virtual void retire()=0;
     virtual void finish_generation()=0;
     virtual void retire_guides(BufferedNative& frame)=0;
+    // Drops backend capture state for released images (capture_mutex held).
+    // session: the session is stopping, so per-swapchain plans go too.
+    virtual void discard_captures(bool session)=0;
     virtual void reset_generation()=0;
     virtual void reset_statistics(bool reset_gpu)=0;
     virtual GenerationStatus generation_status() const=0;

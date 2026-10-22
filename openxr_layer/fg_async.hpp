@@ -372,7 +372,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         std::lock_guard capture_lock(capture_mutex);
         backend->retire();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
-        captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
+        captured.clear();backend->discard_captures(true);capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
         if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         raw=nullptr;raw_done=true;passthrough_events=history_reset_events=0;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
@@ -505,7 +505,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(discarded){
             ended=begun;++skipped;++epoch;discard_pending();ready.clear();latest_native.reset();
             awaiting_generated_submission=0;
-            captured.clear();direct_captures.clear();capture_tokens.clear();capture_frames.clear();capture_crop_tokens.clear();
+            captured.clear();backend->discard_captures(false);capture_tokens.clear();capture_frames.clear();capture_crop_tokens.clear();
             capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;
             if(trace)trace("FG xrBeginFrame discarded the preceding unended application frame");
             changed.notify_all();

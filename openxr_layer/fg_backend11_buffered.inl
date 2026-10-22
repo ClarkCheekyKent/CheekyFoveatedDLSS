@@ -110,7 +110,7 @@ inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {
 struct BufferedBackend11 final : FrameBackend {
     using Native=BufferedNative;using Pair=BufferedPair;using Auxiliary=BufferedAuxiliary;
     using DirectRequest=BufferedDirectRequest;using Chain=BufferedChain;
-    using CapturePlan=BufferedGpuResources::CapturePlan;using Slice=BufferedGpuResources::Slice;
+    using CapturePlan=BufferedResources12::CapturePlan;using Slice=BufferedResources12::Slice;
     BufferedPresenter& owner;
     explicit BufferedBackend11(BufferedPresenter& host):owner(host){}
     // Every stage is queued on the same immediate context. Preserve the native
@@ -169,6 +169,9 @@ struct BufferedBackend11 final : FrameBackend {
         owner.native11->flush();owner.native11->clear_guides();
         std::lock_guard lock(owner.composed11_mutex);owner.composed11.clear();
     }
+    // Composed quad eyes are timestamped and replaced per release; retire()
+    // drops them when the session stops.
+    void discard_captures(bool) override {}
     void finish_generation() override {}
     void reset_generation() override {}
     // The bidirectional shader still samples previous-interval depth.

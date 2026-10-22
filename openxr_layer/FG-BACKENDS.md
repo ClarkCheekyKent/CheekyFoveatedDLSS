@@ -23,18 +23,38 @@ single-immediate-context ordering, dispatch gate, pipeline-state restoration
 and post-runtime flushes. The D3D12 backend retains its fence retirement and
 submitted/prepared callbacks. Neither implementation changes pacing policy.
 
-This first split preserves the existing layer capture hooks and graphics test
-fixtures: frame records live in `fg_buffered_frames.hpp`, and graphics storage
-is grouped in `BufferedGpuResources`. That storage is still host-owned and
-public to those hooks/fixtures; complete resource encapsulation is a later
-step. The graphics entry-point declarations are in
-`fg_buffered_entrypoints.inl`, and common setup/diagnostic glue is in
-`fg_buffered_backend.inl`.
+Frame records (`fg_buffered_frames.hpp`) are graphics-agnostic. Pacing reads
+their identities, poses, timestamps and `FramePolicy`; color images are opaque
+handles, and guide state is a backend payload (`FrameGuides12` or
+`FrameGuides11` in `fg_frame_payloads.hpp`) that only its backend dereferences.
+
+Graphics storage is grouped per API in `fg_buffered_resources.hpp`:
+`BufferedResources12` (capture plans, direct eye captures, transports, FG
+queues, cross-queue guide fence, direct-XR state) and `BufferedResources11`
+(the immediate-context backend and composed quad eyes). The released-image map
+`captured` is shared by both. Pacing never touches this storage directly; it
+calls `FrameBackend::discard_captures` and `retire`. The storage is still
+inherited by `BufferedPresenter` so the layer's capture hooks and the GPU
+fixtures keep their names. Moving each block into its backend object is the
+remaining ownership step; it needs accessors for the hooks in
+`openxr_layer.cpp`/`quad_capture.inl` and about 100 fixture references, mostly
+in `tests/openxr_binding/fg_async_validation.hpp`. The graphics entry-point
+declarations are in `fg_buffered_entrypoints.inl`, and common
+setup/diagnostic glue is in `fg_buffered_backend.inl`.
 
 Regression checks are the default binding suite, `--fg-shader11`,
 `--quad-d3d11`, `--quad-capture`, `--fg-hardening` and
 `--fg-crop-gpu-validation`. The pre-existing `--fg-gpu-validation` failure at
 "Live projection learns direct eye capture layout" remains separate from this
-split. Cross-API pixel parity coverage is the next planned test addition.
+split.
+
+Cross-API parity (`tests/openxr_binding/fg_parity_validation.hpp`, run by
+`--fg-shader11`) feeds identical color, depth and motion to the native D3D11
+backend and the D3D12 focus pipeline and compares every generated pixel. They
+match except in one known band: the D3D12 center pass sees only the center
+crop's guides, so within half the motion distance of the center edge a warp
+whose source lies outside the crop falls back to the unwarped color. Native
+D3D11 keeps full-eye guides there. Giving the D3D12 center pass full-eye
+guides would remove the difference.
 User-reported game checks after this split: DCS, Hogwarts Legacy and AC Rally
 worked. ACC crash/hang investigation remains deferred.
