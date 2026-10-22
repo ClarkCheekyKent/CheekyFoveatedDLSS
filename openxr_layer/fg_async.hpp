@@ -1,9 +1,8 @@
 #pragma once
-#include "fg_transport.hpp"
-#include "fg_backend11.hpp"
+#include "fg_frame_backend.hpp"
+#include "fg_buffered_resources.hpp"
 #include "fg_burst_capture.hpp"
 #include "fg_native_submission_math.hpp"
-#include "../src/d3d12_native.hpp"
 #include "../src/fg_source_lifecycle.hpp"
 #include <condition_variable>
 #include <thread>
@@ -16,7 +15,9 @@ namespace cheeky::fg {
 // The game owns capture/snapshot recording. Only the presentation thread calls
 // the runtime frame functions. A separate worker waits for inference completion.
 // Three native leases and two ready pairs bound latency and texture ownership.
-struct BufferedPresenter final : Presenter {
+struct BufferedPresenter final : Presenter, BufferedGpuResources {
+    std::unique_ptr<FrameBackend> backend;
+    BufferedPresenter();
     inline static thread_local const CheekyFgPair* quad_pair_for_call{};
     std::function<XrResult()> quad_native_fallback;
     XrResult end_quad_frame(const XrFrameEndInfo* end,const XrCompositionLayerProjection* projection,const CheekyFgPair& pair,
@@ -25,155 +26,20 @@ struct BufferedPresenter final : Presenter {
         const auto* prior=quad_pair_for_call;quad_pair_for_call=&pair;
         const auto result=end_frame(end,{},projection);quad_pair_for_call=prior;quad_native_fallback={};return result;
     }
-    struct Slice {XrRect2Di rect{};unsigned layer{};};
-    struct CapturePlan {D3D12_RESOURCE_DESC desc{};std::vector<Slice> slices;std::vector<unsigned> physical_eyes;bool full_required{};};
-    struct DirectCapture {std::vector<std::pair<Slice,Image>> eyes;};
-    static bool same_slice(const Slice& a,const Slice& b) noexcept {
-        return a.layer==b.layer&&a.rect.offset.x==b.rect.offset.x&&a.rect.offset.y==b.rect.offset.y&&
-            a.rect.extent.width==b.rect.extent.width&&a.rect.extent.height==b.rect.extent.height;
-    }
-    struct Auxiliary {XrSwapchain source{};Image image;};
-    struct Native {
-        std::uint64_t id{},ready{},epoch{};
-        unsigned capture_mode{},upload_mode{},direct_output_mode{},direct_shading_mode{1};bool latency_diagnostics{};
-        TimingClock::time_point captured_at{},handed_off_at{};
-        std::array<Image,2> color;
-        std::array<ColorReady,2> color_ready;
-        ColorReady final_color_ready; // GPU end of the combined native-eye crop/assembly batch.
-        std::array<XrCompositionLayerProjectionView,2> views;
-        XrSpace space{};XrEnvironmentBlendMode blend{};
-        FrameLayers layers;
-        std::vector<Auxiliary> auxiliary;
-        CheekyFgPair guides;
-        ComPtr<IUnknown> guide_lease;
-        std::array<ComPtr<ID3D12Resource>,2> guide_depth,guide_motion;
-        std::array<ComPtr<ID3D12Resource>,2> peripheral_depth,peripheral_motion;
-        // Only hook-free split-queue captures use this GPU-side dependency.
-        // The producer queue signals it after the NGX guide command lists.
-        ComPtr<ID3D12Fence> guide_sync_fence;
-        std::uint64_t guide_sync_value{};
-        void retain_guides(const CheekyFgPair& source) noexcept {
-            guides=source;guide_lease=source.lease;
-            for(unsigned eye=0;eye<2;++eye){guide_depth[eye]=source.eyes[eye].depth;guide_motion[eye]=source.eyes[eye].motion;
-                peripheral_depth[eye]=source.eyes[eye].peripheral_depth;peripheral_motion[eye]=source.eyes[eye].peripheral_motion;}
-            // Explicit members own the returned references. The metadata copy
-            // must never be passed to the bridge's ReleasePair function.
-            guides.lease=nullptr;guides.producer_queue=nullptr;
-        }
-        void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};peripheral_depth={};peripheral_motion={};
-            guide_lease.Reset();guide_sync_fence.Reset();guide_sync_value=0;guides11={};}
-        bool guides_valid{};
-        CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
-        unsigned source_depth{},source_motion{};
-        std::uint64_t guide_token{};
-        std::uint64_t source_configuration{}; // Survives release of guide textures.
-        std::uint64_t render_frame{};
-        std::array<std::shared_ptr<Backend11::Guides>,2> guides11; // Native D3D11 backend only.
-    };
-    struct Pair {
-        std::uint64_t native_id{},current_id{},ready{};
-        unsigned upload_mode{};
-        TimingClock::time_point native_captured{},current_captured{},completed_at{},handed_off_at{},worker_started_at{},submitted_at{};
-        std::array<Image,2> native,generated,current;
-        std::array<ColorReady,2> native_color_ready,current_color_ready;
-        ColorReady native_final_ready,current_final_ready;
-        std::array<XrCompositionLayerProjectionView,2> native_views,generated_views,current_views;
-        FrameLayers layers;
-        std::vector<Auxiliary> auxiliary;
-        XrSpace space{};XrEnvironmentBlendMode blend{};
-        bool interpolated{},direct_xr{};
-    };
-    struct DirectRequest {
-        std::uint64_t epoch{},native_id{};
-        std::array<Image,2> previous;
-        std::array<Worker::OutputCopy,2> targets;
-        DXGI_FORMAT format{};unsigned width{},height{};
-        bool decided{},allowed{},complete{},success{};
-        unsigned deferred_ticks{};
-        ComPtr<ID3D12Fence> fence;std::uint64_t serial{};
-        Pair result;
-    };
-    std::shared_ptr<DirectRequest> direct_request; // Handshake guarded by mx; only presenter calls XR.
-    CheekyFgDirectOutput direct_stats;
-    CheekyFgDirectOutputDetails direct_details;
-    CheekyFgDirectShading shading_stats;
-    CheekyFgDirectOutputDetails logged_direct_details;
-    TimingAverage direct_wait;
-    std::atomic<unsigned> direct_output_mode{};
-    std::atomic<unsigned> direct_shading_mode{1};
-    std::atomic<std::uint64_t> direct_blocked_target{};
-    static std::uint64_t direct_target_key(unsigned w,unsigned h,DXGI_FORMAT format) noexcept {
-        return (std::uint64_t(w)<<32)|(std::uint64_t(h)<<8)|unsigned(format);
-    }
-    CheekyFgDirectOutputFn direct_output_query{};
-    CheekyFgDirectShadingFn direct_shading_query{};
-    struct Chain {
-        XrSwapchain handle{};std::vector<XrSwapchainImageD3D12KHR> images;D3D12_RESOURCE_DESC desc{};
-        std::uint64_t uploaded{}; // Content identity; GPU contexts retain sources only until their upload fence.
-        unsigned last_uploaded_index{UINT32_MAX}; // Last image released to OpenXR for this chain.
-        bool direct_writable{},linear_color{};
-        std::vector<XrSwapchainImageD3D11KHR> images11; // Native D3D11 backend; desc then holds width/height/format.
-    };
-    // Native D3D11 backend: replaces the D3D11->D3D12 bridge, transports and
-    // NGX worker for shader-only methods. All pacing below is shared.
-    std::shared_ptr<Backend11> native11;
-    std::recursive_mutex* dispatch_mutex11() const noexcept override {
-        return native11?native11->dispatch:Presenter::dispatch_mutex11();
-    }
-    std::array<XrSwapchain,4> quad_sources11{}; // Raw quad planes (capture_mutex); only composed eyes are captured.
-    bool capture_completed(std::uint64_t ready) const {return native11||producer.completed(ready);}
+    bool capture_completed(std::uint64_t ready) const {return backend->ready(ready);}
     std::condition_variable_any changed;
     std::mutex capture_mutex;
     std::thread presentation_thread,generation_thread,pacing_thread;
-    Transport producer,output,uploads;
     FgBurstCapture burst;
     std::uint64_t burst_native{},burst_current{},burst_presentation{};
     bool burst_generated{};
-    // Default: dedicated HIGH-priority inference queue. Lua can also select a
-    // separate NORMAL queue or share the application's original queue. The
-    // OpenXR binding, guide capture and uploads always retain the original queue.
-    ComPtr<ID3D12CommandQueue> generation_queue;
-    ComPtr<ID3D12CommandQueue> fg_high_queue,fg_normal_queue;
-    // Single monotonically increasing fence shared across hook-free frames.
-    // It bridges a verified NGX execution queue to the OpenXR/FG queues
-    // without depending on UEVR's private renderer/vtable layout.
-    ComPtr<ID3D12Fence> guide_sync_fence;
-    std::uint64_t guide_sync_serial{};
-    bool guide_sync_reported{};
-    bool accept_guide_queue(const CheekyFgPair& guides,Native& job,bool hookless) noexcept {
-        if(cheeky::foveated_dlss::same_d3d12_queue(guides.producer_queue,queue.Get()))return true;
-        // Legacy modes intentionally retain their established same-queue contract.
-        if(!hookless||!guide_sync_fence||!device||!queue)return false;
-        auto actual=cheeky::foveated_dlss::native_d3d12_interface(guides.producer_queue);
-        if(!actual||actual->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT||
-           queue->GetDesc().Type!=D3D12_COMMAND_LIST_TYPE_DIRECT)return false;
-        ComPtr<ID3D12Device> executing_device;
-        if(FAILED(actual->GetDevice(IID_PPV_ARGS(&executing_device)))||
-           !cheeky::foveated_dlss::same_d3d12_device(device.Get(),executing_device.Get()))return false;
-        // The guide command lists were already observed as submitted on
-        // `actual`. Its signal is ordered after those writes. The worker
-        // enqueues Queue::Wait on its OWN queue before accessing their data.
-        const auto value=guide_sync_serial+1;
-        if(FAILED(actual->Signal(guide_sync_fence.Get(),value)))return false;
-        guide_sync_serial=value;
-        job.guide_sync_fence=guide_sync_fence;
-        job.guide_sync_value=value;
-        if(!guide_sync_reported&&trace){
-            trace("DLSS-FG hook-free guide queue differs from OpenXR queue: validated same-device cross-queue GPU fence enabled");
-            guide_sync_reported=true;
-        }
-        return true;
-    }
+
     unsigned last_fg_priority_requested{UINT32_MAX};
     unsigned reported_queue_mode{1}; // Published under mx for presentation diagnostics.
     bool generation_high_priority{};
     static const char* queue_mode_name(unsigned mode) noexcept {
         return mode==2u?"shared-game":mode==0u?"separate-NORMAL":"separate-HIGH";
     }
-    std::unordered_map<XrSwapchain,Image> captured;
-    std::unordered_map<XrSwapchain,DirectCapture> direct_captures;
-    std::unordered_map<XrSwapchain,CapturePlan> capture_plans;
-    std::unordered_map<XrSwapchain,D3D12_RESOURCE_DESC> captured_descs;
     std::atomic<unsigned> color_capture_mode{},upload_mode{},latency_diagnostics{1};
     CheekyFgTransportOptionsFn transport_options_query{};
     CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
@@ -297,14 +163,7 @@ struct BufferedPresenter final : Presenter {
     double capture_cpu_accumulator{};
     struct ProducerElapsed {
         BufferedPresenter& owner;TimingClock::time_point begin{TimingClock::now()};
-        ~ProducerElapsed(){std::lock_guard capture_lock(owner.capture_mutex);std::lock_guard lock(owner.mx);
-            owner.producer_cpu.add(elapsed_ms(begin)+owner.capture_cpu_accumulator);owner.capture_cpu_accumulator=0;
-            owner.release_idle_slots();
-            const auto now=GetTickCount64();if(now>=owner.next_capture_memory){
-                fg_memory::Collector collect(owner.device.Get());
-                owner.memory_state.categories[fg_memory::capture]=owner.producer.memory(collect);
-                owner.memory_state.capture_tick=now;owner.next_capture_memory=now+1000;
-            }}
+        ~ProducerElapsed();
     };
     char diagnostic[384]{"Buffered presenter waiting for stereo frames"};
     bool started{},stopping{},bypass{},fg_active{},pacing_active{},degraded{};
@@ -336,121 +195,9 @@ struct BufferedPresenter final : Presenter {
         if(trace)trace(diagnostic);
         changed.notify_all();
     }
-    bool setup(XrSession s,const XrFns& f,ID3D12Device* dev,ID3D12CommandQueue* q) noexcept override {
-        if(!Presenter::setup(s,f,dev,q))return false;
 
-        // Create the FG queue on the very same D3D12 device/node as the game.
-        // The OpenXR runtime continues to own/use the queue supplied in the
-        // graphics binding. Only NGX evaluation and its final publication copy
-        // are submitted to this dedicated queue. A GPU-side wait in
-        // generation_loop() orders it after the native snapshot/guide work.
-        //
-        // If HIGH priority is unavailable, retain the proven same-queue path;
-        // never make the whole VR presenter fail because of a priority hint.
-        const auto game_desc=q->GetDesc();
-        D3D12_COMMAND_QUEUE_DESC fg_desc{};
-        fg_desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
-        fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-        fg_desc.Flags=D3D12_COMMAND_QUEUE_FLAG_NONE;
-        fg_desc.NodeMask=game_desc.NodeMask;
-        const HRESULT high_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_high_queue));
-        fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-        const HRESULT normal_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_normal_queue));
-        // The default remains HIGH; the shared game queue is an explicit A/B
-        // choice alongside separate NORMAL. Missing priorities fall back here.
-        generation_queue=fg_high_queue.Get() ? fg_high_queue.Get() : fg_normal_queue.Get() ? fg_normal_queue.Get() : q;
-        generation_high_priority=fg_high_queue.Get()!=nullptr&&generation_queue.Get()==fg_high_queue.Get();
-        reported_queue_mode=generation_queue.Get()==q?2u:generation_high_priority?1u:0u;
-        last_fg_priority_requested=UINT32_MAX;
-        guide_sync_fence.Reset();guide_sync_serial=0;guide_sync_reported=false;
-        // Failure merely disables split-queue FG; the native OpenXR path
-        // remains usable, and matching queues need no additional fence.
-        dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&guide_sync_fence));
-        if(trace) {
-            char message[240]{};
-            sprintf_s(message,"DLSS-FG queue A/B: HIGH=%s(0x%08lx), separate NORMAL=%s(0x%08lx); active=%s; capture remains game queue",
-                fg_high_queue?"available":"FAILED",static_cast<unsigned long>(high_result),
-                fg_normal_queue?"available":"FAILED",static_cast<unsigned long>(normal_result),
-                generation_high_priority?"HIGH":fg_normal_queue?"NORMAL":"shared fallback");
-            trace(message);
-        }
-        return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
-    }
-    // Shader-only methods on a D3D11 application: same pacing, native D3D11
-    // GPU stages, no D3D12 device or bridge.
-    bool setup11(XrSession s,const XrFns& f,ID3D11Device* dev,std::uint64_t generation,std::recursive_mutex* dispatch) noexcept {
-        if(!dev||!f.create||!f.enumerate||!f.acquire||!f.wait_image||!f.release||!f.wait_frame||!f.begin_frame||!f.end_frame)return false;
-        auto backend=std::make_shared<Backend11>();
-        if(!backend->initialize(dev,generation,dispatch)){strcpy_s(diagnostic,backend->diagnostic);return false;}
-        xr=f;session=s;native11=std::move(backend);
-        strcpy_s(diagnostic,"Native D3D11 shader FG: waiting for stereo frames");
-        if(trace){char message[200]{};
-            // SINGLETHREADED devices are not free-threaded: creating resources
-            // from presenter threads would then be unsafe.
-            sprintf_s(message,"FG native D3D11 backend: shader interpolation with shared pacing; no D3D12 bridge or NGX; device_flags=0x%x",
-                dev->GetCreationFlags());trace(message);}
-        return true;
-    }
-    bool capture11(XrSwapchain sc,unsigned index,ID3D11Texture2D* source,unsigned width,unsigned height,unsigned array,DXGI_FORMAT declared) override {
-        if(!native11)return Presenter::capture11(sc,index,source,width,height,array,declared);
-        if(bypass||!source)return false;
-        std::lock_guard capture_lock(capture_mutex);
-        // Quad views: the release hook also sees the four raw planes; only the
-        // composed eyes (capture_composed11) and auxiliary layers are presented.
-        if(quad_input&&std::find(quad_sources11.begin(),quad_sources11.end(),sc)!=quad_sources11.end())return false;
-        {std::lock_guard lock(mx);if(stopping||degraded)return false;}
-        const auto captured_at=TimingClock::now();
-        AddElapsed elapsed{capture_cpu_accumulator};
-        auto copy=native11->copy(source,declared);
-        if(!copy){capture_overflow=true;return false;}
-        direct_captures.erase(sc);captured[sc]=std::move(copy);capture_crop_tokens[sc]=0;
-        capture_tokens[sc]=0;capture_frames[sc]=0;capture_times[sc]=captured_at;capture_ready[sc]={};return true;
-    }
-    // Quad compositor output for one eye, while it still owns the image. The
-    // compositor holds the quad dispatch mutex here, so this path must not
-    // take capture_mutex (capture11 takes capture_mutex, then dispatch).
-    std::mutex composed11_mutex; // Leaf lock.
-    std::unordered_map<XrSwapchain,std::pair<Image,TimingClock::time_point>> composed11;
-    bool capture_composed11(XrSwapchain sc,ID3D11Texture2D* source,DXGI_FORMAT format) {
-        if(!native11||bypass||!source)return false;
-        const auto captured_at=TimingClock::now();auto copy=native11->copy(source,format);
-        std::lock_guard lock(composed11_mutex);if(!copy){composed11.erase(sc);return false;}
-        composed11[sc]={std::move(copy),captured_at};return true;
-    }
     void set_quad_sources11(const std::array<XrSwapchain,4>& sources) {std::lock_guard lock(capture_mutex);quad_sources11=sources;}
-    bool prepare_native11(Native& job,const XrCompositionLayerProjection* projection,bool inference_slot) {
-        // Hold capture_mutex.
-        for(unsigned eye=0;eye<2;++eye){
-            const auto& sub=projection->views[eye].subImage;Image full;TimingClock::time_point captured_at{};
-            if(quad_input){std::lock_guard lock(composed11_mutex);const auto found=composed11.find(sub.swapchain);
-                if(found!=composed11.end()){full=found->second.first;captured_at=found->second.second;}}
-            else if(const auto found=captured.find(sub.swapchain);found!=captured.end()){full=found->second;captured_at=capture_times[sub.swapchain];}
-            if(!full)return false;
-            job.color[eye]=native11->crop(full,sub);if(!job.color[eye])return false;++eye_crop_copies;
-            if(!eye||captured_at<job.captured_at)job.captured_at=captured_at;
-            job.views[eye]=projection->views[eye];
-        }
-        const bool good=subimages(job.layers,[&](XrSwapchainSubImage& sub){
-            const auto found=captured.find(sub.swapchain);if(found==captured.end())return false;
-            D3D11_TEXTURE2D_DESC d{};found->second->texture11->GetDesc(&d);
-            if(sub.imageArrayIndex>=d.ArraySize||sub.imageRect.offset.x<0||sub.imageRect.offset.y<0||
-                sub.imageRect.extent.width<=0||sub.imageRect.extent.height<=0||
-                std::uint64_t(sub.imageRect.offset.x)+sub.imageRect.extent.width>d.Width||
-                std::uint64_t(sub.imageRect.offset.y)+sub.imageRect.extent.height>d.Height)return false;
-            if(std::none_of(job.auxiliary.begin(),job.auxiliary.end(),[&](const Auxiliary& a){return a.source==sub.swapchain;}))
-                job.auxiliary.push_back({sub.swapchain,found->second});return true;
-        });
-        if(!good)return false;
-        if(inference_slot){
-            std::array<std::shared_ptr<Backend11::Guides>,2> guides;
-            if(native11->take_guides(guides)){
-                job.guides11=std::move(guides);job.guides_valid=true;job.guide_state=CheekyFgState::waiting_for_history;
-                job.source_configuration=job.guides11[0]->source.meta.configuration;
-                job.guide_token=job.guides11[0]->source.mapping_revision;
-            }else job.guide_state=CheekyFgState::waiting_for_guides;
-        }
-        return true;
-    }
+
     CheekyFgPerformance performance() const noexcept override {
         auto result=telemetry;result.asynchronous_presenter=1;result.queued_native=unsigned(pending.size());
         result.skipped_native=skipped;result.producer_cpu_ms=producer_cpu.mean();result.pacing_wait_ms=pacing_wait.mean();return result;
@@ -494,27 +241,7 @@ struct BufferedPresenter final : Presenter {
         result.begin_ms=runtime_begin.mean();result.end_ms=runtime_end.mean();result.present_cpu_ms=present_cpu.mean();
         result.app_begin_ms=app_calls[0].mean();result.app_end_ms=app_calls[1].mean();result.app_release_ms=app_calls[2].mean();return result;
     }
-    CheekyFgOverhead overhead() const noexcept override {
-        auto result=extra_gpu;result.supported=1;
-        const auto capture=producer.gpu_cost.summary(),upload=uploads.gpu_cost.summary();
-        result.capture_samples=capture.samples;result.capture_ms=capture.mean;result.capture_last_ms=capture.last;
-        result.upload_samples=upload.samples;result.upload_ms=upload.mean;result.upload_last_ms=upload.last;
-        return result;
-    }
-    CheekyFgExperimentDiagnostics experiments() const noexcept override {
-        auto out=experiment_state;out.supported=1;
-        if(out.color_capture_mode!=color_capture_mode||out.upload_mode!=upload_mode||out.latency_enabled!=latency_diagnostics)out.latency_valid=0;
-        out.color_capture_mode=color_capture_mode.load();out.upload_mode=upload_mode.load();
-        out.latency_enabled=latency_diagnostics.load();out.full_color_copies=producer.full_copies.load();
-        out.direct_eye_copies=direct_eye_copies.load();out.eye_crop_copies=eye_crop_copies.load();out.capture_fallbacks=capture_fallbacks.load();
-        out.upload_copies=uploads.upload_copies.load();out.upload_batches=uploads.submissions.load();
-        out.display_time_supported=xr.time_to_qpc!=nullptr;out.gpu_ready_samples=gpu_ready_samples;
-        out.predicted_samples=predicted_samples;out.prediction_late=prediction_late;
-        out.generated_gate_releases=generated_gate_releases;out.generated_gate_skips=generated_gate_skips;
-        out.native_gpu_tail={gpu_ready_ages[0].mean(),gpu_ready_ages[0].last};
-        out.gpu_ready_to_submit={gpu_ready_ages[1].mean(),gpu_ready_ages[1].last};
-        out.gpu_ready_to_display={gpu_ready_ages[2].mean(),gpu_ready_ages[2].last};return out;
-    }
+
     CheekyFgMemory memory() const noexcept override {
         auto out=memory_state;out.supported=out.presenter_present=1;return out;
     }
@@ -523,53 +250,7 @@ struct BufferedPresenter final : Presenter {
     }
     CheekyFgDirectOutputDetails direct_output_details() const noexcept override {auto out=direct_details;out.supported=1;return out;}
     CheekyFgDirectShading direct_shading() const noexcept override {auto out=shading_stats;out.supported=1;out.requested_mode=direct_shading_mode;return out;}
-    void measure_worker_memory() {
-        // Single generation worker, after the prior GPU fence retired. Publish
-        // only integer snapshots; diagnostic readers never walk live resources.
-        const auto now=GetTickCount64();if(now<next_worker_memory)return;
-        output.trim_unused(now);
-        CheekyFgMemory value;fg_memory::Collector collect(device.Get());
-        value.categories[fg_memory::generated]=output.memory(collect);
-        for(const auto& eye:worker.focus.inputs)for(const auto& input:eye){
-            collect.add(value.categories[fg_memory::prepared_color],input.color.Get());
-            collect.add(value.categories[fg_memory::prepared_color],input.recentered_color.Get());
-            collect.add(value.categories[fg_memory::prepared_motion],input.corrected_motion.Get());
-            // Prepared captures are owned/countable by the producer snapshot
-            // pool. These references are borrowed, not a second allocation.
-            if(!input.borrowed_guides){collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());
-                collect.add(value.categories[fg_memory::prepared_motion],input.motion.Get());}
-        }
-        for(const auto* features:{&worker.features,&worker.peripheral_features})for(const auto& f:*features){
-            collect.add(value.categories[fg_memory::ngx_outputs],f.output.Get());
-            collect.add(value.categories[fg_memory::ngx_outputs],f.disable.Get());
-        }
-        for(unsigned eye=0;eye<2;++eye){
-            collect.add(value.categories[fg_memory::periphery],worker.focus.peripheral_output[eye].Get());
-            collect.add(value.categories[fg_memory::periphery],worker.focus.previous_depth[eye].Get());
-            collect.add(value.categories[fg_memory::prepared_color],worker.focus.center_output[eye].Get());
-            collect.add(value.categories[fg_memory::prepared_depth],worker.focus.previous_center_depth[eye].Get());
-            collect.add(value.categories[fg_memory::composition],worker.focus.full[eye].Get());
-        }
-        std::lock_guard lock(mx);
-        for(auto category:{fg_memory::generated,fg_memory::prepared_color,fg_memory::prepared_depth,
-                fg_memory::prepared_motion,fg_memory::ngx_outputs,fg_memory::periphery,fg_memory::composition})
-            memory_state.categories[category]=value.categories[category];
-        memory_state.worker_tick=now;next_worker_memory=now+1000;
-    }
-    void measure_presenter_memory() {
-        // Only the presentation thread creates/destroys/enumerates these chains.
-        const auto now=GetTickCount64();if(now<next_presenter_memory)return;
-        CheekyFgMemory value;fg_memory::Collector collect(device.Get());
-        value.categories[fg_memory::upload_pool]=uploads.memory(collect);
-        for(const auto& chain:scene_chains)for(const auto& image:chain.images)
-            collect.add(value.categories[fg_memory::swapchain_native],image.texture);
-        for(const auto& [sc,chain]:auxiliary_chains)for(const auto& image:chain.images)
-            collect.add(value.categories[fg_memory::swapchain_auxiliary],image.texture);
-        std::lock_guard lock(mx);
-        for(auto category:{fg_memory::upload_pool,fg_memory::swapchain_native,fg_memory::swapchain_generated,fg_memory::swapchain_auxiliary})
-            memory_state.categories[category]=value.categories[category];
-        memory_state.presenter_tick=now;next_presenter_memory=now+1000;
-    }
+
     CheekyFgPresentation presentation() const noexcept override {
         CheekyFgPresentation out;out.supported=1;
         out.native_samples=age_samples[0];out.generated_samples=age_samples[1];out.repeat_samples=age_samples[3];
@@ -611,10 +292,6 @@ struct BufferedPresenter final : Presenter {
         }
     }
     void note_app_image_wait(double ms) noexcept override {std::lock_guard lock(mx);app_image_wait.add(ms);}
-    void collect_color_stamps() {
-        if(native11)return; // No GPU color timestamps on the native D3D11 backend.
-        std::lock_guard capture_lock(capture_mutex);producer.collect(producer.fence->GetCompletedValue());
-    }
     void note_gpu_ready_age(const Pair& pair,std::uint64_t submitted_cpu,std::uint64_t display_cpu) noexcept {
         std::uint64_t ready{},captured=UINT64_MAX;
         for(const auto& stamp:pair.current_color_ready){
@@ -642,8 +319,7 @@ struct BufferedPresenter final : Presenter {
     void note_app_call(unsigned stage,double ms) noexcept override {std::lock_guard lock(mx);if(stage<app_calls.size())app_calls[stage].add(ms);}
     XrResult runtime_end_frame(const XrFrameEndInfo* end) {
         const auto start=TimingClock::now();
-        const auto submit=[&]{return xr.end_frame(session,end);};
-        const auto result=native11?native11->runtime_submit(submit):runtime_dispatch(submit);
+        const auto result=backend->end_frame(end);
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
         if(XR_FAILED(result)&&trace&&end) {
             char message[384]{};
@@ -694,8 +370,7 @@ struct BufferedPresenter final : Presenter {
         if(generation_thread.joinable())generation_thread.join();
         if(pacing_thread.joinable())pacing_thread.join();
         std::lock_guard capture_lock(capture_mutex);
-        producer.drain();output.drain();uploads.drain();worker.wait_idle();
-        if(native11){native11->flush();native11->clear_guides();std::lock_guard composed(composed11_mutex);composed11.clear();}
+        backend->retire();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
         captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
         if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
@@ -704,7 +379,7 @@ struct BufferedPresenter final : Presenter {
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
-        producer.gpu_cost.reset();uploads.gpu_cost.reset();extra_gpu={};
+        reset_gpu_metrics();extra_gpu={};
         frame_ages={};age_samples={};late_pair_wait={};late_wait_samples=late_wait_arrivals=late_wait_timeouts=0;
         late_wait_budget_ms=0;last_credit_tick=completed_pair_id=inflight_id=0;
         late_ready_skips=late_idle_skips=0;capture_to_completion={};completion_to_native={};completion_to_generated={};
@@ -715,7 +390,6 @@ struct BufferedPresenter final : Presenter {
         experiment_state={};direct_request.reset();direct_stats={};direct_wait={};
         direct_details={};logged_direct_details={};
         direct_blocked_target=0;
-        guide_sync_fence.Reset();guide_sync_serial=0;guide_sync_reported=false;
         awaiting_generated_submission=generated_gate_releases=generated_gate_skips=0;
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
@@ -724,28 +398,11 @@ struct BufferedPresenter final : Presenter {
         presentation_trace_events=presentation_trace_anomalies=0;
         changed.notify_all();
     }
-    // Native D3D11 backend: the layer destroys private chains later, from the
-    // application's own xrEndFrame (see retire_private_chain).
+    // Private chains can retire on the application thread after workers stop.
     std::function<void(XrSwapchain)> retire_chain;
-    void destroy_private_chain(XrSwapchain chain) {
-        if(native11&&retire_chain)retire_chain(chain);else destroy_chain(chain);
-    }
-    void destroy_chains() noexcept {
-        if(native11)native11->flush(); // As D3D11Bridge::forget does via drain().
-        for(auto& c:scene_chains){if(c.handle)destroy_private_chain(c.handle);c={};}
-        for(auto& [key,c]:auxiliary_chains)if(c.handle)destroy_private_chain(c.handle);
-        auxiliary_chains.clear();
-    }
-    void reset() noexcept override {
-        // Stop/join both workers and drain their GPU fences before dropping the
-        // dedicated queue. A temporal reset only stops the workers; it keeps
-        // the queue available for the next interpolation session.
-        stop();destroy_chains();Presenter::reset();
-        generation_queue.Reset();fg_high_queue.Reset();fg_normal_queue.Reset();generation_high_priority=false;
-        last_fg_priority_requested=UINT32_MAX;
-    }
+
     void invalidate_temporal() noexcept override {
-        stop();worker.reset();worker.failed=false;destroy_chains();
+        stop();backend->reset_generation();destroy_chains();
         std::lock_guard lock(mx);held_valid=false;generated_valid=false;frames=0;telemetry={};producer_cpu={};pacing_wait={};
     }
     void configure(std::uint64_t next) noexcept override {
@@ -801,7 +458,7 @@ struct BufferedPresenter final : Presenter {
         CheekyFgDirectShading shading_options;
         if(shading_query&&shading_query(&shading_options))direct_shading_mode=std::min(shading_options.requested_mode,2u);
         if(output_query&&output_query(&direct_options)){
-            const unsigned mode=!interop11 && !native11 && direct_options.requested==1u;
+            const unsigned mode=backend->supports_direct_output() && direct_options.requested==1u;
             if(direct_output_mode.exchange(mode)!=mode)direct_blocked_target=0;
         }
         if(query&&query(&options)){
@@ -862,104 +519,7 @@ struct BufferedPresenter final : Presenter {
         if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();return discarded?XR_FRAME_DISCARDED:XR_SUCCESS;
     }
-    bool capture_quad_planes(const XrCompositionLayerProjection& raw,const XrCompositionLayerProjection& logical,
-        const std::array<std::array<float,4>,2>& insets,const CheekyFgPair& pair) {
-        if(raw.views[0].subImage.swapchain==raw.views[1].subImage.swapchain)return false;
-        std::lock_guard capture_lock(capture_mutex);
-        std::array<Image,2> outer,center,packed;std::array<CompactLayout,2> layouts;
-        for(unsigned eye=0;eye<2;++eye){const auto o=captured.find(raw.views[eye].subImage.swapchain),c=captured.find(raw.views[eye+2].subImage.swapchain);
-            if(o==captured.end()||c==captured.end())return false;outer[eye]=o->second;center[eye]=c->second;
-            const auto& logical_rect=logical.views[eye].subImage.imageRect;
-            const auto& inset=insets[eye];auto layout=compact_layout(unsigned(logical_rect.extent.width),unsigned(logical_rect.extent.height),true,
-                inset[2],inset[3],inset[0]+inset[2]*.5f-.5f,inset[1]+inset[3]*.5f-.5f,1,0);
-            if(!layout.packed())return false;
-            layout.center_width=unsigned(raw.views[eye+2].subImage.imageRect.extent.width);layout.center_height=unsigned(raw.views[eye+2].subImage.imageRect.extent.height);
-            layout.context_width=unsigned(raw.views[eye].subImage.imageRect.extent.width);layout.context_height=unsigned(raw.views[eye].subImage.imageRect.extent.height);
-            if(!layout.center_width||!layout.center_height||!layout.context_width||!layout.context_height||layout.stored_width()>16384||layout.stored_height()>16384)return false;
-            layouts[eye]=layout;
-        }
-        uint64_t frame{};{std::lock_guard lock(mx);if(stopping||degraded)return false;frame=next_id+1;}
-        auto* c=producer.begin(frame);if(!c)return false;
-        bool good=true;for(unsigned eye=0;eye<2&&good;++eye){packed[eye]=producer.quad_regions(*c,outer[eye],center[eye],raw.views[eye].subImage,raw.views[eye+2].subImage,layouts[eye]);good=bool(packed[eye]);}
-        uint64_t ready{};if(!producer.execute(*c,ready))return false;if(!good)return false;
-        for(unsigned eye=0;eye<2;++eye){const auto& sub=logical.views[eye].subImage;
-            direct_captures[sub.swapchain].eyes={{{sub.imageRect,sub.imageArrayIndex},packed[eye]}};
-            auto desc=packed[eye]->texture->GetDesc();desc.Width=layouts[eye].width;desc.Height=layouts[eye].height;captured_descs[sub.swapchain]=desc;
-            capture_tokens[sub.swapchain]=capture_crop_tokens[sub.swapchain]=pair.capture_token;capture_frames[sub.swapchain]=pair.render_frame;
-            capture_times[sub.swapchain]=std::min(capture_times[raw.views[eye].subImage.swapchain],capture_times[raw.views[eye+2].subImage.swapchain]);
-        }
-        return true;
-    }
-    bool capture(XrSwapchain sc,unsigned,ID3D12Resource* original,unsigned,unsigned,unsigned,
-                 DXGI_FORMAT declared=DXGI_FORMAT_UNKNOWN) noexcept override {
-        if(bypass||!original)return false;
-        std::lock_guard capture_lock(capture_mutex);
-        {std::lock_guard lock(mx);if(stopping||degraded)return false;}
-        const auto captured_at=TimingClock::now();
-        const auto captured_cpu=latency_diagnostics?LatencyProbe::cpu_now():0;
-        AddElapsed elapsed{capture_cpu_accumulator};
-        auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
-        const auto stamp_fn=guide_stamp?guide_stamp:runtime?reinterpret_cast<CheekyFgCaptureStampFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureStamp")):nullptr;
-        CheekyFgCaptureStamp stamp;if(stamp_fn)stamp_fn(original,&stamp);
-        // The legacy test callback has no production fallback: real generation
-        // requires the RHI frame identity returned with the color stamp.
-        if(guide_token&&!stamp_fn){stamp.token=guide_token(original);stamp.render_frame=stamp.token/2;}
-        const auto token=stamp.token;
-        // Look up the *current* unconsumed, submitted guide pair at color
-        // release, rather than using the preceding WaitFrame's crop cache.
-        // No GPU work and no lease/consumption is performed by this query.
-        CheekyFgCaptureCropsV2 current_crops;
-        current_crops.token=token;
-        current_crops.render_frame=stamp.render_frame;
-        const auto peek=runtime?reinterpret_cast<CheekyFgCaptureCropsFn>(
-            GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
-        if(storage_options.compact&&!quad_input){
-            if(!peek||!peek(&current_crops))current_crops.valid_mask=0;
-            if(current_crops.valid_mask)++compact_current_lookups;
-            else ++compact_current_misses;
-            const auto total=compact_current_lookups+compact_current_misses;
-            if(trace&&(total<=2||total%240==0)){
-                char message[224]{};
-                sprintf_s(message,"FG same-interval crop lookup ok=%llu fallback=%llu token=%llu eye_mask=0x%x (no prior-frame crop reuse)",
-                    static_cast<unsigned long long>(compact_current_lookups),
-                    static_cast<unsigned long long>(compact_current_misses),
-                    static_cast<unsigned long long>(current_crops.token),current_crops.valid_mask);
-                trace(message);
-            }
-        }
-        const auto format=capture_format(original->GetDesc().Format,declared);if(format==DXGI_FORMAT_UNKNOWN)return false;
-        std::uint64_t profile_frame{};{std::lock_guard lock(mx);profile_frame=next_id+1;}
-        auto* c=producer.begin(profile_frame);if(!c){capture_overflow=true;return false;}
-        const auto ready_stamp=captured_cpu?producer.mark_color_ready(*c,captured_cpu):ColorReady{};
-        const auto desc=original->GetDesc();captured_descs[sc]=desc;
-        const auto plan=capture_plans.find(sc);
-        const bool direct=!quad_input&&color_capture_mode==1u&&plan!=capture_plans.end()&&!plan->second.full_required&&
-            !plan->second.slices.empty()&&plan->second.desc.Width==desc.Width&&plan->second.desc.Height==desc.Height&&
-            plan->second.desc.DepthOrArraySize==desc.DepthOrArraySize&&plan->second.desc.Format==desc.Format;
-        DirectCapture eyes;Image copy;
-        if(direct){
-            for(std::size_t n=0;n<plan->second.slices.size();++n){
-                const auto slice=plan->second.slices[n];
-                const unsigned eye=n<plan->second.physical_eyes.size()?plan->second.physical_eyes[n]:2u;
-                const auto layout=eye_color_layout(eye,slice.rect.extent.width,slice.rect.extent.height,current_crops);
-                auto image=layout.packed()?producer.packed_region(*c,original,xr_image_state(),slice.rect,slice.layer,format,layout):
-                    producer.region_copy(*c,original,xr_image_state(),slice.rect,slice.layer,format);
-                if(!image){capture_overflow=true;std::uint64_t discarded{};producer.execute(*c,discarded);return false;}
-                eyes.eyes.push_back({slice,std::move(image)});++direct_eye_copies;
-            }
-        }else {
-            copy=producer.copy(*c,original,xr_image_state(),format);
-            if(color_capture_mode==1u&&(plan==capture_plans.end()||!plan->second.full_required))++capture_fallbacks;
-            if(!copy){capture_overflow=true;c->list->Close();return false;}
-        }
-        std::uint64_t ticket{};if(!producer.execute(*c,ticket))return false;
-        if(direct){captured.erase(sc);direct_captures[sc]=std::move(eyes);}
-        else {direct_captures.erase(sc);captured[sc]=std::move(copy);}
-        // A compact image only belongs to the exact guide interval returned
-        // by PeekCaptureCrops. Full-eye fallback has no crop-token dependency.
-        capture_crop_tokens[sc]=direct&&current_crops.valid_mask?current_crops.token:0;
-        capture_tokens[sc]=token;capture_frames[sc]=stamp.render_frame;capture_times[sc]=captured_at;capture_ready[sc]=ready_stamp;return true;
-    }
+
     template<class Fn> static bool subimages(FrameLayers& layers,Fn&& visit) {
         for(auto& layer:layers.layers)if(!layer.scene)switch(layer.type) {
         case XR_TYPE_COMPOSITION_LAYER_PROJECTION:for(auto& v:layer.views)if(!visit(v.subImage))return false;break;
@@ -971,6 +531,7 @@ struct BufferedPresenter final : Presenter {
         }
         return true;
     }
+
     XrResult passthrough(const XrFrameEndInfo* end,const char* reason) noexcept {
         if(quad_native_fallback){const auto result=quad_native_fallback();if(XR_FAILED(result))return result;}
         std::unique_lock lock(mx);
@@ -1033,173 +594,12 @@ struct BufferedPresenter final : Presenter {
         }
         else {
             std::unique_lock capture_lock(capture_mutex);
-            bool good=true;
-            if(native11){
-                job->capture_mode=job->upload_mode=job->direct_output_mode=job->direct_shading_mode=0;job->latency_diagnostics=false;
-                good=prepare_native11(*job,projection,inference_slot);job->ready=0;
-            }else {
-            std::unordered_map<XrSwapchain,CapturePlan> next_plans;
-            for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
-                auto& plan=next_plans[sub.swapchain];plan.desc=captured_descs[sub.swapchain];
-                Slice slice{sub.imageRect,sub.imageArrayIndex};
-                auto existing=std::find_if(plan.slices.begin(),plan.slices.end(),
-                    [&](const auto& x){return same_slice(x,slice);});
-                if(existing==plan.slices.end()){
-                    plan.slices.push_back(slice);plan.physical_eyes.push_back(eye);
-                }else if(plan.physical_eyes[std::size_t(existing-plan.slices.begin())]!=eye){
-                    // Same image subrect is used for both eyes; cannot give it
-                    // two different packed layouts. Copy the full texture.
-                    plan.full_required=true;
-                }
-            }
-            subimages(job->layers,[&](XrSwapchainSubImage& sub){next_plans[sub.swapchain].full_required=true;return true;});
-            capture_plans=std::move(next_plans);
-            job->capture_mode=color_capture_mode.load();job->upload_mode=upload_mode.load();job->latency_diagnostics=latency_diagnostics!=0;
-            job->direct_output_mode=quad_input?0u:direct_output_mode.load();
-            job->direct_shading_mode=direct_shading_mode.load();
-            auto* c=producer.begin(id,true);
-            if(!c){
-                if(inference_slot&&hookless_complete)hookless_complete(0);
+            job->id=id;
+            const auto capture_result=backend->capture(job,projection,inference_slot,external,hookless_complete);
+            if(capture_result==CaptureOutcome::busy){
                 std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;
             }
-            good=true;std::uint64_t expected_token{},expected_frame{};bool tokens_match=true;
-            if(good)for(unsigned eye=0;eye<2;++eye) {
-                const auto& sub=projection->views[eye].subImage;
-                const auto direct=direct_captures.find(sub.swapchain);
-                if(direct!=direct_captures.end()){
-                    const Slice requested{sub.imageRect,sub.imageArrayIndex};
-                    for(const auto& [slice,image]:direct->second.eyes)if(same_slice(slice,requested)){job->color[eye]=image;break;}
-                    if(!job->color[eye])++capture_fallbacks; // Changed layout: coordinated native passthrough below.
-                }else {
-                    const auto found=captured.find(sub.swapchain);
-                    if(found!=captured.end()){
-                        // Full-swapchain capture is an ordinary full-eye
-                        // fallback, never repack it using stale cached crop.
-                        // The FG worker samples its full resolution directly.
-                        job->color[eye]=producer.crop(*c,found->second,sub.imageRect,sub.imageArrayIndex);
-                    }
-                    if(job->color[eye])++eye_crop_copies;
-                }
-                if(!job->color[eye]){good=false;break;}
-                const auto token=capture_tokens[sub.swapchain];
-                const auto frame=capture_frames[sub.swapchain];
-                const auto captured_at=capture_times[sub.swapchain];
-                job->color_ready[eye]=capture_ready[sub.swapchain];
-                if(!eye||captured_at<job->captured_at)job->captured_at=captured_at;
-                if(!eye){expected_token=token;expected_frame=frame;}else tokens_match&=token==expected_token&&frame==expected_frame;
-                producer.freeze(*c,job->color[eye]);job->views[eye]=projection->views[eye];
-            }
-            if(good)good=subimages(job->layers,[&](XrSwapchainSubImage& sub){
-                const auto found=captured.find(sub.swapchain);if(found==captured.end())return false;
-                const auto d=found->second->texture->GetDesc();
-                if(sub.imageArrayIndex>=d.DepthOrArraySize||sub.imageRect.offset.x<0||sub.imageRect.offset.y<0||
-                    sub.imageRect.extent.width<=0||sub.imageRect.extent.height<=0||
-                    std::uint64_t(sub.imageRect.offset.x)+sub.imageRect.extent.width>d.Width||
-                    std::uint64_t(sub.imageRect.offset.y)+sub.imageRect.extent.height>d.Height)return false;
-                if(std::none_of(job->auxiliary.begin(),job->auxiliary.end(),[&](const Auxiliary& a){return a.source==sub.swapchain;}))
-                    job->auxiliary.push_back({sub.swapchain,found->second});return true;
-            });
-            if(good) {
-                if(external){expected_token=external->capture_token;expected_frame=external->render_frame;tokens_match=expected_token!=0;}
-                if(inference_slot&&hookless_complete){
-                    // Both final stereo colors are now captured. Stereo guides are claimed at the final OpenXR handoff, independent
-                    // of the native-frame release policy.
-                    const auto completed=hookless_complete(1);
-                    if(completed){expected_token=completed;expected_frame=0;tokens_match=true;}
-                    else if(!expected_frame){expected_token=0;tokens_match=false;}
-                }
-                // When a guide interval changed between xrReleaseSwapchainImage
-                // and xrEndFrame, never evaluate FG with the now-wrong packed
-                // crop. Full-eye copies are unaffected and remain eligible.
-                if(tokens_match&&expected_token)for(unsigned eye=0;eye<2;++eye){
-                    if(!job->color[eye]||!job->color[eye]->layout.packed())continue;
-                    const auto sc=projection->views[eye].subImage.swapchain;
-                    if(capture_crop_tokens[sc]!=expected_token){
-                        tokens_match=false;
-                        if(trace){
-                            char message[224]{};
-                            sprintf_s(message,"FG compact capture interval changed eye=%u packed_guide=%llu matched_guide=%llu; skipping FG pair",
-                                eye,static_cast<unsigned long long>(capture_crop_tokens[sc]),
-                                static_cast<unsigned long long>(expected_token));
-                            trace(message);
-                        }
-                        break;
-                    }
-                }
-                auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
-                auto acquire=guide_acquire?guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
-                auto release=guide_release?guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
-                CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
-                const bool acquired=inference_slot&&tokens_match&&expected_token&&
-                    (external?(guides=*external,true):(acquire&&release&&acquire(&guides)));
-                // render_frame is deliberately zero for hook-free mode 3.
-                // The nonzero color token still identifies the immutable pair.
-                if(inference_slot&&(!tokens_match||!expected_token))job->guide_state=CheekyFgState::guide_frame_mismatch;
-                if(acquired) {
-                    // Hook-free mode 3 can work with a different *verified*
-                    // native guide queue. Explicit Signal/Wait orders the
-                    // guide writes before FG reads; same-device alone is NOT
-                    // sufficient. Other release modes still require one queue.
-                    job->guides_valid=accept_guide_queue(guides,*job,expected_frame==0);
-                    if(!job->guides_valid)job->guide_state=CheekyFgState::queue_mismatch;
-                    if(!cheeky_fg_pair_matches_color(guides,expected_token,expected_frame)){
-                        job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;
-                    }
-                    for(unsigned eye=0;eye<2&&job->guides_valid;++eye) {
-                        auto g=guides.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
-                        if(!g.depth||!g.motion){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
-                        job->source_depth=unsigned(g.depth->GetDesc().Format);job->source_motion=unsigned(g.motion->GetDesc().Format);
-                        const auto& layout=job->color[eye]->layout;
-                        if(g.width!=(layout.width?layout.width:d.Width)||g.height!=(layout.height?layout.height:d.Height)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
-                        if(layout.packed()){
-                            // Metadata is published on the preceding guide evaluations.
-                            // If geometry changed since capture, do not feed NGX a high-
-                            // resolution crop partly supplied by low-res context.
-                            const auto expected=compact_layout(layout.width,layout.height,true,
-                                g.focus_width,g.focus_height,g.focus_x,g.focus_y,
-                                external?1u:g.peripheral_percent,layout.feather);
-                            if(!expected.packed()||layout.x!=expected.x||layout.y!=expected.y||
-                               layout.w!=expected.w||layout.h!=expected.h){
-                                job->guides_valid=false;
-                                job->guide_state=CheekyFgState::generation_failed;
-                                if(trace){
-                                    char message[250]{};
-                                    sprintf_s(message,"FG compact capture/guide crop disagreement eye=%u "
-                                        "packed=%u,%u,%u,%u matched=%u,%u,%u,%u; skipping FG pair",
-                                        eye,layout.x,layout.y,layout.w,layout.h,
-                                        expected.x,expected.y,expected.w,expected.h);
-                                    trace(message);
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if(job->guides_valid){
-                        // The plugin has ALREADY captured immutable guides.
-                        // Retain its lease through inference rather than
-                        // converting another full guide set at handoff.
-                        // Worker preparation now crops/normalizes once using
-                        // the original offsets, scales and jitter correction.
-                        job->retain_guides(guides);job->guide_token=expected_token;
-                        job->source_configuration=guides.eyes[0].configuration;job->render_frame=expected_frame;
-                    }
-                    if(!external)release(&guides);
-                }else if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
-                {std::lock_guard lock(mx);telemetry.color_token=expected_token;telemetry.guide_token=job->guide_token;
-                    telemetry.color_render_frame=expected_frame;telemetry.guide_render_frame=job->guides_valid?expected_frame:0;
-                    if(inference_slot&&job->guide_state==CheekyFgState::guide_frame_mismatch)++telemetry.mismatched_guides;}
-                if(job->latency_diagnostics)
-                    job->final_color_ready=producer.mark_color_ready(*c,LatencyProbe::cpu_now());
-                good=producer.execute(*c,job->ready);
-                if(!good&&inference_slot&&hookless_complete)hookless_complete(0);
-            }else if(c){
-                if(inference_slot&&hookless_complete)hookless_complete(0);
-                // A changed layout can fail after one eye was recorded. Queue
-                // those valid partial transitions so tracked pool states stay
-                // consistent before falling back to the original native frame.
-                std::uint64_t discarded{};producer.execute(*c,discarded);
-            }
-            }
+            const bool good=capture_result==CaptureOutcome::captured;
             if(!good){capture_lock.unlock();result=passthrough(end,"incomplete native color capture / changed swapchain layout");}
             else {
                 job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
@@ -1235,6 +635,7 @@ struct BufferedPresenter final : Presenter {
         }
         return result;
     }
+
     void generation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky FG completion");
         std::shared_ptr<Native> previous;bool reset_history=true,last_repeat_policy=true;
@@ -1256,18 +657,16 @@ struct BufferedPresenter final : Presenter {
             }
             if(measured_capture!=job->capture_mode||measured_upload!=job->upload_mode){
                 measured_capture=job->capture_mode;measured_upload=job->upload_mode;logged_samples=0;
-                worker.latency.clear_statistics();
-                if(worker.device&&worker.queue)worker.gpu_timings.initialize(worker.device.Get(),worker.queue.Get());
+                backend->reset_statistics(true);
                 std::lock_guard lock(mx);cadence_window={};gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
             }
             if(job->guides_valid) {
                 const auto point=job->guides.release_point;
                 const bool changed_policy=!release_policy_known||last_release_point!=point;
                 if(changed_policy) {
-                    worker.latency.clear_statistics();logged_samples=0;
+                    backend->reset_statistics(false);logged_samples=0;
                     {std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;}
-                    if(release_policy_known&&worker.device&&worker.queue)
-                        worker.gpu_timings.initialize(worker.device.Get(),worker.queue.Get());
+                    if(release_policy_known)backend->reset_statistics(true);
                     last_release_point=point;
                     if(trace)trace(point==3u?"FG native release=after generated frame OpenXR submission (Lua; histories retained)":
                         point==2u?"FG native release=after stereo GPU completion (Lua; histories retained)":
@@ -1276,11 +675,10 @@ struct BufferedPresenter final : Presenter {
                         "FG native release=after submission (Lua; default overlap)");
                 }
                 if(!release_policy_known||last_repeat_policy!=(job->guides.submit_repeats!=0)) {
-                    worker.latency.clear_statistics();logged_samples=0;
+                    backend->reset_statistics(false);logged_samples=0;
                     {std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;}
                     last_repeat_policy=job->guides.submit_repeats!=0;
-                    if(!changed_policy&&worker.device&&worker.queue)
-                        worker.gpu_timings.initialize(worker.device.Get(),worker.queue.Get());
+                    if(!changed_policy)backend->reset_statistics(true);
                     if(trace)trace(last_repeat_policy?"FG repeat submissions=ON (independent native clock)":
                         "FG repeat submissions=OFF (fresh content only; independent native clock)");
                 }
@@ -1296,181 +694,8 @@ struct BufferedPresenter final : Presenter {
             pair.handed_off_at=job->handed_off_at;pair.worker_started_at=TimingClock::now();
             pair.native_views=pair.current_views=job->views;pair.layers=job->layers;pair.auxiliary=job->auxiliary;
             pair.space=job->space;pair.blend=job->blend;pair.ready=job->ready;
-            bool success{};
-            bool attempted{},history_was_reset{};
-            if(native11){
-                // Native D3D11 shader interpolation. Each guide snapshot keeps
-                // its own reset flag; a reset pair only seeds history.
-                if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&
-                   job->guides_valid&&previous->guides_valid&&previous->guides11[0]&&previous->guides11[1]&&
-                   cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)) {
-                    bool same_size=true;
-                    for(unsigned eye=0;eye<2;++eye){D3D11_TEXTURE2D_DESC a{},b{};
-                        previous->color[eye]->texture11->GetDesc(&a);job->color[eye]->texture11->GetDesc(&b);
-                        same_size&=a.Width==b.Width&&a.Height==b.Height&&a.Format==b.Format;}
-                    history_was_reset=job->guides11[0]->source.meta.reset||job->guides11[1]->source.meta.reset||!same_size;
-                    attempted=true;
-                    if(!history_was_reset){
-                        pair.submitted_at=TimingClock::now();
-                        success=native11->generate(previous->color,job->color,previous->guides11,job->guides11,previous->views,job->views,pair.generated);
-                        inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
-                        if(!success){attempted=false;
-                            strcpy_s(native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}
-                        else strcpy_s(native11->diagnostic,"Native D3D11 shader FG: generating (no D3D12 bridge or NGX)");
-                    }
-                }
-            }else if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
-               cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)&&
-               previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
-               previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height) {
-                // The snapshot is recorded on the game queue. Queue::Wait is
-                // GPU-side, so neither the game nor the FG CPU worker needs to
-                // block while capture finishes. It also covers the earlier
-                // game-queue guide writes that precede the snapshot signal.
-                // Lua setting travels with this native stereo pair. Switch queues
-                // only on the single generation worker after the previous fence
-                // has retired; recreating NGX handles prevents cross-queue history
-                // hazards and makes the A/B measurements independent.
-                const unsigned requested_priority=job->guides.fg_queue_priority<=2u?job->guides.fg_queue_priority:1u;
-                ID3D12CommandQueue* requested=requested_priority==2u?queue.Get():requested_priority==0u?fg_normal_queue.Get():fg_high_queue.Get();
-                ID3D12CommandQueue* selected=requested ? requested : (fg_high_queue.Get()?fg_high_queue.Get():fg_normal_queue.Get()?fg_normal_queue.Get():queue.Get());
-                if(selected!=generation_queue.Get()) {
-                    worker.wait_idle();worker.reset();generation_queue=selected;
-                    generation_high_priority=fg_high_queue.Get()!=nullptr&&selected==fg_high_queue.Get();
-                    reset_history=true;logged_samples=0;
-                    {std::lock_guard lock(mx);cadence_window={};gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
-                        generation_stages={};capture_to_completion={};completion_to_native={};completion_to_generated={};
-                        frame_ages={};age_samples={};pacing_wait={};producer_cpu={};}
-                    if(trace)trace(generation_high_priority?"DLSS-FG queue mode=HIGH (Lua; NGX histories reset)":
-                        selected==fg_normal_queue.Get()?"DLSS-FG queue mode=separate NORMAL (Lua; NGX histories reset)":
-                        "DLSS-FG queue mode=shared game queue (Lua; NGX histories reset)");
-                }
-                {std::lock_guard lock(mx);reported_queue_mode=selected==queue.Get()?2u:generation_high_priority?1u:0u;}
-                if(last_fg_priority_requested!=requested_priority) {
-                    last_fg_priority_requested=requested_priority;
-                    if(trace) {
-                        char msg[176]{};
-                        sprintf_s(msg,"DLSS-FG queue request=%s selected=%s fallback=%u",
-                            queue_mode_name(requested_priority),
-                            generation_queue.Get()==fg_high_queue.Get()&&fg_high_queue.Get()?"HIGH":
-                            generation_queue.Get()==fg_normal_queue.Get()&&fg_normal_queue.Get()?"separate NORMAL":"game queue",
-                            selected!=requested?1u:0u);
-                        trace(msg);
-                    }
-                }
-                auto d=job->color[0]->texture->GetDesc();worker.trace=trace;worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
-                const auto& color_layout=job->color[0]->layout;
-                if(worker.initialize(device.Get(),generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format,cheeky_fg_needs_ngx(job->guides))) {
-                    for(unsigned eye=0;eye<2;++eye){worker.color_layouts[eye]=job->color[eye]->layout;worker.previous_layouts[eye]=previous->color[eye]->layout;}
-                    // The OpenXR capture has its own producer.fence, but it
-                    // does not cover guide writes on a DIFFERENT game queue.
-                    // Bridge that dependency before DLSS-G prepares the guides.
-                    const auto guides_ready=job->guide_sync_value ?
-                        generation_queue->Wait(job->guide_sync_fence.Get(),job->guide_sync_value) : S_OK;
-                    if(FAILED(guides_ready)){worker.failed=true;worker.report("FG guide cross-queue GPU wait",unsigned(guides_ready));
-                        throw std::runtime_error("FG guide cross-queue GPU wait failed");}
-                    const auto ready_result=worker.latency.enqueue_wait(device.Get(),generation_queue.Get(),producer.fence.Get(),job->ready,job->latency_diagnostics);
-                    if(FAILED(ready_result)){worker.failed=true;worker.report("FG capture dependency queue wait",unsigned(ready_result));}
-                    if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");
-                    auto guides=job->guides;guides.producer_queue=generation_queue.Get();
-                    const bool token_gap=previous->guide_token+2!=job->guide_token;
-                    if(token_gap)reset_history=true;
-                    // Hook-free mode 3 deliberately has no native-frame ID.
-                    // Preserve history when the capture tokens are consecutive;
-                    // reset on any transition between tagged and untagged mode.
-                    const bool frame_gap=(previous->render_frame||job->render_frame)&&previous->render_frame+1!=job->render_frame;
-                    if(frame_gap)reset_history=true;
-                    const bool source_reset=guides.eyes[0].reset||guides.eyes[1].reset;
-                    history_was_reset=reset_history||source_reset;
-                    if(history_was_reset&&trace){const auto count=++history_reset_events;
-                        if(count<=4||(count&(count-1))==0){char message[240]{};
-                            sprintf_s(message,"FG HISTORY reset count=%llu frame=%llu worker_restart=%u token_gap=%u frame_gap=%u source_reset=%u",
-                                count,job->render_frame,unsigned(reset_history&&!token_gap&&!frame_gap),unsigned(token_gap),unsigned(frame_gap),unsigned(source_reset));trace(message);}}
-                    if(reset_history)for(auto& eye:guides.eyes)eye.reset=1;
-                    if(trace && ((++pose_sample_count%60u)==1u)) {
-                        auto angle=[](const XrQuaternionf& a,const XrQuaternionf& b){
-                            const double dot=std::abs(double(a.x)*b.x+double(a.y)*b.y+double(a.z)*b.z+double(a.w)*b.w);
-                            return 2.0*180.0/3.141592653589793*std::acos(std::clamp(dot,0.0,1.0));
-                        };
-                        for(unsigned eye=0;eye<2;++eye){
-                            const auto& a=previous->views[eye].pose;
-                            const auto& b=job->views[eye].pose;
-                            const double dx=b.position.x-a.position.x,dy=b.position.y-a.position.y,dz=b.position.z-a.position.z;
-                            char message[360]{};
-                            sprintf_s(message,"FG POSE-DELTA native_prev=%llu native_next=%llu eye=%u "
-                                "source_dt_ms=%.3f position_delta_m=%.6f angle_deg=%.5f "
-                                "current_pose_xyz=%.4f,%.4f,%.4f (OpenXR submitted poses, not game render poses)",
-                                static_cast<unsigned long long>(previous->id),static_cast<unsigned long long>(job->id),eye,
-                                std::chrono::duration<double,std::milli>(job->captured_at-previous->captured_at).count(),std::sqrt(dx*dx+dy*dy+dz*dz),
-                                angle(a.orientation,b.orientation),b.position.x,b.position.y,b.position.z);
-                            trace(message);
-                        }
-                    }
-                    std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)
-                        cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.eyes[eye].depth_inverted!=0);
-                    const bool camera_pair_valid=std::all_of(cameras.begin(),cameras.end(),[](const auto& c){return c.valid;});
-
-                    std::array<ID3D12Resource*,2> input{job->color[0]->texture.Get(),job->color[1]->texture.Get()},
-                        prior{previous->color[0]->texture.Get(),previous->color[1]->texture.Get()},result{};
-                    auto publication=d;publication.Format=worker.focus.color_format;
-                    std::array<Worker::OutputCopy,2> copies;
-                    bool available=true;
-                    // Debug border is drawn by the final OpenXR upload. Avoid
-                    // bypassing that upload via experimental direct XR output.
-                    const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;});
-                    const bool blocked_direct=job->direct_output_mode&&(border_upload||direct_blocked_target==direct_target_key(worker.width,worker.height,worker.focus.color_format));
-                    if(blocked_direct){std::lock_guard lock(mx);++direct_stats.fallbacks;++direct_stats.unsupported;direct_stats.last_path=3;}
-                    if(camera_pair_valid&&job->direct_output_mode&&!blocked_direct){
-                        const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
-                            return g.peripheral_method<=2&&(g.focus_width<.999f||g.focus_height<.999f);});
-                        if(supported){
-                            direct_job=std::make_shared<DirectRequest>();direct_job->epoch=job->epoch;direct_job->native_id=previous->id;
-                            direct_job->previous=previous->color;direct_job->format=worker.focus.color_format;direct_job->width=worker.width;direct_job->height=worker.height;
-                            std::unique_lock lock(mx);++direct_stats.attempts;direct_request=direct_job;changed.notify_all();
-                            changed.wait(lock,[&]{return stopping||job->epoch!=epoch||direct_job->decided;});
-                            if(direct_job->allowed){copies=direct_job->targets;pair.direct_xr=true;
-                                for(unsigned eye=0;eye<2;++eye){copies[eye].shading_mode=job->direct_shading_mode;pair.generated[eye]=std::make_shared<TransportImage>();
-                                    pair.generated[eye]->texture=copies[eye].texture;pair.generated[eye]->state=copies[eye].state;}}
-                        }else{std::lock_guard lock(mx);++direct_stats.unsupported;++direct_stats.fallbacks;direct_stats.last_path=3;
-                            note_direct_failure_locked(CheekyFgDirectReason::configuration);}
-                    }
-                    for(unsigned eye=0;eye<2&&!pair.direct_xr&&camera_pair_valid;++eye) {
-                        const auto& g=guides.eyes[eye];
-                        const auto layout=compact_layout(worker.width,worker.height,job->color[eye]->layout.packed(),g.focus_width,g.focus_height,
-                            g.focus_x,g.focus_y,g.peripheral_percent,g.focus_feather,g.resolution_percent);
-                        publication.Width=layout.stored_width();publication.Height=layout.stored_height();
-                        pair.generated[eye]=output.image(publication,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-                        if(!pair.generated[eye]){available=false;break;}
-                        pair.generated[eye]->layout=layout;
-                        pair.generated[eye]->fg_border=fg_border_rect(worker.width,worker.height,g.focus_width,g.focus_height,
-                            g.focus_x,g.focus_y,g.show_foveation_border!=0);
-                        copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};
-                    }
-                    if(available&&camera_pair_valid) {
-                        success=worker.generate(guides,input,prior,cameras,result,&copies,[](void* context) noexcept {
-                            static_cast<BufferedPresenter*>(context)->inference_submitted();
-                        },this,[](void* context) noexcept {
-                            static_cast<BufferedPresenter*>(context)->inference_prepared();
-                        });attempted=!worker.failed&&worker.temporal_evaluation_completed;
-                        pair.submitted_at=worker.submitted_at;
-                        for(unsigned eye=0;eye<2;++eye) {
-                            pair.generated[eye]->state=copies[eye].state;
-                            pair.generated[eye]->presentation_format=srgb_color(d.Format)&&publication.Format==DXGI_FORMAT_R8G8B8A8_UNORM?
-                                DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:publication.Format;
-                        }
-                        if(pair.direct_xr){std::lock_guard lock(mx);
-                            direct_job->fence=worker.fence;direct_job->serial=worker.serial;
-                            if(success){const bool coarse=worker.focus.coarse_output[0]&&worker.focus.coarse_output[1];
-                                shading_stats.valid=1;shading_stats.active_mode=coarse?job->direct_shading_mode:0u;
-                                shading_stats.grid_width=coarse?worker.peripheral_width:worker.width;
-                                shading_stats.grid_height=coarse?worker.peripheral_height:worker.height;
-                                shading_stats.output_width=worker.width;shading_stats.output_height=worker.height;
-                                if(coarse)++shading_stats.coarse_frames;else ++shading_stats.full_frames;}
-                            for(const auto& f:worker.features)if(f.direct)++direct_stats.ngx_direct_eyes;else ++direct_stats.ngx_scratch_eyes;
-                            direct_stats.last_path=worker.features[0].direct&&worker.features[1].direct?1u:2u;}
-                    }
-                }
-            }
+            const auto generation=backend->generate(previous,job,pair,reset_history,logged_samples,direct_job);
+            const auto success=generation.success,attempted=generation.attempted,history_was_reset=generation.history_reset;
             if(success){pair.interpolated=true;pair.native_id=previous->id;pair.native=previous->color;
                 pair.native_color_ready=previous->color_ready;
                 pair.native_final_ready=previous->final_color_ready;
@@ -1486,19 +711,21 @@ struct BufferedPresenter final : Presenter {
                 // guides. Release completed leases now instead of pinning raw
                 // textures in reusable slots or temporal history indefinitely.
                 // The D3D11 shader samples the previous interval's depth.
-                if(!native11&&(!worker.fence||worker.fence->GetCompletedValue()>=worker.serial))job->clear_guides();
+                backend->retire_guides(*job);
                 if(success&&!pair.direct_xr)for(unsigned eye=0;eye<2;++eye)last_fg_borders[eye]=pair.generated[eye]->fg_border;
                 if(success&&active_release_point==3u&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
-                worker.latency.snapshot(experiment_state);
+                const auto status=backend->generation_status();
+                CheekyFgPerformance gpu_performance;backend->snapshot(gpu_performance,extra_gpu,experiment_state);
                 experiment_state.color_capture_mode=job->capture_mode;experiment_state.upload_mode=job->upload_mode;
                 if(trace&&experiment_state.latency_valid&&experiment_state.latency_samples!=logged_samples){
+                    const auto copies=experiments();
                     logged_samples=experiment_state.latency_samples;
                     const auto& d=experiment_state;char message[768]{};
                     sprintf_s(message,"FG calibrated latency sample=%llu rejected=%llu color=%u uploads=%u release=%u repeats=%u queue=%s mean_ms: queue_entry=%.3f capture_dependency=%.3f ready_to_fg=%.3f gpu_work=%.3f gpu_to_observed=%.3f enqueue_total=%.3f submit_total=%.3f; copies(full/direct/crop)=%llu/%llu/%llu uploads(copies/batches)=%llu/%llu",
                         d.latency_samples,d.latency_rejected,job->capture_mode,job->upload_mode,active_release_point,submit_repeat_frames?1u:0u,queue_mode_name(reported_queue_mode),
                         d.queue_entry.mean,d.capture_dependency.mean,d.ready_to_fg.mean,d.gpu_work.mean,d.gpu_to_observed.mean,d.enqueue_to_observed.mean,d.submit_to_observed.mean,
-                        producer.full_copies.load(),direct_eye_copies.load(),eye_crop_copies.load(),uploads.upload_copies.load(),uploads.submissions.load());trace(message);
+                        copies.full_color_copies,copies.direct_eye_copies,copies.eye_crop_copies,copies.upload_copies,copies.upload_batches);trace(message);
                 }
                 release_deferred_credit();
                 if(job->epoch!=epoch||degraded){previous.reset();reset_history=true;continue;}
@@ -1517,7 +744,7 @@ struct BufferedPresenter final : Presenter {
                             static_cast<unsigned long long>(job->render_frame),
                             static_cast<unsigned long long>(job->guide_token),
                             history_was_reset?1u:0u,success?1u:0u,
-                            static_cast<unsigned long long>(worker.serial));
+                            static_cast<unsigned long long>(status.serial));
                         trace(publication);
                     }
                     ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();
@@ -1527,186 +754,31 @@ struct BufferedPresenter final : Presenter {
                 // speculative native mailbox from running ahead of its first
                 // usable pair. Inference/native failures release this priming.
                 if(success&&!fg_active)transition_until=ticks+8;
-                if(worker.failed||!job->guides_valid)transition_until=0;
-                if(worker.failed)pacing_active=false;
+                if(status.failed||!job->guides_valid)transition_until=0;
+                if(status.failed)pacing_active=false;
                 const auto xr_ms=telemetry.xr_wait_ms,period_ms=telemetry.xr_period_ms;
                 const auto color_token=telemetry.color_token,guide_token=telemetry.guide_token,mismatches=telemetry.mismatched_guides;
                 const auto color_frame=telemetry.color_render_frame,guide_frame=telemetry.guide_render_frame;
-                telemetry=Presenter::performance();telemetry.copy_wait_ms=0;telemetry.xr_wait_ms=xr_ms;telemetry.xr_period_ms=period_ms;
+                telemetry=gpu_performance;telemetry.copy_wait_ms=0;telemetry.xr_wait_ms=xr_ms;telemetry.xr_period_ms=period_ms;
                 telemetry.color_token=color_token;telemetry.guide_token=guide_token;telemetry.mismatched_guides=mismatches;
                 telemetry.color_render_frame=color_frame;telemetry.guide_render_frame=guide_frame;
-                telemetry.inference_color_format=unsigned(worker.focus.color_format);
-                telemetry.shared_gpu_queue=generation_queue.Get()==queue.Get()?1u:0u;
-                if(worker.gpu_timings.valid) {
-                    extra_gpu.publication_samples=worker.gpu_timings.samples;
-                    extra_gpu.publication_ms=worker.gpu_timings.publication.mean();
-                    extra_gpu.publication_last_ms=worker.gpu_timings.publication.last;
-                }
                 telemetry.source_depth_format=job->source_depth;telemetry.source_motion_format=job->source_motion;
-                state=success?CheekyFgState::generating:worker.failed?(worker.capability_ready?CheekyFgState::generation_failed:CheekyFgState::ngx_unavailable):
+                state=success?CheekyFgState::generating:status.failed?(status.capability_ready?CheekyFgState::generation_failed:CheekyFgState::ngx_unavailable):
                     job->guides_valid?CheekyFgState::waiting_for_history:job->guide_state;
                 if(job->guide_state==CheekyFgState::generation_failed&&!job->guides_valid)
                     sprintf_s(diagnostic,"FG guide snapshot unavailable: depth=%u motion=%u; native presentation continues",job->source_depth,job->source_motion);
                 else if(job->guide_state==CheekyFgState::guide_frame_mismatch&&!job->guides_valid)
                     strcpy_s(diagnostic,"Waiting for matching color and guide frames. See the plugin frame-source diagnostics; native presentation continues.");
-                else strcpy_s(diagnostic,native11?native11->diagnostic:worker.diagnostic);changed.notify_all();}
+                else strcpy_s(diagnostic,status.diagnostic);changed.notify_all();}
             previous=std::move(job);
         }}catch(...) {std::lock_guard lock(mx);state=CheekyFgState::generation_failed;degraded=true;fg_active=pacing_active=false;
             discard_pending();ready.clear();awaiting_generated_submission=0;inflight_id=0;inflight_release_point=0;inflight_prepared=false;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
-        worker.wait_idle();output.drain();
+        backend->finish_generation();
     }
-    bool ensure_chain(Chain& chain,const Image& image,bool scene=false) {
-        auto d=image->texture->GetDesc();
-        if(image->presentation_format!=DXGI_FORMAT_UNKNOWN)d.Format=image->presentation_format;
-        if(scene){
-            if(image->layout.width){d.Width=image->layout.width;d.Height=image->layout.height;}
-            const bool srgb=srgb_color(d.Format);d.Format=inference_color_format(d.Format);
-            if(srgb&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM)d.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        }
-        const auto target_key=direct_target_key(unsigned(d.Width),d.Height,inference_color_format(d.Format));
-        const bool writable=scene&&direct_output_mode==1u&&direct_blocked_target!=target_key;
-        if(writable)d.Format=inference_color_format(d.Format);
-        if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.DepthOrArraySize||chain.direct_writable!=writable)) {
-            uploads.drain();destroy_chain(chain.handle);chain={};
-        }
-        if(chain.handle)return true;
-        XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-        if(writable)create.usageFlags|=XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
-        create.format=d.Format;create.width=unsigned(d.Width);create.height=d.Height;create.arraySize=d.DepthOrArraySize;
-        create.sampleCount=create.faceCount=create.mipCount=1;
-        const auto created=xr.create(session,&create,&chain.handle);
-        if(XR_FAILED(created)){
-            if(!writable)return false;chain.handle={};direct_blocked_target=target_key;
-            {std::lock_guard lock(mx);DirectRequest request;request.width=unsigned(d.Width);request.height=d.Height;request.format=d.Format;
-                note_direct_failure_locked(CheekyFgDirectReason::chain_usage,0,&request,&chain,nullptr,created);}
-            if(trace)trace("FG direct XR: runtime rejected writable scene image; falling back to compact uploads");
-            return ensure_chain(chain,image,scene);
-        }
-        if(!enumerate_images(chain.handle,chain.images))return false;
-        next_presenter_memory=0; // Publish newly allocated chains on this presentation, including during startup.
-        chain.desc=d;chain.direct_writable=writable;chain.linear_color=writable&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM;return true;
-    }
+
     // Native D3D11 backend: private chain matching the frame, then one copy.
     // TODO(perf): render generated frames straight into the acquired image.
-    bool upload11(Chain& chain,const Image& source) {
-        if(!source||!source->texture11)return false;
-        D3D11_TEXTURE2D_DESC d{};source->texture11->GetDesc(&d);
-        if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.ArraySize)){
-            destroy_private_chain(chain.handle);chain={};
-        }
-        if(!chain.handle){
-            XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-            create.format=d.Format;create.width=d.Width;create.height=d.Height;create.arraySize=d.ArraySize;
-            create.sampleCount=create.faceCount=create.mipCount=1;
-            if(XR_FAILED(xr.create(session,&create,&chain.handle))){chain={};return false;}
-            unsigned count{};
-            if(XR_FAILED(xr.enumerate(chain.handle,0,&count,nullptr))||!count){destroy_chain(chain.handle);chain={};return false;}
-            chain.images11.assign(count,{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-            if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images11.data())))){
-                destroy_chain(chain.handle);chain={};return false;}
-            chain.desc.Width=d.Width;chain.desc.Height=d.Height;chain.desc.Format=d.Format;chain.desc.DepthOrArraySize=UINT16(d.ArraySize);
-        }
-        if(chain.uploaded==source->identity)return true;
-        unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if(XR_FAILED(xr.acquire(chain.handle,&acquire,&index)))return false;
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-        const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
-        {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-        const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images11.size()&&native11->upload(chain.images11[index].texture,source);
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        const bool released=XR_SUCCEEDED(native11->runtime_submit([&]{return xr.release(chain.handle,&release);}));
-        if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
-        return released&&copied;
-    }
-    bool upload_image(Chain& chain,const Image& source,bool scene=false) {
-        if(!ensure_chain(chain,source,scene))return false;
-        // xrEndFrame uses the most recently released image. Resubmitting that
-        // image needs no acquire/copy/release when its immutable content has
-        // not changed. A new content ID on every pool lease prevents recycled
-        // pointers from being mistaken for the previously uploaded pixels.
-        if(chain.uploaded==source->identity)return true;
-        unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if(XR_FAILED(xr.acquire(chain.handle,&acquire,&index)))return false;
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-        const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
-        {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-        bool copied=false;
-        if(XR_SUCCEEDED(wait_result)&&index<chain.images.size()){
-            auto* target=chain.images[index].texture;
-            if(!burst.recording_frame&&!burst.strict)
-                copied=uploads.upload(source,target,ticks,chain.desc.Format,chain.linear_color,xr_image_state());
-            else {
-                auto* context=uploads.begin(ticks);
-                if(!context){uploads.drain();context=uploads.begin(ticks);}
-                if(context&&uploads.record_upload(*context,source,target,chain.desc.Format,chain.linear_color,xr_image_state())){
-                    if(scene&&burst.recording_frame){
-                        const unsigned eye=&chain==&scene_chains[0]?0u:1u;
-                        burst.record(device.Get(),context->list.Get(),source->texture.Get(),source->state,
-                            "source",eye,index,burst_native,burst_current,burst_generated,burst_presentation);
-                        burst.record(device.Get(),context->list.Get(),target,xr_image_state(),
-                            "openxr",eye,index,burst_native,burst_current,burst_generated,burst_presentation);
-                    }
-                    std::uint64_t ticket{};copied=uploads.execute(*context,ticket);
-                    if(copied){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
-                    else burst.abandon();
-                }else {if(context)context->list->Close();burst.abandon();}
-            }
-        }
-        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        const bool released=XR_SUCCEEDED(release_image(chain.handle,index,&release));
-        if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
-        return released&&copied;
-    }
-    bool upload_batch(const std::vector<std::pair<Chain*,Image>>& requests) {
-        struct Item {Chain* chain;Image source;unsigned index{};bool acquired{},waited{};};
-        std::vector<Item> items;
-        for(const auto& [chain,source]:requests){
-            if(!chain->handle&&!ensure_chain(*chain,source))return false;
-            if(chain->uploaded!=source->identity)items.push_back({chain,source});
-        }
-        if(items.empty())return true;
-        bool good=true;
-        for(auto& item:items){
-            XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-            if(XR_FAILED(xr.acquire(item.chain->handle,&acquire,&item.index))){good=false;break;}
-            item.acquired=true;
-            XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-            const auto started=TimingClock::now();const auto result=xr.wait_image(item.chain->handle,&wait);
-            {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(started));}
-            item.waited=XR_SUCCEEDED(result);
-            if(!item.waited||item.index>=item.chain->images.size()){good=false;break;}
-        }
-        if(good){
-            auto* c=uploads.begin(ticks);if(!c){uploads.drain();c=uploads.begin(ticks);}
-            good=c!=nullptr;
-            if(c){
-                for(auto& item:items)if(!uploads.record_upload(*c,item.source,item.chain->images[item.index].texture,item.chain->desc.Format,item.chain->linear_color,xr_image_state())){good=false;break;}
-                if(good&&burst.recording_frame)for(auto& item:items){
-                    if(item.chain!=&scene_chains[0]&&item.chain!=&scene_chains[1])continue;
-                    const unsigned eye=item.chain==&scene_chains[0]?0u:1u;
-                    burst.record(device.Get(),c->list.Get(),item.source->texture.Get(),item.source->state,
-                        "source",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
-                    burst.record(device.Get(),c->list.Get(),item.chain->images[item.index].texture,xr_image_state(),
-                        "openxr",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
-                }
-                if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
-                    if(good){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
-                    else burst.abandon();}
-                else {c->list->Close();burst.abandon();}
-            }
-        }
-        const bool submitted=good;
-        // All copies MUST be queued before any image is released: the runtime
-        // may insert its own fence at ReleaseSwapchainImage.
-        for(auto& item:items)if(item.acquired&&item.waited){
-            XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-            const bool released=XR_SUCCEEDED(release_image(item.chain->handle,item.index,&release));
-            if(submitted&&released){item.chain->uploaded=item.source->identity;item.chain->last_uploaded_index=item.index;}
-            good&=released;
-        }
-        return good;
-    }
-    #include "fg_direct_xr.inl"
+
     void wake_producer_locked() {
         if(clock_pacing_active){changed.notify_all();return;}
         // Early late-selection wake and ordinary submission share one credit.
@@ -1843,6 +915,7 @@ struct BufferedPresenter final : Presenter {
         if(completed_pair_id>baseline&&epoch==generation)++late_wait_arrivals;
         else if(!stopping&&!raw&&!degraded&&epoch==generation&&TimingClock::now()>=deadline)++late_wait_timeouts;
     }
+
     bool render(Pair& pair,const std::array<Image,2>& images,
                 const std::array<XrCompositionLayerProjectionView,2>& original_views,bool generated,bool repeated,XrTime time,
                 XrResult& result,bool& closed) {
@@ -1854,26 +927,8 @@ struct BufferedPresenter final : Presenter {
         burst_presentation=ticks;
         burst.begin_submission();
         if(latency_diagnostics.load()!=0)collect_native_submission_probes();
-        auto views=original_views;
-        std::vector<std::pair<Chain*,Image>> batch;
-        for(unsigned eye=0;eye<2;++eye) {
-            auto& chain=scene_chains[eye];
-            if(native11){if(!upload11(chain,images[eye]))return false;}
-            else if(generated&&pair.direct_xr){}else if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
-            else if(!upload_image(chain,images[eye],true))return false;
-            views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
-            views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
-        }
-        auto layers=pair.layers;
-        for(auto& a:pair.auxiliary){
-            if(native11){if(!upload11(auxiliary_chains[a.source],a.image))return false;}
-            else if(pair.upload_mode==1u){auto& chain=auxiliary_chains[a.source];if(!ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});}
-            else if(!upload_image(auxiliary_chains[a.source],a.image))return false;
-        }
-        if(pair.upload_mode==1u&&!upload_batch(batch))return false;
-        uploads.close_profile_frame(ticks);
-        if(!subimages(layers,[&](XrSwapchainSubImage& sub){const auto i=auxiliary_chains.find(sub.swapchain);
-            if(i==auxiliary_chains.end())return false;sub.swapchain=i->second.handle;return true;}))return false;
+        auto views=original_views;auto layers=pair.layers;
+        if(!backend->publish(pair,images,views,layers,generated))return false;
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=pair.space;
         projection.layerFlags=layers.scene_flags;projection.viewCount=2;projection.views=views.data();
         auto headers=layers.replace_scene(projection);XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=time;
@@ -1968,7 +1023,7 @@ struct BufferedPresenter final : Presenter {
             }
             if(allow_repeats&&!generated_phase&&frame.shouldRender==XR_TRUE)wait_for_new_pair(present_start,frame.predictedDisplayPeriod,last_position);
             Pair direct_pair;
-            const bool have_direct=frame.shouldRender==XR_TRUE&&service_direct_output(last_position,direct_pair);
+            const bool have_direct=frame.shouldRender==XR_TRUE&&backend->service_direct_output(last_position,direct_pair);
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(have_direct&&!raw_frame&&!stop_now&&!degraded){active=std::move(direct_pair);have_active=true;generated_phase=true;fg_active=pacing_active=true;
                     while(!ready.empty()&&ready.front().current_id<=active.current_id)ready.pop_front();}
@@ -2162,5 +1217,15 @@ struct BufferedPresenter final : Presenter {
             if(native_latency_log[0])trace(native_latency_log);
         }}catch(...) {runtime_failure("presentation exception",XR_ERROR_RUNTIME_FAILURE);}
     }
+    #include "fg_buffered_entrypoints.inl"
 };
 }
+
+namespace cheeky::fg {
+std::unique_ptr<FrameBackend> make_frame_backend12(BufferedPresenter&);
+std::unique_ptr<FrameBackend> make_frame_backend11(BufferedPresenter&);
+}
+
+#include "fg_backend12_buffered.inl"
+#include "fg_backend11_buffered.inl"
+#include "fg_buffered_backend.inl"

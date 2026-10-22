@@ -1,7 +1,6 @@
-// Included inside BufferedPresenter. XR ownership stays on the presenter;
-// inference records only into images whose Acquire/Wait already succeeded.
-void note_direct_failure_locked(CheekyFgDirectReason reason,unsigned eye=0,const DirectRequest* request=nullptr,
-    const Chain* chain=nullptr,const D3D12_RESOURCE_DESC* image=nullptr,std::int32_t api_result=0) {
+// Included in cheeky::fg after BufferedPresenter is complete.
+inline void BufferedPresenter::note_direct_failure_locked(CheekyFgDirectReason reason,unsigned eye,const DirectRequest* request,
+    const Chain* chain,const D3D12_RESOURCE_DESC* image,std::int32_t api_result) {
     const auto count=direct_details.rejections+1;direct_details={};auto& d=direct_details;
     d.supported=1;d.reason=reason;d.eye=eye;d.rejections=count;d.xr_result=api_result;
     if(request){d.expected_format=unsigned(request->format);d.expected_width=request->width;d.expected_height=request->height;}
@@ -16,7 +15,8 @@ void note_direct_failure_locked(CheekyFgDirectReason reason,unsigned eye=0,const
         trace(message);logged_direct_details=d;
     }
 }
-bool service_direct_output(double position,Pair& result) {
+
+inline bool BufferedPresenter::service_direct_output(double position,Pair& result) {
     std::shared_ptr<DirectRequest> request;
     {
         std::lock_guard lock(mx);request=direct_request;
