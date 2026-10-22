@@ -176,7 +176,7 @@ std::string snapshot_locked(State& s) {
         << ",\"compatible_session\":" << bool(fg.compatible_session)
         << ",\"active\":" << bool(fg.active)
         << ",\"state\":\"" << fg_state_name(fg.state) << "\""
-        << ",\"diagnostic\":\"" << json_escape(app_quad?"FG disabled: game composites four DLSS views before stereo OpenXR submission":fg_diagnostic().message) << "\""
+        << ",\"diagnostic\":\"" << json_escape(fg_diagnostic().message) << "\""
         << ",\"native_frames\":" << fg.native_frames
         << ",\"generated_frames\":" << fg.generated_frames
         << ",\"fallback_frames\":" << fg.fallback_frames

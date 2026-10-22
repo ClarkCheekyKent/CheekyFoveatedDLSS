@@ -411,12 +411,21 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     // registration) for full-resolution guides where the user looks.
     const auto quad=quad_view_snapshot();
     unsigned quad_eye=FgGuideIdentity::unknown;
+    // Game-composited quad needs one peripheral guide per eye per frame;
+    // report why a peripheral evaluation was not recorded.
+    const auto quad_skip=[&](const char* reason,unsigned a=0,unsigned b=0,unsigned c=0){
+        if(quad_eye>=2)return;static std::atomic<unsigned> skips{};const auto n=++skips;
+        if(n<=16||n%600==0)trace_event("FG quad peripheral guide skipped eye=%u view=%llu reason=%s values=%u,%u,%u count=%u",
+            quad_eye,static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handle)),reason,a,b,c,n);};
     if(quad.active){
         if(!quad_is_app_snapshot(quad))return;
         const auto* role=quad_view_assignment(quad,reinterpret_cast<std::uintptr_t>(handle),
             stereo_view_generation(reinterpret_cast<std::uintptr_t>(handle)));
         if(!role||role->focus||role->eye_index>=2)return;
         quad_eye=role->eye_index;
+        static std::atomic<unsigned> entered[2]{};const auto total=++entered[quad_eye]+entered[1-quad_eye];
+        if(total<=4||total%600==0)trace_event("FG quad peripheral guides published left=%u right=%u (one per eye per frame expected)",
+            entered[0].load(),entered[1].load());
     }
     const auto settings=current_settings();
     const bool hookless=hookless_selected(settings.fg);
@@ -428,18 +437,19 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     {std::lock_guard lock(mutex);if(auto entry=feature_flags.find(handle);entry!=feature_flags.end()){flags=entry->second;flags_known=true;}}
     // Late attachment can still recover an explicitly supplied declaration.
     // Never manufacture the depth convention when both sources are absent.
-    if(!flags_known&&!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags))return;
+    if(!flags_known&&!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags)){quad_skip("feature flags unknown");return;}
     auto* depth=read(p,"Depth");auto* motion=read(p,"MotionVectors");
-    if(!depth||!motion)return;
+    if(!depth||!motion){quad_skip("depth or motion missing");return;}
     const auto dd=depth->GetDesc(),md=motion->GetDesc();
     // MSFS 2024 passes a two-slice, mipmapped depth texture for one stereo
     // SR evaluation even when native quad-view foveation is disabled. The FG
     // guide preparation path samples mip 0 of slice 0 explicitly.
     if(dd.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||md.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
        (dd.DepthOrArraySize!=1&&dd.DepthOrArraySize!=2)||md.DepthOrArraySize!=1||
-       dd.SampleDesc.Count!=1||md.SampleDesc.Count!=1)return;
+       dd.SampleDesc.Count!=1||md.SampleDesc.Count!=1){
+        quad_skip("unsupported depth/motion layout (depth slices, motion slices, depth dimension)",dd.DepthOrArraySize,md.DepthOrArraySize,unsigned(dd.Dimension));return;}
     const unsigned w=ui(p,"OutWidth"),h=ui(p,"OutHeight");
-    if(!w||!h)return;
+    if(!w||!h){quad_skip("output size missing");return;}
     CheekyFgEye m;
     m.render_frame=hookless?0:render_frame;
     m.depth=depth;m.motion=motion;
@@ -456,7 +466,8 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
         // The peripheral output is upscaled by the game's own composition, so
         // the guides describe the submitted eye image, not the DLSS output.
         const auto frame=quad_app_frame();const auto& view=frame.views[quad_eye];
-        if(frame.view_count<2||view.view_index!=quad_eye||!view.image_rect_width||!view.image_rect_height)return;
+        if(frame.view_count<2||view.view_index!=quad_eye||!view.image_rect_width||!view.image_rect_height){
+            quad_skip("submitted eye rect unknown (views, width, height)",frame.view_count,view.image_rect_width,view.image_rect_height);return;}
         m.width=view.image_rect_width;m.height=view.image_rect_height;
     }
     m.depth_base_x=ui(p,"DLSS.Input.Depth.Subrect.Base.X");
@@ -526,7 +537,9 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
         trace_event("FG stereo identity revision=%llu calibrated=%u view=%llu physical_eye=%u (next complete pair resets history)",
             identity.mapping_revision,unsigned(assignment.calibrated),static_cast<unsigned long long>(view_id),identity.eye);
     }
-    if(snapshots().record(cmd,m,identity)){
+    const bool recorded=snapshots().record(cmd,m,identity);
+    if(!recorded)quad_skip("guide snapshot recording failed",dd.DepthOrArraySize,m.depth_width,m.depth_height);
+    if(recorded){
         pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;
         if(static_eye_crop_configuration!=m.configuration||static_eye_crop_mapping!=identity.mapping_revision){
             static_eye_crops.valid_mask=0;
