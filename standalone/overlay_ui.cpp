@@ -980,12 +980,52 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::TextWrapped("Unique output excludes repeats. Headset refresh target is not measured output FPS.");
     } else ImGui::TextUnformatted("Measuring presentation cadence...");
     const auto gpu = member(fg, "performance");
-    if (flag(gpu, "gpu_valid")) {
-        timing_line(gpu, "FG center", "center_ms");
-        timing_line(gpu, "FG periphery", "periphery_ms");
-        timing_line(gpu, "FG preparation", "preparation_ms");
-        timing_line(gpu, "FG total GPU", "total_ms");
-    }
+    if (!flag(gpu, "supported")) ImGui::TextWrapped("FG GPU timings: install the matching OpenXR layer update.");
+    else if (flag(gpu, "gpu_valid")) {
+        // Same stages as the UEVR menu, for every FG method (DLSS-G and shader).
+        const auto extra = member(fg, "overhead");
+        const bool stages = flag(extra, "supported");
+        const bool focused = number(gpu, "foveated_eyes") > 0;
+        const bool resized = !focused && number(gpu, "center_width") > 0 &&
+            (number(gpu, "center_width") != number(gpu, "output_width") || number(gpu, "center_height") != number(gpu, "output_height"));
+        if (number(gpu, "center_width") > 0) {
+            ImGui::Text("%s: %.0f x %.0f", focused ? "Center FG input" : "Full-frame FG input", number(gpu, "center_width"), number(gpu, "center_height"));
+            if (focused) ImGui::Text("Periphery input: %.0f x %.0f", number(gpu, "peripheral_width"), number(gpu, "peripheral_height"));
+            ImGui::Text("Output per eye: %.0f x %.0f", number(gpu, "output_width"), number(gpu, "output_height"));
+        }
+        ImGui::TextWrapped("GPU timings, both eyes: average / last (ms)");
+        double sum{}, sum_last{};
+        if (ImGui::BeginTable("fg_gpu_timings", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch, 1.6F);
+            ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthStretch, 1.F);
+            const auto row = [](const char* label, double mean, double last, bool sampled = true) {
+                ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextWrapped("%s", label); ImGui::TableNextColumn();
+                if (sampled) ImGui::Text("%.3f / %.3f", mean, last); else ImGui::TextUnformatted("Waiting for GPU samples");
+            };
+            row(focused ? "DLSS-FG / shader center" : "FG full frame", number(gpu, "center_ms"), number(gpu, "center_last_ms"));
+            if (focused || resized) row(resized ? "Output resize" : "Periphery + output assembly", number(gpu, "periphery_ms"), number(gpu, "periphery_last_ms"));
+            row("Color / guide preparation", number(gpu, "preparation_ms"), number(gpu, "preparation_last_ms"));
+            row(stages ? "FG processing subtotal" : "FG GPU total", number(gpu, "total_ms"), number(gpu, "total_last_ms"));
+            sum = number(gpu, "total_ms"); sum_last = number(gpu, "total_last_ms");
+            if (stages) {
+                const auto stage = [&](const char* label, const char* samples, const char* mean, const char* last) {
+                    const bool sampled = number(extra, samples) > 0;
+                    row(label, number(extra, mean), number(extra, last), sampled);
+                    if (sampled) { sum += number(extra, mean); sum_last += number(extra, last); }
+                };
+                stage("Guide capture / preparation (per native)", "guide_samples", "guide_ms", "guide_last_ms");
+                stage("Color capture + guide handoff (per native)", "capture_samples", "capture_ms", "capture_last_ms");
+                stage("Generated output copy (per generated)", "publication_samples", "publication_ms", "publication_last_ms");
+                stage("OpenXR uploads (per presentation)", "upload_samples", "upload_ms", "upload_last_ms");
+                row("All FG GPU work", sum, sum_last);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextWrapped(stages ? "All FG GPU work adds the processing subtotal and the capture, copy and upload stages. Stages are elapsed GPU intervals and can overlap or include contention; runtime compositor work is excluded."
+                                  : "Average of up to 60 completed stereo pairs. Update the OpenXR layer for capture, copy and upload stages.");
+    } else if (!flag(gpu, "gpu_supported") && number(gpu, "gpu_samples") == 0)
+        ImGui::TextWrapped("FG GPU timings: GPU timestamps unavailable or FG has not started.");
+    else ImGui::TextWrapped("FG GPU timings: waiting for a complete GPU timing sample.");
     if (ImGui::TreeNode("FG capture and presentation diagnostics")) {
         if(quad){const auto guides=member(member(snapshot,"quad_views"),"fg");
             ImGui::TextUnformatted("Frame source: Four-view OpenXR submission");

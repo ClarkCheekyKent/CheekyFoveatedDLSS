@@ -162,11 +162,16 @@ void test_ui_diagnostics() {
         "FG does not report an incompatible session as generating");
     state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":true,
         "state":"Generating frames","generated_frames":17,"cadence":{"valid":true,"unique_fps":90},
-        "performance":{"gpu_valid":true,"total_ms":2.5}}})";
+        "performance":{"supported":true,"gpu_valid":true,"total_ms":2.5,"total_last_ms":2.25},
+        "overhead":{"supported":true,"guide_samples":4,"guide_ms":0.25,"guide_last_ms":0.25,"capture_samples":4,"capture_ms":0.125,
+            "capture_last_ms":0.125,"publication_samples":0,"upload_samples":4,"upload_ms":0.5,"upload_last_ms":0.375}}})";
     text = render("DLSS-FG");
     require(text.find("Generating frames") != text.npos && text.find("Generated frames presented: 17") != text.npos &&
-        text.find("Unique output: 90.0 FPS") != text.npos && text.find("FG total GPU: 2.500 ms") != text.npos,
-        "FG reports actual presented frames, unique cadence and GPU cost");
+        text.find("Unique output: 90.0 FPS") != text.npos && text.find("FG processing subtotal") != text.npos &&
+        text.find("2.500 / 2.250") != text.npos && text.find("OpenXR uploads (per presentation)") != text.npos &&
+        text.find("Waiting for GPU samples") != text.npos && text.find("All FG GPU work") != text.npos &&
+        text.find("3.375 / 3.000") != text.npos,
+        "FG reports actual presented frames, unique cadence and every GPU stage with a total");
     require(text.find("CPU waits and pacing") != text.npos && text.find("Frame age at submission") != text.npos &&
         text.find("Copy FG diagnostic JSON") != text.npos && text.find("{\"layer_present\"") == text.npos,
         "FG diagnostics must use readable groups without dumping raw JSON");
