@@ -47,6 +47,26 @@ class RoleMapping11 {
         if(clear_manual){manual_roles={};restore_pending=true;}
         for(auto& v:value.views){v.dlss_view=v.registration_generation=0;v.verified=0;}
     }
+    // Numbers follow slots, so keep live sources in slots 1..n. A game that
+    // creates its next views before releasing the old ones (DCS mission
+    // change) would otherwise number them 5-8 and miss the saved layout.
+    // Markers and number cells encode the slot and are rebuilt after a move.
+    bool compact() {
+        bool moved{};unsigned next{};
+        for(unsigned i=0;i<count;++i){if(!sources[i].id)continue;
+            if(i!=next){sources[next]=std::move(sources[i]);sources[i]={};
+                auto& source=sources[next];source.marker.Reset();source.number_cells={};
+                std::fill(std::begin(source.cell_width),std::end(source.cell_width),0u);
+                std::fill(std::begin(source.cell_height),std::end(source.cell_height),0u);moved=true;}
+            ++next;}
+        return moved;
+    }
+    // Views the game stopped evaluating without releasing them.
+    bool evict_idle(uint64_t now) {
+        bool evicted{};
+        for(auto& source:sources)if(source.id&&now-source.last_ms>3000){source={};evicted=true;}
+        return evicted;
+    }
     void restore_saved() {
         if(!manual||!restore_pending||!saved_count)return;
         const auto present=unsigned(std::count_if(sources.begin(),sources.end(),[](const auto& s){return s.id!=0;}));
@@ -144,7 +164,8 @@ public:
             if(role)used|=1u<<role;roles[i]=role;}
         saved_roles=roles;saved_count=layout.source_count;restore_saved();return true;}
     void forget(uint64_t id,uint64_t generation){std::lock_guard lock(mutex);for(auto& source:sources)
-        if(source.id==id&&source.generation==generation){source={};invalidate(true);}}
+        if(source.id==id&&source.generation==generation){source={};invalidate(true);}
+        compact();}
     bool assign(unsigned number,unsigned role,uint64_t id,uint64_t generation) {
         std::lock_guard lock(mutex);if(!number||number>count||role>4)return false;
         const auto slot=number-1;if(sources[slot].id!=id||sources[slot].generation!=generation)return false;
@@ -160,6 +181,7 @@ public:
             uint64_t(input.x)+input.width>desc.Width||uint64_t(input.y)+input.height>desc.Height)return;
         poll();unsigned slot=count;
         for(unsigned i=0;i<count;++i)if(sources[i].id==input.dlss_view){slot=i;break;}
+        if(slot==count){const bool evicted=evict_idle(GetTickCount64());if(compact()||evicted)invalidate(true);}
         if(slot==count)for(unsigned i=0;i<count;++i)if(!sources[i].id){slot=i;break;}
         if(slot==count){slot=unsigned(std::min_element(sources.begin(),sources.end(),[](const auto& a,const auto& b){return a.last_ms<b.last_ms;})-sources.begin());}
         auto& source=sources[slot];

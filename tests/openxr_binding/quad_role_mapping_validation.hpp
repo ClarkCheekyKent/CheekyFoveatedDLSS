@@ -76,6 +76,17 @@ void quad_role_mapping_validation() {
     mapper.configure(false,false);mapper.reset();
     for(unsigned frame=200;frame<215;++frame){evaluate();postprocess(true);const auto token=mapper.capture(targets,frame);mapper.complete(token,true);Sleep(1);}
     evaluate();check(mapper.snapshot().status!=2&&mapper.snapshot().rejected>0,"Ambiguous/duplicate submitted source became a four-view mapping");
+    // Mission change: the game creates its next four views before releasing
+    // the old ones. Released views must not leave the new set numbered 5-8.
+    std::array<uint64_t,4> old_ids{};
+    for(unsigned i=0;i<4;++i){old_ids[i]=metadata[i].dlss_view;metadata[i].dlss_view=500+i;metadata[i].registration_generation=60+i;}
+    evaluate();
+    for(unsigned i=0;i<4;++i)mapper.forget(old_ids[i],source_for(old_ids[i]).registration_generation);
+    for(unsigned i=0;i<4;++i)check(source_for(metadata[i].dlss_view).number>=1&&source_for(metadata[i].dlss_view).number<=4,
+        "Recreated quad views kept numbers 5-8 after the old views were released");
+    for(unsigned frame=300;frame<380&&mapper.snapshot().status!=2;++frame){evaluate();postprocess();const auto token=mapper.capture(targets,frame);mapper.complete(token,true);Sleep(1);}
+    result=mapper.snapshot();
+    for(unsigned i=0;i<4;++i)check(result.status==2&&result.views[i].dlss_view==metadata[submitted_order[i]].dlss_view,"Recreated quad views were not re-proved after renumbering");
     context->ClearState();context->Flush();
     if(errors)for(UINT64 i=0;i<errors->GetNumStoredMessages();++i){SIZE_T size{};errors->GetMessage(i,nullptr,&size);std::vector<char> storage(size);
         auto* message=reinterpret_cast<D3D11_MESSAGE*>(storage.data());errors->GetMessage(i,message,&size);
