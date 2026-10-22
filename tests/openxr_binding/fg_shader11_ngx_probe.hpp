@@ -4,8 +4,14 @@
 
 // Opt-in isolation probe: real D3D11 DLSS SR on the render thread, native FG
 // copies/uploads/fence signals on another thread. No game or OpenXR runtime.
-inline void fg_shader11_ngx_probe(const std::filesystem::path& models,bool gated){
+inline void fg_shader11_ngx_probe(const std::filesystem::path& models,const std::string& mode){
     using namespace shader11_fixture;using namespace cheeky::fg;
+    check(mode=="gated"||mode=="ungated"||mode=="lifecycle-gated"||mode=="lifecycle-ungated"||
+        mode=="multithread"||mode=="external-context"||mode=="external-context-protected","Unknown real-NGX probe mode");
+    const bool gated=mode!="ungated"&&mode!="multithread";
+    const bool churn_features=mode.find("lifecycle-")==0,gate_lifecycle=mode!="lifecycle-ungated";
+    const bool external_context=mode.find("external-context")==0;
+    const bool protect_evaluation=mode=="multithread"||mode=="external-context-protected";
     check(std::filesystem::exists(models/L"nvngx_dlss.dll"),"NGX probe requires a directory containing nvngx_dlss.dll");
     check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,D3D11_CREATE_DEVICE_BGRA_SUPPORT,
         nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"NGX probe hardware device");
@@ -58,12 +64,37 @@ inline void fg_shader11_ngx_probe(const std::filesystem::path& models,bool gated
             Sleep(1);
         }
     });
+    ComPtr<ID3D11Fence> external_fence;std::atomic<unsigned> external_signals{};
+    std::jthread external;
+    if(external_context){
+        check(SUCCEEDED(device5->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&external_fence))),"NGX probe external fence");
+        external=std::jthread([&](std::stop_token stop){while(!stop.stop_requested()){
+            {Backend11::Guard lock(backend.protection.Get());
+                if(FAILED(context4->Signal(external_fence.Get(),++external_signals))){failed=true;return;}
+                context->Flush();}
+            Sleep(1);
+        }});
+    }
+    unsigned lifecycle_count{};
     NVSDK_NGX_D3D11_DLSS_Eval_Params evaluate{};evaluate.Feature.pInColor=color.Get();evaluate.pInDepth=depth.Get();evaluate.pInMotionVectors=motion.Get();
     evaluate.InRenderSubrectDimensions={input_size,input_size};evaluate.InMVScaleX=evaluate.InMVScaleY=1;
     evaluate.InPreExposure=evaluate.InExposureScale=1;evaluate.InFrameTimeDeltaInMsec=16.67f;
     for(unsigned frame=0;frame<1500&&!failed;++frame){
+        if(churn_features&&frame%25==0){
+            // An unused feature has no in-flight evaluations or output lifetime
+            // dependency. Vary its dimensions so NGX cannot alias either eye.
+            std::unique_lock lock(gate,std::defer_lock);if(gate_lifecycle)lock.lock();
+            auto temporary_create=create;temporary_create.Feature.InTargetWidth+=16;
+            NVSDK_NGX_Handle* temporary{};
+            check(NVSDK_NGX_SUCCEED(NGX_D3D11_CREATE_DLSS_EXT(context.Get(),&temporary,ngx.params,&temporary_create)),
+                "Real NGX concurrent feature creation");
+            check(temporary&&temporary!=ngx.features[0]&&temporary!=ngx.features[1],"NGX lifecycle probe distinct feature");
+            check(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_ReleaseFeature(temporary)),"Real NGX concurrent feature release");
+            ++lifecycle_count;
+        }
         for(unsigned eye=0;eye<2;++eye){
             std::unique_lock lock(gate,std::defer_lock);if(gated)lock.lock();
+            std::optional<Backend11::Guard> context_lock;if(protect_evaluation)context_lock.emplace(backend.protection.Get());
             evaluate.Feature.pInOutput=output[eye].Get();evaluate.InReset=frame==0;
             const auto result=NGX_D3D11_EVALUATE_DLSS_EXT(context.Get(),ngx.features[eye],ngx.params,&evaluate);
             if(NVSDK_NGX_FAILED(result)){failed=true;std::cout<<"NGX evaluation failed: 0x"<<std::hex<<unsigned(result)<<std::dec<<'\n';break;}
@@ -71,11 +102,14 @@ inline void fg_shader11_ngx_probe(const std::filesystem::path& models,bool gated
         if(frame%250==0)std::cout<<"Real NGX frames="<<frame<<" concurrent uploads="<<copies.load()<<" gate="<<gated<<'\n';
         Sleep(4);
     }
+    external.request_stop();if(external.joinable())external.join();
     presenter.request_stop();presenter.join();
     const auto final_value=std::uint64_t(copies.load())+1;
     check(SUCCEEDED(context4->Signal(fence.Get(),final_value)),"NGX probe final signal");context->Flush();
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(15);
     while(fence->GetCompletedValue()<final_value&&std::chrono::steady_clock::now()<deadline)Sleep(1);
     check(!failed&&copies>0&&fence->GetCompletedValue()>=final_value,"Real NGX and background native uploads complete");
-    std::cout<<"PASS real D3D11 NGX SR + native presenter: 3000 evaluations, "<<copies.load()<<" uploads, gate="<<gated<<'\n';
+    std::cout<<"PASS real D3D11 NGX SR + native presenter: 3000 evaluations, "<<copies.load()<<" uploads, gate="<<gated
+        <<" feature_lifecycles="<<lifecycle_count<<" lifecycle_gate="<<gate_lifecycle
+        <<" external_signals="<<external_signals.load()<<" evaluation_context_lock="<<protect_evaluation<<'\n';
 }

@@ -1075,7 +1075,8 @@ int main(int argc,char** argv) {
         if(argc>1&&std::string(argv[1])=="--fg-shader11-hardware") {fg_shader11_validation(true);return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shader11-ngx") {
             check(argc>2,"--fg-shader11-ngx requires the DLSS model DLL directory");
-            fg_shader11_ngx_probe(argv[2],argc<4||std::string(argv[3])!="ungated");return 0;}
+            const std::string mode=argc<4?"gated":argv[3];
+            fg_shader11_ngx_probe(argv[2],mode);return 0;}
         if(argc>1&&std::string(argv[1])=="--quad-capture") {quad_capture_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--quad-d3d11") {quad_capture_d3d11_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--quad-roles") {quad_role_mapping_validation();return 0;}
