@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgPacingClock", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -649,6 +649,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 elseif draft.FgWaitForCompletion ~= nil then
                     check("Wait for FG completion before next frame", "FgWaitForCompletion")
                     text("A/B test: holds the next native frame until both FG eyes finish. May reduce FPS.")
+                end
+                if draft.FgPacingClock ~= nil then
+                    combo("FG pacing clock", "FgPacingClock", {
+                        [0]="Independent display clock", [1]="Follow presented frames", [2]="Follow presented frames + vsync lock"})
+                    if draft.FgPacingClock ~= 0 then
+                        text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
+                    end
                 end
                 if draft.FgSubmitRepeats ~= nil then
                     check("Submit repeat frames", "FgSubmitRepeats")
