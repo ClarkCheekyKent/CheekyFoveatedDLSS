@@ -20,13 +20,15 @@ struct FocusPipeline {
     struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};unsigned shading_mode{1};};
     DXGI_FORMAT color_format{DXGI_FORMAT_R16G16B16A16_FLOAT};
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> prepare,peripheral,peripheral_coarse,peripheral_coarse2,peripheral_coarse4,peripheral_blocks,peripheral_blocks2,peripheral_blocks4,compose,pack,recenter;
+    ComPtr<ID3D12PipelineState> prepare,peripheral,center_shader,peripheral_coarse,peripheral_coarse2,peripheral_coarse4,peripheral_blocks,peripheral_blocks2,peripheral_blocks4,compose,pack,recenter;
     std::array<bool,2> coarse_output{};
     ComPtr<ID3D12DescriptorHeap> descriptors;
     unsigned stride{};
     FocusInput inputs[2][2]; // eye, center/full or periphery
     ComPtr<ID3D12Resource> peripheral_output[2],full[2],previous_depth[2];
     bool history[2]{};
+    ComPtr<ID3D12Resource> center_output[2],previous_center_depth[2];
+    bool center_history[2]{};
     std::array<CompactLayout,2> color_layouts,previous_layouts;
     bool initialize(ID3D12Device*);
     bool prepare_inputs(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,unsigned pass,
@@ -41,11 +43,12 @@ struct FocusPipeline {
         ID3D12Resource* previous,ID3D12Resource* current,const CheekyFgEye&,const Camera&,
         D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
         ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON,
-        const CompactLayout* destination_layout=nullptr,const FinalOutput* final_output=nullptr);
+        const CompactLayout* destination_layout=nullptr,const FinalOutput* final_output=nullptr,
+        const FocusRect* center_region=nullptr);
     bool compose_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect&,unsigned width,unsigned height,
         ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON);
-    bool save_depth(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye);
+    bool save_depth(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,unsigned pass=1);
     bool pack_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,ID3D12Resource* center,ID3D12Resource* context,
         ID3D12Resource* destination,D3D12_RESOURCE_STATES,const CompactLayout&,bool center_direct,bool context_direct);
     void reset() noexcept;

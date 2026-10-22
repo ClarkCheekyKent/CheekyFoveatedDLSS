@@ -58,7 +58,7 @@ struct Worker {
     TimingAverage completion_wait;
     TimingClock::time_point submitted_at{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};unsigned width{},height{};
-    bool configured{};
+    bool configured{},ngx_required{true};
     ComPtr<ID3D12Device> probed_device;
     bool probe_attempted{}, capability_ready{}, failed{};
     char diagnostic[384]{"NGX capability has not been checked"};
@@ -69,7 +69,7 @@ struct Worker {
     bool wait_idle() noexcept;
     bool wait_fence(std::uint64_t value) noexcept;
     void reset() noexcept;
-    bool initialize(ID3D12Device*,ID3D12CommandQueue*,unsigned,unsigned,DXGI_FORMAT) noexcept;
+    bool initialize(ID3D12Device*,ID3D12CommandQueue*,unsigned,unsigned,DXGI_FORMAT,bool require_ngx=true) noexcept;
     static bool record_output_copies(ID3D12GraphicsCommandList*,const std::array<ID3D12Resource*,2>&,
                                     const std::array<OutputCopy,2>&) noexcept;
     // prev and current are both retained by caller; each call records a 2x

@@ -296,3 +296,28 @@ calibration-setting change; continuous mode continues verifying markers.
 **Use lower DLSS hook (DX12)** is enabled by default. Cheeky processes DLSS at the feature runtime, leaving upstream core and Streamline calls intact. Turn it off to use the higher call (the previous outermost-interception path). The control is in the DLSS-SR panel for standalone/UEVR and beside the processing-path controls in ReShade.
 
 The saved setting is `D3D12LowerHook=true` (`false` selects higher). Restart the game after changing it; the active path remains unchanged until restart so existing feature handles and histories keep their owner. The runtime snapshot reports `d3d12_lower_hook_active` and `d3d12_hook_restart_required`. If the lower runtime cannot be identified or hooked, its path leaves game DLSS unchanged; it does not automatically switch to higher processing.
+
+
+## Shader frame generation
+
+The FG center method can be **DLSS**, **Simple motion-vector warping**, or
+**Bidirectional interpolation** (`FgCenterMethod=0`, `1`, or `2`). The periphery
+method remains independent. DLSS is the default center method.
+
+For D3D11 OpenXR stereo and D3D11 quad views, choosing shader methods for both
+regions selects native D3D11 capture, guide history and final-image rendering.
+This path creates no D3D12 device or bridge and does not query DLSS-G capability.
+Choosing DLSS for either active region retains the D3D12 processing path. The
+separate DX11-to-DX12 SR transport option still applies if explicitly enabled.
+
+These methods need captured game inputs: simple warping uses motion vectors and
+previous/current color; bidirectional interpolation also uses depth history and
+camera reprojection. The existing NGX-SR guide source remains necessary. Stereo
+uses calibrated per-eye source crops; quad views require all four assigned views.
+Missing or ambiguous guides keep native presentation.
+
+Native D3D11 writes directly into acquired final OpenXR images, using a compute
+shader where writable UAV views are supported and a pixel shader for render-target
+images, including BGRA and sRGB. It serializes native/generated presentation and
+keeps full-eye guide history. DX12 queue, compact-storage and upload experiments
+do not apply to this path. Replace both the runtime and OpenXR layer together.

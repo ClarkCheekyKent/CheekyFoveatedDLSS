@@ -697,7 +697,7 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
         if (!attachment || !adapter_attached.load() || attachment != active_attachment.load()) return;
         configure_graphics(s, renderer, device, queue);
         fg_set_uevr_queue(renderer == 1 ? static_cast<ID3D12CommandQueue*>(queue) : nullptr);
-        if(!current_settings().fg.enabled)retire_d3d11_fg_transport();
+        if(!fg_requires_d3d12(current_settings()))retire_d3d11_fg_transport();
         if (!s.graphics_ready || renderer != 1) {
             const float empty[2][16]{};
             publish_afw_stereo_projection(empty, 0, 0, false);

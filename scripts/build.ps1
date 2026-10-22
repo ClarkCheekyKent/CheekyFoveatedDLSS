@@ -53,6 +53,7 @@ $buildTarget = if ($SkipTests) {
 & $msbuild `
     (Join-Path $projectRoot "CheekyFoveatedDLSS.sln") `
     /m `
+    /nr:false `
     /nologo `
     /verbosity:minimal `
     $buildTarget `
@@ -88,6 +89,8 @@ foreach ($gazeMode in @('--manual-gaze', '--openxr-independent-on', '--openxr-in
 if ($LASTEXITCODE -ne 0) { throw "OpenXR binding and pointer regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-gpu-validation
 if ($LASTEXITCODE -ne 0) { throw "FG OpenXR image state and software GPU copy regressions failed." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-shader11
+if ($LASTEXITCODE -ne 0) { throw "Native D3D11 shader frame generation regressions failed." }
 & $testExecutable --calibration-search
 if ($LASTEXITCODE -ne 0) { throw "Calibration locator scale and ambiguity regressions failed." }
 & $testExecutable --libovr-policy

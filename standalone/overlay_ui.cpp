@@ -811,10 +811,11 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     }
     if(quad&&settings.fg.peripheral_method>2)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
+    const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable DLSS Frame Generation (2x)", &s.enabled);
     test_control("FgEnabled");
-    ImGui::TextWrapped(quad?"Experimental D3D11 quad views: DLSS-G processes the center, with a cheaper peripheral method. Requires all four view assignments and matching OpenXR support.":
+    ImGui::TextWrapped(quad?"Experimental D3D11 quad views: the selected FG method processes the center, with a cheaper peripheral method. Requires all four view assignments and matching OpenXR support.":
         "Experimental. Requires a D3D11 or D3D12 OpenXR stereo session and the matching Cheeky OpenXR support. Changes save automatically.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
@@ -830,10 +831,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     }
     if(quad)ImGui::TextWrapped("The layer captures depth and motion from all four assigned views before reuse, then assembles full-eye guides at quad submission. Missing or ambiguous captures keep native presentation.");
     else ImGui::TextWrapped("Standalone matches exactly one submitted stereo guide pair at xrEndFrame. Native frames continue when guides are missing or ambiguous. OpenVR, LibOVR and desktop presentation are not supported by this FG presenter.");
-    if(dx11&&!quad)ImGui::TextWrapped("D3D11 / OpenComposite: FG uses DX12 transport automatically while enabled. The game and OpenXR session remain D3D11. Direct OpenXR output uses the compact bridge path.");
+    if(dx11&&!quad)ImGui::TextWrapped("D3D11 / OpenComposite: shader methods in both regions use native D3D11. Selecting DLSS for either region requires DX12 transport.");
     if (!s.enabled) return;
 
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
+    combo("FG center method", s.center_method,
+        "DLSS\0Simple motion-vector warping\0Bidirectional interpolation\0");
+    if(s.center_method)ImGui::TextWrapped("Shader FG uses captured motion vectors and color history; bidirectional interpolation also uses depth history. With shader methods in both regions, D3D11 writes directly into the final OpenXR images.");
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
     ImGui::Checkbox("Foveated frame generation", &s.foveated);
@@ -856,11 +860,14 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         combo("FG periphery method", s.peripheral_method,
             quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0":"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0");
         if(quad)ImGui::TextWrapped("The center region follows the submitted quad-view FOV. A peripheral DLSS-G pass is not used.");
+        if(!native_shader11()){
         int depth = s.depth_bits == 16 ? 0 : 1, motion = s.motion_bits == 16 ? 0 : 1;
         if (ImGui::Combo("FG depth precision", &depth, "16-bit\0" "32-bit\0")) s.depth_bits = depth ? 32 : 16;
         if (ImGui::Combo("FG motion precision", &motion, "16-bit\0" "32-bit\0")) s.motion_bits = motion ? 32 : 16;
+        }
     }
-    if (ImGui::TreeNode("FG scheduling and storage")) {
+    if(native_shader11())ImGui::TextWrapped("Native D3D11 uses serialized native/generated presentation and full-eye 32-bit guide history. DX12 queue, storage and upload experiments do not apply.");
+    if (!native_shader11()&&ImGui::TreeNode("FG scheduling and storage")) {
         combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         combo("Release game rendering", s.release_point,
@@ -1058,7 +1065,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 diagnostic_line(r.snapshot, "NVIDIA DLSS override", "nvidia_override_status");
                 if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shows observed NVIDIA cached DLSS runtime use, including overrides and automatic updates.");
                 if (std::string_view(renderer) != "Vulkan") {
-                    ImGui::Text("Configured DX11 path: %s", r.draft.fg.enabled ? "DX12 transport (required by FG)" : r.draft.d3d11_use_d3d12_transport ? "DX12 transport" : "DX11 direct");
+                    ImGui::Text("Configured DX11 path: %s", fg_requires_d3d12(r.draft) ? "DX12 transport (required by DLSS FG)" : r.draft.d3d11_use_d3d12_transport ? "DX12 transport" : "DX11 direct");
                     const auto active_hook = member(r.snapshot, "d3d12_lower_hook_active");
                     ImGui::Text("Active DLSS hook: %s", active_hook.empty() ? "Waiting for runtime" : active_hook == "true" ? "Lower" : "Higher");
                     if (member(r.snapshot, "d3d12_hook_restart_required") == "true")

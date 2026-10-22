@@ -25,7 +25,16 @@ class QuadFg11 {
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out)override{if(!out)return E_POINTER;*out=nullptr;
             if(id!=__uuidof(IUnknown))return E_NOINTERFACE;*out=static_cast<IUnknown*>(this);AddRef();return S_OK;}
         ULONG STDMETHODCALLTYPE AddRef()override{return ++refs;}ULONG STDMETHODCALLTYPE Release()override{const auto n=--refs;if(!n)delete this;return n;}};
-    Ptr<ID3D11Device> device;Ptr<ID3D11DeviceContext> context,commands;Ptr<ID3D11Multithread> protection;
+    Ptr<ID3D11Device> device;Ptr<ID3D11DeviceContext> context;Ptr<ID3D11Multithread> protection;
+    // Commands go straight to the game's immediate context inside our own
+    // ID3DDeviceContextState (no deferred contexts / command lists): the NVIDIA
+    // driver crashed on its worker thread with quad views + FG, and this
+    // FG-only work was recorded on a deferred context.
+    Ptr<ID3D11DeviceContext1> context1;Ptr<ID3DDeviceContextState> state;
+    // Caller holds Guard. Swaps our pipeline state in for the scope's lifetime.
+    struct StateScope {QuadFg11& owner;Ptr<ID3DDeviceContextState> previous;
+        explicit StateScope(QuadFg11& o):owner(o){owner.context1->SwapDeviceContextState(owner.state.Get(),&previous);}
+        ~StateScope(){owner.context1->SwapDeviceContextState(previous.Get(),nullptr);}};
     Ptr<ID3D11ComputeShader> snapshot_shader,atlas_shader;Ptr<ID3D11Buffer> constants;
     std::mutex mutex;std::atomic<bool> enabled{},atlas_ready{};
     std::array<Source,8> sources;std::array<std::shared_ptr<Frame>,4> frames;
@@ -58,8 +67,10 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
  OutDepth[id.xy]=depth;OutMotion[id.xy]=float4(mv,0,0);
 })";
     bool prepare(){
-        if(snapshot_shader&&atlas_shader&&commands&&constants)return true;
-        if(!commands&&FAILED(device->CreateDeferredContext(0,&commands)))return false;
+        if(snapshot_shader&&atlas_shader&&state&&constants)return true;
+        if(!state){Ptr<ID3D11Device1> device1;const auto level=device->GetFeatureLevel();
+            if(FAILED(context.As(&context1))||FAILED(device.As(&device1))||
+               FAILED(device1->CreateDeviceContextState(0,&level,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),nullptr,&state)))return false;}
         for(unsigned i=0;i<2;++i){auto& shader=i?atlas_shader:snapshot_shader;if(shader)continue;Ptr<ID3DBlob> code;
             if(FAILED(D3DCompile(shaders,sizeof(shaders)-1,nullptr,nullptr,nullptr,i?"Atlas":"Snapshot","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,nullptr))||
                 FAILED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shader)))return false;}
@@ -86,7 +97,9 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         }
         p.width=w;p.height=h;return true;
     }
+    // Caller holds a StateScope.
     bool record(ID3D11ComputeShader* shader,const Constants& c,const std::array<ID3D11ShaderResourceView*,4>& srvs,Pair11& target){
+        auto* commands=context.Get();
         commands->UpdateSubresource(constants.Get(),0,nullptr,&c,0,0);auto* cb=constants.Get();
         commands->CSSetShader(shader,nullptr,0);commands->CSSetConstantBuffers(0,1,&cb);commands->CSSetShaderResources(0,4,srvs.data());
         ID3D11UnorderedAccessView* uavs[]{target.depth_uav.Get(),target.motion_uav.Get()};commands->CSSetUnorderedAccessViews(0,2,uavs,nullptr);
@@ -95,9 +108,57 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         commands->CSSetShaderResources(0,4,empty);commands->CSSetUnorderedAccessViews(0,2,empty_uav,nullptr);
         return true;
     }
-    bool execute(){Ptr<ID3D11CommandList> list;if(FAILED(commands->FinishCommandList(FALSE,&list)))return false;
-        context->ExecuteCommandList(list.Get(),TRUE);return SUCCEEDED(device->GetDeviceRemovedReason());}
+    bool execute(){return SUCCEEDED(device->GetDeviceRemovedReason());}
 public:
+    struct NativeResult {
+        std::array<Ptr<ID3D11Texture2D>,2> depth,motion;
+        std::array<Ptr<ID3D11ShaderResourceView>,2> depth_srv,motion_srv;
+        std::array<CheekyFgEye,2> meta;
+        bool valid{};
+    };
+    NativeResult build_native(const CheekyQuadViewsV1& roles,const XrCompositionLayerProjection& projection,
+        const std::array<std::array<float,4>,2>& insets) {
+        NativeResult result;if(!enabled||!protection||roles.status!=2||!roles.active)return result;
+        Guard guard(protection.Get());std::lock_guard lock(mutex);
+        std::array<Source*,4> selected{};
+        for(unsigned i=0;i<4;++i){const auto& role=roles.views[i];
+            for(auto& source:sources)if(source.id==role.dlss_view&&source.generation==role.registration_generation)selected[i]=&source;
+            const auto* source=selected[i];
+            if(!source||source->interval!=interval||source->evaluations!=1||
+                source->metadata.meta.width!=unsigned(projection.views[i].subImage.imageRect.extent.width)||
+                source->metadata.meta.height!=unsigned(projection.views[i].subImage.imageRect.extent.height))return result;
+            if(i&&(source->metadata.meta.configuration!=selected[0]->metadata.meta.configuration||
+                source->metadata.meta.depth_inverted!=selected[0]->metadata.meta.depth_inverted))return result;
+        }
+        auto configuration=selected[0]->metadata.meta.configuration^roles.revision;
+        std::array<Pair11,2> target;
+        for(unsigned eye=0;eye<2;++eye){const auto& inset=insets[eye];
+            for(float value:inset)if(!std::isfinite(value))return result;
+            if(inset[2]<=0||inset[3]<=0||inset[0]<0||inset[1]<0||inset[0]+inset[2]>1.001f||inset[1]+inset[3]>1.001f)return result;
+            const unsigned w=std::max(selected[eye]->image.width,unsigned(std::ceil(selected[eye+2]->image.width/inset[2]))),
+                h=std::max(selected[eye]->image.height,unsigned(std::ceil(selected[eye+2]->image.height/inset[3])));
+            if(w>16384||h>16384||!allocate(target[eye],w,h))return result;
+            configuration=(configuration^w^(uint64_t(h)<<32))*1099511628211ull;
+            for(float value:inset)configuration=(configuration^std::bit_cast<unsigned>(value))*1099511628211ull;
+            for(unsigned part:{eye,eye+2})configuration=(configuration^selected[part]->id^selected[part]->generation)*1099511628211ull;
+        }
+        const bool reset=configuration!=last_configuration||last_built_interval+1!=interval;
+        if(!prepare())return result;
+        {StateScope scope{*this};
+        for(unsigned eye=0;eye<2;++eye){const auto& outer=selected[eye]->image;const auto& center=selected[eye+2]->image;
+            Constants c;c.size[0]=target[eye].width;c.size[1]=target[eye].height;std::copy(insets[eye].begin(),insets[eye].end(),c.inset);
+            record(atlas_shader.Get(),c,{outer.depth_srv.Get(),outer.motion_srv.Get(),center.depth_srv.Get(),center.motion_srv.Get()},target[eye]);
+            auto& g=result.meta[eye];g=selected[eye+2]->metadata.meta;g.depth=g.motion=g.peripheral_depth=g.peripheral_motion=nullptr;
+            g.focus_width=insets[eye][2];g.focus_height=insets[eye][3];
+            g.focus_x=insets[eye][0]+g.focus_width*.5f-.5f;g.focus_y=insets[eye][1]+g.focus_height*.5f-.5f;
+            g.focus_feather=2.f/std::min(target[eye].width,target[eye].height);g.configuration=configuration;
+            g.reset=reset||selected[eye]->metadata.meta.reset||selected[eye+2]->metadata.meta.reset;
+            result.depth[eye]=target[eye].depth;result.motion[eye]=target[eye].motion;
+            result.depth_srv[eye]=target[eye].depth_srv;result.motion_srv[eye]=target[eye].motion_srv;
+        }}
+        if(!execute())return {};
+        last_configuration=configuration;last_built_interval=interval;result.valid=true;atlas_ready=true;++diagnostics.guide_pairs;return result;
+    }
     struct Result {CheekyFgPair pair;Ptr<IUnknown> lease;};
     explicit QuadFg11(ID3D11Device* d):device(d){device->GetImmediateContext(&context);context.As(&protection);
         if(protection)protection->SetMultithreadProtected(TRUE);}
@@ -135,7 +196,8 @@ public:
         if(g.motion_jittered){if(!reset&&source->metadata.meta.motion_jittered){
             c.jitter[0]=(source->metadata.meta.jitter_x-g.jitter_x)/g.motion_width;c.jitter[1]=(source->metadata.meta.jitter_y-g.jitter_y)/g.motion_height;
         }else reset=true;}
-        diagnostics.capture_stage=7;record(snapshot_shader.Get(),c,{ds.Get(),ms.Get(),nullptr,nullptr},source->image);if(!execute())return false;
+        diagnostics.capture_stage=7;{StateScope scope{*this};record(snapshot_shader.Get(),c,{ds.Get(),ms.Get(),nullptr,nullptr},source->image);}
+        if(!execute())return false;
         source->evaluations=source->interval==interval?source->evaluations+1:1;
         source->id=g.feature;source->generation=input.generation;source->interval=interval;source->metadata=input;
         source->metadata.meta.reset=reset;diagnostics.capture_stage=8;++diagnostics.snapshots;return true;
@@ -170,6 +232,8 @@ public:
             for(const auto f:inset)configuration=(configuration^std::bit_cast<unsigned>(f))*1099511628211ull;
         }
         bool reset=configuration!=last_configuration||last_built_interval+1!=interval;
+        if(!prepare())return result;
+        {StateScope scope{*this};
         for(unsigned eye=0;eye<2;++eye){auto& target=frame->image[eye];const auto& outer=selected[eye]->image;const auto& center=selected[eye+2]->image;
             Constants c;c.size[0]=target.width;c.size[1]=target.height;std::copy(insets[eye].begin(),insets[eye].end(),c.inset);
             record(atlas_shader.Get(),c,{outer.depth_srv.Get(),outer.motion_srv.Get(),center.depth_srv.Get(),center.motion_srv.Get()},target);
@@ -181,7 +245,7 @@ public:
             g.focus_feather=2.f/std::min(widths[eye],heights[eye]);
             g.peripheral_method=std::min(g.peripheral_method,2u);g.peripheral_depth=g.peripheral_motion=nullptr;
             g.reset=reset||selected[eye]->metadata.meta.reset||selected[eye+2]->metadata.meta.reset;g.configuration=configuration;
-        }
+        }}
         diagnostics.assembly_stage=3;if(!execute()||!bridge.from11())return {};
         last_configuration=configuration;last_built_interval=interval;const auto token=(++serial)*2;
         auto& pair=result.pair;pair.capture_token=token;pair.render_frame=serial;pair.producer_queue=bridge.queue.Get();

@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -594,6 +594,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
             end
             if draft.FgEnabled then
+                if draft.FgCenterMethod ~= nil then
+                    combo("FG center method", "FgCenterMethod", {[0]="DLSS", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation"})
+                end
+                local native_shader11 = status and status.renderer == 0 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) < 3)
+                if native_shader11 then
+                    text("Native D3D11: shader FG writes directly to OpenXR. Uses serialized presentation and full-eye 32-bit guide history.")
+                else
                 if draft.FgDiagnosticMode ~= nil then
                     section("Stereo NGX diagnostic mode")
                     combo("FG diagnostic mode", "FgDiagnosticMode", {
@@ -699,6 +706,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgLatencyDiagnostics ~= nil then
                     combo("FG latency diagnostics", "FgLatencyDiagnostics", {[0]="Off", [1]="Calibrated timeline (1 in 17 jobs)"})
                 end
+                end -- DX12 scheduling/storage experiments
                 if draft.FgResolutionPercent ~= nil then
                     combo("FG scale", "FgResolutionPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                 end
@@ -725,8 +733,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     if draft.FgPeripheralPercent ~= nil then
                         combo("FG periphery scale", "FgPeripheralPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                         combo("FG periphery method", "FgPeripheralMethod", {[0]="None (previous frame)", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS"})
+                        if not native_shader11 then
                         combo("FG periphery depth", "FgDepthBits", {[16]="16-bit", [32]="32-bit"})
                         combo("FG periphery motion", "FgMotionBits", {[16]="16-bit", [32]="32-bit"})
+                        end
                     end
                     text("FG scale controls center resolution; matching controls the center region only.")
                     text("Unsupported guides preserve native frames; see status.")

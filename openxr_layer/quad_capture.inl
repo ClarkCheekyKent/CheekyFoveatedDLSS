@@ -176,7 +176,9 @@ XrResult quad_capture_locate(XrSession session,const XrViewLocateInfo* info,XrVi
 
 XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dispatch& dispatch,
     const std::shared_ptr<cheeky::quad_capture::Compositor>& compositor,
-    const std::shared_ptr<cheeky::fg::BufferedPresenter>& presenter={}) {
+    const std::shared_ptr<cheeky::fg::Presenter>& active_presenter={}) {
+    const auto presenter=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(active_presenter);
+    const auto native11=presenter&&presenter->native11?presenter:nullptr;
     struct FinishInterval{cheeky::quad_capture::QuadFg11* guides;~FinishInterval(){if(guides)guides->finish();}};
     FinishInterval interval{compositor->d3d11?compositor->d3d11->fg_guides.get():nullptr};
     if(!info||(info->layerCount&&!info->layers))return XR_ERROR_VALIDATION_FAILURE;
@@ -255,7 +257,26 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
         auto probe=eleven.fg_guides->build(roles,projection,widths,heights,insets,*eleven.fg_bridge);
         if(probe.pair.capture_token&&!was_ready)log_startup("QUAD-FG four-view guide preflight ready; presentation eligible at next frame boundary\n");
     }
-    if(presenter&&compositor->d3d11&&presenter->interop11){
+    if(native11&&compositor->d3d11){
+        // Native D3D11 shader FG: full-eye guide atlases, composed eye colors,
+        // then the shared buffered pacing. No D3D12 bridge.
+        auto& eleven=*compositor->d3d11;auto roles=eleven.mapping->snapshot();roles.active=1;
+        std::array<std::array<float,4>,2> insets;
+        for(unsigned eye=0;eye<2;++eye)insets[eye]=cheeky::quad_capture::inset_rect(corrected[eye].fov,corrected[eye+2].fov);
+        auto guides=eleven.fg_guides->build_native(roles,projection,insets);
+        if(guides.valid)for(unsigned eye=0;eye<2;++eye){
+            auto meta=guides.meta[eye];meta.focus_feather=2.f/std::max(1u,std::min(compositor->recommended[eye].recommendedImageRectWidth,
+                compositor->recommended[eye].recommendedImageRectHeight));
+            native11->native11->adopt_quad_guides(eye,guides.depth[eye].Get(),guides.motion[eye].Get(),
+                guides.depth_srv[eye].Get(),guides.motion_srv[eye].Get(),meta);
+        }
+        std::array<XrSwapchain,4> sources{};for(unsigned i=0;i<4;++i)sources[i]=inputs[i].image.swapchain;
+        native11->set_quad_sources11(sources);
+        eleven.capture_output=[&](unsigned,XrSwapchain chain,unsigned,ID3D11Texture2D* texture,unsigned,unsigned,DXGI_FORMAT format){
+            native11->capture_composed11(chain,texture,format);};
+        result=compositor->compose(inputs,projection,views);eleven.capture_output={};
+        if(result==XR_SUCCESS)result=native11->end_frame(&forwarded,{},&replacement);
+    }else if(presenter&&compositor->d3d11&&presenter->interop11){
         auto& eleven=*compositor->d3d11;auto roles=eleven.mapping->snapshot();roles.active=1;
         std::array<unsigned,2> widths{},heights{};
         for(unsigned eye=0;eye<2;++eye){widths[eye]=compositor->recommended[eye].recommendedImageRectWidth;heights[eye]=compositor->recommended[eye].recommendedImageRectHeight;
@@ -311,7 +332,13 @@ extern "C" __declspec(dllexport) uint32_t __cdecl CheekyQuad_GetViewsV1(CheekyQu
 extern "C" __declspec(dllexport) void* __cdecl CheekyQuad_AcquireD3D11V1(void* context) noexcept {
     if(!context)return nullptr;
     Microsoft::WRL::ComPtr<ID3D11Device> device;static_cast<ID3D11DeviceContext*>(context)->GetDevice(&device);
-    if(!quad_role_owner(nullptr,device.Get()))return nullptr;
+    // Keep the existing ABI name, but protect stereo FG too (ACC has no quad
+    // compositor). Never wait for the dispatch gate while holding state_mutex.
+    bool active{};
+    {std::lock_guard lock(state_mutex);
+        for(const auto& [handle,owner]:sessions)if(owner.running&&owner.graphics_api==11&&
+            owner.graphics_device==device.Get()&&(owner.quad_capture||owner.fg)){active=true;break;}}
+    if(!active)return nullptr;
     auto& dispatch=cheeky::quad_capture::d3d11_dispatch_mutex;dispatch.lock();return &dispatch;
 }
 extern "C" __declspec(dllexport) void __cdecl CheekyQuad_ReleaseD3D11V1(void* ticket) noexcept {

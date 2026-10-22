@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_transport.hpp"
+#include "fg_backend11.hpp"
 #include "fg_burst_capture.hpp"
 #include "fg_native_submission_math.hpp"
 #include "../src/d3d12_native.hpp"
@@ -60,13 +61,14 @@ struct BufferedPresenter final : Presenter {
             guides.lease=nullptr;guides.producer_queue=nullptr;
         }
         void clear_guides() noexcept {guides={};guide_depth={};guide_motion={};peripheral_depth={};peripheral_motion={};
-            guide_lease.Reset();guide_sync_fence.Reset();guide_sync_value=0;}
+            guide_lease.Reset();guide_sync_fence.Reset();guide_sync_value=0;guides11={};}
         bool guides_valid{};
         CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
         unsigned source_depth{},source_motion{};
         std::uint64_t guide_token{};
         std::uint64_t source_configuration{}; // Survives release of guide textures.
         std::uint64_t render_frame{};
+        std::array<std::shared_ptr<Backend11::Guides>,2> guides11; // Native D3D11 backend only.
     };
     struct Pair {
         std::uint64_t native_id{},current_id{},ready{};
@@ -110,7 +112,16 @@ struct BufferedPresenter final : Presenter {
         std::uint64_t uploaded{}; // Content identity; GPU contexts retain sources only until their upload fence.
         unsigned last_uploaded_index{UINT32_MAX}; // Last image released to OpenXR for this chain.
         bool direct_writable{},linear_color{};
+        std::vector<XrSwapchainImageD3D11KHR> images11; // Native D3D11 backend; desc then holds width/height/format.
     };
+    // Native D3D11 backend: replaces the D3D11->D3D12 bridge, transports and
+    // NGX worker for shader-only methods. All pacing below is shared.
+    std::shared_ptr<Backend11> native11;
+    std::recursive_mutex* dispatch_mutex11() const noexcept override {
+        return native11?native11->dispatch:Presenter::dispatch_mutex11();
+    }
+    std::array<XrSwapchain,4> quad_sources11{}; // Raw quad planes (capture_mutex); only composed eyes are captured.
+    bool capture_completed(std::uint64_t ready) const {return native11||producer.completed(ready);}
     std::condition_variable_any changed;
     std::mutex capture_mutex;
     std::thread presentation_thread,generation_thread,pacing_thread;
@@ -198,7 +209,7 @@ struct BufferedPresenter final : Presenter {
         // Hold mx. Only the slot itself owns these completed jobs; pending and
         // worker/history users retain the Native, and ready/upload users retain
         // their Images independently. Do not let an unused lease pin old pixels.
-        for(auto& slot:slots)if(slot&&slot.use_count()==1&&producer.completed(slot->ready)){
+        for(auto& slot:slots)if(slot&&slot.use_count()==1&&capture_completed(slot->ready)){
             slot->color={};slot->color_ready={};slot->auxiliary.clear();slot->clear_guides();
         }
     }
@@ -365,6 +376,81 @@ struct BufferedPresenter final : Presenter {
         }
         return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
     }
+    // Shader-only methods on a D3D11 application: same pacing, native D3D11
+    // GPU stages, no D3D12 device or bridge.
+    bool setup11(XrSession s,const XrFns& f,ID3D11Device* dev,std::uint64_t generation,std::recursive_mutex* dispatch) noexcept {
+        if(!dev||!f.create||!f.enumerate||!f.acquire||!f.wait_image||!f.release||!f.wait_frame||!f.begin_frame||!f.end_frame)return false;
+        auto backend=std::make_shared<Backend11>();
+        if(!backend->initialize(dev,generation,dispatch)){strcpy_s(diagnostic,backend->diagnostic);return false;}
+        xr=f;session=s;native11=std::move(backend);
+        strcpy_s(diagnostic,"Native D3D11 shader FG: waiting for stereo frames");
+        if(trace){char message[200]{};
+            // SINGLETHREADED devices are not free-threaded: creating resources
+            // from presenter threads would then be unsafe.
+            sprintf_s(message,"FG native D3D11 backend: shader interpolation with shared pacing; no D3D12 bridge or NGX; device_flags=0x%x",
+                dev->GetCreationFlags());trace(message);}
+        return true;
+    }
+    bool capture11(XrSwapchain sc,unsigned index,ID3D11Texture2D* source,unsigned width,unsigned height,unsigned array,DXGI_FORMAT declared) override {
+        if(!native11)return Presenter::capture11(sc,index,source,width,height,array,declared);
+        if(bypass||!source)return false;
+        std::lock_guard capture_lock(capture_mutex);
+        // Quad views: the release hook also sees the four raw planes; only the
+        // composed eyes (capture_composed11) and auxiliary layers are presented.
+        if(quad_input&&std::find(quad_sources11.begin(),quad_sources11.end(),sc)!=quad_sources11.end())return false;
+        {std::lock_guard lock(mx);if(stopping||degraded)return false;}
+        const auto captured_at=TimingClock::now();
+        AddElapsed elapsed{capture_cpu_accumulator};
+        auto copy=native11->copy(source,declared);
+        if(!copy){capture_overflow=true;return false;}
+        direct_captures.erase(sc);captured[sc]=std::move(copy);capture_crop_tokens[sc]=0;
+        capture_tokens[sc]=0;capture_frames[sc]=0;capture_times[sc]=captured_at;capture_ready[sc]={};return true;
+    }
+    // Quad compositor output for one eye, while it still owns the image. The
+    // compositor holds the quad dispatch mutex here, so this path must not
+    // take capture_mutex (capture11 takes capture_mutex, then dispatch).
+    std::mutex composed11_mutex; // Leaf lock.
+    std::unordered_map<XrSwapchain,std::pair<Image,TimingClock::time_point>> composed11;
+    bool capture_composed11(XrSwapchain sc,ID3D11Texture2D* source,DXGI_FORMAT format) {
+        if(!native11||bypass||!source)return false;
+        const auto captured_at=TimingClock::now();auto copy=native11->copy(source,format);
+        std::lock_guard lock(composed11_mutex);if(!copy){composed11.erase(sc);return false;}
+        composed11[sc]={std::move(copy),captured_at};return true;
+    }
+    void set_quad_sources11(const std::array<XrSwapchain,4>& sources) {std::lock_guard lock(capture_mutex);quad_sources11=sources;}
+    bool prepare_native11(Native& job,const XrCompositionLayerProjection* projection,bool inference_slot) {
+        // Hold capture_mutex.
+        for(unsigned eye=0;eye<2;++eye){
+            const auto& sub=projection->views[eye].subImage;Image full;TimingClock::time_point captured_at{};
+            if(quad_input){std::lock_guard lock(composed11_mutex);const auto found=composed11.find(sub.swapchain);
+                if(found!=composed11.end()){full=found->second.first;captured_at=found->second.second;}}
+            else if(const auto found=captured.find(sub.swapchain);found!=captured.end()){full=found->second;captured_at=capture_times[sub.swapchain];}
+            if(!full)return false;
+            job.color[eye]=native11->crop(full,sub);if(!job.color[eye])return false;++eye_crop_copies;
+            if(!eye||captured_at<job.captured_at)job.captured_at=captured_at;
+            job.views[eye]=projection->views[eye];
+        }
+        const bool good=subimages(job.layers,[&](XrSwapchainSubImage& sub){
+            const auto found=captured.find(sub.swapchain);if(found==captured.end())return false;
+            D3D11_TEXTURE2D_DESC d{};found->second->texture11->GetDesc(&d);
+            if(sub.imageArrayIndex>=d.ArraySize||sub.imageRect.offset.x<0||sub.imageRect.offset.y<0||
+                sub.imageRect.extent.width<=0||sub.imageRect.extent.height<=0||
+                std::uint64_t(sub.imageRect.offset.x)+sub.imageRect.extent.width>d.Width||
+                std::uint64_t(sub.imageRect.offset.y)+sub.imageRect.extent.height>d.Height)return false;
+            if(std::none_of(job.auxiliary.begin(),job.auxiliary.end(),[&](const Auxiliary& a){return a.source==sub.swapchain;}))
+                job.auxiliary.push_back({sub.swapchain,found->second});return true;
+        });
+        if(!good)return false;
+        if(inference_slot){
+            std::array<std::shared_ptr<Backend11::Guides>,2> guides;
+            if(native11->take_guides(guides)){
+                job.guides11=std::move(guides);job.guides_valid=true;job.guide_state=CheekyFgState::waiting_for_history;
+                job.source_configuration=job.guides11[0]->source.meta.configuration;
+                job.guide_token=job.guides11[0]->source.mapping_revision;
+            }else job.guide_state=CheekyFgState::waiting_for_guides;
+        }
+        return true;
+    }
     CheekyFgPerformance performance() const noexcept override {
         auto result=telemetry;result.asynchronous_presenter=1;result.queued_native=unsigned(pending.size());
         result.skipped_native=skipped;result.producer_cpu_ms=producer_cpu.mean();result.pacing_wait_ms=pacing_wait.mean();return result;
@@ -460,6 +546,8 @@ struct BufferedPresenter final : Presenter {
         for(unsigned eye=0;eye<2;++eye){
             collect.add(value.categories[fg_memory::periphery],worker.focus.peripheral_output[eye].Get());
             collect.add(value.categories[fg_memory::periphery],worker.focus.previous_depth[eye].Get());
+            collect.add(value.categories[fg_memory::prepared_color],worker.focus.center_output[eye].Get());
+            collect.add(value.categories[fg_memory::prepared_depth],worker.focus.previous_center_depth[eye].Get());
             collect.add(value.categories[fg_memory::composition],worker.focus.full[eye].Get());
         }
         std::lock_guard lock(mx);
@@ -524,6 +612,7 @@ struct BufferedPresenter final : Presenter {
     }
     void note_app_image_wait(double ms) noexcept override {std::lock_guard lock(mx);app_image_wait.add(ms);}
     void collect_color_stamps() {
+        if(native11)return; // No GPU color timestamps on the native D3D11 backend.
         std::lock_guard capture_lock(capture_mutex);producer.collect(producer.fence->GetCompletedValue());
     }
     void note_gpu_ready_age(const Pair& pair,std::uint64_t submitted_cpu,std::uint64_t display_cpu) noexcept {
@@ -554,7 +643,7 @@ struct BufferedPresenter final : Presenter {
     XrResult runtime_end_frame(const XrFrameEndInfo* end) {
         const auto start=TimingClock::now();
         const auto submit=[&]{return xr.end_frame(session,end);};
-        const auto result=quad_input&&interop11?interop11->runtime_submit(submit):submit();
+        const auto result=native11?native11->runtime_submit(submit):runtime_dispatch(submit);
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
         if(XR_FAILED(result)&&trace&&end) {
             char message[384]{};
@@ -606,6 +695,7 @@ struct BufferedPresenter final : Presenter {
         if(pacing_thread.joinable())pacing_thread.join();
         std::lock_guard capture_lock(capture_mutex);
         producer.drain();output.drain();uploads.drain();worker.wait_idle();
+        if(native11){native11->flush();native11->clear_guides();std::lock_guard composed(composed11_mutex);composed11.clear();}
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
         captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
         if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
@@ -634,9 +724,16 @@ struct BufferedPresenter final : Presenter {
         presentation_trace_events=presentation_trace_anomalies=0;
         changed.notify_all();
     }
+    // Native D3D11 backend: the layer destroys private chains later, from the
+    // application's own xrEndFrame (see retire_private_chain).
+    std::function<void(XrSwapchain)> retire_chain;
+    void destroy_private_chain(XrSwapchain chain) {
+        if(native11&&retire_chain)retire_chain(chain);else destroy_chain(chain);
+    }
     void destroy_chains() noexcept {
-        for(auto& c:scene_chains){if(c.handle)destroy_chain(c.handle);c={};}
-        for(auto& [key,c]:auxiliary_chains)if(c.handle)destroy_chain(c.handle);
+        if(native11)native11->flush(); // As D3D11Bridge::forget does via drain().
+        for(auto& c:scene_chains){if(c.handle)destroy_private_chain(c.handle);c={};}
+        for(auto& [key,c]:auxiliary_chains)if(c.handle)destroy_private_chain(c.handle);
         auxiliary_chains.clear();
     }
     void reset() noexcept override {
@@ -704,7 +801,7 @@ struct BufferedPresenter final : Presenter {
         CheekyFgDirectShading shading_options;
         if(shading_query&&shading_query(&shading_options))direct_shading_mode=std::min(shading_options.requested_mode,2u);
         if(output_query&&output_query(&direct_options)){
-            const unsigned mode=!interop11 && direct_options.requested==1u;
+            const unsigned mode=!interop11 && !native11 && direct_options.requested==1u;
             if(direct_output_mode.exchange(mode)!=mode)direct_blocked_target=0;
         }
         if(query&&query(&options)){
@@ -919,7 +1016,7 @@ struct BufferedPresenter final : Presenter {
             std::lock_guard lock(mx);
             for(auto& slot:slots) {
                 if(!slot)slot=std::make_shared<Native>();
-                if(slot.use_count()==1&&producer.completed(slot->ready)){job=slot;break;}
+                if(slot.use_count()==1&&capture_completed(slot->ready)){job=slot;break;}
             }
         }
         const bool inference_slot=bool(job);
@@ -936,6 +1033,11 @@ struct BufferedPresenter final : Presenter {
         }
         else {
             std::unique_lock capture_lock(capture_mutex);
+            bool good=true;
+            if(native11){
+                job->capture_mode=job->upload_mode=job->direct_output_mode=job->direct_shading_mode=0;job->latency_diagnostics=false;
+                good=prepare_native11(*job,projection,inference_slot);job->ready=0;
+            }else {
             std::unordered_map<XrSwapchain,CapturePlan> next_plans;
             for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
                 auto& plan=next_plans[sub.swapchain];plan.desc=captured_descs[sub.swapchain];
@@ -960,7 +1062,7 @@ struct BufferedPresenter final : Presenter {
                 if(inference_slot&&hookless_complete)hookless_complete(0);
                 std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;
             }
-            bool good=true;std::uint64_t expected_token{},expected_frame{};bool tokens_match=true;
+            good=true;std::uint64_t expected_token{},expected_frame{};bool tokens_match=true;
             if(good)for(unsigned eye=0;eye<2;++eye) {
                 const auto& sub=projection->views[eye].subImage;
                 const auto direct=direct_captures.find(sub.swapchain);
@@ -1097,6 +1199,7 @@ struct BufferedPresenter final : Presenter {
                 // consistent before falling back to the original native frame.
                 std::uint64_t discarded{};producer.execute(*c,discarded);
             }
+            }
             if(!good){capture_lock.unlock();result=passthrough(end,"incomplete native color capture / changed swapchain layout");}
             else {
                 job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
@@ -1195,7 +1298,28 @@ struct BufferedPresenter final : Presenter {
             pair.space=job->space;pair.blend=job->blend;pair.ready=job->ready;
             bool success{};
             bool attempted{},history_was_reset{};
-            if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
+            if(native11){
+                // Native D3D11 shader interpolation. Each guide snapshot keeps
+                // its own reset flag; a reset pair only seeds history.
+                if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&
+                   job->guides_valid&&previous->guides_valid&&previous->guides11[0]&&previous->guides11[1]&&
+                   cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)) {
+                    bool same_size=true;
+                    for(unsigned eye=0;eye<2;++eye){D3D11_TEXTURE2D_DESC a{},b{};
+                        previous->color[eye]->texture11->GetDesc(&a);job->color[eye]->texture11->GetDesc(&b);
+                        same_size&=a.Width==b.Width&&a.Height==b.Height&&a.Format==b.Format;}
+                    history_was_reset=job->guides11[0]->source.meta.reset||job->guides11[1]->source.meta.reset||!same_size;
+                    attempted=true;
+                    if(!history_was_reset){
+                        pair.submitted_at=TimingClock::now();
+                        success=native11->generate(previous->color,job->color,previous->guides11,job->guides11,previous->views,job->views,pair.generated);
+                        inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
+                        if(!success){attempted=false;
+                            strcpy_s(native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}
+                        else strcpy_s(native11->diagnostic,"Native D3D11 shader FG: generating (no D3D12 bridge or NGX)");
+                    }
+                }
+            }else if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
                cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)&&
                previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
                previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height) {
@@ -1236,7 +1360,7 @@ struct BufferedPresenter final : Presenter {
                 }
                 auto d=job->color[0]->texture->GetDesc();worker.trace=trace;worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
                 const auto& color_layout=job->color[0]->layout;
-                if(worker.initialize(device.Get(),generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format)) {
+                if(worker.initialize(device.Get(),generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format,cheeky_fg_needs_ngx(job->guides))) {
                     for(unsigned eye=0;eye<2;++eye){worker.color_layouts[eye]=job->color[eye]->layout;worker.previous_layouts[eye]=previous->color[eye]->layout;}
                     // The OpenXR capture has its own producer.fence, but it
                     // does not cover guide writes on a DIFFERENT game queue.
@@ -1361,7 +1485,8 @@ struct BufferedPresenter final : Presenter {
                 // Previous-frame history needs colors/poses, not its original
                 // guides. Release completed leases now instead of pinning raw
                 // textures in reusable slots or temporal history indefinitely.
-                if(!worker.fence||worker.fence->GetCompletedValue()>=worker.serial)job->clear_guides();
+                // The D3D11 shader samples the previous interval's depth.
+                if(!native11&&(!worker.fence||worker.fence->GetCompletedValue()>=worker.serial))job->clear_guides();
                 if(success&&!pair.direct_xr)for(unsigned eye=0;eye<2;++eye)last_fg_borders[eye]=pair.generated[eye]->fg_border;
                 if(success&&active_release_point==3u&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
@@ -1424,7 +1549,7 @@ struct BufferedPresenter final : Presenter {
                     sprintf_s(diagnostic,"FG guide snapshot unavailable: depth=%u motion=%u; native presentation continues",job->source_depth,job->source_motion);
                 else if(job->guide_state==CheekyFgState::guide_frame_mismatch&&!job->guides_valid)
                     strcpy_s(diagnostic,"Waiting for matching color and guide frames. See the plugin frame-source diagnostics; native presentation continues.");
-                else strcpy_s(diagnostic,worker.diagnostic);changed.notify_all();}
+                else strcpy_s(diagnostic,native11?native11->diagnostic:worker.diagnostic);changed.notify_all();}
             previous=std::move(job);
         }}catch(...) {std::lock_guard lock(mx);state=CheekyFgState::generation_failed;degraded=true;fg_active=pacing_active=false;
             discard_pending();ready.clear();awaiting_generated_submission=0;inflight_id=0;inflight_release_point=0;inflight_prepared=false;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
@@ -1460,6 +1585,38 @@ struct BufferedPresenter final : Presenter {
         if(!enumerate_images(chain.handle,chain.images))return false;
         next_presenter_memory=0; // Publish newly allocated chains on this presentation, including during startup.
         chain.desc=d;chain.direct_writable=writable;chain.linear_color=writable&&d.Format==DXGI_FORMAT_R8G8B8A8_UNORM;return true;
+    }
+    // Native D3D11 backend: private chain matching the frame, then one copy.
+    // TODO(perf): render generated frames straight into the acquired image.
+    bool upload11(Chain& chain,const Image& source) {
+        if(!source||!source->texture11)return false;
+        D3D11_TEXTURE2D_DESC d{};source->texture11->GetDesc(&d);
+        if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.ArraySize)){
+            destroy_private_chain(chain.handle);chain={};
+        }
+        if(!chain.handle){
+            XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+            create.format=d.Format;create.width=d.Width;create.height=d.Height;create.arraySize=d.ArraySize;
+            create.sampleCount=create.faceCount=create.mipCount=1;
+            if(XR_FAILED(xr.create(session,&create,&chain.handle))){chain={};return false;}
+            unsigned count{};
+            if(XR_FAILED(xr.enumerate(chain.handle,0,&count,nullptr))||!count){destroy_chain(chain.handle);chain={};return false;}
+            chain.images11.assign(count,{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+            if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images11.data())))){
+                destroy_chain(chain.handle);chain={};return false;}
+            chain.desc.Width=d.Width;chain.desc.Height=d.Height;chain.desc.Format=d.Format;chain.desc.DepthOrArraySize=UINT16(d.ArraySize);
+        }
+        if(chain.uploaded==source->identity)return true;
+        unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if(XR_FAILED(xr.acquire(chain.handle,&acquire,&index)))return false;
+        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
+        const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
+        {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
+        const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images11.size()&&native11->upload(chain.images11[index].texture,source);
+        XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        const bool released=XR_SUCCEEDED(native11->runtime_submit([&]{return xr.release(chain.handle,&release);}));
+        if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
+        return released&&copied;
     }
     bool upload_image(Chain& chain,const Image& source,bool scene=false) {
         if(!ensure_chain(chain,source,scene))return false;
@@ -1655,7 +1812,7 @@ struct BufferedPresenter final : Presenter {
     std::deque<Pair>::iterator newest_ready_pair(double position) {
         auto selected=ready.end();
         for(auto it=ready.begin();it!=ready.end();++it)
-            if(producer.completed(it->ready)&&double(it->native_id)>=position)selected=it;
+            if(capture_completed(it->ready)&&double(it->native_id)>=position)selected=it;
         return selected;
     }
     void wait_for_new_pair(TimingClock::time_point start,XrDuration period,double position=0) {
@@ -1692,7 +1849,7 @@ struct BufferedPresenter final : Presenter {
         // An interpolated pair is published only after the worker's single
         // inference + immutable-copy fence completes. Native pairs retain the
         // producer fence; both paths therefore refer to the original job here.
-        if(!producer.completed(pair.ready))return false;
+        if(!capture_completed(pair.ready))return false;
         burst_native=pair.native_id;burst_current=pair.current_id;burst_generated=generated;
         burst_presentation=ticks;
         burst.begin_submission();
@@ -1701,14 +1858,16 @@ struct BufferedPresenter final : Presenter {
         std::vector<std::pair<Chain*,Image>> batch;
         for(unsigned eye=0;eye<2;++eye) {
             auto& chain=scene_chains[eye];
-            if(generated&&pair.direct_xr){}else if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
+            if(native11){if(!upload11(chain,images[eye]))return false;}
+            else if(generated&&pair.direct_xr){}else if(pair.upload_mode==1u){if(!ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
             else if(!upload_image(chain,images[eye],true))return false;
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
             views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
         }
         auto layers=pair.layers;
         for(auto& a:pair.auxiliary){
-            if(pair.upload_mode==1u){auto& chain=auxiliary_chains[a.source];if(!ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});}
+            if(native11){if(!upload11(auxiliary_chains[a.source],a.image))return false;}
+            else if(pair.upload_mode==1u){auto& chain=auxiliary_chains[a.source];if(!ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});}
             else if(!upload_image(auxiliary_chains[a.source],a.image))return false;
         }
         if(pair.upload_mode==1u&&!upload_batch(batch))return false;
@@ -1747,7 +1906,7 @@ struct BufferedPresenter final : Presenter {
         const auto selected=newest_ready_pair(position);
         if(selected!=ready.end()&&(double(selected->native_id)>position||
             (selected->interpolated&&double(selected->current_id)>position)))return true;
-        return !fg_active&&ticks>=transition_until&&latest_native&&producer.completed(latest_native->ready)&&
+        return !fg_active&&ticks>=transition_until&&latest_native&&capture_completed(latest_native->ready)&&
             double(latest_native->native_id)>position;
     }
     bool await_content(const Pair& active,bool have_active,bool generated_phase,double position,bool& allow_repeats) {
@@ -1759,8 +1918,8 @@ struct BufferedPresenter final : Presenter {
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
-            const bool producer_pending=(!fg_active&&latest_native&&!producer.completed(latest_native->ready))||
-                std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !producer.completed(pair.ready);});
+            const bool producer_pending=(!fg_active&&latest_native&&!capture_completed(latest_native->ready))||
+                std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !capture_completed(pair.ready);});
             if(producer_pending)changed.wait_for(lock,std::chrono::milliseconds(1));
             else changed.wait(lock);
         }
@@ -1794,7 +1953,7 @@ struct BufferedPresenter final : Presenter {
             if(XR_FAILED(result)){runtime_failure("runtime xrWaitFrame",result);break;}
             const auto present_start=TimingClock::now();
             burst.log=trace;burst.poll_keys();
-            XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=xr.begin_frame(session,&begin);
+            XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=runtime_dispatch([&]{return xr.begin_frame(session,&begin);});
             {std::lock_guard lock(mx);runtime_begin.add(elapsed_ms(present_start));}
             if(XR_FAILED(result)){runtime_failure("runtime xrBeginFrame",result);break;}
             const XrFrameEndInfo* raw_frame{};bool stop_now{};
@@ -1827,7 +1986,7 @@ struct BufferedPresenter final : Presenter {
                     // Prioritize a usable interpolation pair. During NGX
                     // startup, keep showing new native frames even when every
                     // inference lease is busy. Never rewind to a stale pair.
-                    if(!fg_active&&!generated_submission_pending()&&ticks>=transition_until&&latest_native&&producer.completed(latest_native->ready)&&
+                    if(!fg_active&&!generated_submission_pending()&&ticks>=transition_until&&latest_native&&capture_completed(latest_native->ready)&&
                        double(latest_native->native_id)>=last_position&&
                        (!have_active||latest_native->native_id>active.native_id)) {
                         active=*latest_native;have_active=true;

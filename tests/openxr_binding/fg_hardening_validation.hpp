@@ -95,7 +95,7 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     auto buffer=[&](D3D12_HEAP_TYPE heap_type,UINT64 bytes){
         D3D12_HEAP_PROPERTIES hp{};hp.Type=heap_type;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
         d.Width=bytes;d.Height=1;d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        ComPtr<ID3D12Resource> result;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&result))),"Completion upload buffer");return result;
+        ComPtr<ID3D12Resource> result;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,heap_type==D3D12_HEAP_TYPE_READBACK?D3D12_RESOURCE_STATE_COPY_DEST:D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&result))),"Completion upload buffer");return result;
     };
     flag_upload=buffer(D3D12_HEAP_TYPE_UPLOAD,8);
     auto flag=[&](unsigned value){void* data{};check(SUCCEEDED(flag_upload->Map(0,nullptr,&data)),"Map completion flag");
@@ -154,6 +154,32 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     worker.reset_features();check(!worker.temporal_evaluation_completed,"Feature reset invalidates completion state");
     check(generate(cameras)&&worker.temporal_evaluation_completed,"Generation resumes after resetting features");
     worker.reset();check(!worker.temporal_evaluation_completed,"Worker reset clears completion state");flag_upload.Reset();
+    worker.probe_attempted=true;worker.capability_ready=false;worker.failed=true;
+    check(worker.initialize(device,queue,64,64,DXGI_FORMAT_R8G8B8A8_UNORM,false),"Shader-only D3D12 FG bypasses unavailable NGX capability");
+    worker.create=nullptr;worker.evaluate=nullptr;worker.allocate=nullptr;
+    for(unsigned method:{1u,2u})for(bool focused:{false,true}){
+        for(auto& g:guides.eyes){g.center_method=method;g.peripheral_method=0;g.focus_width=g.focus_height=focused?.5f:1.f;++g.configuration;}
+        check(!cheeky_fg_needs_ngx(guides),"Shader regions need no NGX initialization");
+        check(generate(cameras)&&generate(cameras)&&worker.temporal_evaluation_completed,"Production worker interpolates both shader center methods without any NGX callbacks");
+        check(!worker.features[0].handle&&!worker.features[1].handle,"Shader center creates no DLSS-G feature");
+    }
+    check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Shader center readback commands");
+    const auto shader_desc=output[0]->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT shader_footprint{};UINT64 shader_bytes{};
+    device->GetCopyableFootprints(&shader_desc,0,1,0,&shader_footprint,nullptr,nullptr,&shader_bytes);
+    auto shader_readback=buffer(D3D12_HEAP_TYPE_READBACK,shader_bytes);
+    color_transition(list.Get(),output[0],D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION shader_from{},shader_to{};shader_from.pResource=output[0];shader_from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    shader_to.pResource=shader_readback.Get();shader_to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;shader_to.PlacedFootprint=shader_footprint;
+    list->CopyTextureRegion(&shader_to,0,0,0,&shader_from,nullptr);
+    color_transition(list.Get(),output[0],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    check(SUCCEEDED(list->Close()),"Close shader center readback");ID3D12CommandList* shader_lists[]{list.Get()};queue->ExecuteCommandLists(1,shader_lists);
+    check(SUCCEEDED(queue->Signal(initialized.Get(),2)),"Shader center readback fence");event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+    check(event&&SUCCEEDED(initialized->SetEventOnCompletion(2,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0,"Wait shader center pixels");CloseHandle(event);
+    void* shader_data{};check(SUCCEEDED(shader_readback->Map(0,nullptr,&shader_data)),"Map shader center output");
+    const auto* shader_pixel=static_cast<const unsigned char*>(shader_data)+shader_footprint.Offset+32*shader_footprint.Footprint.RowPitch+32*4;
+    check(shader_pixel[0]==255&&shader_pixel[1]==0&&shader_pixel[2]==0,"D3D12 cropped shader center produces actual source pixels without NGX");
+    shader_readback->Unmap(0,nullptr);
+    worker.reset();
     std::cout<<"PASS FG evaluation completion: warm-up/resume, early rejection, partial recording, NGX failure, failed publication, recovery and reset\n";
 }
 

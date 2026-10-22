@@ -10,7 +10,9 @@
 namespace cheeky::fg {
 // Each command allocator and every referenced image stays leased until its
 // fence retires. The producer only polls for a free context; it never waits.
-struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;float presentation_feather{-1};};
+struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;float presentation_feather{-1};
+    // Native D3D11 backend images (Backend11); texture stays null for these.
+    ComPtr<ID3D11Texture2D> texture11;ComPtr<ID3D11ShaderResourceView> srv11;};
 using Image=std::shared_ptr<TransportImage>;
 struct ColorReadyStamp {
     std::atomic<std::uint64_t> ready_qpc{};

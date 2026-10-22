@@ -32,3 +32,5 @@ add_test(NAME OpenXRQuadVersion COMMAND CheekyOpenXRBindingTests --quad-version)
 add_test(NAME OpenXRFGCopyStates COMMAND CheekyOpenXRBindingTests --fg-gpu-validation)
 add_test(NAME OpenXRFGCropRecenter COMMAND CheekyOpenXRBindingTests --fg-crop-gpu-validation)
 add_test(NAME OpenXRFGHardening COMMAND CheekyOpenXRBindingTests --fg-hardening)
+
+add_test(NAME OpenXRFGNativeShader11 COMMAND CheekyOpenXRBindingTests --fg-shader11)

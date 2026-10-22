@@ -4195,12 +4195,12 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
         diagnostic_note_result(DiagnosticApi::d3d11,result);return result;
     }
     NgxResult transport_result{};
-    if (!settings.d3d11_use_d3d12_transport && !settings.fg.enabled) {
+    if (!settings.d3d11_use_d3d12_transport && !fg_requires_d3d12(settings)) {
         diagnostic_note_d3d11_transport_status(
             D3D11TransportStatus::not_attempted
         );
     }
-    if (settings.d3d11_use_d3d12_transport || settings.fg.enabled) {
+    if (settings.d3d11_use_d3d12_transport || fg_requires_d3d12(settings)) {
         NgxPresetOverrideScope center_preset{
             parameters, settings.center_preset
         };
@@ -4348,12 +4348,12 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
         diagnostic_note_result(DiagnosticApi::d3d11,result);return result;
     }
     NgxResult transport_result{};
-    if (!settings.d3d11_use_d3d12_transport && !settings.fg.enabled) {
+    if (!settings.d3d11_use_d3d12_transport && !fg_requires_d3d12(settings)) {
         diagnostic_note_d3d11_transport_status(
             D3D11TransportStatus::not_attempted
         );
     }
-    if (settings.d3d11_use_d3d12_transport || settings.fg.enabled) {
+    if (settings.d3d11_use_d3d12_transport || fg_requires_d3d12(settings)) {
         NgxPresetOverrideScope center_preset{
             parameters, settings.center_preset
         };
@@ -4482,7 +4482,7 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
         log_ngx_exposure<ID3D11Resource>(11, handle, parameters);
     const QuadD3D11DispatchScope quad_dispatch{context,depth.outer};
     if(quad_dispatch.ticket){static std::atomic<bool> noted{};if(!noted.exchange(true))
-        trace_event("QUAD-FG NGX D3D11/runtime dispatch gate active");}
+        trace_event("FG NGX D3D11/runtime dispatch gate active (stereo or quad)");}
     const auto result = invoke();
     // All temporary NGX parameters and private composites have been restored
     // before this point. Tag only the outer game evaluation's final output.
@@ -4499,6 +4499,7 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
             source.context=context;source.texture=texture.Get();source.x=get_ui(parameters,"DLSS.Output.Subrect.Base.X");source.y=get_ui(parameters,"DLSS.Output.Subrect.Base.Y");
             source.width=get_ui(parameters,"OutWidth");source.height=get_ui(parameters,"OutHeight");
             if(!quad_view_observe11(source)&&eye_calibration_enabled())eye_calibration_stamp(context, output, source.dlss_view,source.x,source.y,source.width,source.height);
+            fg_publish_shader11(context,handle,parameters);
             fg_publish_quad11(context,handle,parameters);
         }
     }

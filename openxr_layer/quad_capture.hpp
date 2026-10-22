@@ -96,6 +96,7 @@ struct Compositor11 {
     std::unique_ptr<QuadFg11> fg_guides;
     std::shared_ptr<cheeky::fg::D3D11Bridge> fg_bridge;
     std::array<XrSwapchain,4> source_chains{};
+    std::vector<ComPtr<IUnknown>> recorded_views; // Alive until the command list has executed.
     // Invoked while the composite output is still acquired, before release.
     std::function<void(unsigned,XrSwapchain,unsigned,ID3D11Texture2D*,unsigned,unsigned,DXGI_FORMAT)> capture_output;
     std::array<Eye,2> eyes;
@@ -163,6 +164,9 @@ struct Compositor11 {
         ComPtr<ID3D11RenderTargetView> target_view;D3D11_RENDER_TARGET_VIEW_DESC rtv{};
         rtv.Format=eyes[eye].format;rtv.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
         if(FAILED(device->CreateRenderTargetView(target,&rtv,&target_view)))return false;
+        // The recorded draw references these views until ExecuteCommandList.
+        // Never let them die when they are unbound at the end of recording.
+        recorded_views.insert(recorded_views.end(),{sources[0],sources[1],target_view});
         deferred->UpdateSubresource(constants.Get(),0,nullptr,params,0,0);
         deferred->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         deferred->VSSetShader(vs.Get(),nullptr,0);deferred->PSSetShader(ps.Get(),nullptr,0);
@@ -203,6 +207,7 @@ struct Compositor11 {
             else {ContextLock lock(multithread.Get());immediate->ExecuteCommandList(commands.Get(),TRUE);immediate->Flush();
                 if(FAILED(device->GetDeviceRemovedReason()))result=XR_ERROR_RUNTIME_FAILURE;}
         }
+        commands.Reset();recorded_views.clear();
         for(unsigned eye=0;eye<2;++eye)if(eyes[eye].waited){
             if(result==XR_SUCCESS&&capture_output)capture_output(eye,eyes[eye].chain,eyes[eye].index,eyes[eye].images[eyes[eye].index].texture,
                 eyes[eye].width,eyes[eye].height,eyes[eye].format);

@@ -130,6 +130,8 @@ void settings_tests(const std::filesystem::path& root) {
             !set_named_setting(fg,"FgDirectPeripheralShading","3")&&!set_named_setting(fg,"FgDirectPeripheralShading","-1"),"Direct periphery shading default and dropdown bounds");
         for(const auto key:{"FgColorCaptureMode","FgUploadMode","FgLatencyDiagnostics","FgGuideCaptureMode","FgDirectXrOutput"})
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
+        require(fg.fg.center_method==0&&set_named_setting(fg,"FgCenterMethod","1")&&set_named_setting(fg,"FgCenterMethod","2")&&
+            !set_named_setting(fg,"FgCenterMethod","3")&&!set_named_setting(fg,"FgCenterMethod","-1"),"Center FG defaults to DLSS and validates shader methods");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","3")&&set_named_setting(fg,"FgDepthBits","16")&&
@@ -138,14 +140,14 @@ void settings_tests(const std::filesystem::path& root) {
         Settings restored;
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
+            restored.fg.center_method==2&&restored.fg.peripheral_method==3&&restored.fg.depth_bits==16&&restored.fg.motion_bits==16&&
             restored.fg.release_point==3&&!restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&
             restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1&&
             restored.fg.direct_peripheral_shading==2&&restored.fg.hookless_mode3,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
             !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
-            restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2&&restored.fg.direct_peripheral_shading==1&&
+            restored.fg.center_method==0&&restored.fg.peripheral_percent==25&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2&&restored.fg.direct_peripheral_shading==1&&
             !restored.fg.hookless_mode3,"FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;

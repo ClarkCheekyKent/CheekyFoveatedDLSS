@@ -149,7 +149,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{unsigned(s.foveated),unsigned(s.match_sr_region),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
-        s.peripheral_method,s.depth_bits,s.motion_bits,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
+        s.center_method,s.peripheral_method,s.depth_bits,s.motion_bits,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
     return hash;
@@ -281,6 +281,94 @@ void fg_forget_feature(const NgxHandle* handle) noexcept try {
     if(revision)trace_event("FG game DLSS-SR feature released: handle=%p revision=%llu (awaiting recreated guides)",
         static_cast<const void*>(handle),static_cast<unsigned long long>(revision));
 } catch(...) {}
+void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* p) noexcept try {
+    if(!enabled()||!context||!handle||!p)return;
+    const auto settings=current_settings();
+    if(!cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
+    const auto layer=quad_view_module();const auto observe=layer?reinterpret_cast<CheekyFgShaderObserve11Fn>(GetProcAddress(layer,"CheekyFG_ObserveShaderD3D11V1")):nullptr;
+    if(!observe)return;
+    unsigned flags{};bool known{};
+    {std::lock_guard lock(mutex);const auto it=feature_flags.find(handle);if(it!=feature_flags.end()){flags=it->second;known=true;}}
+    if(!known&&!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags))return;
+    ID3D11Resource *depth{},*motion{};
+    if(!ngx_succeeded(p->Get("Depth",&depth))||!ngx_succeeded(p->Get("MotionVectors",&motion))||!depth||!motion)return;
+    ComPtr<ID3D11Texture2D> dt,mt;if(FAILED(depth->QueryInterface(IID_PPV_ARGS(&dt)))||FAILED(motion->QueryInterface(IID_PPV_ARGS(&mt))))return;
+    D3D11_TEXTURE2D_DESC dd{},md{};dt->GetDesc(&dd);mt->GetDesc(&md);
+    const unsigned w=ui(p,"OutWidth"),h=ui(p,"OutHeight");if(!w||!h)return;
+    CheekyFgShaderSource11V1 source;source.context=context;source.depth=dt.Get();source.motion=mt.Get();
+    auto& m=source.meta;m.width=w;m.height=h;m.feature=reinterpret_cast<uintptr_t>(handle);
+    m.depth_width=ui(p,"DLSS.Render.Subrect.Dimensions.Width",dd.Width);
+    m.depth_height=ui(p,"DLSS.Render.Subrect.Dimensions.Height",dd.Height);
+    if(!m.depth_width)m.depth_width=ui(p,"Width",dd.Width);
+    if(!m.depth_height)m.depth_height=ui(p,"Height",dd.Height);
+    if(!m.depth_width)m.depth_width=dd.Width;
+    if(!m.depth_height)m.depth_height=dd.Height;
+    const bool low_res=(flags & 2U)!=0||md.Width<w||md.Height<h;
+    m.motion_width=low_res?m.depth_width:w;m.motion_height=low_res?m.depth_height:h;
+    m.depth_base_x=ui(p,"DLSS.Input.Depth.Subrect.Base.X");
+    m.depth_base_y=ui(p,"DLSS.Input.Depth.Subrect.Base.Y");
+    m.motion_base_x=ui(p,"DLSS.Input.MV.Subrect.Base.X");
+    m.motion_base_y=ui(p,"DLSS.Input.MV.Subrect.Base.Y");
+    m.jitter_x=f(p,"Jitter.Offset.X");m.jitter_y=f(p,"Jitter.Offset.Y");
+    m.motion_jittered=(flags&4U)!=0;
+    m.motion_scale_x=f(p,"MV.Scale.X",1);m.motion_scale_y=f(p,"MV.Scale.Y",1);
+    m.depth_inverted=(flags & 8U)!=0;
+    m.low_res_mv=(flags & 2U)!=0;
+    m.reset=ui(p,"Reset");
+    m.focus_width=settings.fg.foveated ? settings.fg.width : 1.0f;
+    m.focus_height=settings.fg.foveated ? settings.fg.height : 1.0f;
+    m.focus_feather=settings.fg.feather;
+    m.show_foveation_border=settings.fg.foveated&&settings.fg.show_border?1u:0u;
+    // Each DLSS view maps to a different optical center. FG offsets are
+    // relative to that stereo-aligned center, even with SR-size matching OFF.
+    const auto view_id=static_cast<DlssViewId>(reinterpret_cast<std::uintptr_t>(handle));
+    // Query the known calibration without changing SR eye-role counters.
+    const auto assignment=stereo_eye_assignment(view_id);
+    // Native shader FG requires a calibrated physical eye and source crop.
+    const float signed_sr_x=assignment.assigned&&!assignment.shared_source
+        ? ((bool(assignment.eye_index==1)!=settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
+        : 0.f;
+    const auto sr=fg_sr_prepared_for(view_id,w,h);
+    const float base_u=sr.valid ? sr.center_u : fg_fallback_center(settings.width,signed_sr_x);
+    const float base_v=sr.valid ? sr.center_v : fg_fallback_center(settings.height,settings.height_offset);
+    m.focus_x=base_u-.5f+settings.fg.x;
+    m.focus_y=base_v-.5f+settings.fg.y;
+    if(settings.fg.foveated&&settings.fg.match_sr_region){
+        // Use the exact SR crop that was actually prepared, including its
+        // pixel rounding. Never invoke the SR gaze solver again from FG:
+        // doing so advances the same temporal/crop state twice per eye.
+        const auto size=sr.valid ? std::pair{sr.region_width,sr.region_height} :
+            fg_sr_fallback_size(settings.width,settings.height,m.depth_width,m.depth_height,w,h);
+        m.focus_width=size.first;
+        m.focus_height=size.second;
+        m.focus_feather=settings.transition_width;
+        // Matching overrides manual FG offsets but retains stereo alignment.
+        m.focus_x=base_u-.5f;
+        m.focus_y=base_v-.5f;
+    }
+    m.resolution_percent=settings.fg.resolution_percent;
+    m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
+    m.center_method=settings.fg.center_method;
+    m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
+    m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
+    if(!assignment.calibrated||assignment.eye_index>1||!assignment.calibration_session)return;
+    source.session_generation=assignment.calibration_session;source.mapping_revision=assignment.mapping_revision;
+    source.generation=stereo_view_generation(view_id);source.vertical_flip=assignment.vertical_flip;
+    m.configuration=configuration(settings);
+    for(unsigned eye=0;eye<2;++eye){
+        if(!assignment.shared_source&&eye!=assignment.eye_index)continue;
+        source.eye=eye;const auto& crop=assignment.source_crops[eye];
+        if(!crop.valid)continue;
+        source.crop[0]=crop.valid?crop.x:0;source.crop[1]=crop.valid?crop.y:0;
+        source.crop[2]=crop.valid?crop.width:1;source.crop[3]=crop.valid?crop.height:1;
+        observe(&source);
+    }
+}catch(...){}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetShaderOptionsV1(CheekyFgShaderOptionsV1* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    const auto s=current_settings();out->enabled=enabled();out->center_method=s.fg.center_method;
+    out->peripheral_method=s.fg.peripheral_method;out->foveated=s.fg.foveated;return true;
+}
 void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* p) noexcept try {
     if(!enabled()||!context||!handle||!p)return;
     const auto settings=current_settings();const auto quad=quad_view_snapshot();
@@ -304,6 +392,7 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
     m.motion_base_x=ui(p,"DLSS.Input.MV.Subrect.Base.X");m.motion_base_y=ui(p,"DLSS.Input.MV.Subrect.Base.Y");
     m.motion_scale_x=f(p,"MV.Scale.X",1);m.motion_scale_y=f(p,"MV.Scale.Y",1);m.jitter_x=f(p,"Jitter.Offset.X");m.jitter_y=f(p,"Jitter.Offset.Y");
     m.reset=ui(p,"Reset");m.resolution_percent=settings.fg.resolution_percent;m.peripheral_percent=settings.fg.peripheral_percent;
+    m.center_method=settings.fg.center_method;
     m.peripheral_method=std::min(settings.fg.peripheral_method,2u);m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
     m.focus_feather=settings.fg.feather;m.show_foveation_border=settings.fg.show_border;m.configuration=configuration(settings);
     source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;source.submit_repeats=settings.fg.submit_repeats;
@@ -394,6 +483,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     }
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
+    m.center_method=settings.fg.center_method;
     m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
     m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
     // Include the primary foveated-SR ON/OFF state, even if the game keeps

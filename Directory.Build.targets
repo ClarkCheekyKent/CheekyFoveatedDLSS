@@ -1,0 +1,24 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- The add-on used a configuration-only intermediate directory. Keep its
+       objects separate from other targets and from the old compiler PDB. -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'CheekyFoveatedDLSS'">
+    <IntDir>$(MSBuildThisFileDirectory)build\msbuild\$(MSBuildProjectName)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- /Z7 keeps compiler debug records in each object instead of sharing
+           vc143.pdb. The linker still produces the normal debugging symbols. -->
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <!-- Several modules deliberately share TargetName but have different
+           extensions (.addon64, .dll, .asi). They must never share a PDB. -->
+      <ProgramDatabaseFile>$(OutDir)$(TargetName)$(TargetExt).pdb</ProgramDatabaseFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(MSBuildProjectName)' == 'CheekyFoveatedDLSS' Or '$(MSBuildProjectName)' == 'CheekyFoveatedDLSSUEVR'">
+    <Link>
+      <ImportLibrary>$(IntDir)$(MSBuildProjectName).lib</ImportLibrary>
+    </Link>
+  </ItemDefinitionGroup>
+</Project>

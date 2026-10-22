@@ -17,7 +17,8 @@ inline HMODULE quad_view_module() noexcept {
     return module;
 }
 // NGX can submit native driver work in addition to ordinary D3D11 API calls.
-// Share one CPU dispatch gate with the quad presenter's runtime submissions.
+// Share one CPU dispatch gate with D3D11 FG runtime submissions, including
+// ordinary stereo sessions. The exported names retain the original quad ABI.
 struct QuadD3D11DispatchScope {
     void* ticket{};CheekyQuadReleaseD3D11V1Fn release{};
     QuadD3D11DispatchScope(void* context,bool enabled) noexcept {

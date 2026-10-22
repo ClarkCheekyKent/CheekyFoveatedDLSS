@@ -1,3 +1,35 @@
+# Shader FG without a D3D12 bridge
+
+`CheekyOpenXRBindingTests --fg-shader11` runs the native D3D11 presenter on WARP.
+It also checks that stereo NGX evaluations exclude competing FG GPU/runtime
+submissions through the shared dispatch gate. `--fg-shader11-hardware` runs
+the same coverage on the hardware adapter, plus concurrent fence signals,
+guide snapshots, interpolation and resource retirement without a headset.
+It reads generated pixels for both center methods and an independently selected
+periphery, checks opposite per-eye object motion, RGBA/BGRA/sRGB, direct UAV and
+render-target publication, history warm-up, duplicate guide rejection and extra
+OpenXR frame ordering. It also checks four-view guide assembly, immutable depth
+history and stale source rejection without creating a D3D12 bridge.
+
+`CheekyOpenXRBindingTests --fg-shader11-ngx "C:/path/to/DLSS/model/directory"`
+uses a real `nvngx_dlss.dll` and NVIDIA hardware to race 3000 DLSS SR
+evaluations against native backend copies, uploads and shared fence signals.
+The default uses the shared dispatch gate. Appending `ungated` deliberately
+removes that gate: this has reproduced NVIDIA command-dispatch access violations
+and is a crash reproducer, not a passing regression test. Run it under a debugger
+when collecting a full-memory dump; the probe uses its own device and resources.
+
+Checkpoint status (2026-10-22): automated native, quad and hardware tests pass,
+and one gated real-NGX probe passed. DCS also completed a user-reported five-minute
+session with FG setting/mode changes; its log confirms generated submissions.
+ACC still reproduces fatal driver crashes and hangs after enabling native FG,
+including with the dispatch gate and copy-only context-state changes installed.
+These changes are not a confirmed fix for either ACC failure.
+
+`--fg-hardening` additionally runs both shader center methods through the D3D12
+worker with unavailable NGX capability and null NGX callbacks. This complements
+the existing DLSS-G failure/recovery fixtures; live headset testing remains needed.
+
 # FG camera and evaluation hardening
 
 `CheekyOpenXRBindingTests --fg-hardening` checks non-finite/singular camera

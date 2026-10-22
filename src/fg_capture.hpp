@@ -21,6 +21,7 @@ const char* fg_state_name(CheekyFgState state) noexcept;
 #include <d3d12.h>
 namespace cheeky::foveated_dlss {
 void fg_publish_ngx(ID3D12GraphicsCommandList*,const NgxHandle*,const NgxParameters*,NgxResult) noexcept;
+void fg_publish_shader11(ID3D11DeviceContext*,const NgxHandle*,const NgxParameters*) noexcept;
 void fg_publish_quad11(ID3D11DeviceContext*,const NgxHandle*,const NgxParameters*) noexcept;
 void fg_remember_feature(const NgxHandle*,const NgxParameters*) noexcept;
 // Only feature=1 (Super Resolution) can provide stereo FG guides.

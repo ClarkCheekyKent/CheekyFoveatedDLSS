@@ -2,6 +2,7 @@
 
 #include "foveation.hpp"
 #include "eye_calibration_policy.hpp"
+#include "../shared/cheeky_fg_shader11.hpp"
 
 #include <cstdint>
 #include <array>
@@ -44,6 +45,7 @@ struct Settings {
         bool match_sr_region{true}; // Copy SR size and effective per-eye placement when enabled.
         bool show_border{false}; // Blue FG debug outline, drawn after FG into OpenXR output.
         std::uint32_t resolution_percent{100},peripheral_percent{25};
+        std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
         std::uint32_t peripheral_method{1},depth_bits{32},motion_bits{32};
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
         std::uint32_t diagnostic_mode{}; // UEVR Lua: normal, prepare-first, left-only, right-only, split-lists.
@@ -152,6 +154,9 @@ struct Settings {
 
 inline bool uses_coordinated_center(const Settings& settings) noexcept {
     return settings.auto_stereo_alignment || settings.center_mode != FoveationCenterMode::fixed;
+}
+inline bool fg_requires_d3d12(const Settings& settings) noexcept {
+    return settings.fg.enabled&&!cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated);
 }
 
 using CropGeometry = FoveationGeometry;

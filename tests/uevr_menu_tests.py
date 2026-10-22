@@ -7,13 +7,14 @@ This validates Lua behavior, not UEVR's renderer, input routing, or headset UI.
 import copy
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "build/test-python"))
-reports = list((ROOT / "bin/Release/uevr-test-data").glob("*/CheekyFoveatedDLSS-diagnostics.json"))
+reports = list((Path(os.environ.get("CHEEKY_UEVR_TEST_BIN", str(ROOT / "bin/Release"))) / "uevr-test-data").glob("*/CheekyFoveatedDLSS-diagnostics.json"))
 if not reports:
     raise SystemExit("Run CheekyUEVRTests.exe first to produce a real runtime snapshot.")
 baseline_path = max(reports, key=lambda p: p.stat().st_mtime)
@@ -137,6 +138,12 @@ def run(engine):
     g.callbacks.on_frame()
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
+    if "--fg-center" in sys.argv:
+        state["settings"]["FgEnabled"] = False
+        state["settings"]["FgCenterMethod"] = 0
+        state["settings"]["FgMatchSrRegion"] = False
+        state["afw_experiment"]["rendering_mode_known"] = True
+        state["afw_experiment"]["rendering_mode"] = 0
     state["settings"]["Enabled"] = True
     state["settings"]["D3D12LowerHook"] = True
     state["setting_groups"]["D3D12LowerHook"] = "sr"
@@ -161,6 +168,35 @@ def run(engine):
                    "match_reason": "No guides with the color frame ID"}
     receive(state)
     draw()
+    if "--fg-center" in sys.argv:
+        for method in (1, 2, 0):
+            draw(changes={"FG center method": method})
+            assert f"FgCenterMethod={method}" in last()
+            state["request"] = state["applied_request"] = int(last().splitlines()[1])
+            state["settings"]["FgCenterMethod"] = method
+            receive(state)
+            draw()
+            assert g["values"]["FG center method"] == method
+        state["renderer"] = 0
+        state["settings"]["FgCenterMethod"] = 2
+        state["settings"]["FgPeripheralMethod"] = 1
+        receive(state)
+        draw()
+        assert g["values"]["FG center method"] == 2
+        assert g["values"]["FG periphery method"] == 1
+        assert g["values"]["FG GPU queue"] is None
+        assert g["values"]["Release game rendering"] is None
+        assert any("Native D3D11" in text for text in g.drawn.values())
+        state["settings"]["FgPeripheralMethod"] = 3
+        receive(state)
+        draw()
+        assert g["values"]["FG GPU queue"] is not None
+        del state["settings"]["FgCenterMethod"]
+        receive(state)
+        draw()
+        assert g["values"]["FG center method"] is None
+        print("PASS FG center menu:", engine)
+        return
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
     assert g["values"]["Release game rendering"] == 3
     assert g["values"]["Submit repeat frames"] is False
@@ -372,6 +408,7 @@ def run(engine):
     assert g.slider_ranges["FG transition width"][1] == 0
     for label,key,value in (("FG scale","FgResolutionPercent",50),
                             ("FG periphery scale","FgPeripheralPercent",25),
+                            ("FG center method","FgCenterMethod",2),
                             ("FG periphery method","FgPeripheralMethod",3),
                             ("FG periphery depth","FgDepthBits",16),
                             ("FG periphery motion","FgMotionBits",16)):

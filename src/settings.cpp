@@ -271,6 +271,7 @@ void update_settings(const Settings& settings) noexcept {
     fg_settings.resolution_percent=fg_percent(fg_settings.resolution_percent);
     fg_settings.peripheral_percent=fg_percent(fg_settings.peripheral_percent);
     fg_settings.peripheral_method=std::min(fg_settings.peripheral_method,3u);
+    fg_settings.center_method=std::min(fg_settings.center_method,2u);
     fg_settings.depth_bits=fg_settings.depth_bits==16?16:32;
     fg_settings.motion_bits=fg_settings.motion_bits==16?16:32;
     d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);

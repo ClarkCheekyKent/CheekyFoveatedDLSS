@@ -6,7 +6,7 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473A; // CFG10: leased, producer-prepared center/peripheral guides.
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473B; // CFG11: independently selected center FG method.
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -27,6 +27,7 @@ struct CheekyFgEye {
     std::uint32_t show_foveation_border{}; // Blue border on FG generated output only (not history).
     std::uint32_t resolution_percent{100},peripheral_percent{50};
     std::uint32_t peripheral_method{2},depth_bits{32},motion_bits{32};
+    std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
     std::uint64_t configuration{};
     std::uint32_t guide_capture_mode{},prepared_guides{}; // Requested mode / actual immutable representation.
     ID3D12Resource* peripheral_depth{};
@@ -46,6 +47,11 @@ struct CheekyFgPair {
     std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
     std::uint32_t submit_repeats{1}; // Resubmit unchanged scene content at runtime frame opportunities.
 };
+inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
+    for(const auto& g:pair.eyes)
+        if(g.center_method==0||((g.focus_width<.999f||g.focus_height<.999f)&&g.peripheral_method==3))return true;
+    return false;
+}
 // eyes[] is in physical OpenXR order. Evaluation ordinals retain capture order,
 // so either eye may own the final evaluation identified by the color token.
 inline bool cheeky_fg_pair_matches_color(const CheekyFgPair& pair,std::uint64_t token,std::uint64_t frame) noexcept {

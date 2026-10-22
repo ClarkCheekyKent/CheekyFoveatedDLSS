@@ -140,12 +140,14 @@ bool Worker::probe(ID3D12Device* dev,const wchar_t* model_directory) noexcept {
     if(trace)trace(diagnostic);
     return capability_ready;
 }
-bool Worker::initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsigned h,DXGI_FORMAT fmt) noexcept {
+bool Worker::initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsigned h,DXGI_FORMAT fmt,bool require_ngx) noexcept {
     std::lock_guard lock(ngx_mutex);
-    if(configured&&dev==device.Get()&&q==queue.Get()&&w==width&&h==height&&fmt==format)return true;
+    if(configured&&dev==device.Get()&&q==queue.Get()&&w==width&&h==height&&fmt==format&&require_ngx==ngx_required)return true;
     reset();
     if(!dev||!q||!w||!h)return false;
-    if(!probe(dev))return false;
+    if(require_ngx&&!probe(dev))return false;
+    ngx_required=require_ngx;failed=false;
+    if(!require_ngx)strcpy_s(diagnostic,"Shader FG: D3D12 compute (no NVIDIA inference)");
     // reset() releases graphics objects but capability data remains cached.
     allocate=&NVSDK_NGX_D3D12_AllocateParameters;destroy=&NVSDK_NGX_D3D12_DestroyParameters;
     create=&NVSDK_NGX_D3D12_CreateFeature;evaluate=&NVSDK_NGX_D3D12_EvaluateFeature;
@@ -172,7 +174,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     void(*on_submitted)(void*) noexcept,void* submitted_context,void(*on_prepared)(void*) noexcept) noexcept {
     submitted_at={};prepared_serial=0;temporal_evaluation_completed=false;
     std::lock_guard lock(ngx_mutex);
-    if(!configured||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
+    if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||guides.eyes[0].center_method>2||guides.eyes[1].center_method>2||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!wait_idle())return false;
     ngx_burst.trace=trace;
     ngx_burst.start(guides.render_frame,guides.capture_token);
@@ -502,7 +504,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 const bool frame_backwards=guides.render_frame&&last.evaluated_frame&&
                     guides.render_frame<=last.evaluated_frame;
                 moving_crop_reset[eye]=g.reset||!compatible||frame_backwards;
-                if(!moving_crop_reset[eye]&&rect.active){
+                if(g.center_method==0&&!moving_crop_reset[eye]&&rect.active){
                     previous_center_crops[eye]=last.evaluated_crop;
                     motion_crop_dx[eye]=(float(rect.x)-last.evaluated_crop.x)/rect.w;
                     motion_crop_dy[eye]=(float(rect.y)-last.evaluated_crop.y)/rect.h;
@@ -522,7 +524,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(!rect.active)for(unsigned part=0;part<4;++part)gpu_timings.preparation_stamp(commands,eye,1,part);
                 // Feature creation can record GPU commands. In prepare-first
                 // mode configure both feature instances before either evaluates.
-                if(prepare_first&&evaluate_center&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)) {
+                if(prepare_first&&evaluate_center&&g.center_method==0&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)) {
                     good=false;break;
                 }
                 gpu_timings.stamp(commands,query+1);
@@ -541,7 +543,14 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                     cut_to_second_list=true;
                 }
                 gpu_timings.stamp(commands,query+2);
-                if(evaluate_center) {
+                if(evaluate_center&&g.center_method) {
+                    const auto& last=features[eye];
+                    focus.center_history[eye]=focus.center_history[eye]&&!g.reset&&last.evaluated_crop_valid&&
+                        last.evaluated_crop.x==rect.x&&last.evaluated_crop.y==rect.y&&last.evaluated_crop.w==rect.w&&last.evaluated_crop.h==rect.h;
+                    good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
+                        nullptr,D3D12_RESOURCE_STATE_COMMON,nullptr,nullptr,&rect);
+                    for(unsigned mark=0;mark<4;++mark)gpu_timings.ngx_stamp(commands,eye,mark);
+                } else if(evaluate_center) {
                     good=prepare_first?dispatch_pass(features[eye],eye,true):
                         (configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)&&dispatch_pass(features[eye],eye,true));
                 } else {
@@ -555,7 +564,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             }
             if(prepare_first&&phase==1)continue;
             gpu_timings.stamp(commands,query+4);
-            auto* center=evaluate_center?features[eye].target:focus.inputs[eye][0].color.Get();
+            auto* center=evaluate_center?(g.center_method?focus.center_output[eye].Get():features[eye].target):focus.inputs[eye][0].color.Get();
             if(evaluate_center&&(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f)){
                 // For a static full-eye point P and crop origins A -> B, NGX
                 // interpolates (P-A)/size -> (P-B)/size. Its midpoint belongs
@@ -604,6 +613,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_GENERIC_READ;
             } else outputs[eye]=base;
             if(good&&rect.active&&g.peripheral_method==2)good=focus.save_depth(device.Get(),commands,eye);
+            if(good&&g.center_method==2)good=focus.save_depth(device.Get(),commands,eye,0);
             if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
             gpu_timings.stamp(commands,query+5);
         }
@@ -788,6 +798,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     bool enabled=true;
     for(unsigned eye=0;eye<2;++eye){
         focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
+        focus.center_history[eye]=(active_mask&(1u<<eye))&&guides.eyes[eye].center_method==2;
         for(auto* f:{&features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==3?&peripheral_features[eye]:nullptr}) {
             if(!f)continue;
             if(!f->handle)continue;void* data{};if(FAILED(f->readback->Map(0,nullptr,&data))||!data)return false;

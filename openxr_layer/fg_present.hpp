@@ -53,6 +53,17 @@ struct Presenter {
     ComPtr<ID3D12CommandQueue> queue;
     std::shared_ptr<D3D11Bridge> interop11;
     bool quad_input{}; // Separate raw quad color planes plus explicitly supplied guide atlases.
+    virtual std::recursive_mutex* dispatch_mutex11() const noexcept {
+        return interop11?interop11->dispatch_mutex:nullptr;
+    }
+    // NGX can bypass the D3D11 API's per-call protection. Serialize complete
+    // driver submissions without holding ID3D11Multithread across a runtime
+    // call (the runtime may use its own helper threads).
+    template<class Submit> auto runtime_dispatch(Submit&& submit) {
+        std::unique_lock<std::recursive_mutex> lock;
+        if(auto* gate=dispatch_mutex11())lock=std::unique_lock(*gate);
+        return submit();
+    }
     D3D12_RESOURCE_STATES xr_image_state() const noexcept {
         return interop11 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
@@ -66,14 +77,14 @@ struct Presenter {
     XrResult release_image(XrSwapchain chain, unsigned index, const XrSwapchainImageReleaseInfo* info) {
         const bool copied = !interop11 || interop11->upload(chain,index);
         const auto submit=[&]{return xr.release(chain,info);};
-        const auto result = quad_input&&interop11?interop11->runtime_submit(submit):submit();
+        const auto result = runtime_dispatch(submit);
         return copied || XR_FAILED(result) ? result : XR_ERROR_RUNTIME_FAILURE;
     }
     void destroy_chain(XrSwapchain chain) {
         if (interop11) interop11->forget(chain);
         if (xr.destroy) xr.destroy(chain);
     }
-    bool capture11(XrSwapchain chain, unsigned index, ID3D11Texture2D* source,
+    virtual bool capture11(XrSwapchain chain, unsigned index, ID3D11Texture2D* source,
         unsigned width, unsigned height, unsigned array, DXGI_FORMAT format) {
         return interop11 && interop11->capture(chain,source,[&](ID3D12Resource* shared) {
             return capture(chain,index,shared,width,height,array,format);
@@ -230,7 +241,7 @@ struct Presenter {
         std::lock_guard lock(mx);
         if(!original||!width||!height)return false;
         worker.trace=trace;
-        if(!worker.probe(device.Get())) {state=worker.capability_ready?CheekyFgState::generation_failed:CheekyFgState::ngx_unavailable;return false;}
+        if(worker.ngx_required&&!worker.probe(device.Get())) {state=worker.capability_ready?CheekyFgState::generation_failed:CheekyFgState::ngx_unavailable;return false;}
         auto desc=original->GetDesc();if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
             desc.SampleDesc.Count!=1||desc.DepthOrArraySize!=array_size)return false;
         const auto typed=capture_format(desc.Format,declared_format);
@@ -446,7 +457,7 @@ struct Presenter {
             state=CheekyFgState::ngx_unavailable;
             const bool log_ngx=trace&&!ngx_logged;
             if(log_ngx) {trace("DLSS-FG NGX initialization starting");ngx_logged=true;}
-            const bool initialized=worker.initialize(device.Get(),queue.Get(),static_cast<unsigned>(d.Width),d.Height,d.Format);
+            const bool initialized=worker.initialize(device.Get(),queue.Get(),static_cast<unsigned>(d.Width),d.Height,d.Format,cheeky_fg_needs_ngx(guides));
             if(log_ngx)trace(initialized?"DLSS-FG NGX initialized":"DLSS-FG NGX initialization unavailable");
             if(initialized){
                 std::array<ID3D12Resource*,2> input{colors[0].Get(),colors[1].Get()};
