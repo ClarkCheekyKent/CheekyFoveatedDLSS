@@ -14,6 +14,10 @@
       <!-- Several modules deliberately share TargetName but have different
            extensions (.addon64, .dll, .asi). They must never share a PDB. -->
       <ProgramDatabaseFile>$(OutDir)$(TargetName)$(TargetExt).pdb</ProgramDatabaseFile>
+      <!-- Full LTCG, not /LTCG:incremental. Incremental LTCG reuses the last
+           link's .iobj/.ipdb and rejects a recompiled /Z7 module with
+           LNK1103 ("debugging information corrupt"), which only a rebuild cleared. -->
+      <LinkTimeCodeGeneration Condition="'%(Link.LinkTimeCodeGeneration)' == 'UseFastLinkTimeCodeGeneration' Or '%(Link.LinkTimeCodeGeneration)' == ''">UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(MSBuildProjectName)' == 'CheekyFoveatedDLSS' Or '$(MSBuildProjectName)' == 'CheekyFoveatedDLSSUEVR'">

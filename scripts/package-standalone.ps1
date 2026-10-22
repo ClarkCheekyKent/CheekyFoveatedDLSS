@@ -20,12 +20,8 @@ $version = $Matches[1]
 $modes = if ($Mode -eq "Both") { @("Standalone", "OptiScaler") } else { @($Mode) }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-# Check all archives before staging any payload. Packaging never replaces an
-# earlier artifact and never modifies a game directory or an OptiScaler install.
-foreach ($packageMode in $modes) {
-    $archive = Join-Path $BinaryRoot "CheekyFoveatedDLSS-$version-$packageMode-$Label.zip"
-    if (Test-Path -LiteralPath $archive) { throw "Archive already exists: $archive. Choose a new -Label." }
-}
+# Packaging replaces an earlier archive with the same label, but never modifies
+# a game directory or an OptiScaler install.
 
 foreach ($packageMode in $modes) {
     $prefix = if ($packageMode -eq "OptiScaler") { "OptiScaler\plugins\" } else { "" }
@@ -68,8 +64,8 @@ foreach ($packageMode in $modes) {
         Copy-Item -LiteralPath $entry.Value -Destination $destination
     }
     $archive = Join-Path $BinaryRoot "CheekyFoveatedDLSS-$version-$packageMode-$Label.zip"
-    # CreateFromDirectory refuses an existing destination, including a file that
-    # appears after the earlier check. No overwrite flag is provided.
+    # CreateFromDirectory has no overwrite flag; remove the previous archive.
+    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
     [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive)
 
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)
