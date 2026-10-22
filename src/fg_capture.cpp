@@ -3,6 +3,9 @@
 #include "fg_snapshot.hpp"
 #include "fg_frame_phase.hpp"
 #include "fg_source_lifecycle.hpp"
+#include "quad_view_bridge.hpp"
+#include "../shared/cheeky_quad_fg.hpp"
+#include <d3d11.h>
 #include "../shared/fg_uevr_mode.hpp"
 #include "gaze_foveation.hpp"
 #include "fg_sr_region.hpp"
@@ -278,9 +281,39 @@ void fg_forget_feature(const NgxHandle* handle) noexcept try {
     if(revision)trace_event("FG game DLSS-SR feature released: handle=%p revision=%llu (awaiting recreated guides)",
         static_cast<const void*>(handle),static_cast<unsigned long long>(revision));
 } catch(...) {}
+void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* p) noexcept try {
+    if(!enabled()||!context||!handle||!p)return;
+    const auto settings=current_settings();const auto quad=quad_view_snapshot();
+    const auto id=reinterpret_cast<uintptr_t>(handle),generation=stereo_view_generation(id);
+    if(!quad_view_assignment(quad,id,generation))return;
+    const auto layer=quad_view_module();const auto observe=layer?reinterpret_cast<CheekyQuadFgObserveFn>(GetProcAddress(layer,"CheekyQuadFG_ObserveD3D11V1")):nullptr;
+    if(!observe)return;
+    std::uint32_t flags{};bool known{};
+    {std::lock_guard lock(mutex);const auto found=feature_flags.find(handle);if(found!=feature_flags.end()){flags=found->second;known=true;}}
+    if(!known&&!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags))return;
+    ID3D11Resource* depth{};ID3D11Resource* motion{};
+    if(!ngx_succeeded(p->Get("Depth",&depth))||!ngx_succeeded(p->Get("MotionVectors",&motion))||!depth||!motion)return;
+    ComPtr<ID3D11Texture2D> dt,mt;if(FAILED(depth->QueryInterface(IID_PPV_ARGS(&dt)))||FAILED(motion->QueryInterface(IID_PPV_ARGS(&mt))))return;
+    CheekyQuadFgSourceV1 source;source.context=context;source.depth=dt.Get();source.motion=mt.Get();source.generation=generation;
+    auto& m=source.meta;m.feature=id;m.width=ui(p,"OutWidth");m.height=ui(p,"OutHeight");
+    m.depth_width=ui(p,"DLSS.Render.Subrect.Dimensions.Width");m.depth_height=ui(p,"DLSS.Render.Subrect.Dimensions.Height");
+    if(!m.depth_width)m.depth_width=ui(p,"Width");if(!m.depth_height)m.depth_height=ui(p,"Height");
+    m.low_res_mv=(flags&2u)!=0;m.depth_inverted=(flags&8u)!=0;m.motion_jittered=(flags&4u)!=0;
+    m.motion_width=m.low_res_mv?m.depth_width:m.width;m.motion_height=m.low_res_mv?m.depth_height:m.height;
+    m.depth_base_x=ui(p,"DLSS.Input.Depth.Subrect.Base.X");m.depth_base_y=ui(p,"DLSS.Input.Depth.Subrect.Base.Y");
+    m.motion_base_x=ui(p,"DLSS.Input.MV.Subrect.Base.X");m.motion_base_y=ui(p,"DLSS.Input.MV.Subrect.Base.Y");
+    m.motion_scale_x=f(p,"MV.Scale.X",1);m.motion_scale_y=f(p,"MV.Scale.Y",1);m.jitter_x=f(p,"Jitter.Offset.X");m.jitter_y=f(p,"Jitter.Offset.Y");
+    m.reset=ui(p,"Reset");m.resolution_percent=settings.fg.resolution_percent;m.peripheral_percent=settings.fg.peripheral_percent;
+    m.peripheral_method=std::min(settings.fg.peripheral_method,2u);m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
+    m.focus_feather=settings.fg.feather;m.show_foveation_border=settings.fg.show_border;m.configuration=configuration(settings);
+    source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;source.submit_repeats=settings.fg.submit_repeats;
+    // Quad native frame identities are assigned at the four-view xrEndFrame.
+    source.frame_id=0;observe(&source);
+}catch(...){}
 void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
                     const NgxParameters* p,NgxResult result) noexcept try {
     if(!enabled()||!cmd||!p||!handle||!ngx_succeeded(result))return;
+    if(quad_view_snapshot().active)return; // The quad bridge owns all four guide identities.
     const auto settings=current_settings();
     const bool hookless=hookless_selected(settings.fg);
     if(!hookless&&(!render_frame||ticket_epoch!=source_epoch.load())){++missing_frame_guides;return;}

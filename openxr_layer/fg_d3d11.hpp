@@ -19,23 +19,42 @@ struct D3D11Bridge {
     struct Image { Ptr<ID3D11Texture2D> original, shared11; Ptr<ID3D12Resource> shared12; std::uint64_t last_read{}; };
     MicrosoftDevice device11;
     Ptr<ID3D11DeviceContext4> context;
+    Ptr<ID3D11Multithread> protection;
+    Ptr<ID3D11DeviceContext> copy_commands;
+    bool native_shared_textures{};
+    struct ContextGuard {
+        ID3D11Multithread* protection;
+        explicit ContextGuard(ID3D11Multithread* value):protection(value){protection->Enter();}
+        ~ContextGuard(){protection->Leave();}
+    };
     Ptr<ID3D12Device> device12;
     Ptr<ID3D12CommandQueue> queue;
     Ptr<ID3D12Fence> fence12;
     Ptr<ID3D11Fence> fence11;
     Ptr<ID3D12Fence> completion;
     std::recursive_mutex mutex;
+    std::recursive_mutex* dispatch_mutex{}; // Layer lifetime; shared with game NGX evaluation.
+    std::unique_lock<std::recursive_mutex> lock_dispatch() {
+        return dispatch_mutex?std::unique_lock<std::recursive_mutex>(*dispatch_mutex):std::unique_lock<std::recursive_mutex>{};
+    }
+    template<class Submit> auto runtime_submit(Submit&& submit) {
+        // The runtime may use helper threads. Do not hold the immediate-
+        // context lock across that external call; serialize against NGX and
+        // our bridge, while individual D3D11 calls retain API protection.
+        auto dispatch=lock_dispatch();return submit();
+    }
     std::uint64_t serial{};
     std::uint64_t completion_serial{};
     std::unordered_map<XrSwapchain, std::unordered_map<ID3D11Texture2D*, Image>> sources;
     std::unordered_map<XrSwapchain, std::vector<Image>> outputs;
-    bool initialize(ID3D11Device* device) {
+    bool initialize(ID3D11Device* device,bool native_shared=false) {
         if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&device11)))) return false;
         Ptr<ID3D11DeviceContext> immediate; device->GetImmediateContext(&immediate);
         if (FAILED(immediate.As(&context))) return false;
-        Ptr<ID3D11Multithread> multithread;
-        if (FAILED(immediate.As(&multithread))) return false;
-        multithread->SetMultithreadProtected(TRUE);
+        if (FAILED(immediate.As(&protection))) return false;
+        protection->SetMultithreadProtected(TRUE);
+        native_shared_textures=native_shared;
+        if(native_shared_textures&&FAILED(device->CreateDeferredContext(0,&copy_commands)))return false;
         Ptr<IDXGIDevice> dxgi; Ptr<IDXGIAdapter> adapter;
         if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)) ||
             FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12)))) return false;
@@ -54,6 +73,11 @@ struct D3D11Bridge {
         D3D11_TEXTURE2D_DESC source{}; original->GetDesc(&source);
         if (source.SampleDesc.Count != 1 || source.MipLevels != 1 || !source.ArraySize) return false;
         result.original = original;
+        // Quad presentation crosses the game's D3D11 context in both directions.
+        // Keep allocation and command recording native to D3D11, opening only
+        // the private texture alias on D3D12. Do not use the D3D12 allocation
+        // fallback on this path after the driver command-dispatch crash.
+        if(native_shared_textures)return image11(source,result);
         D3D12_RESOURCE_DESC desc{}; desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = source.Width; desc.Height = source.Height;
         desc.DepthOrArraySize = static_cast<UINT16>(source.ArraySize); desc.MipLevels = 1;
@@ -68,10 +92,14 @@ struct D3D11Bridge {
         if (handle) CloseHandle(handle);
         if (SUCCEEDED(hr)) return true;
         result.shared12.Reset(); result.shared11.Reset(); handle = nullptr;
+        return image11(source,result);
+    }
+    bool image11(D3D11_TEXTURE2D_DESC source,Image& result) {
         source.Usage = D3D11_USAGE_DEFAULT; source.CPUAccessFlags = 0;
         source.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         source.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-        hr = device11->CreateTexture2D(&source, nullptr, &result.shared11);
+        auto hr = device11->CreateTexture2D(&source, nullptr, &result.shared11);
+        HANDLE handle{};
         Ptr<IDXGIResource1> shared;
         if (SUCCEEDED(hr)) hr = result.shared11.As(&shared);
         if (SUCCEEDED(hr)) hr = shared->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
@@ -80,10 +108,24 @@ struct D3D11Bridge {
         return SUCCEEDED(hr);
     }
     bool from11() {
+        ContextGuard guard(protection.Get());
         const auto value = serial + 1;
         if (FAILED(context->Signal(fence11.Get(), value))) return false;
         serial = value; context->Flush();
         return SUCCEEDED(queue->Wait(fence12.Get(), value));
+    }
+    bool copy_from11(ID3D11Resource* destination,ID3D11Resource* source) {
+        Ptr<ID3D11CommandList> recorded;
+        if(copy_commands){
+            copy_commands->CopyResource(destination,source);
+            if(FAILED(copy_commands->FinishCommandList(FALSE,&recorded)))return false;
+        }
+        // The copy, signal and flush form one immediate-context transaction.
+        // Other DCS/layer threads must not interleave commands into it.
+        ContextGuard guard(protection.Get());
+        if(recorded)context->ExecuteCommandList(recorded.Get(),TRUE);
+        else context->CopyResource(destination,source);
+        return from11();
     }
     bool mark_complete(std::uint64_t& value) {
         value=completion_serial+1;
@@ -98,6 +140,7 @@ struct D3D11Bridge {
         CloseHandle(event);return good&&SUCCEEDED(device12->GetDeviceRemovedReason());
     }
     template<class Capture> bool capture(XrSwapchain chain, ID3D11Texture2D* original, Capture&& consume) {
+        auto dispatch=lock_dispatch();
         std::lock_guard lock(mutex);
         auto& images = sources[chain];
         auto it = images.find(original);
@@ -108,8 +151,7 @@ struct D3D11Bridge {
         // Reuse only after the private copy has read this shared source. A busy
         // slot skips FG capture, leaving native rendering and its context free.
         if(it->second.last_read&&completion->GetCompletedValue()<it->second.last_read)return false;
-        context->CopyResource(it->second.shared11.Get(), original);
-        if (!from11()) return false;
+        if (!copy_from11(it->second.shared11.Get(),original)) return false;
         const bool good = consume(it->second.shared12.Get());
         // Even a rejected capture may have enqueued reads. Protect reuse.
         const bool ordered = mark_complete(it->second.last_read);
@@ -132,17 +174,23 @@ struct D3D11Bridge {
         return true;
     }
     bool upload(XrSwapchain chain, unsigned index) {
-        std::lock_guard lock(mutex);
-        const auto it = outputs.find(chain);
-        if (it == outputs.end() || index >= it->second.size()) return false;
-        std::uint64_t ready{};
+        Image shared;std::uint64_t ready{};
+        {
+            std::lock_guard lock(mutex);
+            const auto it = outputs.find(chain);
+            if (it == outputs.end() || index >= it->second.size()) return false;
+            shared=it->second[index];
+            if(!mark_complete(ready))return false;
+        }
         // This runs on the presenter thread, outside the D3D11 context lock.
         // The game can submit the SR signals needed by this private GPU work.
-        if(!mark_complete(ready)||!wait_complete(ready))return false;
-        auto& shared = it->second[index];
-        context->CopyResource(shared.original.Get(), shared.shared11.Get());
+        // Do not hold the bridge while waiting: the next game's guide atlas
+        // and color captures use it too. The local COM references pin this eye.
+        if(!wait_complete(ready))return false;
+        auto dispatch=lock_dispatch();
+        std::lock_guard lock(mutex);
         // Also protect the shared image from the next private D3D12 upload.
-        return from11();
+        return copy_from11(shared.original.Get(),shared.shared11.Get());
     }
     void drain() noexcept {
         if (!completion || !completion_serial) return;

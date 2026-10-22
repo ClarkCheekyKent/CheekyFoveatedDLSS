@@ -541,7 +541,7 @@ bool draw_quad_controls(OverlayUiState& r,const OverlayRuntime& runtime) {
         if(!assignment_payload.empty()){command(r,runtime,"quad_assign",assignment_payload);return true;}
     }
     if(ImGui::Button(r.draft.quad_manual_assignment?"Reset quad assignments":"Retry automatic assignment"))command(r,runtime,"quad_recalibrate");
-    ImGui::TextWrapped("Manual assignments apply to this session and clear when views are recreated. Each role can be assigned once.");
+    ImGui::TextWrapped("Manual roles are saved by view number and restored when the source count matches. Each role can be assigned once. Check the labels if the game's order changes.");
     return true;
 }
 
@@ -799,31 +799,38 @@ void fg_percent(const char* label, std::uint32_t& value) {
 }
 
 void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
+    const bool quad=flag(member(snapshot,"quad_views"),"active");
+    if(quad&&settings.fg.peripheral_method>2)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable DLSS Frame Generation (2x)", &s.enabled);
     test_control("FgEnabled");
-    ImGui::TextWrapped("Experimental. Requires a D3D11 or D3D12 OpenXR stereo session and the matching Cheeky OpenXR support. Changes save automatically.");
+    ImGui::TextWrapped(quad?"Experimental D3D11 quad views: DLSS-G processes the center, with a cheaper peripheral method. Requires all four view assignments and matching OpenXR support.":
+        "Experimental. Requires a D3D11 or D3D12 OpenXR stereo session and the matching Cheeky OpenXR support. Changes save automatically.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
     else if (!flag(fg, "controls_supported"))
         warning("Update the OpenXR layer and restart the game.");
     else if (!s.enabled) ImGui::TextUnformatted("Status: Off");
     else if (!flag(fg, "compatible_session"))
-        ImGui::TextWrapped("Status: Waiting for a running D3D11 or D3D12 OpenXR stereo session");
+        ImGui::TextWrapped(quad?"Status: Waiting for D3D11 quad-view FG support":"Status: Waiting for a running D3D11 or D3D12 OpenXR stereo session");
     else {
         diagnostic_line(fg, "Status", "state");
         const auto detail = plain(member(fg, "diagnostic"));
         if (!detail.empty()) ImGui::TextWrapped("%s", detail.c_str());
     }
-    ImGui::TextWrapped("Standalone matches exactly one submitted stereo guide pair at xrEndFrame. Native frames continue when guides are missing or ambiguous. OpenVR, LibOVR and desktop presentation are not supported by this FG presenter.");
-    if(dx11)ImGui::TextWrapped("D3D11 / OpenComposite: FG uses DX12 transport automatically while enabled. The game and OpenXR session remain D3D11. Direct OpenXR output uses the compact bridge path.");
+    if(quad)ImGui::TextWrapped("The layer captures depth and motion from all four assigned views before reuse, then assembles full-eye guides at quad submission. Missing or ambiguous captures keep native presentation.");
+    else ImGui::TextWrapped("Standalone matches exactly one submitted stereo guide pair at xrEndFrame. Native frames continue when guides are missing or ambiguous. OpenVR, LibOVR and desktop presentation are not supported by this FG presenter.");
+    if(dx11&&!quad)ImGui::TextWrapped("D3D11 / OpenComposite: FG uses DX12 transport automatically while enabled. The game and OpenXR session remain D3D11. Direct OpenXR output uses the compact bridge path.");
     if (!s.enabled) return;
 
-    ImGui::SeparatorText("Foveation");
-    fg_percent("FG scale", s.resolution_percent);
+    ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
+    fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
+    if(!quad){
     ImGui::Checkbox("Foveated frame generation", &s.foveated);
-    if (s.foveated) {
+    }
+    if (s.foveated||quad) {
+        if(!quad){
         ImGui::Checkbox("Match DLSS-SR foveation region", &s.match_sr_region);
         if (s.match_sr_region)
             ImGui::TextWrapped("Uses SR size, transition and per-eye placement, including gaze when available.");
@@ -834,27 +841,30 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             slider("FG vertical offset", s.y, -1.F, 1.F);
             slider("FG transition width", s.feather, 0.F, .3F);
         }
+        }
         ImGui::Checkbox("Show blue FG region border", &s.show_border);
         fg_percent("FG periphery scale", s.peripheral_percent);
         combo("FG periphery method", s.peripheral_method,
-            "Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0");
+            quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0":"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0");
+        if(quad)ImGui::TextWrapped("The center region follows the submitted quad-view FOV. A peripheral DLSS-G pass is not used.");
         int depth = s.depth_bits == 16 ? 0 : 1, motion = s.motion_bits == 16 ? 0 : 1;
         if (ImGui::Combo("FG depth precision", &depth, "16-bit\0" "32-bit\0")) s.depth_bits = depth ? 32 : 16;
         if (ImGui::Combo("FG motion precision", &motion, "16-bit\0" "32-bit\0")) s.motion_bits = motion ? 32 : 16;
     }
     if (ImGui::TreeNode("FG scheduling and storage")) {
-        combo("FG GPU queue", s.queue_priority, "Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
+        combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
+        if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         combo("Release game rendering", s.release_point,
             "After FG submission\0After GPU preparation\0After FG completion\0After generated frame submission\0" "4 ms after FG submission\0");
         if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.");
         ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
         ImGui::Checkbox("Submit repeat frames", &s.submit_repeats);
-        combo("FG guide capture", s.guide_capture_mode, "Raw snapshots\0Prepared FG layouts\0");
-        combo("FG frame storage", s.compact_storage, "Full-resolution frames\0Compact center + periphery\0");
+        if(!quad){combo("FG guide capture", s.guide_capture_mode, "Raw snapshots\0Prepared FG layouts\0");
+        combo("FG frame storage", s.compact_storage, "Full-resolution frames\0Compact center + periphery\0");}
         combo("FG color capture", s.color_capture_mode, "Full snapshot + eye crops\0Direct eye capture\0");
         combo("FG OpenXR uploads", s.upload_mode, "Per-image submissions\0Batch stereo and UI uploads\0");
-        if(!dx11) {
+        if(!dx11&&!quad) {
             combo("FG output destination", s.direct_xr_output, "Compact intermediate\0Direct OpenXR image (experimental)\0");
             combo("Direct periphery shading", s.direct_peripheral_shading, "Full-resolution warp\0Coarse blocks\0Coarse grid + bilinear filtering\0");
         }
@@ -883,9 +893,15 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         timing_line(gpu, "FG total GPU", "total_ms");
     }
     if (ImGui::TreeNode("FG capture and presentation diagnostics")) {
+        if(quad){const auto guides=member(member(snapshot,"quad_views"),"fg");
+            ImGui::TextUnformatted("Frame source: Four-view OpenXR submission");
+            diagnostic_line(guides,"Captured view guides","snapshots");diagnostic_line(guides,"Assembled guide pairs","guide_pairs");
+            diagnostic_line(guides,"Capture stage (8 = ready)","capture_stage");diagnostic_line(guides,"Assembly stage (4 = ready)","assembly_stage");
+        }else{
         diagnostic_line(fg, "Frame source", "frame_source");
         diagnostic_line(fg, "Captured guides", "captured_guides");
         diagnostic_line(fg, "Guide matching", "match_reason");
+        }
         diagnostic_line(member(fg,"direct_output"), "Direct output fallback", "reason_text");
         const auto rows = [](std::string_view object,
             std::initializer_list<std::pair<const char*, const char*>> fields, bool milliseconds = false) {
@@ -1060,12 +1076,8 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 end_tab();
             }
             if (begin_tab("DLSS-FG")) {
-                if(flag(member(r.snapshot,"quad_views"),"active")){
-                    ImGui::TextWrapped("Frame generation for quad views is not implemented yet.");
-                }else{
                 draw_fg(r.draft, r.snapshot, std::string_view(renderer)=="D3D11");
                 if (ImGui::Button("Reset FG defaults")) command(r, runtime, "defaults_fg");
-                }
                 end_tab();
             }
             if (begin_tab("DLSS-NR")) {

@@ -306,8 +306,12 @@ can be assigned once; all four must be assigned before the mapping is used.
 **Show view numbers** is an independent checkbox in either mode. Small numbers
 repeat in a 7 by 5 grid to remain visible outside the inset.
 Only evaluated game handles receive numbers, so unused feature registrations
-do not consume labels. Roles are session-local and clear when sources are
-released, recreated or resized; the mode and label preference are saved.
+do not consume labels. Manual roles save by view number in the game's settings,
+along with the evaluated source count. On the next session they restore once
+that count matches; handle addresses are never persisted. This is a manual
+declaration of stable game ordering, not automatic verification. Check labels
+after changing the game's rendering setup. Reset quad assignments also clears
+the saved layout. The mode and label preference remain separate settings.
 
 Diagnostics and support reports include `quad_views` with source numbers,
 handle generations, raw submission roles and automatic versus manual mapping.
@@ -327,6 +331,70 @@ game's raster resolution or the OpenXR swapchain dimensions. Disable
 retain the game's rendering until all four roles are assigned.
 
 NR applies over the whole assigned center views only (D3D11 requires DX12
-Transport); its extra fovea controls are hidden. Quad frame generation remains
-unimplemented and its stereo-only controls are hidden during a quad session.
-These policies and the repeated labels require manual in-game validation.
+Transport); its extra fovea controls are hidden.
+
+Experimental DCS D3D11 quad FG captures each assigned view's depth and motion
+after its successful game evaluation, before DCS reuses those resources. The
+four raw color views are captured before their OpenXR image releases. Center
+and peripheral color stay in separate planes: memory packing copies pixels
+without resampling, feathering or compositing. DLSS-G consumes the raw center
+planes; peripheral methods are previous-frame reuse, motion warping or
+bidirectional interpolation. Final presentation combines the processed planes.
+
+Guide atlases normalize all four views into the full-eye projection using the
+corrected submitted FOVs. One fresh evaluation per assigned view is required
+within the same quad submission interval. Native presentation continues if
+guides, sharing, storage or submission layouts are unavailable. The current raw
+plane path targets DCS's separate per-eye swapchains; unsupported shared-eye
+layouts keep native rendering. The layer owns D3D12 processing and leases;
+enabling quad FG does not force the game's SR through DX12 Transport.
+
+The FG tab exposes center scale and cheaper peripheral methods while hiding
+stereo fovea placement. `quad_views.fg` records captured guide counts, assembled
+pairs and last stages (capture 8 and assembly 4 indicate success). Source,
+layer, UI and shader compilation are checked locally; DCS generation cadence,
+headset quality and persistence after restart require manual validation.
+
+The DCS 42032 capture from October 21 records an NVIDIA D3D11 command-dispatch
+access violation (execution at `0x11`) during FG bridge presentation. The later
+stack overflow is in DCS's crash reporter. No generated resources were recorded,
+so this capture does not establish a DLSS-G inference failure. Quad FG now uses
+D3D11-created shared textures and deferred bridge copies, with copy/signal/flush
+protected as one immediate-context transaction. These changes address the
+observed bridge path; a manual DCS run must confirm whether they resolve the
+driver fault. Missing four-view guides use coordinated native composition,
+without sending precomposed eye images through FG. `QUAD-FG submit` logs include
+mapping status, guide counts, packing readiness and capture/assembly stages.
+
+The follow-up 14724 capture confirms automatic roles were verified and all four
+guide snapshots succeeded, but atlas allocation stopped at assembly stage 2.
+A local adapter probe reproduced `E_INVALIDARG` creating a shared RG32_FLOAT
+motion texture; shared RGBA32_FLOAT creation, views and D3D12 opening succeeded.
+Quad guide motion storage therefore uses RGBA32_FLOAT, retaining float32 XY.
+Before first activation, native runtime frames continue until a complete guide
+pair proves allocation and sharing. Color capture and asynchronous presentation
+start only afterward. Quad presenter retirement waits for accepted application
+frames to end before removing their session owner, since xrWaitFrame can overlap
+the preceding render-thread xrEndFrame. Cockpit loading, active generation and
+turning FG off still need manual DCS validation; the prior bridge-only change
+did not resolve the crash.
+
+Capture 35424 confirms actual quad generation (43 generated submissions at the
+support snapshot), with matched color/guide tokens and successful atlas assembly.
+It also records recurring native passthroughs. Bridge upload previously held its
+mutex during a GPU wait while guide assembly used try_lock; contention therefore
+discarded valid intervals and cleared the presenter epoch/history. Upload now
+pins its eye locally, waits outside the mutex and reacquires only for the D3D11
+copy. Guide assembly waits for that bounded CPU section. Raw color packing can
+still publish a native frame when no inference guide lease is available, without
+forcing coordinated passthrough and resetting the whole epoch.
+
+The later dump still faults in NVIDIA D3D11 command dispatch. Quad NGX evaluation,
+bridge copies and runtime release/end submissions now share a CPU dispatch gate.
+Runtime calls do not hold the immediate-context lock across external work, since
+the runtime may use helper threads; ordinary D3D11 API protection remains enabled.
+This excludes NGX's driver submission from overlapping those presentation calls;
+it remains a crash mitigation requiring manual DCS validation. The additive
+Acquire/ReleaseD3D11V1 exports require updating both runtime and OpenXR layer.
+Sampled `FG HISTORY` messages identify worker restart, token gap, frame gap and
+upstream source reset separately. Resets remain required for real discontinuities.

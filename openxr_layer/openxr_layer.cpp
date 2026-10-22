@@ -2625,7 +2625,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
             iterator->second.quad_capture_locates = iterator->second.quad_capture_frames = 0;
             iterator->second.quad_capture_correct_focus_fov = bool(iterator->second.quad_capture)&&dcs_quad_capture_host();
             iterator->second.quad_capture_fovs.clear();
-            if(iterator->second.quad_capture)log_startup("QUAD-CAPTURE compositor graphics_api=%u focus_fov_correction=%u; quad FG policy unavailable\n",
+            if(iterator->second.quad_capture)log_startup("QUAD-CAPTURE compositor graphics_api=%u focus_fov_correction=%u; D3D11 quad FG guide path available\n",
                 iterator->second.graphics_api,unsigned(iterator->second.quad_capture_correct_focus_fov));
             iterator->second.unsupported_view_configuration =
                 info->primaryViewConfigurationType !=
@@ -3498,7 +3498,15 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
         std::lock_guard fg_lock(state_mutex);
         const auto chain = swapchains.find(swapchain);
         const auto owner = sessions.find(session);
+        bool quad_capture_ready=true;
+        if(owner!=sessions.end()&&owner->second.quad_capture&&owner->second.fg){
+            std::lock_guard presenter_lock(owner->second.fg->mx);
+            const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner->second.fg);
+            quad_capture_ready=buffered&&buffered->started;
+        }
         if (chain != swapchains.end() && owner != sessions.end() && owner->second.fg &&
+            quad_capture_ready &&
+            (!owner->second.quad_capture||!owner->second.native_frame_begun) &&
             (chain->second.create_info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
             has_acquired && acquired_index < chain->second.calibration_images.size()) {
             fg_presenter=owner->second.fg;
@@ -3552,7 +3560,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
 std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
     SessionState& owner, const Dispatch& d, bool requested) {
     const bool supported=owner.running && (owner.graphics_api==12 || owner.graphics_api==11) &&
-        owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        (owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || (owner.quad_capture&&owner.graphics_api==11));
+    if(owner.quad_capture&&owner.quad_capture->d3d11&&owner.quad_capture->d3d11->fg_guides)
+        owner.quad_capture->d3d11->fg_guides->enable(requested&&supported&&bool(owner.fg));
     if (!requested || !supported) {
         if(owner.fg)log_startup("DLSS-FG disabling session=%p; draining private GPU work\n",owner.session);
         owner.fg_requested=false;
@@ -3570,14 +3580,18 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
         fn.wait_image=d.wait_swapchain_image;fn.release=d.release_swapchain_image;
         fn.wait_frame=d.wait_frame;fn.begin_frame=d.begin_frame;fn.end_frame=d.end_frame;
         auto candidate=std::make_shared<cheeky::fg::BufferedPresenter>();
+        candidate->quad_input=bool(owner.quad_capture);
         candidate->trace=[](const char* message) noexcept {log_startup("%s\n",message);};
         auto* device12=owner.graphics_api==12?static_cast<ID3D12Device*>(owner.graphics_device):nullptr;
         auto* queue12=owner.graphics_api==12?static_cast<ID3D12CommandQueue*>(owner.graphics_queue):nullptr;
         if(owner.graphics_api==11) {
             auto bridge=std::make_shared<cheeky::fg::D3D11Bridge>();
-            if(bridge->initialize(static_cast<ID3D11Device*>(owner.graphics_device))) {
+            if(candidate->quad_input)bridge->dispatch_mutex=&cheeky::quad_capture::d3d11_dispatch_mutex;
+            if(bridge->initialize(static_cast<ID3D11Device*>(owner.graphics_device),candidate->quad_input)) {
                 device12=bridge->device12.Get();queue12=bridge->queue.Get();
                 candidate->interop11=std::move(bridge);
+                if(owner.quad_capture&&owner.quad_capture->d3d11)owner.quad_capture->d3d11->fg_bridge=candidate->interop11;
+                if(candidate->quad_input)log_startup("QUAD-FG bridge native D3D11 shared textures; deferred copies with protected copy/signal/flush; NGX/runtime dispatch serialized; device_flags=0x%x\n",static_cast<ID3D11Device*>(owner.graphics_device)->GetCreationFlags());
             }
         }
         if (candidate->setup(owner.session,fn,device12,queue12)) {
@@ -3590,6 +3604,8 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
             log_startup("DLSS-FG presenter initialization failed session=%p\n",owner.session);
         }
     }
+    if(owner.quad_capture&&owner.quad_capture->d3d11&&owner.quad_capture->d3d11->fg_guides)
+        owner.quad_capture->d3d11->fg_guides->enable(bool(owner.fg));
     return {};
 }
 
@@ -3621,6 +3637,18 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     const bool mode_allows_fg=!mode_epoch_valid ||
         (uevr_mode_v2.known && uevr_mode_v2.mode==0);
     const bool fg_requested_now=requested && mode_allows_fg;
+    std::shared_ptr<cheeky::fg::BufferedPresenter> finishing_quad;
+    {
+        std::lock_guard lock(state_mutex);const auto found=sessions.find(session);
+        if(found!=sessions.end()&&found->second.quad_capture&&found->second.fg){
+            const auto& active=found->second.fg;std::lock_guard fg_lock(active->mx);
+            if(!fg_requested_now||cheeky::fg::replace_presenter_for_configuration(requested,active->configuration,control.configuration))
+                finishing_quad=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(active);
+        }
+    }
+    // Keep the old owner visible to the render thread until its pipelined
+    // xrEndFrame finishes. Waiting while holding state_mutex would deadlock it.
+    if(finishing_quad)finishing_quad->finish_application_frame();
     static bool warned_missing_mode_epoch{};
     if(get_uevr_mode && !get_uevr_mode_v2 && !warned_missing_mode_epoch){
         warned_missing_mode_epoch=true;
@@ -3686,6 +3714,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
                     owner.fg_state=CheekyFgState::paused_rendering_mode;
             }
             if (owner.running && state) presenter=owner.fg;
+            if(presenter&&owner.quad_capture&&owner.quad_capture->d3d11){
+                const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(presenter);
+                std::lock_guard fg_lock(presenter->mx);
+                if(buffered&&!buffered->started){
+                    if(!owner.quad_capture->d3d11->fg_guides->ready()){
+                        presenter->state=CheekyFgState::waiting_for_guides;
+                        strcpy_s(buffered->diagnostic,"Preparing four-view guides; native presentation remains active");presenter.reset();
+                    }else buffered->diagnostic[0]=0;
+                }
+            }
             if (!presenter && downstream && state) {
                 ++owner.native_waits_pending;
                 native_wait_reserved=true;
@@ -3722,12 +3760,14 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStatus(CheekyFgStatus*
     std::lock_guard lock(state_mutex);
     for (const auto& [handle,owner]:sessions) {
         if ((owner.graphics_api!=12 && owner.graphics_api!=11) || !owner.running ||
-            owner.view_configuration!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) continue;
+            (owner.view_configuration!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO&&!(owner.quad_capture&&owner.graphics_api==11))) continue;
         status.compatible_session=1;
         status.state=owner.fg_state;
         if (!owner.fg) continue;
         std::lock_guard fg_lock(owner.fg->mx);
         status.active=1;status.state=owner.fg->state;
+        if(owner.quad_capture){const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner.fg);
+            status.active=buffered&&buffered->started;}
         status.native_frames=owner.fg->native_count;
         status.generated_frames=owner.fg->generated_count;
         status.fallback_frames=owner.fg->fallback_count;
@@ -3871,12 +3911,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     const XrFrameEndInfo* const frame_end_info
 ) {
     std::shared_ptr<cheeky::quad_capture::Compositor> quad;
+    std::shared_ptr<cheeky::fg::BufferedPresenter> quad_presenter;
     Dispatch quad_dispatch{};
     {
         std::lock_guard lock(state_mutex);
         const auto found=sessions.find(session);
         if(found!=sessions.end()){
             quad=found->second.quad_capture;
+            if(quad&&!found->second.native_frame_begun)quad_presenter=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(found->second.fg);
             quad_dispatch=instances.at(found->second.instance).dispatch;
             if(!quad && ++found->second.quad_capture_frames<=8 && frame_end_info && frame_end_info->layers){
                 for(unsigned i=0;i<frame_end_info->layerCount;++i){
@@ -3889,8 +3931,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
         }
     }
     if(quad){
-        const auto result=quad_capture_end(session,frame_end_info,quad_dispatch,quad);
-        if(XR_SUCCEEDED(result)){std::lock_guard lock(state_mutex);auto found=sessions.find(session);if(found!=sessions.end())found->second.native_frame_begun=false;}
+        const auto result=quad_capture_end(session,frame_end_info,quad_dispatch,quad,quad_presenter);
+        if(XR_SUCCEEDED(result)){std::lock_guard lock(state_mutex);auto found=sessions.find(session);if(found!=sessions.end()){
+            found->second.native_frame_begun=false;if(found->second.fg)found->second.fg->set_native_frame_pending(found->second.native_waits_pending!=0);}}
         return result;
     }
     PFN_xrEndFrame next{};

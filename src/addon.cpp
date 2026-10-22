@@ -856,6 +856,8 @@ void load_settings_from_reshade() noexcept {
     reshade::get_config_value(nullptr, config_section, "ManualStereoRightFirst", settings.manual_stereo_right_first);
     reshade::get_config_value(nullptr,config_section,"ManualQuadViewAssignment",settings.quad_manual_assignment);
     reshade::get_config_value(nullptr,config_section,"ShowQuadViewNumbers",settings.quad_show_numbers);
+    reshade::get_config_value(nullptr,config_section,"QuadSavedSourceCount",settings.quad_saved_source_count);
+    for(unsigned i=0;i<8;++i){const auto key="QuadView"+std::to_string(i+1)+"Role";reshade::get_config_value(nullptr,config_section,key.c_str(),settings.quad_saved_roles[i]);}
     reshade::get_config_value(nullptr, config_section, "IndependentOpenXRGaze", settings.independent_openxr_gaze);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "GazeSmoothingMs",
@@ -1040,6 +1042,8 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     reshade::set_config_value(nullptr, config_section, "ManualStereoRightFirst", settings.manual_stereo_right_first);
     reshade::set_config_value(nullptr,config_section,"ManualQuadViewAssignment",settings.quad_manual_assignment);
     reshade::set_config_value(nullptr,config_section,"ShowQuadViewNumbers",settings.quad_show_numbers);
+    reshade::set_config_value(nullptr,config_section,"QuadSavedSourceCount",settings.quad_saved_source_count);
+    for(unsigned i=0;i<8;++i){const auto key="QuadView"+std::to_string(i+1)+"Role";reshade::set_config_value(nullptr,config_section,key.c_str(),settings.quad_saved_roles[i]);}
     reshade::set_config_value(nullptr, config_section, "IndependentOpenXRGaze", settings.independent_openxr_gaze);
     reshade::set_config_value(
         nullptr, config_section, "GazeSmoothingMs",
@@ -1735,15 +1739,20 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         if(ImGui::Combo("Quad assignment mode",&quad_mode,"Automatic\0Manual\0")){settings.quad_manual_assignment=quad_mode==1;changed=true;}
         const auto quad=quad_view_snapshot();
         if(quad.active){
-            ImGui::TextWrapped("Small numbers repeat across each view. Manual assignments last for this session; recreated views clear them.");
+            ImGui::TextWrapped("Small numbers repeat across each view. Manual roles are saved by view number and restored when the source count matches. Check labels if the game's order changes.");
             for(const auto& source:quad.sources)if(source.dlss_view){const auto label="View "+std::to_string(source.number);int selected=int(source.manual_role);
                 if(!settings.quad_manual_assignment){unsigned role{};
                     if(quad.status==2)for(const auto& view:quad.views)if(view.dlss_view==source.dlss_view&&view.registration_generation==source.registration_generation)role=view.view_index+1;
                     ImGui::Text("%s: %s",label.c_str(),quad_role_name(role));continue;}
-                if(ImGui::Combo(label.c_str(),&selected,"Unassigned\0Periphery Left\0Periphery Right\0Center Left\0Center Right\0"))
-                    quad_view_assign(quad.session_generation,source.number,unsigned(selected),source.dlss_view,source.registration_generation);
+                if(ImGui::Combo(label.c_str(),&selected,"Unassigned\0Periphery Left\0Periphery Right\0Center Left\0Center Right\0")&&
+                    quad_view_assign(quad.session_generation,source.number,unsigned(selected),source.dlss_view,source.registration_generation)){
+                    const auto assigned=quad_view_snapshot();settings.quad_saved_roles={};settings.quad_saved_source_count=0;
+                    for(const auto& entry:assigned.sources)if(entry.dlss_view&&entry.number&&entry.number<=8){
+                        settings.quad_saved_roles[entry.number-1]=entry.manual_role;++settings.quad_saved_source_count;}
+                    changed=true;}
             }
-            if(ImGui::Button("Reset quad assignments"))quad_view_recalibrate();
+            if(ImGui::Button("Reset quad assignments")){settings.quad_saved_roles={};settings.quad_saved_source_count=0;changed=true;
+                quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers,settings.quad_saved_roles.data(),0);quad_view_recalibrate();}
         }else{
         ImGui::SeparatorText("Stereo Eye Mapping");
         int method = settings.manual_stereo_mapping ? 4 : int(settings.eye_calibration_method);

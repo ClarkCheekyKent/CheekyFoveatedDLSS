@@ -175,7 +175,10 @@ XrResult quad_capture_locate(XrSession session,const XrViewLocateInfo* info,XrVi
 }
 
 XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dispatch& dispatch,
-    const std::shared_ptr<cheeky::quad_capture::Compositor>& compositor) {
+    const std::shared_ptr<cheeky::quad_capture::Compositor>& compositor,
+    const std::shared_ptr<cheeky::fg::BufferedPresenter>& presenter={}) {
+    struct FinishInterval{cheeky::quad_capture::QuadFg11* guides;~FinishInterval(){if(guides)guides->finish();}};
+    FinishInterval interval{compositor->d3d11?compositor->d3d11->fg_guides.get():nullptr};
     if(!info||(info->layerCount&&!info->layers))return XR_ERROR_VALIDATION_FAILURE;
     const XrCompositionLayerProjection* scene{};unsigned scene_index{};
     for(unsigned i=0;i<info->layerCount;++i){
@@ -183,7 +186,7 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
         if(info->layers[i]->type!=XR_TYPE_COMPOSITION_LAYER_PROJECTION)continue;
         if(scene)return XR_ERROR_LAYER_INVALID;scene=reinterpret_cast<const XrCompositionLayerProjection*>(info->layers[i]);scene_index=i;
     }
-    if(!scene)return dispatch.end_frame(session,info);
+    if(!scene)return presenter?presenter->end_quad_frame(info,nullptr,{}):dispatch.end_frame(session,info);
     if(scene->viewCount!=4||!scene->views)return XR_ERROR_LAYER_INVALID;
     std::array<XrCompositionLayerProjectionView,4> corrected;
     std::copy_n(scene->views,4,corrected.begin());
@@ -211,6 +214,7 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
                chain->second.released_index>=chain->second.calibration_images.size())return XR_ERROR_LAYER_INVALID;
             auto* resource=chain->second.calibration_images[chain->second.released_index];
             inputs[i].image=image;inputs[i].format=static_cast<DXGI_FORMAT>(chain->second.create_info.format);
+            if(compositor->d3d11)compositor->d3d11->source_chains[i]=image.swapchain;
             if(owner->second.graphics_api==11)inputs[i].texture11=static_cast<ID3D11Texture2D*>(resource);
             else inputs[i].texture=static_cast<ID3D12Resource*>(resource);
             if(diagnostic)log_startup("QUAD-CAPTURE submit input_views=4 view=%u role=%s eye=%u chain=%p resource=%p released=%u slice=%u rect=%d,%d,%d,%d format=%lld\n",
@@ -234,12 +238,54 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
     }
     const auto complete_mapping=[&](bool success){if(compositor->d3d11&&compositor->d3d11->mapping)
         compositor->d3d11->mapping->complete(mapping_ticket,success);};
-    auto result=compositor->compose(inputs,projection,views);
-    if(result!=XR_SUCCESS){complete_mapping(false);log_startup("QUAD-CAPTURE composition failed result=%d\n",int(result));return result;}
     auto replacement=*scene;replacement.viewCount=2;replacement.views=views.data();
     std::vector<const XrCompositionLayerBaseHeader*> layers(info->layers,info->layers+info->layerCount);
     layers[scene_index]=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&replacement);
-    auto forwarded=*info;forwarded.layers=layers.data();result=dispatch.end_frame(session,&forwarded);
+    auto forwarded=*info;forwarded.layers=layers.data();
+    XrResult result=XR_SUCCESS;
+    if(!presenter&&compositor->d3d11&&compositor->d3d11->fg_bridge){
+        // Prove the four-view guide/sharing path while the application still
+        // owns ordinary runtime frames. No color bridge or pacing takeover.
+        auto& eleven=*compositor->d3d11;auto roles=eleven.mapping->snapshot();roles.active=1;
+        std::array<unsigned,2> widths{},heights{};std::array<std::array<float,4>,2> insets;
+        for(unsigned eye=0;eye<2;++eye){widths[eye]=compositor->recommended[eye].recommendedImageRectWidth;
+            heights[eye]=compositor->recommended[eye].recommendedImageRectHeight;
+            insets[eye]=cheeky::quad_capture::inset_rect(corrected[eye].fov,corrected[eye+2].fov);}
+        const bool was_ready=eleven.fg_guides->ready();
+        auto probe=eleven.fg_guides->build(roles,projection,widths,heights,insets,*eleven.fg_bridge);
+        if(probe.pair.capture_token&&!was_ready)log_startup("QUAD-FG four-view guide preflight ready; presentation eligible at next frame boundary\n");
+    }
+    if(presenter&&compositor->d3d11&&presenter->interop11){
+        auto& eleven=*compositor->d3d11;auto roles=eleven.mapping->snapshot();roles.active=1;
+        std::array<unsigned,2> widths{},heights{};
+        for(unsigned eye=0;eye<2;++eye){widths[eye]=compositor->recommended[eye].recommendedImageRectWidth;heights[eye]=compositor->recommended[eye].recommendedImageRectHeight;
+            views[eye]=corrected[eye];views[eye].next=nullptr;views[eye].subImage.imageRect={{0,0},{int32_t(widths[eye]),int32_t(heights[eye])}};views[eye].subImage.imageArrayIndex=0;}
+        std::array<std::array<float,4>,2> insets;
+        for(unsigned eye=0;eye<2;++eye)insets[eye]=cheeky::quad_capture::inset_rect(corrected[eye].fov,corrected[eye+2].fov);
+        auto guides=eleven.fg_guides->build(roles,projection,widths,heights,insets,*presenter->interop11);
+        // Native color publication does not require an inference lease. Keep
+        // the packed raw views even if a guide pool slot is temporarily busy.
+        const bool packed=presenter->capture_quad_planes(projection,replacement,insets,guides.pair);
+        static thread_local uint64_t fg_submissions{};
+        const auto fg_submission=++fg_submissions;
+        if(fg_submission<=3||fg_submission%240==0){const auto stats=eleven.fg_guides->stats();
+            log_startup("QUAD-FG submit guides=%u packed=%u roles=%u manual=%u observations=%llu snapshots=%llu pairs=%llu capture_stage=%u assembly_stage=%u\n",
+                unsigned(guides.pair.capture_token!=0),unsigned(packed),roles.status,roles.manual_mode,stats.observations,stats.snapshots,stats.guide_pairs,stats.capture_stage,stats.assembly_stage);}
+        if(packed){
+            // The raw center/peripheral planes remain separate in storage.
+            // DLSS-G runs on the raw center; final color composition is last.
+            if(diagnostic)log_startup("QUAD-FG raw planes before composition four_view_guides=%u token=%llu\n",unsigned(guides.pair.capture_token!=0),guides.pair.capture_token);
+            result=presenter->end_quad_frame(&forwarded,&replacement,guides.pair,[&]{return compositor->compose(inputs,projection,views);});
+        }else{
+            // Missing assignments/guides or capture pressure uses the proven
+            // native compositor. A null projection selects coordinated runtime
+            // passthrough; no precomposed colors enter the FG upload path.
+            result=presenter->end_quad_frame(&forwarded,nullptr,{},[&]{return compositor->compose(inputs,projection,views);});
+        }
+    }else{
+        result=compositor->compose(inputs,projection,views);
+        if(result==XR_SUCCESS)result=dispatch.end_frame(session,&forwarded);
+    }
     complete_mapping(result==XR_SUCCESS);
     if(diagnostic)log_startup("QUAD-CAPTURE submit output_views=2 result=%d\n",int(result));
     return result;
@@ -262,6 +308,15 @@ extern "C" __declspec(dllexport) uint32_t __cdecl CheekyQuad_GetViewsV1(CheekyQu
         *output=value;return 1;
     }catch(...){return 0;}
 }
+extern "C" __declspec(dllexport) void* __cdecl CheekyQuad_AcquireD3D11V1(void* context) noexcept {
+    if(!context)return nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;static_cast<ID3D11DeviceContext*>(context)->GetDevice(&device);
+    if(!quad_role_owner(nullptr,device.Get()))return nullptr;
+    auto& dispatch=cheeky::quad_capture::d3d11_dispatch_mutex;dispatch.lock();return &dispatch;
+}
+extern "C" __declspec(dllexport) void __cdecl CheekyQuad_ReleaseD3D11V1(void* ticket) noexcept {
+    auto& dispatch=cheeky::quad_capture::d3d11_dispatch_mutex;if(ticket==&dispatch)dispatch.unlock();
+}
 extern "C" __declspec(dllexport) uint32_t __cdecl CheekyQuad_ObserveD3D11V1(const CheekyQuadSourceD3D11V1* input) noexcept {
     if(!input||input->version!=CHEEKY_QUAD_VIEWS_VERSION||input->size!=sizeof(*input)||!input->context||!input->texture)return 0;
     try {Microsoft::WRL::ComPtr<ID3D11Device> device;static_cast<ID3D11DeviceContext*>(input->context)->GetDevice(&device);
@@ -282,4 +337,19 @@ extern "C" __declspec(dllexport) uint32_t __cdecl CheekyQuad_AssignV1(uint64_t s
     try {uint64_t current{};const auto owner=quad_role_owner(&current);
         return owner&&current==session&&owner->d3d11&&owner->d3d11->mapping&&owner->d3d11->mapping->assign(number,role,id,generation);
     }catch(...){return 0;}
+}
+extern "C" __declspec(dllexport) uint32_t __cdecl CheekyQuad_SetSavedLayoutV1(const CheekyQuadSavedLayoutV1* layout) noexcept {
+    if(!layout||layout->version!=1||layout->size!=sizeof(*layout))return 0;
+    try{const auto owner=quad_role_owner();return owner&&owner->d3d11&&owner->d3d11->mapping&&owner->d3d11->mapping->saved_layout(*layout);}catch(...){return 0;}
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyQuadFG_ObserveD3D11V1(const CheekyQuadFgSourceV1* input) noexcept {
+    if(!input||input->abi!=1||input->size!=sizeof(*input)||!input->context)return false;
+    try{Microsoft::WRL::ComPtr<ID3D11Device> device;static_cast<ID3D11DeviceContext*>(input->context)->GetDevice(&device);
+        const auto owner=quad_role_owner(nullptr,device.Get());return owner&&owner->d3d11&&owner->d3d11->fg_guides&&owner->d3d11->fg_guides->observe(*input);
+    }catch(...){return false;}
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyQuadFG_GetStatsV1(CheekyQuadFgStatsV1* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    try{const auto owner=quad_role_owner();if(!owner||!owner->d3d11||!owner->d3d11->fg_guides)return false;
+        *out=owner->d3d11->fg_guides->stats();return true;}catch(...){return false;}
 }

@@ -2,7 +2,7 @@
 #include <stdint.h>
 #define CHEEKY_QUAD_VIEWS_VERSION 1U
 // Separate from the two-eye gaze ABI. View order is OpenXR peripheral L/R,
-// focus L/R; an NGX handle acquires a role only after pixel verification.
+// focus L/R; roles require pixel verification or an explicit manual layout.
 typedef struct CheekyQuadViewV1 {
     uint64_t dlss_view, registration_generation, submitted_resource;
     uint32_t view_index, eye_index, focus, verified;
@@ -33,3 +33,9 @@ typedef void(__cdecl* CheekyQuadForgetSourceV1Fn)(uint64_t, uint64_t);
 typedef void(__cdecl* CheekyQuadRecalibrateV1Fn)();
 typedef void(__cdecl* CheekyQuadConfigureV1Fn)(uint32_t, uint32_t);
 typedef uint32_t(__cdecl* CheekyQuadAssignV1Fn)(uint64_t, uint32_t, uint32_t, uint64_t, uint64_t);
+typedef struct CheekyQuadSavedLayoutV1 {
+    uint32_t version,size,source_count,roles[8];
+} CheekyQuadSavedLayoutV1;
+typedef uint32_t(__cdecl* CheekyQuadSavedLayoutV1Fn)(const CheekyQuadSavedLayoutV1*);
+typedef void*(__cdecl* CheekyQuadAcquireD3D11V1Fn)(void*);
+typedef void(__cdecl* CheekyQuadReleaseD3D11V1Fn)(void*);

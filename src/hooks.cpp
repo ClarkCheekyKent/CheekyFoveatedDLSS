@@ -4458,6 +4458,9 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
     }
     if (depth.outer && !is_d3d11_private_handle(handle))
         log_ngx_exposure<ID3D11Resource>(11, handle, parameters);
+    const QuadD3D11DispatchScope quad_dispatch{context,depth.outer};
+    if(quad_dispatch.ticket){static std::atomic<bool> noted{};if(!noted.exchange(true))
+        trace_event("QUAD-FG NGX D3D11/runtime dispatch gate active");}
     const auto result = invoke();
     // All temporary NGX parameters and private composites have been restored
     // before this point. Tag only the outer game evaluation's final output.
@@ -4467,13 +4470,14 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
             ngx_succeeded(parameters->Get("Color", &color)) && color &&
             ngx_succeeded(parameters->Get("Depth", &z)) && z &&
             ngx_succeeded(parameters->Get("MotionVectors", &motion)) && motion) {
-            const auto settings=current_settings();quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers);
+            const auto settings=current_settings();quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers,settings.quad_saved_roles.data(),settings.quad_saved_source_count);
             Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;output->QueryInterface(IID_PPV_ARGS(&texture));
             CheekyQuadSourceD3D11V1 source{};source.version=CHEEKY_QUAD_VIEWS_VERSION;source.size=sizeof(source);
             source.dlss_view=reinterpret_cast<std::uint64_t>(handle);source.registration_generation=stereo_view_generation(source.dlss_view);
             source.context=context;source.texture=texture.Get();source.x=get_ui(parameters,"DLSS.Output.Subrect.Base.X");source.y=get_ui(parameters,"DLSS.Output.Subrect.Base.Y");
             source.width=get_ui(parameters,"OutWidth");source.height=get_ui(parameters,"OutHeight");
             if(!quad_view_observe11(source)&&eye_calibration_enabled())eye_calibration_stamp(context, output, source.dlss_view,source.x,source.y,source.width,source.height);
+            fg_publish_quad11(context,handle,parameters);
         }
     }
     return result;

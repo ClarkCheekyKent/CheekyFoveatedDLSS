@@ -48,6 +48,7 @@ std::atomic<std::uint32_t> center_mode{};
 std::atomic<bool> manual_stereo_mapping{false};
 std::atomic<bool> manual_stereo_right_first{false};
 std::atomic<bool> quad_manual_assignment{false},quad_show_numbers{false};
+std::array<unsigned,8> quad_saved_roles{};unsigned quad_saved_source_count{}; // settings_mutex
 std::atomic<bool> independent_openxr_gaze{false};
 
 std::atomic<std::uint32_t> simulation_pattern{};
@@ -204,6 +205,7 @@ Settings configured_settings() noexcept {
     settings.manual_stereo_mapping = manual_stereo_mapping.load(std::memory_order_acquire);
     settings.manual_stereo_right_first = manual_stereo_right_first.load(std::memory_order_acquire);
     settings.quad_manual_assignment=quad_manual_assignment.load();settings.quad_show_numbers=quad_show_numbers.load();
+    settings.quad_saved_roles=quad_saved_roles;settings.quad_saved_source_count=quad_saved_source_count;
     settings.independent_openxr_gaze = independent_openxr_gaze.load(std::memory_order_acquire);
     settings.gaze_smoothing_ms = load_float(gaze_smoothing_ms_bits);
     settings.gaze_hold_ms = load_float(gaze_hold_ms_bits);
@@ -343,6 +345,7 @@ void update_settings(const Settings& settings) noexcept {
     manual_stereo_mapping.store(settings.manual_stereo_mapping, std::memory_order_release);
     manual_stereo_right_first.store(settings.manual_stereo_right_first, std::memory_order_release);
     quad_manual_assignment.store(settings.quad_manual_assignment);quad_show_numbers.store(settings.quad_show_numbers);
+    quad_saved_roles=settings.quad_saved_roles;quad_saved_source_count=std::min(settings.quad_saved_source_count,8u);
     independent_openxr_gaze.store(settings.independent_openxr_gaze, std::memory_order_release);
     show_next_jump_target.store(settings.show_next_jump_target, std::memory_order_release);
     simulation_pattern.store(std::min(settings.simulation_pattern, 5U), std::memory_order_release);
@@ -430,7 +433,7 @@ void update_settings(const Settings& settings) noexcept {
         nr_motion_scale_y_bits,
         std::clamp(settings.nr_motion_scale_y_multiplier, -4.0F, 4.0F)
     );
-    lock.unlock();quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers);
+    lock.unlock();quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers,settings.quad_saved_roles.data(),settings.quad_saved_source_count);
 }
 
 void set_processing_allowed(bool allowed) noexcept {
@@ -678,7 +681,7 @@ Settings settings_for_view(
         result.afw_manual_coverage=result.afw_automatic_coverage=false;result.afw_mask={};result.afw_nr_mask={};
         result.nr_foveated=result.nr_use_sr_foveation=result.nr_alignment_border_enabled=false;
         result.nr_enabled=settings.nr_enabled&&role&&role->focus;
-        // The current presenter consumes a stereo pair; quad FG needs a separate implementation.
+        // Quad FG is captured/presented by the layer, independently of SR transport.
         result.fg.enabled=false;
         if(!role){result.enabled=false;result.peripheral_dlaa_enabled=false;}
         else if(role->focus){result.peripheral_dlaa_enabled=false;}

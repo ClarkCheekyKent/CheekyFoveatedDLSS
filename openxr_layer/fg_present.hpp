@@ -52,6 +52,7 @@ struct Presenter {
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     std::shared_ptr<D3D11Bridge> interop11;
+    bool quad_input{}; // Separate raw quad color planes plus explicitly supplied guide atlases.
     D3D12_RESOURCE_STATES xr_image_state() const noexcept {
         return interop11 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
@@ -64,7 +65,8 @@ struct Presenter {
     }
     XrResult release_image(XrSwapchain chain, unsigned index, const XrSwapchainImageReleaseInfo* info) {
         const bool copied = !interop11 || interop11->upload(chain,index);
-        const auto result = xr.release(chain,info);
+        const auto submit=[&]{return xr.release(chain,info);};
+        const auto result = quad_input&&interop11?interop11->runtime_submit(submit):submit();
         return copied || XR_FAILED(result) ? result : XR_ERROR_RUNTIME_FAILURE;
     }
     void destroy_chain(XrSwapchain chain) {

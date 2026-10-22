@@ -10,7 +10,7 @@
 namespace cheeky::fg {
 // Each command allocator and every referenced image stays leased until its
 // fence retires. The producer only polls for a free context; it never waits.
-struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;};
+struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;float presentation_feather{-1};};
 using Image=std::shared_ptr<TransportImage>;
 struct ColorReadyStamp {
     std::atomic<std::uint64_t> ready_qpc{};
@@ -133,7 +133,7 @@ struct Transport {
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
             if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
-               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->fg_border={};p->identity=++next_identity;p->last_used_tick=now;return p;}
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->fg_border={};p->presentation_feather=-1;p->identity=++next_identity;p->last_used_tick=now;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
@@ -185,6 +185,31 @@ struct Transport {
         auto result=region_copy(c,source->texture.Get(),source->state,rect,layer);
         if(result)c.images.push_back(source);return result;
     }
+    Image quad_regions(Context& c,const Image& outer,const Image& center,
+        const XrSwapchainSubImage& outer_rect,const XrSwapchainSubImage& center_rect,const CompactLayout& layout) {
+        if(!outer||!center||!layout.packed())return {};
+        auto desc=outer->texture->GetDesc();desc.Width=layout.stored_width();desc.Height=layout.stored_height();desc.DepthOrArraySize=desc.MipLevels=1;
+        auto destination=image(desc);if(!destination)return {};
+        color_transition(c.list.Get(),destination->texture.Get(),destination->state,D3D12_RESOURCE_STATE_COPY_DEST);
+        bool good=true;
+        for(unsigned part=0;part<2;++part){const auto& from=part?outer:center;const auto& sub=part?outer_rect:center_rect;
+            const auto d=from->texture->GetDesc();const auto& r=sub.imageRect;
+            if(r.offset.x<0||r.offset.y<0||r.extent.width<=0||r.extent.height<=0||sub.imageArrayIndex>=d.DepthOrArraySize||
+                unsigned(r.extent.width)!=(part?layout.context_width:layout.center_width)||unsigned(r.extent.height)!=(part?layout.context_height:layout.center_height)||
+                uint64_t(r.offset.x)+r.extent.width>d.Width||uint64_t(r.offset.y)+r.extent.height>d.Height||!compatible_color(desc.Format,d.Format)){good=false;break;}
+            color_transition(c.list.Get(),from->texture.Get(),from->state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION source{},target{};source.pResource=from->texture.Get();source.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            source.SubresourceIndex=sub.imageArrayIndex*d.MipLevels;target.pResource=destination->texture.Get();target.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX box{unsigned(r.offset.x),unsigned(r.offset.y),0,unsigned(r.offset.x+r.extent.width),unsigned(r.offset.y+r.extent.height),1};
+            c.list->CopyTextureRegion(&target,0,part?layout.center_height:0,0,&source,&box);
+            color_transition(c.list.Get(),from->texture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,from->state);c.images.push_back(from);
+        }
+        color_transition(c.list.Get(),destination->texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
+        destination->layout=layout;destination->presentation_feather=2.f/std::min(layout.width,layout.height);
+        destination->state=D3D12_RESOURCE_STATE_COMMON;c.images.push_back(destination);
+        // The two raw planes stay separate until final publication.
+        return good?destination:Image{};
+    }
     Image packed_region(Context& c,ID3D12Resource* source,D3D12_RESOURCE_STATES source_state,
                         XrRect2Di rect,unsigned layer,DXGI_FORMAT format,const CompactLayout& layout) {
         if(!source||!layout.packed())return {};
@@ -222,6 +247,7 @@ struct Transport {
             const auto readable=(source->state&D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)?source->state:D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             color_transition(c.list.Get(),source->texture.Get(),source->state,readable);
             ColorDraw::Constants constants;source->layout.constants(constants.crop,constants.spans,constants.texel);
+            if(source->presentation_feather>=0)constants.texel[2]=source->presentation_feather;
             constants.options[0]=!linear_target&&srgb_color(sf)&&!srgb_color(target_format)?1.f:0.f;
             if(source->fg_border.visible){
                 constants.border[0]=source->fg_border.x;constants.border[1]=source->fg_border.y;

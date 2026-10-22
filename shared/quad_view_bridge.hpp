@@ -1,5 +1,6 @@
 #pragma once
 #include "cheeky_quad_views.h"
+#include "cheeky_quad_fg.hpp"
 #include <Windows.h>
 #include <atomic>
 #include <sstream>
@@ -13,6 +14,20 @@ inline HMODULE quad_view_module() noexcept {
     }}
     return module;
 }
+// NGX can submit native driver work in addition to ordinary D3D11 API calls.
+// Share one CPU dispatch gate with the quad presenter's runtime submissions.
+struct QuadD3D11DispatchScope {
+    void* ticket{};CheekyQuadReleaseD3D11V1Fn release{};
+    QuadD3D11DispatchScope(void* context,bool enabled) noexcept {
+        if(!enabled||!context)return;const auto module=quad_view_module();if(!module)return;
+        const auto acquire=reinterpret_cast<CheekyQuadAcquireD3D11V1Fn>(GetProcAddress(module,"CheekyQuad_AcquireD3D11V1"));
+        release=reinterpret_cast<CheekyQuadReleaseD3D11V1Fn>(GetProcAddress(module,"CheekyQuad_ReleaseD3D11V1"));
+        if(acquire&&release)ticket=acquire(context);
+    }
+    ~QuadD3D11DispatchScope(){if(ticket)release(ticket);}
+    QuadD3D11DispatchScope(const QuadD3D11DispatchScope&)=delete;
+    QuadD3D11DispatchScope& operator=(const QuadD3D11DispatchScope&)=delete;
+};
 inline CheekyQuadViewsV1 quad_view_snapshot() noexcept {
     CheekyQuadViewsV1 value{};value.version=CHEEKY_QUAD_VIEWS_VERSION;value.size=sizeof(value);
     const auto module=quad_view_module();
@@ -35,10 +50,13 @@ inline void quad_view_recalibrate() noexcept {
     const auto reset=module?reinterpret_cast<CheekyQuadRecalibrateV1Fn>(GetProcAddress(module,"CheekyQuad_RecalibrateV1")):nullptr;
     if(reset)reset();
 }
-inline void quad_view_configure(bool manual,bool show_numbers) noexcept {
+inline void quad_view_configure(bool manual,bool show_numbers,const unsigned* roles=nullptr,unsigned source_count=0) noexcept {
     const auto module=quad_view_module();
     const auto configure=module?reinterpret_cast<CheekyQuadConfigureV1Fn>(GetProcAddress(module,"CheekyQuad_ConfigureV1")):nullptr;
     if(configure)configure(manual,show_numbers);
+    if(roles){const auto save=module?reinterpret_cast<CheekyQuadSavedLayoutV1Fn>(GetProcAddress(module,"CheekyQuad_SetSavedLayoutV1")):nullptr;
+        if(save){CheekyQuadSavedLayoutV1 layout{};layout.version=1;layout.size=sizeof(layout);layout.source_count=source_count;
+            for(unsigned i=0;i<8;++i)layout.roles[i]=roles[i];save(&layout);}}
 }
 inline bool quad_view_assign(uint64_t session,unsigned number,unsigned role,uint64_t id,uint64_t generation) noexcept {
     const auto module=quad_view_module();
@@ -53,6 +71,10 @@ inline const CheekyQuadViewV1* quad_view_assignment(const CheekyQuadViewsV1& sna
 inline const char* quad_role_name(unsigned role) noexcept {
     static constexpr const char* names[]{"Unassigned","Periphery Left","Periphery Right","Center Left","Center Right"};
     return role<5?names[role]:names[0];
+}
+inline bool quad_fg_stats(CheekyQuadFgStatsV1& stats) noexcept {
+    const auto module=quad_view_module();const auto get=module?reinterpret_cast<CheekyQuadFgStatsFn>(GetProcAddress(module,"CheekyQuadFG_GetStatsV1")):nullptr;
+    return get&&get(&stats);
 }
 inline std::string quad_view_diagnostics_json() {
     const auto quad=quad_view_snapshot();std::ostringstream out;out<<std::boolalpha;
@@ -72,6 +94,10 @@ inline std::string quad_view_diagnostics_json() {
     for(unsigned i=0;i<4;++i){if(i)out<<',';const auto& view=quad.views[i];
         out<<"{\"index\":"<<i<<",\"role\":\""<<quad_role_name(i+1)<<"\",\"id\":\""<<view.dlss_view<<"\",\"generation\":\""<<view.registration_generation
             <<"\",\"verified\":"<<bool(view.verified)<<",\"resource\":\""<<view.submitted_resource<<"\",\"slice\":"<<view.array_slice<<'}';}
-    out<<"]}";return out.str();
+    out<<"],\"fg\":{";
+    CheekyQuadFgStatsV1 stats;const bool supported=quad_fg_stats(stats);
+    out<<"\"supported\":"<<supported<<",\"enabled\":"<<bool(stats.enabled)<<",\"observations\":"<<stats.observations<<",\"snapshots\":"<<stats.snapshots
+        <<",\"frames\":"<<stats.frames<<",\"guide_pairs\":"<<stats.guide_pairs<<",\"capture_stage\":"<<stats.capture_stage<<",\"assembly_stage\":"<<stats.assembly_stage;
+    out<<"}}";return out.str();
 }
 }

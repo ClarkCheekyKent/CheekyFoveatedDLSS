@@ -113,6 +113,7 @@ std::string snapshot_locked(State& s) {
     const auto gaze = gaze_diagnostics();
     const auto views = stereo_view_statistics();
     const auto details = stereo_view_details();
+    const auto quad=quad_view_snapshot();CheekyQuadFgStatsV1 quad_fg;const bool quad_guides=quad.active&&quad_fg_stats(quad_fg);
     const auto receiving_views = std::count_if(details.begin(), details.end(),
         [](const auto& view) { return view.recently_evaluated; });
     const auto evaluated_views = std::count_if(details.begin(), details.end(),
@@ -178,10 +179,10 @@ std::string snapshot_locked(State& s) {
         << ",\"native_frames\":" << fg.native_frames
         << ",\"generated_frames\":" << fg.generated_frames
         << ",\"fallback_frames\":" << fg.fallback_frames
-        << ",\"frame_source\":\"" << json_escape(fg_capture.source) << "\""
+        << ",\"frame_source\":\"" << json_escape(quad_guides?"Quad D3D11 raw-view capture":fg_capture.source) << "\""
         << ",\"frame_source_hook\":" << bool(fg_capture.plugin_hook)
-        << ",\"frame_source_calls\":" << fg_capture.frame_calls
-        << ",\"captured_guides\":" << fg_capture.captured_guides
+        << ",\"frame_source_calls\":" << (quad_guides?quad_fg.frames:fg_capture.frame_calls)
+        << ",\"captured_guides\":" << (quad_guides?quad_fg.snapshots:fg_capture.captured_guides)
         << ",\"missing_frame_guides\":" << fg_capture.missing_frame_guides
         << ",\"last_guide_frame\":" << fg_capture.last_guide_frame
         << ",\"color_copies\":" << fg_capture.color_copies
@@ -190,7 +191,7 @@ std::string snapshot_locked(State& s) {
         << ",\"eligible_guides\":" << fg_capture.eligible
         << ",\"pending_guides\":" << fg_capture.pending
         << ",\"foreign_guides\":" << fg_capture.foreign
-        << ",\"match_reason\":\"" << json_escape(fg_capture.match_reason) << "\""
+        << ",\"match_reason\":\"" << json_escape(quad_guides?(quad_fg.assembly_stage==4?"Quad guide assembly ready":"Waiting for four current view guides"):fg_capture.match_reason) << "\""
         << ",\"performance\":{\"supported\":" << fg_time_supported
         << ",\"gpu_supported\":" << bool(fg_time.gpu_supported)
         << ",\"gpu_valid\":" << bool(fg_time.gpu_valid)
@@ -776,9 +777,15 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
             in>>std::ws;if(!in.eof())return false;
             const bool ok=quad_view_assign(session,number,role,source_id,generation);
             s.message=ok?"Quad view assignment updated":"Role already assigned or view changed; refresh and retry";
-            if(ok)++s.revision;return ok;
+            if(ok){auto settings=configured_settings();const auto quad=quad_view_snapshot();
+                settings.quad_saved_roles={};settings.quad_saved_source_count=0;
+                for(const auto& source:quad.sources)if(source.dlss_view&&source.number&&source.number<=8){
+                    settings.quad_saved_roles[source.number-1]=source.manual_role;++settings.quad_saved_source_count;}
+                update_settings(settings);++s.revision;request_save(s);}
+            return ok;
         }
-        if(action=="quad_recalibrate"){quad_view_recalibrate();++s.revision;return true;}
+        if(action=="quad_recalibrate"){auto settings=configured_settings();settings.quad_saved_roles={};settings.quad_saved_source_count=0;
+            update_settings(settings);quad_view_recalibrate();++s.revision;request_save(s);return true;}
         if (action == "mark_vram_baseline") {
             const bool marked=s.memory.mark_baseline(GetTickCount64(),configured_settings().fg.enabled);
             s.message=marked?"Process GPU memory baseline marked":"GPU memory query unavailable; baseline not marked";

@@ -110,6 +110,8 @@ struct Settings {
     bool manual_stereo_right_first{false};
     bool quad_manual_assignment{false};
     bool quad_show_numbers{false};
+    std::array<unsigned,8> quad_saved_roles{}; // Manual layout indexed by displayed view number.
+    unsigned quad_saved_source_count{};
     bool quad_view_mode{}; // Evaluation-local; the submitted view already defines its fovea.
     unsigned quad_view_region{}; // 0 unresolved, 1 periphery, 2 center; never persisted.
     bool independent_openxr_gaze{false};

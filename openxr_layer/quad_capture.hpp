@@ -13,10 +13,13 @@
 #include <cstring>
 #include <vector>
 #include <memory>
+#include <functional>
 #include "quad_role_mapping.hpp"
+#include "quad_fg.hpp"
 
 namespace cheeky::quad_capture {
 using Microsoft::WRL::ComPtr;
+inline std::recursive_mutex d3d11_dispatch_mutex;
 constexpr auto configuration = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO;
 inline bool is_quad(XrViewConfigurationType type) { return type == configuration; }
 
@@ -90,12 +93,18 @@ struct Compositor11 {
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11DepthStencilState> depth;
     std::unique_ptr<RoleMapping11> mapping;
+    std::unique_ptr<QuadFg11> fg_guides;
+    std::shared_ptr<cheeky::fg::D3D11Bridge> fg_bridge;
+    std::array<XrSwapchain,4> source_chains{};
+    // Invoked while the composite output is still acquired, before release.
+    std::function<void(unsigned,XrSwapchain,unsigned,ID3D11Texture2D*,unsigned,unsigned,DXGI_FORMAT)> capture_output;
     std::array<Eye,2> eyes;
     std::array<XrViewConfigurationView,2> recommended{};
     bool initialize() {
         if(vs)return true;
         if(!device||!create||!destroy||!enumerate_images||!acquire||!wait||!release)return false;
         if(!mapping)mapping=std::make_unique<RoleMapping11>(device.Get());
+        if(!fg_guides)fg_guides=std::make_unique<QuadFg11>(device.Get());
         device->GetImmediateContext(&immediate);
         if(FAILED(immediate.As(&multithread)))return false;
         multithread->SetMultithreadProtected(TRUE);
@@ -168,6 +177,7 @@ struct Compositor11 {
         return true;
     }
     XrResult compose(const std::array<Input,4>& inputs,const XrCompositionLayerProjection& projection,std::array<XrCompositionLayerProjectionView,2>& views) {
+        std::lock_guard dispatch(d3d11_dispatch_mutex);
         if(!initialize())return XR_ERROR_RUNTIME_FAILURE;
         for(const auto& input:inputs)if(!valid(input))return XR_ERROR_VALIDATION_FAILURE;
         if(!output(0,inputs[0].format)||!output(1,inputs[1].format))return XR_ERROR_RUNTIME_FAILURE;
@@ -194,6 +204,8 @@ struct Compositor11 {
                 if(FAILED(device->GetDeviceRemovedReason()))result=XR_ERROR_RUNTIME_FAILURE;}
         }
         for(unsigned eye=0;eye<2;++eye)if(eyes[eye].waited){
+            if(result==XR_SUCCESS&&capture_output)capture_output(eye,eyes[eye].chain,eyes[eye].index,eyes[eye].images[eyes[eye].index].texture,
+                eyes[eye].width,eyes[eye].height,eyes[eye].format);
             auto& e=eyes[eye];XrSwapchainImageReleaseInfo r{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};const auto released=release(e.chain,&r);
             if(XR_FAILED(released))result=released;else e.acquired=e.waited=false;
             views[eye]=projection.views[eye];views[eye].next=nullptr;views[eye].subImage={eyes[eye].chain,{{0,0},{int32_t(eyes[eye].width),int32_t(eyes[eye].height)}},0};

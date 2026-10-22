@@ -39,6 +39,9 @@ std::string_view trim(std::string_view s) {
 }
 }
 bool set_named_setting(Settings& s, std::string_view key, std::string_view value) {
+    if(key=="QuadSavedSourceCount"){unsigned count{};if(!parse(value,count)||count>8)return false;s.quad_saved_source_count=count;return true;}
+    if(key.size()==13&&key.starts_with("QuadView")&&key.ends_with("Role")&&key[8]>='1'&&key[8]<='8'){
+        unsigned role{};if(!parse(value,role)||role>4)return false;s.quad_saved_roles[key[8]-'1']=role;return true;}
     if (key == "FgDirectPeripheralShading") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.direct_peripheral_shading=mode; return true;
@@ -71,6 +74,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     return false;
 }
 std::string_view setting_group(std::string_view key) {
+    if(key.starts_with("Quad"))return "gaze";
     if (key.starts_with("Fg")) return "fg";
     if (key.starts_with("Nr")) return "nr";
     for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
@@ -130,6 +134,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     candidate.manual_stereo_mapping = false;
     candidate.manual_stereo_right_first = false;
     candidate.quad_manual_assignment=false;candidate.quad_show_numbers=false;
+    candidate.quad_saved_roles={};candidate.quad_saved_source_count=0;
     candidate.independent_openxr_gaze = false;
     candidate.fix_motion_blur = false; // Compatibility copies are always opt-in.
     // Older files predate this additive key and use After, even when loaded

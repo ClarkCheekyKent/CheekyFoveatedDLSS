@@ -36,6 +36,7 @@ class RoleMapping11 {
     std::array<Source,count> sources;
     std::array<Frame,3> frames;
     std::array<unsigned,count> manual_roles{};
+    std::array<unsigned,count> saved_roles{};unsigned saved_count{};bool restore_pending{true};
     CheekyQuadViewsV1 value{};
     std::array<unsigned,4> candidate{};
     uint64_t revision{1},ticket{},last_confirmation{};unsigned attempts{},confirmations{};
@@ -43,8 +44,15 @@ class RoleMapping11 {
     struct Guard {ID3D11Multithread* p;explicit Guard(ID3D11Multithread* v):p(v){p->Enter();}~Guard(){p->Leave();}};
     void invalidate(bool clear_manual) {
         ++revision;verified=false;confirmations=attempts=0;last_confirmation=0;
-        if(clear_manual)manual_roles={};
+        if(clear_manual){manual_roles={};restore_pending=true;}
         for(auto& v:value.views){v.dlss_view=v.registration_generation=0;v.verified=0;}
+    }
+    void restore_saved() {
+        if(!manual||!restore_pending||!saved_count)return;
+        const auto present=unsigned(std::count_if(sources.begin(),sources.end(),[](const auto& s){return s.id!=0;}));
+        if(present!=saved_count)return;
+        for(unsigned i=0;i<count;++i)if(saved_roles[i]&&!sources[i].id)return;
+        manual_roles=saved_roles;restore_pending=false;++revision;
     }
     bool prepare() {
         if(context)return true;
@@ -130,13 +138,18 @@ public:
     void reset(){std::lock_guard lock(mutex);invalidate(true);}
     void configure(bool use_manual,bool show){std::lock_guard lock(mutex);
         if(manual!=use_manual){manual=use_manual;invalidate(false);}numbers=show;}
+    bool saved_layout(const CheekyQuadSavedLayoutV1& layout){std::lock_guard lock(mutex);
+        if(layout.source_count>count)return false;std::array<unsigned,count> roles{};unsigned used{};
+        for(unsigned i=0;i<count;++i){const auto role=layout.roles[i];if(role>4||(role&&(used&(1u<<role))))return false;
+            if(role)used|=1u<<role;roles[i]=role;}
+        saved_roles=roles;saved_count=layout.source_count;restore_saved();return true;}
     void forget(uint64_t id,uint64_t generation){std::lock_guard lock(mutex);for(auto& source:sources)
         if(source.id==id&&source.generation==generation){source={};invalidate(true);}}
     bool assign(unsigned number,unsigned role,uint64_t id,uint64_t generation) {
         std::lock_guard lock(mutex);if(!number||number>count||role>4)return false;
         const auto slot=number-1;if(sources[slot].id!=id||sources[slot].generation!=generation)return false;
         if(role)for(unsigned i=0;i<count;++i)if(i!=slot&&manual_roles[i]==role)return false;
-        manual_roles[slot]=role;return true;
+        manual_roles[slot]=role;restore_pending=false;++revision;return true;
     }
     void observe(const CheekyQuadSourceD3D11V1& input) {
         if(!context||!input.dlss_view||!input.registration_generation)return;
@@ -153,6 +166,7 @@ public:
         if(source.id!=input.dlss_view||source.generation!=input.registration_generation||source.width!=input.width||source.height!=input.height||source.format!=desc.Format){
             source={};source.id=input.dlss_view;source.generation=input.registration_generation;source.width=input.width;source.height=input.height;source.format=desc.Format;invalidate(true);}
         source.last_ms=GetTickCount64();
+        restore_saved();
         const auto bytes=cheeky::foveated_dlss::calibration_pixel_bytes(desc.Format);
         if(!manual&&!verified&&attempts<120&&bytes&&input.width>=64&&input.height>=64){
             if(!source.marker){std::vector<unsigned char> data(block*block*bytes);

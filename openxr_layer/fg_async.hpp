@@ -9,12 +9,21 @@
 #include <atomic>
 #include <optional>
 #include <stdexcept>
+#include <functional>
 
 namespace cheeky::fg {
 // The game owns capture/snapshot recording. Only the presentation thread calls
 // the runtime frame functions. A separate worker waits for inference completion.
 // Three native leases and two ready pairs bound latency and texture ownership.
 struct BufferedPresenter final : Presenter {
+    inline static thread_local const CheekyFgPair* quad_pair_for_call{};
+    std::function<XrResult()> quad_native_fallback;
+    XrResult end_quad_frame(const XrFrameEndInfo* end,const XrCompositionLayerProjection* projection,const CheekyFgPair& pair,
+        std::function<XrResult()> fallback={}) noexcept {
+        quad_native_fallback=std::move(fallback);
+        const auto* prior=quad_pair_for_call;quad_pair_for_call=&pair;
+        const auto result=end_frame(end,{},projection);quad_pair_for_call=prior;quad_native_fallback={};return result;
+    }
     struct Slice {XrRect2Di rect{};unsigned layer{};};
     struct CapturePlan {D3D12_RESOURCE_DESC desc{};std::vector<Slice> slices;std::vector<unsigned> physical_eyes;bool full_required{};};
     struct DirectCapture {std::vector<std::pair<Slice,Image>> eyes;};
@@ -164,6 +173,7 @@ struct BufferedPresenter final : Presenter {
     std::uint64_t pose_sample_count{};
     CompactLayout eye_color_layout(unsigned eye,unsigned width,unsigned height,
                                    const CheekyFgCaptureCropsV2& current) const noexcept {
+        if(quad_input)return {}; // Quad plane packing supplies its own explicit layout.
         const auto& s=storage_options;
         // Compact packing requires an exact pending stereo guide pair from
         // THIS capture interval. No cached previous-frame or global offset.
@@ -302,6 +312,11 @@ struct BufferedPresenter final : Presenter {
     ~BufferedPresenter() override {reset();}
     void set_native_frame_pending(bool pending_frame) noexcept override {
         std::lock_guard lock(mx);native_frame_pending=pending_frame;changed.notify_all();
+    }
+    void finish_application_frame() noexcept {
+        // A following xrWaitFrame may overlap the preceding xrEndFrame.
+        // Preserve its presenter until every accepted application frame ends.
+        std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||waited==ended;});
     }
     void runtime_failure(const char* stage,XrResult result) noexcept {
         std::lock_guard lock(mx);
@@ -537,7 +552,9 @@ struct BufferedPresenter final : Presenter {
     }
     void note_app_call(unsigned stage,double ms) noexcept override {std::lock_guard lock(mx);if(stage<app_calls.size())app_calls[stage].add(ms);}
     XrResult runtime_end_frame(const XrFrameEndInfo* end) {
-        const auto start=TimingClock::now();const auto result=xr.end_frame(session,end);
+        const auto start=TimingClock::now();
+        const auto submit=[&]{return xr.end_frame(session,end);};
+        const auto result=quad_input&&interop11?interop11->runtime_submit(submit):submit();
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
         if(XR_FAILED(result)&&trace&&end) {
             char message[384]{};
@@ -580,6 +597,7 @@ struct BufferedPresenter final : Presenter {
     // Caller holds mx (or has joined the workers). Dropped jobs have never
     // submitted inference, so their raw snapshot leases can retire immediately.
     std::uint64_t passthrough_events{};
+    std::uint64_t history_reset_events{};
     void discard_pending() noexcept {for(auto& job:pending)job->clear_guides();pending.clear();}
     void stop() noexcept {
         {std::lock_guard lock(mx);stopping=true;changed.notify_all();}
@@ -591,7 +609,7 @@ struct BufferedPresenter final : Presenter {
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
         captured.clear();direct_captures.clear();capture_plans.clear();captured_descs.clear();capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
         if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
-        raw=nullptr;raw_done=true;passthrough_events=0;
+        raw=nullptr;raw_done=true;passthrough_events=history_reset_events=0;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
@@ -747,6 +765,34 @@ struct BufferedPresenter final : Presenter {
         if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();return discarded?XR_FRAME_DISCARDED:XR_SUCCESS;
     }
+    bool capture_quad_planes(const XrCompositionLayerProjection& raw,const XrCompositionLayerProjection& logical,
+        const std::array<std::array<float,4>,2>& insets,const CheekyFgPair& pair) {
+        if(raw.views[0].subImage.swapchain==raw.views[1].subImage.swapchain)return false;
+        std::lock_guard capture_lock(capture_mutex);
+        std::array<Image,2> outer,center,packed;std::array<CompactLayout,2> layouts;
+        for(unsigned eye=0;eye<2;++eye){const auto o=captured.find(raw.views[eye].subImage.swapchain),c=captured.find(raw.views[eye+2].subImage.swapchain);
+            if(o==captured.end()||c==captured.end())return false;outer[eye]=o->second;center[eye]=c->second;
+            const auto& logical_rect=logical.views[eye].subImage.imageRect;
+            const auto& inset=insets[eye];auto layout=compact_layout(unsigned(logical_rect.extent.width),unsigned(logical_rect.extent.height),true,
+                inset[2],inset[3],inset[0]+inset[2]*.5f-.5f,inset[1]+inset[3]*.5f-.5f,1,0);
+            if(!layout.packed())return false;
+            layout.center_width=unsigned(raw.views[eye+2].subImage.imageRect.extent.width);layout.center_height=unsigned(raw.views[eye+2].subImage.imageRect.extent.height);
+            layout.context_width=unsigned(raw.views[eye].subImage.imageRect.extent.width);layout.context_height=unsigned(raw.views[eye].subImage.imageRect.extent.height);
+            if(!layout.center_width||!layout.center_height||!layout.context_width||!layout.context_height||layout.stored_width()>16384||layout.stored_height()>16384)return false;
+            layouts[eye]=layout;
+        }
+        uint64_t frame{};{std::lock_guard lock(mx);if(stopping||degraded)return false;frame=next_id+1;}
+        auto* c=producer.begin(frame);if(!c)return false;
+        bool good=true;for(unsigned eye=0;eye<2&&good;++eye){packed[eye]=producer.quad_regions(*c,outer[eye],center[eye],raw.views[eye].subImage,raw.views[eye+2].subImage,layouts[eye]);good=bool(packed[eye]);}
+        uint64_t ready{};if(!producer.execute(*c,ready))return false;if(!good)return false;
+        for(unsigned eye=0;eye<2;++eye){const auto& sub=logical.views[eye].subImage;
+            direct_captures[sub.swapchain].eyes={{{sub.imageRect,sub.imageArrayIndex},packed[eye]}};
+            auto desc=packed[eye]->texture->GetDesc();desc.Width=layouts[eye].width;desc.Height=layouts[eye].height;captured_descs[sub.swapchain]=desc;
+            capture_tokens[sub.swapchain]=capture_crop_tokens[sub.swapchain]=pair.capture_token;capture_frames[sub.swapchain]=pair.render_frame;
+            capture_times[sub.swapchain]=std::min(capture_times[raw.views[eye].subImage.swapchain],capture_times[raw.views[eye+2].subImage.swapchain]);
+        }
+        return true;
+    }
     bool capture(XrSwapchain sc,unsigned,ID3D12Resource* original,unsigned,unsigned,unsigned,
                  DXGI_FORMAT declared=DXGI_FORMAT_UNKNOWN) noexcept override {
         if(bypass||!original)return false;
@@ -770,7 +816,7 @@ struct BufferedPresenter final : Presenter {
         current_crops.render_frame=stamp.render_frame;
         const auto peek=runtime?reinterpret_cast<CheekyFgCaptureCropsFn>(
             GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
-        if(storage_options.compact){
+        if(storage_options.compact&&!quad_input){
             if(!peek||!peek(&current_crops))current_crops.valid_mask=0;
             if(current_crops.valid_mask)++compact_current_lookups;
             else ++compact_current_misses;
@@ -790,7 +836,7 @@ struct BufferedPresenter final : Presenter {
         const auto ready_stamp=captured_cpu?producer.mark_color_ready(*c,captured_cpu):ColorReady{};
         const auto desc=original->GetDesc();captured_descs[sc]=desc;
         const auto plan=capture_plans.find(sc);
-        const bool direct=color_capture_mode==1u&&plan!=capture_plans.end()&&!plan->second.full_required&&
+        const bool direct=!quad_input&&color_capture_mode==1u&&plan!=capture_plans.end()&&!plan->second.full_required&&
             !plan->second.slices.empty()&&plan->second.desc.Width==desc.Width&&plan->second.desc.Height==desc.Height&&
             plan->second.desc.DepthOrArraySize==desc.DepthOrArraySize&&plan->second.desc.Format==desc.Format;
         DirectCapture eyes;Image copy;
@@ -829,6 +875,7 @@ struct BufferedPresenter final : Presenter {
         return true;
     }
     XrResult passthrough(const XrFrameEndInfo* end,const char* reason) noexcept {
+        if(quad_native_fallback){const auto result=quad_native_fallback();if(XR_FAILED(result))return result;}
         std::unique_lock lock(mx);
         if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++passthrough_events;
@@ -849,6 +896,7 @@ struct BufferedPresenter final : Presenter {
     }
     XrResult end_frame(const XrFrameEndInfo* end,const std::array<unsigned,2>&,
                        const XrCompositionLayerProjection* projection) noexcept override {
+        const auto* external=quad_pair_for_call;
         if(bypass)return xr.end_frame(session,end);
         if(!end)return XR_ERROR_VALIDATION_FAILURE;
         ProducerElapsed elapsed{*this};
@@ -856,7 +904,7 @@ struct BufferedPresenter final : Presenter {
         {std::lock_guard lock(mx);if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
             if(!started||begun==ended)return XR_ERROR_CALL_ORDER_INVALID;++native_count;id=++next_id;use_raw=degraded;}
         const auto fg_runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
-        const auto hookless_complete=fg_runtime?reinterpret_cast<CheekyFgCompleteHooklessFrameFn>(
+        const auto hookless_complete=fg_runtime&&!external?reinterpret_cast<CheekyFgCompleteHooklessFrameFn>(
             GetProcAddress(fg_runtime,"CheekyFG_CompleteHooklessFrameV1")):nullptr;
         if(use_raw){
             if(hookless_complete)hookless_complete(0);
@@ -887,7 +935,7 @@ struct BufferedPresenter final : Presenter {
             result=passthrough(end,"unsupported OpenXR projection/layers");
         }
         else {
-            std::lock_guard capture_lock(capture_mutex);
+            std::unique_lock capture_lock(capture_mutex);
             std::unordered_map<XrSwapchain,CapturePlan> next_plans;
             for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
                 auto& plan=next_plans[sub.swapchain];plan.desc=captured_descs[sub.swapchain];
@@ -905,7 +953,7 @@ struct BufferedPresenter final : Presenter {
             subimages(job->layers,[&](XrSwapchainSubImage& sub){next_plans[sub.swapchain].full_required=true;return true;});
             capture_plans=std::move(next_plans);
             job->capture_mode=color_capture_mode.load();job->upload_mode=upload_mode.load();job->latency_diagnostics=latency_diagnostics!=0;
-            job->direct_output_mode=direct_output_mode.load();
+            job->direct_output_mode=quad_input?0u:direct_output_mode.load();
             job->direct_shading_mode=direct_shading_mode.load();
             auto* c=producer.begin(id,true);
             if(!c){
@@ -950,6 +998,7 @@ struct BufferedPresenter final : Presenter {
                     job->auxiliary.push_back({sub.swapchain,found->second});return true;
             });
             if(good) {
+                if(external){expected_token=external->capture_token;expected_frame=external->render_frame;tokens_match=expected_token!=0;}
                 if(inference_slot&&hookless_complete){
                     // Both final stereo colors are now captured. Stereo guides are claimed at the final OpenXR handoff, independent
                     // of the native-frame release policy.
@@ -979,10 +1028,12 @@ struct BufferedPresenter final : Presenter {
                 auto acquire=guide_acquire?guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
                 auto release=guide_release?guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
                 CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
+                const bool acquired=inference_slot&&tokens_match&&expected_token&&
+                    (external?(guides=*external,true):(acquire&&release&&acquire(&guides)));
                 // render_frame is deliberately zero for hook-free mode 3.
                 // The nonzero color token still identifies the immutable pair.
                 if(inference_slot&&(!tokens_match||!expected_token))job->guide_state=CheekyFgState::guide_frame_mismatch;
-                if(inference_slot&&tokens_match&&expected_token&&acquire&&release&&acquire(&guides)) {
+                if(acquired) {
                     // Hook-free mode 3 can work with a different *verified*
                     // native guide queue. Explicit Signal/Wait orders the
                     // guide writes before FG reads; same-device alone is NOT
@@ -1004,7 +1055,7 @@ struct BufferedPresenter final : Presenter {
                             // resolution crop partly supplied by low-res context.
                             const auto expected=compact_layout(layout.width,layout.height,true,
                                 g.focus_width,g.focus_height,g.focus_x,g.focus_y,
-                                g.peripheral_percent,layout.feather);
+                                external?1u:g.peripheral_percent,layout.feather);
                             if(!expected.packed()||layout.x!=expected.x||layout.y!=expected.y||
                                layout.w!=expected.w||layout.h!=expected.h){
                                 job->guides_valid=false;
@@ -1030,7 +1081,7 @@ struct BufferedPresenter final : Presenter {
                         job->retain_guides(guides);job->guide_token=expected_token;
                         job->source_configuration=guides.eyes[0].configuration;job->render_frame=expected_frame;
                     }
-                    release(&guides);
+                    if(!external)release(&guides);
                 }else if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
                 {std::lock_guard lock(mx);telemetry.color_token=expected_token;telemetry.guide_token=job->guide_token;
                     telemetry.color_render_frame=expected_frame;telemetry.guide_render_frame=job->guides_valid?expected_frame:0;
@@ -1046,7 +1097,7 @@ struct BufferedPresenter final : Presenter {
                 // consistent before falling back to the original native frame.
                 std::uint64_t discarded{};producer.execute(*c,discarded);
             }
-            if(!good)result=passthrough(end,"incomplete native color capture / changed swapchain layout");
+            if(!good){capture_lock.unlock();result=passthrough(end,"incomplete native color capture / changed swapchain layout");}
             else {
                 job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();
@@ -1198,13 +1249,19 @@ struct BufferedPresenter final : Presenter {
                     if(FAILED(ready_result)){worker.failed=true;worker.report("FG capture dependency queue wait",unsigned(ready_result));}
                     if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");
                     auto guides=job->guides;guides.producer_queue=generation_queue.Get();
-                    if(previous->guide_token+2!=job->guide_token)reset_history=true;
+                    const bool token_gap=previous->guide_token+2!=job->guide_token;
+                    if(token_gap)reset_history=true;
                     // Hook-free mode 3 deliberately has no native-frame ID.
                     // Preserve history when the capture tokens are consecutive;
                     // reset on any transition between tagged and untagged mode.
-                    if((previous->render_frame||job->render_frame)&&
-                       previous->render_frame+1!=job->render_frame)reset_history=true;
-                    history_was_reset=reset_history;
+                    const bool frame_gap=(previous->render_frame||job->render_frame)&&previous->render_frame+1!=job->render_frame;
+                    if(frame_gap)reset_history=true;
+                    const bool source_reset=guides.eyes[0].reset||guides.eyes[1].reset;
+                    history_was_reset=reset_history||source_reset;
+                    if(history_was_reset&&trace){const auto count=++history_reset_events;
+                        if(count<=4||(count&(count-1))==0){char message[240]{};
+                            sprintf_s(message,"FG HISTORY reset count=%llu frame=%llu worker_restart=%u token_gap=%u frame_gap=%u source_reset=%u",
+                                count,job->render_frame,unsigned(reset_history&&!token_gap&&!frame_gap),unsigned(token_gap),unsigned(frame_gap),unsigned(source_reset));trace(message);}}
                     if(reset_history)for(auto& eye:guides.eyes)eye.reset=1;
                     if(trace && ((++pose_sample_count%60u)==1u)) {
                         auto angle=[](const XrQuaternionf& a,const XrQuaternionf& b){
