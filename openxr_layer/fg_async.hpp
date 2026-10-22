@@ -52,7 +52,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
     // Native D3D11 frames carry no release policy (point 0: release the game
     // at FG submission). Nonzero applies that release point to them instead.
-    std::atomic<unsigned> native11_release_point{};
+    std::atomic<unsigned> native11_release_point{3}; // Matches the D3D12 default: after generated frame submission.
     CheekyFgTransportOptionsFn transport_options_query{};
     CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
     CheekyFgStaticEyeCropsV1 static_eye_crops; // Diagnostic only; NEVER used to pack a later native frame.
@@ -506,9 +506,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const auto mode=std::min(pacing.clock_mode,2u);
             if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
                 mode==1u?"FG pacing clock=presented native rate":"FG pacing clock=independent display clock");
-            const auto point=pacing.native11_release_point==3u?3u:0u;
-            if(native11_release_point.exchange(point)!=point&&trace)trace(point?"FG native D3D11 release=after generated frame submission":
-                "FG native D3D11 release=after FG submission");
+            const auto point=std::min(pacing.native11_release_point,4u);
+            if(native11_release_point.exchange(point)!=point&&trace){char message[96]{};
+                sprintf_s(message,"FG native D3D11 release point=%u (3 = after generated frame submission)",point);trace(message);}
         }
         std::unique_lock lock(mx);
         if(!start())return XR_ERROR_RUNTIME_FAILURE;

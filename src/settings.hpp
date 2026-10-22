@@ -55,7 +55,6 @@ struct Settings {
         bool hookless_mode3{false}; // Experimental all release modes: no private UEVR frame hooks or native frame IDs.
         bool submit_repeats{false}; // Runtime handles repeated display content.
         std::uint32_t pacing_clock{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
-        std::uint32_t native11_release{}; // Native D3D11: 0 release game at FG submission; 1 after generated frame submission.
         std::uint32_t color_capture_mode{1},upload_mode{1}; // Proven Joey-run defaults; 0 retains each baseline for A/B testing.
         std::uint32_t latency_diagnostics{1}; // Sparse calibrated GPU/CPU timeline; independently switchable.
         std::uint32_t compact_storage{1}; // Native-density center plus reduced peripheral context, reconstructed at XR upload.

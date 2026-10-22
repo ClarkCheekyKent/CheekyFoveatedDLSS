@@ -697,7 +697,9 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
     const auto& fg=cheeky::foveated_dlss::current_settings().fg;
     out->clock_mode=fg.pacing_clock<=2u?fg.pacing_clock:0u;
-    out->native11_release_point=fg.native11_release==1u?3u:0u;return true;
+    // Native D3D11 follows the shared release setting (default: after the
+    // generated frame is submitted), like the D3D12 path.
+    out->native11_release_point=fg.release_point<=4u?fg.release_point:3u;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(CheekyFgStorageOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;

@@ -934,20 +934,22 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if (ImGui::Combo("FG motion precision", &motion, "16-bit\0" "32-bit\0")) s.motion_bits = motion ? 32 : 16;
         }
     }
-    if(native_shader11())combo("Release game rendering (native D3D11)", s.native11_release, "After FG submission\0After generated frame submission (experimental)\0");
-    if(native_shader11())ImGui::TextWrapped("Native D3D11 uses serialized native/generated presentation and full-eye 32-bit guide history. DX12 queue, storage and upload experiments do not apply.");
+    if(native_shader11())ImGui::TextWrapped("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.");
     combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
     if (s.pacing_clock != 0)
         ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
-    if (!native_shader11()&&ImGui::TreeNode("FG scheduling and storage")) {
+    if (ImGui::TreeNode("FG scheduling and storage")) {
+        if(!native_shader11()){
         combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
+        }
         combo("Release game rendering", s.release_point,
             "After FG submission\0After GPU preparation\0After FG completion\0After generated frame submission\0" "4 ms after FG submission\0");
         if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.");
-        ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
         ImGui::Checkbox("Submit repeat frames", &s.submit_repeats);
+        if(!native_shader11()){
+        ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
         if(!quad){combo("FG guide capture", s.guide_capture_mode, "Raw snapshots\0Prepared FG layouts\0");
         combo("FG frame storage", s.compact_storage, "Full-resolution frames\0Compact center + periphery\0");}
         combo("FG color capture", s.color_capture_mode, "Full snapshot + eye crops\0Direct eye capture\0");
@@ -956,8 +958,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             combo("FG output destination", s.direct_xr_output, "Compact intermediate\0Direct OpenXR image (experimental)\0");
             combo("Direct periphery shading", s.direct_peripheral_shading, "Full-resolution warp\0Coarse blocks\0Coarse grid + bilinear filtering\0");
         }
+        }
         combo("FG latency diagnostics", s.latency_diagnostics, "Off\0Calibrated timeline (1 in 17 jobs)\0");
-        combo("FG diagnostic mode", s.diagnostic_mode, "Normal (both eyes)\0Prepare both eyes first\0Left NGX only\0Right NGX only\0Split command lists\0");
+        if(!native_shader11())combo("FG diagnostic mode", s.diagnostic_mode, "Normal (both eyes)\0Prepare both eyes first\0Left NGX only\0Right NGX only\0Split command lists\0");
         if (s.diagnostic_mode == 2 || s.diagnostic_mode == 3)
             warning("Diagnostic mode interpolates only one eye; avoid normal VR play.");
         ImGui::TreePop();
