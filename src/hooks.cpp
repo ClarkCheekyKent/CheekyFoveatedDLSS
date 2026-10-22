@@ -3377,7 +3377,7 @@ std::uint32_t hook_sl_evaluate_feature(
     if(command_buffer && vulkan_command_device(static_cast<VkCommandBuffer>(command_buffer)))
         return original(feature,frame,inputs,input_count,command_buffer);
     detect_afw_runtime();
-    if (feature == sl_feature_dlss_rr || ((d3d12_lower_hook_enabled() || quad_view_blocks_fg()) && feature == 0U)) {
+    if (feature == sl_feature_dlss_rr || ((d3d12_lower_hook_enabled() || quad_view_app_composited()) && feature == 0U)) {
         // Keep the game's viewport/tags/options intact through upstream hooks. The nested
         // native DX12 path owns lower-hook SR and all RR. RR must not enter
         // StreamlineEvaluationScope: that would suppress its nested NGX feature 13
@@ -3644,9 +3644,9 @@ void note_evaluation_begin(
         quad_view_observe12(id,stereo_view_generation(id),
             get_ui(parameters,"OutWidth")?get_ui(parameters,"OutWidth"):output.width,
             get_ui(parameters,"OutHeight")?get_ui(parameters,"OutHeight"):output.height);
-        static std::atomic<bool> previous_quad{};const bool active=quad_view_blocks_fg();
+        static std::atomic<bool> previous_quad{};const bool active=quad_view_app_composited();
         if(previous_quad.exchange(active)!=active)trace_event(active?
-            "DLSS QUAD application-composited mode: four recurring game views, default order=peripheral-left,center-left,peripheral-right,center-right; FG disabled":
+            "DLSS QUAD application-composited mode: four recurring game views, default order=peripheral-left,center-left,peripheral-right,center-right; FG uses peripheral guides":
             "DLSS QUAD application-composited mode ended: returning to ordinary view processing");
     }
 }

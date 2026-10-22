@@ -135,7 +135,7 @@ void synchronize_capture_enabled_locked(bool requested) {
         [](const auto& p){return p->pending_submissions();})||state.colors.has_pending();
 }
 bool enabled() noexcept {
-    return !quad_view_blocks_fg() && current_settings().fg.enabled &&
+    return current_settings().fg.enabled &&
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
 bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
@@ -404,7 +404,20 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
 void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
                     const NgxParameters* p,NgxResult result) noexcept try {
     if(!enabled()||!cmd||!p||!handle||!ngx_succeeded(result))return;
-    if(quad_view_snapshot().active)return; // The quad bridge owns all four guide identities.
+    // The layer's quad bridge owns all four guide identities. A game that
+    // composites four views itself submits full-eye stereo color, so its two
+    // peripheral views (full eye FOV, lower resolution) become the stereo pair.
+    // TODO: composite the center views' guides into the inset (gaze + depth
+    // registration) for full-resolution guides where the user looks.
+    const auto quad=quad_view_snapshot();
+    unsigned quad_eye=FgGuideIdentity::unknown;
+    if(quad.active){
+        if(!quad_is_app_snapshot(quad))return;
+        const auto* role=quad_view_assignment(quad,reinterpret_cast<std::uintptr_t>(handle),
+            stereo_view_generation(reinterpret_cast<std::uintptr_t>(handle)));
+        if(!role||role->focus||role->eye_index>=2)return;
+        quad_eye=role->eye_index;
+    }
     const auto settings=current_settings();
     const bool hookless=hookless_selected(settings.fg);
     if(!hookless&&(!render_frame||ticket_epoch!=source_epoch.load())){++missing_frame_guides;return;}
@@ -439,6 +452,13 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     if(!m.depth_height)m.depth_height=dd.Height;
     const bool low_res=(flags & 2U)!=0||md.Width<w||md.Height<h;
     m.motion_width=low_res?m.depth_width:w;m.motion_height=low_res?m.depth_height:h;
+    if(quad_eye<2){
+        // The peripheral output is upscaled by the game's own composition, so
+        // the guides describe the submitted eye image, not the DLSS output.
+        const auto frame=quad_app_frame();const auto& view=frame.views[quad_eye];
+        if(frame.view_count<2||view.view_index!=quad_eye||!view.image_rect_width||!view.image_rect_height)return;
+        m.width=view.image_rect_width;m.height=view.image_rect_height;
+    }
     m.depth_base_x=ui(p,"DLSS.Input.Depth.Subrect.Base.X");
     m.depth_base_y=ui(p,"DLSS.Input.Depth.Subrect.Base.Y");
     m.motion_base_x=ui(p,"DLSS.Input.MV.Subrect.Base.X");
@@ -460,7 +480,9 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const auto assignment=stereo_eye_assignment(view_id);
     // Preserve the existing ordinal fallback before calibration. Once known,
     // use physical eyes; a verified shared source cannot form two FG guides.
-    const FgGuideIdentity identity{assignment.calibrated ? (assignment.shared_source?2u:assignment.eye_index) :
+    // Quad roles replace stereo calibration; a role change resets history.
+    const FgGuideIdentity identity=quad_eye<2 ? FgGuideIdentity{quad_eye,(std::uint64_t(1)<<63)|quad.revision} :
+        FgGuideIdentity{assignment.calibrated ? (assignment.shared_source?2u:assignment.eye_index) :
         FgGuideIdentity::unknown,assignment.mapping_revision};
     const float signed_sr_x=assignment.assigned&&!assignment.shared_source
         ? ((bool(assignment.eye_index==1)!=settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
@@ -631,7 +653,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
     using namespace cheeky::foveated_dlss;
     const auto settings=current_settings();
-    out->enabled=!quad_view_blocks_fg() && settings.fg.enabled && cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
+    out->enabled=settings.fg.enabled && cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
     out->configuration=configuration(settings);
     // This transition does not require users to uncheck/recheck FG. The
     // OpenXR layer observes the changed key on its next xrWaitFrame and

@@ -871,12 +871,10 @@ void fg_percent(const char* label, std::uint32_t& value) {
 }
 
 void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
-    const bool quad=flag(member(snapshot,"quad_views"),"active");
-    if(flag(member(snapshot,"quad_views"),"fg_blocked")){
-        bool off{};ImGui::BeginDisabled();ImGui::Checkbox("Enable DLSS Frame Generation (2x)",&off);test_control("FgEnabled");ImGui::EndDisabled();
-        ImGui::TextWrapped("Frame generation is disabled: four DLSS views are composited by the game before the stereo OpenXR submission. SR and center-only NR remain available.");
-        return;
-    }
+    // Game-composited quad views submit stereo, so they keep the stereo FG controls.
+    const bool outer_guides=flag(member(snapshot,"quad_views"),"fg_outer_guides");
+    const bool quad=flag(member(snapshot,"quad_views"),"active")&&!outer_guides;
+    if(outer_guides)ImGui::TextWrapped("The game composites four DLSS views before OpenXR. Frame generation uses the two periphery views' depth and motion for the whole eye.");
     if(quad&&settings.fg.peripheral_method>2)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
     const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};

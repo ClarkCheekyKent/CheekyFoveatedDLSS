@@ -303,9 +303,26 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
             // passthrough; no precomposed colors enter the FG upload path.
             result=presenter->end_quad_frame(&forwarded,nullptr,{},[&]{return compositor->compose(inputs,projection,views);});
         }
+    }else if(presenter&&!compositor->d3d11){
+        // D3D12: the composed eyes are an ordinary stereo frame for the shared
+        // buffered presenter. The runtime supplies full-eye guides from the two
+        // peripheral views; colors pair with them at this xrEndFrame (hook-free).
+        compositor->capture_output12=[&](unsigned,XrSwapchain chain,unsigned index,ID3D12Resource* texture,unsigned width,unsigned height,DXGI_FORMAT format){
+            presenter->capture(chain,index,texture,width,height,0,format);};
+        result=compositor->compose(inputs,projection,views);compositor->capture_output12={};
+        if(result==XR_SUCCESS)result=presenter->end_frame(&forwarded,{},&replacement);
     }else{
         result=compositor->compose(inputs,projection,views);
         if(result==XR_SUCCESS)result=dispatch.end_frame(session,&forwarded);
+    }
+    if(!compositor->d3d11&&views[0].subImage.swapchain){
+        // Publish the composed eye rects like a stereo submission: runtime guide
+        // metadata describes these images, not the application's quad views.
+        std::lock_guard lock(state_mutex);auto owner=sessions.find(session);
+        if(owner!=sessions.end()){for(unsigned eye=0;eye<2;++eye){auto& submitted=owner->second.submitted_views[eye];
+                submitted.swapchain=views[eye].subImage.swapchain;submitted.rect=views[eye].subImage.imageRect;
+                submitted.array_index=0;submitted.resource_identity=0;submitted.valid=false;}
+            publish_snapshot_locked(&owner->second);}
     }
     complete_mapping(result==XR_SUCCESS);
     if(diagnostic)log_startup("QUAD-CAPTURE submit output_views=2 result=%d\n",int(result));

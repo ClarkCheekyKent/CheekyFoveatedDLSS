@@ -3544,6 +3544,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
         if (chain != swapchains.end() && owner != sessions.end() && owner->second.fg &&
             quad_capture_ready &&
             (!owner->second.quad_capture||!owner->second.native_frame_begun) &&
+            // D3D12 quad captures the composed eyes at xrEndFrame instead.
+            !(owner->second.quad_capture&&owner->second.graphics_api==12) &&
             (chain->second.create_info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
             has_acquired && acquired_index < chain->second.calibration_images.size()) {
             fg_presenter=owner->second.fg;
@@ -3598,7 +3600,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
 std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
     SessionState& owner, const Dispatch& d, bool requested,bool native_shader11=false) {
     const bool supported=owner.running && (owner.graphics_api==12 || owner.graphics_api==11) &&
-        (owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || (owner.quad_capture&&owner.graphics_api==11));
+        (owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || owner.quad_capture);
     if(owner.quad_capture&&owner.quad_capture->d3d11&&owner.quad_capture->d3d11->fg_guides)
         owner.quad_capture->d3d11->fg_guides->enable(requested&&supported&&bool(owner.fg));
     if (!requested || !supported) {
@@ -3637,7 +3639,9 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
             return {};
         }
         auto candidate=std::make_shared<cheeky::fg::BufferedPresenter>();
-        candidate->quad_input=bool(owner.quad_capture);
+        // D3D12 quad presents the composed eyes as stereo; only the D3D11
+        // bridge sends raw quad planes.
+        candidate->quad_input=bool(owner.quad_capture)&&owner.graphics_api==11;
         candidate->trace=[](const char* message) noexcept {log_startup("%s\n",message);};
         auto* device12=owner.graphics_api==12?static_cast<ID3D12Device*>(owner.graphics_device):nullptr;
         auto* queue12=owner.graphics_api==12?static_cast<ID3D12CommandQueue*>(owner.graphics_queue):nullptr;
@@ -3891,7 +3895,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStatus(CheekyFgStatus*
     std::lock_guard lock(state_mutex);
     for (const auto& [handle,owner]:sessions) {
         if ((owner.graphics_api!=12 && owner.graphics_api!=11) || !owner.running ||
-            (owner.view_configuration!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO&&!(owner.quad_capture&&owner.graphics_api==11))) continue;
+            (owner.view_configuration!=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO&&!owner.quad_capture)) continue;
         status.compatible_session=1;
         status.state=owner.fg_state;
         if (!owner.fg) continue;

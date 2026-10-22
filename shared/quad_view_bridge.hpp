@@ -57,7 +57,7 @@ inline void quad_view_observe12(uint64_t id,uint64_t generation,unsigned width,u
     const auto frame=quad_app_frame();
     app_quad_views().observe(frame.session_generation,uint64_t(frame.predicted_display_time),GetTickCount64(),id,generation,width,height);
 }
-inline bool quad_view_blocks_fg() noexcept {
+inline bool quad_view_app_composited() noexcept {
     // Also called by the layer while querying FG controls. Do not call back
     // into layer exports under its session/presenter locks.
     return app_quad_views().detected();
@@ -110,7 +110,7 @@ inline bool quad_fg_stats(CheekyQuadFgStatsV1& stats) noexcept {
 inline std::string quad_view_diagnostics_json() {
     const auto quad=quad_view_snapshot();std::ostringstream out;out<<std::boolalpha;
     const bool app=quad.active&&quad_is_app_snapshot(quad);
-    out<<"{\"active\":"<<bool(quad.active)<<",\"app_composited\":"<<app<<",\"openxr_quad\":"<<bool(quad.active&&!app)<<",\"fg_blocked\":"<<app
+    out<<"{\"active\":"<<bool(quad.active)<<",\"app_composited\":"<<app<<",\"openxr_quad\":"<<bool(quad.active&&!app)<<",\"fg_outer_guides\":"<<app
         <<",\"manual\":"<<bool(quad.manual_mode)<<",\"show_numbers\":"<<bool(quad.show_numbers)
         <<",\"session\":\""<<quad.session_generation<<"\",\"revision\":"<<quad.revision
         <<",\"status\":\""<<(quad.active?(quad.manual_mode?(quad.status==2?"Manual assigned":"Manual incomplete"):

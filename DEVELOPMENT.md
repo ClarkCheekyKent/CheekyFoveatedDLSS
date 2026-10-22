@@ -85,8 +85,7 @@ corrected from the matching `xrLocateViews` display time; without a matching
 sample the fixed inset is reconstructed from the outer FOV. This follows the
 DCS compatibility issue documented in the
 [Quad-Views-Foveated implementation](https://github.com/mbucchia/Quad-Views-Foveated/blob/main/openxr-api-layer/layer.cpp).
-It does not add eye tracking or the planned per-view SR/NR/FG policy. The current
-stereo FG presenter stays inactive for a quad session.
+It does not add eye tracking or the planned per-view SR/NR/FG policy.
 
 `CheekyOpenXRBindingTests --quad-d3d11` exercises the production interceptors
 with WARP and a stereo-only mock runtime, including output pixel readback, context
@@ -398,3 +397,19 @@ it remains a crash mitigation requiring manual DCS validation. The additive
 Acquire/ReleaseD3D11V1 exports require updating both runtime and OpenXR layer.
 Sampled `FG HISTORY` messages identify worker restart, token gap, frame gap and
 upstream source reset separately. Resets remain required for real discontinuities.
+
+Games that composite four DLSS views themselves before a stereo OpenXR submission
+(MSFS 2024's eye-tracked foveation opens a stereo session) no longer disable FG.
+The two periphery evaluations, which cover the full eye FOV at lower resolution,
+become the stereo guide pair; the center evaluations are ignored. Eyes come from
+the four-view roles (default order or Manual assignment) and the guide output size
+is the submitted eye rect. Color is the game's own composite. TODO: composite the
+center guides into the inset, located from gaze plus depth registration, for
+full-resolution guides where the user looks.
+
+D3D12 games using real quad views through the layer also run FG: the layer composes
+each eye, captures the composed images for the shared buffered presenter and
+presents them as an ordinary stereo frame. Guides use the same periphery pair
+(hook-free pairing at xrEndFrame). The composed eye rects are published as the
+submitted views. D3D12 quad has no automatic role proof yet, so it uses the
+default evaluation order unless roles are assigned manually.

@@ -236,6 +236,9 @@ struct Compositor {
     ComPtr<ID3D12DescriptorHeap> srvs,rtvs;
     std::array<Eye,2> eyes;
     std::array<XrViewConfigurationView,2> recommended{};
+    // D3D12 FG: receives each composed eye after its GPU work completes,
+    // before the image is released (still in RENDER_TARGET state).
+    std::function<void(unsigned,XrSwapchain,unsigned,ID3D12Resource*,unsigned,unsigned,DXGI_FORMAT)> capture_output12;
     bool initialize() {
         if(device11){
             if(!d3d11){d3d11=std::make_unique<Compositor11>();d3d11->session=session;d3d11->device=device11;
@@ -346,6 +349,8 @@ struct Compositor {
         if(result==XR_SUCCESS){ID3D12CommandList* commands[]{list.Get()};queue->ExecuteCommandLists(1,commands);
             if(FAILED(queue->Signal(fence.Get(),++serial))||!idle())result=XR_ERROR_RUNTIME_FAILURE;}
         for(unsigned eye=0;eye<2;++eye)if(acquired[eye]&&waited[eye]){
+            if(result==XR_SUCCESS&&capture_output12)capture_output12(eye,eyes[eye].chain,indices[eye],eyes[eye].images[indices[eye]].texture,
+                eyes[eye].width,eyes[eye].height,eyes[eye].format);
             XrSwapchainImageReleaseInfo r{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};const auto released=release(eyes[eye].chain,&r);if(XR_FAILED(released))result=released;
             views[eye]=projection.views[eye];views[eye].next=nullptr;views[eye].subImage={eyes[eye].chain,{{0,0},{int32_t(eyes[eye].width),int32_t(eyes[eye].height)}},0};
         }
