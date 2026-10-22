@@ -691,6 +691,12 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(Che
     out->upload_mode=settings.upload_mode==1u?1u:0u;
     out->latency_diagnostics=settings.latency_diagnostics==1u?1u:0u;return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(CheekyFgPacingOptions* out) noexcept {
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    const auto& fg=cheeky::foveated_dlss::current_settings().fg;
+    out->clock_mode=fg.pacing_clock<=2u?fg.pacing_clock:0u;
+    out->native11_release_point=fg.native11_release==1u?3u:0u;return true;
+}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(CheekyFgStorageOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
     const auto settings=cheeky::foveated_dlss::current_settings();

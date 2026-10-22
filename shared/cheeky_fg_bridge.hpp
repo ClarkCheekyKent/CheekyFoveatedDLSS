@@ -211,6 +211,13 @@ struct CheekyFgTransportOptions {
     std::uint32_t color_capture_mode{},upload_mode{},latency_diagnostics{1};
 };
 using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
+// Separate export so the transport layout keeps its exact-size check.
+struct CheekyFgPacingOptions {
+    std::uint32_t abi{1},size{sizeof(CheekyFgPacingOptions)};
+    std::uint32_t clock_mode{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
+    std::uint32_t native11_release_point{}; // 0 after FG submission; 3 after generated frame submission.
+};
+using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
 // Independent export: older transport/pair layouts remain compatible.
 struct CheekyFgDirectOutput {
     std::uint32_t abi{1},size{sizeof(CheekyFgDirectOutput)},supported{},requested{};

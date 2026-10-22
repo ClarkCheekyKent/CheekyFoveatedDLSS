@@ -41,6 +41,18 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         return mode==2u?"shared-game":mode==0u?"separate-NORMAL":"separate-HIGH";
     }
     std::atomic<unsigned> color_capture_mode{},upload_mode{},latency_diagnostics{1};
+    // Native credit clock (FG pacing clock setting). 0 keeps the independent
+    // display clock. 1 slows it toward the rate native frames actually reach
+    // the runtime, so a late presenter is not fed frames it will drop. 2 does
+    // that and also phase-locks clock ticks to the runtime xrWaitFrame wakes.
+    std::atomic<unsigned> pacing_clock_mode{};
+    double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
+    TimingClock::time_point last_native_present{},runtime_wake{};
+    std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{};
+    double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
+    // Native D3D11 frames carry no release policy (point 0: release the game
+    // at FG submission). Nonzero applies that release point to them instead.
+    std::atomic<unsigned> native11_release_point{};
     CheekyFgTransportOptionsFn transport_options_query{};
     CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
     CheekyFgStaticEyeCropsV1 static_eye_crops; // Diagnostic only; NEVER used to pack a later native frame.
@@ -394,6 +406,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
         distinct_native=repeated_presentations=runtime_submissions=0;
+        presented_native_ms=native_clock_ms=0;last_native_present=runtime_wake={};runtime_wakes=adapted_ticks=phase_corrections=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         changed.notify_all();
@@ -474,6 +487,16 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 char message[192]{};sprintf_s(message,"FG transport A/B: color=%s uploads=%s latency=%s (next native frame)",
                     color_capture_mode?"direct-eyes":"full-snapshot",upload_mode?"batched":"per-image",latency_diagnostics?"1-in-17":"OFF");trace(message);
             }
+        }
+        const auto pacing_query=runtime?reinterpret_cast<CheekyFgPacingOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetPacingOptionsV1")):nullptr;
+        CheekyFgPacingOptions pacing;
+        if(pacing_query&&pacing_query(&pacing)){
+            const auto mode=std::min(pacing.clock_mode,2u);
+            if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
+                mode==1u?"FG pacing clock=presented native rate":"FG pacing clock=independent display clock");
+            const auto point=pacing.native11_release_point==3u?3u:0u;
+            if(native11_release_point.exchange(point)!=point&&trace)trace(point?"FG native D3D11 release=after generated frame submission":
+                "FG native D3D11 release=after FG submission");
         }
         std::unique_lock lock(mx);
         if(!start())return XR_ERROR_RUNTIME_FAILURE;
@@ -615,6 +638,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 native.native=native.current=job->color;native.native_views=native.current_views=job->views;
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
                 latest_native=std::move(native);
+                if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),4u);
                 if(inference_slot){pending.push_back(job);while(pending.size()>2){pending.front()->clear_guides();pending.pop_front();++skipped;}}
                 ++frames;held_valid=true;changed.notify_all();
             }
@@ -802,7 +826,19 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             // let the independent clock expose an uninitialized frame state.
             changed.wait(lock,[&]{return stopping||telemetry.xr_period_ms>0;});
             auto next=TimingClock::now();
+            std::uint64_t seen_wakes=runtime_wakes;
             while(!stopping) {
+                const auto mode=pacing_clock_mode.load(std::memory_order_relaxed);
+                if(mode==2u&&runtime_wakes!=seen_wakes&&telemetry.xr_period_ms>0) {
+                    // Pull the next tick toward the runtime's wake grid (either
+                    // parity). Gain 1/4 converges in a few frames and tracks a
+                    // runtime period that differs from its reported value.
+                    seen_wakes=runtime_wakes;const double v=telemetry.xr_period_ms;
+                    double error=std::fmod(std::chrono::duration<double,std::milli>(next-runtime_wake).count(),v);
+                    if(error<0)error+=v;if(error>v/2)error-=v;
+                    if(std::abs(error)>.05){next-=std::chrono::duration_cast<TimingClock::duration>(
+                        std::chrono::duration<double,std::milli>(error*.25));++phase_corrections;}
+                }
                 const auto now=TimingClock::now();
                 // A deferred native credit may become available between
                 // display clock ticks. Wake exactly at the soft-release
@@ -815,8 +851,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(now>=next) {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
+                    double native_ms=std::max(1.,display_ms*(pacing_active?2.:1.));
+                    // Stay 8% faster than the measured presentation rate so
+                    // the clock keeps probing upward and returns to the
+                    // display rate as soon as the presenter catches up.
+                    if(mode!=0u&&pacing_active&&presented_native_ms*.92>native_ms){
+                        native_ms=std::min(presented_native_ms*.92,display_ms*4.);++adapted_ticks;}
+                    native_clock_ms=native_ms;
                     const auto period=std::chrono::duration_cast<TimingClock::duration>(
-                        std::chrono::duration<double,std::milli>(std::max(1.,display_ms*(pacing_active?2.:1.))));
+                        std::chrono::duration<double,std::milli>(native_ms));
                     if(!raw) {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                             mark_credit_deferred();
@@ -1019,6 +1062,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     note_direct_failure_locked(CheekyFgDirectReason::cancelled,0,direct_request.get());
                     direct_request->decided=true;direct_request.reset();++direct_stats.fallbacks;direct_stats.last_path=3;changed.notify_all();}
                 predicted=frame;telemetry.xr_period_ms=double(frame.predictedDisplayPeriod)/1000000.;
+                runtime_wake=TimingClock::now();++runtime_wakes;
                 xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;changed.notify_all();
             }
             if(allow_repeats&&!generated_phase&&frame.shouldRender==XR_TRUE)wait_for_new_pair(present_start,frame.predictedDisplayPeriod,last_position);
@@ -1164,7 +1208,14 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{},native_latency_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted){++generated_count;last_generated_submit_tick=GetTickCount64();}
-                if(submitted&&!is_generated&&!raw_frame){if(repeated)++repeated_presentations;else ++distinct_native;}
+                if(submitted&&!is_generated&&!raw_frame){if(repeated)++repeated_presentations;else {++distinct_native;
+                    const auto now=TimingClock::now();
+                    if(last_native_present!=TimingClock::time_point{}&&pacing_active){
+                        // Gaps over 250 ms are pauses or transitions, not a rate.
+                        const double interval=std::chrono::duration<double,std::milli>(now-last_native_present).count();
+                        if(interval<250.)presented_native_ms=presented_native_ms>0?presented_native_ms*.9+interval*.1:interval;
+                    }else if(!pacing_active)presented_native_ms=0;
+                    last_native_present=now;}}
                 present_cpu.add(elapsed_ms(present_start));
                 if(XR_SUCCEEDED(result)){++runtime_submissions;
                     const auto now_ms=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();

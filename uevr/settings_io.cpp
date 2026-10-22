@@ -47,6 +47,14 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.direct_peripheral_shading=mode; return true;
     }
+    if (key == "FgPacingClock") {
+        std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
+        s.fg.pacing_clock=mode; return true;
+    }
+    if (key == "FgNative11Release") {
+        std::uint32_t mode{}; if (!parse(value, mode) || mode > 1U) return false;
+        s.fg.native11_release=mode; return true;
+    }
     if (key == "FgQueuePriority") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.queue_priority=mode; return true;
