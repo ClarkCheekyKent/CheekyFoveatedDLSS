@@ -9,6 +9,7 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "fg_capture.hpp"
+#include "cheeky_fg_shader11.hpp"
 #include "fg_sr_region.hpp"
 #include "ngx_parameter_overlay.hpp"
 
@@ -1835,7 +1836,12 @@ bool evaluate_d3d11_via_d3d12(
     }
     TimingScope timing{context, slot};
     bool fg_guides_ready{};
-    if(settings.fg.enabled) {
+    // Shader-only FG on a D3D11 game runs natively in the OpenXR layer and
+    // takes its guides from fg_publish_shader11. Sharing DLSS-G guides through
+    // this transport too (on with DLSS-NR) was pure overhead every frame.
+    const bool dlss_fg=settings.fg.enabled&&
+        !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated);
+    if(dlss_fg) {
         auto ensure_fg=[&](SharedTexture& texture,const char* name,unsigned w,unsigned h,DXGI_FORMAT format) {
             if(texture.resource12 && (texture.width!=w || texture.height!=h || texture.format!=format))
                 release_shared_texture(texture); // Slot has retired before reuse.
