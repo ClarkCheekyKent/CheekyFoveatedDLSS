@@ -444,7 +444,11 @@ void draw_view_details(std::string_view snapshot) {
         const auto view = array_object(views, i);
         if (view.empty()) break;
         ImGui::PushID(static_cast<int>(i));
-        ImGui::SeparatorText("DLSS handle");
+        // One scannable line per handle; the identifiers open on demand.
+        const auto summary = plain(member(view, "eye")) + " | " + plain(member(view, "api")) + " | " +
+            plain(member(view, "activity")) + " | " + std::to_string(static_cast<long long>(number(view, "output_width"))) +
+            "x" + std::to_string(static_cast<long long>(number(view, "output_height")));
+        if (!ImGui::TreeNode("handle", "%s", summary.c_str())) {ImGui::PopID();continue;}
         diagnostic_line(view, "ID", "id");
         diagnostic_line(view, "Registration generation", "generation");
         diagnostic_line(view, "Activity", "activity");
@@ -464,6 +468,7 @@ void draw_view_details(std::string_view snapshot) {
                 number(view, "crop_x"), number(view, "crop_y"));
             diagnostic_line(view, "Geometry observations", "evaluations");
         }
+        ImGui::TreePop();
         ImGui::PopID();
     }
     if (number(snapshot, "view_details_total") > 16)
@@ -593,43 +598,100 @@ void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
         ImGui::TextWrapped("Scores are sampled candidates, not exhaustive maxima. -1 means no candidate was scored. A high score alone does not establish the correct eye pair or crop. Shift values stay zero when recognition failed before geometry could be checked.");
         ImGui::TreePop();
     }
-    ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
-    ImGui::Text("Verification worker: %.2f us/frame (background)",number(data,"verification_cpu_us_per_frame"));
-    ImGui::Text("Verification worker (last / peak sample): %.2f / %.2f ms",
-        number(data,"verification_last_ms"),number(data,"verification_peak_ms"));
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Worker elapsed time for completed local searches, including failures and patch conversion. Separate from graphics-thread CPU work; includes worker scheduling delays.");
-    ImGui::Text("Verification attempts (exact / nearby / broad): %.0f / %.0f / %.0f",
-        number(data,"verification_exact"),number(data,"verification_nearby"),number(data,"verification_broad"));
-    if (number(data, "capture_timing_samples") > 0) {
-        ImGui::Text("Image acquisition total (L / R): %.1f / %.1f ms", number(data,"capture_total_left_ms"),number(data,"capture_total_right_ms"));
-        ImGui::Text("Capture allocation / record (L / R): %.1f / %.1f ms", number(data,"capture_setup_left_ms"),number(data,"capture_setup_right_ms"));
-        ImGui::Text("Readback elapsed (L / R): %.1f / %.1f ms", number(data,"capture_wait_left_ms"),number(data,"capture_wait_right_ms"));
-        ImGui::Text("Map calls CPU (L / R): %.1f / %.1f ms", number(data,"capture_map_left_ms"),number(data,"capture_map_right_ms"));
-        ImGui::Text("CPU image allocation / copy (L / R): %.1f / %.1f ms", number(data,"capture_copy_left_ms"),number(data,"capture_copy_right_ms"));
-        ImGui::Text("Image acquisition peak: %.1f ms",number(data,"max_capture_ms"));
-        ImGui::Text("Peak capture: eye %s, %.0fx%.0f, sample %.0f, %.0f Map polls",
-            number(data,"peak_capture_eye")==0 ? "L" : "R", number(data,"peak_capture_width"),
-            number(data,"peak_capture_height"),number(data,"peak_capture_sequence"),number(data,"peak_capture_map_polls"));
-        ImGui::Text("At peak - allocation / record: %.1f ms; readback: %.1f ms",
-            number(data,"peak_capture_setup_ms"),number(data,"peak_capture_wait_ms"));
-        ImGui::Text("At peak - CPU copy: %.1f ms; other: %.1f ms; Map CPU: %.1f ms",
-            number(data,"peak_capture_copy_ms"),number(data,"peak_capture_other_ms"),number(data,"peak_capture_map_ms"));
-        ImGui::TextWrapped("Readback elapsed includes GPU queue and polling delay; Map CPU overlaps it. -1 means unavailable.");
-    }
-    if (number(data, "search_timing_samples") > 0) {
-        ImGui::Text("Full-image search (last L / R): %.1f / %.1f ms",
-            number(data, "search_left_ms"), number(data, "search_right_ms"));
-        ImGui::Text("Full-image search (peak per eye): %.1f ms", number(data, "max_search_ms"));
-    } else ImGui::TextUnformatted("Full-image search: no completed timing yet");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Worker elapsed time per eye, including unsuccessful searches. Eyes run concurrently; do not add their times. Excludes image readback/conversion and final verification. -1 means unavailable.");
-    if (number(data, "gpu_samples") > 0) ImGui::Text("GPU marker / copy work: %.2f us", number(data, "gpu_us"));
-    else diagnostic_line(data, "GPU marker / copy work", "gpu_timing_status");
-    ImGui::Text("Readback latency: %.2f VR frames", number(data, "latency_frames"));
     diagnostic_line(data, "Last recognized left view", "left_view");
     diagnostic_line(data, "Last recognized right view", "right_view");
+    if (ImGui::TreeNode("Calibration timing")) {
+        ImGui::Text("CPU work: %.2f us/frame", number(data, "cpu_us_per_frame"));
+        ImGui::Text("Verification worker: %.2f us/frame (background)",number(data,"verification_cpu_us_per_frame"));
+        ImGui::Text("Verification worker (last / peak sample): %.2f / %.2f ms",
+            number(data,"verification_last_ms"),number(data,"verification_peak_ms"));
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Worker elapsed time for completed local searches, including failures and patch conversion. Separate from graphics-thread CPU work; includes worker scheduling delays.");
+        ImGui::Text("Verification attempts (exact / nearby / broad): %.0f / %.0f / %.0f",
+            number(data,"verification_exact"),number(data,"verification_nearby"),number(data,"verification_broad"));
+        if (number(data, "capture_timing_samples") > 0) {
+            ImGui::Text("Image acquisition total (L / R): %.1f / %.1f ms", number(data,"capture_total_left_ms"),number(data,"capture_total_right_ms"));
+            ImGui::Text("Capture allocation / record (L / R): %.1f / %.1f ms", number(data,"capture_setup_left_ms"),number(data,"capture_setup_right_ms"));
+            ImGui::Text("Readback elapsed (L / R): %.1f / %.1f ms", number(data,"capture_wait_left_ms"),number(data,"capture_wait_right_ms"));
+            ImGui::Text("Map calls CPU (L / R): %.1f / %.1f ms", number(data,"capture_map_left_ms"),number(data,"capture_map_right_ms"));
+            ImGui::Text("CPU image allocation / copy (L / R): %.1f / %.1f ms", number(data,"capture_copy_left_ms"),number(data,"capture_copy_right_ms"));
+            ImGui::Text("Image acquisition peak: %.1f ms",number(data,"max_capture_ms"));
+            ImGui::Text("Peak capture: eye %s, %.0fx%.0f, sample %.0f, %.0f Map polls",
+                number(data,"peak_capture_eye")==0 ? "L" : "R", number(data,"peak_capture_width"),
+                number(data,"peak_capture_height"),number(data,"peak_capture_sequence"),number(data,"peak_capture_map_polls"));
+            ImGui::Text("At peak - allocation / record: %.1f ms; readback: %.1f ms",
+                number(data,"peak_capture_setup_ms"),number(data,"peak_capture_wait_ms"));
+            ImGui::Text("At peak - CPU copy: %.1f ms; other: %.1f ms; Map CPU: %.1f ms",
+                number(data,"peak_capture_copy_ms"),number(data,"peak_capture_other_ms"),number(data,"peak_capture_map_ms"));
+            ImGui::TextWrapped("Readback elapsed includes GPU queue and polling delay; Map CPU overlaps it. -1 means unavailable.");
+        }
+        if (number(data, "search_timing_samples") > 0) {
+            ImGui::Text("Full-image search (last L / R): %.1f / %.1f ms",
+                number(data, "search_left_ms"), number(data, "search_right_ms"));
+            ImGui::Text("Full-image search (peak per eye): %.1f ms", number(data, "max_search_ms"));
+        } else ImGui::TextUnformatted("Full-image search: no completed timing yet");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Worker elapsed time per eye, including unsuccessful searches. Eyes run concurrently; do not add their times. Excludes image readback/conversion and final verification. -1 means unavailable.");
+        if (number(data, "gpu_samples") > 0) ImGui::Text("GPU marker / copy work: %.2f us", number(data, "gpu_us"));
+        else diagnostic_line(data, "GPU marker / copy work", "gpu_timing_status");
+        ImGui::Text("Readback latency: %.2f VR frames", number(data, "latency_frames"));
+        ImGui::TreePop();
+    }
     ImGui::TextWrapped("Corner verification samples every 10 VR frames; timing recovery captures every frame while acquiring. Corrections count changes to an existing eye assignment. GPU time covers marker and copy commands; CPU time excludes lock waiting.");
     if (ImGui::Button("Reset calibration counters")) command(r, runtime, "calibration_reset");
     ImGui::TreePop();
+}
+
+// One row per feature, so the state of the whole pipeline is readable at a
+// glance before opening any detail group.
+void draw_diagnostics_summary(const OverlayUiState& r, const char* status) {
+    const auto& s = r.draft;
+    const auto& snapshot = r.snapshot;
+    ImGui::SeparatorText("Summary");
+    if (!ImGui::BeginTable("summary", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) return;
+    ImGui::TableSetupColumn("Item", ImGuiTableColumnFlags_WidthStretch, 1.F);
+    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 2.2F);
+    const auto row = [](const char* label, const std::string& value) {
+        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(label);
+        ImGui::TableNextColumn(); ImGui::TextWrapped("%s", value.empty() ? "Unavailable" : value.c_str());
+    };
+    const auto yes_no = [](std::string_view object, const char* key) -> std::string {
+        const auto value = plain(member(object, key));
+        return value == "true" ? "Yes" : value == "false" ? "No" : value;
+    };
+    row("Runtime ready", yes_no(snapshot, "ready"));
+    row("Overlay", status ? status : "");
+    const auto present_ms = number(member(snapshot, "frame"), "present_ms");
+    char frame[64]{};
+    if (present_ms > 0) std::snprintf(frame, sizeof(frame), "%.2f ms (%.1f FPS)", present_ms, 1000 / present_ms);
+    row("Frame time", present_ms > 0 ? frame : "Not sampled yet");
+    std::string sr;
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto api = array_object(member(snapshot, "apis"), i);
+        if (number(api, "evaluations") == 0) continue;
+        if (!sr.empty()) sr += "; ";
+        sr += (i ? "D3D12: " : "D3D11: ") + plain(member(api, "state"));
+    }
+    const auto vulkan = member(snapshot, "vulkan");
+    if (sr.empty() && number(vulkan, "evaluations") > 0) sr = "Vulkan: " + plain(member(vulkan, "state"));
+    row("DLSS-SR", !s.enabled ? "Off" : sr.empty() ? "Waiting for the first DLSS evaluation" : sr);
+    const auto nr_skip = plain(member(member(snapshot, "nr_details"), "skip_reason"));
+    row("DLSS-NR", !s.nr_enabled ? "Off" : plain(member(snapshot, "nr")) + (nr_skip.empty() ? "" : " (" + nr_skip + ")"));
+    const auto fg = member(snapshot, "fg");
+    row("Frame generation", !s.fg.enabled ? "Off" : fg.empty() ? "Unavailable" :
+        !flag(fg, "layer_present") ? "OpenXR layer not loaded" :
+        !flag(fg, "compatible_session") ? "Waiting for a compatible OpenXR session" : plain(member(fg, "state")));
+    const char* tracking = s.center_mode == FoveationCenterMode::fixed ? "Not in use (fixed placement)" :
+        s.center_mode == FoveationCenterMode::simulated_gaze ? "Not in use (simulated gaze)" :
+        !s.enabled && !(s.nr_enabled && s.nr_foveated) ? "Not evaluated (SR and foveated NR are off)" :
+        gaze_warning(s, snapshot) ? "No" : "Yes";
+    row("Eye tracking", tracking);
+    row("Stereo alignment", alignment_name(static_cast<unsigned>(number(member(snapshot, "gaze"), "alignment"))));
+    row("Eye mapping", plain(member(member(snapshot, "eye_calibration"), "status")));
+    const auto quad = member(snapshot, "quad_views");
+    if (flag(quad, "active")) row("Quad views", plain(member(quad, "status")));
+    row("Native observer ready", yes_no(member(snapshot, "observer"), "ready"));
+    ImGui::EndTable();
+    if (std::string_view(tracking) == "No") warning(gaze_warning(s, snapshot));
+    warning(alignment_warning(s, snapshot));
 }
 
 void timing_line(std::string_view data, const char* label, const char* key) {
@@ -1121,17 +1183,19 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 end_tab();
             }
             if (begin_tab("Diagnostics")) {
-                diagnostic_line(r.snapshot, "NR state", "nr");
-                diagnostic_line(member(r.snapshot, "frame"), "Frame time (ms)", "present_ms");
-                diagnostic_line(member(r.snapshot, "observer"), "Native observer ready", "ready");
-                diagnostic_line(member(r.snapshot, "nr_details"), "NR skip reason", "skip_reason");
-                draw_gaze_details(r.snapshot);
-                draw_view_details(r.snapshot);
-                draw_calibration(r, runtime);
+                draw_diagnostics_summary(r, status);
+                ImGui::SeparatorText("Support");
                 if (ImGui::Button("Report an issue...")) command(r, runtime, "report_issue");
+                ImGui::SameLine();
                 if (ImGui::Button("Create support ZIP")) command(r, runtime, "report");
+                ImGui::SameLine();
                 if (ImGui::Button("Show support ZIP")) command(r, runtime, "show_report");
                 if (ImGui::Button("Copy diagnostic snapshot")) ImGui::SetClipboardText(r.snapshot.c_str());
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copies the complete JSON snapshot for a bug report.");
+                ImGui::SeparatorText("Details");
+                draw_gaze_details(r.snapshot);
+                draw_calibration(r, runtime);
+                draw_view_details(r.snapshot);
                 if (ImGui::TreeNode("DX12 GPU timing collection")) {
                     ImGui::TextWrapped("These counters cover the DX12 collector only. DX11 direct SR and eye calibration use separate timers.");
                     const auto gpu = member(r.snapshot, "gpu_timing");
@@ -1144,7 +1208,11 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     ImGui::TreePop();
                 }
                 if (ImGui::TreeNode("Full diagnostic snapshot")) {
-                    ImGui::TextWrapped("%s", r.snapshot.c_str());
+                    // Bounded, independently scrolling region: the raw JSON is
+                    // tens of kilobytes and would otherwise bury the page.
+                    if (ImGui::BeginChild("snapshot", ImVec2(0, 240.F * ImGui::GetIO().FontGlobalScale),
+                            ImGuiChildFlags_Borders)) ImGui::TextWrapped("%s", r.snapshot.c_str());
+                    ImGui::EndChild();
                     ImGui::TreePop();
                 }
                 end_tab();

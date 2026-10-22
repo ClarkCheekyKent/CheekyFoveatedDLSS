@@ -246,6 +246,11 @@ void test_ui_diagnostics() {
     render("Diagnostics", false); text = render("Diagnostics", false);
     require(text.find("Eye tracking details") != text.npos && text.find("Eye calibration diagnostics") != text.npos, "Diagnostic groups missing");
     require(text.find("Corrections applied") == text.npos && text.find("Sample age") == text.npos, "Detailed diagnostics should start collapsed");
+    require(text.find("10.00 ms (100.0 FPS)") != text.npos && text.find("D3D12: Active") != text.npos &&
+        text.find("Ready, {mapped}") != text.npos && text.find("Frame generation") != text.npos,
+        "Diagnostics summary reports frame time, SR, eye mapping and FG without opening groups");
+    require(text.find("Summary") < text.find("Report an issue...") && text.find("Report an issue...") < text.find("Eye tracking details") &&
+        text.find("Copy diagnostic snapshot") != text.npos, "Diagnostics leads with the summary, then support actions, then detail groups");
     render("Diagnostics"); text = render("Diagnostics");
     require(text.find("Corrections applied: 7") != text.npos, "Calibration counters missing");
     require(text.find("Automatic eye calibration (this session)") == text.npos &&
