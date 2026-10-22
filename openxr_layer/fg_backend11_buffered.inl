@@ -82,19 +82,23 @@ inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {
         XrSwapchainCreateInfo create{XR_TYPE_SWAPCHAIN_CREATE_INFO};create.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         create.format=d.Format;create.width=d.Width;create.height=d.Height;create.arraySize=d.ArraySize;
         create.sampleCount=create.faceCount=create.mipCount=1;
-        if(XR_FAILED(xr.create(session,&create,&chain.handle))){chain={};return false;}
+        // Every runtime call that may touch the game's D3D11 context goes through
+        // the dispatch gate: an ungated call racing the game's NGX evaluation
+        // reproduced the NVIDIA driver-worker crash (--fg-shader11-ngx ungated).
+        const auto gated=[&](auto&& call){return native11->runtime_submit(call);};
+        if(XR_FAILED(gated([&]{return xr.create(session,&create,&chain.handle);}))){chain={};return false;}
         unsigned count{};
-        if(XR_FAILED(xr.enumerate(chain.handle,0,&count,nullptr))||!count){destroy_chain(chain.handle);chain={};return false;}
+        if(XR_FAILED(gated([&]{return xr.enumerate(chain.handle,0,&count,nullptr);}))||!count){destroy_chain(chain.handle);chain={};return false;}
         chain.images11.assign(count,{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-        if(XR_FAILED(xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images11.data())))){
+        if(XR_FAILED(gated([&]{return xr.enumerate(chain.handle,count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(chain.images11.data()));}))){
             destroy_chain(chain.handle);chain={};return false;}
         chain.desc.Width=d.Width;chain.desc.Height=d.Height;chain.desc.Format=d.Format;chain.desc.DepthOrArraySize=UINT16(d.ArraySize);
     }
     if(chain.uploaded==source->identity)return true;
     unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if(XR_FAILED(xr.acquire(chain.handle,&acquire,&index)))return false;
+    if(XR_FAILED(native11->runtime_submit([&]{return xr.acquire(chain.handle,&acquire,&index);})))return false;
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-    const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
+    const auto wait_begin=TimingClock::now();const auto wait_result=native11->runtime_submit([&]{return xr.wait_image(chain.handle,&wait);});
     {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
     const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images11.size()&&native11->upload(chain.images11[index].texture,source);
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
