@@ -486,8 +486,11 @@ void fg_lifecycle_retirement_test() {
     auto third=std::make_shared<RetirementProbe>();live.fg=third;live.fg_requested=true;live.running=true;
     const auto chain=h<XrSwapchain>(70);SwapchainState swapchain;swapchain.session=session;
     swapchains.emplace(chain,std::move(swapchain));
-    check(XR_SUCCEEDED(cheeky_xrDestroySwapchain(chain)) && third->retired && third->outside_state_lock &&
-        !live.fg&&!live.fg_requested,"Swapchain replacement must rebuild setup instead of reusing a stopped presenter");
+    // Another thread may be waiting inside the presenter (OpenComposite destroys
+    // overlay swapchains on the game thread), so destroy only marks it.
+    check(XR_SUCCEEDED(cheeky_xrDestroySwapchain(chain)) && !third->retired && live.fg==third &&
+        live.fg_retire_pending,"Swapchain replacement retires the presenter at the next xrWaitFrame, not from the destroying thread");
+    live.fg_retire_pending=false;
     sessions.clear();
     std::cout<<"PASS FG session restart/end and swapchain retirement outside the state lock\n";
 }

@@ -258,6 +258,29 @@ inline void fg_backend11_dispatch_gate(){
     check(admitted&&excluded&&completed&&bridged&&inactive,
         "Stereo NGX excludes native GPU/runtime and bridge submissions; inactive sessions remain ungated");
 }
+// OpenComposite destroys an overlay swapchain on the game thread while its
+// render thread waits in xrWaitFrame. A reset during that wait must report an
+// interruption the layer can retry, and the presenter must restart cleanly.
+inline void fg_backend11_interrupted_wait(){
+    using namespace shader11_fixture;using namespace cheeky::fg;
+    Runtime::reset();
+    BufferedPresenter p;p.trace=[](const char*) noexcept {};p.retire_chain=[](XrSwapchain){};
+    check(p.setup11(reinterpret_cast<XrSession>(3),Runtime::functions(),device.Get(),7,nullptr),"Interrupted-wait presenter setup");
+    XrFrameState state{XR_TYPE_FRAME_STATE};
+    check(XR_SUCCEEDED(p.wait_frame(nullptr,&state)),"First application wait");
+    // Waiting again before xrBeginFrame blocks inside the presenter.
+    auto blocked=std::async(std::launch::async,[&]{XrFrameState next{XR_TYPE_FRAME_STATE};return p.wait_frame(nullptr,&next);});
+    check(blocked.wait_for(std::chrono::milliseconds(100))==std::future_status::timeout,"Second wait blocks until the frame begins");
+    p.invalidate_temporal();
+    const auto result=blocked.get();
+    Runtime::frame_thread=0; // New presenter threads own the runtime frame loop.
+    check(result==XR_ERROR_SESSION_NOT_RUNNING&&p.interrupted(),"A reset during the wait is reported as an interruption, not a runtime failure");
+    check(XR_SUCCEEDED(p.wait_frame(nullptr,&state))&&XR_SUCCEEDED(p.begin_frame(nullptr)),"The retried wait restarts the presenter");
+    check(!p.interrupted()&&Runtime::errors==0,"Restarted presenter runs without runtime call-order errors");
+    p.forget_swapchain(reinterpret_cast<XrSwapchain>(100));
+    p.reset();
+    std::cout<<"PASS interrupted xrWaitFrame: concurrent reset reports a retryable interruption; the presenter restarts\n";
+}
 // OpenComposite games (ACC) calibrate eyes through OpenVR, so the runtime
 // publishes guides with session 0. The layer binds them to its only running
 // D3D11 session and refuses when more than one could own them.
@@ -321,6 +344,7 @@ void fg_shader11_validation(bool hardware=false){
     fg_backend11_copy_state();
     fg_backend11_dispatch_gate();
     fg_backend11_openvr_calibration();
+    fg_backend11_interrupted_wait();
     if(hardware)fg_backend11_fence_stress();
     else fg_backend11_pixels();
     fg_backend11_pipelined();

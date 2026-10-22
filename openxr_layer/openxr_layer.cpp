@@ -290,6 +290,10 @@ struct SessionState {
     std::shared_ptr<cheeky::fg::Presenter> fg;
     CheekyFgState fg_state{CheekyFgState::off};
     bool fg_requested{};
+    // An application swapchain was destroyed. Retire the presenter at the next
+    // xrWaitFrame boundary, never from the destroying thread: another thread
+    // may be blocked inside the presenter's xrWaitFrame at that moment.
+    bool fg_retire_pending{};
     // A WaitFrame issued before activation still belongs to the runtime.
     // Preserve that ownership through its matching BeginFrame and EndFrame.
     std::uint64_t native_waits_pending{};
@@ -3313,7 +3317,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
 ) {
     PFN_xrDestroySwapchain next{};
     XrSession session{XR_NULL_HANDLE};
-    std::shared_ptr<cheeky::fg::Presenter> fg_to_invalidate;
+    std::shared_ptr<cheeky::fg::Presenter> fg_to_forget;
     std::shared_ptr<cheeky::quad_capture::Compositor> quad_to_invalidate;
     {
         std::lock_guard lock(state_mutex);
@@ -3325,10 +3329,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
         next = instance->dispatch.destroy_swapchain;
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
-            fg_to_invalidate=std::move(session_it->second.fg);
+            fg_to_forget=session_it->second.fg;
             quad_to_invalidate=session_it->second.quad_capture;
-            session_it->second.fg_requested=false;
-            session_it->second.fg_state=CheekyFgState::waiting_for_history;
+            if(fg_to_forget)session_it->second.fg_retire_pending=true;
             auto& calibration = session_it->second.calibration;
             for (const auto& region : calibration.history) {
                 if (region.swapchain == reinterpret_cast<std::uint64_t>(swapchain)) {
@@ -3347,9 +3350,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
         }
     }
     if(quad_to_invalidate&&quad_to_invalidate->d3d11&&quad_to_invalidate->d3d11->mapping)quad_to_invalidate->d3d11->mapping->reset();
-    if(fg_to_invalidate) {
-        fg_to_invalidate->invalidate_temporal();
-        if(fg_to_invalidate->interop11)fg_to_invalidate->interop11->forget(swapchain);
+    if(fg_to_forget) {
+        // OpenComposite destroys overlay swapchains from the game thread while
+        // its render thread waits in xrWaitFrame (ACC loading into a map).
+        // Stopping the presenter here returned XR_ERROR_SESSION_NOT_RUNNING
+        // to that wait, and OpenComposite aborts on any failed wait.
+        if(const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(fg_to_forget))
+            buffered->forget_swapchain(swapchain);
+        if(fg_to_forget->interop11)fg_to_forget->interop11->forget(swapchain);
     }
     return next == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
@@ -3659,9 +3667,14 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
     return {};
 }
 
+XrResult wait_frame_once(XrSession session,const XrFrameWaitInfo* info,XrFrameState* state,bool retry);
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     const XrSession session, const XrFrameWaitInfo* const info,
     XrFrameState* const state) {
+    return wait_frame_once(session,info,state,true);
+}
+XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const info,
+    XrFrameState* const state,const bool retry) {
     PFN_xrWaitFrame downstream{};
     PFN_xrBeginFrame downstream_begin{};
     PFN_xrEndFrame downstream_end{};
@@ -3741,6 +3754,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
                 }
                 owner.fg_uevr_mode_epoch=next_epoch;
             }
+            if (state && owner.fg_retire_pending) {
+                owner.fg_retire_pending=false;
+                if(owner.fg){
+                    log_startup("DLSS-FG application swapchain destroyed: replacing presenter at xrWaitFrame (keeping FG enabled)\n");
+                    retired=std::move(owner.fg);
+                    owner.fg_requested=false;
+                    owner.fg_state=CheekyFgState::waiting_for_history;
+                    replacing_source_presenter=true;
+                }
+            }
             if (state && fg_requested_now && owner.fg) {
                 // A foveated-SR toggle changes both the capture layout and the
                 // guide history.  An in-place temporal reset stops the threads,
@@ -3802,7 +3825,16 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitFrame(
     }
     retired.reset();
     if (presenter) {presenter->configure(control.configuration);const auto r=presenter->wait_frame(info,state);
-        if(trace_transition())log_startup("FG-TRANSITION xrWaitFrame presenter thread=%lu result=%d\n",GetCurrentThreadId(),int(r));return r;}
+        if(trace_transition())log_startup("FG-TRANSITION xrWaitFrame presenter thread=%lu result=%d\n",GetCurrentThreadId(),int(r));
+        // Another thread retired or reset this presenter while the application
+        // waited in it. That is not a session failure: wait again against the
+        // session's current presenter (or the runtime) instead.
+        const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(presenter);
+        if(r==XR_ERROR_SESSION_NOT_RUNNING&&retry&&buffered&&buffered->interrupted()){
+            log_startup("DLSS-FG xrWaitFrame interrupted by a presenter reset on another thread; waiting again\n");
+            presenter.reset();return wait_frame_once(session,info,state,false);
+        }
+        return r;}
     const bool traced=trace_transition();
     if(traced)log_startup("FG-TRANSITION xrWaitFrame enter native thread=%lu reserved=%u\n",GetCurrentThreadId(),unsigned(native_wait_reserved));
     auto result=downstream ? downstream(session,info,state) : XR_ERROR_FUNCTION_UNSUPPORTED;

@@ -174,6 +174,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     XrFrameState predicted{XR_TYPE_FRAME_STATE};
     XrTime app_display_time{};
     XrResult terminal{XR_SUCCESS},raw_result{XR_SUCCESS};
+    bool stop_in_progress{}; // Protected by mx; set for the whole of stop().
     const XrFrameEndInfo* raw{};bool raw_done{};
     CheekyFgAcquireFn guide_acquire{};CheekyFgReleaseFn guide_release{};
     CheekyFgCaptureTokenFn guide_token{};
@@ -196,6 +197,17 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         changed.notify_all();
     }
 
+    // An application swapchain is being destroyed: drop captures keyed by its
+    // handle so a reused handle never pairs with old images. The presenter
+    // itself is retired at the next xrWaitFrame boundary.
+    void forget_swapchain(XrSwapchain sc) noexcept {
+        std::lock_guard lock(capture_mutex);
+        captured.erase(sc);direct_captures.erase(sc);capture_plans.erase(sc);captured_descs.erase(sc);
+        capture_tokens.erase(sc);capture_frames.erase(sc);capture_times.erase(sc);capture_ready.erase(sc);capture_crop_tokens.erase(sc);
+        std::lock_guard composed(composed11_mutex);composed11.erase(sc);
+    }
+    // True when the workers stopped for a reason other than a runtime failure.
+    bool interrupted() noexcept {std::lock_guard lock(mx);return stopping&&!XR_FAILED(terminal);}
     void set_quad_sources11(const std::array<XrSwapchain,4>& sources) {std::lock_guard lock(capture_mutex);quad_sources11=sources;}
 
     CheekyFgPerformance performance() const noexcept override {
@@ -365,7 +377,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t history_reset_events{};
     void discard_pending() noexcept {for(auto& job:pending)job->clear_guides();pending.clear();}
     void stop() noexcept {
-        {std::lock_guard lock(mx);stopping=true;changed.notify_all();}
+        {std::lock_guard lock(mx);stopping=true;stop_in_progress=true;changed.notify_all();}
         if(presentation_thread.joinable())presentation_thread.join();
         if(generation_thread.joinable())generation_thread.join();
         if(pacing_thread.joinable())pacing_thread.join();
@@ -396,7 +408,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=repeated_presentations=runtime_submissions=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
-        changed.notify_all();
+        stop_in_progress=false;changed.notify_all();
     }
     // Private chains can retire on the application thread after workers stop.
     std::function<void(XrSwapchain)> retire_chain;
@@ -482,6 +494,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw&&!release_gate_active());});
         --app_waiters;
         pacing_wait.add(elapsed_ms(wait_begin));
+        // Interrupted by a retirement or reset on another thread: let the stop
+        // finish so the layer can retry against the current presenter.
+        if(stopping&&!XR_FAILED(terminal))changed.wait(lock,[&]{return !stop_in_progress||XR_FAILED(terminal);});
         if(stopping||XR_FAILED(terminal))return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         --credits;++waited;
         const auto next=frame->next;*frame=predicted;frame->next=next;
