@@ -147,7 +147,7 @@ struct BufferedBackend11 final : FrameBackend {
             if(!history_was_reset){
                 pair.submitted_at=TimingClock::now();
                 success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,pair.generated,
-                    owner.direct11_requested.load());
+                    owner.direct11_requested.load(),owner.direct_shading_mode.load());
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
                     strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}

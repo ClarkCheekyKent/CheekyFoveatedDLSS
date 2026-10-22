@@ -116,6 +116,17 @@ inline void fg_backend11_pixels(){
             for(const auto& at:{std::pair{32u,32u},std::pair{2u,2u},std::pair{20u,40u}})
                 check(pixel(target.Get(),at.first,at.second)==pixel(generated[eye]->texture11.Get(),at.first,at.second),
                     "Direct OpenXR output matches the private-image path");}
+        // Coarse periphery: a half-resolution grid is shaded in its own pass
+        // (blocks or bilinear), full rate shades every pixel; all keep the
+        // previous-frame periphery here.
+        for(unsigned mode=0;mode<3;++mode){
+            auto coarse_guides=[&](const std::array<std::shared_ptr<Backend11::Guides>,2>& base){auto copy=base;
+                for(auto& g:copy){g=std::make_shared<Backend11::Guides>(*g);g->source.meta.peripheral_percent=50;}return copy;};
+            std::array<Image,2> shaded;check(b.generate(a,c,coarse_guides(ga),coarse_guides(gc),views,views,shaded,true,mode),"Coarse periphery generation");
+            check(bool(Backend11::deferred(shaded[0])->periphery)==(mode!=0),"Only coarse modes allocate the grid-sized periphery pass");
+            auto target=texture(format,{0,1,0,1});check(b.draw_into(target.Get(),shaded[0]),"Draw coarse periphery pass");
+            const unsigned ri=format==DXGI_FORMAT_B8G8R8A8_UNORM?2:0,bi=2-ri;const auto edge=pixel(target.Get(),2,2);
+            check(edge[ri]>250&&edge[bi]<3,"Coarse periphery keeps the previous-frame periphery");}
         for(unsigned eye=0;eye<2;++eye){auto* result=generated[eye]->texture11.Get();
             const auto center=pixel(result,32,32),edge=pixel(result,2,2);const unsigned ri=format==DXGI_FORMAT_B8G8R8A8_UNORM?2:0,bi=2-ri;
             check(edge[ri]>250&&edge[bi]<3,"Native D3D11 periphery independently uses previous frame");

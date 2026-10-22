@@ -5,6 +5,7 @@ inline constexpr char interpolation_shader[]=CHEEKY_FG_COMPACT_HLSL R"HLSL(
 Texture2D<float4> Previous:register(t0);Texture2D<float4> Current:register(t1);
 Texture2D<float2> Motion:register(t2);Texture2D<float> Depth:register(t3);Texture2D<float> PreviousDepth:register(t4);
 Texture2D<float4> Center:register(t5);
+Texture2D<float4> CoarsePeriphery:register(t6); // Native D3D11 coarse periphery pass.
 RWTexture2D<float4> Output:register(u0);
 cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
 SamplerState LinearClamp:register(s0);
@@ -102,7 +103,11 @@ float4 regionsAt(uint2 pixel){
   float2 q=Rect.xy+(floor(saturate((uv-Rect.xy)/Rect.zw)*grid)+.5)/grid*Rect.zw;
   c=interpolateAt(q,w,h,MotionAdjust.z);}
  if(fade<1){float2 grid=max(float2(1,1),round(float2(w,h)*Dimensions.w));
-  float2 q=(floor(uv*grid)+.5)/grid;b=peripheralAt(q,w,h);}
+  // JitterCorrection.x: periphery was shaded once per grid cell by
+  // PeripheryPS; .y selects bilinear filtering instead of blocks.
+  [branch]if(JitterCorrection.x>.5)b=JitterCorrection.y>.5?CoarsePeriphery.SampleLevel(LinearClamp,uv,0):
+   CoarsePeriphery.Load(int3(min(uint2(uv*grid),uint2(grid)-1),0));
+  else{float2 q=(floor(uv*grid)+.5)/grid;b=peripheralAt(q,w,h);}}
  float4 result=fade>=1?c:fade<=0?b:lerp(b,c,fade);
  if(GuideOffset.z>.5&&MotionAdjust.w>.5){float2 edge=abs(min(uv-Rect.xy,Rect.xy+Rect.zw-uv))*float2(w,h);
   if(all(uv>=Rect.xy-2/float2(w,h))&&all(uv<=Rect.xy+Rect.zw+2/float2(w,h))&&min(edge.x,edge.y)<2)result=float4(0,.25,1,1);}
@@ -115,6 +120,11 @@ float4 RegionsVS(uint id:SV_VertexID):SV_Position{
  float2 uv=float2((id<<1)&2,id&2);return float4(uv*float2(2,-2)+float2(-1,1),0,1);
 }
 float4 RegionsPS(float4 position:SV_Position):SV_Target{return regionsAt(uint2(position.xy));}
+// One periphery sample per coarse grid cell, at the same positions the
+// per-pixel path quantizes to. The render target is the grid itself.
+float4 PeripheryPS(float4 position:SV_Position):SV_Target{
+ uint w=uint(Dimensions.x),h=uint(Dimensions.y);float2 grid=max(float2(1,1),round(float2(w,h)*Dimensions.w));
+ return peripheralAt((floor(position.xy)+.5)/grid,w,h);}
 [numthreads(8,8,1)] void CenterMain(uint3 id:SV_DispatchThreadID){
  uint w=uint(Dimensions.x),h=uint(Dimensions.y);if(id.x>=w||id.y>=h)return;
  float2 uv=Rect.xy+(float2(id.xy)+.5)/float2(w,h)*Rect.zw;

@@ -58,7 +58,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     std::recursive_mutex* dispatch{}; // Shared with the game's NGX evaluation in stereo and quad modes.
     ComPtr<ID3D11ComputeShader> snapshot;
     ComPtr<ID3D11VertexShader> vertex;
-    ComPtr<ID3D11PixelShader> pixel;
+    ComPtr<ID3D11PixelShader> pixel,periphery_pixel;
     ComPtr<ID3D11RasterizerState> rasterizer;
     ComPtr<ID3D11SamplerState> sampler;
     std::uint64_t session_generation{};
@@ -84,6 +84,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         if(!compile(snapshot_hlsl,"Main","cs_5_0")||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&snapshot)))return false;
         if(!compile(interpolation_shader,"RegionsVS","vs_5_0")||FAILED(dev->CreateVertexShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&vertex)))return false;
         if(!compile(interpolation_shader,"RegionsPS","ps_5_0")||FAILED(dev->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&pixel)))return false;
+        if(!compile(interpolation_shader,"PeripheryPS","ps_5_0")||FAILED(dev->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&periphery_pixel)))return false;
         D3D11_RASTERIZER_DESC rd{};rd.FillMode=D3D11_FILL_SOLID;rd.CullMode=D3D11_CULL_NONE;rd.DepthClipEnable=TRUE;
         if(FAILED(dev->CreateRasterizerState(&rd,&rasterizer)))return false;
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -262,18 +263,30 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         std::shared_ptr<Guides> old_guides,new_guides;
         ComPtr<ID3D11Buffer> constants;
         D3D11_TEXTURE2D_DESC desc{};
+        // Coarse periphery: shaded once per grid cell, then expanded.
+        Image periphery;ComPtr<ID3D11RenderTargetView> periphery_target;
     };
     void record_draw(ID3D11DeviceContext* commands,const DeferredDraw& draw,ID3D11RenderTargetView* target) {
         auto* cb=draw.constants.Get();auto* ss=sampler.Get();
         ID3D11ShaderResourceView* srvs[]{draw.previous->srv11.Get(),draw.current->srv11.Get(),
             draw.new_guides->motion_srv.Get(),draw.new_guides->depth_srv.Get(),draw.old_guides->depth_srv.Get()};
-        const D3D11_VIEWPORT viewport{0,0,float(draw.desc.Width),float(draw.desc.Height),0,1};
-        commands->OMSetRenderTargets(1,&target,nullptr);commands->OMSetDepthStencilState(nullptr,0);
-        commands->OMSetBlendState(nullptr,nullptr,~0u);commands->RSSetState(rasterizer.Get());commands->RSSetViewports(1,&viewport);
+        commands->OMSetDepthStencilState(nullptr,0);
+        commands->OMSetBlendState(nullptr,nullptr,~0u);commands->RSSetState(rasterizer.Get());
         commands->IASetInputLayout(nullptr);commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        commands->VSSetShader(vertex.Get(),nullptr,0);commands->PSSetShader(pixel.Get(),nullptr,0);
-        commands->PSSetConstantBuffers(0,1,&cb);commands->PSSetSamplers(0,1,&ss);commands->PSSetShaderResources(0,5,srvs);commands->Draw(3,0);
-        ID3D11ShaderResourceView* empty[5]{};commands->PSSetShaderResources(0,5,empty);commands->OMSetRenderTargets(0,nullptr,nullptr);
+        commands->VSSetShader(vertex.Get(),nullptr,0);
+        commands->PSSetConstantBuffers(0,1,&cb);commands->PSSetSamplers(0,1,&ss);commands->PSSetShaderResources(0,5,srvs);
+        if(draw.periphery){
+            D3D11_TEXTURE2D_DESC grid{};draw.periphery->texture11->GetDesc(&grid);
+            const D3D11_VIEWPORT coarse{0,0,float(grid.Width),float(grid.Height),0,1};
+            auto* periphery_target=draw.periphery_target.Get();
+            commands->OMSetRenderTargets(1,&periphery_target,nullptr);commands->RSSetViewports(1,&coarse);
+            commands->PSSetShader(periphery_pixel.Get(),nullptr,0);commands->Draw(3,0);
+            auto* coarse_srv=draw.periphery->srv11.Get();
+            commands->OMSetRenderTargets(1,&target,nullptr);commands->PSSetShaderResources(6,1,&coarse_srv);
+        }else commands->OMSetRenderTargets(1,&target,nullptr);
+        const D3D11_VIEWPORT viewport{0,0,float(draw.desc.Width),float(draw.desc.Height),0,1};
+        commands->RSSetViewports(1,&viewport);commands->PSSetShader(pixel.Get(),nullptr,0);commands->Draw(3,0);
+        ID3D11ShaderResourceView* empty[7]{};commands->PSSetShaderResources(0,7,empty);commands->OMSetRenderTargets(0,nullptr,nullptr);
     }
     static const DeferredDraw* deferred(const Image& image) noexcept {
         return image?static_cast<const DeferredDraw*>(image->pending11.get()):nullptr;
@@ -283,7 +296,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     bool generate(const std::array<Image,2>& previous,const std::array<Image,2>& current,
         const std::array<std::shared_ptr<Guides>,2>& old_guides,const std::array<std::shared_ptr<Guides>,2>& new_guides,
         const std::array<XrCompositionLayerProjectionView,2>& previous_views,const std::array<XrCompositionLayerProjectionView,2>& current_views,
-        std::array<Image,2>& out,bool deferred_output=false) {
+        std::array<Image,2>& out,bool deferred_output=false,unsigned periphery_shading=1) {
         // Prepare both eyes first; then issue all commands in one submission.
         std::array<std::shared_ptr<DeferredDraw>,2> draws;std::array<ComPtr<ID3D11RenderTargetView>,2> targets;
         for(unsigned eye=0;eye<2;++eye){
@@ -302,6 +315,18 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             c.rect[0]=std::clamp(center_x-c.rect[2]*.5f,0.f,1-c.rect[2]);c.rect[1]=std::clamp(center_y-c.rect[3]*.5f,0.f,1-c.rect[3]);
             c.offset[0]=g.focus_feather;c.offset[2]=float(g.show_foveation_border);c.motion[2]=float(g.center_method);c.motion[3]=focused?1.f:0.f;
             auto& draw=draws[eye];draw=std::make_shared<DeferredDraw>();
+            // Periphery shading, as the D3D12 "Direct periphery shading" modes:
+            // 0 every pixel at full rate, 1 coarse blocks, 2 coarse grid +
+            // bilinear filtering. Coarse modes shade each grid cell once.
+            const unsigned grid_w=std::max(1u,unsigned(std::lround(d.Width*c.dimensions[3]))),grid_h=std::max(1u,unsigned(std::lround(d.Height*c.dimensions[3])));
+            if(focused&&periphery_shading==0)c.dimensions[3]=1;
+            else if(focused&&(grid_w<d.Width||grid_h<d.Height)){
+                D3D11_TEXTURE2D_DESC p{};p.Width=grid_w;p.Height=grid_h;p.MipLevels=p.ArraySize=1;p.Format=d.Format;p.SampleDesc.Count=1;
+                p.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
+                draw->periphery=image(p,true);
+                if(!draw->periphery||FAILED(device->CreateRenderTargetView(draw->periphery->texture11.Get(),nullptr,&draw->periphery_target)))return false;
+                c.jitter[0]=1.f;c.jitter[1]=periphery_shading==2?1.f:0.f;
+            }
             draw->previous=previous[eye];draw->current=current[eye];draw->old_guides=old_guides[eye];draw->new_guides=new_guides[eye];
             // Render-target output works for every swapchain color format,
             // including BGRA and sRGB, which typed UAVs do not.

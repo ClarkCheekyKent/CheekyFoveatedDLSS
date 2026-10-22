@@ -948,8 +948,11 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.");
         ImGui::Checkbox("Submit repeat frames", &s.submit_repeats);
-        if(native_shader11())
+        if(native_shader11()){
             combo("FG output destination", s.direct_xr_output, "Private image + copy\0Direct OpenXR image (experimental)\0");
+            combo("Periphery shading", s.direct_peripheral_shading, "Full-resolution warp\0Coarse blocks\0Coarse grid + bilinear filtering\0");
+            ImGui::TextWrapped("Coarse modes shade the periphery once per FG periphery-scale cell instead of once per pixel.");
+        }
         if(!native_shader11()){
         ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
         if(!quad){combo("FG guide capture", s.guide_capture_mode, "Raw snapshots\0Prepared FG layouts\0");
