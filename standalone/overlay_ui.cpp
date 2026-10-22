@@ -1177,6 +1177,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 }
                 draw_nr(r.draft,flag(member(r.snapshot,"quad_views"),"active"));
                 if (ImGui::Button("Reset NR history / retry")) command(r, runtime, "reset_nr");
+                ImGui::SameLine();
                 if (ImGui::Button("Reset NR defaults")) command(r, runtime, "defaults_nr");
                 if (ImGui::CollapsingHeader("Performance##nr", ImGuiTreeNodeFlags_DefaultOpen))
                     draw_nr_performance(r.snapshot, r.draft);
