@@ -141,6 +141,16 @@ void test_ui_diagnostics() {
     require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "General") == 0, "General should be the first tab");
     require(bar->Tabs.Size == 7, "Standalone tabs include DLSS-FG");
     require(text.find("no active OpenXR layer") != text.npos, "Missing gaze adapter warning");
+    text = render("Stereo / Gaze", false);
+    require(text.find("Quad view assignment") == text.npos && text.find("Quad assignment mode") == text.npos &&
+        text.find("Quad-view games") != text.npos, "Stereo sessions keep quad preferences collapsed below gaze controls");
+    state.snapshot = R"({"gaze":{"layer":true,"abi":true,"views":4,"alignment":0},"quad_views":{"active":true,"status":"Verified","sources":[]}})";
+    render("Stereo / Gaze"); text = render("Stereo / Gaze");
+    require(text.find("Quad view assignment") != text.npos && text.find("Quad assignment mode") != text.npos &&
+        text.find("Quad-view games") == text.npos && text.find("Reset gaze defaults") == text.npos,
+        "Active quad views replace the stereo gaze page");
+    state.snapshot = R"({"gaze":{"layer":false,"views":2,"alignment":0}})";
+    text = render("Stereo / Gaze");
     require(text.find("manual fallback placement") != text.npos, "Missing stereo fallback warning");
     state.draft.fg.enabled = true;
     state.snapshot = R"({"fg":{"layer_present":false}})";
@@ -162,8 +172,8 @@ void test_ui_diagnostics() {
         "FG diagnostics must use readable groups without dumping raw JSON");
     render_api="D3D11";
     text=render("DLSS-FG");
-    require(text.find("FG uses DX12 transport automatically")!=text.npos && text.find("FG output destination")==text.npos,
-        "DX11 FG explains automatic transport and omits the unavailable direct-XR experiment");
+    require(text.find("Selecting DLSS for either region requires DX12 transport")!=text.npos && text.find("FG output destination")==text.npos,
+        "DX11 FG explains when DX12 transport is required and omits the unavailable direct-XR experiment");
     render_api="D3D12";
     state.draft.fg.enabled = false;
     state.draft.center_mode = FoveationCenterMode::fixed;

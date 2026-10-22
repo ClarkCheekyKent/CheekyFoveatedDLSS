@@ -505,16 +505,22 @@ void draw_calibration_controls(OverlayUiState& r, const OverlayRuntime& runtime)
     if (ImGui::Button("Recalibrate now")) command(r, runtime, "calibration_recalibrate");
 }
 
-bool draw_quad_controls(OverlayUiState& r,const OverlayRuntime& runtime) {
-    const auto quad=member(r.snapshot,"quad_views");const bool active=flag(quad,"active");
-    ImGui::SeparatorText("Quad view assignment");
+void draw_quad_preferences(Settings& s) {
     // Independent of assignment mode: never enable manual mode or labels as a
     // side effect of changing the other control.
-    ImGui::Checkbox("Show view numbers",&r.draft.quad_show_numbers);
+    ImGui::Checkbox("Show view numbers",&s.quad_show_numbers);
     ImGui::TextWrapped("Small numbers repeat across each view, including outside the center inset.");
-    int mode=r.draft.quad_manual_assignment?1:0;
-    if(ImGui::Combo("Quad assignment mode",&mode,"Automatic\0Manual\0"))r.draft.quad_manual_assignment=mode==1;
-    if(!active){ImGui::TextDisabled("Waiting for a running quad-view session.");return false;}
+    int mode=s.quad_manual_assignment?1:0;
+    if(ImGui::Combo("Quad assignment mode",&mode,"Automatic\0Manual\0"))s.quad_manual_assignment=mode==1;
+}
+
+// Quad assignment replaces the stereo page only while four views are active.
+// Stereo and flat sessions keep the preferences in a collapsed group below.
+bool draw_quad_controls(OverlayUiState& r,const OverlayRuntime& runtime) {
+    const auto quad=member(r.snapshot,"quad_views");
+    if(!flag(quad,"active"))return false;
+    ImGui::SeparatorText("Quad view assignment");
+    draw_quad_preferences(r.draft);
     if(flag(quad,"app_composited"))ImGui::TextWrapped("Four DLSS views; the game composites them before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right. Use Manual to change it.");
     diagnostic_line(quad,"Assignment","status");
     const auto sources=member(quad,"sources");
@@ -1081,6 +1087,11 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 ImGui::SeparatorText("Placement");
                 draw_gaze(r.draft);
                 if (ImGui::Button("Reset gaze defaults")) command(r, runtime, "defaults_gaze");
+                if (ImGui::TreeNode("Quad-view games")) {
+                    ImGui::TextWrapped("No quad-view session is running. These preferences apply when a game submits four views.");
+                    draw_quad_preferences(r.draft);
+                    ImGui::TreePop();
+                }
                 }
                 end_tab();
             }
