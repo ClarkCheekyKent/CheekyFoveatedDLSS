@@ -517,6 +517,19 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
         m.focus_x=base_u-.5f;
         m.focus_y=base_v-.5f;
     }
+    if(quad_eye<2&&settings.fg.foveated){
+        // Cheeky does not crop game-composited quad views, so there is no SR
+        // region to follow. Center the FG region in this eye's submitted image:
+        // on OpenXR gaze when selected, otherwise on the stereo-forward point
+        // (asymmetric eye FOVs put it off-center, mirrored between eyes).
+        const auto frame=quad_app_frame();const auto& view=frame.views[quad_eye];
+        const bool gaze=settings.center_mode==FoveationCenterMode::openxr_gaze&&(frame.status_flags&CHEEKY_GAZE_STATUS_GAZE_VALID)!=0;
+        if(gaze||(view.flags&CHEEKY_GAZE_VIEW_FORWARD_VALID)){
+            const float u=gaze?view.center_u:view.forward_u,v=gaze?view.center_v:view.forward_v;
+            const float offset_x=settings.fg.match_sr_region?0.f:settings.fg.x,offset_y=settings.fg.match_sr_region?0.f:settings.fg.y;
+            m.focus_x=std::clamp(u,0.f,1.f)-.5f+offset_x;m.focus_y=std::clamp(v,0.f,1.f)-.5f+offset_y;
+        }
+    }
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.center_method=settings.fg.center_method;
