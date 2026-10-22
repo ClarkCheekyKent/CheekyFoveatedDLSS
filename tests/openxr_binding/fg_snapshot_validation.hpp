@@ -74,9 +74,9 @@ void fg_snapshot_validation(ID3D12Device* device) {
     check(capture.acquire(pair)&&pair.eyes[0].evaluation==1&&pair.eyes[1].evaluation==2,
         "Acquire must select the color's exact token, never substitute the newer pair");
     auto release=[&](CheekyFgPair& p){for(auto& eye:p.eyes){eye.depth->Release();eye.motion->Release();}p.producer_queue->Release();p.lease->Release();};
-    cheeky::fg::BufferedPresenter::Native retained;
-    retained.retain_guides(pair);release(pair);pair=retained.guides;
-    check(retained.guide_lease&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,
+    cheeky::fg::FrameGuides12 retained;
+    retained.retain(pair);release(pair);pair=retained.pair;
+    check(retained.lease&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,
         "Native FG job must retain the exact original stereo guide lease after releasing the bridge response");
     // Read every snapshot after the engine has reused the SAME original guide
     // textures for both eyes and a later frame. No constant-source mock passes.
@@ -116,8 +116,8 @@ void fg_snapshot_validation(ID3D12Device* device) {
         check(capture.token(frame)!=0,"Guide pool must remain usable while one old stereo job is retained");
         wait();capture.retire();wait();
     }
-    read_retained();retained.clear_guides();
-    check(!retained.guide_lease&&!retained.guide_depth[0]&&!retained.guide_motion[1],"Retired native job releases guide leases and resources");
+    read_retained();retained=cheeky::fg::FrameGuides12{};
+    check(!retained.lease&&!retained.depth[0]&&!retained.motion[1],"Retired native job releases guide leases and resources");
     capture.invalidate();check(capture.token()==0,"Configuration/session reset rejects previous-frame guides");
     provenance.invalidate();check(provenance.token(depth.Get())==0,"Session reset clears color provenance");
     // Exercise physical eye identity with different GPU pixels while call order

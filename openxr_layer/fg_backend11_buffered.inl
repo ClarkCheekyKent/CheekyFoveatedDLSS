@@ -63,9 +63,10 @@ inline bool BufferedPresenter::prepare_native11(Native& job,const XrCompositionL
     if(inference_slot){
         std::array<std::shared_ptr<Backend11::Guides>,2> guides;
         if(native11->take_guides(guides)){
-            job.guides11=std::move(guides);job.guides_valid=true;job.guide_state=CheekyFgState::waiting_for_history;
-            job.source_configuration=job.guides11[0]->source.meta.configuration;
-            job.guide_token=job.guides11[0]->source.mapping_revision;
+            auto payload=std::make_shared<FrameGuides11>();payload->eyes=std::move(guides);
+            job.source_configuration=payload->eyes[0]->source.meta.configuration;
+            job.guide_token=payload->eyes[0]->source.mapping_revision;
+            job.guides=std::move(payload);job.policy={};job.guides_valid=true;job.guide_state=CheekyFgState::waiting_for_history;
         }else job.guide_state=CheekyFgState::waiting_for_guides;
     }
     return true;
@@ -127,17 +128,18 @@ struct BufferedBackend11 final : FrameBackend {
         // Native D3D11 shader interpolation. Each guide snapshot keeps
         // its own reset flag; a reset pair only seeds history.
         if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&
-           job->guides_valid&&previous->guides_valid&&previous->guides11[0]&&previous->guides11[1]&&
+           job->guides_valid&&previous->guides_valid&&guides11(*job)&&guides11(*previous)&&
            cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)) {
             bool same_size=true;
             for(unsigned eye=0;eye<2;++eye){D3D11_TEXTURE2D_DESC a{},b{};
                 previous->color[eye]->texture11->GetDesc(&a);job->color[eye]->texture11->GetDesc(&b);
                 same_size&=a.Width==b.Width&&a.Height==b.Height&&a.Format==b.Format;}
-            history_was_reset=job->guides11[0]->source.meta.reset||job->guides11[1]->source.meta.reset||!same_size;
+            const auto& now=guides11(*job)->eyes;const auto& before=guides11(*previous)->eyes;
+            history_was_reset=now[0]->source.meta.reset||now[1]->source.meta.reset||!same_size;
             attempted=true;
             if(!history_was_reset){
                 pair.submitted_at=TimingClock::now();
-                success=owner.native11->generate(previous->color,job->color,previous->guides11,job->guides11,previous->views,job->views,pair.generated);
+                success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,pair.generated);
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
                     strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}

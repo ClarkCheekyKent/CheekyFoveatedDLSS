@@ -1,7 +1,7 @@
 // Graphics entry points used by the layer capture hooks and GPU fixtures.
 // Included inside BufferedPresenter. The pacing loops use FrameBackend instead.
     std::recursive_mutex* dispatch_mutex11() const noexcept override;
-    bool accept_guide_queue(const CheekyFgPair& guides,Native& job,bool hookless) noexcept;
+    bool accept_guide_queue(const CheekyFgPair& guides,FrameGuides12& payload,bool hookless) noexcept;
     bool setup(XrSession s,const XrFns& f,ID3D12Device* dev,ID3D12CommandQueue* q) noexcept override;
     bool setup11(XrSession s,const XrFns& f,ID3D11Device* dev,std::uint64_t generation,std::recursive_mutex* dispatch) noexcept;
     bool capture11(XrSwapchain sc,unsigned index,ID3D11Texture2D* source,unsigned width,unsigned height,unsigned array,DXGI_FORMAT declared) override;

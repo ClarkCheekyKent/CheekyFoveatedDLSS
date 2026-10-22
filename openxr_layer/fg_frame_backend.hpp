@@ -16,6 +16,17 @@ struct TransportImage;
 struct FrameLayers;
 using Image=std::shared_ptr<TransportImage>;
 
+// Scheduling policy carried by a frame. The backend fills it at capture from
+// whatever source supplied the guides; pacing reads only these values.
+struct FramePolicy {
+    std::uint32_t release_point{};  // 0 submission, 1 preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
+    std::uint32_t submit_repeats{1};
+    std::uint32_t queue_priority{1}; // 0 separate NORMAL, 1 separate HIGH, 2 shared game queue.
+};
+// Backend-owned per-frame guide state (textures, leases, GPU dependencies).
+// Pacing only holds and drops it; each backend defines its own subtype.
+struct FrameGuides {virtual ~FrameGuides()=default;};
+
 enum class CaptureOutcome { captured, unavailable, busy };
 struct GenerationOutcome {
     bool success{},attempted{},history_reset{};

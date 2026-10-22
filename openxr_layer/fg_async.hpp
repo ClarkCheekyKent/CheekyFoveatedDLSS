@@ -586,7 +586,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // In hook-free mode only the completed xrEndFrame can claim a pair.
         if(!inference_slot&&hookless_complete)hookless_complete(0);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
-        job->color={};job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
+        job->color={};job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->policy={};job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         if(!projection||!job->layers.prepare(end,projection)||!job->layers.retain_spaces(session,xr.retain_space)){
             if(inference_slot&&hookless_complete)hookless_complete(0);
@@ -644,10 +644,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
              job=pending.back();inflight_id=job->id;
-             inflight_release_point=job->guides_valid?job->guides.release_point:0u;inflight_prepared=false;
+             inflight_release_point=job->guides_valid?job->policy.release_point:0u;inflight_prepared=false;
              if(job->guides_valid){
-                 if(submit_repeat_frames!=(job->guides.submit_repeats!=0)||active_release_point!=job->guides.release_point)cadence_window={};
-                 submit_repeat_frames=job->guides.submit_repeats!=0;active_release_point=job->guides.release_point;
+                 if(submit_repeat_frames!=(job->policy.submit_repeats!=0)||active_release_point!=job->policy.release_point)cadence_window={};
+                 submit_repeat_frames=job->policy.submit_repeats!=0;active_release_point=job->policy.release_point;
              }changed.notify_all();
              skipped+=pending.size()-1;
              for(auto& dropped:pending)if(dropped!=job)dropped->clear_guides();pending.clear();}
@@ -661,7 +661,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 std::lock_guard lock(mx);cadence_window={};gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
             }
             if(job->guides_valid) {
-                const auto point=job->guides.release_point;
+                const auto point=job->policy.release_point;
                 const bool changed_policy=!release_policy_known||last_release_point!=point;
                 if(changed_policy) {
                     backend->reset_statistics(false);logged_samples=0;
@@ -674,10 +674,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         point==4u?"FG native release=4 ms after FG command submission (Lua; CPU timer, no GPU wait)":
                         "FG native release=after submission (Lua; default overlap)");
                 }
-                if(!release_policy_known||last_repeat_policy!=(job->guides.submit_repeats!=0)) {
+                if(!release_policy_known||last_repeat_policy!=(job->policy.submit_repeats!=0)) {
                     backend->reset_statistics(false);logged_samples=0;
                     {std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;}
-                    last_repeat_policy=job->guides.submit_repeats!=0;
+                    last_repeat_policy=job->policy.submit_repeats!=0;
                     if(!changed_policy)backend->reset_statistics(true);
                     if(trace)trace(last_repeat_policy?"FG repeat submissions=ON (independent native clock)":
                         "FG repeat submissions=OFF (fresh content only; independent native clock)");
@@ -844,12 +844,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(inflight_id&&(inflight_id>submitted_native_id||inflight_release_point==2u||inflight_release_point==3u||
             (inflight_release_point==1u&&!inflight_prepared)))return true;
         return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
-            return job->guides_valid&&(job->guides.release_point!=0||job->id>submitted_native_id);
+            return job->guides_valid&&(job->policy.release_point!=0||job->id>submitted_native_id);
         });
     }
     bool generated_submission_pending() const noexcept {
         return awaiting_generated_submission||(inflight_id&&inflight_release_point==3u)||
-            std::any_of(pending.begin(),pending.end(),[](const auto& job){return job->guides_valid&&job->guides.release_point==3u;});
+            std::any_of(pending.begin(),pending.end(),[](const auto& job){return job->guides_valid&&job->policy.release_point==3u;});
     }
     void mark_credit_deferred() noexcept {
         // Hold mx. A missed clock tick is coalesced; measure the actual held duration.

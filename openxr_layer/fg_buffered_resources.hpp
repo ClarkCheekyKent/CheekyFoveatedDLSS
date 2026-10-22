@@ -1,5 +1,5 @@
 #pragma once
-#include "fg_buffered_frames.hpp"
+#include "fg_frame_payloads.hpp"
 #include <atomic>
 
 namespace cheeky::fg {

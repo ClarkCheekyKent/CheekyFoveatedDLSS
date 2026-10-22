@@ -130,25 +130,25 @@ void fg_hookless_crossqueue_validation(ID3D12Device* device) {
     check(presenter.setup(h<XrSession>(31),buffered_probe::Runtime::functions(),device,xr_queue.Get()),
         "Split NGX/OpenXR presenter setup");
     check(presenter.guide_sync_fence.Get()!=nullptr,"Hook-free GPU bridge fence allocated");
-    cheeky::fg::BufferedPresenter::Native job;
+    cheeky::fg::FrameGuides12 job;
     CheekyFgPair guides{};guides.producer_queue=ngx_queue.Get();guides.release_point=3;
     check(!presenter.accept_guide_queue(guides,job,false),"Legacy path rejects distinct queues");
     check(presenter.accept_guide_queue(guides,job,true),"Hook-free mode accepts synchronized distinct queues");
-    check(job.guide_sync_fence&&job.guide_sync_value==1,"Bridge publishes first GPU dependency");
+    check(job.sync_fence&&job.sync_value==1,"Bridge publishes first GPU dependency");
     ComPtr<ID3D12Fence> done;
     check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&done)))&&
-          SUCCEEDED(presenter.generation_queue->Wait(job.guide_sync_fence.Get(),job.guide_sync_value))&&
+          SUCCEEDED(presenter.generation_queue->Wait(job.sync_fence.Get(),job.sync_value))&&
           SUCCEEDED(presenter.generation_queue->Signal(done.Get(),1)),"Worker waits for NGX queue");
     HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     check(event&&SUCCEEDED(done->SetEventOnCompletion(1,event))&&
           WaitForSingleObject(event,10000)==WAIT_OBJECT_0,"Split-queue GPU wait completes");
     CloseHandle(event);
-    job.clear_guides();
-    check(presenter.accept_guide_queue(guides,job,true)&&job.guide_sync_value==2,
+    job=cheeky::fg::FrameGuides12{};
+    check(presenter.accept_guide_queue(guides,job,true)&&job.sync_value==2,
         "Guide GPU bridge advances serial on second native frame");
     for(unsigned point : {0u,1u,2u,3u,4u}) {
         guides.release_point=point;
-        check(presenter.accept_guide_queue(guides,job,true)&&job.guide_sync_value==3+point,
+        check(presenter.accept_guide_queue(guides,job,true)&&job.sync_value==3+point,
             "Hook-free queue synchronization is independent of CPU release policy");
         check(!presenter.accept_guide_queue(guides,job,false),"Legacy mode keeps its same-queue contract");
     }
@@ -485,7 +485,7 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
     }
     {
         P held;held.started=true;held.credits=2;held.pacing_active=true;held.ticks=2;
-        auto job=std::make_shared<P::Native>();job->id=5;job->guides_valid=true;job->guides.release_point=2;
+        auto job=std::make_shared<P::Native>();job->id=5;job->guides_valid=true;job->policy.release_point=2;
         held.pending.push_back(job);held.wake_producer();
         check(held.release_gate_active()&&held.credits==2&&held.credit_deferred,
             "Completion policy must block pre-existing credits before worker pickup");

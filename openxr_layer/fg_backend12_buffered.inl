@@ -1,7 +1,7 @@
 // D3D12 capture, interpolation and publication behind the shared pacing core.
 #include "../src/d3d12_native.hpp"
 namespace cheeky::fg {
-inline bool BufferedPresenter::accept_guide_queue(const CheekyFgPair& guides,Native& job,bool hookless) noexcept {
+inline bool BufferedPresenter::accept_guide_queue(const CheekyFgPair& guides,FrameGuides12& payload,bool hookless) noexcept {
     if(cheeky::foveated_dlss::same_d3d12_queue(guides.producer_queue,queue.Get()))return true;
     // Legacy modes intentionally retain their established same-queue contract.
     if(!hookless||!guide_sync_fence||!device||!queue)return false;
@@ -17,8 +17,8 @@ inline bool BufferedPresenter::accept_guide_queue(const CheekyFgPair& guides,Nat
     const auto value=guide_sync_serial+1;
     if(FAILED(actual->Signal(guide_sync_fence.Get(),value)))return false;
     guide_sync_serial=value;
-    job.guide_sync_fence=guide_sync_fence;
-    job.guide_sync_value=value;
+    payload.sync_fence=guide_sync_fence;
+    payload.sync_value=value;
     if(!guide_sync_reported&&trace){
         trace("DLSS-FG hook-free guide queue differs from OpenXR queue: validated same-device cross-queue GPU fence enabled");
         guide_sync_reported=true;
@@ -459,7 +459,8 @@ struct BufferedBackend12 final : FrameBackend {
                 // native guide queue. Explicit Signal/Wait orders the
                 // guide writes before FG reads; same-device alone is NOT
                 // sufficient. Other release modes still require one queue.
-                job->guides_valid=owner.accept_guide_queue(guides,*job,expected_frame==0);
+                auto payload=std::make_shared<FrameGuides12>();
+                job->guides_valid=owner.accept_guide_queue(guides,*payload,expected_frame==0);
                 if(!job->guides_valid)job->guide_state=CheekyFgState::queue_mismatch;
                 if(!cheeky_fg_pair_matches_color(guides,expected_token,expected_frame)){
                     job->guides_valid=false;job->guide_state=CheekyFgState::guide_frame_mismatch;
@@ -499,7 +500,7 @@ struct BufferedBackend12 final : FrameBackend {
                     // converting another full guide set at handoff.
                     // Worker preparation now crops/normalizes once using
                     // the original offsets, scales and jitter correction.
-                    job->retain_guides(guides);job->guide_token=expected_token;
+                    payload->retain(guides);job->guides=std::move(payload);job->policy=FrameGuides12::policy_of(guides);job->guide_token=expected_token;
                     job->source_configuration=guides.eyes[0].configuration;job->render_frame=expected_frame;
                 }
                 if(!external)release(&guides);
@@ -526,7 +527,8 @@ struct BufferedBackend12 final : FrameBackend {
         bool& reset_history,std::uint64_t& logged_samples,
         std::shared_ptr<BufferedDirectRequest>& direct_job) override {
         GenerationOutcome outcome;auto& success=outcome.success;auto& attempted=outcome.attempted;auto& history_was_reset=outcome.history_reset;
-        if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&
+        const auto* job_guides=guides12(*job);
+        if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&job_guides&&
            cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)&&
            previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
            previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height) {
@@ -538,7 +540,7 @@ struct BufferedBackend12 final : FrameBackend {
             // only on the single generation worker after the previous fence
             // has retired; recreating NGX handles prevents cross-queue history
             // hazards and makes the A/B measurements independent.
-            const unsigned requested_priority=job->guides.fg_queue_priority<=2u?job->guides.fg_queue_priority:1u;
+            const unsigned requested_priority=job->policy.queue_priority<=2u?job->policy.queue_priority:1u;
             ID3D12CommandQueue* requested=requested_priority==2u?owner.queue.Get():requested_priority==0u?owner.fg_normal_queue.Get():owner.fg_high_queue.Get();
             ID3D12CommandQueue* selected=requested ? requested : (owner.fg_high_queue.Get()?owner.fg_high_queue.Get():owner.fg_normal_queue.Get()?owner.fg_normal_queue.Get():owner.queue.Get());
             if(selected!=owner.generation_queue.Get()) {
@@ -567,19 +569,19 @@ struct BufferedBackend12 final : FrameBackend {
             }
             auto d=job->color[0]->texture->GetDesc();owner.worker.trace=owner.trace;owner.worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
             const auto& color_layout=job->color[0]->layout;
-            if(owner.worker.initialize(owner.device.Get(),owner.generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format,cheeky_fg_needs_ngx(job->guides))) {
+            if(owner.worker.initialize(owner.device.Get(),owner.generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format,cheeky_fg_needs_ngx(job_guides->pair))) {
                 for(unsigned eye=0;eye<2;++eye){owner.worker.color_layouts[eye]=job->color[eye]->layout;owner.worker.previous_layouts[eye]=previous->color[eye]->layout;}
                 // The OpenXR capture has its own producer.fence, but it
                 // does not cover guide writes on a DIFFERENT game queue.
                 // Bridge that dependency before DLSS-G prepares the guides.
-                const auto guides_ready=job->guide_sync_value ?
-                    owner.generation_queue->Wait(job->guide_sync_fence.Get(),job->guide_sync_value) : S_OK;
+                const auto guides_ready=job_guides->sync_value ?
+                    owner.generation_queue->Wait(job_guides->sync_fence.Get(),job_guides->sync_value) : S_OK;
                 if(FAILED(guides_ready)){owner.worker.failed=true;owner.worker.report("FG guide cross-queue GPU wait",unsigned(guides_ready));
                     throw std::runtime_error("FG guide cross-queue GPU wait failed");}
                 const auto ready_result=owner.worker.latency.enqueue_wait(owner.device.Get(),owner.generation_queue.Get(),owner.producer.fence.Get(),job->ready,job->latency_diagnostics);
                 if(FAILED(ready_result)){owner.worker.failed=true;owner.worker.report("FG capture dependency queue wait",unsigned(ready_result));}
                 if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");
-                auto guides=job->guides;guides.producer_queue=owner.generation_queue.Get();
+                auto guides=job_guides->pair;guides.producer_queue=owner.generation_queue.Get();
                 const bool token_gap=previous->guide_token+2!=job->guide_token;
                 if(token_gap)reset_history=true;
                 // Hook-free mode 3 deliberately has no native-frame ID.
