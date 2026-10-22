@@ -236,6 +236,19 @@ void test_ui_diagnostics() {
         text.find("Recalibrate now") == text.npos, "Diagnostics must not contain calibration controls");
     require(text.find("Ready, {mapped}") != text.npos, "Quoted diagnostic braces parsed as structure");
     require(text.find("18446744073709551614") != text.npos, "Calibration view identity lost integer precision");
+    const auto activity_snapshot = state.snapshot;
+    state.snapshot = R"({"gaze":{"views":4,"registered_views":4,"receiving_views":2,"evaluated_views":2,"never_evaluated_views":2},
+        "view_details_total":2,"view_details":[
+            {"id":"18446744073709551614","generation":1,"activity":"Never evaluated","evaluation_calls":0,"last_evaluation_age_ms":null,"api":"Unknown","eye":"Unassigned","mapping":"Unassigned","region":"Unknown"},
+            {"id":"42","generation":2,"activity":"Receiving calls","evaluation_calls":14922,"last_evaluation_age_ms":8,"api":"DX11","eye":"Left","mapping":"Calibrated","region":"Unknown","input_width":1756,"input_height":1648,"output_width":3024,"output_height":2836}]})";
+    render("Diagnostics"); text = render("Diagnostics");
+    require(text.find("Registered handles: 4") != text.npos && text.find("Receiving calls (last 2 seconds): 2") != text.npos &&
+        text.find("Never evaluated: 2") != text.npos && text.find("Active stereo views") == text.npos,
+        "Registered handles must be distinguished from evaluated views");
+    require(text.find("18446744073709551614") != text.npos && text.find("Evaluation calls: 14922") != text.npos &&
+        text.find("Input: 1756 x 1648 | Output: 3024 x 2836") != text.npos && text.find("Focus/periphery: Unknown") != text.npos,
+        "Per-view activity must retain IDs, actual work, dimensions and unknown regions");
+    state.snapshot = activity_snapshot;
     // Cover slower/equal modes and incomplete baselines without inventing a
     // percentage or confusing percentage FPS gain with frame-time savings.
     for (const auto& sample : {std::pair{

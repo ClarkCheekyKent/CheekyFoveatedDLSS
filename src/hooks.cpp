@@ -26,6 +26,7 @@
 #include "peripheral_dlaa.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "quad_view_bridge.hpp"
 #include "fg_capture.hpp"
 #include "fg_sr_region.hpp"
 
@@ -33,6 +34,7 @@
 #include <winver.h>
 #include <Psapi.h>
 #include <MinHook.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -2469,6 +2471,8 @@ DebugExposure current_streamline_debug_exposure(const void* frame, const void* c
         evaluation.viewport.value
     ) + 1U;
     register_stereo_view(streamline_view_id);
+    note_stereo_view_evaluation(streamline_view_id, 12, render_width,
+        render_height, output_width, output_height);
     auto streamline_settings = settings_for_view(
         current_settings(),
         streamline_view_id
@@ -3599,7 +3603,9 @@ std::uint32_t hook_sl_evaluate_feature(
 
 void note_evaluation_begin(
     const DiagnosticApi api,
-    const NgxParameters* const parameters
+    const NgxParameters* const parameters,
+    const NgxHandle* const handle,
+    const NgxOutputExtent output = {}
 ) noexcept {
     auto input_width = get_ui(
         parameters,
@@ -3618,6 +3624,10 @@ void note_evaluation_begin(
         get_ui(parameters, "OutWidth"),
         get_ui(parameters, "OutHeight")
     );
+    note_stereo_view_evaluation(reinterpret_cast<std::uintptr_t>(handle),
+        api == DiagnosticApi::d3d11 ? 11U : 12U, input_width, input_height,
+        get_ui(parameters, "OutWidth") ? get_ui(parameters, "OutWidth") : output.width,
+        get_ui(parameters, "OutHeight") ? get_ui(parameters, "OutHeight") : output.height);
 }
 
 [[nodiscard]] bool is_dlss_feature(const std::uint32_t feature) noexcept {
@@ -4013,6 +4023,26 @@ void prepare_d3d11_direct_peripheral(const D3D11RuntimeCallbacks& runtime,
     ));
 }
 
+bool evaluate_d3d11_quad_periphery(const D3D11RuntimeCallbacks& runtime,
+    ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* parameters,const Settings& settings) noexcept {
+    D3D11PeripheralDlaaResult peripheral{};
+    prepare_d3d11_direct_peripheral(runtime,context,handle,parameters,settings,
+        runtime.evaluate.load(std::memory_order_acquire),peripheral);
+    const bool composed=compose_d3d11_peripheral_view(context,handle,parameters,peripheral);
+    release_d3d11_peripheral_dlaa_result(peripheral);
+    if(composed){
+        diagnostic_note_state(DiagnosticApi::d3d11,DiagnosticState::active);
+        diagnostic_note_d3d11_execution_path(D3D11ExecutionPath::dx11_direct);
+        diagnostic_note_d3d11_transport_status(D3D11TransportStatus::not_attempted);
+        diagnostic_note_result(DiagnosticApi::d3d11,1U);
+    }else{
+        static std::atomic<unsigned> failures{};
+        const auto n=++failures;if(n<=8||(n%300)==0)trace_event("Quad peripheral full-view DLAA rejected handle=%p; retaining game full-view DLSS preset=%u scale=%.3f",
+            handle,settings.peripheral_dlaa_preset,settings.peripheral_dlaa_scale);
+    }
+    return composed;
+}
+
 // Bound creation diagnostics per route and feature: first eight, then powers of two.
 // These report observed calls, not proof that a created feature was evaluated.
 template<class Fn, class Context>
@@ -4104,7 +4134,6 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
 ) {
     const auto original = runtime.evaluate.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
-    note_evaluation_begin(DiagnosticApi::d3d11, parameters);
     if (!is_d3d11_private_handle(handle)) {
         if (!adopt_d3d11_game_feature(handle, parameters,
                 runtime.create.load(std::memory_order_acquire),
@@ -4116,7 +4145,8 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
             reinterpret_cast<std::uintptr_t>(handle)
         ));
     }
-    const auto settings = current_settings();
+    note_evaluation_begin(DiagnosticApi::d3d11, parameters, handle, d3d11_game_output_extent(handle));
+    const auto settings = settings_for_view(current_settings(),reinterpret_cast<uintptr_t>(handle));
 
     if (!settings.enabled && !settings.fg.enabled &&
         !(settings.nr_enabled && settings.d3d11_use_d3d12_transport)) {
@@ -4135,6 +4165,14 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
         return result;
     }
 
+    if(settings.quad_view_region==1){
+        if(evaluate_d3d11_quad_periphery(runtime,context,handle,parameters,settings))return 1U;
+        NgxPresetOverrideScope preset{parameters,settings.peripheral_dlaa_preset};
+        const auto result=original(context,handle,parameters,callback);
+        diagnostic_note_state(DiagnosticApi::d3d11,DiagnosticState::prepare_rejected);
+        diagnostic_note_d3d11_execution_path(D3D11ExecutionPath::game_fallback);
+        diagnostic_note_result(DiagnosticApi::d3d11,result);return result;
+    }
     NgxResult transport_result{};
     if (!settings.d3d11_use_d3d12_transport && !settings.fg.enabled) {
         diagnostic_note_d3d11_transport_status(
@@ -4187,7 +4225,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
     release_d3d11_peripheral_dlaa_result(peripheral);
     const auto* const private_handle = d3d11_private_handle(evaluation);
     if (evaluation == nullptr || private_handle == nullptr) {
-        center_preset.restore();
+        if(!settings.quad_view_mode)center_preset.restore();
         diagnostic_note_state(
             DiagnosticApi::d3d11,
             DiagnosticState::prepare_rejected
@@ -4227,6 +4265,7 @@ NgxResult evaluate_d3d11_impl(const D3D11RuntimeCallbacks& runtime,
         D3D11DlssTimingScope timing{
             context, D3D11DlssTimingKind::native
         };
+        NgxPresetOverrideScope fallback_preset{settings.quad_view_mode?parameters:nullptr,settings.center_preset};
         result = original(context, handle, parameters, callback);
     } else {
         diagnostic_note_d3d11_execution_path(
@@ -4247,7 +4286,6 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
 ) {
     const auto original = runtime.evaluate_c.load(std::memory_order_acquire);
     if (original == nullptr) return 0xBAD00007U;
-    note_evaluation_begin(DiagnosticApi::d3d11, parameters);
     if (!is_d3d11_private_handle(handle)) {
         if (!adopt_d3d11_game_feature(handle, parameters,
                 runtime.create.load(std::memory_order_acquire),
@@ -4259,7 +4297,8 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
             reinterpret_cast<std::uintptr_t>(handle)
         ));
     }
-    const auto settings = current_settings();
+    note_evaluation_begin(DiagnosticApi::d3d11, parameters, handle, d3d11_game_output_extent(handle));
+    const auto settings = settings_for_view(current_settings(),reinterpret_cast<uintptr_t>(handle));
 
     if (!settings.enabled && !settings.fg.enabled &&
         !(settings.nr_enabled && settings.d3d11_use_d3d12_transport)) {
@@ -4278,6 +4317,14 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
         return result;
     }
 
+    if(settings.quad_view_region==1){
+        if(evaluate_d3d11_quad_periphery(runtime,context,handle,parameters,settings))return 1U;
+        NgxPresetOverrideScope preset{parameters,settings.peripheral_dlaa_preset};
+        const auto result=original(context,handle,parameters,callback);
+        diagnostic_note_state(DiagnosticApi::d3d11,DiagnosticState::prepare_rejected);
+        diagnostic_note_d3d11_execution_path(D3D11ExecutionPath::game_fallback);
+        diagnostic_note_result(DiagnosticApi::d3d11,result);return result;
+    }
     NgxResult transport_result{};
     if (!settings.d3d11_use_d3d12_transport && !settings.fg.enabled) {
         diagnostic_note_d3d11_transport_status(
@@ -4330,7 +4377,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
     release_d3d11_peripheral_dlaa_result(peripheral);
     const auto* const private_handle = d3d11_private_handle(evaluation);
     if (evaluation == nullptr || private_handle == nullptr) {
-        center_preset.restore();
+        if(!settings.quad_view_mode)center_preset.restore();
         diagnostic_note_state(
             DiagnosticApi::d3d11,
             DiagnosticState::prepare_rejected
@@ -4366,6 +4413,7 @@ NgxResult evaluate_d3d11_c_impl(const D3D11RuntimeCallbacks& runtime,
         D3D11DlssTimingScope timing{
             context, D3D11DlssTimingKind::native
         };
+        NgxPresetOverrideScope fallback_preset{settings.quad_view_mode?parameters:nullptr,settings.center_preset};
         result = original(context, handle, parameters, callback);
     } else {
         diagnostic_note_d3d11_execution_path(
@@ -4413,15 +4461,19 @@ NgxResult evaluate_with_eye_calibration(ID3D11DeviceContext* context, const NgxH
     const auto result = invoke();
     // All temporary NGX parameters and private composites have been restored
     // before this point. Tag only the outer game evaluation's final output.
-    if (depth.outer && eye_calibration_enabled() && ngx_succeeded(result) && parameters && !is_d3d11_private_handle(handle)) {
+    if (depth.outer && ngx_succeeded(result) && parameters && !is_d3d11_private_handle(handle)) {
         ID3D11Resource *output{}, *color{}, *z{}, *motion{};
         if (ngx_succeeded(parameters->Get("Output", &output)) && output &&
             ngx_succeeded(parameters->Get("Color", &color)) && color &&
             ngx_succeeded(parameters->Get("Depth", &z)) && z &&
             ngx_succeeded(parameters->Get("MotionVectors", &motion)) && motion) {
-            eye_calibration_stamp(context, output, reinterpret_cast<std::uint64_t>(handle),
-                get_ui(parameters, "DLSS.Output.Subrect.Base.X"), get_ui(parameters, "DLSS.Output.Subrect.Base.Y"),
-                get_ui(parameters, "OutWidth"), get_ui(parameters, "OutHeight"));
+            const auto settings=current_settings();quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers);
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;output->QueryInterface(IID_PPV_ARGS(&texture));
+            CheekyQuadSourceD3D11V1 source{};source.version=CHEEKY_QUAD_VIEWS_VERSION;source.size=sizeof(source);
+            source.dlss_view=reinterpret_cast<std::uint64_t>(handle);source.registration_generation=stereo_view_generation(source.dlss_view);
+            source.context=context;source.texture=texture.Get();source.x=get_ui(parameters,"DLSS.Output.Subrect.Base.X");source.y=get_ui(parameters,"DLSS.Output.Subrect.Base.Y");
+            source.width=get_ui(parameters,"OutWidth");source.height=get_ui(parameters,"OutHeight");
+            if(!quad_view_observe11(source)&&eye_calibration_enabled())eye_calibration_stamp(context, output, source.dlss_view,source.x,source.y,source.width,source.height);
         }
     }
     return result;
@@ -5048,7 +5100,7 @@ NgxResult process_d3d12_evaluation_impl(
         remember_d3d12_game_view(call.handle, inside_rr_runtime ? 13U : 1U);
     }
     diagnostic_note_reconstruction_feature(DiagnosticApi::d3d12, d3d12_game_feature(call.handle));
-    note_evaluation_begin(DiagnosticApi::d3d12, call.parameters);
+    note_evaluation_begin(DiagnosticApi::d3d12, call.parameters, call.handle, d3d12_game_output_extent(call.handle));
     diagnostic_note_d3d12_ngx_route(call.route);
     static std::atomic<std::uint32_t> route_logs{};
     const auto route_log = route_logs.fetch_add(1U, std::memory_order_relaxed);
@@ -5239,7 +5291,7 @@ NgxResult evaluate_d3d12_c_impl(
         remember_d3d12_game_view(handle, inside_rr_runtime ? 13U : 1U);
     }
     diagnostic_note_reconstruction_feature(DiagnosticApi::d3d12, d3d12_game_feature(handle));
-    note_evaluation_begin(DiagnosticApi::d3d12, parameters);
+    note_evaluation_begin(DiagnosticApi::d3d12, parameters, handle, d3d12_game_output_extent(handle));
     diagnostic_note_d3d12_ngx_route(D3D12NgxRoute::public_runtime);
     if (inside_streamline_evaluation) {
         NrResetOverride nr_reset{parameters};

@@ -20,6 +20,7 @@
 #include "projection_selection.hpp"
 #include "fg_async.hpp"
 #include "fg_restart_policy.hpp"
+#include "quad_capture.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
 #include "menu_geometry.hpp"
 #include "../src/realvr_runtime.hpp"
@@ -36,6 +37,7 @@
 #include <cwchar>
 #include <cmath>
 #include <mutex>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -69,6 +71,11 @@ struct Dispatch {
     PFN_xrGetInstanceProperties get_instance_properties{};
     PFN_xrGetSystem get_system{};
     PFN_xrGetSystemProperties get_system_properties{};
+    PFN_xrEnumerateViewConfigurations enumerate_view_configurations{};
+    PFN_xrEnumerateViewConfigurationViews enumerate_view_configuration_views{};
+    PFN_xrGetViewConfigurationProperties get_view_configuration_properties{};
+    PFN_xrEnumerateEnvironmentBlendModes enumerate_environment_blend_modes{};
+    PFN_xrGetVisibilityMaskKHR get_visibility_mask{};
     PFN_xrCreateSession create_session{};
     PFN_xrDestroySession destroy_session{};
     PFN_xrPollEvent poll_event{};
@@ -92,6 +99,7 @@ struct Dispatch {
     PFN_xrCreateReferenceSpace create_reference_space{};
     PFN_xrDestroySpace destroy_space{};
     PFN_xrLocateSpace locate_space{};
+    PFN_xrLocateSpaces locate_spaces{};
     PFN_xrLocateViews locate_views{};
     PFN_xrCreateSwapchain create_swapchain{};
     PFN_xrEnumerateSwapchainFormats enumerate_swapchain_formats{};
@@ -118,6 +126,12 @@ void populate_dispatch(
     CHEEKY_LOAD(get_instance_properties, GetInstanceProperties);
     CHEEKY_LOAD(get_system, GetSystem);
     CHEEKY_LOAD(get_system_properties, GetSystemProperties);
+    CHEEKY_LOAD(locate_spaces, LocateSpaces);
+    CHEEKY_LOAD(enumerate_view_configurations, EnumerateViewConfigurations);
+    CHEEKY_LOAD(enumerate_view_configuration_views, EnumerateViewConfigurationViews);
+    CHEEKY_LOAD(get_view_configuration_properties, GetViewConfigurationProperties);
+    CHEEKY_LOAD(enumerate_environment_blend_modes, EnumerateEnvironmentBlendModes);
+    CHEEKY_LOAD(get_visibility_mask, GetVisibilityMaskKHR);
     CHEEKY_LOAD(create_session, CreateSession);
     CHEEKY_LOAD(destroy_session, DestroySession);
     CHEEKY_LOAD(poll_event, PollEvent);
@@ -266,6 +280,10 @@ struct SessionState {
     XrTime simulation_start{};
     unsigned simulation_pattern{};
     bool unsupported_view_configuration{};
+    std::shared_ptr<cheeky::quad_capture::Compositor> quad_capture;
+    std::uint64_t quad_capture_locates{}, quad_capture_frames{};
+    bool quad_capture_correct_focus_fov{};
+    std::map<XrTime,std::array<XrFovf,4>> quad_capture_fovs;
     bool ambiguous_resource{};
     XrTime predicted_display_time{};
     XrTime sample_time{};
@@ -301,6 +319,9 @@ struct SwapchainState {
 };
 
 struct InstanceState {
+    bool quad_capture_enabled{};
+    bool quad_capture_prefer_quad{};
+    bool msfs_version_bridge{};
     XrInstance instance{XR_NULL_HANDLE};
     Dispatch dispatch{};
     std::string runtime_name;
@@ -1905,6 +1926,8 @@ XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
 
 namespace {
 
+#include "quad_capture.inl"
+
 [[nodiscard]] bool is_intercepted_name(
     const char* const name,
     PFN_xrVoidFunction& function
@@ -1919,6 +1942,11 @@ namespace {
     CHEEKY_INTERCEPT("xrDestroyInstance", cheeky_xrDestroyInstance)
     CHEEKY_INTERCEPT("xrGetSystem", cheeky_xrGetSystem)
     CHEEKY_INTERCEPT("xrGetSystemProperties", cheeky_xrGetSystemProperties)
+    CHEEKY_INTERCEPT("xrEnumerateViewConfigurations", cheeky_xrEnumerateViewConfigurations)
+    CHEEKY_INTERCEPT("xrEnumerateViewConfigurationViews", cheeky_xrEnumerateViewConfigurationViews)
+    CHEEKY_INTERCEPT("xrGetViewConfigurationProperties", cheeky_xrGetViewConfigurationProperties)
+    CHEEKY_INTERCEPT("xrEnumerateEnvironmentBlendModes", cheeky_xrEnumerateEnvironmentBlendModes)
+    CHEEKY_INTERCEPT("xrGetVisibilityMaskKHR", cheeky_xrGetVisibilityMaskKHR)
     CHEEKY_INTERCEPT("xrCreateSession", cheeky_xrCreateSession)
     CHEEKY_INTERCEPT("xrDestroySession", cheeky_xrDestroySession)
     CHEEKY_INTERCEPT("xrCreateReferenceSpace", cheeky_xrCreateReferenceSpace)
@@ -1941,6 +1969,7 @@ namespace {
     CHEEKY_INTERCEPT("xrGetActionStateFloat", cheeky_xrGetActionStateFloat)
     CHEEKY_INTERCEPT("xrGetActionStateVector2f", cheeky_xrGetActionStateVector2f)
     CHEEKY_INTERCEPT("xrLocateViews", cheeky_xrLocateViews)
+    CHEEKY_INTERCEPT("xrLocateSpaces", cheeky_xrLocateSpaces)
     CHEEKY_INTERCEPT("xrCreateSwapchain", cheeky_xrCreateSwapchain)
     CHEEKY_INTERCEPT("xrDestroySwapchain", cheeky_xrDestroySwapchain)
     CHEEKY_INTERCEPT(
@@ -1969,17 +1998,26 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetInstanceProcAddr(
 ) {
     if (function == nullptr) return XR_ERROR_VALIDATION_FAILURE;
     *function = nullptr;
-    if (is_intercepted_name(name, *function)) return XR_SUCCESS;
+    const bool capability_query=name&&(!std::strcmp(name,"xrEnumerateInstanceExtensionProperties")||
+        !std::strcmp(name,"xrEnumerateViewConfigurations")||!std::strcmp(name,"xrEnumerateViewConfigurationViews")||
+        !std::strcmp(name,"xrGetViewConfigurationProperties")||!std::strcmp(name,"xrEnumerateEnvironmentBlendModes")||!std::strcmp(name,"xrBeginSession"));
+    if (is_intercepted_name(name, *function)) {
+        if(capability_query)log_startup("QUAD-CAPTURE proc_resolve instance=%p name=%s route=layer result=0\n",instance,name);
+        return XR_SUCCESS;
+    }
 
     std::lock_guard lock(state_mutex);
     const auto iterator = instances.find(instance);
     if (iterator == instances.end() ||
         iterator->second.dispatch.get_instance_proc_addr == nullptr) {
+        if(capability_query)log_startup("QUAD-CAPTURE proc_resolve instance=%p name=%s route=none result=%d\n",instance,name,int(XR_ERROR_HANDLE_INVALID));
         return XR_ERROR_HANDLE_INVALID;
     }
-    return iterator->second.dispatch.get_instance_proc_addr(
+    const auto result=iterator->second.dispatch.get_instance_proc_addr(
         instance, name, function
     );
+    if(capability_query)log_startup("QUAD-CAPTURE proc_resolve instance=%p name=%s route=downstream result=%d\n",instance,name,int(result));
+    return result;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
@@ -2000,6 +2038,15 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
     }
 
     const auto next_gipa = layer_info->nextInfo->nextGetInstanceProcAddr;
+    const bool msfs_capture_host=msfs_quad_version_bridge_host();
+    const bool prefer_quad_host=msfs_capture_host||dcs_quad_capture_host();
+    bool quad_requested = info->applicationInfo.apiVersion >= XR_MAKE_VERSION(1,1,0);
+    for (uint32_t i=0;i<info->enabledExtensionCount;++i) {
+        log_startup("QUAD-CAPTURE requested extension=%s\n",info->enabledExtensionNames[i]);
+        quad_requested |= std::strcmp(info->enabledExtensionNames[i],XR_VARJO_QUAD_VIEWS_EXTENSION_NAME)==0;
+    }
+    log_startup("QUAD-CAPTURE provider=fixed-d3d11-d3d12 enabled=%u api=%llu prefer_quad=%u\n",unsigned(quad_requested),
+        static_cast<unsigned long long>(info->applicationInfo.apiVersion),unsigned(quad_requested&&prefer_quad_host));
     const auto next_create = layer_info->nextInfo->nextCreateApiLayerInstance;
     bool already_enabled{};
     for (std::uint32_t index{}; index < info->enabledExtensionCount; ++index) {
@@ -2052,6 +2099,11 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
         (cylinder_availability == ExtensionAvailability::unknown ? cylinder_bit : 0);
     XrResult result = XR_ERROR_EXTENSION_NOT_PRESENT;
     unsigned attempt{};
+    const bool allow_msfs_version_bridge=msfs_capture_host&&
+        XR_VERSION_MAJOR(info->applicationInfo.apiVersion)==1&&XR_VERSION_MINOR(info->applicationInfo.apiVersion)==1;
+    bool msfs_version_bridge{};
+    XrVersion downstream_api=info->applicationInfo.apiVersion;
+    std::vector<const char*> promoted_extensions;
     for (int selection = unknown; selection >= 0; --selection) {
         if ((selection & ~unknown) != 0) continue;
         inject_extension = !already_enabled && (gaze_availability == ExtensionAvailability::present ||
@@ -2062,10 +2114,15 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
         if (info->enabledExtensionCount != 0U) {
             extensions.assign(info->enabledExtensionNames, info->enabledExtensionNames + info->enabledExtensionCount);
         }
+        // This layer implements fixed quad views over the runtime's stereo
+        // configuration. Its extension must not be requested of that runtime.
+        std::erase_if(extensions,[](const char* name){return std::strcmp(name,XR_VARJO_QUAD_VIEWS_EXTENSION_NAME)==0;});
         if (inject_extension) extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
         if (inject_cylinder) extensions.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
         if(inject_time)extensions.push_back(XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
+        extensions.insert(extensions.end(),promoted_extensions.begin(),promoted_extensions.end());
         XrInstanceCreateInfo forwarded_info = *info;
+        forwarded_info.applicationInfo.apiVersion = downstream_api;
         forwarded_info.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
         forwarded_info.enabledExtensionNames = extensions.empty() ? nullptr : extensions.data();
         XrApiLayerCreateInfo next_layer_info = *layer_info;
@@ -2076,6 +2133,26 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
             attempt == 1 ? "initial" : "extension_not_present");
         result = next_create(&forwarded_info, &next_layer_info, instance);
         log_startup("instance_create attempt=%u result=%d\n", attempt, result);
+        if(result==XR_ERROR_API_VERSION_UNSUPPORTED&&allow_msfs_version_bridge&&!msfs_version_bridge){
+            msfs_version_bridge=true;
+            downstream_api=XR_MAKE_VERSION(1,0,XR_VERSION_PATCH(info->applicationInfo.apiVersion));
+            // Enable available equivalents of promoted functionality without
+            // changing any extensions explicitly requested by the application.
+            for(const char* promoted:{XR_EXT_LOCAL_FLOOR_EXTENSION_NAME,XR_EXT_PALM_POSE_EXTENSION_NAME}){
+                const bool requested=std::any_of(extensions.begin(),extensions.end(),[promoted](const char* name){return std::strcmp(name,promoted)==0;});
+                if(!requested&&extension_availability(next_gipa,promoted)==ExtensionAvailability::present){
+                    extensions.push_back(promoted);promoted_extensions.push_back(promoted);
+                }
+            }
+            forwarded_info.applicationInfo.apiVersion=downstream_api;
+            forwarded_info.enabledExtensionCount=static_cast<uint32_t>(extensions.size());
+            forwarded_info.enabledExtensionNames=extensions.empty()?nullptr:extensions.data();
+            ++attempt;
+            log_startup("QUAD-CAPTURE version_bridge app_api=1.1.%u downstream_api=1.0.%u quad_provider=enabled reason=runtime_api_version_unsupported\n",
+                XR_VERSION_PATCH(info->applicationInfo.apiVersion),XR_VERSION_PATCH(downstream_api));
+            result=next_create(&forwarded_info,&next_layer_info,instance);
+            log_startup("instance_create attempt=%u result=%d version_bridge=1\n",attempt,result);
+        }
         if (result != XR_ERROR_EXTENSION_NOT_PRESENT) break;
     }
     log_startup("instance_create end result=%d gaze_enabled=%u cylinder_enabled=%u\n", result,
@@ -2085,6 +2162,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
 
     InstanceState state{};
     state.instance = *instance;
+    state.quad_capture_enabled = quad_requested;
+    state.quad_capture_prefer_quad = quad_requested&&prefer_quad_host;
+    state.msfs_version_bridge = msfs_version_bridge;
     state.il2_input_compatibility = il2_host();
     if (state.il2_input_compatibility) {
         log_startup("input_compatibility host=IL2Series.exe policy=guarded_independent_input; host actions reserve attachment, host sync disables fallback\n");
@@ -2491,15 +2571,43 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
 ) {
     PFN_xrBeginSession next{};
     std::shared_ptr<cheeky::fg::Presenter> retired_fg;
+    std::shared_ptr<cheeky::quad_capture::Compositor> quad;
+    XrSessionBeginInfo forwarded{};
+    log_startup("QUAD-CAPTURE begin_request session=%p app_configuration=%d\n",session,info?int(info->primaryViewConfigurationType):-1);
+    const auto rejected=[&](XrResult result){log_startup("QUAD-CAPTURE begin_rejected session=%p app_configuration=%d result=%d stage=provider_preflight\n",
+        session,info?int(info->primaryViewConfigurationType):-1,int(result));return result;};
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.begin_session;
+        if(info && cheeky::quad_capture::is_quad(info->primaryViewConfigurationType)) {
+            auto& owner=sessions.at(session);
+            if(!instance->quad_capture_enabled)return rejected(XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+            if(owner.graphics_api!=12&&owner.graphics_api!=11)return rejected(XR_ERROR_GRAPHICS_DEVICE_INVALID);
+            quad=std::make_shared<cheeky::quad_capture::Compositor>();
+            quad->session=session;
+            if(owner.graphics_api==11)quad->device11=static_cast<ID3D11Device*>(owner.graphics_device);
+            else {quad->device=static_cast<ID3D12Device*>(owner.graphics_device);quad->queue=static_cast<ID3D12CommandQueue*>(owner.graphics_queue);}
+            const auto& d=instance->dispatch;
+            quad->create=d.create_swapchain;quad->destroy=d.destroy_swapchain;quad->enumerate_images=d.enumerate_swapchain_images;
+            quad->acquire=d.acquire_swapchain_image;quad->wait=d.wait_swapchain_image;quad->release=d.release_swapchain_image;
+            for(auto& view:quad->recommended)view.type=XR_TYPE_VIEW_CONFIGURATION_VIEW;
+            uint32_t count{};
+            if(!d.enumerate_view_configuration_views)return rejected(XR_ERROR_FUNCTION_UNSUPPORTED);
+            const auto result=d.enumerate_view_configuration_views(instance->instance,owner.system_id,
+                XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,2,&count,quad->recommended.data());
+            if(XR_FAILED(result))return rejected(result);
+            if(count!=2)return rejected(XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+            forwarded=*info;forwarded.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        }
     }
+    if(quad&&!quad->initialize())return rejected(XR_ERROR_RUNTIME_FAILURE);
     const auto result = next == nullptr
         ? XR_ERROR_FUNCTION_UNSUPPORTED
-        : next(session, info);
+        : next(session, quad ? &forwarded : info);
+    log_startup("QUAD-CAPTURE begin session=%p app_configuration=%d runtime_configuration=%d result=%d\n",session,
+        info?int(info->primaryViewConfigurationType):-1,quad?int(forwarded.primaryViewConfigurationType):info?int(info->primaryViewConfigurationType):-1,int(result));
     if (XR_SUCCEEDED(result) && info != nullptr) {
         std::lock_guard lock(state_mutex);
         const auto iterator = sessions.find(session);
@@ -2513,6 +2621,12 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
             iterator->second.last_fallback_sync_time = 0;
             iterator->second.view_configuration =
                 info->primaryViewConfigurationType;
+            iterator->second.quad_capture = std::move(quad);
+            iterator->second.quad_capture_locates = iterator->second.quad_capture_frames = 0;
+            iterator->second.quad_capture_correct_focus_fov = bool(iterator->second.quad_capture)&&dcs_quad_capture_host();
+            iterator->second.quad_capture_fovs.clear();
+            if(iterator->second.quad_capture)log_startup("QUAD-CAPTURE compositor graphics_api=%u focus_fov_correction=%u; quad FG policy unavailable\n",
+                iterator->second.graphics_api,unsigned(iterator->second.quad_capture_correct_focus_fov));
             iterator->second.unsupported_view_configuration =
                 info->primaryViewConfigurationType !=
                 XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -2543,6 +2657,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndSession(
         session_state.native_waits_pending=0;
         session_state.native_frame_begun=false;
         session_state.running = false;
+        session_state.quad_capture_fovs.clear();
         session_state.action_active = false;
         session_state.gaze_valid = false;
         publish_snapshot_locked(&session_state);
@@ -2900,6 +3015,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
     PFN_xrLocateViews next{};
     PFN_xrGetActionStatePose get_pose{};
     PFN_xrLocateSpace locate_space{};
+    bool emulating_quad{};
     XrAction gaze_action{XR_NULL_HANDLE};
     XrSpace gaze_space{XR_NULL_HANDLE};
     XrSpace calibration_local_space{XR_NULL_HANDLE};
@@ -2913,6 +3029,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
         locate_space = instance->dispatch.locate_space;
         gaze_action = instance->gaze_action;
         auto& session_state = sessions.at(session);
+        emulating_quad = session_state.quad_capture && locate_info && cheeky::quad_capture::is_quad(locate_info->viewConfigurationType);
         if (locate_info && locate_info->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
             poll_independent_gaze_locked(*instance, session_state, locate_info->displayTime);
         gaze_space = session_state.gaze_space;
@@ -2922,6 +3039,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
             session_state.input.sync_result == XR_SUCCESS;
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (emulating_quad)return quad_capture_locate(session,locate_info,view_state,capacity,count,views,next);
     const auto result = next(
         session, locate_info, view_state, capacity, count, views
     );
@@ -3128,14 +3246,23 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSwapchain(
     XrSwapchain* const swapchain
 ) {
     PFN_xrCreateSwapchain next{};
+    bool quad{};
     {
         std::lock_guard lock(state_mutex);
         auto* instance = find_instance_for_session_locked(session);
         if (instance == nullptr) return XR_ERROR_HANDLE_INVALID;
         next = instance->dispatch.create_swapchain;
+        const auto& owner=sessions.at(session);
+        // Applications can create their color swapchains before BeginSession.
+        // DCS must receive sampleable images on that normal startup path too.
+        quad = bool(owner.quad_capture)||(instance->quad_capture_enabled&&instance->quad_capture_prefer_quad&&
+            (owner.graphics_api==11||owner.graphics_api==12));
     }
     if (next == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
-    const auto result = next(session, create_info, swapchain);
+    XrSwapchainCreateInfo forwarded{};
+    if(quad&&create_info){forwarded=*create_info;
+        if(forwarded.usageFlags&XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)forwarded.usageFlags|=XR_SWAPCHAIN_USAGE_SAMPLED_BIT;}
+    const auto result = next(session, quad&&create_info?&forwarded:create_info, swapchain);
     if (XR_SUCCEEDED(result) && create_info != nullptr && swapchain != nullptr) {
         std::lock_guard lock(state_mutex);
         SwapchainState state{};
@@ -3158,6 +3285,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
     PFN_xrDestroySwapchain next{};
     XrSession session{XR_NULL_HANDLE};
     std::shared_ptr<cheeky::fg::Presenter> fg_to_invalidate;
+    std::shared_ptr<cheeky::quad_capture::Compositor> quad_to_invalidate;
     {
         std::lock_guard lock(state_mutex);
         const auto swapchain_it = swapchains.find(swapchain);
@@ -3169,6 +3297,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
         const auto session_it = sessions.find(session);
         if (session_it != sessions.end()) {
             fg_to_invalidate=std::move(session_it->second.fg);
+            quad_to_invalidate=session_it->second.quad_capture;
             session_it->second.fg_requested=false;
             session_it->second.fg_state=CheekyFgState::waiting_for_history;
             auto& calibration = session_it->second.calibration;
@@ -3188,6 +3317,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySwapchain(
             publish_snapshot_locked(&session_it->second);
         }
     }
+    if(quad_to_invalidate&&quad_to_invalidate->d3d11&&quad_to_invalidate->d3d11->mapping)quad_to_invalidate->d3d11->mapping->reset();
     if(fg_to_invalidate) {
         fg_to_invalidate->invalidate_temporal();
         if(fg_to_invalidate->interop11)fg_to_invalidate->interop11->forget(swapchain);
@@ -3740,6 +3870,29 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     const XrSession session,
     const XrFrameEndInfo* const frame_end_info
 ) {
+    std::shared_ptr<cheeky::quad_capture::Compositor> quad;
+    Dispatch quad_dispatch{};
+    {
+        std::lock_guard lock(state_mutex);
+        const auto found=sessions.find(session);
+        if(found!=sessions.end()){
+            quad=found->second.quad_capture;
+            quad_dispatch=instances.at(found->second.instance).dispatch;
+            if(!quad && ++found->second.quad_capture_frames<=8 && frame_end_info && frame_end_info->layers){
+                for(unsigned i=0;i<frame_end_info->layerCount;++i){
+                    const auto* layer=frame_end_info->layers[i];
+                    if(layer&&layer->type==XR_TYPE_COMPOSITION_LAYER_PROJECTION)
+                        log_startup("QUAD-CAPTURE native submit configuration=%d layer=%u input_views=%u\n",int(found->second.view_configuration),i,
+                            reinterpret_cast<const XrCompositionLayerProjection*>(layer)->viewCount);
+                }
+            }
+        }
+    }
+    if(quad){
+        const auto result=quad_capture_end(session,frame_end_info,quad_dispatch,quad);
+        if(XR_SUCCEEDED(result)){std::lock_guard lock(state_mutex);auto found=sessions.find(session);if(found!=sessions.end())found->second.native_frame_begun=false;}
+        return result;
+    }
     PFN_xrEndFrame next{};
     std::shared_ptr<cheeky::fg::Presenter> presenter;
     cheeky::fg::AppFrameCallTimer app_timer{presenter,1};

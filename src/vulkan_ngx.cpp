@@ -62,6 +62,10 @@ template<unsigned I> NgxResult evaluate(VkCommandBuffer cmd,const NgxHandle* han
             // Creation-time dimensions can be absent from per-frame parameter maps.
             for(const auto& pair:{std::pair{"Width",feature.width},{"Height",feature.height},{"OutWidth",feature.out_width},{"OutHeight",feature.out_height}})
                 if(!get_ui(p,pair.first))parameters.Set(pair.first,pair.second);
+            note_stereo_view_evaluation(reinterpret_cast<std::uintptr_t>(handle), 1,
+                get_ui(&parameters,"DLSS.Render.Subrect.Dimensions.Width") ? get_ui(&parameters,"DLSS.Render.Subrect.Dimensions.Width") : get_ui(&parameters,"Width"),
+                get_ui(&parameters,"DLSS.Render.Subrect.Dimensions.Height") ? get_ui(&parameters,"DLSS.Render.Subrect.Dimensions.Height") : get_ui(&parameters,"Height"),
+                get_ui(&parameters,"OutWidth"),get_ui(&parameters,"OutHeight"));
             unsigned value{};
             if(!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",value))parameters.Set("DLSS.Feature.Create.Flags",feature.flags);
             if(!try_get_ngx_integer_bits(p,"PerfQualityValue",value))parameters.Set("PerfQualityValue",feature.quality);

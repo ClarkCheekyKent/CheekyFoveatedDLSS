@@ -75,7 +75,7 @@ std::string_view setting_group(std::string_view key) {
     if (key.starts_with("Nr")) return "nr";
     for (const auto gaze : {"XOffset", "HeightOffset", "InvertStereoXOffset", "CenterMode",
             "AutoStereoAlignment", "EyeCalibrationContinuous", "EyeCalibrationMethod", "EyeCalibrationLearnedMethod", "EyeCalibrationLearnedSignature", "EyeCalibrationLearnedSessions", "AlignedHeightOffset", "ShowNextJumpTarget", "SimulationPattern",
-            "ManualStereoMapping", "ManualStereoRightFirst", "IndependentOpenXRGaze",
+            "ManualStereoMapping", "ManualStereoRightFirst", "ManualQuadViewAssignment", "ShowQuadViewNumbers", "IndependentOpenXRGaze",
             "GazeSmoothingMs", "GazeHoldMs", "GazeQuantizationPixels", "GazeJumpResetRatio",
             "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin"})
         if (key == gaze) return "gaze";
@@ -129,6 +129,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     candidate.d3d12_lower_hook = true; // Older files use the new lower-hook default.
     candidate.manual_stereo_mapping = false;
     candidate.manual_stereo_right_first = false;
+    candidate.quad_manual_assignment=false;candidate.quad_show_numbers=false;
     candidate.independent_openxr_gaze = false;
     candidate.fix_motion_blur = false; // Compatibility copies are always opt-in.
     // Older files predate this additive key and use After, even when loaded

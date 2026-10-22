@@ -1,4 +1,5 @@
 #include "settings.hpp"
+#include "quad_view_bridge.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +47,7 @@ std::atomic<bool> alignment_border_enabled{false};
 std::atomic<std::uint32_t> center_mode{};
 std::atomic<bool> manual_stereo_mapping{false};
 std::atomic<bool> manual_stereo_right_first{false};
+std::atomic<bool> quad_manual_assignment{false},quad_show_numbers{false};
 std::atomic<bool> independent_openxr_gaze{false};
 
 std::atomic<std::uint32_t> simulation_pattern{};
@@ -92,6 +94,11 @@ struct StereoView {
     bool has_geometry{};
     std::uint64_t generation{};
     std::uint64_t first_evaluation{};
+    std::uint64_t evaluation_calls{};
+    std::uint64_t last_evaluation_ms{};
+    unsigned graphics_api{};
+    std::uint32_t evaluation_input_width{}, evaluation_input_height{};
+    std::uint32_t evaluation_output_width{}, evaluation_output_height{};
 };
 
 std::mutex stereo_views_mutex;
@@ -196,6 +203,7 @@ Settings configured_settings() noexcept {
     settings.simulation_pattern = simulation_pattern.load(std::memory_order_acquire);
     settings.manual_stereo_mapping = manual_stereo_mapping.load(std::memory_order_acquire);
     settings.manual_stereo_right_first = manual_stereo_right_first.load(std::memory_order_acquire);
+    settings.quad_manual_assignment=quad_manual_assignment.load();settings.quad_show_numbers=quad_show_numbers.load();
     settings.independent_openxr_gaze = independent_openxr_gaze.load(std::memory_order_acquire);
     settings.gaze_smoothing_ms = load_float(gaze_smoothing_ms_bits);
     settings.gaze_hold_ms = load_float(gaze_hold_ms_bits);
@@ -246,7 +254,7 @@ Settings current_settings() noexcept {
 }
 
 void update_settings(const Settings& settings) noexcept {
-    std::lock_guard lock(settings_mutex);
+    std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
     fg_settings.direct_peripheral_shading=std::min(fg_settings.direct_peripheral_shading,2u);
     const auto bounded = [](float value, float lo, float hi, float fallback) {
@@ -334,6 +342,7 @@ void update_settings(const Settings& settings) noexcept {
     );
     manual_stereo_mapping.store(settings.manual_stereo_mapping, std::memory_order_release);
     manual_stereo_right_first.store(settings.manual_stereo_right_first, std::memory_order_release);
+    quad_manual_assignment.store(settings.quad_manual_assignment);quad_show_numbers.store(settings.quad_show_numbers);
     independent_openxr_gaze.store(settings.independent_openxr_gaze, std::memory_order_release);
     show_next_jump_target.store(settings.show_next_jump_target, std::memory_order_release);
     simulation_pattern.store(std::min(settings.simulation_pattern, 5U), std::memory_order_release);
@@ -421,6 +430,7 @@ void update_settings(const Settings& settings) noexcept {
         nr_motion_scale_y_bits,
         std::clamp(settings.nr_motion_scale_y_multiplier, -4.0F, 4.0F)
     );
+    lock.unlock();quad_view_configure(settings.quad_manual_assignment,settings.quad_show_numbers);
 }
 
 void set_processing_allowed(bool allowed) noexcept {
@@ -452,6 +462,7 @@ void register_stereo_view(const std::uint64_t view_id) noexcept {
 
 void unregister_stereo_view(const std::uint64_t view_id) noexcept {
     if (view_id == 0U) return;
+    quad_view_forget(view_id,stereo_view_generation(view_id));
     std::lock_guard lock(stereo_views_mutex);
     if (view_id == calibration.left || view_id == calibration.right) { calibration = {}; ++stereo_mapping_revision; }
     for (auto iterator = stereo_views.begin();
@@ -466,6 +477,7 @@ void unregister_stereo_view(const std::uint64_t view_id) noexcept {
 }
 
 bool has_multiple_stereo_views() noexcept {
+    const auto quad=quad_view_snapshot();if(quad.active)return quad.status==2;
     std::lock_guard lock(stereo_views_mutex);
     if (calibration_live()) return calibration.left != calibration.right;
     return eye_roles[0].view_id != 0U && eye_roles[1].view_id != 0U;
@@ -474,7 +486,16 @@ bool has_multiple_stereo_views() noexcept {
 StereoEyeAssignment stereo_eye_assignment(
     const std::uint64_t view_id
 ) noexcept {
+    const auto quad=quad_view_snapshot();
     std::lock_guard lock(stereo_views_mutex);
+    if(quad.active){StereoEyeAssignment result;result.mapping_revision=quad.revision;
+        for(const auto& view:stereo_views)if(view.view_id==view_id){
+            if(const auto* role=quad_view_assignment(quad,view_id,view.generation)){
+                result.assigned=true;result.eye_index=role->eye_index;result.quad_assigned=true;
+                result.quad_manual=quad.manual_mode!=0;result.quad_view_index=role->view_index;
+                result.calibration_session=quad.session_generation;}
+            break;}
+        return result;}
     const auto corrected = calibrated_assignment(view_id);
     if (corrected.assigned) return corrected;
     StereoEyeAssignment fallback;fallback.mapping_revision=stereo_mapping_revision;
@@ -568,7 +589,9 @@ void clear_stereo_calibration() noexcept {
 }
 
 std::vector<StereoViewDetail> stereo_view_details() {
+    const auto quad=quad_view_snapshot();
     std::lock_guard lock(stereo_views_mutex);
+    const auto now = GetTickCount64();
     std::vector<StereoViewDetail> details;
     details.reserve(stereo_views.size());
     for (const auto& view : stereo_views) {
@@ -584,9 +607,38 @@ std::vector<StereoViewDetail> stereo_view_details() {
             view.output_height,
             view.crop,
             view.has_geometry,
+            view.generation,
+            view.evaluation_calls,
+            view.evaluation_calls ? now - view.last_evaluation_ms : 0,
+            view.evaluation_calls && now - view.last_evaluation_ms <= 2000,
+            view.graphics_api,
+            corrected.calibrated,
+            view.evaluation_input_width, view.evaluation_input_height,
+            view.evaluation_output_width, view.evaluation_output_height,
         });
+        if(quad.active){auto& detail=details.back();const auto* role=quad_view_assignment(quad,view.view_id,view.generation);
+            detail.calibrated=false;detail.has_eye_assignment=role!=nullptr;
+            detail.second_eye=role&&role->eye_index==1;
+            if(role){detail.quad_region=role->focus?2u:1u;detail.quad_view_index=role->view_index;detail.quad_manual=quad.manual_mode!=0;}}
     }
     return details;
+}
+
+void note_stereo_view_evaluation(std::uint64_t view_id, unsigned graphics_api,
+    std::uint32_t input_width, std::uint32_t input_height,
+    std::uint32_t output_width, std::uint32_t output_height) noexcept {
+    std::lock_guard lock(stereo_views_mutex);
+    for (auto& view : stereo_views) {
+        if (view.view_id != view_id) continue;
+        ++view.evaluation_calls;
+        view.last_evaluation_ms = GetTickCount64();
+        view.graphics_api = graphics_api;
+        view.evaluation_input_width = input_width;
+        view.evaluation_input_height = input_height;
+        view.evaluation_output_width = output_width;
+        view.evaluation_output_height = output_height;
+        break;
+    }
 }
 
 void note_stereo_view_geometry(
@@ -615,6 +667,25 @@ Settings settings_for_view(
     const Settings& settings,
     const std::uint64_t view_id
 ) noexcept {
+    const auto quad=quad_view_snapshot();
+    if(quad.active){auto result=settings;result.quad_view_mode=true;result.quad_view_region=0;
+        const auto* role=quad_view_assignment(quad,view_id,stereo_view_generation(view_id));
+        if(role)result.quad_view_region=role->focus?2u:1u;
+        result.width=result.height=1.0F;result.x_offset=result.height_offset=result.aligned_height_offset=0;
+        result.roundness=result.transition_width=0;result.alignment_border_enabled=false;
+        result.auto_stereo_alignment=false;result.center_mode=FoveationCenterMode::fixed;
+        result.next_jump_visible=false;result.eye_independent_coverage=false;
+        result.afw_manual_coverage=result.afw_automatic_coverage=false;result.afw_mask={};result.afw_nr_mask={};
+        result.nr_foveated=result.nr_use_sr_foveation=result.nr_alignment_border_enabled=false;
+        result.nr_enabled=settings.nr_enabled&&role&&role->focus;
+        // The current presenter consumes a stereo pair; quad FG needs a separate implementation.
+        result.fg.enabled=false;
+        if(!role){result.enabled=false;result.peripheral_dlaa_enabled=false;}
+        else if(role->focus){result.peripheral_dlaa_enabled=false;}
+        else {result.enabled=settings.enabled&&settings.peripheral_dlaa_enabled;
+            result.center_preset=settings.peripheral_dlaa_preset;result.rr_center_preset=settings.rr_peripheral_preset;
+            result.center_supersampling=1.0F;result.d3d11_use_d3d12_transport=false;}
+        return result;}
     if (settings.eye_independent_coverage) return settings;
     auto result = settings;
     std::lock_guard lock(stereo_views_mutex);

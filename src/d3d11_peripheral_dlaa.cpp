@@ -6,6 +6,8 @@
 #include "d3d11_write_bindings.hpp"
 
 #include "d3d_shaders.hpp"
+#include <d3dcompiler.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -240,6 +242,11 @@ struct ViewState {
     ID3D11ComputeShader* depth_shader{};
     ID3D11ComputeShader* motion_shader{};
     ID3D11Buffer* constants{};
+    ID3D11DeviceContext* full_context{};
+    ID3D11ComputeShader* full_shader{};
+    ID3D11Buffer* full_constants{};
+    ID3D11UnorderedAccessView* full_output_uav{};
+    ID3D11Resource* full_output_resource{}; // Retained by full_output_uav.
 
     std::array<TimingSlot, timing_slot_count> timing{};
     std::size_t next_timing_slot{};
@@ -355,6 +362,10 @@ void release_state(ViewState& state) noexcept {
         state.private_handle = nullptr;
     }
     for (auto& slot : state.timing) release_timing_slot(slot);
+    release(state.full_output_uav);
+    release(state.full_constants);
+    release(state.full_shader);
+    release(state.full_context);
     release(state.constants);
     release(state.motion_shader);
     release(state.depth_shader);
@@ -1550,6 +1561,60 @@ bool evaluate_d3d11_peripheral_dlaa(
     output.output_srv->AddRef();
     output.working_width = dimensions.width;
     output.working_height = dimensions.height;
+    return true;
+}
+
+bool compose_d3d11_peripheral_view(ID3D11DeviceContext* context,const NgxHandle* handle,
+    const NgxParameters* parameters,const D3D11PeripheralDlaaResult& output) noexcept {
+    using Microsoft::WRL::ComPtr;
+    if(!context||!handle||!parameters||!output.output_srv||context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
+    const auto original=capture_parameters(parameters);
+    if(!original.output||!original.out_width||!original.out_height)return false;
+    ComPtr<ID3D11Texture2D> target;
+    if(FAILED(original.output->QueryInterface(IID_PPV_ARGS(&target))))return false;
+    D3D11_TEXTURE2D_DESC desc{};target->GetDesc(&desc);
+    if(desc.SampleDesc.Count!=1||desc.ArraySize!=1||!(desc.BindFlags&D3D11_BIND_UNORDERED_ACCESS)||
+        uint64_t(original.output_x)+original.out_width>desc.Width||uint64_t(original.output_y)+original.out_height>desc.Height)return false;
+    std::lock_guard<std::recursive_mutex> lock(state_mutex);
+    auto found=std::find_if(states.begin(),states.end(),[&](const auto& s){return s.game_handle==handle&&s.context==context&&s.output_srv==output.output_srv;});
+    if(found==states.end())return false;auto& state=*found;
+    ComPtr<ID3D11Device> device;context->GetDevice(&device);
+    if(!state.full_context&&FAILED(device->CreateDeferredContext(0,&state.full_context)))return false;
+    if(!state.full_shader){
+        constexpr char shader[]=R"(
+Texture2D<float4> Source:register(t0);RWTexture2D<float4> Target:register(u0);
+cbuffer Params:register(b0){uint2 SourceSize;uint2 DestSize;uint2 DestBase;uint2 Pad;};
+float4 Load(int2 p){return Source.Load(int3(clamp(p,int2(0,0),int2(SourceSize)-1),0));}
+[numthreads(16,16,1)]void Main(uint3 id:SV_DispatchThreadID){
+ if(any(id.xy>=DestSize))return;
+ float2 p=(float2(id.xy)+.5)*float2(SourceSize)/float2(DestSize)-.5;int2 b=int2(floor(p));float2 f=frac(p);
+ Target[DestBase+id.xy]=lerp(lerp(Load(b),Load(b+int2(1,0)),f.x),lerp(Load(b+int2(0,1)),Load(b+1),f.x),f.y);
+})";
+        ComPtr<ID3DBlob> code;
+        if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"Main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,nullptr))||
+            FAILED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&state.full_shader)))return false;
+    }
+    if(!state.full_constants){D3D11_BUFFER_DESC buffer{};buffer.ByteWidth=32;buffer.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        if(FAILED(device->CreateBuffer(&buffer,nullptr,&state.full_constants)))return false;}
+    if(state.full_output_resource!=original.output){
+        release(state.full_output_uav);state.full_output_resource=nullptr;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC view{};view.Format=typed_resource_format(desc.Format);view.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
+        if(FAILED(device->CreateUnorderedAccessView(original.output,&view,&state.full_output_uav)))return false;
+        state.full_output_resource=original.output;
+    }
+    const unsigned constants[]{output.working_width,output.working_height,original.out_width,original.out_height,original.output_x,original.output_y,0,0};
+    auto* commands=state.full_context;
+    commands->UpdateSubresource(state.full_constants,0,nullptr,constants,0,0);
+    commands->CSSetShader(state.full_shader,nullptr,0);commands->CSSetConstantBuffers(0,1,&state.full_constants);
+    commands->CSSetShaderResources(0,1,&state.output_srv);commands->CSSetUnorderedAccessViews(0,1,&state.full_output_uav,nullptr);
+    commands->Dispatch((original.out_width+15)/16,(original.out_height+15)/16,1);
+    ID3D11ShaderResourceView* empty_srv{};ID3D11UnorderedAccessView* empty_uav{};
+    commands->CSSetShaderResources(0,1,&empty_srv);commands->CSSetUnorderedAccessViews(0,1,&empty_uav,nullptr);
+    ComPtr<ID3D11CommandList> list;if(FAILED(commands->FinishCommandList(FALSE,&list)))return false;
+    context->ExecuteCommandList(list.Get(),TRUE);
+    const auto rw=original.render_width?original.render_width:original.width,rh=original.render_height?original.render_height:original.height;
+    const CropGeometry full{0,0,rw,rh,original.output_x,original.output_y,original.out_width,original.out_height};
+    note_stereo_view_geometry(reinterpret_cast<uintptr_t>(handle),rw,rh,original.out_width,original.out_height,full);
     return true;
 }
 

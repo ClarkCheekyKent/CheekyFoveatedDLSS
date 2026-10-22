@@ -5,7 +5,10 @@
     "library_path": ".\\CheekyOpenXRLayer.dll",
     "api_version": "1.0",
     "implementation_version": "1",
-    "description": "Cheeky Foveated DLSS OpenXR eye-gaze bridge",
+    "description": "Cheeky Foveated DLSS OpenXR bridge with experimental fixed D3D11/D3D12 quad views",
+    "instance_extensions": [
+      { "name": "XR_VARJO_quad_views", "extension_version": "2" }
+    ],
     "disable_environment": "CHEEKY_OPENXR_LAYER_DISABLE"
   }
 }

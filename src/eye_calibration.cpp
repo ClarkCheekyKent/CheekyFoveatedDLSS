@@ -1,4 +1,5 @@
 #include "eye_calibration.hpp"
+#include "quad_view_bridge.hpp"
 #include "eye_calibration_source.hpp"
 #include "eye_calibration_pixels.hpp"
 #include "eye_calibration_d3d12.hpp"
@@ -1354,12 +1355,13 @@ void eye_calibration_suspend() noexcept {
     enabled = false;
 }
 void eye_calibration_recalibrate() noexcept {
+    if(quad_view_snapshot().active){quad_view_recalibrate();return;}
     auto& s = state();
     std::lock_guard lock(s.mutex);
     if (enabled) restart_calibration(s, "manual_recalibration");
 }
 bool eye_calibration_enabled() noexcept {
-    return enabled.load();
+    return enabled.load()&&!quad_view_snapshot().active;
 }
 EyeCalibrationStats eye_calibration_stats() noexcept {
     auto& s = state();
@@ -1409,6 +1411,7 @@ void eye_calibration_reset_stats() noexcept {
 }
 bool eye_calibration_frame(EyeCalibrationBackend backend, std::uint64_t session_generation,
                            unsigned graphics_api) noexcept {
+    if(quad_view_snapshot().active)return false;
     auto& s = state();
     std::lock_guard lock(s.mutex);
     const auto now = GetTickCount64();
@@ -2127,6 +2130,7 @@ void eye_calibration_stop() noexcept {
 }
 
 const char* eye_calibration_status(const EyeCalibrationStats& stats) noexcept {
+    if(quad_view_snapshot().active)return "Quad views use four-view assignment";
     if (!stats.enabled)
         return "Disabled";
     if (!stats.runtime_active)

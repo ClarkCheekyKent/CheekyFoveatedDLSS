@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{C47D3490-F455-4E86-AF9E-E8D67A2ED723}</ProjectGuid><RootNamespace>CheekyOpenXRCapabilityProbe</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>Application</ConfigurationType><TargetName>FlightSimulator2024</TargetName></PropertyGroup>
+  <Import Project="..\standalone\build.props" />
+  <PropertyGroup><OutDir>$(MSBuildProjectDirectory)\..\bin\$(Configuration)\quad-capability-probe\</OutDir><IntDir>$(MSBuildProjectDirectory)\..\build\msbuild\quad-capability-probe\$(Configuration)\</IntDir></PropertyGroup>
+  <ItemDefinitionGroup><ClCompile><AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\third_party\openxr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile></ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="openxr_capability_probe.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

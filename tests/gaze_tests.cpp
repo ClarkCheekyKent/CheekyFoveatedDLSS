@@ -2809,6 +2809,42 @@ int run_vulkan_tests(bool real=false, bool integration=false);
 int run_d3d11_binding_tests();
 int run_debug_exposure_tests();
 int main(int argc, char** argv) {
+    const auto test_view_activity = [] {
+        using namespace cheeky::foveated_dlss;
+        constexpr std::uint64_t unused = 0xF00001, live = 0xF00002;
+        register_stereo_view(unused); register_stereo_view(live);
+        const auto generation = stereo_view_generation(live);
+        const auto detail = [](std::uint64_t id) {
+            for (const auto& view : stereo_view_details()) if (view.view_id == id) return view;
+            return StereoViewDetail{};
+        };
+        expect(!detail(unused).evaluation_calls && !detail(unused).recently_evaluated,
+            "Registration alone is not live evaluation activity");
+        note_stereo_view_evaluation(live, 11, 1756, 1648, 3024, 2836);
+        register_stereo_view(live);
+        const auto observed = detail(live);
+        expect(observed.evaluation_calls == 1 && observed.recently_evaluated &&
+            observed.graphics_api == 11 && observed.evaluation_input_width == 1756 &&
+            observed.evaluation_output_height == 2836 && !observed.has_geometry && !observed.has_eye_assignment,
+            "Passthrough calls are visible without inventing geometry or eye mapping");
+        expect(observed.render_width == 0, "Activity diagnostics do not change geometry used by eye mapping");
+        note_stereo_view_geometry(live, 1700, 1600, 3000, 2800, {});
+        expect(detail(live).evaluation_calls == 1 && detail(live).evaluations == 1,
+            "Geometry observations do not double-count evaluation calls");
+        Sleep(2050);
+        expect(!detail(live).recently_evaluated && detail(live).last_evaluation_age_ms >= 2000,
+            "Stopped evaluations become idle while retaining their lifetime count");
+        unregister_stereo_view(live);
+        note_stereo_view_evaluation(live, 12, 1, 1, 2, 2);
+        expect(stereo_view_generation(live) == 0, "A late diagnostic call does not resurrect a released handle");
+        register_stereo_view(live);
+        expect(stereo_view_generation(live) != generation && !detail(live).evaluation_calls,
+            "Reused handles start a fresh diagnostic generation");
+        unregister_stereo_view(live); unregister_stereo_view(unused);
+    };
+    if (argc == 2 && std::strcmp(argv[1], "--view-activity") == 0) {
+        test_view_activity(); return failures ? 1 : 0;
+    }
     if (argc == 2 && (std::strcmp(argv[1], "--openxr-independent-on") == 0 ||
         std::strcmp(argv[1], "--openxr-independent-off") == 0)) {
         extern int run_openxr_independent_option_tests(bool);

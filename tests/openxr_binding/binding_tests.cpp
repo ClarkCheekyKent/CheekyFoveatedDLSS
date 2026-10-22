@@ -1062,9 +1062,17 @@ void diagnostic_lifetime_test() {
     std::cout<<"PASS diagnostic space lifecycle forwarding and EndFrame handle probes\n";
 }
 #endif
+#include "quad_capture_validation.hpp"
+#include "quad_version_validation.hpp"
+#include "quad_capture_d3d11_validation.hpp"
+#include "quad_role_mapping_validation.hpp"
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--quad-capture") {quad_capture_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--quad-d3d11") {quad_capture_d3d11_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--quad-roles") {quad_role_mapping_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--quad-version") {quad_version_validation();return 0;}
         frame_space_lifetime_test();
         if(argc>1&&std::string(argv[1])=="--fg-space-lifetime")return 0;
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS

@@ -7,6 +7,7 @@
 #include "gaze_foveation.hpp"
 #include "runtime.hpp"
 #include "settings.hpp"
+#include "quad_view_bridge.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "support_report.hpp"
 #include "eye_calibration.hpp"
@@ -137,7 +138,7 @@ void draw_api_diagnostics(
         }
         const auto views = stereo_view_statistics();
         diagnostic_row(
-            "Views", "Active %u | Peak %u | Seen %u",
+            "DLSS handles", "Registered %u | Peak %u | Seen %u",
             views.active,
             views.peak,
             views.seen
@@ -151,6 +152,7 @@ void draw_api_diagnostics(
     }
 
     if (ImGui::TreeNode("View details")) {
+        ImGui::TextWrapped("Registered DLSS handles are not a count of OpenXR projection views. Evaluation calls do not prove successful GPU frames.");
         const auto views = stereo_view_details();
         const auto assigned_views = static_cast<std::size_t>(std::count_if(
             views.begin(),
@@ -174,14 +176,25 @@ void draw_api_diagnostics(
                 static_cast<unsigned>(index + 1U),
                 static_cast<unsigned long long>(view.view_id),
                 !view.has_eye_assignment
-                    ? "Idle"
-                    : view.second_eye ? "B" : "A",
+                    ? "Unassigned"
+                    : view.second_eye ? "Right" : "Left",
                 effective_x
             );
             ImGui::Text(
-                "Evaluations: %llu",
-                static_cast<unsigned long long>(view.evaluations)
+                "Evaluation calls: %llu | %s",
+                static_cast<unsigned long long>(view.evaluation_calls),
+                view.evaluation_calls ? (view.recently_evaluated ? "Receiving calls (last 2 s)" : "Idle") : "Never evaluated"
             );
+            if (view.evaluation_calls) ImGui::Text("Last call: %llu ms ago | API %s",
+                static_cast<unsigned long long>(view.last_evaluation_age_ms),
+                view.graphics_api == 11 ? "DX11" : view.graphics_api == 12 ? "DX12" : view.graphics_api == 1 ? "Vulkan" : "Unknown");
+            ImGui::Text("Eye mapping: %s | Focus/periphery: %s",
+                view.quad_region ? (view.quad_manual ? "Manual quad assignment" : "Verified quad submission") :
+                view.calibrated ? "Calibrated" : view.has_eye_assignment ? "Unverified assignment" : "Unassigned",
+                view.quad_region == 1 ? "Periphery" : view.quad_region == 2 ? "Center" : "Unknown");
+            ImGui::Text("Latest call input: %u x %u | Output: %u x %u",
+                view.evaluation_input_width, view.evaluation_input_height,
+                view.evaluation_output_width, view.evaluation_output_height);
             if (view.has_geometry) {
                 ImGui::Text(
                     "Input: %u x %u | Crop: %u x %u at %u,%u",
@@ -841,6 +854,8 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "SimulationPattern", settings.simulation_pattern));
     reshade::get_config_value(nullptr, config_section, "ManualStereoMapping", settings.manual_stereo_mapping);
     reshade::get_config_value(nullptr, config_section, "ManualStereoRightFirst", settings.manual_stereo_right_first);
+    reshade::get_config_value(nullptr,config_section,"ManualQuadViewAssignment",settings.quad_manual_assignment);
+    reshade::get_config_value(nullptr,config_section,"ShowQuadViewNumbers",settings.quad_show_numbers);
     reshade::get_config_value(nullptr, config_section, "IndependentOpenXRGaze", settings.independent_openxr_gaze);
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "GazeSmoothingMs",
@@ -1023,6 +1038,8 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "SimulationPattern", settings.simulation_pattern);
     reshade::set_config_value(nullptr, config_section, "ManualStereoMapping", settings.manual_stereo_mapping);
     reshade::set_config_value(nullptr, config_section, "ManualStereoRightFirst", settings.manual_stereo_right_first);
+    reshade::set_config_value(nullptr,config_section,"ManualQuadViewAssignment",settings.quad_manual_assignment);
+    reshade::set_config_value(nullptr,config_section,"ShowQuadViewNumbers",settings.quad_show_numbers);
     reshade::set_config_value(nullptr, config_section, "IndependentOpenXRGaze", settings.independent_openxr_gaze);
     reshade::set_config_value(
         nullptr, config_section, "GazeSmoothingMs",
@@ -1115,6 +1132,7 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
 }
 
 void draw_sr_controls(Settings& settings, bool& changed) {
+    const bool quad=quad_view_snapshot().active!=0;
     static bool size_drafts_initialized{};
     static bool editing_width{};
     static bool editing_height{};
@@ -1157,7 +1175,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
             changed = true;
         }
     };
-    changed |= ImGui::Checkbox("Enable foveated DLSS-SR", &settings.enabled);
+    changed |= ImGui::Checkbox(quad?"Enable quad-view DLSS-SR":"Enable foveated DLSS-SR", &settings.enabled);
     ImGui::SameLine();
     ImGui::TextDisabled("(Alt+Shift+/)");
     preset_combo(rr ? "Center RR preset" : "Center preset", rr ? settings.rr_center_preset : settings.center_preset, true);
@@ -1188,7 +1206,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     ImGui::TextDisabled("Area downsampling; 1.00x is off");
 
     changed |= ImGui::Checkbox(
-        "Peripheral DLAA",
+        quad?"Override peripheral views":"Peripheral DLAA",
         &settings.peripheral_dlaa_enabled
     );
     if (!editing_peripheral_scale) {
@@ -1218,6 +1236,10 @@ void draw_sr_controls(Settings& settings, bool& changed) {
         ImGui::TextDisabled(
             "Downscale periphery even more from original resolution"
         );
+    }
+    if(quad){
+        ImGui::TextWrapped("Assigned center views use the center preset and supersampling over the full view. Peripheral views use the peripheral preset and input scale over the full view; disabling the override keeps the game's peripheral DLSS.");
+        return;
     }
     int center_mode = static_cast<int>(settings.center_mode);
     if (ImGui::Combo(
@@ -1459,6 +1481,7 @@ void draw_sr_controls(Settings& settings, bool& changed) {
 }
 
 void draw_nr_controls(Settings& settings, bool& changed) {
+    const bool quad=quad_view_snapshot().active!=0;
     struct GeometryDrafts {
         bool initialized{};
         bool editing_width{};
@@ -1504,6 +1527,8 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         }
     };
 
+    if(quad)ImGui::TextWrapped("Quad mode applies NR over the full assigned center views only. D3D11 requires DX12 Transport.");
+    if(!quad){
     changed |= ImGui::Checkbox("Foveated DLSS-NR", &settings.nr_foveated);
     if (settings.nr_foveated) {
         ImGui::TextDisabled("Uses the shared gaze/alignment center, even with SR disabled.");
@@ -1552,6 +1577,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         );
     }
 
+    }
     ImGui::SeparatorText("Neural rendering");
     int order = static_cast<int>(settings.nr_processing_order);
     if (ImGui::Combo("Rendering order", &order, "After upscaling\0Before upscaling\0")) {
@@ -1703,6 +1729,22 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
 
     ImGui::Spacing();
     if (ImGui::CollapsingHeader("Stereo / Gaze")) {
+        ImGui::SeparatorText("Quad view assignment");
+        changed|=ImGui::Checkbox("Show view numbers",&settings.quad_show_numbers);
+        int quad_mode=settings.quad_manual_assignment?1:0;
+        if(ImGui::Combo("Quad assignment mode",&quad_mode,"Automatic\0Manual\0")){settings.quad_manual_assignment=quad_mode==1;changed=true;}
+        const auto quad=quad_view_snapshot();
+        if(quad.active){
+            ImGui::TextWrapped("Small numbers repeat across each view. Manual assignments last for this session; recreated views clear them.");
+            for(const auto& source:quad.sources)if(source.dlss_view){const auto label="View "+std::to_string(source.number);int selected=int(source.manual_role);
+                if(!settings.quad_manual_assignment){unsigned role{};
+                    if(quad.status==2)for(const auto& view:quad.views)if(view.dlss_view==source.dlss_view&&view.registration_generation==source.registration_generation)role=view.view_index+1;
+                    ImGui::Text("%s: %s",label.c_str(),quad_role_name(role));continue;}
+                if(ImGui::Combo(label.c_str(),&selected,"Unassigned\0Periphery Left\0Periphery Right\0Center Left\0Center Right\0"))
+                    quad_view_assign(quad.session_generation,source.number,unsigned(selected),source.dlss_view,source.registration_generation);
+            }
+            if(ImGui::Button("Reset quad assignments"))quad_view_recalibrate();
+        }else{
         ImGui::SeparatorText("Stereo Eye Mapping");
         int method = settings.manual_stereo_mapping ? 4 : int(settings.eye_calibration_method);
         if (ImGui::Combo("Mapping method", &method, "Auto\0Standard corners\0Timing tolerant corners\0Full crop search\0Manual\0")) {
@@ -1733,6 +1775,7 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         }
         if (ImGui::Button("Recalibrate now")) eye_calibration_recalibrate();
         ImGui::EndDisabled();
+        }
     }
     if (ImGui::CollapsingHeader("DLSS-SR", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (ImGui::TreeNodeEx(

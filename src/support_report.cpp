@@ -1,4 +1,5 @@
 #include "support_report.hpp"
+#include "quad_view_bridge.hpp"
 #include "support_zip.hpp"
 #include "openxr_startup_log.hpp"
 #include "support_summary.hpp"
@@ -113,6 +114,7 @@ std::string settings_text(const Settings& s) {
     out << "show_next_jump_target=" << s.show_next_jump_target << '\n';
     out << "manual_stereo_mapping=" << s.manual_stereo_mapping << '\n';
     out << "manual_stereo_right_first=" << s.manual_stereo_right_first << '\n';
+    out << "manual_quad_view_assignment="<<s.quad_manual_assignment<<'\n'<<"show_quad_view_numbers="<<s.quad_show_numbers<<'\n';
     out << "independent_openxr_gaze=" << s.independent_openxr_gaze << '\n';
     out << "gaze_smoothing_ms=" << s.gaze_smoothing_ms << '\n';
     out << "gaze_hold_ms=" << s.gaze_hold_ms << '\n';
@@ -206,6 +208,27 @@ std::string diagnostics_text() {
             << c.output_width << ',' << c.output_height << '\n';
     }
     out << "\n[Eye calibration]\n" << eye_calibration_json() << '\n';
+    out << "\n[Quad views]\n"<<quad_view_diagnostics_json()<<'\n';
+    const auto view_details = stereo_view_details();
+    out << "\n[DLSS views]\nregistered_handles=" << view_details.size() << '\n';
+    out << "receiving_calls=" << std::count_if(view_details.begin(), view_details.end(),
+        [](const auto& view) { return view.recently_evaluated; }) << '\n';
+    out << "activity_window_ms=2000\n";
+    for (const auto& view : view_details) {
+        out << "\n[DLSS view " << view.view_id << "]\n"
+            << "generation=" << view.generation << '\n'
+            << "evaluation_calls=" << view.evaluation_calls << '\n'
+            << "activity=" << (view.evaluation_calls ? (view.recently_evaluated ? "Receiving calls" : "Idle") : "Never evaluated") << '\n'
+            << "last_evaluation_age_ms=" << (view.evaluation_calls ? std::to_string(view.last_evaluation_age_ms) : "unavailable") << '\n'
+            << "graphics_api=" << view.graphics_api << '\n'
+            << "eye=" << (view.has_eye_assignment ? (view.second_eye ? "Right" : "Left") : "Unassigned") << '\n'
+            << "mapping=" << (view.quad_region ? (view.quad_manual ? "Manual quad assignment" : "Verified quad submission") :
+                view.calibrated ? "Calibrated" : view.has_eye_assignment ? "Unverified assignment" : "Unassigned") << '\n'
+            << "region=" << (view.quad_region == 1 ? "Periphery" : view.quad_region == 2 ? "Center" : "Unknown")
+            << "\ninput=" << view.evaluation_input_width << 'x' << view.evaluation_input_height
+            << "\noutput=" << view.evaluation_output_width << 'x' << view.evaluation_output_height
+            << "\ngeometry_observations=" << view.evaluations << '\n';
+    }
     const auto g = gaze_diagnostics();
     out << "\n[OpenXR]\n";
     out << "input=" << gaze_input_diagnostics_json(g.input) << '\n';

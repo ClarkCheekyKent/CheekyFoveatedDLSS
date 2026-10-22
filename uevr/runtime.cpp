@@ -14,6 +14,7 @@
 #include "d3d11_peripheral_dlaa.hpp"
 #include "d3d11_d3d12_transport.hpp"
 #include "eye_calibration.hpp"
+#include "quad_view_bridge.hpp"
 #include "gaze_foveation.hpp"
 #include "openvr_gaze.hpp"
 #include "libovr_gaze.hpp"
@@ -111,6 +112,11 @@ std::string snapshot_locked(State& s) {
     const auto observer = native_observer_status();
     const auto gaze = gaze_diagnostics();
     const auto views = stereo_view_statistics();
+    const auto details = stereo_view_details();
+    const auto receiving_views = std::count_if(details.begin(), details.end(),
+        [](const auto& view) { return view.recently_evaluated; });
+    const auto evaluated_views = std::count_if(details.begin(), details.end(),
+        [](const auto& view) { return view.evaluation_calls != 0; });
     const auto nr = dlss_nr_snapshot();
     const auto attach = late_attach_status();
     const auto afw = afw_compatibility_status();
@@ -351,6 +357,11 @@ std::string snapshot_locked(State& s) {
         << ",\"using_gaze\":" << gaze.using_gaze << ",\"alignment\":" << gaze.alignment_source
         << ",\"afw_bilateral\":" << gaze.afw_bilateral << ",\"afw_fresh_sample\":" << gaze.afw_fresh_sample
         << ",\"ambiguous\":" << gaze.mapping_ambiguous << ",\"views\":" << views.active
+        << ",\"registered_views\":" << details.size()
+        << ",\"receiving_views\":" << receiving_views
+        << ",\"evaluated_views\":" << evaluated_views
+        << ",\"never_evaluated_views\":" << details.size() - evaluated_views
+        << ",\"activity_window_ms\":2000"
         << ",\"submitted_copies\":" << gaze.submitted_copies
         << ",\"left_mapped\":" << gaze.views[0].resource_mapped << ",\"right_mapped\":" << gaze.views[1].resource_mapped
         << ",\"runtime\":\"" << json_escape(gaze.runtime_name) << "\",\"age_ms\":" << gaze.sample_age_ms
@@ -426,7 +437,6 @@ std::string snapshot_locked(State& s) {
         << ",\"result\":" << vk.last_result << ",\"input_width\":" << vk.input_width
         << ",\"input_height\":" << vk.input_height << ",\"output_width\":" << vk.output_width
         << ",\"output_height\":" << vk.output_height << "},\"view_details\":[";
-    const auto details = stereo_view_details();
     // Bound the event size even in games that churn many view identities.
     for (std::size_t i = 0; i < (std::min)(details.size(), std::size_t{16}); ++i) {
         const auto& v = details[i];
@@ -434,11 +444,19 @@ std::string snapshot_locked(State& s) {
         out << "{\"id\":\"" << v.view_id << "\",\"eye\":\""
             << (v.has_eye_assignment ? (v.second_eye ? "Right" : "Left") : afw.coverage_enabled ? "Unknown (AFW source eye)" : "Unassigned")
             << "\",\"evaluations\":" << v.evaluations
-            << ",\"input_width\":" << v.render_width << ",\"input_height\":" << v.render_height
-            << ",\"output_width\":" << v.output_width << ",\"output_height\":" << v.output_height
-            << ",\"crop_width\":" << v.crop.output_width << ",\"crop_height\":" << v.crop.output_height << '}';
+            << ",\"generation\":" << v.generation
+            << ",\"evaluation_calls\":" << v.evaluation_calls
+            << ",\"activity\":\"" << (v.evaluation_calls ? (v.recently_evaluated ? "Receiving calls" : "Idle") : "Never evaluated") << '"'
+            << ",\"last_evaluation_age_ms\":" << (v.evaluation_calls ? std::to_string(v.last_evaluation_age_ms) : "null")
+            << ",\"api\":\"" << (v.graphics_api == 11 ? "DX11" : v.graphics_api == 12 ? "DX12" : v.graphics_api == 1 ? "Vulkan" : "Unknown") << '"'
+            << ",\"mapping\":\"" << (v.quad_region ? (v.quad_manual ? "Manual quad assignment" : "Verified quad submission") : v.calibrated ? "Calibrated" : v.has_eye_assignment ? "Unverified eye assignment" : "Unassigned") << '"'
+            << ",\"region\":\"" << (v.quad_region==1?"Periphery":v.quad_region==2?"Center":"Unknown") << "\",\"has_geometry\":" << v.has_geometry
+            << ",\"input_width\":" << v.evaluation_input_width << ",\"input_height\":" << v.evaluation_input_height
+            << ",\"output_width\":" << v.evaluation_output_width << ",\"output_height\":" << v.evaluation_output_height
+            << ",\"crop_width\":" << v.crop.output_width << ",\"crop_height\":" << v.crop.output_height
+            << ",\"crop_x\":" << v.crop.output_base_x << ",\"crop_y\":" << v.crop.output_base_y << '}';
     }
-    out << "],\"view_details_total\":" << details.size() << '}'; return out.str();
+    out << "],\"view_details_total\":" << details.size() << ",\"quad_views\":"<<quad_view_diagnostics_json()<<'}'; return out.str();
 }
 DWORD WINAPI persistence_worker(void*) {
     auto& s = state();
@@ -752,6 +770,15 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
         if (parsed.ec != std::errc{} || parsed.ptr != request.data()+request.size()) return false;
         s.request = id;
         if (action == "get") return true;
+        if(action=="quad_assign"){
+            uint64_t session{},source_id{},generation{};unsigned number{},role{};
+            if(!(in>>session>>number>>role>>source_id>>generation)||!number||number>8||role>4)return false;
+            in>>std::ws;if(!in.eof())return false;
+            const bool ok=quad_view_assign(session,number,role,source_id,generation);
+            s.message=ok?"Quad view assignment updated":"Role already assigned or view changed; refresh and retry";
+            if(ok)++s.revision;return ok;
+        }
+        if(action=="quad_recalibrate"){quad_view_recalibrate();++s.revision;return true;}
         if (action == "mark_vram_baseline") {
             const bool marked=s.memory.mark_baseline(GetTickCount64(),configured_settings().fg.enabled);
             s.message=marked?"Process GPU memory baseline marked":"GPU memory query unavailable; baseline not marked";

@@ -44,6 +44,11 @@ void release_d3d11_peripheral_dlaa_result(
     D3D11PeripheralDlaaResult& result
 ) noexcept;
 
+// Expand a peripheral quad view's reduced DLAA output over its whole game
+// output rectangle. No second center evaluation or fovea blend is performed.
+[[nodiscard]] bool compose_d3d11_peripheral_view(ID3D11DeviceContext*, const NgxHandle*,
+    const NgxParameters*, const D3D11PeripheralDlaaResult&) noexcept;
+
 void release_d3d11_peripheral_dlaa_view(
     const NgxHandle* game_handle
 ) noexcept;

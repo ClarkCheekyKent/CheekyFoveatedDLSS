@@ -30,6 +30,74 @@ independent-input test runs in its own process to exercise the restart latch.
 
 ## Build
 
+### Experimental MSFS 2024 quad-view startup
+
+For `FlightSimulator2024.exe`, an OpenXR 1.1 request rejected with
+`XR_ERROR_API_VERSION_UNSUPPORTED` is retried inside the layer using a 1.0
+downstream instance. The application's original version and the layer's quad
+provider remain active. Native 1.1 runtimes, existing 1.0 applications, other
+executables and requests for future API versions retain their normal behavior.
+The bridge supplies core `xrLocateSpaces` through `xrLocateSpace`, including
+optional velocities, and enables available local-floor/palm-pose extensions.
+This is a targeted capture compatibility path, not general OpenXR 1.1 runtime
+support. Restart MSFS after replacing the layer DLL.
+
+The startup log records `QUAD-CAPTURE version_bridge` and the retry result.
+Successful version negotiation does not force the game to select quad views:
+check the logged offered configurations, selected application configuration and
+submitted view counts separately. `CheekyOpenXRBindingTests --quad-version`
+checks the ordinary-host path; run a copy of that test executable named
+`FlightSimulator2024.exe --quad-version` to exercise the MSFS retry. The
+`--quad-capture` test validates four-view poses and GPU composition on WARP.
+
+For MSFS and DCS capture instances, quad views are listed first as the preferred
+configuration; stereo remains available. Other hosts retain the downstream
+preference order. Negotiation logs include count-only queries, short-buffer and
+downstream failures, view descriptions for both configurations, function
+resolution and the application's session request. The layer does not force a
+stereo session to become a quad session.
+
+Build `tools/openxr-capability-probe.vcxproj` and run the resulting
+`bin/Release/quad-capability-probe/FlightSimulator2024.exe` with the absolute
+path of MSFS's `openxr_loader.dll` as its argument. This is a read-only probe,
+named to exercise the MSFS compatibility path; it does not start the game or
+create a graphics session. It checks global and layer-specific extension
+visibility through the real loader, then queries both view configurations with
+the headset connected. `--extensions-only` skips instance/system queries. Its
+printed log path identifies the corresponding layer trace. Pre-instance
+extension enumeration is performed by the loader using the registered layer
+manifest, so this separate check complements the layer's application-call logs.
+
+### Experimental DCS quad-view composition
+
+`DCS.exe` requests `XR_VARJO_quad_views` on OpenXR 1.0 and uses D3D11. The layer
+now prefers quad views for that executable, accepts its D3D11 quad session and
+begins stereo downstream. It samples four application views and blends each
+focus view over its peripheral view into two private runtime swapchains. Array
+slices, nonzero image rectangles, typed SRGB views over typeless textures, and
+other application layers are retained. Color swapchains created before
+`xrBeginSession` are also made sampleable for the targeted quad hosts.
+
+D3D11 composition uses a private deferred context, executes with application
+state restoration and flushes before releasing the output images. Pending image
+waits can be retried without acquiring the same image twice. DCS focus FOVs are
+corrected from the matching `xrLocateViews` display time; without a matching
+sample the fixed inset is reconstructed from the outer FOV. This follows the
+DCS compatibility issue documented in the
+[Quad-Views-Foveated implementation](https://github.com/mbucchia/Quad-Views-Foveated/blob/main/openxr-api-layer/layer.cpp).
+It does not add eye tracking or the planned per-view SR/NR/FG policy. The current
+stereo FG presenter stays inactive for a quad session.
+
+`CheekyOpenXRBindingTests --quad-d3d11` exercises the production interceptors
+with WARP and a stereo-only mock runtime, including output pixel readback, context
+state, pre-begin image creation, SRGB, FOV correction and wait recovery. Also run
+`--quad-capture` for D3D12 regression coverage. A copy named `DCS.exe` running
+`--quad-version` checks executable-scoped quad-first preference without enabling
+the MSFS API-version bridge. Build and install packages separately before a live
+DCS retest; successful mock composition does not prove DCS selected quad views.
+Look for `prefer_quad=1`, `app_configuration=1000037000`,
+`compositor graphics_api=11`, `submit input_views=4` and `submit output_views=2`.
+
 UEVR deferred-loading coverage: `CheekyUEVRTests --loader-lifecycle` and
 `--loader-missing` exercise dormancy, event isolation, deferred transitions,
 disable/re-enable, concurrent requests, missing exports and package repair.
@@ -203,3 +271,62 @@ source status. DX12 GPU/Streamline coverage uses `--late-dx12`, `--late-dx12-c`,
 it no longer expects concurrent modules to disable the lower hook. Vulkan cache
 routing uses synthetic exports; real NVIDIA override coverage still needs a
 Vulkan game check.
+
+## Per-view activity diagnostics
+
+The Diagnostics tab's **DLSS view activity** group distinguishes registered
+handles from observed evaluation calls. Receiving calls means a hook observed an
+evaluation within 2000 ms; idle handles retain their lifetime count. Each handle
+includes its registration generation, API, last-call age, input/output dimensions,
+last recorded crop and calibrated/unverified/unassigned eye mapping. Focus versus
+periphery remains unknown until explicitly mapped. These counters do not count
+successful GPU frames or OpenXR projection views.
+
+Support snapshots retain `gaze.views` as the legacy registered-handle count and
+add `registered_views`, `receiving_views`, `evaluated_views`, and
+`never_evaluated_views`. `view_details[].evaluation_calls` counts observed calls;
+the older `evaluations` field counts geometry observations. Released handles are
+removed; reusing an address starts a new generation. ReShade's text support report
+also includes per-handle activity. `CheekyTests --view-activity` verifies unused,
+passthrough, idle and reused handles; overlay tests verify the visible breakdown.
+
+## Quad view assignment
+
+In a running D3D11 quad session, **Stereo / Gaze** shows four-view assignment
+controls instead of two-eye calibration. Automatic assignment tags successful
+game DLSS outputs with distinct small patterns and checks the four raw OpenXR
+views before composition. Two matching submissions establish the association;
+handle order and equal dimensions are insufficient. Acquisition stops after
+120 captures if unresolved and can be retried. This path currently targets DCS
+D3D11; D3D12 quad composition does not yet provide this assignment interface.
+
+**Quad assignment mode: Manual** exposes a role dropdown for each numbered
+source: Periphery Left, Periphery Right, Center Left, or Center Right. Each role
+can be assigned once; all four must be assigned before the mapping is used.
+**Show view numbers** is an independent checkbox in either mode. Small numbers
+repeat in a 7 by 5 grid to remain visible outside the inset.
+Only evaluated game handles receive numbers, so unused feature registrations
+do not consume labels. Roles are session-local and clear when sources are
+released, recreated or resized; the mode and label preference are saved.
+
+Diagnostics and support reports include `quad_views` with source numbers,
+handle generations, raw submission roles and automatic versus manual mapping.
+`CheekyOpenXRBindingTests --quad-roles` is the focused GPU check. Actual DCS
+postprocessing and headset label visibility still require manual validation.
+
+Assigned quad views bypass the extra gaze/crop/roundness/feather/alignment
+settings. Center views use the center preset and supersampling over their full
+image, with no additional peripheral pass. Peripheral views use the peripheral
+preset and a single full-view DLAA pass at `PeripheralDlaaScale` times the game's
+input width and height; the result expands to the original output rectangle.
+For example, input 880x824 at 0.75 runs DLAA at 660x618 before expanding to
+1512x1420. This reduces Cheeky's reconstruction workload; it does not change the
+game's raster resolution or the OpenXR swapchain dimensions. Disable
+**Override peripheral views** to retain the game's peripheral DLSS. The master
+**Enable quad-view DLSS-SR** switch controls both overrides. Unresolved handles
+retain the game's rendering until all four roles are assigned.
+
+NR applies over the whole assigned center views only (D3D11 requires DX12
+Transport); its extra fovea controls are hidden. Quad frame generation remains
+unimplemented and its stereo-only controls are hidden during a quad session.
+These policies and the repeated labels require manual in-game validation.

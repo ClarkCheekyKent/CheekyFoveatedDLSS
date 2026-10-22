@@ -108,6 +108,10 @@ struct Settings {
     float next_jump_width{}, next_jump_height{};
     bool manual_stereo_mapping{false};
     bool manual_stereo_right_first{false};
+    bool quad_manual_assignment{false};
+    bool quad_show_numbers{false};
+    bool quad_view_mode{}; // Evaluation-local; the submitted view already defines its fovea.
+    unsigned quad_view_region{}; // 0 unresolved, 1 periphery, 2 center; never persisted.
     bool independent_openxr_gaze{false};
     float gaze_smoothing_ms{20.0F};
     // Shorter gaze loss (a blink) keeps the last gaze without a DLSS history reset.
@@ -167,6 +171,18 @@ struct StereoViewDetail {
     std::uint32_t output_height{};
     CropGeometry crop{};
     bool has_geometry{};
+    std::uint64_t generation{};
+    // Observed game evaluation calls, including passthrough. These are not
+    // successful GPU frames or OpenXR projection-view counts.
+    std::uint64_t evaluation_calls{};
+    std::uint64_t last_evaluation_age_ms{};
+    bool recently_evaluated{}; // A call within the last 2000 ms.
+    unsigned graphics_api{}; // 11 = DX11, 12 = DX12, 1 = Vulkan.
+    bool calibrated{};
+    std::uint32_t evaluation_input_width{}, evaluation_input_height{};
+    std::uint32_t evaluation_output_width{}, evaluation_output_height{};
+    unsigned quad_region{},quad_view_index{~0U}; // 1 peripheral, 2 focus.
+    bool quad_manual{};
 };
 
 struct StereoSourceCrop {
@@ -185,6 +201,8 @@ struct StereoEyeAssignment {
     std::array<StereoSourceCrop, 2> source_crops{}; // Indexed by physical eye.
     // Changes only when the identity/transform changes, not on verification.
     std::uint64_t mapping_revision{};
+    bool quad_assigned{},quad_manual{};
+    unsigned quad_view_index{~0U};
 };
 
 // A registration generation distinguishes a released/recreated NGX handle at
@@ -215,6 +233,9 @@ void register_stereo_view(std::uint64_t view_id) noexcept;
 void unregister_stereo_view(std::uint64_t view_id) noexcept;
 [[nodiscard]] StereoViewStatistics stereo_view_statistics() noexcept;
 [[nodiscard]] std::vector<StereoViewDetail> stereo_view_details();
+void note_stereo_view_evaluation(std::uint64_t view_id, unsigned graphics_api,
+    std::uint32_t input_width, std::uint32_t input_height,
+    std::uint32_t output_width, std::uint32_t output_height) noexcept;
 [[nodiscard]] bool has_multiple_stereo_views() noexcept;
 [[nodiscard]] StereoEyeAssignment stereo_eye_assignment(
     std::uint64_t view_id

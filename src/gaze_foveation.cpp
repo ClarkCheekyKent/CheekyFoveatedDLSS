@@ -447,6 +447,14 @@ bool calculate_coordinated_crop(
     FoveationCenter* resolved_center,
     std::uint64_t native_resource_identity
 ) noexcept {
+    // A quad projection view is already a complete center/peripheral image.
+    // Bypass two-eye placement, gaze mapping and any cached crop overrides.
+    if(const auto full=settings_for_view(settings,view_id);full.quad_view_mode){
+        reset_history=false;
+        if(resolved_center)*resolved_center={.5F,.5F};
+        return calculate_crop(full,render_width,render_height,output_width,output_height,
+            output_origin_x,output_origin_y,crop);
+    }
     if (coordinated_crop_override && coordinated_crop_override->view_id == view_id && view_id != 0U) {
         crop = coordinated_crop_override->crop;
         reset_history = coordinated_crop_override->reset;

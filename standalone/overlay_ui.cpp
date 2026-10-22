@@ -157,9 +157,10 @@ void rr_preset(const char* label, std::uint32_t& value) {
     for (int i=0;i<4;++i) if (value==values[i]) selected=i;
     if (ImGui::Combo(label,&selected,names,4)) value=values[selected];
 }
-void draw_sr(Settings& s, bool rr) {
-    ImGui::Checkbox("Enable foveated DLSS-SR", &s.enabled);
+void draw_sr(Settings& s, bool rr, bool quad) {
+    ImGui::Checkbox(quad?"Enable quad-view DLSS-SR":"Enable foveated DLSS-SR", &s.enabled);
     test_control("Enabled");
+    if(quad)ImGui::TextWrapped("Each assigned view is processed in full. Center controls apply to both center views; peripheral controls apply to both peripheral views.");
     ImGui::SeparatorText("Center quality");
     if (rr) { ImGui::TextUnformatted("Ray Reconstruction active"); rr_preset("Center RR preset",s.rr_center_preset); }
     else preset("Center preset", s.center_preset, true);
@@ -172,12 +173,14 @@ void draw_sr(Settings& s, bool rr) {
         ImGui::TextDisabled("(Use if preset causes blurriness)");
     }
     slider("Center supersampling", s.center_supersampling, 1.0F, 2.0F, "%.2fx");
-    ImGui::Checkbox("Peripheral DLAA", &s.peripheral_dlaa_enabled);
+    ImGui::Checkbox(quad?"Override peripheral views":"Peripheral DLAA", &s.peripheral_dlaa_enabled);
     if (s.peripheral_dlaa_enabled) {
         if (rr) rr_preset("Peripheral RR preset",s.rr_peripheral_preset);
         else preset("Peripheral preset", s.peripheral_dlaa_preset, false);
         slider("Periphery scale", s.peripheral_dlaa_scale, .2F, 1.0F);
+        if(quad)ImGui::TextWrapped("Peripheral DLAA runs at this fraction of the game's input width and height, then expands over the full peripheral view. Off keeps the game's peripheral DLSS.");
     }
+    if(quad)return;
     if (rr) ImGui::TextWrapped("RR denoises both regions. Disabling peripheral DLAA uses input-resolution RR in the periphery.");
     ImGui::SeparatorText("Size and shape");
     slider("Fovea width", s.width, .2F, 1.0F);
@@ -233,8 +236,10 @@ void draw_gaze(Settings& s) {
     }
 }
 
-void draw_nr(Settings& s) {
-    ImGui::Checkbox("Enable DLSS-NR", &s.nr_enabled);
+void draw_nr(Settings& s, bool quad) {
+    ImGui::Checkbox(quad?"Enable DLSS-NR on center views":"Enable DLSS-NR", &s.nr_enabled);
+    if(quad)ImGui::TextWrapped("NR covers each assigned center view in full. Peripheral views do not run NR. D3D11 requires DX12 Transport.");
+    if(!quad){
     ImGui::SeparatorText("Size and shape");
     ImGui::Checkbox("Foveated DLSS-NR", &s.nr_foveated);
     if (s.nr_foveated) {
@@ -249,6 +254,7 @@ void draw_nr(Settings& s) {
             slider("NR transition width", s.nr_transition_width, 0.0F, .3F, "%.3f");
         }
         ImGui::Checkbox("Show green alignment border", &s.nr_alignment_border_enabled);
+    }
     }
     ImGui::SeparatorText("Neural rendering");
     combo("Rendering order", s.nr_processing_order, "After upscaling\0Before upscaling (experimental)\0");
@@ -385,7 +391,7 @@ void draw_gaze_details(std::string_view snapshot) {
         diagnostic_line(gaze, "Runtime adapter loaded", "layer");
         diagnostic_line(gaze, "Compatible gaze ABI", "abi");
         diagnostic_line(gaze, "Mapping ambiguity", "ambiguous");
-        diagnostic_line(gaze, "Active stereo views", "views");
+        diagnostic_line(gaze, "Registered DLSS handles", "views");
         diagnostic_line(gaze, "Sample age (ms)", "age_ms");
         const auto flags = static_cast<unsigned>(number(gaze, "status_flags"));
         for (const auto& item : {std::pair{"System supports eye tracking", CHEEKY_GAZE_STATUS_SYSTEM_SUPPORTED},
@@ -424,6 +430,46 @@ void draw_gaze_details(std::string_view snapshot) {
     }
 }
 
+void draw_view_details(std::string_view snapshot) {
+    if (!ImGui::TreeNode("DLSS view activity")) return;
+    const auto gaze = member(snapshot, "gaze");
+    diagnostic_line(gaze, "Registered handles", "registered_views");
+    diagnostic_line(gaze, "Receiving calls (last 2 seconds)", "receiving_views");
+    diagnostic_line(gaze, "Ever evaluated", "evaluated_views");
+    diagnostic_line(gaze, "Never evaluated", "never_evaluated_views");
+    ImGui::TextWrapped("Counts describe DLSS handles and observed evaluation calls. They do not establish successful GPU frames or the number of OpenXR projection views. Focus/periphery roles remain unknown until verified.");
+    const auto views = member(snapshot, "view_details");
+    for (unsigned i = 0; i < 16; ++i) {
+        const auto view = array_object(views, i);
+        if (view.empty()) break;
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::SeparatorText("DLSS handle");
+        diagnostic_line(view, "ID", "id");
+        diagnostic_line(view, "Registration generation", "generation");
+        diagnostic_line(view, "Activity", "activity");
+        diagnostic_line(view, "Evaluation calls", "evaluation_calls");
+        if (plain(member(view, "last_evaluation_age_ms")) != "null")
+            diagnostic_line(view, "Last evaluation age (ms)", "last_evaluation_age_ms");
+        diagnostic_line(view, "API", "api");
+        diagnostic_line(view, "Eye", "eye");
+        diagnostic_line(view, "Mapping", "mapping");
+        diagnostic_line(view, "Focus/periphery", "region");
+        ImGui::Text("Input: %.0f x %.0f | Output: %.0f x %.0f",
+            number(view, "input_width"), number(view, "input_height"),
+            number(view, "output_width"), number(view, "output_height"));
+        if (flag(view, "has_geometry")) {
+            ImGui::Text("Last output crop: %.0f x %.0f at %.0f, %.0f",
+                number(view, "crop_width"), number(view, "crop_height"),
+                number(view, "crop_x"), number(view, "crop_y"));
+            diagnostic_line(view, "Geometry observations", "evaluations");
+        }
+        ImGui::PopID();
+    }
+    if (number(snapshot, "view_details_total") > 16)
+        ImGui::TextDisabled("Showing the first 16 registered handles.");
+    ImGui::TreePop();
+}
+
 void draw_calibration_controls(OverlayUiState& r, const OverlayRuntime& runtime) {
     ImGui::SeparatorText("Stereo Eye Mapping");
     int method = r.draft.manual_stereo_mapping ? 4 : int(r.draft.eye_calibration_method);
@@ -456,6 +502,47 @@ void draw_calibration_controls(OverlayUiState& r, const OverlayRuntime& runtime)
             ImGui::TextWrapped("Keeps the learned alignment without validation markers until views, dimensions, submission bounds, or the VR session change. Eye swaps or image crop changes within unchanged views are not detected.");
     }
     if (ImGui::Button("Recalibrate now")) command(r, runtime, "calibration_recalibrate");
+}
+
+bool draw_quad_controls(OverlayUiState& r,const OverlayRuntime& runtime) {
+    const auto quad=member(r.snapshot,"quad_views");const bool active=flag(quad,"active");
+    ImGui::SeparatorText("Quad view assignment");
+    // Independent of assignment mode: never enable manual mode or labels as a
+    // side effect of changing the other control.
+    ImGui::Checkbox("Show view numbers",&r.draft.quad_show_numbers);
+    ImGui::TextWrapped("Small numbers repeat across each view, including outside the center inset.");
+    int mode=r.draft.quad_manual_assignment?1:0;
+    if(ImGui::Combo("Quad assignment mode",&mode,"Automatic\0Manual\0"))r.draft.quad_manual_assignment=mode==1;
+    if(!active){ImGui::TextDisabled("Waiting for a running quad-view session.");return false;}
+    diagnostic_line(quad,"Assignment","status");
+    const auto sources=member(quad,"sources");
+    for(unsigned i=0;i<8;++i){const auto source=array_object(sources,i);if(source.empty())break;
+        const auto view_number=static_cast<unsigned>(number(source,"number"));
+        std::string assignment_payload;
+        const auto label="View "+std::to_string(view_number);int selected=static_cast<int>(number(source,"manual_role"));
+        static constexpr const char* roles[]{"Unassigned","Periphery Left","Periphery Right","Center Left","Center Right"};
+        ImGui::PushID(static_cast<int>(view_number));
+        if(r.draft.quad_manual_assignment){
+            if(ImGui::BeginCombo(label.c_str(),selected>=0&&selected<5?roles[selected]:roles[0])){
+                for(int role=0;role<5;++role){bool taken{};
+                    for(unsigned j=0;j<8&&role;++j){const auto other=array_object(sources,j);if(other.empty())break;
+                        taken|=number(other,"number")!=view_number&&number(other,"manual_role")==role;}
+                    ImGui::BeginDisabled(taken);
+                    if(ImGui::Selectable(roles[role],selected==role)){
+                        assignment_payload=plain(member(quad,"session"))+" "+std::to_string(view_number)+" "+std::to_string(role)+" "+
+                            plain(member(source,"id"))+" "+plain(member(source,"generation"));
+                    }
+                    ImGui::EndDisabled();
+                }
+                ImGui::EndCombo();
+            }
+        }else diagnostic_line(source,label.c_str(),"role");
+        ImGui::PopID();
+        if(!assignment_payload.empty()){command(r,runtime,"quad_assign",assignment_payload);return true;}
+    }
+    if(ImGui::Button(r.draft.quad_manual_assignment?"Reset quad assignments":"Retry automatic assignment"))command(r,runtime,"quad_recalibrate");
+    ImGui::TextWrapped("Manual assignments apply to this session and clear when views are recreated. Each role can be assigned once.");
+    return true;
 }
 
 void draw_calibration(OverlayUiState& r, const OverlayRuntime& runtime) {
@@ -956,23 +1043,29 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 end_tab();
             }
             if (begin_tab("Stereo / Gaze")) {
+                if(!draw_quad_controls(r,runtime)){
                 draw_gaze_status(r.draft, r.snapshot);
                 draw_calibration_controls(r, runtime);
                 ImGui::SeparatorText("Placement");
                 draw_gaze(r.draft);
                 if (ImGui::Button("Reset gaze defaults")) command(r, runtime, "defaults_gaze");
+                }
                 end_tab();
             }
             if (begin_tab("DLSS-SR")) {
-                draw_sr(r.draft, member(array_object(member(r.snapshot,"apis"),1),"reconstruction_feature") == "13");
+                draw_sr(r.draft, member(array_object(member(r.snapshot,"apis"),1),"reconstruction_feature") == "13",flag(member(r.snapshot,"quad_views"),"active"));
                 if (ImGui::Button("Reset SR defaults")) command(r, runtime, "defaults_sr");
                 if (ImGui::CollapsingHeader("Performance##sr", ImGuiTreeNodeFlags_DefaultOpen))
                     draw_sr_performance(r.snapshot, r.draft);
                 end_tab();
             }
             if (begin_tab("DLSS-FG")) {
+                if(flag(member(r.snapshot,"quad_views"),"active")){
+                    ImGui::TextWrapped("Frame generation for quad views is not implemented yet.");
+                }else{
                 draw_fg(r.draft, r.snapshot, std::string_view(renderer)=="D3D11");
                 if (ImGui::Button("Reset FG defaults")) command(r, runtime, "defaults_fg");
+                }
                 end_tab();
             }
             if (begin_tab("DLSS-NR")) {
@@ -981,7 +1074,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     const auto reason = plain(member(member(r.snapshot, "nr_details"), "skip_reason"));
                     if (!reason.empty()) warning(reason.c_str());
                 }
-                draw_nr(r.draft);
+                draw_nr(r.draft,flag(member(r.snapshot,"quad_views"),"active"));
                 if (ImGui::Button("Reset NR history / retry")) command(r, runtime, "reset_nr");
                 if (ImGui::Button("Reset NR defaults")) command(r, runtime, "defaults_nr");
                 if (ImGui::CollapsingHeader("Performance##nr", ImGuiTreeNodeFlags_DefaultOpen))
@@ -994,6 +1087,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 diagnostic_line(member(r.snapshot, "observer"), "Native observer ready", "ready");
                 diagnostic_line(member(r.snapshot, "nr_details"), "NR skip reason", "skip_reason");
                 draw_gaze_details(r.snapshot);
+                draw_view_details(r.snapshot);
                 draw_calibration(r, runtime);
                 if (ImGui::Button("Report an issue...")) command(r, runtime, "report_issue");
                 if (ImGui::Button("Create support ZIP")) command(r, runtime, "report");
