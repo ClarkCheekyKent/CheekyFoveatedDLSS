@@ -30,6 +30,7 @@
 #include "quad_views_d3d12.hpp"
 #include "fg_capture.hpp"
 #include "fg_sr_region.hpp"
+#include "nvapi_d3d11_guard.hpp"
 
 #include <Windows.h>
 #include <winver.h>
@@ -6730,6 +6731,13 @@ DWORD WINAPI interception_worker(void*) noexcept {
         drain_hook_debug_loader_events();
         poll_openvr_hooks();
         poll_libovr_hooks();
+        if (minhook_initialized.load(std::memory_order_acquire) &&
+            !nvapi_guard::installed.load(std::memory_order_acquire) &&
+            GetModuleHandleW(L"nvapi64.dll") != nullptr) {
+            const bool guarded = nvapi_guard::install();
+            trace_event("NVAPI D3D11 recording calls %s (depth bounds, UAV overlap) under the D3D11 device lock",
+                guarded ? "guarded" : "only partly guarded");
+        }
         if (worker_tick < 20U) trace_event("HOOKDBG worker tick=%u begin tid=%lu", worker_tick, static_cast<unsigned long>(GetCurrentThreadId()));
         if (streamline_loaded()) {
             if (!streamline_inline_mode.load(std::memory_order_acquire) &&
