@@ -441,11 +441,12 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     auto* depth=read(p,"Depth");auto* motion=read(p,"MotionVectors");
     if(!depth||!motion){quad_skip("depth or motion missing");return;}
     const auto dd=depth->GetDesc(),md=motion->GetDesc();
-    // MSFS 2024 passes a two-slice, mipmapped depth texture for one stereo
-    // SR evaluation even when native quad-view foveation is disabled. The FG
-    // guide preparation path samples mip 0 of slice 0 explicitly.
+    // MSFS 2024 passes a mipmapped depth array to one SR evaluation: two
+    // slices in stereo, four for its first quad view (periphery left). DLSS
+    // reads slice 0, and the FG guide preparation path samples mip 0 of slice
+    // 0 explicitly; raw snapshots still reject arrays.
     if(dd.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||md.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-       (dd.DepthOrArraySize!=1&&dd.DepthOrArraySize!=2)||md.DepthOrArraySize!=1||
+       !dd.DepthOrArraySize||md.DepthOrArraySize!=1||
        dd.SampleDesc.Count!=1||md.SampleDesc.Count!=1){
         quad_skip("unsupported depth/motion layout (depth slices, motion slices, depth dimension)",dd.DepthOrArraySize,md.DepthOrArraySize,unsigned(dd.Dimension));return;}
     const unsigned w=ui(p,"OutWidth"),h=ui(p,"OutHeight");
