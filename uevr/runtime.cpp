@@ -55,6 +55,7 @@ struct State {
     CheekyFgMemory fg_memory;
     std::uint64_t next_fg_memory_sample{};
     std::uint64_t logged_memory_sample{};
+    ULONGLONG next_memory_log{};std::uint64_t logged_local_usage{}; // Memory lines: every 30 s or on a 64 MB change.
     ULONGLONG next_timing_log{};
     std::string message{"Not initialized"};
     std::atomic<bool> save_requested{}, report_requested{};
@@ -556,7 +557,7 @@ bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* qu
     }
     s.observed_device = device; s.observed_queue = queue; s.graphics_ready = true;
     s.memory.attach(renderer,device,queue);
-    s.logged_memory_sample=0;
+    s.logged_memory_sample=0;s.next_memory_log=0;
     s.fg_memory={};s.next_fg_memory_sample=0;
     s.message = "Ready. Enable DLSS in the game; complete future evaluations can be adopted after injection. Check diagnostics if processing is waiting.";
     return true;
@@ -720,6 +721,11 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
         if(s.graphics_ready&&s.memory.samples!=s.logged_memory_sample){
             s.logged_memory_sample=s.memory.samples;
             sample_fg_memory(s,GetTickCount64());
+        }
+        constexpr std::uint64_t memory_log_change=64ull<<20;
+        const auto local_change=s.memory.local.usage>s.logged_local_usage?s.memory.local.usage-s.logged_local_usage:s.logged_local_usage-s.memory.local.usage;
+        if(s.graphics_ready&&s.memory.samples&&(GetTickCount64()>=s.next_memory_log||local_change>=memory_log_change)){
+            s.next_memory_log=GetTickCount64()+30000;s.logged_local_usage=s.memory.local.usage;
             const auto& m=s.memory;CheekyFgCadence fg_rates;fg_cadence(fg_rates);
             trace_event("GPU memory process tick=%llu node=%u fg_enabled=%u fg_active=%u queue_request=%u local_valid=%u local_usage=%llu local_budget=%llu local_headroom=%llu local_over=%llu local_peak=%llu local_over_samples=%llu nonlocal_valid=%u nonlocal_usage=%llu nonlocal_budget=%llu baseline_valid=%u baseline_fg=%u baseline_tick=%llu baseline_local=%llu game_fps=%.3f unique_fps=%.3f cadence_valid=%u present_fps=%.3f hr=0x%08lX/0x%08lX (bytes)",
                 m.sampled_at,m.node,configured_settings().fg.enabled?1u:0u,fg_status().active,configured_settings().fg.queue_priority,

@@ -56,7 +56,7 @@ struct Settings {
         bool submit_repeats{false}; // Runtime handles repeated display content.
         std::uint32_t pacing_clock{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
         std::uint32_t color_capture_mode{1},upload_mode{1}; // Proven Joey-run defaults; 0 retains each baseline for A/B testing.
-        std::uint32_t latency_diagnostics{1}; // Sparse calibrated GPU/CPU timeline; independently switchable.
+        std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.
         std::uint32_t compact_storage{1}; // Native-density center plus reduced peripheral context, reconstructed at XR upload.
         std::uint32_t guide_capture_mode{1}; // 0 raw snapshots; 1 capture directly into prepared FG guide grids.
         std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.

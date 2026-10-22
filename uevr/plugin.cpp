@@ -151,10 +151,17 @@ void on_present() {
             sync_frame_source(); // Live toggle: detach/attach before the next native frame.
             snapshots.push_back(read_snapshot());
         }
+        // The status JSON is only shown in the UEVR menu. While it is closed,
+        // refresh slowly enough that Lua still sees a live host (it times out
+        // after 600 frames), and refresh at once when the menu opens.
         static ULONGLONG next_snapshot{};
+        static bool menu_was_open{};
         const auto now = GetTickCount64();
-        if (pending.empty() && (now >= next_snapshot || loader_state)) {
-            next_snapshot = now + 250;
+        const bool menu_open = !api->functions->is_drawing_ui || api->functions->is_drawing_ui();
+        const bool menu_opened = menu_open && !menu_was_open;
+        menu_was_open = menu_open;
+        if (pending.empty() && (now >= next_snapshot || loader_state || menu_opened)) {
+            next_snapshot = now + (menu_open ? 250 : 2000);
             snapshots.push_back(read_snapshot());
         }
         // Lua may synchronously send another command; release every plugin lock.

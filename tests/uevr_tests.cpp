@@ -123,7 +123,7 @@ void settings_tests(const std::filesystem::path& root) {
             set_named_setting(fg,"FgQueuePriority","1")&&set_named_setting(fg,"FgQueuePriority","2")&&
             !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
             "Shared game queue is the default; separate GPU queues remain selectable");
-        require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==1,"Transport defaults use direct eyes and batched uploads");
+        require(fg.fg.color_capture_mode==1&&fg.fg.upload_mode==1&&fg.fg.latency_diagnostics==0,"Transport defaults use direct eyes, batched uploads and no latency timeline");
         require(fg.fg.direct_xr_output==0,"Direct XR experiment defaults off");
         require(fg.fg.direct_peripheral_shading==1&&set_named_setting(fg,"FgDirectPeripheralShading","0")&&
             set_named_setting(fg,"FgDirectPeripheralShading","1")&&set_named_setting(fg,"FgDirectPeripheralShading","2")&&
@@ -579,7 +579,7 @@ int main(int argc, char** argv) {
                 snapshot(get).find("\"FgDirectXrOutput\":0")!=std::string::npos,"FG reset disables the direct XR experiment");
             shading=CheekyFgDirectShading{};require(shading_fn(&shading)&&shading.requested_mode==1,"FG reset restores coarse block shading");
             options=CheekyFgTransportOptions{};require(transport_fn(&options)&&options.color_capture_mode==1&&
-                options.upload_mode==1&&options.latency_diagnostics==1&&snapshot(get).find("\"FgReleasePoint\":3")!=std::string::npos&&
+                options.upload_mode==1&&options.latency_diagnostics==0&&snapshot(get).find("\"FgReleasePoint\":3")!=std::string::npos&&
                 snapshot(get).find("\"FgSubmitRepeats\":false")!=std::string::npos,"Tested defaults reset live settings");
             require(control_fn(&control) && !control.enabled,"FG reset restores live opt-out");
             std::puts("PASS FG protocol, control ABI, host detach/re-enable and FG group reset");
