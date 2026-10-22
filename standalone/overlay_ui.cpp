@@ -934,7 +934,11 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if (ImGui::Combo("FG motion precision", &motion, "16-bit\0" "32-bit\0")) s.motion_bits = motion ? 32 : 16;
         }
     }
+    if(native_shader11())combo("Release game rendering (native D3D11)", s.native11_release, "After FG submission\0After generated frame submission (experimental)\0");
     if(native_shader11())ImGui::TextWrapped("Native D3D11 uses serialized native/generated presentation and full-eye 32-bit guide history. DX12 queue, storage and upload experiments do not apply.");
+    combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
+    if (s.pacing_clock != 0)
+        ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
     if (!native_shader11()&&ImGui::TreeNode("FG scheduling and storage")) {
         combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");

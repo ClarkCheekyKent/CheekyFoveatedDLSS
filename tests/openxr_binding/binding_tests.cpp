@@ -1073,6 +1073,7 @@ void diagnostic_lifetime_test() {
 #include "fg_parity_validation.hpp"
 #include "fg_shader11_ngx_probe.hpp"
 #include "fg_shader11_nvapi_probe.hpp"
+#include "fg_pacing_simulation.hpp"
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
@@ -1083,6 +1084,7 @@ int main(int argc,char** argv) {
             check(argc>2,"--fg-shader11-ngx requires the DLSS model DLL directory");
             const std::string mode=argc<4?"gated":argv[3];
             fg_shader11_ngx_probe(argv[2],mode);return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-pacing-sim") {pacing_sim::fg_pacing_simulation(argc>2?std::stod(argv[2]):12.,argc>3?argv[3]:nullptr,argc>4?argv[4]:nullptr);return 0;}
         if(argc>1&&std::string(argv[1])=="--quad-capture") {quad_capture_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--quad-d3d11") {quad_capture_d3d11_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--quad-roles") {quad_role_mapping_validation();return 0;}
