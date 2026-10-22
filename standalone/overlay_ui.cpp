@@ -948,6 +948,8 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.");
         ImGui::Checkbox("Submit repeat frames", &s.submit_repeats);
+        if(native_shader11())
+            combo("FG output destination", s.direct_xr_output, "Private image + copy\0Direct OpenXR image (experimental)\0");
         if(!native_shader11()){
         ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
         if(!quad){combo("FG guide capture", s.guide_capture_mode, "Raw snapshots\0Prepared FG layouts\0");

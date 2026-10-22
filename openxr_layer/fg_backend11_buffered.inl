@@ -73,8 +73,10 @@ inline bool BufferedPresenter::prepare_native11(Native& job,const XrCompositionL
 }
 
 inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {
-    if(!source||!source->texture11)return false;
-    D3D11_TEXTURE2D_DESC d{};source->texture11->GetDesc(&d);
+    // A deferred interpolation pass renders straight into the OpenXR image.
+    const auto* draw=Backend11::deferred(source);
+    if(!source||(!source->texture11&&!draw))return false;
+    D3D11_TEXTURE2D_DESC d{};if(draw)d=draw->desc;else source->texture11->GetDesc(&d);
     if(chain.handle&&(chain.desc.Width!=d.Width||chain.desc.Height!=d.Height||chain.desc.Format!=d.Format||chain.desc.DepthOrArraySize!=d.ArraySize)){
         destroy_private_chain(chain.handle);chain={};
     }
@@ -100,7 +102,8 @@ inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {
     XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
     const auto wait_begin=TimingClock::now();const auto wait_result=native11->runtime_submit([&]{return xr.wait_image(chain.handle,&wait);});
     {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-    const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images11.size()&&native11->upload(chain.images11[index].texture,source);
+    const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images11.size()&&
+        (draw?native11->draw_into(chain.images11[index].texture,source):native11->upload(chain.images11[index].texture,source));
     XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     const bool released=XR_SUCCEEDED(native11->runtime_submit([&]{return xr.release(chain.handle,&release);}));
     if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
@@ -143,7 +146,8 @@ struct BufferedBackend11 final : FrameBackend {
             attempted=true;
             if(!history_was_reset){
                 pair.submitted_at=TimingClock::now();
-                success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,pair.generated);
+                success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,pair.generated,
+                    owner.direct11_requested.load());
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
                     strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}

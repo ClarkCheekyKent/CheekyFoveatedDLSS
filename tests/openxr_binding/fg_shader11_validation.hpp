@@ -107,6 +107,15 @@ inline void fg_backend11_pixels(){
         check(!gc[0]->source.meta.reset&&!gc[1]->source.meta.reset,"Consecutive guide interval keeps history");
         std::array<Image,2> generated;
         check(b.generate(a,c,ga,gc,views,views,generated),"Native D3D11 interpolation");
+        // Direct output: the same pass rendered straight into an OpenXR-like
+        // target must produce the same pixels as the private image.
+        std::array<Image,2> direct;check(b.generate(a,c,ga,gc,views,views,direct,true),"Native D3D11 deferred interpolation");
+        for(unsigned eye=0;eye<2;++eye){
+            check(!direct[eye]->texture11&&Backend11::deferred(direct[eye]),"Deferred output allocates no private image");
+            auto target=texture(format,{0,1,0,1});check(b.draw_into(target.Get(),direct[eye]),"Draw deferred pass into the OpenXR image");
+            for(const auto& at:{std::pair{32u,32u},std::pair{2u,2u},std::pair{20u,40u}})
+                check(pixel(target.Get(),at.first,at.second)==pixel(generated[eye]->texture11.Get(),at.first,at.second),
+                    "Direct OpenXR output matches the private-image path");}
         for(unsigned eye=0;eye<2;++eye){auto* result=generated[eye]->texture11.Get();
             const auto center=pixel(result,32,32),edge=pixel(result,2,2);const unsigned ri=format==DXGI_FORMAT_B8G8R8A8_UNORM?2:0,bi=2-ri;
             check(edge[ri]>250&&edge[bi]<3,"Native D3D11 periphery independently uses previous frame");
@@ -139,7 +148,7 @@ inline void fg_backend11_pixels(){
 }
 // BufferedPresenter + Backend11 driven like DCS: the simulation thread waits
 // for frame N+1 while the render thread still owns frame N.
-inline void fg_backend11_pipelined(){
+inline void fg_backend11_pipelined(bool direct=false){
     using namespace shader11_fixture;using namespace cheeky::fg;
     Runtime::reset();
     auto presenter=std::make_unique<BufferedPresenter>();auto& p=*presenter;
@@ -147,6 +156,7 @@ inline void fg_backend11_pipelined(){
     std::vector<XrSwapchain> retired;p.retire_chain=[&](XrSwapchain chain){retired.push_back(chain);};
     check(p.setup11(reinterpret_cast<XrSession>(1),Runtime::functions(),device.Get(),7,&cheeky::quad_capture::d3d11_dispatch_mutex),"Native D3D11 buffered presenter setup");
     check(!p.device&&!p.queue&&!p.interop11,"Native D3D11 backend creates no D3D12 objects");
+    p.direct11_requested=direct;
     const auto format=DXGI_FORMAT_R8G8B8A8_UNORM;
     auto depth=texture(DXGI_FORMAT_R32_FLOAT,{.5f,0,0,0});auto motion=texture(DXGI_FORMAT_R32G32_FLOAT,{0,0,0,0});
     std::array<ComPtr<ID3D11Texture2D>,2> app_colors{texture(format,{1,0,0,1}),texture(format,{0,0,1,1})};
@@ -348,6 +358,7 @@ void fg_shader11_validation(bool hardware=false){
     if(hardware)fg_backend11_fence_stress();
     else fg_backend11_pixels();
     fg_backend11_pipelined();
+    fg_backend11_pipelined(true);
     {
         cheeky::quad_capture::QuadFg11 quad(device.Get());quad.enable(true);
         auto input=[&](DXGI_FORMAT f,float x){D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=64;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;

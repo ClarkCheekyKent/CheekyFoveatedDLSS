@@ -254,16 +254,40 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         last_guides=taken;out=std::move(taken);return true;
     }
     void clear_guides() {std::lock_guard lock(guide_mutex);pending_guides={};last_guides={};}
-    // Interpolates previous (A) -> current (B) into new images for both eyes.
+    // One eye's interpolation pass, kept until it is drawn. With direct output
+    // the pass renders straight into the acquired OpenXR image at
+    // publication, which saves the private texture and its full-eye copy.
+    struct DeferredDraw {
+        Image previous,current;
+        std::shared_ptr<Guides> old_guides,new_guides;
+        ComPtr<ID3D11Buffer> constants;
+        D3D11_TEXTURE2D_DESC desc{};
+    };
+    void record_draw(ID3D11DeviceContext* commands,const DeferredDraw& draw,ID3D11RenderTargetView* target) {
+        auto* cb=draw.constants.Get();auto* ss=sampler.Get();
+        ID3D11ShaderResourceView* srvs[]{draw.previous->srv11.Get(),draw.current->srv11.Get(),
+            draw.new_guides->motion_srv.Get(),draw.new_guides->depth_srv.Get(),draw.old_guides->depth_srv.Get()};
+        const D3D11_VIEWPORT viewport{0,0,float(draw.desc.Width),float(draw.desc.Height),0,1};
+        commands->OMSetRenderTargets(1,&target,nullptr);commands->OMSetDepthStencilState(nullptr,0);
+        commands->OMSetBlendState(nullptr,nullptr,~0u);commands->RSSetState(rasterizer.Get());commands->RSSetViewports(1,&viewport);
+        commands->IASetInputLayout(nullptr);commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commands->VSSetShader(vertex.Get(),nullptr,0);commands->PSSetShader(pixel.Get(),nullptr,0);
+        commands->PSSetConstantBuffers(0,1,&cb);commands->PSSetSamplers(0,1,&ss);commands->PSSetShaderResources(0,5,srvs);commands->Draw(3,0);
+        ID3D11ShaderResourceView* empty[5]{};commands->PSSetShaderResources(0,5,empty);commands->OMSetRenderTargets(0,nullptr,nullptr);
+    }
+    static const DeferredDraw* deferred(const Image& image) noexcept {
+        return image?static_cast<const DeferredDraw*>(image->pending11.get()):nullptr;
+    }
+    // Interpolates previous (A) -> current (B) for both eyes. Deferred output
+    // only prepares each pass; draw_into() renders it at publication.
     bool generate(const std::array<Image,2>& previous,const std::array<Image,2>& current,
         const std::array<std::shared_ptr<Guides>,2>& old_guides,const std::array<std::shared_ptr<Guides>,2>& new_guides,
         const std::array<XrCompositionLayerProjectionView,2>& previous_views,const std::array<XrCompositionLayerProjectionView,2>& current_views,
-        std::array<Image,2>& out) {
+        std::array<Image,2>& out,bool deferred_output=false) {
         // Prepare both eyes first; then issue all commands in one submission.
-        std::array<ComPtr<ID3D11Buffer>,2> constants;std::array<ComPtr<ID3D11RenderTargetView>,2> targets;
-        std::array<D3D11_VIEWPORT,2> viewports{};
+        std::array<std::shared_ptr<DeferredDraw>,2> draws;std::array<ComPtr<ID3D11RenderTargetView>,2> targets;
         for(unsigned eye=0;eye<2;++eye){
-            const auto& now=*new_guides[eye];const auto& old=*old_guides[eye];const auto& g=now.source.meta;
+            const auto& now=*new_guides[eye];const auto& g=now.source.meta;
             D3D11_TEXTURE2D_DESC d{};current[eye]->texture11->GetDesc(&d);
             auto cam=camera(current_views[eye],&previous_views[eye],g.depth_inverted!=0);if(!cam.valid)return false;
             Constants c;c.previous=cam.clip_to_prev;c.options[0]=float(g.peripheral_method);c.options[1]=.5f;c.options[2]=g.reset?0.f:1.f;
@@ -277,32 +301,37 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             if(now.source.vertical_flip)center_y=1-center_y;
             c.rect[0]=std::clamp(center_x-c.rect[2]*.5f,0.f,1-c.rect[2]);c.rect[1]=std::clamp(center_y-c.rect[3]*.5f,0.f,1-c.rect[3]);
             c.offset[0]=g.focus_feather;c.offset[2]=float(g.show_foveation_border);c.motion[2]=float(g.center_method);c.motion[3]=focused?1.f:0.f;
+            auto& draw=draws[eye];draw=std::make_shared<DeferredDraw>();
+            draw->previous=previous[eye];draw->current=current[eye];draw->old_guides=old_guides[eye];draw->new_guides=new_guides[eye];
             // Render-target output works for every swapchain color format,
             // including BGRA and sRGB, which typed UAVs do not.
-            // TODO(perf): render straight into the acquired OpenXR image (and use
-            // the compute path where the format allows) instead of a private
-            // texture plus an upload copy.
             D3D11_TEXTURE2D_DESC e{};e.Width=d.Width;e.Height=d.Height;e.MipLevels=e.ArraySize=1;e.Format=d.Format;e.SampleDesc.Count=1;
-            e.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;
-            out[eye]=image(e,true);if(!out[eye])return false;
-            auto& rtv=targets[eye];if(FAILED(device->CreateRenderTargetView(out[eye]->texture11.Get(),nullptr,&rtv)))return false;
+            e.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;draw->desc=e;
             D3D11_BUFFER_DESC b{};b.ByteWidth=sizeof(c);b.BindFlags=D3D11_BIND_CONSTANT_BUFFER;D3D11_SUBRESOURCE_DATA initial{&c};
-            if(FAILED(device->CreateBuffer(&b,&initial,&constants[eye])))return false;
-            viewports[eye]={0,0,float(d.Width),float(d.Height),0,1};
-        }
-        return submit_shader([&](ID3D11DeviceContext* commands){
-            for(unsigned eye=0;eye<2;++eye){
-                auto* cb=constants[eye].Get();auto* ss=sampler.Get();
-                ID3D11ShaderResourceView* srvs[]{previous[eye]->srv11.Get(),current[eye]->srv11.Get(),
-                    new_guides[eye]->motion_srv.Get(),new_guides[eye]->depth_srv.Get(),old_guides[eye]->depth_srv.Get()};
-                auto* target=targets[eye].Get();commands->OMSetRenderTargets(1,&target,nullptr);commands->OMSetDepthStencilState(nullptr,0);
-                commands->OMSetBlendState(nullptr,nullptr,~0u);commands->RSSetState(rasterizer.Get());commands->RSSetViewports(1,&viewports[eye]);
-                commands->IASetInputLayout(nullptr);commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                commands->VSSetShader(vertex.Get(),nullptr,0);commands->PSSetShader(pixel.Get(),nullptr,0);
-                commands->PSSetConstantBuffers(0,1,&cb);commands->PSSetSamplers(0,1,&ss);commands->PSSetShaderResources(0,5,srvs);commands->Draw(3,0);
-                ID3D11ShaderResourceView* empty[5]{};commands->PSSetShaderResources(0,5,empty);commands->OMSetRenderTargets(0,nullptr,nullptr);
+            if(FAILED(device->CreateBuffer(&b,&initial,&draw->constants)))return false;
+            if(deferred_output){
+                static std::atomic<std::uint64_t> next_identity{1ull<<62};
+                out[eye]=std::make_shared<TransportImage>();out[eye]->identity=++next_identity;out[eye]->pending11=draw;
+                continue;
             }
+            out[eye]=image(e,true);if(!out[eye])return false;
+            if(FAILED(device->CreateRenderTargetView(out[eye]->texture11.Get(),nullptr,&targets[eye])))return false;
+        }
+        if(deferred_output)return true;
+        return submit_shader([&](ID3D11DeviceContext* commands){
+            for(unsigned eye=0;eye<2;++eye)record_draw(commands,*draws[eye],targets[eye].Get());
             return true;},true);
+    }
+    // Renders a deferred pass into an acquired OpenXR image of the same size.
+    bool draw_into(ID3D11Texture2D* target,const Image& source) {
+        const auto* draw=deferred(source);if(!target||!draw)return false;
+        D3D11_TEXTURE2D_DESC t{};target->GetDesc(&t);
+        if(t.Width!=draw->desc.Width||t.Height!=draw->desc.Height||!(t.BindFlags&D3D11_BIND_RENDER_TARGET))return false;
+        D3D11_RENDER_TARGET_VIEW_DESC view{};view.Format=draw->desc.Format;
+        view.ViewDimension=t.ArraySize>1?D3D11_RTV_DIMENSION_TEXTURE2DARRAY:D3D11_RTV_DIMENSION_TEXTURE2D;
+        if(t.ArraySize>1){view.Texture2DArray.ArraySize=1;}
+        ComPtr<ID3D11RenderTargetView> rtv;if(FAILED(device->CreateRenderTargetView(target,&view,&rtv)))return false;
+        return submit_shader([&](ID3D11DeviceContext* commands){record_draw(commands,*draw,rtv.Get());return true;},true);
     }
     // Copies an immutable frame into an acquired OpenXR image (presentation thread).
     bool upload(ID3D11Texture2D* target,const Image& source) {

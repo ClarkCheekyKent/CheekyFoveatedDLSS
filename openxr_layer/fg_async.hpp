@@ -52,6 +52,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
     // Native D3D11 frames carry no release policy (point 0: release the game
     // at FG submission). Nonzero applies that release point to them instead.
+    std::atomic<bool> direct11_requested{};
     std::atomic<unsigned> native11_release_point{3}; // Matches the D3D12 default: after generated frame submission.
     CheekyFgTransportOptionsFn transport_options_query{};
     CheekyFgStorageOptions storage_options; // Protected by capture_mutex; latched at app WaitFrame.
@@ -485,6 +486,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(output_query&&output_query(&direct_options)){
             const unsigned mode=backend->supports_direct_output() && direct_options.requested==1u;
             if(direct_output_mode.exchange(mode)!=mode)direct_blocked_target=0;
+            // Native D3D11 renders generated frames straight into the OpenXR
+            // image without the D3D12 direct-output handshake.
+            if(direct11_requested.exchange(direct_options.requested==1u)!=(direct_options.requested==1u)&&native11&&trace)
+                trace(direct_options.requested==1u?"FG native D3D11 output=direct OpenXR image":"FG native D3D11 output=private image + copy");
         }
         if(query&&query(&options)){
             const auto old_color=color_capture_mode.exchange(options.color_capture_mode==1u?1u:0u);
