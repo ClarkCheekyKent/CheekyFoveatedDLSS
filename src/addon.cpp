@@ -1743,7 +1743,7 @@ void draw_settings_overlay(reshade::api::effect_runtime*) {
         if(ImGui::Combo("Quad assignment mode",&quad_mode,"Automatic\0Manual\0")){settings.quad_manual_assignment=quad_mode==1;changed=true;}
         const auto quad=quad_view_snapshot();
         if(quad.active){
-            if(quad_is_app_snapshot(quad))ImGui::TextWrapped("The game composites four DLSS views before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right (right eye first when the first DLSS view is set as the right eye). Frame generation uses the two periphery views' depth and motion for the whole eye.");
+            if(quad_is_app_snapshot(quad))ImGui::TextWrapped("The game composites four DLSS views before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right. Frame generation uses the two periphery views' depth and motion for the whole eye.");
             ImGui::TextWrapped("Small numbers repeat across each view. Manual roles are saved by view number and restored when the source count matches. Check labels if the game's order changes.");
             for(const auto& source:quad.sources)if(source.dlss_view){const auto label="View "+std::to_string(source.number);int selected=int(source.manual_role);
                 if(!settings.quad_manual_assignment){unsigned role{};
