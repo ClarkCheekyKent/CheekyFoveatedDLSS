@@ -1067,11 +1067,12 @@ void diagnostic_lifetime_test() {
 #include "quad_capture_d3d11_validation.hpp"
 #include "quad_role_mapping_validation.hpp"
 #include "fg_shader11_validation.hpp"
+#include "fg_parity_validation.hpp"
 #include "fg_shader11_ngx_probe.hpp"
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
-        if(argc>1&&std::string(argv[1])=="--fg-shader11") {fg_shader11_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-shader11") {fg_shader11_validation();fg_cross_api_parity();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shader11-hardware") {fg_shader11_validation(true);return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shader11-ngx") {
             check(argc>2,"--fg-shader11-ngx requires the DLSS model DLL directory");
