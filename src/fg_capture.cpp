@@ -351,7 +351,9 @@ void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,co
     m.center_method=settings.fg.center_method;
     m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
     m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
-    if(!assignment.calibrated||assignment.eye_index>1||!assignment.calibration_session)return;
+    // calibration_session 0 means OpenVR calibration (OpenComposite); the
+    // layer binds it to its single running D3D11 OpenXR session.
+    if(!assignment.calibrated||assignment.eye_index>1)return;
     source.session_generation=assignment.calibration_session;source.mapping_revision=assignment.mapping_revision;
     source.generation=stereo_view_generation(view_id);source.vertical_flip=assignment.vertical_flip;
     m.configuration=configuration(settings);

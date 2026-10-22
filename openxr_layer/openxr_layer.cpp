@@ -3838,10 +3838,18 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_ObserveShaderD3D11V1(cons
     if(!input||input->abi!=1||input->size!=sizeof(*input)||!input->context)return false;
     try{
         std::shared_ptr<cheeky::fg::BufferedPresenter> presenter;
+        auto source=*input;
         {std::lock_guard lock(state_mutex);
-            for(const auto& [handle,owner]:sessions)if(owner.running&&owner.graphics_api==11&&owner.generation==input->session_generation){
-                presenter=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner.fg);break;}}
-        return presenter&&presenter->native11&&presenter->native11->observe(*input);
+            // Session 0: the eye calibration came from OpenVR (an OpenComposite
+            // game such as ACC), which has no OpenXR generation. Bind it to the
+            // only running D3D11 session; with several, the owner is ambiguous.
+            unsigned matches{};
+            for(const auto& [handle,owner]:sessions)if(owner.running&&owner.graphics_api==11&&
+                (owner.generation==input->session_generation||!input->session_generation)){
+                presenter=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner.fg);
+                source.session_generation=owner.generation;++matches;}
+            if(matches!=1)return false;}
+        return presenter&&presenter->native11&&presenter->native11->observe(source);
     }catch(...){return false;}
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStatus(CheekyFgStatus* out) noexcept {

@@ -258,6 +258,30 @@ inline void fg_backend11_dispatch_gate(){
     check(admitted&&excluded&&completed&&bridged&&inactive,
         "Stereo NGX excludes native GPU/runtime and bridge submissions; inactive sessions remain ungated");
 }
+// OpenComposite games (ACC) calibrate eyes through OpenVR, so the runtime
+// publishes guides with session 0. The layer binds them to its only running
+// D3D11 session and refuses when more than one could own them.
+inline void fg_backend11_openvr_calibration(){
+    using namespace shader11_fixture;using namespace cheeky::fg;
+    auto presenter=std::make_shared<BufferedPresenter>();
+    const auto session=reinterpret_cast<XrSession>(0xf612),other=reinterpret_cast<XrSession>(0xf613);
+    check(presenter->setup11(session,Runtime::functions(),device.Get(),7,nullptr),"OpenVR calibration presenter setup");
+    {std::lock_guard lock(state_mutex);auto& owner=sessions[session];
+        owner.running=true;owner.graphics_api=11;owner.graphics_device=device.Get();owner.generation=7;owner.fg=presenter;}
+    auto depth=texture(DXGI_FORMAT_R32_FLOAT,{.5f,0,0,0});auto motion=texture(DXGI_FORMAT_R32G32_FLOAT,{0,0,0,0});
+    auto openvr=[&](unsigned eye){auto s=source(eye,1,depth.Get(),motion.Get());s.session_generation=0;return s;};
+    auto left=openvr(0),right=openvr(1);
+    const bool bound=CheekyFG_ObserveShaderD3D11V1(&left)&&CheekyFG_ObserveShaderD3D11V1(&right);
+    std::array<std::shared_ptr<Backend11::Guides>,2> guides;
+    const bool claimed=presenter->native11->take_guides(guides)&&guides[0]->source.session_generation==7;
+    {std::lock_guard lock(state_mutex);auto& owner=sessions[other];owner.running=true;owner.graphics_api=11;owner.generation=8;}
+    const bool ambiguous=!CheekyFG_ObserveShaderD3D11V1(&left);
+    auto stale=source(0,1,depth.Get(),motion.Get());stale.session_generation=6;
+    const bool mismatched=!CheekyFG_ObserveShaderD3D11V1(&stale);
+    {std::lock_guard lock(state_mutex);sessions.erase(session);sessions.erase(other);}
+    check(bound&&claimed&&ambiguous&&mismatched,
+        "OpenVR-calibrated guides bind to the single running D3D11 session; ambiguous or stale sessions are rejected");
+}
 // Exercise the same immediate-context fence submission seen in Virtual
 // Desktop's xrEndFrame while Backend11 switches state and records GPU work.
 // This uses the real adapter but needs neither a headset nor an OpenXR runtime.
@@ -296,6 +320,7 @@ void fg_shader11_validation(bool hardware=false){
     check(SUCCEEDED(D3D11CreateDevice(nullptr,hardware?D3D_DRIVER_TYPE_HARDWARE:D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"Native shader D3D11 device");
     fg_backend11_copy_state();
     fg_backend11_dispatch_gate();
+    fg_backend11_openvr_calibration();
     if(hardware)fg_backend11_fence_stress();
     else fg_backend11_pixels();
     fg_backend11_pipelined();
