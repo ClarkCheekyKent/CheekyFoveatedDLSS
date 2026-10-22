@@ -345,6 +345,7 @@ void update_settings(const Settings& settings) noexcept {
     );
     manual_stereo_mapping.store(settings.manual_stereo_mapping, std::memory_order_release);
     manual_stereo_right_first.store(settings.manual_stereo_right_first, std::memory_order_release);
+    app_quad_views().default_right_first(settings.manual_stereo_mapping&&settings.manual_stereo_right_first);
     quad_manual_assignment.store(settings.quad_manual_assignment);quad_show_numbers.store(settings.quad_show_numbers);
     quad_saved_roles=settings.quad_saved_roles;quad_saved_source_count=std::min(settings.quad_saved_source_count,8u);
     independent_openxr_gaze.store(settings.independent_openxr_gaze, std::memory_order_release);

@@ -526,7 +526,7 @@ bool draw_quad_controls(OverlayUiState& r,const OverlayRuntime& runtime) {
     if(!flag(quad,"active"))return false;
     ImGui::SeparatorText("Quad view assignment");
     draw_quad_preferences(r.draft);
-    if(flag(quad,"app_composited"))ImGui::TextWrapped("Four DLSS views; the game composites them before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right. Use Manual to change it.");
+    if(flag(quad,"app_composited"))ImGui::TextWrapped("Four DLSS views; the game composites them before OpenXR. Default order: Periphery Left, Center Left, Periphery Right, Center Right (right eye first when the first DLSS view is set as the right eye). Use Manual to change it.");
     diagnostic_line(quad,"Assignment","status");
     const auto sources=member(quad,"sources");
     for(unsigned i=0;i<8;++i){const auto source=array_object(sources,i);if(source.empty())break;

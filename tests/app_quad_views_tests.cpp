@@ -16,6 +16,11 @@ int main(){
     check(s.active&&s.status==2&&!s.manual_mode,"Four evaluated views plus a unique desktop view must activate");
     const unsigned order[]{0,2,1,3};
     for(unsigned i=0;i<4;++i)check(s.views[i].dlss_view==100+order[i]&&s.views[i].focus==unsigned(i>=2)&&s.views[i].eye_index==i%2,"Default quad order");
+    const auto revision=s.revision;map.default_right_first(true);s=map.snapshot(1,4,40);
+    const unsigned right_order[]{2,0,3,1};
+    for(unsigned i=0;i<4;++i)check(s.views[i].dlss_view==100+right_order[i]&&s.views[i].eye_index==i%2,"Right-first default quad order");
+    check(s.revision!=revision,"Changing the default eye order must reset FG history");
+    map.default_right_first(false);s=map.snapshot(1,4,40);
     for(const auto scale:{.2F,.75F,1.F,1.5F,2.F,3.F}){
         const auto dimensions=cheeky::foveated_dlss::peripheral_dlaa_dimensions(800,600,scale);
         const auto clamped=(std::min)(scale,1.F);

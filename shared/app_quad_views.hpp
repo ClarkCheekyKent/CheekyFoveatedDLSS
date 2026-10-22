@@ -8,7 +8,8 @@ namespace cheeky::foveated_dlss {
 // Some games composite their four reconstructions before OpenXR. This tracks
 // evaluated game features, never private NGX features or merely created handles.
 // Geometry identifies a four-view set. Default roles follow first evaluation
-// order (peripheral L, center L, peripheral R, center R); manual roles override it.
+// order (peripheral L, center L, peripheral R, center R, or the right eye first
+// when the game's stereo views are declared right-first); manual roles override it.
 class AppQuadViews {
     struct Source { uint64_t id{},generation{}; unsigned width{},height{}; };
     std::mutex mutex;
@@ -16,7 +17,7 @@ class AppQuadViews {
     std::array<unsigned,8> roles{},saved{};
     uint64_t xr_session{},frame_key{},epoch{},revision{},last_seen{};
     unsigned confirmations{},misses{},saved_count{};
-    bool overflow{},active{},manual{},numbers{},restore_pending{true};
+    bool overflow{},active{},manual{},numbers{},restore_pending{true},right_first{};
     static bool same(const Source& a,const Source& b) {
         return a.id==b.id&&a.generation==b.generation&&a.width==b.width&&a.height==b.height;
     }
@@ -69,14 +70,17 @@ class AppQuadViews {
         out.manual_mode=manual;out.show_numbers=numbers;out.status=active?2:0;
         unsigned assigned{};
         for(unsigned i=0;i<8;++i){const auto& s=sources[i];out.sources[i]={s.id,s.generation,i+1,roles[i],s.width,s.height};
-            static constexpr unsigned defaults[]{1,3,2,4};
-            const auto role=manual?roles[i]:(i<4?defaults[i]:0);
+            static constexpr unsigned defaults[]{1,3,2,4},right_defaults[]{2,4,1,3};
+            const auto role=manual?roles[i]:(i<4?(right_first?right_defaults:defaults)[i]:0);
             if(s.id&&role){auto& v=out.views[role-1];v.dlss_view=s.id;v.registration_generation=s.generation;
                 v.width=s.width;v.height=s.height;/* Default order is a convention, not pixel verification. */++assigned;}}
         for(unsigned i=0;i<4;++i){out.views[i].view_index=i;out.views[i].eye_index=i%2;out.views[i].focus=i>=2;}
         if(active&&manual)out.status=assigned==4?2:1;
         return out;
     }
+    // The game evaluates its right eye first (the stereo "first DLSS view is
+    // right eye" declaration). A change re-roles both eyes, so FG history resets.
+    void default_right_first(bool value) {std::lock_guard lock(mutex);if(right_first!=value){right_first=value;++revision;}}
     void configure(bool m,bool n,const unsigned* layout,unsigned count) {
         std::lock_guard lock(mutex);if(manual!=m){manual=m;++revision;}numbers=n;
         if(layout&&count<=8){unsigned used{};bool valid=true;
