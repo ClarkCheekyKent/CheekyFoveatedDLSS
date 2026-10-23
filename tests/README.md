@@ -276,8 +276,8 @@ builds use Windows foreground state. `--capture=<absolute.bmp>` saves an SDR
 frame for visual inspection.
 
 `CheekyStandaloneHostTests.exe fg standalone` (also `fg optiscaler`) exercises
-the actual host, runtime, NGX hooks and GPU guide snapshots without UEVR frame
-hooks. It checks automatic hook-free pairing, partial/ambiguous guide rejection,
+the actual host, runtime, NGX hooks and GPU guide snapshots. It checks
+`xrEndFrame` pairing, partial/ambiguous guide rejection,
 recovery, FG disable/re-enable and defaults. `CheekyOverlayTests.exe --ui` also
 checks the FG tab's compatibility status, presented counters, unique FPS and GPU
 timings. `fg-dx11 standalone` and `fg-dx11 optiscaler` exercise automatic DX12

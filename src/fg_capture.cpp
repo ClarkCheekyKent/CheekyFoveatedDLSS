@@ -1,7 +1,6 @@
 #include "fg_capture.hpp"
 #include "settings.hpp"
 #include "fg_snapshot.hpp"
-#include "fg_frame_phase.hpp"
 #include "fg_source_lifecycle.hpp"
 #include "quad_view_bridge.hpp"
 #include "../shared/cheeky_quad_fg.hpp"
@@ -9,7 +8,6 @@
 #include "../shared/fg_uevr_mode.hpp"
 #include "gaze_foveation.hpp"
 #include "fg_sr_region.hpp"
-#include "uevr_frame_source.hpp"
 #include "runtime.hpp"
 #include <Windows.h>
 #include <wrl/client.h>
@@ -26,67 +24,13 @@ namespace cheeky::foveated_dlss {
 namespace {
 std::mutex mutex;
 std::atomic<bool> pending_submissions{};
-std::atomic<bool> standalone_host{};
 // Two different concepts: desired FG setting vs. whether the current UEVR
 // rendering method can supply native stereo. Never overwrite FgEnabled.
 std::atomic<int> uevr_fg_rendering_mode{cheeky::fg::no_uevr_host};
 std::atomic<std::uint64_t> uevr_fg_mode_epoch{1};
 std::atomic<std::uint64_t> observed_fg_lists{},recognized_fg_guides{};
-// Set by UEVR's executing RHI command, not by an engine-tick/global counter.
-thread_local std::uint64_t render_frame{};
-std::atomic<std::uint64_t> source_epoch{1};
-thread_local std::uint64_t ticket_epoch{};
-std::mutex source_mutex;
-using EnqueueRenderPoses=void(*)(void*,std::uint32_t);
-void* original_enqueue{};
-int source_hook{-1};
-std::atomic<bool> source_abandoned{};
-CheekyFgUnregisterHookFn unregister_source{};
-std::atomic<std::uint64_t> source_calls{},last_guide_frame{},captured_guides{},missing_frame_guides{},color_copies{};
-std::atomic<std::uint64_t> last_color_frame{};
+std::atomic<std::uint64_t> captured_guides{};
 FgSnapshots::Match last_color_match;
-char source_message[128]{"Plugin frame source has not attached"};
-using RhiCommand=void*(*)(void*,void*,void*,void*,void*,void*,void*,void*,void*,void*,void*,void*);
-struct RhiHook {void* original{};int id{-1};std::uintptr_t begin{},end{};};
-std::array<RhiHook,8> rhi_hooks;
-unsigned rhi_hook_count{};
-std::atomic<int> selected_rhi{-1};
-std::atomic<std::uint64_t> rhi_serial{};
-thread_local bool rhi_ticket{};
-thread_local FgFramePhase frame_phase;
-std::atomic<unsigned> phase_traces{};
-template<unsigned Index> void* rhi_command(void* a,void* b,void* c,void* d,void* e,void* f,void* g,void* h,void* i,void* j,void* k,void* l) {
-    if(!source_abandoned.load()&&selected_rhi.load()==int(Index)){
-        const auto epoch=source_epoch.load();if(ticket_epoch!=epoch||!rhi_ticket)frame_phase={};
-        render_frame=0x100000000ull+(++rhi_serial);ticket_epoch=epoch;rhi_ticket=true;
-        frame_phase.begin(render_frame);
-    }
-    return reinterpret_cast<RhiCommand>(rhi_hooks[Index].original)(a,b,c,d,e,f,g,h,i,j,k,l);
-}
-template<std::size_t... I> auto rhi_detours(std::index_sequence<I...>){return std::array<RhiCommand,sizeof...(I)>{&rhi_command<unsigned(I)>...};}
-void enqueue_render_poses(void* runtime,std::uint32_t frame) {
-    // This is the frame argument of the actual UEVR render-pose command, on
-    // the calling render/RHI thread. Never read a latest game-thread counter.
-    if(!source_abandoned.load()&&selected_rhi.load()<0&&rhi_hook_count){
-        void* stack[16]{};const auto count=CaptureStackBackTrace(0,16,stack,nullptr);
-        for(unsigned n=0;n<count&&selected_rhi.load()<0;++n)for(unsigned slot=0;slot<rhi_hook_count;++slot){
-            auto ip=reinterpret_cast<std::uintptr_t>(stack[n]);const auto& hook=rhi_hooks[slot];
-            if(hook.id>=0&&ip>=hook.begin&&ip<hook.end){
-                selected_rhi=int(slot);++source_epoch;render_frame=0;rhi_ticket=false;
-                trace_event("FG RHI frame source selected entry=%p; stamp precedes original command execution",reinterpret_cast<void*>(hook.begin));break;
-            }
-        }
-    }
-    if(source_abandoned.load())render_frame=0;
-    else if(selected_rhi.load()<0){render_frame=std::uint64_t(frame)+1;ticket_epoch=source_epoch.load();rhi_ticket=false;}
-    else if(!rhi_ticket||ticket_epoch!=source_epoch.load())render_frame=0;
-    // enqueue_render_poses can run AFTER the original RHI command. Once its
-    // dispatcher is selected, retain the entry ticket instead of overwriting
-    // it here with a frame number that arrives after DLSS has already run.
-    ++source_calls;
-    const auto original=reinterpret_cast<EnqueueRenderPoses>(original_enqueue);
-    if(original)original(runtime,frame);
-}
 // Creation and evaluation need not use the same parameter object. In
 // particular, reversed depth and jittered motion are feature creation flags.
 std::unordered_map<const NgxHandle*,std::uint32_t> feature_flags;
@@ -102,7 +46,6 @@ std::uint64_t static_eye_crop_configuration{},static_eye_crop_mapping{};
 // GPU recordings can outlive a runtime detach. Keep queue generations until
 // their recorded work and every consumer lease have retired.
 struct SnapshotStore {
-    FgColorProvenance colors;
     std::vector<std::unique_ptr<FgSnapshots>> generations;
     FgSnapshots* active{};
     bool capture_was_enabled{};
@@ -120,9 +63,7 @@ void synchronize_capture_enabled_locked(bool requested) {
     if(state.capture_was_enabled==requested)return;
     state.capture_was_enabled=requested;
     state.active->invalidate();
-    state.colors.invalidate();
     last_color_match={};
-    last_color_frame=0;
     if(!requested){
         state.generations.push_back(std::make_unique<FgSnapshots>());
         state.active=state.generations.back().get();
@@ -132,17 +73,12 @@ void synchronize_capture_enabled_locked(bool requested) {
     }
     state.collect();
     pending_submissions=std::any_of(state.generations.begin(),state.generations.end(),
-        [](const auto& p){return p->pending_submissions();})||state.colors.has_pending();
+        [](const auto& p){return p->pending_submissions();});
 }
 bool enabled() noexcept {
     return current_settings().fg.enabled &&
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
-// Standalone always matches guide pairs at xrEndFrame; UEVR uses its frame hooks.
-bool hookless_selected(const Settings::FrameGeneration&) noexcept {
-    return standalone_host.load(std::memory_order_acquire);
-}
-bool hookless_selected() noexcept {return hookless_selected(current_settings().fg);}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // Pacing policy is NOT a texture/NGX feature configuration. Hashing
     // release_point here stopped FG, invalidated stereo snapshots and reset
@@ -150,7 +86,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{unsigned(s.foveated),unsigned(s.match_sr_region),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
-        s.center_method,s.peripheral_method,s.depth_bits,s.motion_bits,unsigned(hookless_selected(s)),std::bit_cast<unsigned>(s.width),
+        s.center_method,s.peripheral_method,s.depth_bits,s.motion_bits,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
     return hash;
@@ -184,7 +120,6 @@ float f(const NgxParameters* p,const char* n,float fallback=0) noexcept {
 // A mode transition is also a producer-lifecycle transition. Retire the
 // previous immutable snapshot generation when leaving native stereo; the
 // old generation remains alive until GPU submissions and leases retire.
-void fg_set_standalone_host(bool value) noexcept { standalone_host.store(value,std::memory_order_release); }
 void fg_uevr_mode_attached() noexcept { fg_uevr_mode_published(0xFFFFFFFFu); }
 void fg_uevr_mode_published(std::uint32_t mode) noexcept try {
     const int next=cheeky::fg::uevr_mode_value(mode);
@@ -203,60 +138,36 @@ void fg_set_uevr_queue(ID3D12CommandQueue* q) noexcept try {
     std::lock_guard lock(mutex);
     synchronize_capture_enabled_locked(enabled());
     if(!enabled()){store().collect();return;}
-    if(!q){
-        // D3D11/OpenComposite has no D3D12 presentation queue. Its private
-        // transport publishes the actual guide queue on each evaluation.
-        if(hookless_selected())return;
-        snapshots().invalidate();store().colors.invalidate();return;
-    }
+    // D3D11/OpenComposite has no D3D12 presentation queue. Its private
+    // transport publishes the actual guide queue on each evaluation.
+    if(!q)return;
     store().collect();
-    // In hook-free mode 3 the UEVR renderer accessor is only the provisional
-    // queue. Once a real NGX guide submission identified its executing queue,
-    // do not overwrite that proof on the next (per-frame) UEVR runtime tick.
-    // A different device still forces the normal queue-generation transition.
-    if(hookless_selected()&&snapshots().has_discovered_submission_queue()&&
-       snapshots().same_queue_device(q))return;
+    // The UEVR renderer accessor is only the provisional queue. Once a real
+    // NGX guide submission identified its executing queue, do not overwrite
+    // that proof on the next (per-frame) UEVR runtime tick. A different
+    // device still forces the normal queue-generation transition.
+    if(snapshots().has_discovered_submission_queue()&&snapshots().same_queue_device(q))return;
     if(!snapshots().initialize(q)&&store().generations.size()<8){
         snapshots().invalidate();
-        store().colors.invalidate();
         auto next=std::make_unique<FgSnapshots>();
         if(next->initialize(q)){store().generations.push_back(std::move(next));store().active=store().generations.back().get();}
     }
 } catch(...) {}
 void fg_note_submission(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* list) noexcept try {
     std::lock_guard lock(mutex);++observed_fg_lists;
-    const bool hookless=hookless_selected();
     for(auto& p:store().generations)
-        recognized_fg_guides+=p->submitted(q,list,hookless&&p.get()==store().active);
-    if(!hookless)store().colors.submitted(q,list,snapshots());
+        recognized_fg_guides+=p->submitted(q,list,p.get()==store().active);
     pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
-        [](const auto& p){return p->pending_submissions();})||store().colors.has_pending();
+        [](const auto& p){return p->pending_submissions();});
 } catch(...) {}
 void fg_retire_snapshots() noexcept try {std::lock_guard lock(mutex);synchronize_capture_enabled_locked(enabled());store().collect();} catch(...) {}
 void fg_note_reset(ID3D12GraphicsCommandList* list) noexcept try {
     std::lock_guard lock(mutex);for(auto& p:store().generations)p->reset(list);
-    store().colors.reset(list);
     pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
-        [](const auto& p){return p->pending_submissions();})||store().colors.has_pending();
-} catch(...) {}
-void fg_note_color_copy(ID3D12GraphicsCommandList* list,ID3D12Resource* color) noexcept try {
-    // Most copies (including our guide snapshots) are unrelated. Inspect the
-    // registration before taking the mutex; snapshot recording already owns it.
-    // Standalone matching happens at xrEndFrame, after the complete stereo submission.
-    // Do not require private UEVR color-copy queues or resource identities.
-    if(!enabled()||hookless_selected()||!FgColorProvenance::registered(color))return;
-    const bool hookless=false;
-    const auto color_frame=hookless?0:ticket_epoch!=source_epoch.load()?0:rhi_ticket?frame_phase.color():render_frame;
-    ++color_copies;
-    std::lock_guard lock(mutex);store().colors.observe(list,color,snapshots(),color_frame,hookless);
-    pending_submissions=true;
-    if(!hookless&&rhi_ticket&&phase_traces.fetch_add(1)<48)
-        trace_event("FG color phase copy=%p command=%p render_entry=%llu color_content=%llu evaluations=%u previous_complete=%llu",
-            color,list,render_frame,color_frame,frame_phase.evaluations,frame_phase.previous);
+        [](const auto& p){return p->pending_submissions();});
 } catch(...) {}
 bool fg_recording_tagged(ID3D12GraphicsCommandList* list) noexcept{return FgSnapshots::tagged(list);}
 bool fg_has_pending_submissions() noexcept{return pending_submissions.load(std::memory_order_relaxed);}
-void fg_abandon_frame_source() noexcept {source_abandoned=true;++source_epoch;}
 void fg_remember_feature(const NgxHandle* handle,const NgxParameters* p) noexcept try {
     std::uint32_t flags{};if(!handle||!try_get_ngx_integer_bits(p,"DLSS.Feature.Create.Flags",flags))return;
     std::uint64_t revision{};
@@ -398,7 +309,7 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
     m.center_method=settings.fg.center_method;
     m.peripheral_method=std::min(settings.fg.peripheral_method,2u);m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
     m.focus_feather=settings.fg.feather;m.show_foveation_border=settings.fg.show_border;m.configuration=configuration(settings);
-    source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;source.submit_repeats=settings.fg.submit_repeats;
+    source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;
     // Quad native frame identities are assigned at the four-view xrEndFrame.
     source.frame_id=0;observe(&source);
 }catch(...){}
@@ -429,11 +340,8 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
             entered[0].load(),entered[1].load());
     }
     const auto settings=current_settings();
-    const bool hookless=hookless_selected(settings.fg);
-    if(!hookless&&(!render_frame||ticket_epoch!=source_epoch.load())){++missing_frame_guides;return;}
-    // Standalone mode has no frame ticket. Only the ordered, immutable guide
-    // recordings and final color-copy enqueue are used to associate a pair.
-    if(!hookless&&rhi_ticket)frame_phase.evaluated();
+    // There is no frame ticket. Only the ordered, immutable guide recordings
+    // and the stereo pair completed at xrEndFrame associate a pair.
     std::uint32_t flags{};bool flags_known{};
     {std::lock_guard lock(mutex);if(auto entry=feature_flags.find(handle);entry!=feature_flags.end()){flags=entry->second;flags_known=true;}}
     // Late attachment can still recover an explicitly supplied declaration.
@@ -453,7 +361,6 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const unsigned w=ui(p,"OutWidth"),h=ui(p,"OutHeight");
     if(!w||!h){quad_skip("output size missing");return;}
     CheekyFgEye m;
-    m.render_frame=hookless?0:render_frame;
     m.depth=depth;m.motion=motion;
     m.feature=reinterpret_cast<std::uintptr_t>(handle);m.width=w;m.height=h;
     m.depth_width=ui(p,"DLSS.Render.Subrect.Dimensions.Width",static_cast<unsigned>(dd.Width));
@@ -555,7 +462,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const bool recorded=snapshots().record(cmd,m,identity);
     if(!recorded)quad_skip("guide snapshot recording failed",dd.DepthOrArraySize,m.depth_width,m.depth_height);
     if(recorded){
-        pending_submissions=true;++captured_guides;last_guide_frame=m.render_frame;
+        pending_submissions=true;++captured_guides;
         if(static_eye_crop_configuration!=m.configuration||static_eye_crop_mapping!=identity.mapping_revision){
             static_eye_crops.valid_mask=0;
             static_eye_crop_configuration=m.configuration;
@@ -569,104 +476,30 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     }
 } catch(...) {}
 }
-// Called by the adapter before installing any UEVR-private inline hooks and
-// after Lua settings changes. In hook-free mode the adapter never probes UEVR.
-extern "C" __declspec(dllexport) bool __cdecl CheekyFG_NeedsUEVRFrameSourceV1() noexcept {
-    return !cheeky::foveated_dlss::hookless_selected();
-}
-extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AttachUEVRFrameSource(void* backend,
-    CheekyFgRegisterHookFn install,CheekyFgUnregisterHookFn remove) noexcept try {
-    using namespace cheeky::foveated_dlss;
-    std::lock_guard lock(source_mutex);
-    if(hookless_selected()){
-        strcpy_s(source_message,"Standalone FG: no UEVR frame hooks");
-        return true; // Do not even inspect the installed UEVR runtime layout.
-    }
-    if(source_hook>=0&&!source_abandoned.load())return true;
-    // On a complete plugin unload UEVR clears its own inline hooks after
-    // FreeLibrary. The resident runtime must not reuse that old hook ID or
-    // trampoline when a fresh adapter attaches later.
-    source_hook=-1;
-    rhi_hooks={};rhi_hook_count=0;selected_rhi=-1;phase_traces=0;
-    if(!backend||!install||!remove){strcpy_s(source_message,"UEVR did not provide the native hook API");return false;}
-    const auto target=uevr_frames::locate(static_cast<HMODULE>(backend));
-    if(!target.function){strcpy_s(source_message,"Installed UEVR runtime layout is not supported by the plugin frame hook");trace_event("FG frame source: %s",source_message);return false;}
-    const auto image=uevr_frames::image(static_cast<HMODULE>(backend));
-    const auto roots=uevr_frames::rhi_dispatchers(image);
-    static const auto detours=rhi_detours(std::make_index_sequence<8>{});
-    for(const auto& root:roots){auto& hook=rhi_hooks[rhi_hook_count];
-        hook.begin=reinterpret_cast<std::uintptr_t>(backend)+root.begin;hook.end=reinterpret_cast<std::uintptr_t>(backend)+root.end;
-        hook.id=install(reinterpret_cast<void*>(hook.begin),reinterpret_cast<void*>(detours[rhi_hook_count]),&hook.original);
-        if(hook.id<0){for(unsigned n=0;n<rhi_hook_count;++n)remove(rhi_hooks[n].id);rhi_hook_count=0;
-            strcpy_s(source_message,"UEVR could not install a verified RHI command hook");return false;}
-        ++rhi_hook_count;
-    }
-    const auto id=install(target.function,reinterpret_cast<void*>(&enqueue_render_poses),&original_enqueue);
-    if(id<0){for(unsigned n=0;n<rhi_hook_count;++n)remove(rhi_hooks[n].id);rhi_hook_count=0;
-        strcpy_s(source_message,"UEVR could not install the plugin frame hook");return false;}
-    source_hook=id;unregister_source=remove;source_abandoned=false;++source_epoch;strcpy_s(source_message,"Plugin hook: UEVR render-pose frame argument");
-    trace_event("FG frame source attached: backend=%p table_rva=0x%X target=%p hook=%d rhi_entries=%u",backend,target.table_rva,target.function,id,rhi_hook_count);return true;
-} catch(...){return false;}
-extern "C" __declspec(dllexport) void __cdecl CheekyFG_DetachUEVRFrameSource() noexcept {
-    using namespace cheeky::foveated_dlss;
-    std::lock_guard lock(source_mutex);
-    source_abandoned=true;++source_epoch;
-    if(source_hook>=0&&unregister_source)unregister_source(source_hook);
-    for(unsigned n=0;n<rhi_hook_count;++n)if(rhi_hooks[n].id>=0&&unregister_source)unregister_source(rhi_hooks[n].id);
-    rhi_hook_count=0;selected_rhi=-1;
-    source_hook=-1;unregister_source=nullptr;++source_epoch;render_frame=0;
-    strcpy_s(source_message,hookless_selected()?"Standalone FG: no UEVR frame hooks":"Plugin frame source detached");
-}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFgCaptureHealth* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
-    std::lock_guard lock(source_mutex);out->plugin_hook=source_hook>=0&&!source_abandoned.load();
-    out->frame_calls=source_calls;out->last_guide_frame=last_guide_frame;out->captured_guides=captured_guides;
-    out->missing_frame_guides=missing_frame_guides;out->color_copies=color_copies;
-    strcpy_s(out->source,hookless_selected()?"Stereo pairs matched at xrEndFrame":
-        selected_rhi.load()>=0?"Plugin hook: RHI stereo phases":source_message);
+    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
+    out->captured_guides=captured_guides;
     std::lock_guard captures(mutex);const auto& match=last_color_match;
-    out->color_frame=last_color_frame;out->match_frame=match.frame;out->latest_frame=match.latest_frame;
     out->latest_evaluation=match.latest;out->consumed_evaluation=match.consumed;
     out->eligible=match.eligible;out->pending=match.pending;out->foreign=match.foreign;out->cancelled=match.cancelled;
     strcpy_s(out->match_reason,match.reason);return true;
 }
-extern "C" __declspec(dllexport) void __cdecl CheekyFG_SetRenderFrameV1(std::uint64_t frame) noexcept {
-    cheeky::foveated_dlss::render_frame=frame;
-    cheeky::foveated_dlss::ticket_epoch=cheeky::foveated_dlss::source_epoch.load();
-    cheeky::foveated_dlss::rhi_ticket=false;
-    cheeky::foveated_dlss::frame_phase={};
-}
-extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureStamp(ID3D12Resource* color,CheekyFgCaptureStamp* out) noexcept {
+// Each eye may release its OpenXR image independently. The stereo pair is
+// associated only at the single xrEndFrame after both releases.
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureStamp(ID3D12Resource*,CheekyFgCaptureStamp* out) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!out||out->abi!=1||out->size!=sizeof(*out)||!enabled())return false;
-    const bool hookless=hookless_selected();
-    if(hookless){
-        // Each eye may release its OpenXR image independently. The authoritative
-        // association is the single xrEndFrame AFTER both releases, not here.
-        out->token=out->render_frame=0;
-        return true;
-    }
-    std::lock_guard lock(mutex);out->token=store().colors.token(color,&snapshots(),false);out->render_frame=store().colors.frame(color);
-    last_color_frame=out->render_frame;
-    last_color_match=hookless?snapshots().last_match:snapshots().inspect(out->render_frame);
-    if(out->token)last_color_match.reason="Matched";
-    else if(!hookless&&!out->render_frame)last_color_match.reason="Color copy has no completed stereo interval";
-    static ULONGLONG next_trace{};const auto now=GetTickCount64();
-    if(now>=next_trace){next_trace=now+2000;const auto& m=last_color_match;
-        trace_event("FG match color_frame=%llu token=%llu last_guide_frame=%llu latest_frame=%llu eligible=%u pending=%u foreign=%u cancelled=%u latest_eval=%llu consumed=%llu failed=%llu reason=%s",
-            out->render_frame,out->token,last_guide_frame.load(),m.latest_frame,m.eligible,m.pending,m.foreign,m.cancelled,m.latest,m.consumed,m.failed,m.reason);}
-    return true;
+    out->token=out->render_frame=0;return true;
 }
 extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHooklessFrameV1(
     std::uint32_t use_for_fg) noexcept {
     using namespace cheeky::foveated_dlss;
-    if(!enabled()||!hookless_selected())return 0;
+    if(!enabled())return 0;
     std::lock_guard lock(mutex);
     auto& guides=snapshots();
-    const auto token=use_for_fg?guides.token(0,true):0;
-    if(!token)guides.discard_hookless_interval();
-    last_color_frame=0;
+    const auto token=use_for_fg?guides.token():0;
+    if(!token)guides.discard_interval();
     last_color_match=guides.last_match;
     if(!use_for_fg)last_color_match.reason="Native frame skipped at xrEndFrame";
     else if(token)last_color_match.reason="Matched at xrEndFrame";
@@ -700,7 +533,6 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
         static std::uint64_t previous_configuration{};
         if (previous != bool(out->enabled)||previous_configuration!=out->configuration) {
             snapshots().invalidate();
-            store().colors.invalidate();
             previous=out->enabled != 0;
             previous_configuration=out->configuration;
         }
@@ -783,7 +615,6 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_PeekCaptureCropsV2(Cheeky
         return false;
     CheekyFgCaptureCropsV2 sample;
     sample.token=out->token;
-    sample.render_frame=out->render_frame;
     // Reject any pending guide whose SR/FG settings revision is stale.
     const auto desired=fg_source_configuration(configuration(settings),game_sr_revision);
     if(!snapshots().peek_current_crops(sample,desired)||!sample.width||!sample.height)return false;
@@ -832,12 +663,6 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFg
     }
     out->guides_supported=1;out->guide_tick=GetTickCount64();return true;
 }
-extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_GetCaptureToken(ID3D12Resource* color) noexcept {
-    using namespace cheeky::foveated_dlss;
-    if(!enabled())return 0;
-    if(hookless_selected())return 0; // Only xrEndFrame may claim a hook-free stereo pair.
-    std::lock_guard lock(mutex);return store().colors.token(color,&snapshots(),false);
-}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair* out) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!out || out->abi!=CHEEKY_FG_PAIR_ABI || out->size!=sizeof(CheekyFgPair)||!enabled())return false;
@@ -848,10 +673,9 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     std::lock_guard lock(mutex);
     if(!snapshots().acquire(*out))return false;
     out->diagnostic_mode=mode;
-    out->enable_frame_id=!hookless_selected(settings)&&settings.backbuffer_frame_id ? 1u : 0u;
+    out->enable_frame_id=0; // There is no native frame number to pass as BackbufferFrameID.
     out->fg_queue_priority=settings.queue_priority <= 2u ? settings.queue_priority : 1u;
     out->release_point=settings.release_point<=5u?settings.release_point:0u;
-    out->submit_repeats=settings.submit_repeats?1u:0u;
     return true;
 }
 extern "C" __declspec(dllexport) void __cdecl CheekyFG_ReleasePair(CheekyFgPair* p) noexcept {
@@ -895,8 +719,8 @@ CheekyFgDiagnostic fg_diagnostic() noexcept {
     const auto query=layer?reinterpret_cast<CheekyFgDiagnosticFn>(GetProcAddress(layer,"CheekyFG_GetDiagnostic")):nullptr;
     if(query)query(&diagnostic);
     if(fg_status().state==CheekyFgState::guide_frame_mismatch){
-        CheekyFgCaptureHealth health;CheekyFG_GetCaptureHealth(&health);
-        if(!health.plugin_hook)strcpy_s(diagnostic.message,health.source);
+        CheekyFgCaptureHealth health;
+        if(CheekyFG_GetCaptureHealth(&health))strcpy_s(diagnostic.message,health.match_reason);
     }
     return diagnostic;
 }

@@ -20,9 +20,6 @@ using Image=std::shared_ptr<TransportImage>;
 // whatever source supplied the guides; pacing reads only these values.
 struct FramePolicy {
     std::uint32_t release_point{};  // 0 submission, 1 preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
-    // Native D3D11 captures use this default policy rather than the D3D12
-    // guide-pair settings. Keep both paths fresh-only unless explicitly set.
-    std::uint32_t submit_repeats{};
     std::uint32_t queue_priority{1}; // 0 separate NORMAL, 1 separate HIGH, 2 shared game queue.
 };
 // Backend-owned per-frame guide state (textures, leases, GPU dependencies).

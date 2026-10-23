@@ -190,15 +190,7 @@ std::string snapshot_locked(State& s) {
         << ",\"native_frames\":" << fg.native_frames
         << ",\"generated_frames\":" << fg.generated_frames
         << ",\"fallback_frames\":" << fg.fallback_frames
-        << ",\"frame_source\":\"" << json_escape(quad_guides?"Quad D3D11 raw-view capture":fg_capture.source) << "\""
-        << ",\"frame_source_hook\":" << bool(fg_capture.plugin_hook)
-        << ",\"frame_source_calls\":" << (quad_guides?quad_fg.frames:fg_capture.frame_calls)
         << ",\"captured_guides\":" << (quad_guides?quad_fg.snapshots:fg_capture.captured_guides)
-        << ",\"missing_frame_guides\":" << fg_capture.missing_frame_guides
-        << ",\"last_guide_frame\":" << fg_capture.last_guide_frame
-        << ",\"color_copies\":" << fg_capture.color_copies
-        << ",\"last_color_frame\":" << fg_capture.color_frame
-        << ",\"latest_captured_frame\":" << fg_capture.latest_frame
         << ",\"eligible_guides\":" << fg_capture.eligible
         << ",\"pending_guides\":" << fg_capture.pending
         << ",\"foreign_guides\":" << fg_capture.foreign
@@ -260,7 +252,7 @@ std::string snapshot_locked(State& s) {
         << ",\"cadence\":{\"supported\":" << bool(fg_rates.supported) << ",\"valid\":" << bool(fg_rates.valid)
         << ",\"game_fps\":" << fg_rates.game_fps << ",\"native_fps\":" << fg_rates.native_fps
         << ",\"generated_fps\":" << fg_rates.generated_fps << ",\"unique_fps\":" << fg_rates.unique_fps
-        << ",\"repeat_fps\":" << fg_rates.repeat_fps << ",\"submission_fps\":" << fg_rates.submission_fps
+        << ",\"submission_fps\":" << fg_rates.submission_fps
         << ",\"refresh_hz\":" << fg_rates.refresh_hz << ",\"native_target_fps\":" << fg_rates.native_target_fps
         << ",\"application_period_ms\":" << fg_rates.application_period_ms
         << ",\"app_image_wait_ms\":" << fg_rates.app_image_wait_ms << ",\"present_image_wait_ms\":" << fg_rates.present_image_wait_ms
@@ -314,14 +306,10 @@ std::string snapshot_locked(State& s) {
     out << "}"
         << ",\"presentation\":{\"supported\":" << bool(fg_present.supported)
         << ",\"native_samples\":" << fg_present.native_samples << ",\"generated_samples\":" << fg_present.generated_samples
-        << ",\"repeat_samples\":" << fg_present.repeat_samples << ",\"wait_samples\":" << fg_present.wait_samples
-        << ",\"wait_arrivals\":" << fg_present.wait_arrivals << ",\"wait_timeouts\":" << fg_present.wait_timeouts
         << ",\"native_age_ms\":" << fg_present.native_age_ms << ",\"native_age_last_ms\":" << fg_present.native_age_last_ms
         << ",\"generated_age_ms\":" << fg_present.generated_age_ms << ",\"generated_age_last_ms\":" << fg_present.generated_age_last_ms
         << ",\"newest_input_age_ms\":" << fg_present.newest_input_age_ms << ",\"newest_input_age_last_ms\":" << fg_present.newest_input_age_last_ms
-        << ",\"repeat_age_ms\":" << fg_present.repeat_age_ms << ",\"repeat_age_last_ms\":" << fg_present.repeat_age_last_ms
-        << ",\"late_wait_ms\":" << fg_present.late_wait_ms << ",\"late_wait_last_ms\":" << fg_present.late_wait_last_ms
-        << ",\"wait_budget_ms\":" << fg_present.wait_budget_ms << "}}"
+        << "}}"
         << ",\"d3d12_lower_hook_active\":" << d3d12_lower_hook_enabled()
         << ",\"d3d12_hook_restart_required\":" << d3d12_hook_restart_required(configured_settings().d3d12_lower_hook)
         << ",\"afw_experiment\":{\"enabled\":" << afw.enabled
@@ -614,7 +602,6 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
         if (!s.started) {
             set_processing_allowed(false);
             s.host = input->host;
-            fg_set_standalone_host(s.host != CheekyRuntimeHost::uevr);
             s.directory = input->config_directory;
             std::filesystem::create_directories(s.directory);
             s.config = s.directory / L"CheekyFoveatedDLSS.ini";
@@ -672,7 +659,6 @@ extern "C" __declspec(dllexport) bool CheekyUEVR_Start(const CheekyUEVRStart* in
 extern "C" __declspec(dllexport) void CheekyRuntime_Detach(std::uint64_t attachment) {
     if (!attachment || active_attachment.load(std::memory_order_acquire) != attachment) return;
     adapter_attached.store(false, std::memory_order_release);
-    fg_abandon_frame_source();
     if(state().host == CheekyRuntimeHost::uevr)fg_uevr_mode_detached();
     allow_afw_stereo_projection(false);
     eye_calibration_suspend();

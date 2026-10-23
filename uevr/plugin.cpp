@@ -20,11 +20,6 @@ CheekyUEVRPublishStereoFn runtime_publish_stereo{};
 CheekyUEVRPublishRenderingModeFn runtime_publish_mode{};
 CheekyUEVRCommandFn runtime_command{};
 CheekyUEVRSnapshotFn runtime_snapshot{};
-CheekyFgDetachFrameSourceFn runtime_detach_frame_source{};
-CheekyFgAttachFrameSourceFn runtime_attach_frame_source{};
-using NeedsFrameSourceFn=bool(__cdecl*)();
-NeedsFrameSourceFn runtime_needs_frame_source{};
-bool frame_source_policy_known{},frame_source_required{};
 
 std::atomic<bool> initialized{};
 std::atomic<bool> should_load{};
@@ -44,21 +39,6 @@ constexpr char snapshot_event[] = "cheeky.foveated_dlss.snapshot.v1";
 // Forward declarations
 bool initialize_dll();
 void detach_runtime();
-// The plugin's public API is stable across UEVR builds. Only the legacy
-// frame-source branch touches the private UEVR vtable/RHI implementation.
-void sync_frame_source() {
-    if(!api)return;
-    // Older runtimes lack the policy export and retain their legacy hook path.
-    const bool required=!runtime_needs_frame_source||runtime_needs_frame_source();
-    if(frame_source_policy_known&&frame_source_required==required)return;
-    if(frame_source_policy_known&&frame_source_required&&runtime_detach_frame_source)
-        runtime_detach_frame_source();
-    frame_source_policy_known=true;
-    frame_source_required=required;
-    if(required&&runtime_attach_frame_source&&api->functions->register_inline_hook&&api->functions->unregister_inline_hook)
-        runtime_attach_frame_source(api->uevr_module,api->functions->register_inline_hook,api->functions->unregister_inline_hook);
-}
-
 void on_custom_event(const char* event, const char* data) {
     if (event && data && strcmp(event, load_event) == 0) {
         if (strcmp(data, "true") != 0 && strcmp(data, "false") != 0) return;
@@ -148,7 +128,6 @@ void on_present() {
         { std::lock_guard lock(commands_mutex); pending.swap(commands); }
         for (const auto& command : pending) {
             if (runtime_command && attachment) runtime_command(attachment, command.c_str());
-            sync_frame_source(); // Live toggle: detach/attach before the next native frame.
             snapshots.push_back(read_snapshot());
         }
         // The status JSON is only shown in the UEVR menu. While it is closed,
@@ -228,13 +207,6 @@ bool initialize_dll() {
         start.config_directory = directory.data(); start.renderer = r->renderer_type;
         start.device = r->device; start.queue = r->command_queue; start.attachment = &attachment;
         initialized = runtime_start(&start);
-        if(initialized){
-            load_export(dll.value,"CheekyFG_DetachUEVRFrameSource",runtime_detach_frame_source);
-            load_export(dll.value,"CheekyFG_AttachUEVRFrameSource",runtime_attach_frame_source);
-            load_export(dll.value,"CheekyFG_NeedsUEVRFrameSourceV1",runtime_needs_frame_source);
-            frame_source_policy_known=false;
-            sync_frame_source();
-        }
         if (!initialized) {
             if (attachment) runtime_detach(attachment);
             attachment = 0;
@@ -249,10 +221,6 @@ bool initialize_dll() {
 }
 
 void detach_runtime() {
-    if(runtime_detach_frame_source)runtime_detach_frame_source();
-    runtime_detach_frame_source=nullptr;
-    runtime_attach_frame_source=nullptr;runtime_needs_frame_source=nullptr;
-    frame_source_policy_known=frame_source_required=false;
     if (runtime_detach && attachment) runtime_detach(attachment);
     attachment = 0;
     attached_compositor = nullptr; next_openvr_attach = 0;

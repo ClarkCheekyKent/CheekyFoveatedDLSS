@@ -254,7 +254,7 @@ public:
         last_configuration=configuration;last_built_interval=interval;const auto token=(++serial)*2;
         auto& pair=result.pair;pair.capture_token=token;pair.render_frame=serial;pair.producer_queue=bridge.queue.Get();
         const auto& options=selected[0]->metadata;pair.fg_queue_priority=options.queue_priority;pair.release_point=options.release_point;
-        pair.submit_repeats=options.submit_repeats;pair.enable_frame_id=options.frame_id;
+        pair.enable_frame_id=options.frame_id;
         for(unsigned i=0;i<2;++i){pair.eyes[i].render_frame=serial;pair.eyes[i].evaluation=token-1+i;}
         result.lease.Attach(new Lease(std::move(frame)));pair.lease=result.lease.Get();diagnostics.assembly_stage=4;++diagnostics.guide_pairs;atlas_ready=true;return result;
     }

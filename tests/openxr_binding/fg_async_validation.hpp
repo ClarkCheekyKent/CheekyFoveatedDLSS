@@ -77,14 +77,13 @@ struct Runtime {
     }
     static std::uint64_t __cdecl token(ID3D12Resource*){return snapshots?snapshots->token():capture_token;}
     static bool __cdecl stamp(ID3D12Resource*,CheekyFgCaptureStamp* out){
-        out->render_frame=capture_token/2;out->token=snapshots?snapshots->token(out->render_frame):capture_token;return true;
+        out->render_frame=capture_token/2;out->token=snapshots?snapshots->token():capture_token;return true;
     }
     static bool __cdecl missing_stamp(ID3D12Resource*,CheekyFgCaptureStamp* out){out->token=out->render_frame=0;return true;}
     static bool __cdecl acquire_guides(CheekyFgPair* out) {
         if(snapshots){
             const bool acquired=snapshots->acquire(*out);
-            if(acquired){out->release_point=guides.release_point;out->submit_repeats=guides.submit_repeats;
-                out->fg_queue_priority=guides.fg_queue_priority;}
+            if(acquired){out->release_point=guides.release_point;out->fg_queue_priority=guides.fg_queue_priority;}
             return acquired;
         }
         const auto expected=out->capture_token;*out=guides;out->capture_token=expected;
@@ -402,20 +401,15 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         corrected.finish_generated_gate(7,true);check(corrected.credits==1&&corrected.generated_gate_releases==1&&!corrected.release_gate_active(),
             "Matching generated OpenXR submission releases exactly one coalesced native credit");
     }
-    check(P::pair_wait_deadline(now,8333333)-now==nanoseconds(4333333)&&
-        P::pair_wait_deadline(now,10000000)-now==milliseconds(6)&&
-        P::pair_wait_deadline(now,16666667)-now==milliseconds(10)&&
-        P::pair_wait_deadline(now,4000000)==now,
-        "Late FG wait must cap at 10 ms and reserve 4 ms of the actual headset period");
     P p;P::Pair pair;pair.native_captured=now-milliseconds(40);pair.current_captured=now-milliseconds(20);
     pair.interpolated=true;pair.completed_at=now-milliseconds(5);
     pair.handed_off_at=now-milliseconds(19);pair.worker_started_at=now-milliseconds(17);pair.submitted_at=now-milliseconds(15);
-    p.note_frame_age(pair,false,false,now);p.note_frame_age(pair,true,false,now);p.note_frame_age(pair,false,true,now+milliseconds(10));
+    p.note_frame_age(pair,false,now);p.note_frame_age(pair,true,now);
     auto measured=p.presentation();
-    check(measured.supported&&measured.native_samples==1&&measured.generated_samples==1&&measured.repeat_samples==1&&
+    check(measured.supported&&measured.native_samples==1&&measured.generated_samples==1&&
         std::abs(measured.native_age_ms-40)<.001&&std::abs(measured.generated_age_ms-30)<.001&&
-        std::abs(measured.newest_input_age_ms-20)<.001&&std::abs(measured.repeat_age_ms-50)<.001,
-        "Submission age must follow actual native captures, generated midpoint and unchanged repeated content");
+        std::abs(measured.newest_input_age_ms-20)<.001,
+        "Submission age must follow actual native captures and the generated midpoint");
     check(std::abs(p.capture_to_completion.mean()-15)<.001&&std::abs(p.completion_to_generated.mean()-5)<.001&&
         std::abs(p.completion_to_native.mean()-5)<.001&&
         std::abs(p.capture_to_completion.mean()+p.completion_to_generated.mean()-measured.newest_input_age_ms)<.001,
@@ -424,47 +418,16 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
     check(std::abs(stages-p.capture_to_completion.mean())<.001&&p.generation_stages[0].count==1,
         "Capture/handoff/record/GPU completion stages must account for the exact same submitted frame population");
     pair.native_captured={};pair.current_captured=now+milliseconds(1);
-    p.note_frame_age(pair,false,false,now);p.note_frame_age(pair,true,false,now);
+    p.note_frame_age(pair,false,now);p.note_frame_age(pair,true,now);
     measured=p.presentation();
     check(measured.native_samples==1&&measured.generated_samples==1&&p.age_samples[2]==1,
         "Missing/future capture timestamps must never become valid frame-age samples");
 
-    p.fg_active=p.pacing_active=true;p.state=CheekyFgState::generating;p.ticks=2;p.completed_pair_id=7;p.app_waiters=1;
-    std::atomic<bool> finished{};
-    std::thread waiter([&]{p.wait_for_new_pair(Clock::now(),50000000);finished=true;});
-    {std::unique_lock lock(p.mx);
-        const bool woke=p.changed.wait_for(lock,seconds(1),[&]{return p.credits>0;});
-        check(woke&&!finished&&p.late_wait_samples==0,
-            "An already-complete baseline pair must not satisfy the new-pair wait");
-        p.changed.notify_all();p.completed_pair_id=8;p.changed.notify_all();}
-    waiter.join();measured=p.presentation();
-    check(finished&&measured.wait_samples==1&&measured.wait_arrivals==1&&measured.wait_timeouts==0,
-        "New FG publication must wake the presenter before timeout");
-    const auto credits=p.credits;p.wake_producer();
-    check(credits==1&&p.credits==credits,"Early wake plus submission must grant only one game credit per XR tick");
-    ++p.ticks;p.credits=0;p.app_waiters=0;
-    p.wait_for_new_pair(Clock::now(),8333333);
-    check(p.presentation().wait_samples==1,"No incoming render or inference must not cause an artificial wait");
-    p.inflight_id=9;p.wait_for_new_pair(Clock::now(),4500000);measured=p.presentation();
-    check(measured.wait_samples==2&&measured.wait_timeouts==1&&measured.late_wait_last_ms>=.45,
-        "An unavailable new pair must expire its bounded budget and preserve normal fallback selection");
-    p.wait_for_new_pair(Clock::now()-milliseconds(50),8333333);
-    check(p.presentation().wait_samples==2,"A spent submission budget must not add any late wait");
-    p.state=CheekyFgState::waiting_for_guides;p.wait_for_new_pair(Clock::now(),16666667);
-    check(p.presentation().wait_samples==2,"Unavailable FG must continue native presentation without an artificial wait");
-    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&p.producer.fence))),"Late selection completed producer fence");
-    p.state=CheekyFgState::generating;++p.ticks;p.completed_pair_id=9;p.inflight_id=10;p.credits=0;
+    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&p.producer.fence))),"Ready-pair selection producer fence");
     P::Pair available;available.native_id=8;available.current_id=9;available.interpolated=true;p.ready.push_back(available);
-    p.wait_for_new_pair(Clock::now(),8333333,7.5);
-    check(p.presentation().wait_samples==2&&p.late_ready_skips==1&&p.credits==0,
-        "A forward completed pair must bypass waiting for another native render and preserve upload-before-game-wake order");
-    p.wait_for_new_pair(Clock::now(),8333333,8);
-    check(p.presentation().wait_samples==2&&p.late_ready_skips==2,
-        "A ready interpolation after the already-presented native image is useful new content");
+    check(p.newest_ready_pair(7.5)!=p.ready.end()&&p.newest_ready_pair(8)!=p.ready.end(),
+        "A completed pair after the displayed native image is selectable new content");
     check(p.newest_ready_pair(9.5)==p.ready.end(),"Ready pairs must not rewind past the displayed interpolation");
-    p.wait_for_new_pair(Clock::now(),4500000,9.5);
-    check(p.presentation().wait_samples==3&&p.presentation().wait_timeouts==2,
-        "A stale completed pair must not suppress the wait for a newer in-flight pair");
     {
         P ordered;ordered.pacing_active=true;ordered.ticks=2;ordered.inflight_id=5;ordered.submitted_native_id=4;
         ordered.wake_producer();
@@ -586,14 +549,12 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
     }
     {
         P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=8.333333;
-        clock.submit_repeat_frames=false;
         std::thread pacer([&]{clock.pacing_loop();});
         bool delivered{};{std::unique_lock lock(clock.mx);delivered=clock.changed.wait_for(lock,seconds(1),[&]{return clock.credits>0;});
             clock.stopping=true;clock.changed.notify_all();}
-        pacer.join();check(delivered&&clock.ticks==0,"Native clock must deliver credits without any XR or repeat submissions");
+        pacer.join();check(delivered&&clock.ticks==0,"Native clock must deliver credits without any XR submissions");
     }
-    std::cout<<"PASS bounded late FG wait: baseline race, completion wake, timeout, refresh budget and single pacing credit; native/generated/repeat capture ages\n";
-    std::cout<<"PASS ready-pair late selection: useful completed pairs bypass new-publication waits, stale pairs cannot rewind, source age decomposes into completion and residence\n";
+    std::cout<<"PASS native/generated capture ages; ready-pair selection cannot rewind; source age decomposes into completion and residence\n";
     std::cout<<"PASS FG submission backpressure: next render waits for older FG enqueue, not GPU completion; retirement/fallback releases, no duplicate credits or shutdown wake\n";
     std::cout<<"PASS FG completion gate: pending/in-flight holds, submit and pacing paths, existing/pipelined credits, retirement, fallback and shutdown\n";
     std::cout<<"PASS FG preparation milestone and independent native clock without XR submissions\n";
@@ -613,13 +574,11 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         check(value.samples==2&&std::abs(value.last-.3)<.000001,"Guide timing must sum both eye snapshots");
     }
     {
-        cheeky::fg::CadenceWindow measured;std::array<double,5> rates{};
-        for(unsigned tick=0;tick<=120;++tick)measured.add(tick*1000./120,
-            {tick/4,tick/4,tick/4,tick-2*(tick/4),tick});
+        cheeky::fg::CadenceWindow measured;std::array<double,4> rates{};
+        for(unsigned tick=0;tick<=120;++tick)measured.add(tick*1000./120,{tick/4,tick/4,tick/4,tick});
         check(measured.rates(rates)&&std::abs(rates[0]-30)<.001&&std::abs(rates[1]+rates[2]-60)<.001&&
-            std::abs(rates[3]-60)<.001&&std::abs(rates[4]-120)<.001,
-            "120 runtime submissions with repeated pixels must report 60 unique FPS, not 120");
-        measured.add(2000,{30,30,30,180,240});
+            std::abs(rates[3]-120)<.001,"120 runtime submissions with 60 new images must report 60 unique FPS, not 120");
+        measured.add(2000,{30,30,30,240});
         check(measured.rates(rates)&&std::abs(rates[0]-15)<.001&&std::abs(rates[1]+rates[2]-30)<.001,
             "Measured unique cadence follows wall time and content changes, not headset refresh metadata");
     }
@@ -726,7 +685,6 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         if(models&&frame>=24&&Runtime::generated>=4)break;
     }
     if(!models) {
-        {std::lock_guard lock(p.mx);p.submit_repeat_frames=false;p.changed.notify_all();}
         for(unsigned frame=0;frame<8;++frame) {
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"No-repeat native clock progression");
             end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;
@@ -736,9 +694,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         }
         Sleep(50);const auto submitted=Runtime::ends.load();Sleep(40);
         check(Runtime::ends==submitted,"No new content must mean no further XR frame submissions, including empty frames");
-        {std::lock_guard lock(p.mx);p.submit_repeat_frames=true;p.changed.notify_all();}
-        Sleep(40);check(Runtime::ends>submitted,"Repeat submissions can resume live");
-        std::cout<<"PASS no-repeat native fallback: fresh images advance; stalled content produces zero XR submissions; live re-enable\n";
+        std::cout<<"PASS fresh-only native fallback: fresh images advance; stalled content produces zero XR submissions\n";
     }
     for(unsigned capture_mode:{0u,1u})for(unsigned upload_mode:{0u,1u}){
         Runtime::options.color_capture_mode=capture_mode;Runtime::options.upload_mode=upload_mode;
@@ -758,7 +714,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         std::cout<<"PASS live transport experiment: capture="<<capture_mode<<" upload="<<upload_mode<<"\n";
     }
     if(models&&method<=2){
-        Runtime::guides.release_point=3;Runtime::guides.submit_repeats=0;
+        Runtime::guides.release_point=3;
         auto frames=[&](unsigned count){for(unsigned frame=0;frame<count;++frame){
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Direct XR toggle frame");
             end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
@@ -776,17 +732,17 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             check(shading.valid&&shading.requested_mode==mode&&shading.active_mode==mode&&shading.output_width==width&&
                 shading.grid_width==(mode?p.worker.peripheral_width:width),"Live shading toggle must change actual GPU grid and mode");}
         Runtime::direct_mode=0;frames(6);
-        std::uint64_t direct_before{},repeats_before{};{std::lock_guard lock(p.mx);direct_before=p.direct_stats.frames;}
+        std::uint64_t direct_before{};{std::lock_guard lock(p.mx);direct_before=p.direct_stats.frames;}
         Runtime::typeless_writable=true;Runtime::direct_mode=1;frames(24);
         {std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return !p.inflight_id&&p.pending.empty();}),"Typeless direct XR retirement");
             check(p.direct_stats.frames>direct_before+10,"Compatible typeless XR images must use actual direct generation");}
         Runtime::direct_mode=0;frames(6);Runtime::omit_writable_flag=true;Runtime::direct_mode=1;
-        {std::lock_guard lock(p.mx);repeats_before=p.repeated_presentations;}
+        const auto ends_before=Runtime::ends.load();
         frames(12);
         {std::lock_guard lock(p.mx);const auto d=p.direct_output_details();
             check(d.reason==CheekyFgDirectReason::image_usage&&d.expected_format==28&&d.image_format==27&&!(d.image_flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
                 "Real backing-image rejection must report missing UAV flags and compatible typeless format");
-            check(p.repeated_presentations==repeats_before,"A failed direct-output request must not bypass fresh-only policy");}
+            check(Runtime::ends-ends_before<=24,"A failed direct-output request must not resubmit native content");}
         std::uint64_t blocked_attempts{};{std::lock_guard lock(p.mx);blocked_attempts=p.direct_stats.attempts;}
         frames(6);{std::lock_guard lock(p.mx);check(p.direct_stats.attempts==blocked_attempts,
             "Unsupported backing images must use cached fallback without another XR acquisition handshake per native frame");}
@@ -907,31 +863,26 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             Runtime::guides.release_point=0;
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Disable live completion hold");
             submit_native();
-            for(unsigned point:{0u,4u,1u,2u,3u})for(bool repeats:{true,false}) {
-                Runtime::guides.release_point=point;Runtime::guides.submit_repeats=repeats?1u:0u;
-                std::uint64_t repeat_baseline{};
+            for(unsigned point:{0u,4u,1u,2u,3u}) {
+                Runtime::guides.release_point=point;
                 for(unsigned frame=0;frame<40;++frame){
-                    check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Live release/repeat experiment frame");
+                    check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Live release experiment frame");
                     submit_native();
-                    if(frame==5){std::lock_guard lock(p.mx);repeat_baseline=p.repeated_presentations;}
                 }
                 {std::unique_lock lock(p.mx);
                     check(p.changed.wait_for(lock,std::chrono::seconds(2),[&]{return p.inflight_id==0&&p.pending.empty();}),"Experiment GPU retirement");
-                    check(p.active_release_point==point&&p.submit_repeat_frames==repeats,"Live experiment settings reach presenter");
+                    check(p.active_release_point==point,"Live release setting reaches presenter");
                     if(point==1)check(p.worker.prepared_serial>0&&p.worker.prepared_serial<p.worker.serial&&
                         p.worker.fence->GetCompletedValue()>=p.worker.serial,"Both-eye GPU preparation fence precedes final stereo fence");
-                    if(!repeats)check(p.repeated_presentations==repeat_baseline,"Fresh-only mode must skip duplicate native prefixes before generated frames too");
                     if(point==3)check(p.generated_gate_releases>0,"Generated submission policy reaches actual OpenXR presentation");
                 }
-                if(!repeats){
-                    Sleep(50);const auto submitted=Runtime::ends.load();Sleep(40);
-                    check(Runtime::ends==submitted,"Fresh-only FG must stop runtime frame calls while input is paused");
-                }
-                std::cout<<"PASS physical experiment: release="<<point<<" repeat_submissions="<<repeats<<"\n";
+                Sleep(50);const auto submitted=Runtime::ends.load();Sleep(40);
+                check(Runtime::ends==submitted,"FG must stop runtime frame calls while input is paused; content is never repeated");
+                std::cout<<"PASS physical experiment: release="<<point<<"\n";
             }
             // Prove that GPU completion alone cannot release policy 3: stall
             // the real presenter's generated xrEndFrame after copies queued.
-            Runtime::guides.release_point=3;Runtime::guides.submit_repeats=0;
+            Runtime::guides.release_point=3;
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Prepare generated submission gate");
             Runtime::allow_generated_end=false;Runtime::generated_end_entered=false;Runtime::block_generated_end=true;
             submit_native();std::atomic<bool> next_returned{};XrResult next_result=XR_ERROR_RUNTIME_FAILURE;
@@ -945,11 +896,10 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             check(Runtime::generated_end_entered&&fence_complete&&gate_holding&&XR_SUCCEEDED(next_result),
                 "After generated submission must hold past GPU completion until generated xrEndFrame returns");
             check(XR_SUCCEEDED(p.begin_frame(&begin)),"Resume game after generated submission");
-            Runtime::guides.release_point=0;Runtime::guides.submit_repeats=1;submit_native();
+            Runtime::guides.release_point=0;submit_native();
             // Execute real NGX on each selected queue. In particular, a shared
             // queue must not wait on a future producer signal or strand either
             // GPU-preparation or generated-submission release policies.
-            Runtime::guides.submit_repeats=0;
             for(unsigned mode:{2u,0u,1u})for(unsigned point:{0u,1u,3u}) {
                 Runtime::guides.fg_queue_priority=mode;Runtime::guides.release_point=point;
                 const auto generated_before=Runtime::generated.load();
@@ -971,7 +921,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                 check(Runtime::generated>generated_before+20,"Live queue switching preserves real generated output");
                 std::cout<<"PASS physical GPU queue switch: mode="<<mode<<" release="<<point<<"\n";
             }
-            Runtime::guides.release_point=0;Runtime::guides.submit_repeats=1;
+            Runtime::guides.release_point=0;
             // Policy changes clear GPU timing windows. Refill both alternating
             // execution orders and the 17-frame detailed sampling cadence.
             for(unsigned frame=0;frame<36;++frame){
@@ -1016,15 +966,14 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         }
         const auto age=p.presentation();
         check(age.native_samples>0&&age.native_age_ms>0,"Real immutable native captures must retain their timestamps until runtime submission");
-        if(models)check(age.generated_samples>0&&age.generated_age_ms>=age.newest_input_age_ms&&p.late_ready_skips>0&&
+        if(models)check(age.generated_samples>0&&age.generated_age_ms>=age.newest_input_age_ms&&
             std::abs(p.capture_to_completion.mean()+p.completion_to_generated.mean()-age.newest_input_age_ms)<.001,
-            "Real NGX presentation must bypass waits for usable ready pairs and account for newest-input age with completion plus residence");
+            "Real NGX presentation must account for newest-input age with completion plus residence");
         if(models){double stages{};for(auto& stage:p.generation_stages)stages+=stage.mean();
             check(p.generation_stages[0].count>0&&std::abs(stages-p.capture_to_completion.mean())<.001,
                 "Actual handoff, worker, CPU recording and completion intervals must account for color capture to completed FG");}
         std::cout<<"Submission age: native="<<age.native_age_ms<<", generated midpoint="<<age.generated_age_ms
-            <<", newest input="<<age.newest_input_age_ms<<" ms; late waits="<<age.wait_samples
-            <<" arrived="<<age.wait_arrivals<<" timeouts="<<age.wait_timeouts<<'\n';
+            <<", newest input="<<age.newest_input_age_ms<<" ms\n";
     }
     p.stop();snapshot_active=false;
     check(Runtime::errors==0&&Runtime::waits==Runtime::begins&&Runtime::begins==Runtime::ends,

@@ -7,7 +7,7 @@ struct CheekyQuadFgSourceV1 {
     unsigned long long generation{};
     void* context{};void* depth{};void* motion{};
     CheekyFgEye meta;
-    unsigned queue_priority{2},release_point{3},submit_repeats{},frame_id{};
+    unsigned queue_priority{2},release_point{3},submit_repeats{}/*retired; ABI layout*/,frame_id{};
 };
 using CheekyQuadFgObserveFn=bool(__cdecl*)(const CheekyQuadFgSourceV1*);
 struct CheekyQuadFgStatsV1 {

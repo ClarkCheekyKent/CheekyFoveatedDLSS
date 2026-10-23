@@ -377,7 +377,6 @@ void copy_resource(CopyFn real_copy, ID3D12GraphicsCommandList* list, ID3D12Reso
     // Retain the snapshotted identities until publication; otherwise a wrapper
     // releasing its arguments could invalidate them before an edge is recorded.
     real_copy(list, destination, source);
-    if(scope.outer&&ready)fg_note_color_copy(list,destination);
     observation.publish(list);
 }
 void capture_texture_copy(CopyObservation& observation, ID3D12GraphicsCommandList* list,
@@ -412,11 +411,6 @@ void copy_texture(CopyTextureFn real_copy_texture, ID3D12GraphicsCommandList* li
     CopyObservation observation;
     if (scope.outer && ready) try { capture_texture_copy(observation, list, dst, x, y, z, src, box); } catch (...) {}
     real_copy_texture(list, dst, x, y, z, src, box);
-    if(scope.outer&&ready&&dst){
-        D3D12_TEXTURE_COPY_LOCATION target{};
-        if(probe_metadata("FG color copy location",dst,[&]{target=*dst;})&&target.Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX)
-            fg_note_color_copy(list,target.pResource);
-    }
     observation.publish(list);
 }
 void resolve(ResolveFn real_resolve, ID3D12GraphicsCommandList* list, ID3D12Resource* dst, UINT dst_sub,
@@ -429,7 +423,6 @@ void resolve(ResolveFn real_resolve, ID3D12GraphicsCommandList* list, ID3D12Reso
             observation.capture_list(list);
     } catch (...) {}
     real_resolve(list, dst, dst_sub, src, src_sub, format);
-    if(scope.outer&&ready)fg_note_color_copy(list,dst);
     observation.publish(list);
 }
 } // namespace

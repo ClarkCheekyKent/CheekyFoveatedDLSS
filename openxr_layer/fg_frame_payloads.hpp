@@ -24,7 +24,7 @@ struct FrameGuides12 final : FrameGuides {
         pair.lease=nullptr;pair.producer_queue=nullptr;
     }
     static FramePolicy policy_of(const CheekyFgPair& source) noexcept {
-        return {source.release_point,source.submit_repeats,source.fg_queue_priority};
+        return {source.release_point,source.fg_queue_priority};
     }
 };
 inline FrameGuides12* guides12(const BufferedNative& frame) noexcept {return dynamic_cast<FrameGuides12*>(frame.guides.get());}

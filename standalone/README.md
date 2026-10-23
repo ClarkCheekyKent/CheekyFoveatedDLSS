@@ -201,9 +201,8 @@ between APIs. The matching updated OpenXR installer is required. The direct-XR
 output experiment uses compact intermediates on D3D11. This path has GPU
 integration coverage; ACC and headset compatibility still require game testing.
 
-Standalone matches guide pairs at `xrEndFrame`; the UEVR-specific
-`FgBackbufferFrameId` preference does not override that behavior. Each native frame must supply exactly two submitted
-eye evaluations. Missing, partial or ambiguous guide intervals retain native
+Standalone and UEVR both match guide pairs at `xrEndFrame`. Each native frame
+must supply exactly two submitted eye evaluations. Missing, partial or ambiguous guide intervals retain native
 presentation and recover on a later complete stereo frame. Keep **Release game
 rendering** at **After generated frame submission** (the default) for serialized
 matching. Other release modes allow experimental overlap without native frame

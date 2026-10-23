@@ -24,9 +24,7 @@
 #include <thread>
 #include <string>
 #include <vector>
-#include "../src/uevr_frame_source.hpp"
 #include "../src/fg_source_lifecycle.hpp"
-#include "uevr_frame_source_fixture.hpp"
 
 using namespace cheeky::foveated_dlss;
 using Microsoft::WRL::ComPtr;
@@ -89,7 +87,6 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
     check(fence->SetEventOnCompletion(1, event), "SetEventOnCompletion");
     auto result = WaitForSingleObject(event, 10000); CloseHandle(event); require(result == WAIT_OBJECT_0, "GPU timeout");
 }
-#include "fg_runtime_validation.hpp"
 void settings_tests(const std::filesystem::path& root) {
     {
         Settings fg;
@@ -104,7 +101,7 @@ void settings_tests(const std::filesystem::path& root) {
             set_named_setting(fg,"FgShowBorder","false") && !fg.fg.show_border &&
             !set_named_setting(fg,"FgShowBorder","invalid"),
             "FG match-SR and blue-border options parse independently");
-        require(fg.fg.release_point==3&&!fg.fg.submit_repeats&&fg.fg.resolution_percent==100&&
+        require(fg.fg.release_point==3&&fg.fg.resolution_percent==100&&
             fg.fg.peripheral_percent==50&&fg.fg.peripheral_method==1,"FG uses the tested generated-submission/fresh-only and quality defaults");
         require(set_named_setting(fg,"FgWaitForCompletion","false")&&fg.fg.release_point==0&&set_named_setting(fg,"FgWaitForCompletion","true")&&
             fg.fg.release_point==2&&!set_named_setting(fg,"FgWaitForCompletion","invalid"),
@@ -114,11 +111,11 @@ void settings_tests(const std::filesystem::path& root) {
             "FG settings validate types");
         require(set_named_setting(fg,"FgReleasePoint","1")&&fg.fg.release_point==1&&
             set_named_setting(fg,"FgReleasePoint","3")&&set_named_setting(fg,"FgReleasePoint","4")&&fg.fg.release_point==4&&
-            set_named_setting(fg,"FgReleasePoint","5")&&fg.fg.release_point==5&&!set_named_setting(fg,"FgReleasePoint","6")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
-            set_named_setting(fg,"FgSubmitRepeats","true")&&!fg.fg.submit_repeats,"Release points validate; retired repeat option is ignored");
+            set_named_setting(fg,"FgReleasePoint","5")&&fg.fg.release_point==5&&!set_named_setting(fg,"FgReleasePoint","6")&&!set_named_setting(fg,"FgReleasePoint","-1"),"Release points validate");
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
-        for(const auto key:{"FgHooklessMode3","FgDepthBits","FgMotionBits","FgSubmitRepeats","FgGuideCaptureMode","FgCompactStorage",
-                "FgColorCaptureMode","FgUploadMode","FgDirectPeripheralShading","FgDiagnosticMode"})
+        for(const auto key:{"FgHooklessMode3","FgBackbufferFrameId","FgDepthBits","FgMotionBits","FgSubmitRepeats","FgGuideCaptureMode","FgCompactStorage",
+                "FgColorCaptureMode","FgUploadMode","FgDirectPeripheralShading","FgDiagnosticMode",
+                "D3D11D3D12SharedGuides","D3D11D3D12SingleBuffer","HookRescanOnModuleChange"})
             require(set_named_setting(fg,key,"0")&&set_named_setting(fg,key,"invalid")&&
                 setting_groups_json().find(std::string("\"")+key+"\"")==std::string::npos,"Retired FG options are accepted from older menus but not persisted");
         require(fg.fg.queue_priority==2&&set_named_setting(fg,"FgQueuePriority","0")&&
@@ -141,20 +138,20 @@ void settings_tests(const std::filesystem::path& root) {
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
             restored.fg.center_method==2&&restored.fg.peripheral_method==3&&restored.fg.depth_bits==32&&restored.fg.motion_bits==32&&
-            restored.fg.release_point==3&&!restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&
+            restored.fg.release_point==3&&restored.fg.color_capture_mode==1&&
             restored.fg.upload_mode==1&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1&&
             restored.fg.direct_peripheral_shading==0,"FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
-            !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
+            restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1&&
             restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2&&restored.fg.direct_peripheral_shading==0,
             "FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
         require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&
-            !restored.fg.submit_repeats&&restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1,"Old profiles inherit the tested FG preset and default FG off");
+            restored.fg.color_capture_mode==1&&restored.fg.upload_mode==1,"Old profiles inherit the tested FG preset and default FG off");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgWaitForCompletion=1\n";}
-        require(read_settings_file(path,restored,error)&&restored.fg.release_point==2&&!restored.fg.submit_repeats,"Migrate old completion checkbox with fresh-only default");
+        require(read_settings_file(path,restored,error)&&restored.fg.release_point==2,"Migrate old completion checkbox with fresh-only default");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgReleasePoint=1\nFgWaitForCompletion=1\n";}
         require(read_settings_file(path,restored,error)&&restored.fg.release_point==1,"Explicit release point overrides legacy key");
         fg.fg.width=5;fg.fg.height=-1;fg.fg.feather=3;
@@ -277,18 +274,6 @@ int main(int argc, char** argv) {
     static_assert(a!=b && fg_same_source_history(a,a) &&
         !fg_same_source_history(a,b) && !fg_same_source_history(0,a));
     try {
-        if(argc>2&&std::string(argv[1])=="--fg-frame-source-pe"){
-            auto path=std::filesystem::path(argv[2]);auto module=LoadLibraryExW(path.c_str(),nullptr,DONT_RESOLVE_DLL_REFERENCES);
-            require(module!=nullptr,"Map original UEVR image without executing it");
-            const auto found=uevr_frames::locate(module);
-            require(found.function!=nullptr,"Resolve existing OpenXR runtime frame method by validated RTTI");
-            std::printf("PASS original UEVR image: table RVA=0x%X method RVA=0x%llX\n",found.table_rva,
-                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(found.function)-reinterpret_cast<std::uintptr_t>(module)));
-            const auto roots=uevr_frames::rhi_dispatchers(uevr_frames::image(module));
-            std::printf("Verified RHI command dispatchers: %zu\n",roots.size());
-            require(!roots.empty(),"Identify RHI entry points by three call-site literals and unwind boundaries");
-            FreeLibrary(module);return 0;
-        }
         wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const auto bin = std::filesystem::path(exe).parent_path();
         // Windows reuses PIDs. Keep fixtures from earlier runs from masquerading
@@ -380,10 +365,6 @@ int main(int argc, char** argv) {
             renderer = {UEVR_RENDERER_D3D11, device11.Get(), nullptr, nullptr};
         }
         UEVR_PluginInitializeParam api{}; api.version = &version; api.functions = &functions; api.callbacks = &callbacks; api.renderer = &renderer;
-        if(mode=="--fg-controls"){
-            api.uevr_module=GetModuleHandleW(nullptr);
-            functions.register_inline_hook=fg_test_install_hook;functions.unregister_inline_hook=fg_test_remove_hook;
-        }
         UEVR_VRData vr_api{}; vr_api.is_openvr = is_openvr;
         vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
         vr_api.get_mod_value = get_mod_value;
@@ -556,20 +537,18 @@ int main(int argc, char** argv) {
             require(control_fn(&control)&&control.enabled&&control.configuration==before_release_configuration,
                 "Switching release modes preserves an enabled FG pipeline and its temporal configuration");
             command("1\n903\nset\nEnabled=false");
-            fg_runtime_frame_validation(runtime,bin,device.Get(),queue.Get());
             command("1\n905\nset\nFgReleasePoint=0");
             require(snapshot(get).find("\"FgReleasePoint\":0")!=std::string::npos,
                 "Lua protocol restores overlapping native rendering");
-            CheekyFgCaptureHealth resumed;
+            CheekyFgCaptureHealth health;
             auto capture_health=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureHealth"));
-            require(capture_health&&capture_health(&resumed)&&resumed.plugin_hook&&fg_test_hook_installs==2&&
-                fg_test_hook_targets.size()==2,"UEVR keeps its frame hooks across release modes");
+            require(capture_health&&capture_health(&health)&&
+                !GetProcAddress(runtime,"CheekyFG_AttachUEVRFrameSource")&&!GetProcAddress(runtime,"CheekyFG_NeedsUEVRFrameSourceV1"),
+                "UEVR matches FG guides at xrEndFrame without frame-source hooks");
             custom("cheeky.foveated_dlss.load.v1","false");present();
-            require(fg_test_hook_removals==2&&fg_test_hook_targets.empty(),"Unload removes the plugin-owned frame hooks");
             require(control_fn(&control) && !control.enabled && snapshot(get).find("\"FgEnabled\":true")!=std::string::npos,
                 "Host detach pauses FG without discarding saved preference");
             custom("cheeky.foveated_dlss.load.v1","true");present();
-            require(fg_test_hook_installs==4&&fg_test_hook_targets.size()==2,"Reload restores the plugin frame hooks");
             require(control_fn(&control) && control.enabled,"Host re-enable restores FG preference");
             command("1\n902\ndefaults_fg");
             direct=CheekyFgDirectOutput{};require(direct_fn(&direct)&&!direct.requested&&

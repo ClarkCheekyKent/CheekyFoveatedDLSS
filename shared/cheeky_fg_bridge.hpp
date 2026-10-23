@@ -45,7 +45,7 @@ struct CheekyFgPair {
     std::uint32_t enable_frame_id{1}; // Optional NGX BackbufferFrameID A/B; applied to each feature.
     std::uint32_t fg_queue_priority{1}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
     std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
-    std::uint32_t submit_repeats{1}; // Resubmit unchanged scene content at runtime frame opportunities.
+    std::uint32_t submit_repeats{}; // Retired: the presenter never resubmits unchanged content. Kept for ABI layout.
 };
 inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
     for(const auto& g:pair.eyes)
@@ -67,19 +67,13 @@ struct CheekyFgCaptureStamp {
     std::uint64_t token{},render_frame{};
 };
 using CheekyFgCaptureStampFn=bool(__cdecl*)(ID3D12Resource*,CheekyFgCaptureStamp*);
-// Hook-free mode 3: once per native xrEndFrame, AFTER both eye releases.
-// True claims one complete stereo pair; false retires an unused/failed frame.
-// Unlike per-image capture stamps, this needs no UEVR frame ticket or color-copy hook.
+// Once per native xrEndFrame, AFTER both eye releases. True claims one
+// complete stereo pair; false retires an unused/failed frame. This is the
+// only way a captured guide pair is matched to the frame's color.
 using CheekyFgCompleteHooklessFrameFn=std::uint64_t(__cdecl*)(std::uint32_t use_for_fg);
-using CheekyFgRegisterHookFn=int(*)(void*,void*,void**);
-using CheekyFgUnregisterHookFn=void(*)(int);
-using CheekyFgAttachFrameSourceFn=bool(__cdecl*)(void*,CheekyFgRegisterHookFn,CheekyFgUnregisterHookFn);
-using CheekyFgDetachFrameSourceFn=void(__cdecl*)();
 struct CheekyFgCaptureHealth {
-    std::uint32_t abi{1},size{sizeof(CheekyFgCaptureHealth)},plugin_hook{};
-    std::uint64_t frame_calls{},last_guide_frame{},captured_guides{},missing_frame_guides{},color_copies{};
-    char source[128]{};
-    std::uint64_t color_frame{},match_frame{},latest_frame{},latest_evaluation{},consumed_evaluation{};
+    std::uint32_t abi{2},size{sizeof(CheekyFgCaptureHealth)};
+    std::uint64_t captured_guides{},latest_evaluation{},consumed_evaluation{};
     std::uint32_t eligible{},pending{},foreign{},cancelled{};
     char match_reason[128]{};
 };
@@ -147,8 +141,8 @@ using CheekyFgPerformanceFn=bool(__cdecl*)(CheekyFgPerformance*);
 
 // Separate optional export: v15's performance structure remains unchanged.
 struct CheekyFgCadence {
-    std::uint32_t abi{1},size{sizeof(CheekyFgCadence)},supported{},valid{};
-    double game_fps{},native_fps{},generated_fps{},unique_fps{},repeat_fps{},submission_fps{};
+    std::uint32_t abi{2},size{sizeof(CheekyFgCadence)},supported{},valid{};
+    double game_fps{},native_fps{},generated_fps{},unique_fps{},submission_fps{};
     double refresh_hz{},native_target_fps{},application_period_ms{};
     double app_image_wait_ms{},present_image_wait_ms{},begin_ms{},end_ms{},present_cpu_ms{};
     double app_begin_ms{},app_end_ms{},app_release_ms{};
@@ -196,12 +190,10 @@ using CheekyFgOverheadFn=bool(__cdecl*)(CheekyFgOverhead*);
 // CPU color-capture observation -> xrEndFrame entry, NOT motion-to-photon.
 // Generated content time is the midpoint of its two native capture times.
 struct CheekyFgPresentation {
-    std::uint32_t abi{1},size{sizeof(CheekyFgPresentation)},supported{};
-    std::uint64_t native_samples{},generated_samples{},repeat_samples{};
-    std::uint64_t wait_samples{},wait_arrivals{},wait_timeouts{};
+    std::uint32_t abi{2},size{sizeof(CheekyFgPresentation)},supported{};
+    std::uint64_t native_samples{},generated_samples{};
     double native_age_ms{},native_age_last_ms{},generated_age_ms{},generated_age_last_ms{};
-    double newest_input_age_ms{},newest_input_age_last_ms{},repeat_age_ms{},repeat_age_last_ms{};
-    double late_wait_ms{},late_wait_last_ms{},wait_budget_ms{};
+    double newest_input_age_ms{},newest_input_age_last_ms{};
 };
 using CheekyFgPresentationFn=bool(__cdecl*)(CheekyFgPresentation*);
 

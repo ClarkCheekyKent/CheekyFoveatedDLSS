@@ -38,12 +38,11 @@ std::string snapshot(CheekyHostSnapshotFn get) {
 void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
     using namespace cheeky::foveated_dlss;
     const auto runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
-    const auto needs_hook = proc<bool(*)()>(runtime,"CheekyFG_NeedsUEVRFrameSourceV1");
     const auto complete = proc<CheekyFgCompleteHooklessFrameFn>(runtime,"CheekyFG_CompleteHooklessFrameV1");
     const auto acquire = proc<CheekyFgAcquireFn>(runtime,"CheekyFG_AcquirePair");
     const auto release = proc<CheekyFgReleaseFn>(runtime,"CheekyFG_ReleasePair");
     command("1\n200\nset\nEnabled=false\nNrEnabled=false\nFgEnabled=true");
-    require(!needs_hook(),"Standalone matches FG guide pairs at xrEndFrame without UEVR hooks");
+    require(!GetProcAddress(runtime,"CheekyFG_NeedsUEVRFrameSourceV1"),"FG guide pairs match at xrEndFrame without UEVR hooks");
     frame();
     ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> list;
     check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"FG allocator");
@@ -94,7 +93,7 @@ void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
     command("1\n202\nset\nFgEnabled=true"); frame();
     guides(2); pair();
     command("1\n203\ndefaults_fg\n"); frame();
-    require(!needs_hook()&&!complete(1),"FG defaults retain automatic standalone matching and disable generation");
+    require(!complete(1),"FG defaults disable generation");
     require(ngx_succeeded(proc<NgxResult(*)(NgxHandle*)>(ngx,"NVSDK_NGX_D3D12_ReleaseFeature")(handle)),"FG release feature");
     check(list->Close(),"Close unused FG recording");
     std::puts("PASS: standalone FG capture without UEVR hooks, stereo rejection/recovery, disable/re-enable and defaults");

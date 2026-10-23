@@ -261,7 +261,6 @@ void update_settings(const Settings& settings) noexcept {
     std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
     // Fixed FG choices; the alternatives remain only as internal A/B paths.
-    fg_settings.submit_repeats=false;
     fg_settings.guide_capture_mode=fg_settings.compact_storage=1;
     fg_settings.color_capture_mode=fg_settings.upload_mode=1;
     fg_settings.direct_peripheral_shading=0;

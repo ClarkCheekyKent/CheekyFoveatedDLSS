@@ -141,35 +141,21 @@ public:
     }
     cheeky::gpu::Summary capture_gpu() const {return gpu_cost.summary();}
     struct Match {
-        std::uint64_t frame{},latest_frame{},latest{},consumed{},failed{};
+        std::uint64_t latest{},consumed{},failed{};
         unsigned eligible{},pending{},foreign{},cancelled{};
         const char* reason{"No guides for this frame"};
     };
     Match last_match;
-    Match inspect(std::uint64_t frame) const {
-        Match result;result.frame=frame;result.consumed=consumed;result.failed=failed_record;
-        for(auto& s:shots){result.latest_frame=std::max(result.latest_frame,s->meta.render_frame);
-            if(frame&&s->meta.render_frame!=frame)continue;
-            if(s->cancelled)++result.cancelled;
-            else if(s->foreign)++result.foreign;
-            else if(!s->submitted)++result.pending;
-            else {++result.eligible;result.latest=std::max(result.latest,s->meta.evaluation);}
-        }
-        result.reason=result.pending?"Guides are not submitted":result.foreign?"Guides submitted on a different queue":
-            result.cancelled?"Guide command list was reset":result.eligible!=2?(result.eligible?"Frame does not contain exactly two guides":"No guides with the color frame ID"):
-            result.latest<=consumed?"Guide pair was already consumed":result.latest<=failed_record?"Guide capture failed before this pair":"Guides ready; color copy has no matching token";
-        return result;
-    }
     // Peek only the UNCONSUMED capture interval (no latch/consume). A first
-    // eye may be released before the second eye has been evaluated. In
-    // hook-free mode only, predict the completed pair token as ordinal+1;
-    // xrEndFrame MUST verify the actual token and the final crop geometry.
+    // eye may be released before the second eye has been evaluated. Predict
+    // the completed pair token as ordinal+1; xrEndFrame MUST verify the
+    // actual token and the final crop geometry.
     bool peek_current_crops(CheekyFgCaptureCropsV2& out,std::uint64_t expected_configuration) const noexcept {
         if(failed_record>consumed)return false;
-        const auto token=cheeky::fg::pending_stereo_crop_token(ordinal,consumed,!out.render_frame);
+        const auto token=cheeky::fg::pending_stereo_crop_token(ordinal,consumed,true);
         if(!token)return false;
         const auto count=ordinal-consumed;
-        if(count==1&&(out.render_frame||out.token))return false;
+        if(count==1&&out.token)return false;
         const Shot* a=nullptr;const Shot* b=nullptr;
         for(const auto& shot:shots)if(shot->meta.evaluation>consumed){
             if(!shot->submitted||shot->foreign||shot->cancelled)return false;
@@ -177,11 +163,10 @@ public:
             else if(shot->meta.evaluation==ordinal)b=shot.get();
             else return false;
         }
-        if(!b||b->identity.eye>=2||b->meta.configuration!=expected_configuration||
-           b->meta.render_frame!=out.render_frame)return false;
+        if(!b||b->identity.eye>=2||b->meta.configuration!=expected_configuration)return false;
         if(count==2&&(!a||!compatible_eyes(*a,*b)||a->identity.eye>=2||
            a->meta.configuration!=expected_configuration||a->meta.width!=b->meta.width||
-           a->meta.height!=b->meta.height||a->meta.render_frame!=out.render_frame))return false;
+           a->meta.height!=b->meta.height))return false;
         if(out.token&&out.token!=token)return false;
         out.token=token;out.width=b->meta.width;out.height=b->meta.height;
         out.valid_mask=1u<<b->identity.eye;
@@ -321,11 +306,9 @@ public:
         auto& prior=previous_raw[history_eye];
         const auto prior_identity=previous_identity[history_eye];
         if(meta.motion_jittered){
-            // Without a UEVR frame ticket, the consecutive left/right
-            // evaluation ordinal is the same-eye temporal identity. Never
-            // compare two identical zero frame IDs as native frame numbers.
-            const bool previous_eye=meta.render_frame ? prior.render_frame+1==meta.render_frame :
-                prior.render_frame==0 && prior.evaluation+2==id;
+            // The consecutive left/right evaluation ordinal is the same-eye
+            // temporal identity.
+            const bool previous_eye=prior.evaluation+2==id;
             if(previous_eye&&prior.motion_jittered&&prior_identity.eye==identity.eye&&prior_identity.mapping_revision==identity.mapping_revision&&
                prior.feature==meta.feature&&prior.motion_width==meta.motion_width&&
                prior.motion_height==meta.motion_height&&!meta.reset){
@@ -355,7 +338,7 @@ public:
             if(!mr.full){meta.motion_base_x=meta.motion_base_y=0;meta.motion_width=mr.w;meta.motion_height=mr.h;}
             meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.prepared_guides=0;
         }
-        slot->meta=meta;slot->profile_frame=meta.render_frame;slot->profile_ms=0;slot->profile_ready=false;return true;
+        slot->meta=meta;slot->profile_frame=0;slot->profile_ms=0;slot->profile_ready=false;return true;
     }
     unsigned submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands,bool discover_queue=false) {
         unsigned found{};
@@ -398,55 +381,45 @@ public:
             failed_record=std::max(failed_record,s->meta.evaluation);
         }
     }
-    std::uint64_t token(std::uint64_t render_frame=0,bool hookless=false) {
-        retire();last_match=inspect(render_frame);
-        if(hookless){
-            // Exactly two consecutive, submitted guide recordings since the
-            // last consumed COLOR interval. Never silently take the newest
-            // two from a 1/3/4-eye interval or across a failed recording.
-            last_match={};last_match.consumed=consumed;last_match.failed=failed_record;
-            last_match.latest_frame=0;last_match.frame=0;
-            for(const auto& s:shots)if(s->meta.evaluation>consumed){
-                if(s->cancelled)++last_match.cancelled;
-                else if(s->foreign)++last_match.foreign;
-                else if(!s->submitted)++last_match.pending;
-                else {++last_match.eligible;last_match.latest=std::max(last_match.latest,s->meta.evaluation);}
-            }
-            if(ordinal<consumed||ordinal-consumed!=2||failed_record>consumed||
-                last_match.eligible!=2||last_match.pending||last_match.foreign||last_match.cancelled||
-                last_match.latest!=ordinal){
-                last_match.reason=failed_record>consumed?"Guide capture failed":
-                    last_match.pending?"Guides await submission":
-                    last_match.foreign?"Guide queue mismatch":
-                    last_match.cancelled?"Guide commands cancelled":
-                    "Color interval has not exactly two fresh eyes";
-                return 0;
-            }
+    std::uint64_t token() {
+        retire();
+        // Exactly two consecutive, submitted guide recordings since the last
+        // consumed interval. Never silently take the newest two from a
+        // 1/3/4-eye interval or across a failed recording.
+        last_match={};last_match.consumed=consumed;last_match.failed=failed_record;
+        for(const auto& s:shots)if(s->meta.evaluation>consumed){
+            if(s->cancelled)++last_match.cancelled;
+            else if(s->foreign)++last_match.foreign;
+            else if(!s->submitted)++last_match.pending;
+            else {++last_match.eligible;last_match.latest=std::max(last_match.latest,s->meta.evaluation);}
         }
-        const auto latest=last_match.latest;
-        if(render_frame&&last_match.eligible!=2){
-            last_match.reason=last_match.pending?"Guides are not submitted":last_match.foreign?"Guides submitted on a different queue":
-                last_match.cancelled?"Guide command list was reset":last_match.eligible?"Frame does not contain exactly two guides":"No guides with the color frame ID";
+        if(ordinal<consumed||ordinal-consumed!=2||failed_record>consumed||
+            last_match.eligible!=2||last_match.pending||last_match.foreign||last_match.cancelled||
+            last_match.latest!=ordinal){
+            last_match.reason=failed_record>consumed?"Guide capture failed":
+                last_match.pending?"Guides await submission":
+                last_match.foreign?"Guide queue mismatch":
+                last_match.cancelled?"Guide commands cancelled":
+                "Color interval has not exactly two fresh eyes";
             return 0;
         }
+        const auto latest=last_match.latest;
         if(latest<=consumed){last_match.reason="Guide pair was already consumed";return 0;}
         if(latest<=failed_record){last_match.reason="Guide capture failed before this pair";return 0;}
         last_match.reason="Matched";
         for(auto& latch:latched)if(latch.token==latest)return latest;
         std::shared_ptr<Shot> a,b;
         for(auto& s:shots)if(s->submitted&&!s->foreign&&!s->cancelled){if(s->meta.evaluation==latest-1)a=s;if(s->meta.evaluation==latest)b=s;}
-        if(!a||!b||(render_frame&&(a->meta.render_frame!=render_frame||b->meta.render_frame!=render_frame))||
-            (hookless&&(a->meta.render_frame||b->meta.render_frame))){last_match.reason="Guide pair is interrupted";return 0;}
+        if(!a||!b){last_match.reason="Guide pair is interrupted";return 0;}
         if(!compatible_eyes(*a,*b)){last_match.reason="Guide eye mapping changed or stereo identities are ambiguous";return 0;}
-        // Standalone has no game-frame ticket. Group its timestamps only after
-        // this exact stereo pair has been matched to a released color image.
-        if(!a->meta.render_frame&&!b->meta.render_frame){a->profile_frame=b->profile_frame=(1ull<<63)|latest;}
+        // Group timestamps only after this exact stereo pair has been matched.
+        a->profile_frame=b->profile_frame=(1ull<<63)|latest;
         // Pin guides at COLOR release, not later at EndFrame. A future DLSS
         // recording must not recycle either snapshot while color awaits submit.
         if(latched.size()>=4)latched.erase(latched.begin());
         latched.push_back({latest,a,b});return latest;
     }
-    void discard_hookless_interval() {
+    void discard_interval() {
         // A partial/ambiguous color handoff consumes the interval without
         // generating FG. Start fresh with the next native stereo pair rather
         // than permanently starving on an extra or failed evaluation.
@@ -460,7 +433,6 @@ public:
         std::shared_ptr<Shot> a,b;
         for(auto& latch:latched)if(latch.token==expected){a=latch.a;b=latch.b;break;}
         if(!a||!b||a->meta.width!=b->meta.width||a->meta.height!=b->meta.height||a->meta.configuration!=b->meta.configuration)return false;
-        if(out.render_frame&&(a->meta.render_frame!=out.render_frame||b->meta.render_frame!=out.render_frame))return false;
         if(!compatible_eyes(*a,*b))return false;
         const auto first_eye=a->identity.eye;
         if(first_eye==1)std::swap(a,b);
@@ -478,114 +450,6 @@ public:
         out.producer_queue=queue.Get();out.producer_queue->AddRef();out.lease=lease;
         consumed=expected;
         std::erase_if(latched,[&](const Latch& l){return l.token<=consumed;});return true;
-    }
-};
-
-// An OpenXR image is registered on its first release. The existing native copy
-// observer stamps subsequent game->OpenXR copies, then commits the stamp only
-// after that exact command list is submitted to the producer queue. Newer DLSS
-// evaluations between the color copy and xrReleaseSwapchainImage cannot retag it.
-class FgColorProvenance {
-    template<class T> using ComPtr=Microsoft::WRL::ComPtr<T>;
-    struct Tag {std::uint64_t generation{},token{},render_frame{};};
-    struct Pending {ComPtr<ID3D12GraphicsCommandList> list;ComPtr<ID3D12Resource> color;Tag tag;std::uint64_t recording{};bool conflicted{},hookless{};};
-    static inline constexpr GUID key{0x41c548c2,0x8d8a,0x4f23,{0x83,0x24,0x90,0xbe,0xa5,0xf8,0x22,0x7d}};
-    std::vector<Pending> pending;
-    // In mode 3, color can be copied multiple times during one native frame.
-    // Queue submission only establishes provenance; choose a stereo token at
-    // the FINAL OpenXR color handoff, not at each intermediate copy.
-    std::vector<ComPtr<ID3D12Resource>> hookless_submitted;
-    std::uint64_t generation{1};
-    static bool read(ID3D12Resource* color,Tag& tag) {
-        if(!color)return false;UINT size=sizeof(tag);
-        __try{return SUCCEEDED(color->GetPrivateData(key,&size,&tag))&&size==sizeof(tag);}
-        __except(GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION||GetExceptionCode()==EXCEPTION_IN_PAGE_ERROR?EXCEPTION_EXECUTE_HANDLER:EXCEPTION_CONTINUE_SEARCH){return false;}
-    }
-public:
-    static bool registered(ID3D12Resource* color) {
-        Tag tag;return read(color,tag);
-    }
-    void invalidate(){++generation;pending.clear();hookless_submitted.clear();}
-    bool has_pending() const {return !pending.empty();}
-    std::uint64_t token(ID3D12Resource* color,FgSnapshots* guides=nullptr,bool hookless=false) {
-        if(!color)return 0;Tag tag;
-        if(!read(color,tag)||tag.generation!=generation){
-            tag={generation,0};color->SetPrivateData(key,sizeof(tag),&tag);return 0;
-        }
-        if(hookless&&guides){
-            const auto it=std::find_if(hookless_submitted.begin(),hookless_submitted.end(),
-                [&](const auto& r){return r.Get()==color;});
-            if(it!=hookless_submitted.end()){
-                // Only a submitted copy of THIS OpenXR color image authorizes
-                // pairing. token() refuses incomplete/extra/pending guides.
-                const auto matched=guides->token(0,true);
-                if(!matched){
-                    // The OpenXR handoff is the sole rejection boundary.
-                    // Incomplete/extra work cannot poison subsequent frames.
-                    guides->discard_hookless_interval();
-                    hookless_submitted.erase(it);
-                    return 0;
-                }
-                tag={generation,matched,0};
-                if(FAILED(color->SetPrivateData(key,sizeof(tag),&tag))){
-                    guides->discard_hookless_interval();
-                    hookless_submitted.erase(it);
-                    return 0;
-                }
-                hookless_submitted.erase(it); // latch pins snapshots until acquire
-            }
-        }
-        return tag.token;
-    }
-    std::uint64_t frame(ID3D12Resource* color) {Tag tag;return read(color,tag)&&tag.generation==generation?tag.render_frame:0;}
-    void observe(ID3D12GraphicsCommandList* list,ID3D12Resource* color,FgSnapshots& guides,
-                 std::uint64_t render_frame=0,bool hookless=false) {
-        if(!registered(color))return;
-        auto native=native_d3d12_interface(list);
-        const Tag tag{generation,hookless?0:render_frame?guides.token(render_frame):0,render_frame};
-        const auto recording=FgSnapshots::tag_recording(list);if(!recording)return;
-        for(auto& p:pending)if(p.recording==recording&&p.color.Get()==color){
-            if(p.hookless!=hookless||p.tag.render_frame!=tag.render_frame||
-               (p.tag.token!=tag.token&&(!render_frame||(p.tag.token&&tag.token)))){
-                p.conflicted=true;p.tag.token=0;
-            }else if(!p.conflicted&&tag.token)p.tag.token=tag.token;
-            return;
-        }
-        if(pending.size()>=128){Tag invalid{generation,0};color->SetPrivateData(key,sizeof(invalid),&invalid);return;}
-        pending.push_back({native,color,tag,recording,false,hookless});
-    }
-    void submitted(ID3D12CommandQueue* queue,ID3D12GraphicsCommandList* list,FgSnapshots& guides) {
-        const auto recording=FgSnapshots::recording_identity(list);
-        std::erase_if(pending,[&](Pending& p){
-            if(recording?p.recording!=recording:!same_d3d12_list(p.list.Get(),list))return false;
-            if(p.tag.generation!=generation||!guides.matches(queue))p.tag={generation,0};
-            else if(!p.conflicted){
-                if(!p.hookless&&!p.tag.token&&p.tag.render_frame)
-                    // Guides and final color can be recorded in the SAME command
-                    // list. They become eligible only after this enqueue.
-                    p.tag.token=guides.token(p.tag.render_frame);
-            }
-            if(p.hookless){
-                // A previous frame's token must not survive a new color copy.
-                // Preserve the unconsumed guide interval until the OpenXR
-                // handoff. Intermediate copies no longer destroy a stereo pair.
-                p.tag={generation,0,0};
-                if(SUCCEEDED(p.color->SetPrivateData(key,sizeof(p.tag),&p.tag)) &&
-                   !p.conflicted&&guides.matches(queue)){
-                    if(std::none_of(hookless_submitted.begin(),hookless_submitted.end(),
-                       [&](const auto& r){return r.Get()==p.color.Get();})){
-                        if(hookless_submitted.size()>=16)hookless_submitted.erase(hookless_submitted.begin());
-                        hookless_submitted.push_back(p.color);
-                    }
-                }
-            }else p.color->SetPrivateData(key,sizeof(p.tag),&p.tag);
-            return true;
-        });
-    }
-    void reset(ID3D12GraphicsCommandList* list) {
-        const auto recording=FgSnapshots::recording_identity(list);
-        std::erase_if(pending,[&](Pending& p){return recording?p.recording==recording:
-            same_d3d12_list(p.list.Get(),list);});
     }
 };
 }

@@ -41,10 +41,8 @@ void fg_snapshot_validation(ID3D12Device* device) {
         }
     };
     FgSnapshots capture;check(capture.initialize(queue.Get()),"Snapshot initialize");
-    std::uint64_t recording_frame=77;
     auto record=[&](float value) {
         clear(value);CheekyFgEye eye;eye.depth=depth.Get();eye.motion=motion.Get();eye.width=eye.height=32;
-        eye.render_frame=recording_frame;
         eye.depth_width=eye.depth_height=eye.motion_width=eye.motion_height=16;
         check(capture.record(list.Get(),eye),"Record immutable evaluation-time guides");
     };
@@ -62,21 +60,16 @@ void fg_snapshot_validation(ID3D12Device* device) {
         HANDLE e=CreateEventW(nullptr,FALSE,FALSE,nullptr);check(e!=nullptr,"Snapshot event");
         const bool done=SUCCEEDED(f->SetEventOnCompletion(1,e))&&WaitForSingleObject(e,10000)==WAIT_OBJECT_0;CloseHandle(e);check(done,"Snapshot readback wait");
     };wait();
-    cheeky::foveated_dlss::FgColorProvenance provenance;
-    check(provenance.token(depth.Get())==0,"Unobserved OpenXR color must not borrow the newest guides");
     allocator->Reset();list->Reset(allocator.Get(),nullptr);
-    provenance.observe(list.Get(),depth.Get(),capture,77);
-    recording_frame=78;record(.4f);record(.6f);list->Close();queue->ExecuteCommandLists(1,lists);capture.submitted(queue.Get(),list.Get());
-    provenance.submitted(queue.Get(),list.Get(),capture);wait();
-    check(capture.token()==4,"Later guides may be submitted before consumption of the captured color");
-    check(provenance.token(depth.Get())==color_token,"Newer DLSS submissions must not retag a color copy recorded earlier");
-    CheekyFgPair pair;pair.capture_token=provenance.token(depth.Get());
+    record(.4f);record(.6f);list->Close();queue->ExecuteCommandLists(1,lists);capture.submitted(queue.Get(),list.Get());wait();
+    CheekyFgPair pair;pair.capture_token=color_token;
     check(capture.acquire(pair)&&pair.eyes[0].evaluation==1&&pair.eyes[1].evaluation==2,
-        "Acquire must select the color's exact token, never substitute the newer pair");
+        "A pair matched at xrEndFrame keeps its exact guides after newer guides are submitted");
+    check(capture.token()==4,"The next complete interval matches once the earlier pair is consumed");
     auto release=[&](CheekyFgPair& p){for(auto& eye:p.eyes){eye.depth->Release();eye.motion->Release();}p.producer_queue->Release();p.lease->Release();};
     cheeky::fg::FrameGuides12 retained;
     retained.retain(pair);release(pair);pair=retained.pair;
-    check(retained.lease&&pair.eyes[0].render_frame==77&&pair.eyes[1].render_frame==77,
+    check(retained.lease&&pair.eyes[0].evaluation==1&&pair.eyes[1].evaluation==2,
         "Native FG job must retain the exact original stereo guide lease after releasing the bridge response");
     // Read every snapshot after the engine has reused the SAME original guide
     // textures for both eyes and a later frame. No constant-source mock passes.
@@ -109,17 +102,18 @@ void fg_snapshot_validation(ID3D12Device* device) {
     // Recycle the producer pool for 32 newer stereo frames after returning the
     // bridge response. Holding resource pointers alone would not prevent its
     // Shot objects from being selected and overwritten by the producer.
-    for(unsigned frame=79;frame<111;++frame) {
+    for(unsigned frame=0;frame<32;++frame) {
         allocator->Reset();list->Reset(allocator.Get(),nullptr);capture.reset(list.Get());
-        recording_frame=frame;record(.1f);record(.9f);
+        record(.1f);record(.9f);
         list->Close();queue->ExecuteCommandLists(1,lists);capture.submitted(queue.Get(),list.Get());
-        check(capture.token(frame)!=0,"Guide pool must remain usable while one old stereo job is retained");
+        CheekyFgPair recycled;recycled.capture_token=capture.token();
+        check(recycled.capture_token&&capture.acquire(recycled),"Guide pool must remain usable while one old stereo job is retained");
+        release(recycled);
         wait();capture.retire();wait();
     }
     read_retained();retained=cheeky::fg::FrameGuides12{};
     check(!retained.lease&&!retained.depth[0]&&!retained.motion[1],"Retired native job releases guide leases and resources");
     capture.invalidate();check(capture.token()==0,"Configuration/session reset rejects previous-frame guides");
-    provenance.invalidate();check(provenance.token(depth.Get())==0,"Session reset clears color provenance");
     // Exercise physical eye identity with different GPU pixels while call order
     // and calibration change independently, as they can across ACC scenes.
     using cheeky::foveated_dlss::FgGuideIdentity;
@@ -134,7 +128,7 @@ void fg_snapshot_validation(ID3D12Device* device) {
     };
     auto submit_mapped=[&]{list->Close();queue->ExecuteCommandLists(1,lists);mapped.submitted(queue.Get(),list.Get());wait();};
     auto acquire_mapped=[&](bool reset) {
-        pair={};pair.capture_token=mapped.token(0,true);
+        pair={};pair.capture_token=mapped.token();
         check(pair.capture_token&&mapped.acquire(pair),"Acquire a complete calibrated stereo pair");
         check(cheeky_fg_pair_matches_color(pair,pair.capture_token,0),
             "The OpenXR handoff must accept physical eye order with either evaluation order");
@@ -157,16 +151,16 @@ void fg_snapshot_validation(ID3D12Device* device) {
     // Same evaluation order but the handles now represent opposite eyes.
     start_mapped();record_mapped(1,12,101);record_mapped(0,12,102);submit_mapped();acquire_mapped(true);
     start_mapped();record_mapped(0,12);record_mapped(1,13);submit_mapped();
-    check(!mapped.token(0,true),"A calibration switch between evaluations rejects the whole stereo pair");
-    mapped.discard_hookless_interval();
+    check(!mapped.token(),"A calibration switch between evaluations rejects the whole stereo pair");
+    mapped.discard_interval();
     start_mapped();record_mapped(0,13);record_mapped(1,13);submit_mapped();acquire_mapped(true);
     start_mapped();record_mapped(0,13);record_mapped(0,13);submit_mapped();
-    check(!mapped.token(0,true),"Two guides for one physical eye cannot masquerade as stereo");
-    mapped.discard_hookless_interval();
+    check(!mapped.token(),"Two guides for one physical eye cannot masquerade as stereo");
+    mapped.discard_interval();
     start_mapped();record_mapped(0,13);record_mapped(1,13);submit_mapped();acquire_mapped(true);
     start_mapped();record_mapped(FgGuideIdentity::unknown,13);record_mapped(1,13);submit_mapped();
-    check(!mapped.token(0,true),"A partial calibrated/unknown pair cannot use ordinal fallback");
-    mapped.discard_hookless_interval();
+    check(!mapped.token(),"A partial calibrated/unknown pair cannot use ordinal fallback");
+    mapped.discard_interval();
     start_mapped();record_mapped(1,14);record_mapped(0,14);submit_mapped();acquire_mapped(true);
     // Physical-eye jitter must not cross a changed mapping, even when native
     // frame IDs, dimensions and the NGX handle address are unchanged.
@@ -178,7 +172,7 @@ void fg_snapshot_validation(ID3D12Device* device) {
     };
     for(unsigned frame=0;frame<3;++frame) {
         start_mapped();record_jitter(1,frame<2?14:15,.25f+.5f*frame);record_jitter(0,frame<2?14:15,.25f+.5f*frame);submit_mapped();
-        CheekyFgPair jitter_pair;jitter_pair.capture_token=mapped.token(0,true);
+        CheekyFgPair jitter_pair;jitter_pair.capture_token=mapped.token();
         check(jitter_pair.capture_token&&mapped.acquire(jitter_pair),"Calibrated jitter pair");
         for(auto& eye:jitter_pair.eyes)
             check(std::abs(eye.jitter_correction_x-(frame==1?-.5f/16:0.f))<.00001f,
@@ -203,16 +197,14 @@ void fg_snapshot_validation(ID3D12Device* device) {
     allocator->Reset();list->Reset(allocator.Get(),nullptr);
     FgSnapshots aliased;check(aliased.initialize(queue.Get()),"Alias snapshot queue");
     TimingListAlias alias(list.Get());CheekyFgEye meta;meta.depth=depth.Get();meta.motion=motion.Get();
-    meta.width=meta.height=32;meta.render_frame=909;
+    meta.width=meta.height=32;
     meta.depth_base_x=2;meta.depth_base_y=3;meta.depth_width=7;meta.depth_height=9;
     meta.motion_base_x=4;meta.motion_base_y=5;meta.motion_width=8;meta.motion_height=6;
     check(aliased.record(alias.get(),meta)&&aliased.record(alias.get(),meta),"Capture through opaque command-list facade");
-    cheeky::foveated_dlss::FgColorProvenance alias_color;alias_color.token(depth.Get());
-    alias_color.observe(alias.get(),depth.Get(),aliased,909);
     list->Close();queue->ExecuteCommandLists(1,lists);
-    aliased.submitted(queue.Get(),list.Get());alias_color.submitted(queue.Get(),list.Get(),aliased);wait();
-    check(alias_color.token(depth.Get())==2,"Native submission must commit guides/color recorded through an opaque alias");
-    CheekyFgPair alias_pair;alias_pair.capture_token=2;alias_pair.render_frame=909;
+    aliased.submitted(queue.Get(),list.Get());wait();
+    check(aliased.token()==2,"Native submission must commit guides recorded through an opaque alias");
+    CheekyFgPair alias_pair;alias_pair.capture_token=2;
     check(aliased.acquire(alias_pair),"Opaque alias must preserve the exact native frame's guide lease");
     check(alias_pair.eyes[0].depth->GetDesc().Width==7&&alias_pair.eyes[0].depth->GetDesc().Height==9&&
         alias_pair.eyes[0].motion->GetDesc().Width==8&&alias_pair.eyes[0].motion->GetDesc().Height==6&&
@@ -221,5 +213,5 @@ void fg_snapshot_validation(ID3D12Device* device) {
     check(alias.references==0,"Alias guide/color command references retire after native enqueue");
     aliased.retire();const auto guide_gpu=aliased.capture_gpu();
     check(guide_gpu.samples==1&&guide_gpu.mean>0,"Both completed eye snapshots must contribute one measured stereo guide-copy sample");
-    std::cout<<"Guide alignment: reused source pixels, copy provenance, delayed consumption, bounded/reset recovery and reversed-Z head translation passed\n";
+    std::cout<<"Guide alignment: reused source pixels, delayed consumption, bounded/reset recovery and reversed-Z head translation passed\n";
 }

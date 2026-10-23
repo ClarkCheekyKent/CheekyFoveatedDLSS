@@ -67,7 +67,7 @@ void fg_prepared_validation(ID3D12Device* device) {
         color_transition(list.Get(),depth.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         color_transition(list.Get(),motion.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         check(SUCCEEDED(list->Close()),"Prepared capture close");snapshots.submitted(queue.Get(),list.Get());ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
-        CheekyFgPair pair;pair.capture_token=snapshots.token(77);pair.render_frame=77;check(snapshots.acquire(pair),"Lease exact prepared stereo pair");
+        CheekyFgPair pair;pair.capture_token=snapshots.token();pair.render_frame=77;check(snapshots.acquire(pair),"Lease exact prepared stereo pair");
         queue->Signal(fence.Get(),++serial);HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
         check(event&&SUCCEEDED(fence->SetEventOnCompletion(serial,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0,"Prepared capture fence");CloseHandle(event);
         allocator->Reset();list->Reset(allocator.Get(),nullptr);

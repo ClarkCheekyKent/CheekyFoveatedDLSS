@@ -972,7 +972,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     if (flag(cadence, "valid")) {
         ImGui::Text("FPS (game / native / generated): %.1f / %.1f / %.1f", number(cadence,"game_fps"), number(cadence,"native_fps"), number(cadence,"generated_fps"));
         ImGui::Text("Unique FPS output: %.1f FPS", number(cadence,"unique_fps"));
-        ImGui::Text("Repeated / total OpenXR submissions: %.1f / %.1f FPS", number(cadence,"repeat_fps"), number(cadence,"submission_fps"));
     } else ImGui::TextUnformatted("Measuring presentation cadence...");
     ImGui::SeparatorText("Content age at OpenXR submission (average ms)");
     ImGui::TextWrapped("Capture-to-submit age, not rendering time or headset display latency.");
@@ -1054,7 +1053,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             diagnostic_line(guides,"Captured view guides","snapshots");diagnostic_line(guides,"Assembled guide pairs","guide_pairs");
             diagnostic_line(guides,"Capture stage (8 = ready)","capture_stage");diagnostic_line(guides,"Assembly stage (4 = ready)","assembly_stage");
         }else{
-        diagnostic_line(fg, "Frame source", "frame_source");
         diagnostic_line(fg, "Captured guides", "captured_guides");
         diagnostic_line(fg, "Guide matching", "match_reason");
         }

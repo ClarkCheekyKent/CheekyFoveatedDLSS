@@ -27,14 +27,13 @@ struct TimingAverage {
     }
 };
 struct CadenceWindow {
-    // Counters: game submissions, distinct native, generated, repeated, runtime
-    // submissions. Repeated native pixels must never inflate unique-frame FPS.
-    struct Sample {double ms{};std::array<std::uint64_t,5> counts{};};
+    // Counters: game submissions, distinct native, generated, runtime submissions.
+    struct Sample {double ms{};std::array<std::uint64_t,4> counts{};};
     std::array<Sample,256> samples{};unsigned count{},next{};
-    void add(double ms,std::array<std::uint64_t,5> counts) {
+    void add(double ms,std::array<std::uint64_t,4> counts) {
         samples[next]={ms,counts};next=(next+1)%samples.size();count=std::min<unsigned>(count+1,unsigned(samples.size()));
     }
-    bool rates(std::array<double,5>& result) const {
+    bool rates(std::array<double,4>& result) const {
         result={};if(count<2)return false;
         const auto& newest=samples[(next+samples.size()-1)%samples.size()];auto oldest=newest;
         for(unsigned i=2;i<=count;++i){const auto& candidate=samples[(next+samples.size()-i)%samples.size()];

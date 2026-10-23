@@ -121,7 +121,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
             for(auto* resource:{g.depth,g.motion})cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         }
         check(SUCCEEDED(list->Close()),"Prepared physical capture close");queue->ExecuteCommandLists(1,commands);prepared_snapshots.submitted(queue.Get(),list.Get());
-        prepared_pair.capture_token=prepared_snapshots.token(77);prepared_pair.render_frame=77;
+        prepared_pair.capture_token=prepared_snapshots.token();prepared_pair.render_frame=77;
         check(prepared_snapshots.acquire(prepared_pair),"Prepared physical guide lease");
         guides.eyes[0]=prepared_pair.eyes[0];guides.eyes[1]=prepared_pair.eyes[1];
         check(guides.eyes[0].prepared_guides&&guides.eyes[1].prepared_guides,"Physical capture must use prepared buffers");

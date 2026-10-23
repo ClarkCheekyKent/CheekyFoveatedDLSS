@@ -180,11 +180,8 @@ def run(engine):
     state["fg"] = {"layer_present": True, "controls_supported": True, "compatible_session": True,
                    "active": True, "state": "Generating frames", "native_frames": 5,
                    "generated_frames": 3, "fallback_frames": 1,
-                   "frame_source": "Plugin hook: UEVR render-pose frame argument",
-                   "frame_source_calls": 20, "captured_guides": 38,
-                   "last_color_frame": 80, "last_guide_frame": 79,
-                   "eligible_guides": 0, "pending_guides": 2,
-                   "match_reason": "No guides with the color frame ID"}
+                   "captured_guides": 38, "eligible_guides": 0, "pending_guides": 2,
+                   "match_reason": "Guides await submission"}
     receive(state)
     draw()
     if "--fg-center" in sys.argv:
@@ -295,8 +292,8 @@ def run(engine):
             receive(state)
             draw()
             assert g["values"][label] == option
-    assert "Frame ID source" in list(g.drawn.values()) and "20 / 38" in list(g.drawn.values())
-    for text in ("Captured frame (color / guides)","80 / 79","Matching guides (ready / pending)","0 / 2","No guides with the color frame ID"):
+    assert "Frame ID source" not in list(g.drawn.values())
+    for text in ("Guides captured","38","Matching guides (ready / pending)","0 / 2","Guides await submission"):
         assert text in list(g.drawn.values()), "Missing precise match diagnostic: " + text
     assert any("matching OpenXR update for FG timings" in t for t in g.drawn.values())
     performance = {"supported": True, "gpu_supported": True, "gpu_valid": True, "gpu_samples": 42,
@@ -354,7 +351,6 @@ def run(engine):
     performance["queued_native"] = 2
     performance["skipped_native"] = 7
     performance["color_token"] = performance["guide_token"] = 42
-    performance["color_render_frame"] = performance["guide_render_frame"] = 77
     performance["inference_color_format"] = 28
     performance["shared_gpu_queue"] = 1
     performance["mismatched_guides"] = 3
@@ -363,33 +359,30 @@ def run(engine):
     for label in ("FG completion wait (background)", "OpenXR waits (presenter)",
                   "Game frame handoff (CPU)", "Game pacing wait", "Skipped FG jobs (busy)",
                   "Color / guide submission", "42 / 42", "Rejected guide matches",
-                  "UEVR frame (color / guides)", "77 / 77", "FG input color", "RGBA8 SDR",
+                  "FG input color", "RGBA8 SDR",
                   "FG GPU queue", "Game queue; background CPU worker"):
         assert label in list(g.drawn.values()), "Missing buffered FG diagnostic: " + label
     assert "FG completion wait (CPU)" not in list(g.drawn.values())
     state["fg"]["cadence"] = {"supported":True,"valid":True,"game_fps":32,"native_target_fps":60,
-        "native_fps":32,"generated_fps":32,"unique_fps":64,"repeat_fps":56,"submission_fps":120,"refresh_hz":120,
+        "native_fps":32,"generated_fps":32,"unique_fps":64,"submission_fps":120,"refresh_hz":120,
         "app_image_wait_ms":4,"present_image_wait_ms":5,"begin_ms":6,"end_ms":7,"present_cpu_ms":8}
     count = len(g.sent)
     receive(state)
     draw()
     for label in ("FPS (game / native / generated)","32.0 / 32.0 / 32.0","Unique FPS output","64.0 FPS",
-                  "Repeated / total OpenXR submissions","56.0 / 120.0 FPS",
                   "Game image wait / call","Presenter image wait / call","Runtime begin / end","6.000 / 7.000 ms"):
         assert label in list(g.drawn.values()), "Missing measured cadence: " + label
     assert len(g.sent) == count, "Reading cadence must not change settings"
     assert "Real frame" not in list(g.drawn.values()), "Older layers must not show zero as a measured frame age"
-    state["fg"]["presentation"] = {"supported":True,"native_samples":10,"generated_samples":9,"repeat_samples":2,
+    state["fg"]["presentation"] = {"supported":True,"native_samples":10,"generated_samples":9,
         "native_age_ms":30,"native_age_last_ms":31,"generated_age_ms":22,"generated_age_last_ms":23,
-        "newest_input_age_ms":12,"newest_input_age_last_ms":13,"repeat_age_ms":40,"repeat_age_last_ms":41,
-        "wait_samples":20,"wait_arrivals":12,"wait_timeouts":8,"late_wait_ms":2,"late_wait_last_ms":3,"wait_budget_ms":4.333}
+        "newest_input_age_ms":12,"newest_input_age_last_ms":13}
     receive(state)
     draw()
     for label in ("Content age at OpenXR submission (average / last ms)","Real frame","30.000 / 31.000 ms",
                   "Generated frame (from the midpoint of its two real frames)","22.000 / 23.000 ms",
                   "Newest input used for the generated frame","12.000 / 13.000 ms"):
         assert label in list(g.drawn.values()), "Missing frame latency telemetry: " + label
-    assert "40.000 / 41.000 ms" not in list(g.drawn.values()), "Repeat submissions are fixed off"
     assert len(g.sent) == count, "Frame-age telemetry must never apply settings"
     state["fg"]["presentation"]["generated_samples"] = 0
     receive(state)

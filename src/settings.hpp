@@ -49,10 +49,8 @@ struct Settings {
         std::uint32_t peripheral_method{1},depth_bits{32},motion_bits{32}; // Guide precision is fixed at 32-bit; not user-facing.
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
         std::uint32_t diagnostic_mode{}; // Fixed at 0 (normal); 1-4 are internal NGX diagnostics.
-        bool backbuffer_frame_id{true}; // Native render-frame identity shared by both NGX stereo evaluations.
         std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
         std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held.
-        bool submit_repeats{false}; // Fixed off: the runtime handles repeated display content.
         std::uint32_t pacing_clock{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
         std::uint32_t color_capture_mode{1},upload_mode{1}; // Fixed: direct eye capture and batched uploads.
         std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.

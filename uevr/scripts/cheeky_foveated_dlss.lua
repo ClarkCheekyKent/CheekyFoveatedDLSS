@@ -677,10 +677,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         end
                     end
                     if not native_shader11 then
-                        if draft.FgBackbufferFrameId ~= nil then
-                            check("Pass native BackbufferFrameID to NGX", "FgBackbufferFrameId")
-                            text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
-                        end
                         if draft.FgQueuePriority ~= nil then
                             combo("FG GPU queue", "FgQueuePriority", {
                                 [0]="Separate NORMAL queue", [1]="Separate HIGH queue", [2]="Shared game queue"})
@@ -722,8 +718,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if cadence and cadence.supported then
                     if cadence.valid then
                         rows("fg_cadence", {{"FPS (game / native / generated)", string.format("%.1f / %.1f / %.1f",cadence.game_fps or 0,cadence.native_fps or 0,cadence.generated_fps or 0)},
-                            {"Unique FPS output",string.format("%.1f FPS",cadence.unique_fps or 0)},
-                            {"Repeated / total OpenXR submissions",string.format("%.1f / %.1f FPS",cadence.repeat_fps or 0,cadence.submission_fps or 0)}})
+                            {"Unique FPS output",string.format("%.1f FPS",cadence.unique_fps or 0)}})
                     else text("Measuring actual presentation cadence...") end
                 elseif p and p.asynchronous_presenter then
                     text("Update the OpenXR layer for measured unique-output FPS.")
@@ -741,14 +736,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         {"Generated frame (from the midpoint of its two real frames)",age(presentation.generated_samples,presentation.generated_age_ms,presentation.generated_age_last_ms)},
                         {"Newest input used for the generated frame",age(presentation.generated_samples,presentation.newest_input_age_ms,presentation.newest_input_age_last_ms)}})
                 end
-                if fg.frame_source then
-                    rows("fg_source", {{"Frame ID source",fg.frame_source},
-                        {"Frame ID calls / guides captured",string.format("%.0f / %.0f",fg.frame_source_calls or 0,fg.captured_guides or 0)}})
-                    if fg.match_reason then
-                        rows("fg_source_match",{{"Captured frame (color / guides)",string.format("%.0f / %.0f",fg.last_color_frame or 0,fg.last_guide_frame or 0)},
-                            {"Matching guides (ready / pending)",string.format("%.0f / %.0f",fg.eligible_guides or 0,fg.pending_guides or 0)},
-                            {"Frame match",fg.match_reason}})
-                    end
+                if fg.match_reason then
+                    rows("fg_source_match",{{"Guides captured",string.format("%.0f",fg.captured_guides or 0)},
+                        {"Matching guides (ready / pending)",string.format("%.0f / %.0f",fg.eligible_guides or 0,fg.pending_guides or 0)},
+                        {"Guide matching",fg.match_reason}})
                 end
                 section("GPU timings, both eyes (average / last ms)")
                 local extra = fg.overhead
@@ -878,7 +869,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     if p.asynchronous_presenter then
                         text("Pacing wait: game sleeps until the next native-frame slot.")
                         rows("fg_alignment", {{"Color / guide submission",string.format("%.0f / %.0f",p.color_token or 0,p.guide_token or 0)},
-                            {"UEVR frame (color / guides)",string.format("%.0f / %.0f",p.color_render_frame or 0,p.guide_render_frame or 0)},
                             {"FG input color",p.inference_color_format==28 and "RGBA8 SDR" or p.inference_color_format==24 and "RGB10" or "FP16"},
                             {"FG GPU queue",p.shared_gpu_queue==1 and "Game queue; background CPU worker" or "Separate queue"},
                             {"Rejected guide matches",tostring(p.mismatched_guides or 0)}})

@@ -50,7 +50,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     // Retired: native D3D11 now follows FgReleasePoint. Accept older files.
     if (key == "FgNative11Release") return true;
     // Retired options now fixed by the runtime; older files and menus may still send them.
-    for (const auto retired : {"FgHooklessMode3", "FgDepthBits", "FgMotionBits", "FgSubmitRepeats", "FgGuideCaptureMode",
+    for (const auto retired : {"FgHooklessMode3", "FgBackbufferFrameId", "FgDepthBits", "FgMotionBits", "FgSubmitRepeats", "FgGuideCaptureMode",
             "FgCompactStorage", "FgColorCaptureMode", "FgUploadMode", "FgDirectPeripheralShading", "FgDiagnosticMode",
             "D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "HookRescanOnModuleChange"})
         if (key == retired) return true;

@@ -28,8 +28,6 @@ void fg_remember_feature(const NgxHandle*,const NgxParameters*) noexcept;
 bool fg_is_registered_sr_feature(const NgxHandle*) noexcept;
 void fg_forget_feature(const NgxHandle*) noexcept;
 void fg_set_uevr_queue(ID3D12CommandQueue*) noexcept;
-// Standalone hosts have no UEVR render tickets. Match submitted guides at xrEndFrame.
-void fg_set_standalone_host(bool) noexcept;
 // Published by the existing UEVR plugin rendering-method observer; never
 // derived from an FG frame number, NGX eval order or a private vtable hook.
 void fg_uevr_mode_attached() noexcept;
@@ -38,8 +36,6 @@ void fg_uevr_mode_detached() noexcept;
 void fg_note_submission(ID3D12CommandQueue*,ID3D12GraphicsCommandList*) noexcept;
 void fg_retire_snapshots() noexcept;
 void fg_note_reset(ID3D12GraphicsCommandList*) noexcept;
-void fg_note_color_copy(ID3D12GraphicsCommandList*,ID3D12Resource*) noexcept;
 bool fg_recording_tagged(ID3D12GraphicsCommandList*) noexcept;
 bool fg_has_pending_submissions() noexcept;
-void fg_abandon_frame_source() noexcept; // Loader-lock-safe; UEVR owns hook cleanup on plugin unload.
 }

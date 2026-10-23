@@ -198,9 +198,9 @@ inline void fg_backend11_pipelined(bool direct=false){
     }
     // Disable exactly as xrWaitFrame does, while the render thread may still
     // own the last frame: finish application frames, then drain.
-    std::uint64_t generated{},native{},repeats{};bool fresh_only{};CheekyFgPerformance gpu;CheekyFgOverhead overhead;
+    std::uint64_t generated{},native{};CheekyFgPerformance gpu;CheekyFgOverhead overhead;
     {std::lock_guard lock(p.mx);generated=p.generated_count;native=p.native_count;
-        repeats=p.repeated_presentations;fresh_only=!p.submit_repeat_frames;gpu=p.performance();overhead=p.overhead();}
+        gpu=p.performance();overhead=p.overhead();}
     auto disable=std::async(std::launch::async,[&]{p.finish_application_frame();p.invalidate_temporal();});
     const bool disabled=disable.wait_for(std::chrono::seconds(5))==std::future_status::ready;
     if(!disabled){std::cerr<<"backend11 disable hung\n";std::_Exit(3);}
@@ -213,7 +213,6 @@ inline void fg_backend11_pipelined(bool direct=false){
     check(!Runtime::errors,"Presenter alone owns runtime frames and private swapchain image order");
     check(!app_errors,"Application wait/begin/capture/end succeed with overlapping frames");
     check(generated>=frames/4,"Native D3D11 interpolation reaches the headset with overlapping application frames");
-    check(fresh_only&&repeats==0,"Native D3D11 honors the fixed fresh-only policy for copied and direct output");
     check(gpu.gpu_supported&&gpu.gpu_valid&&gpu.gpu_samples>0&&gpu.window_samples>0&&
         gpu.total_ms>0&&gpu.total_last_ms>0&&gpu.output_width==64&&gpu.output_height==64,
         "Native D3D11 reports completed GPU timestamps for both copied and direct stereo generation");

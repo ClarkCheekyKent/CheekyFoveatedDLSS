@@ -4042,7 +4042,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPerformance(CheekyFgPe
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCadenceV1(CheekyFgCadence* out) noexcept {
-    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
     *out=CheekyFgCadence{};std::lock_guard lock(state_mutex);
     for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
         std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->cadence();return true;}
@@ -4079,7 +4079,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetOverheadV1(CheekyFgOve
 }
 
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPresentationV1(CheekyFgPresentation* out) noexcept {
-    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
     *out=CheekyFgPresentation{};std::lock_guard lock(state_mutex);
     for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
         std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->presentation();return true;}

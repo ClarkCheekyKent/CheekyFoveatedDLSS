@@ -410,6 +410,6 @@ full-resolution guides where the user looks.
 D3D12 games using real quad views through the layer also run FG: the layer composes
 each eye, captures the composed images for the shared buffered presenter and
 presents them as an ordinary stereo frame. Guides use the same periphery pair
-(hook-free pairing at xrEndFrame). The composed eye rects are published as the
+(pairing at xrEndFrame). The composed eye rects are published as the
 submitted views. D3D12 quad has no automatic role proof yet, so it uses the
 default evaluation order unless roles are assigned manually.
