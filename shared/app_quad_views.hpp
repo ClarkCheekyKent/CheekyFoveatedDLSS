@@ -46,8 +46,10 @@ class AppQuadViews {
             // evaluations, splitting one game frame across two keys. Views that
             // are all known members of the set are not a miss: only an unknown
             // view (another rendering setup) or release/idleness ends the set.
-            const bool known=!overflow&&std::all_of(frame.begin(),frame.end(),[&](const Source& f){
-                return !f.id||std::any_of(sources.begin(),sources.end(),[&](const Source& s){return same(s,f);});});
+            // Uniquely sized views (desktop/menu mirror, e.g. 2560x1440) were
+            // never candidates and must not end the set either.
+            const bool known=!overflow&&std::all_of(selected.begin(),selected.begin()+count,[&](const Source& f){
+                return std::any_of(sources.begin(),sources.end(),[&](const Source& s){return same(s,f);});});
             bool live=true;for(unsigned i=0;i<8;++i)live&=!sources[i].id||now-member_seen[i]<=750;
             if(known&&live){misses=0;return;}
         }

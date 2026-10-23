@@ -41,6 +41,13 @@ int main(){
     const auto split_revision=map.snapshot(1,14,140).revision;
     check(map.detected(),"Split frames of the known set must not end quad mode");
     frame(map,15);check(map.snapshot(1,16,160).revision==split_revision,"Split frames must not reset the quad revision");
+    // A desktop-sized view appearing mid-session (MSFS menu, 2560x1440).
+    for(uint64_t key=16;key<19;++key){
+        for(unsigned i=0;i<2;++i)map.observe(1,key*2,key*10,100+i,10+i,1047,981);
+        map.observe(1,key*2,key*10,700,70,2560,1440);
+        for(unsigned i=2;i<4;++i)map.observe(1,key*2+1,key*10+5,100+i,10+i,1047,981);
+        map.observe(1,key*2+1,key*10+5,700,70,2560,1440);}
+    check(map.snapshot(1,40,190).revision==split_revision&&map.detected(),"A uniquely sized desktop view must not end quad mode");
     // Switching to stereo that reuses two of the handles: the other two go idle.
     for(uint64_t key=20;key<=120;key+=10)frame(map,key,false);s=map.snapshot(1,130,1300);
     check(!s.active&&!map.detected(),"Stereo frames must end quad mode");
