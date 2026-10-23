@@ -6707,9 +6707,8 @@ FARPROC WINAPI hook_get_proc_address(
         modules.size(),
         static_cast<std::size_t>(required / sizeof(HMODULE))
     );
-    // Import tables only change when modules load or unload. With
-    // HookRescanOnModuleChange, rescan on a new module list (or Streamline/core
-    // detection) plus a slow safety rescan; a full walk calls
+    // Import tables only change when modules load or unload. Rescan on a new
+    // module list (or Streamline/core detection) plus a slow safety rescan; a full walk calls
     // GetModuleFileNameW per import under the loader lock.
     const bool streamline = streamline_loaded();
     std::uint64_t signature = 14695981039346656037ULL ^ count ^ (streamline ? 1ULL << 63U : 0ULL);
@@ -6719,8 +6718,7 @@ FARPROC WINAPI hook_get_proc_address(
     static std::uint64_t scanned_signature{};
     static ULONGLONG next_full_scan{};
     const auto now = GetTickCount64();
-    if (configured_settings().hook_rescan_on_module_change &&
-        signature == scanned_signature && now < next_full_scan) return false;
+    if (signature == scanned_signature && now < next_full_scan) return false;
     scanned_signature = signature;
     next_full_scan = now + 10000U;
     bool patched{};

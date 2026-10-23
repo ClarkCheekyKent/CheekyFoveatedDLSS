@@ -138,8 +138,9 @@ bool enabled() noexcept {
     return current_settings().fg.enabled &&
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
-bool hookless_selected(const Settings::FrameGeneration& s) noexcept {
-    return standalone_host.load(std::memory_order_acquire) || s.hookless_mode3;
+// Standalone always matches guide pairs at xrEndFrame; UEVR uses its frame hooks.
+bool hookless_selected(const Settings::FrameGeneration&) noexcept {
+    return standalone_host.load(std::memory_order_acquire);
 }
 bool hookless_selected() noexcept {return hookless_selected(current_settings().fg);}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
@@ -241,7 +242,7 @@ void fg_note_reset(ID3D12GraphicsCommandList* list) noexcept try {
 void fg_note_color_copy(ID3D12GraphicsCommandList* list,ID3D12Resource* color) noexcept try {
     // Most copies (including our guide snapshots) are unrelated. Inspect the
     // registration before taking the mutex; snapshot recording already owns it.
-    // Hook-free matching happens at xrEndFrame, after the complete stereo submission.
+    // Standalone matching happens at xrEndFrame, after the complete stereo submission.
     // Do not require private UEVR color-copy queues or resource identities.
     if(!enabled()||hookless_selected()||!FgColorProvenance::registered(color))return;
     const bool hookless=false;
@@ -430,7 +431,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const auto settings=current_settings();
     const bool hookless=hookless_selected(settings.fg);
     if(!hookless&&(!render_frame||ticket_epoch!=source_epoch.load())){++missing_frame_guides;return;}
-    // Hook-free mode has no frame ticket. Only the ordered, immutable guide
+    // Standalone mode has no frame ticket. Only the ordered, immutable guide
     // recordings and final color-copy enqueue are used to associate a pair.
     if(!hookless&&rhi_ticket)frame_phase.evaluated();
     std::uint32_t flags{};bool flags_known{};
@@ -578,7 +579,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AttachUEVRFrameSource(voi
     using namespace cheeky::foveated_dlss;
     std::lock_guard lock(source_mutex);
     if(hookless_selected()){
-        strcpy_s(source_message,"Hook-free FG: no UEVR frame hooks");
+        strcpy_s(source_message,"Standalone FG: no UEVR frame hooks");
         return true; // Do not even inspect the installed UEVR runtime layout.
     }
     if(source_hook>=0&&!source_abandoned.load())return true;
@@ -614,7 +615,7 @@ extern "C" __declspec(dllexport) void __cdecl CheekyFG_DetachUEVRFrameSource() n
     for(unsigned n=0;n<rhi_hook_count;++n)if(rhi_hooks[n].id>=0&&unregister_source)unregister_source(rhi_hooks[n].id);
     rhi_hook_count=0;selected_rhi=-1;
     source_hook=-1;unregister_source=nullptr;++source_epoch;render_frame=0;
-    strcpy_s(source_message,hookless_selected()?"Hook-free FG: no UEVR frame hooks":"Plugin frame source detached");
+    strcpy_s(source_message,hookless_selected()?"Standalone FG: no UEVR frame hooks":"Plugin frame source detached");
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFgCaptureHealth* out) noexcept {
     using namespace cheeky::foveated_dlss;
@@ -622,7 +623,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFg
     std::lock_guard lock(source_mutex);out->plugin_hook=source_hook>=0&&!source_abandoned.load();
     out->frame_calls=source_calls;out->last_guide_frame=last_guide_frame;out->captured_guides=captured_guides;
     out->missing_frame_guides=missing_frame_guides;out->color_copies=color_copies;
-    strcpy_s(out->source,hookless_selected()?"Hook-free FG: capture-ordered stereo pairs":
+    strcpy_s(out->source,hookless_selected()?"Stereo pairs matched at xrEndFrame":
         selected_rhi.load()>=0?"Plugin hook: RHI stereo phases":source_message);
     std::lock_guard captures(mutex);const auto& match=last_color_match;
     out->color_frame=last_color_frame;out->match_frame=match.frame;out->latest_frame=match.latest_frame;
@@ -667,7 +668,7 @@ extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHookless
     if(!token)guides.discard_hookless_interval();
     last_color_frame=0;
     last_color_match=guides.last_match;
-    if(!use_for_fg)last_color_match.reason="Hook-free native frame skipped at xrEndFrame";
+    if(!use_for_fg)last_color_match.reason="Native frame skipped at xrEndFrame";
     else if(token)last_color_match.reason="Matched at xrEndFrame";
     static ULONGLONG next_trace{};const auto now=GetTickCount64();
     if(now>=next_trace){next_trace=now+2000;const auto& m=last_color_match;

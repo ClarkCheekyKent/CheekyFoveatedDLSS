@@ -139,7 +139,7 @@ void test_ui_diagnostics() {
     auto text = render("Stereo / Gaze");
     auto* bar = context->TabBars.GetByIndex(0);
     require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "General") == 0, "General should be the first tab");
-    require(bar->Tabs.Size == 7, "Standalone tabs include DLSS-FG");
+    require(bar->Tabs.Size == 6, "Standalone tabs include DLSS-FG");
     require(text.find("no active OpenXR layer") != text.npos, "Missing gaze adapter warning");
     text = render("Stereo / Gaze", false);
     require(text.find("Quad view assignment") == text.npos && text.find("Quad assignment mode") == text.npos &&
@@ -166,19 +166,20 @@ void test_ui_diagnostics() {
         "overhead":{"supported":true,"guide_samples":4,"guide_ms":0.25,"guide_last_ms":0.25,"capture_samples":4,"capture_ms":0.125,
             "capture_last_ms":0.125,"publication_samples":0,"upload_samples":4,"upload_ms":0.5,"upload_last_ms":0.375}}})";
     text = render("DLSS-FG");
-    require(text.find("Generating frames") != text.npos && text.find("Generated frames presented: 17") != text.npos &&
-        text.find("Unique output: 90.0 FPS") != text.npos && text.find("FG processing subtotal") != text.npos &&
+    require(text.find("Generating frames") != text.npos && text.find("Total frames (native / generated / fallback): 0 / 17 / 0") != text.npos &&
+        text.find("Unique FPS output: 90.0 FPS") != text.npos && text.find("Generation subtotal") != text.npos &&
+        text.find("Capture subtotal") != text.npos && text.find("Presentation subtotal") != text.npos &&
         text.find("2.500 / 2.250") != text.npos && text.find("OpenXR uploads (per presentation)") != text.npos &&
         text.find("Waiting for GPU samples") != text.npos && text.find("All FG GPU work") != text.npos &&
         text.find("3.375 / 3.000") != text.npos,
         "FG reports actual presented frames, unique cadence and every GPU stage with a total");
-    require(text.find("CPU waits and pacing") != text.npos && text.find("Frame age at submission") != text.npos &&
+    require(text.find("CPU waits and pacing") != text.npos && text.find("Frame latency (game frame captured") != text.npos &&
+        text.find("Frame matching") == text.npos && text.find("GPU workload and transport") == text.npos &&
         text.find("Copy FG diagnostic JSON") != text.npos && text.find("{\"layer_present\"") == text.npos,
         "FG diagnostics must use readable groups without dumping raw JSON");
     render_api="D3D11";
     text=render("DLSS-FG");
-    require(text.find("Selecting DLSS for either region requires DX12 transport")!=text.npos && text.find("FG output destination")==text.npos,
-        "DX11 FG explains when DX12 transport is required and omits the unavailable direct-XR experiment");
+    require(text.find("FG output destination")==text.npos,"DX11 FG omits the unavailable direct-XR experiment");
     render_api="D3D12";
     state.draft.fg.enabled = false;
     state.draft.center_mode = FoveationCenterMode::fixed;

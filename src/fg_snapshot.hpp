@@ -408,11 +408,11 @@ public:
             if(ordinal<consumed||ordinal-consumed!=2||failed_record>consumed||
                 last_match.eligible!=2||last_match.pending||last_match.foreign||last_match.cancelled||
                 last_match.latest!=ordinal){
-                last_match.reason=failed_record>consumed?"Hook-free guide capture failed":
-                    last_match.pending?"Hook-free guides await submission":
-                    last_match.foreign?"Hook-free guide queue mismatch":
-                    last_match.cancelled?"Hook-free guide commands cancelled":
-                    "Hook-free color interval has not exactly two fresh eyes";
+                last_match.reason=failed_record>consumed?"Guide capture failed":
+                    last_match.pending?"Guides await submission":
+                    last_match.foreign?"Guide queue mismatch":
+                    last_match.cancelled?"Guide commands cancelled":
+                    "Color interval has not exactly two fresh eyes";
                 return 0;
             }
         }

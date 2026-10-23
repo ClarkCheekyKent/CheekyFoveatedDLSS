@@ -126,8 +126,7 @@ runtime, but each installation has its own settings file.
 
 Both hosts expose the shared settings, including D3D11 direct/transport, center
 and peripheral SR, full/foveated NR before or after upscaling, gaze, calibration,
-presets and diagnostics. The **All settings** tab provides the complete public
-configuration field set. D3D11 NR uses the existing D3D12 transport path.
+presets and diagnostics. D3D11 NR uses the existing D3D12 transport path.
 The overlay renders SDR, scRGB and HDR10 with the game's presentation color
 space; HDR10 alpha blending is approximate.
 
@@ -145,8 +144,8 @@ the locations expected by the game. D3D11 requires **DX12 Transport** for NR.
 See the [NR settings reference](https://github.com/ClarkCheekyKent/CheekyFoveatedDLSS/blob/master/USAGE.md#experimental-dlss-nr-support)
 for tuning and runtime compatibility notes.
 
-Select `D3D11D3D12Transport` manually in the **DLSS-NR** tab
-or **All settings**. The NR toggle and hotkey do not change the transport setting.
+Select `D3D11D3D12Transport` manually in the **DLSS-NR** tab.
+The NR toggle and hotkey do not change the transport setting.
 The private DX12 path explicitly registers the loaded DLSS library's directory
 when the game's NGX initialization paths are unavailable. A log entry such as
 `D3D12 canonical create ... result=0xBAD0000B` means that private DLSS feature
@@ -202,9 +201,8 @@ between APIs. The matching updated OpenXR installer is required. The direct-XR
 output experiment uses compact intermediates on D3D11. This path has GPU
 integration coverage; ACC and headset compatibility still require game testing.
 
-Standalone automatically uses hook-free guide matching at `xrEndFrame`; the
-UEVR-specific `FgHooklessMode3` and `FgBackbufferFrameId` preferences do not
-override that behavior. Each native frame must supply exactly two submitted
+Standalone matches guide pairs at `xrEndFrame`; the UEVR-specific
+`FgBackbufferFrameId` preference does not override that behavior. Each native frame must supply exactly two submitted
 eye evaluations. Missing, partial or ambiguous guide intervals retain native
 presentation and recover on a later complete stereo frame. Keep **Release game
 rendering** at **After generated frame submission** (the default) for serialized
@@ -212,9 +210,9 @@ matching. Other release modes allow experimental overlap without native frame
 identity proof.
 
 The tab includes full/foveated FG, matching the SR region and gaze placement,
-manual region controls, center/peripheral scales, peripheral methods and guide
-precision, queue scheduling, capture/storage/output experiments, and reset to FG
-defaults. Status, generated frame counts, measured unique output FPS and GPU
+manual region controls, center/peripheral scales and peripheral methods. An
+**Advanced settings** section holds pacing, queue scheduling, capture/storage/
+output experiments and diagnostics. Reset restores the FG defaults. Status, generated frame counts, measured unique output FPS and GPU
 timings use the shared presenter diagnostics. Unique FPS excludes repeats.
 
 This path requires the same NVIDIA DLSS-G capability as UEVR. Vulkan,

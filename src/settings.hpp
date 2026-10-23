@@ -44,33 +44,28 @@ struct Settings {
         bool foveated{true};
         bool match_sr_region{true}; // Copy SR size and effective per-eye placement when enabled.
         bool show_border{false}; // Blue FG debug outline, drawn after FG into OpenXR output.
-        std::uint32_t resolution_percent{100},peripheral_percent{25};
+        std::uint32_t resolution_percent{100},peripheral_percent{50};
         std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
-        std::uint32_t peripheral_method{1},depth_bits{32},motion_bits{32};
+        std::uint32_t peripheral_method{1},depth_bits{32},motion_bits{32}; // Guide precision is fixed at 32-bit; not user-facing.
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
-        std::uint32_t diagnostic_mode{}; // UEVR Lua: normal, prepare-first, left-only, right-only, split-lists.
+        std::uint32_t diagnostic_mode{}; // Fixed at 0 (normal); 1-4 are internal NGX diagnostics.
         bool backbuffer_frame_id{true}; // Native render-frame identity shared by both NGX stereo evaluations.
         std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
         std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held.
-        bool hookless_mode3{false}; // Experimental all release modes: no private UEVR frame hooks or native frame IDs.
-        bool submit_repeats{false}; // Runtime handles repeated display content.
+        bool submit_repeats{false}; // Fixed off: the runtime handles repeated display content.
         std::uint32_t pacing_clock{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
-        std::uint32_t color_capture_mode{1},upload_mode{1}; // Proven Joey-run defaults; 0 retains each baseline for A/B testing.
+        std::uint32_t color_capture_mode{1},upload_mode{1}; // Fixed: direct eye capture and batched uploads.
         std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.
-        std::uint32_t compact_storage{1}; // Native-density center plus reduced peripheral context, reconstructed at XR upload.
-        std::uint32_t guide_capture_mode{1}; // 0 raw snapshots; 1 capture directly into prepared FG guide grids.
+        std::uint32_t compact_storage{1}; // Fixed. Native-density center plus reduced peripheral context, reconstructed at XR upload.
+        std::uint32_t guide_capture_mode{1}; // Fixed: capture directly into prepared FG guide grids.
         std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.
-        std::uint32_t direct_peripheral_shading{1}; // 0 full rate, 1 coarse blocks, 2 filtered coarse grid.
+        std::uint32_t direct_peripheral_shading{0}; // Fixed at full-rate warp.
         bool native11_skip_identity_crop{false}; // Native D3D11: reuse a whole-image eye capture instead of copying it again.
     } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
     bool d3d11_use_d3d12_transport{false};
-    // Experimental DX11 -> DX12 transport savings; both off keep the baseline copies and slots.
-    bool d3d11_transport_shared_guides{false}; // FG and NR-before reuse the peripheral full-frame depth/motion copies.
-    bool d3d11_transport_single_buffer{false}; // One set of shared textures instead of one per ring slot.
     bool d3d12_quad_compose_wait{true}; // D3D12 quad views: xrEndFrame waits for the composition GPU work.
-    bool hook_rescan_on_module_change{false}; // Import-table/LibOVR scans only when the loaded-module list changes.
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};

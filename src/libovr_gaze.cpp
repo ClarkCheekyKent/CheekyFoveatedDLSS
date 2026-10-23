@@ -688,13 +688,12 @@ HMODULE find_runtime_module() noexcept {
     DWORD bytes{};
     if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &bytes)) return nullptr;
     const auto count = (std::min)(modules.size(), static_cast<std::size_t>(bytes / sizeof(HMODULE)));
-    // Most games never load LibOVR. With HookRescanOnModuleChange, skip the
-    // export probes until the module list differs from the last one searched.
+    // Most games never load LibOVR. Skip the export probes until the module list differs from the last one searched.
     std::uint64_t signature = 14695981039346656037ULL ^ count;
     for (std::size_t i = 0; i < count; ++i)
         signature = (signature ^ reinterpret_cast<std::uintptr_t>(modules[i])) * 1099511628211ULL;
     static std::uint64_t searched_signature{};
-    if (configured_settings().hook_rescan_on_module_change && signature == searched_signature) return nullptr;
+    if (signature == searched_signature) return nullptr;
     for (std::size_t i = 0; i < count; ++i) {
         const auto module = modules[i];
         if (GetProcAddress(module, "ovr_CommitTextureSwapChain") && GetProcAddress(module, "ovr_GetTextureSwapChainBufferDX") &&

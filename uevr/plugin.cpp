@@ -233,7 +233,7 @@ bool initialize_dll() {
             load_export(dll.value,"CheekyFG_AttachUEVRFrameSource",runtime_attach_frame_source);
             load_export(dll.value,"CheekyFG_NeedsUEVRFrameSourceV1",runtime_needs_frame_source);
             frame_source_policy_known=false;
-            sync_frame_source(); // Persisted hook-free mode skips UEVR layout probing on load.
+            sync_frame_source();
         }
         if (!initialized) {
             if (attachment) runtime_detach(attachment);

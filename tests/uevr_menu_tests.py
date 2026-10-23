@@ -185,7 +185,7 @@ def run(engine):
         assert g["values"]["FG center method"] == 2
         assert g["values"]["FG periphery method"] == 1
         assert g["values"]["FG GPU queue"] is None
-        assert g["values"]["Release game rendering"] is None
+        assert g["values"]["Release game rendering"] == state["settings"]["FgReleasePoint"]
         assert any("Native D3D11" in text for text in g.drawn.values())
         state["settings"]["FgPeripheralMethod"] = 3
         receive(state)
@@ -199,9 +199,11 @@ def run(engine):
         return
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
     assert g["values"]["Release game rendering"] == 3
-    assert g["values"]["Submit repeat frames"] is False
-    assert g["values"]["FG color capture"] == 1
-    assert g["values"]["FG OpenXR uploads"] == 1
+    for retired in ("Submit repeat frames", "FG color capture", "FG OpenXR uploads", "FG guide capture",
+                    "FG frame storage", "Direct periphery shading", "FG diagnostic mode", "FG periphery depth"):
+        assert g["values"][retired] is None, "Fixed FG option must not be drawn: " + retired
+    assert g.tree_parents["Advanced settings"] == "DLSS-FG (experimental)"
+    assert g.tree_parents["Advanced settings"] is not None and g["values"]["FG pacing clock"] is not None
     state["gpu_memory"] = {"supported":True,"scope":"process","adapter":"Test GPU","dedicated_capacity_bytes":12288*1048576,
         "local":{"valid":True,"usage_bytes":9000*1048576,"budget_bytes":8192*1048576,"headroom_bytes":0,
                  "over_budget_bytes":808*1048576,"peak_bytes":10000*1048576,"over_budget_samples":3},
@@ -256,7 +258,7 @@ def run(engine):
         receive(state)
         draw()
         assert g["values"]["FG GPU queue"] == option
-    for point in (1, 2, 3, 4, 0):
+    for point in (1, 2, 3, 4, 5, 0):
         draw(changes={"Release game rendering": point})
         assert "FgReleasePoint=" + str(point) in last()
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
@@ -264,16 +266,8 @@ def run(engine):
         receive(state)
         draw()
         assert g["values"]["Release game rendering"] == point
-    for enabled in (False, True):
-        draw(changes={"Submit repeat frames": enabled})
-        assert "FgSubmitRepeats=" + str(enabled).lower() in last()
-        state["request"] = state["applied_request"] = int(last().splitlines()[1])
-        state["settings"]["FgSubmitRepeats"] = enabled
-        receive(state)
-        draw()
-        assert g["values"]["Submit repeat frames"] is enabled
     assert any("Generating frames" in t for t in g.drawn.values())
-    for label, key in (("FG color capture","FgColorCaptureMode"),("FG OpenXR uploads","FgUploadMode"),("FG latency diagnostics","FgLatencyDiagnostics")):
+    for label, key in (("FG latency diagnostics","FgLatencyDiagnostics"),):
         for option in (1,0):
             draw(changes={label:option})
             assert key + "=" + str(option) in last()
@@ -297,7 +291,7 @@ def run(engine):
     count = len(g.sent)
     receive(state)
     draw()
-    for text in ("DLSS-FG center", "Periphery + blending", "2.750 / 2.500", "0.400 / 0.350",
+    for text in ("DLSS-FG center", "Periphery + output assembly", "2.750 / 2.500", "0.400 / 0.350",
                  "FG GPU total", "4.200 ms", "18.200 ms", "11.111 ms", "280 x 232", "256 x 256", "512 x 512"):
         assert text in list(g.drawn.values()), "Missing FG timing: " + text
     assert len(g.sent) == count, "Reading FG performance must not change settings"
@@ -329,8 +323,9 @@ def run(engine):
         "upload_ms":.4,"upload_last_ms":.3}
     receive(state)
     draw()
-    for label in ("FG processing subtotal","Guide snapshot copies / native","Capture + guide handoff / native",
-                  "Generated output copy / generated","OpenXR uploads / presentation","1.300 / 1.200"):
+    for label in ("  Generation subtotal","Guide capture (per real frame)","Color capture + guide handoff (per real frame)",
+                  "  Capture subtotal","1.500 / 1.300","Generated output copy (per generated frame)","OpenXR uploads (per presentation)",
+                  "  Presentation subtotal","0.700 / 0.500","All FG GPU work","6.100 / 5.300","1.300 / 1.200"):
         assert label in list(g.drawn.values()), "Missing separately measured GPU stage: " + label
     assert "FG GPU total" not in list(g.drawn.values()), "Do not label a partial processing interval as complete FG overhead"
     assert len(g.sent) == count, "Reading additional GPU stages must not change settings"
@@ -359,45 +354,37 @@ def run(engine):
     count = len(g.sent)
     receive(state)
     draw()
-    for label in ("Game / native target","32.0 / 60.0 FPS","Unique output","64.0 FPS","Native / generated output",
-                  "Repeated presentations","56.0 FPS","OpenXR submissions","Headset refresh target","120.0 Hz",
+    for label in ("FPS (game / native / generated)","32.0 / 32.0 / 32.0","Unique FPS output","64.0 FPS",
                   "Game image wait / call","Presenter image wait / call","Runtime begin / end","6.000 / 7.000 ms"):
         assert label in list(g.drawn.values()), "Missing measured cadence: " + label
     assert len(g.sent) == count, "Reading cadence must not change settings"
-    assert "Native frame age" not in list(g.drawn.values()), "Older layers must not show zero as a measured frame age"
+    assert "Real frame" not in list(g.drawn.values()), "Older layers must not show zero as a measured frame age"
     state["fg"]["presentation"] = {"supported":True,"native_samples":10,"generated_samples":9,"repeat_samples":2,
         "native_age_ms":30,"native_age_last_ms":31,"generated_age_ms":22,"generated_age_last_ms":23,
         "newest_input_age_ms":12,"newest_input_age_last_ms":13,"repeat_age_ms":40,"repeat_age_last_ms":41,
         "wait_samples":20,"wait_arrivals":12,"wait_timeouts":8,"late_wait_ms":2,"late_wait_last_ms":3,"wait_budget_ms":4.333}
     receive(state)
     draw()
-    for label in ("Native frame age","30.000 / 31.000 ms","Generated frame age (midpoint)","22.000 / 23.000 ms",
-                  "Newest FG input age","12.000 / 13.000 ms","Repeated frame age","40.000 / 41.000 ms",
-                  "Late FG wait (CPU)","2.000 / 3.000 ms","Late FG wait budget","4.333 ms (10 ms maximum)",
-                  "New pairs / wait timeouts","12 / 8"):
-        assert label in list(g.drawn.values()), "Missing frame age or bounded-wait telemetry: " + label
+    for label in ("Frame latency (game frame captured -> sent to headset)","Real frame","30.000 / 31.000 ms",
+                  "Generated frame (from the midpoint of its two real frames)","22.000 / 23.000 ms",
+                  "Newer real frame behind a generated frame","12.000 / 13.000 ms"):
+        assert label in list(g.drawn.values()), "Missing frame latency telemetry: " + label
+    assert "40.000 / 41.000 ms" not in list(g.drawn.values()), "Repeat submissions are fixed off"
     assert len(g.sent) == count, "Frame-age telemetry must never apply settings"
-    state["settings"]["FgSubmitRepeats"] = False
+    state["fg"]["presentation"]["generated_samples"] = 0
     receive(state)
     draw()
-    assert "Late FG selection wait disabled: repeat submissions are OFF." in list(g.drawn.values())
-    assert "Late FG wait (CPU)" not in list(g.drawn.values()), "Frozen historical waits must not appear active when repeats are OFF"
-    state["settings"]["FgSubmitRepeats"] = True
-    state["fg"]["presentation"]["repeat_samples"] = 0
-    receive(state)
-    draw()
-    assert "No samples yet" in list(g.drawn.values()) and "40.000 / 41.000 ms" not in list(g.drawn.values())
+    assert "No samples yet" in list(g.drawn.values()) and "22.000 / 23.000 ms" not in list(g.drawn.values())
     state["fg"]["presentation"]["supported"] = False
     receive(state)
     draw()
-    assert "Native frame age" not in list(g.drawn.values()), "Missing optional export must preserve older layer compatibility"
+    assert "Real frame" not in list(g.drawn.values()), "Missing optional export must preserve older layer compatibility"
     performance["asynchronous_presenter"] = False
     performance["foveated_eyes"] = 0
     performance["center_width"] = performance["center_height"] = 512
     receive(state)
     draw()
     assert "DLSS-FG full frame" in list(g.drawn.values())
-    assert "Not used (full-frame FG)" in list(g.drawn.values())
     assert "0.400 / 0.350" not in list(g.drawn.values()), "Do not present full-frame FG as a measured periphery pass"
     performance["gpu_valid"] = False
     receive(state)
@@ -409,9 +396,7 @@ def run(engine):
     for label,key,value in (("FG scale","FgResolutionPercent",50),
                             ("FG periphery scale","FgPeripheralPercent",25),
                             ("FG center method","FgCenterMethod",2),
-                            ("FG periphery method","FgPeripheralMethod",3),
-                            ("FG periphery depth","FgDepthBits",16),
-                            ("FG periphery motion","FgMotionBits",16)):
+                            ("FG periphery method","FgPeripheralMethod",3)):
         draw(changes={label:value})
         assert f"{key}={value}" in last(), "FG control must send its actual setting: " + label
         state["request"] = state["applied_request"] = int(last().splitlines()[1])

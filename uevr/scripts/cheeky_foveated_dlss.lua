@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "FgDiagnosticMode", "FgReleasePoint", "FgHooklessMode3", "FgSubmitRepeats", "FgPacingClock", "FgColorCaptureMode", "FgUploadMode", "FgLatencyDiagnostics", "FgCompactStorage", "FgGuideCaptureMode", "FgDirectXrOutput", "FgDirectPeripheralShading", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgDepthBits", "FgMotionBits", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -574,7 +574,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             text("The enable preference is preserved and FG will resume automatically on return to Native Stereo.")
         else
             check("Enable DLSS Frame Generation (2x)", "FgEnabled")
-            text("Applies at the next OpenXR frame and saves automatically.")
+            text("Experimental. Requires an OpenXR game (D3D11 or D3D12) whose render resolution matches the headset resolution.")
             text("Runs only in UEVR Native Stereo. AER, sequential and AFW pause FG automatically; the checkbox stays enabled.")
             local fg = status.fg or {}
             if not fg.layer_present then
@@ -593,127 +593,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     text(tostring(fg.diagnostic))
                 end
             end
-            if draft.FgEnabled then
+            do -- Settings stay editable while FG is off; measurements only exist while it runs.
                 if draft.FgCenterMethod ~= nil then
                     combo("FG center method", "FgCenterMethod", {[0]="DLSS", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation"})
                 end
                 local native_shader11 = status and status.renderer == 0 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) < 3)
-                if native_shader11 then
-                    text("Native D3D11: shader FG writes directly to OpenXR. Uses serialized presentation and full-eye 32-bit guide history.")
-                else
-                if draft.FgDiagnosticMode ~= nil then
-                    section("Stereo NGX diagnostic mode")
-                    combo("FG diagnostic mode", "FgDiagnosticMode", {
-                        [0]="Normal (both eyes)", [1]="Prepare both eyes first",
-                        [2]="Left NGX only", [3]="Right NGX only",
-                        [4]="Split NGX into two command lists"})
-                    if draft.FgDiagnosticMode == 2 or draft.FgDiagnosticMode == 3 then
-                        text("Diagnostics only: one eye uses a native center, not interpolated. Avoid normal VR play.")
-                    end
-                    if draft.FgDiagnosticMode == 4 then
-                        text("Two ordered submissions on the selected FG GPU queue; no extra fence wait.")
-                    end
-                    text("Applies live to the FG worker; logged as 'FG diagnostic mode=...'.")
-                end
-                if draft.FgBackbufferFrameId ~= nil then
-                    section("DLSS-G frame identity and GPU scheduling")
-                    check("Pass native BackbufferFrameID to NGX", "FgBackbufferFrameId")
-                    if draft.FgHooklessMode3 then
-                        text("Overridden by hook-free mode: no native frame number is attached to either eye.")
-                    else
-                        text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
-                    end
-                end
-                if draft.FgQueuePriority ~= nil then
-                    combo("FG GPU queue", "FgQueuePriority", {
-                        [0]="Separate NORMAL queue", [1]="Separate HIGH queue", [2]="Shared game queue"})
-                    text("Switches live after the previous FG job retires; recreates NGX histories and resets FG timings and FPS averages.")
-                    if draft.FgQueuePriority == 2 then text("FG runs in order on the game's GPU queue. Capture and OpenXR uploads keep using that queue in every mode.") end
-                end
-                if draft.FgReleasePoint ~= nil then
-                    combo("Release game rendering", "FgReleasePoint", {
-                        [0]="After FG submission", [4]="4 ms after FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission"})
-                    text("4 ms: CPU pacing delay after FG queue submission; does NOT wait on a GPU fence.")
-                    text("Preparation waits for both eyes' GPU input preparation, then overlaps native rendering with NGX.")
-                    if draft.FgReleasePoint == 3 then
-                        text("Holds the next native frame through generated-frame uploads and OpenXR submission.")
-                    end
-                    if draft.FgHooklessMode3 ~= nil then
-                        check("Hook-free FG guide matching (UEVR compatibility)", "FgHooklessMode3")
-                        text("Disables private UEVR frame/RHI hooks and native frame IDs for every release mode.")
-                        text("Matches exactly one unconsumed stereo guide pair at xrEndFrame; ambiguous pairs fall back to native.")
-                        if draft.FgHooklessMode3 and draft.FgReleasePoint ~= 3 then
-                            text("EXPERIMENTAL: modes 0-2 allow additional overlap; capture order alone cannot prove frame identity.")
-                        end
-                    end
-                elseif draft.FgWaitForCompletion ~= nil then
-                    check("Wait for FG completion before next frame", "FgWaitForCompletion")
-                    text("A/B test: holds the next native frame until both FG eyes finish. May reduce FPS.")
-                end
-                if draft.FgPacingClock ~= nil then
-                    combo("FG pacing clock", "FgPacingClock", {
-                        [0]="Independent display clock", [1]="Follow presented frames", [2]="Follow presented frames + vsync lock"})
-                    if draft.FgPacingClock ~= 0 then
-                        text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
-                    end
-                end
-                if draft.FgSubmitRepeats ~= nil then
-                    check("Submit repeat frames", "FgSubmitRepeats")
-                    text("OFF submits fresh content only; the runtime handles repeats. Native pacing continues independently.")
-                end
-                if draft.FgGuideCaptureMode ~= nil then
-                    combo("FG guide capture", "FgGuideCaptureMode", {[0]="Raw snapshots (baseline)", [1]="Prepared FG layouts"})
-                    text("Prepared capture stores only the center/periphery depth and motion grids. Restart for a clean VRAM A/B baseline.")
-                end
-                if draft.FgDirectXrOutput ~= nil then
-                    combo("FG output destination", "FgDirectXrOutput", {[0]="Compact intermediate (baseline)", [1]="Direct OpenXR image (experimental)"})
-                    text("Direct output waits for FG at presentation; avoids the generated atlas/upload. Periphery shading rate is selectable below.")
-                    text("Uses custom periphery modes. Unsupported images/configurations fall back automatically.")
-                    text("SDR direct output uses linear 8-bit XR storage; check shadow gradients when comparing.")
-                    if draft.FgDirectPeripheralShading ~= nil then
-                        combo("Direct periphery shading", "FgDirectPeripheralShading", {
-                            [0]="Full-resolution warp (baseline)", [1]="Coarse blocks (VRS style)", [2]="Coarse grid + bilinear filtering"})
-                        text("Coarse modes follow Periphery scale; final writes and the center feather remain full resolution.")
-                        text("Blocks reuse one warped color per block. Bilinear filtering smooths between coarse samples.")
-                    end
-                    local direct = status and status.fg and status.fg.direct_output
-                    if direct and direct.supported then
-                        local paths = {[0]="Baseline / waiting", [1]="NGX + assembly direct to XR", [2]="NGX scratch; assembly direct to XR", [3]="Compact fallback"}
-                        rows("fg_direct_output", {{"Last output path", paths[direct.last_path] or "Waiting"},
-                            {"Direct frames / fallback jobs",string.format("%.0f / %.0f",direct.frames or 0,direct.fallbacks or 0)},
-                            {"NGX direct / scratch eyes",string.format("%.0f / %.0f",direct.ngx_direct_eyes or 0,direct.ngx_scratch_eyes or 0)},
-                            {"Unsupported / native not ready",string.format("%.0f / %.0f",direct.unsupported or 0,direct.not_ready or 0)},
-                            {"Direct presentation wait: avg / last",string.format("%.3f / %.3f ms",direct.wait_ms or 0,direct.last_wait_ms or 0)}})
-                        local shading = direct.shading
-                        if shading and shading.supported and shading.valid then
-                            local modes = {[0]="Full resolution", [1]="Coarse blocks", [2]="Coarse bilinear"}
-                            rows("fg_direct_shading", {{"Last direct shading mode",modes[shading.active_mode] or "Unknown"},
-                                {"Periphery shading grid / output",string.format("%dx%d / %dx%d",shading.grid_width or 0,shading.grid_height or 0,shading.output_width or 0,shading.output_height or 0)},
-                                {"Coarse / full-rate direct frames",string.format("%.0f / %.0f",shading.coarse_frames or 0,shading.full_frames or 0)}})
-                        end
-                        if direct.details_supported then
-                            rows("fg_direct_output_failure", {{"Last fallback reason",direct.reason_text or "None"},
-                                {"Requested / XR / backing formats",string.format("%d / %d / %d",direct.expected_format or 0,direct.chain_format or 0,direct.image_format or 0)},
-                                {"Backing flags / API result",string.format("0x%X / %d",direct.image_flags or 0,direct.api_result or 0)},
-                                {"Expected / backing extent",string.format("%dx%d / %dx%d",direct.expected_width or 0,direct.expected_height or 0,direct.image_width or 0,direct.image_height or 0)}})
-                        end
-                    end
-                end
-                if draft.FgCompactStorage ~= nil then
-                    combo("FG frame storage", "FgCompactStorage", {[0]="Full-resolution frames", [1]="Compact center + periphery"})
-                    text("Compact storage keeps a sharp native center; native and generated peripheral detail follows Periphery scale.")
-                end
-                if draft.FgColorCaptureMode ~= nil then
-                    combo("FG color capture", "FgColorCaptureMode", {[0]="Full snapshot + eye crops (baseline)", [1]="Direct eye capture"})
-                    text("Direct capture learns the eye layout; layout changes use a native fallback frame.")
-                end
-                if draft.FgUploadMode ~= nil then
-                    combo("FG OpenXR uploads", "FgUploadMode", {[0]="Per-image submissions (baseline)", [1]="Batch stereo and UI uploads"})
-                end
-                if draft.FgLatencyDiagnostics ~= nil then
-                    combo("FG latency diagnostics", "FgLatencyDiagnostics", {[0]="Off", [1]="Calibrated timeline (1 in 17 jobs)"})
-                end
-                end -- DX12 scheduling/storage experiments
                 if draft.FgResolutionPercent ~= nil then
                     combo("FG scale", "FgResolutionPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                 end
@@ -723,7 +607,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         check("Match DLSS-SR foveation region", "FgMatchSrRegion")
                         if draft.FgMatchSrRegion then
                             text("Uses SR region size, transition and per-eye placement (including gaze when resolved).")
-                            text("FG manual region settings are preserved for when matching is disabled.")
                         end
                     end
                     if not draft.FgMatchSrRegion then
@@ -733,36 +616,72 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         slider("FG vertical offset", "FgYOffset", -1, 1)
                         slider("FG transition width", "FgFeather", 0, 0.3)
                     end
-                    if draft.FgShowBorder ~= nil then
-                        check("Show blue FG region border", "FgShowBorder")
-                        text("Blue outline marks FG region on generated and subsequent native frames.")
-                    end
                     if draft.FgPeripheralPercent ~= nil then
                         combo("FG periphery scale", "FgPeripheralPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                         combo("FG periphery method", "FgPeripheralMethod", {[0]="None (previous frame)", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS"})
-                        if not native_shader11 then
-                        combo("FG periphery depth", "FgDepthBits", {[16]="16-bit", [32]="32-bit"})
-                        combo("FG periphery motion", "FgMotionBits", {[16]="16-bit", [32]="32-bit"})
+                    end
+                end
+                if native_shader11 then
+                    text("Native D3D11: shader FG writes directly to OpenXR. Uses serialized presentation and full-eye 32-bit guide history.")
+                end
+                if imgui.tree_node("Advanced settings") then
+                    if draft.FgFoveated and draft.FgShowBorder ~= nil then
+                        check("Show blue FG region border", "FgShowBorder")
+                    end
+                    if draft.FgPacingClock ~= nil then
+                        combo("FG pacing clock", "FgPacingClock", {
+                            [0]="Independent display clock", [1]="Follow presented frames", [2]="Follow presented frames + vsync lock"})
+                        if draft.FgPacingClock ~= 0 then
+                            text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
                         end
                     end
-                    text("FG scale controls center resolution; matching controls the center region only.")
-                    text("Unsupported guides preserve native frames; see status.")
+                    if not native_shader11 then
+                        if draft.FgBackbufferFrameId ~= nil then
+                            check("Pass native BackbufferFrameID to NGX", "FgBackbufferFrameId")
+                            text("Same real-frame ID for both eyes. Disable only for timing A/B; NGX features reset on toggle.")
+                        end
+                        if draft.FgQueuePriority ~= nil then
+                            combo("FG GPU queue", "FgQueuePriority", {
+                                [0]="Separate NORMAL queue", [1]="Separate HIGH queue", [2]="Shared game queue"})
+                            text("Switches live after the previous FG job retires; recreates NGX histories and resets FG timings and FPS averages.")
+                        end
+                    end
+                    if draft.FgReleasePoint ~= nil then
+                        combo("Release game rendering", "FgReleasePoint", {
+                            [0]="After FG submission", [4]="4 ms after FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission", [5]="Never (display clock only)"})
+                        if draft.FgReleasePoint == 5 then
+                            text("Experimental: the game is paced only by the headset clock and never waits for frame generation.")
+                        elseif draft.FgReleasePoint ~= 3 then
+                            text("Experimental overlap: use After generated frame submission for serialized matching.")
+                        end
+                    elseif draft.FgWaitForCompletion ~= nil then
+                        check("Wait for FG completion before next frame", "FgWaitForCompletion")
+                        text("A/B test: holds the next native frame until both FG eyes finish. May reduce FPS.")
+                    end
+                    if not native_shader11 and draft.FgDirectXrOutput ~= nil then
+                        combo("FG output destination", "FgDirectXrOutput", {[0]="Compact intermediate", [1]="Direct OpenXR image (experimental)"})
+                        local direct = status and status.fg and status.fg.direct_output
+                        if draft.FgDirectXrOutput == 1 and direct and direct.supported then
+                            local paths = {[0]="Baseline / waiting", [1]="NGX + assembly direct to XR", [2]="NGX scratch; assembly direct to XR", [3]="Compact fallback"}
+                            rows("fg_direct_output", {{"Last output path", paths[direct.last_path] or "Waiting"},
+                                {"Direct frames / fallback jobs",string.format("%.0f / %.0f",direct.frames or 0,direct.fallbacks or 0)},
+                                {"Last fallback reason",direct.reason_text or "None"}})
+                        end
+                    end
+                    if not native_shader11 and draft.FgLatencyDiagnostics ~= nil then
+                        combo("FG latency diagnostics", "FgLatencyDiagnostics", {[0]="Off", [1]="Calibrated timeline (1 in 17 jobs)"})
+                    end
+                    imgui.tree_pop()
                 end
-                text("Target: 2x. Native cadence continues until generation succeeds.")
-                rows("fg_frames", {{"Native frames", fg.native_frames or 0},
-                    {"Generated frames presented", fg.generated_frames or 0},
-                    {"Repeated fallback frames", fg.fallback_frames or 0}})
+                if draft.FgEnabled then
+                rows("fg_frames", {{"Total frames (native / generated / fallback)",
+                    string.format("%.0f / %.0f / %.0f",fg.native_frames or 0,fg.generated_frames or 0,fg.fallback_frames or 0)}})
                 local p = fg.performance
                 local cadence = fg.cadence
                 if cadence and cadence.supported then
                     if cadence.valid then
-                        rows("fg_cadence", {{"Game / native target", string.format("%.1f / %.1f FPS",cadence.game_fps or 0,cadence.native_target_fps or 0)},
-                            {"Unique output",string.format("%.1f FPS",cadence.unique_fps or 0)},
-                            {"Native / generated output",string.format("%.1f / %.1f FPS",cadence.native_fps or 0,cadence.generated_fps or 0)},
-                            {"Repeated presentations",string.format("%.1f FPS",cadence.repeat_fps or 0)},
-                            {"OpenXR submissions",string.format("%.1f FPS",cadence.submission_fps or 0)},
-                            {"Headset refresh target",string.format("%.1f Hz",cadence.refresh_hz or 0)}})
-                        text("Unique output excludes repeats. Refresh target is not measured output FPS.")
+                        rows("fg_cadence", {{"FPS (game / native / generated)", string.format("%.1f / %.1f / %.1f",cadence.game_fps or 0,cadence.native_fps or 0,cadence.generated_fps or 0)},
+                            {"Unique FPS output",string.format("%.1f FPS",cadence.unique_fps or 0)}})
                     else text("Measuring actual presentation cadence...") end
                 elseif p and p.asynchronous_presenter then
                     text("Update the OpenXR layer for measured unique-output FPS.")
@@ -772,23 +691,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     local function age(samples, mean, last)
                         return (samples or 0)>0 and string.format("%.3f / %.3f ms",mean or 0,last or 0) or "No samples yet"
                     end
-                    text("Frame age at OpenXR submission: average / last")
+                    section("Frame latency (game frame captured -> sent to headset)")
                     rows("fg_frame_age", {
-                        {"Native frame age",age(presentation.native_samples,presentation.native_age_ms,presentation.native_age_last_ms)},
-                        {"Generated frame age (midpoint)",age(presentation.generated_samples,presentation.generated_age_ms,presentation.generated_age_last_ms)},
-                        {"Newest FG input age",age(presentation.generated_samples,presentation.newest_input_age_ms,presentation.newest_input_age_last_ms)},
-                        {"Repeated frame age",age(presentation.repeat_samples,presentation.repeat_age_ms,presentation.repeat_age_last_ms)}})
-                    text("Age starts at color capture; generated content uses the input-time midpoint.")
-                    text("Excludes earlier game rendering and runtime/display latency.")
-                    if draft.FgSubmitRepeats == false then
-                        text("Late FG selection wait disabled: repeat submissions are OFF.")
-                    else
-                        rows("fg_late_wait", {
-                        {"Late FG wait (CPU)",age(presentation.wait_samples,presentation.late_wait_ms,presentation.late_wait_last_ms)},
-                        {"Late FG wait budget",string.format("%.3f ms (10 ms maximum)",presentation.wait_budget_ms or 0)},
-                        {"New pairs / wait timeouts",string.format("%.0f / %.0f",presentation.wait_arrivals or 0,presentation.wait_timeouts or 0)}})
-                        text("Wait ends on a new pair; reserves 4 ms of the headset period for submission.")
-                    end
+                        {"Real frame",age(presentation.native_samples,presentation.native_age_ms,presentation.native_age_last_ms)},
+                        {"Generated frame (from the midpoint of its two real frames)",age(presentation.generated_samples,presentation.generated_age_ms,presentation.generated_age_last_ms)},
+                        {"Newer real frame behind a generated frame",age(presentation.generated_samples,presentation.newest_input_age_ms,presentation.newest_input_age_last_ms)}})
                 end
                 if fg.frame_source then
                     rows("fg_source", {{"Frame ID source",fg.frame_source},
@@ -799,7 +706,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             {"Frame match",fg.match_reason}})
                     end
                 end
-                text("GPU timings: average / last (ms), both eyes")
+                section("GPU timings, both eyes (average / last ms)")
                 local extra = fg.overhead
                 if not p or not p.supported then
                     text("Install the matching OpenXR update for FG timings.")
@@ -816,27 +723,38 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                                 {"Periphery input", focused and size(p.peripheral_width,p.peripheral_height) or "Not used"},
                                 {"Output per eye", size(p.output_width,p.output_height)}})
                         end
-                        rows("fg_gpu_timings", {
-                            {focused and "DLSS-FG center" or "DLSS-FG full frame", gpu_ms(p.center_ms, p.center_last_ms)},
-                            {resized and "Output resize" or "Periphery + output assembly", (focused or resized) and
-                                gpu_ms(p.periphery_ms,p.periphery_last_ms) or "Not used (full-frame FG)"},
-                            {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)},
-                            {extra and extra.supported and "FG processing subtotal" or "FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}})
-                        text("Average of up to 60 completed stereo pairs.")
-                        if extra and extra.supported then
-                            local function stage(samples, mean, last)
-                                return (samples or 0)>0 and gpu_ms(mean,last) or "Waiting for GPU samples"
-                            end
-                            text("Additional GPU stages outside the processing subtotal:")
-                            rows("fg_transport_gpu", {
-                                {"Guide capture / preparation / native",stage(extra.guide_samples,extra.guide_ms,extra.guide_last_ms)},
-                                {"Capture + guide handoff / native",stage(extra.capture_samples,extra.capture_ms,extra.capture_last_ms)},
-                                {"Generated output copy / generated",stage(extra.publication_samples,extra.publication_ms,extra.publication_last_ms)},
-                                {"OpenXR uploads / presentation",stage(extra.upload_samples,extra.upload_ms,extra.upload_last_ms)}})
-                            text("Color / guide preparation above is already in the subtotal.")
-                            if focused then text("Periphery includes both eyes' output assembly/history; compact feather blending is in OpenXR uploads.") end
-                            text("Runtime compositor GPU work is outside these application timers.")
+                        -- Pipeline order with inline subtotals, matching the standalone menu.
+                        local stages = extra and extra.supported
+                        local entries, sum, sum_last = {}, 0, 0
+                        local function stage(label, samples, mean, last, group)
+                            if (samples or 0) > 0 then
+                                group[1], group[2] = group[1] + (mean or 0), group[2] + (last or 0)
+                                entries[#entries+1] = {label, gpu_ms(mean, last)}
+                            else entries[#entries+1] = {label, "Waiting for GPU samples"} end
                         end
+                        if stages then
+                            local capture = {0, 0}
+                            stage("Guide capture (per real frame)", extra.guide_samples, extra.guide_ms, extra.guide_last_ms, capture)
+                            stage("Color capture + guide handoff (per real frame)", extra.capture_samples, extra.capture_ms, extra.capture_last_ms, capture)
+                            entries[#entries+1] = {"  Capture subtotal", gpu_ms(capture[1], capture[2])}
+                            sum, sum_last = sum + capture[1], sum_last + capture[2]
+                        end
+                        entries[#entries+1] = {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)}
+                        entries[#entries+1] = {focused and "DLSS-FG center" or "DLSS-FG full frame", gpu_ms(p.center_ms, p.center_last_ms)}
+                        if focused or resized then
+                            entries[#entries+1] = {resized and "Output resize" or "Periphery + output assembly", gpu_ms(p.periphery_ms,p.periphery_last_ms)}
+                        end
+                        entries[#entries+1] = {stages and "  Generation subtotal" or "FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}
+                        sum, sum_last = sum + (p.total_ms or 0), sum_last + (p.total_last_ms or 0)
+                        if stages then
+                            local present = {0, 0}
+                            stage("Generated output copy (per generated frame)", extra.publication_samples, extra.publication_ms, extra.publication_last_ms, present)
+                            stage("OpenXR uploads (per presentation)", extra.upload_samples, extra.upload_ms, extra.upload_last_ms, present)
+                            entries[#entries+1] = {"  Presentation subtotal", gpu_ms(present[1], present[2])}
+                            sum, sum_last = sum + present[1], sum_last + present[2]
+                            entries[#entries+1] = {"All FG GPU work", gpu_ms(sum, sum_last)}
+                        end
+                        rows("fg_gpu_timings", entries)
                     elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then
                         text("GPU timestamps unavailable or FG has not started.")
                     else
@@ -954,6 +872,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     text("This is the FG-ON native delay, NOT added FG latency: no matching FG-OFF GPU-ready baseline is measured.")
                 end
                 text("If generation is unavailable, the original native frame is displayed.")
+                end
             end
             gpu_memory("fg")
             reset_group("Reset DLSS-FG defaults", "fg")
@@ -965,14 +884,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         if status.renderer == 0 then
             check("DX11 -> DX12 transport", "D3D11D3D12Transport")
             text("DLSS-NR on DX11 requires DX12 transport.")
-            if draft.D3D11D3D12Transport and draft.D3D11D3D12SharedGuides ~= nil then
-                check("Transport: share full-frame guides (experimental)", "D3D11D3D12SharedGuides")
-                text("With peripheral DLAA on, DLSS-FG and NR before upscaling reuse its depth and motion copies.")
-            end
-            if draft.D3D11D3D12Transport and draft.D3D11D3D12SingleBuffer ~= nil then
-                check("Transport: single-buffer textures (experimental)", "D3D11D3D12SingleBuffer")
-                text("One set of shared textures per eye instead of three. Saves VRAM.")
-            end
         end
         if status.renderer ~= 0 or draft.D3D11D3D12Transport then
             check("Enable DLSS-NR", "NrEnabled")

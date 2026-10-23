@@ -1646,15 +1646,10 @@ void test_auto_alignment() {
     unregister_stereo_view(901U); unregister_stereo_view(902U);
     update_settings(Settings{});
     reset_gaze_foveation();
-    // Every top-level toggle must survive the runtime's settings store, or
-    // menu checkboxes snap back to the stored value.
-    Settings toggles;
-    toggles.d3d11_transport_shared_guides = toggles.d3d11_transport_single_buffer = true;
-    toggles.d3d12_quad_compose_wait = false; toggles.hook_rescan_on_module_change = true;
+    // The quad-wait checkbox must survive the runtime's settings store.
+    Settings toggles; toggles.d3d12_quad_compose_wait = false;
     update_settings(toggles);
-    const auto stored = configured_settings();
-    expect(stored.d3d11_transport_shared_guides && stored.d3d11_transport_single_buffer &&
-        !stored.d3d12_quad_compose_wait && stored.hook_rescan_on_module_change, "transport, quad-wait and hook toggles are stored");
+    expect(!configured_settings().d3d12_quad_compose_wait, "quad-wait toggle is stored");
     update_settings(Settings{});
 }
 

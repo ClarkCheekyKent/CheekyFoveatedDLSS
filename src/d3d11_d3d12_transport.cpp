@@ -1850,8 +1850,11 @@ bool evaluate_d3d11_via_d3d12(
     // slot. Every evaluation ends with a DX11 GPU wait on its DX12 work, so the
     // next frame's DX11 copies are already ordered after it. The CPU waits on
     // the previous slot only before releasing or resizing one of its textures.
+    // Disabled: single buffering crashes the DX11 transport regression tests.
+    // Keep one texture set per ring slot until that is fixed.
+    constexpr bool single_buffer = false;
     bool textures_pending{};
-    if (settings.d3d11_transport_single_buffer && view->texture_slot < transport_slot_count &&
+    if (single_buffer && view->texture_slot < transport_slot_count &&
             view->texture_slot != slot_index) {
         auto& owner = view->slots[view->texture_slot];
         release_slot_textures(slot); // This slot's own previous work has retired.
@@ -1909,7 +1912,7 @@ bool evaluate_d3d11_via_d3d12(
         !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated);
     // Shared guides: the peripheral DLAA full-frame depth/motion below are the
     // same depth conversion and MV box as the FG (and NR-before) guides.
-    const bool share_guides=settings.d3d11_transport_shared_guides&&settings.peripheral_dlaa_enabled;
+    const bool share_guides=settings.peripheral_dlaa_enabled;
     const auto release_fg=[&] {
         if((slot.fg_depth.resource12||slot.fg_motion.resource12)&&textures_retired()) {
             release_shared_texture(slot.fg_depth);release_shared_texture(slot.fg_motion);

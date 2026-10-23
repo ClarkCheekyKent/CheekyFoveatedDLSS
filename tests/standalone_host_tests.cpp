@@ -42,8 +42,8 @@ void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
     const auto complete = proc<CheekyFgCompleteHooklessFrameFn>(runtime,"CheekyFG_CompleteHooklessFrameV1");
     const auto acquire = proc<CheekyFgAcquireFn>(runtime,"CheekyFG_AcquirePair");
     const auto release = proc<CheekyFgReleaseFn>(runtime,"CheekyFG_ReleasePair");
-    command("1\n200\nset\nEnabled=false\nNrEnabled=false\nFgEnabled=true\nFgHooklessMode3=false\nFgGuideCaptureMode=0");
-    require(!needs_hook(),"Standalone automatically selects hook-free FG despite saved UEVR preference");
+    command("1\n200\nset\nEnabled=false\nNrEnabled=false\nFgEnabled=true");
+    require(!needs_hook(),"Standalone matches FG guide pairs at xrEndFrame without UEVR hooks");
     frame();
     ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> list;
     check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"FG allocator");
@@ -105,7 +105,7 @@ void verify_fg11(ID3D11Device* device) {
     const auto complete=proc<CheekyFgCompleteHooklessFrameFn>(runtime,"CheekyFG_CompleteHooklessFrameV1");
     const auto acquire=proc<CheekyFgAcquireFn>(runtime,"CheekyFG_AcquirePair");
     const auto release=proc<CheekyFgReleaseFn>(runtime,"CheekyFG_ReleasePair");
-    command("1\n300\nset\nFgEnabled=true\nFgHooklessMode3=false\nFgGuideCaptureMode=0\nD3D11D3D12Transport=false\nEnabled=true\nWidth=0.5\nHeight=0.5\nNrEnabled=false\nPeripheralDlaa=false");
+    command("1\n300\nset\nFgEnabled=true\nFgFoveated=false\nD3D11D3D12Transport=false\nEnabled=true\nWidth=0.5\nHeight=0.5\nNrEnabled=false\nPeripheralDlaa=false");
     ComPtr<ID3D11DeviceContext> context;device->GetImmediateContext(&context);
     auto texture=[&](DXGI_FORMAT format,unsigned size=128) {
         D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=size;desc.ArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;

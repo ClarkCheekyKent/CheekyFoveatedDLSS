@@ -43,27 +43,24 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     if(key=="QuadSavedSourceCount"){unsigned count{};if(!parse(value,count)||count>8)return false;s.quad_saved_source_count=count;return true;}
     if(key.size()==13&&key.starts_with("QuadView")&&key.ends_with("Role")&&key[8]>='1'&&key[8]<='8'){
         unsigned role{};if(!parse(value,role)||role>4)return false;s.quad_saved_roles[key[8]-'1']=role;return true;}
-    if (key == "FgDirectPeripheralShading") {
-        std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
-        s.fg.direct_peripheral_shading=mode; return true;
-    }
     if (key == "FgPacingClock") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.pacing_clock=mode; return true;
     }
     // Retired: native D3D11 now follows FgReleasePoint. Accept older files.
     if (key == "FgNative11Release") return true;
+    // Retired options now fixed by the runtime; older files and menus may still send them.
+    for (const auto retired : {"FgHooklessMode3", "FgDepthBits", "FgMotionBits", "FgSubmitRepeats", "FgGuideCaptureMode",
+            "FgCompactStorage", "FgColorCaptureMode", "FgUploadMode", "FgDirectPeripheralShading", "FgDiagnosticMode",
+            "D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "HookRescanOnModuleChange"})
+        if (key == retired) return true;
     if (key == "FgQueuePriority") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.queue_priority=mode; return true;
     }
-    if (key == "FgColorCaptureMode" || key == "FgUploadMode" || key == "FgLatencyDiagnostics" || key == "FgCompactStorage" || key == "FgGuideCaptureMode" || key == "FgDirectXrOutput") {
+    if (key == "FgLatencyDiagnostics" || key == "FgDirectXrOutput") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 1U) return false;
-        if(key == "FgColorCaptureMode") s.fg.color_capture_mode=mode;
-        else if(key == "FgUploadMode") s.fg.upload_mode=mode;
-        else if(key == "FgCompactStorage") s.fg.compact_storage=mode;
-        else if(key == "FgGuideCaptureMode") s.fg.guide_capture_mode=mode;
-        else if(key == "FgDirectXrOutput") s.fg.direct_xr_output=mode;
+        if(key == "FgDirectXrOutput") s.fg.direct_xr_output=mode;
         else s.fg.latency_diagnostics=mode;
         return true;
     }

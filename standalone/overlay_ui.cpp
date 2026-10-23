@@ -874,15 +874,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     // Game-composited quad views submit stereo, so they keep the stereo FG controls.
     const bool outer_guides=flag(member(snapshot,"quad_views"),"fg_outer_guides");
     const bool quad=flag(member(snapshot,"quad_views"),"active")&&!outer_guides;
-    if(outer_guides)ImGui::TextWrapped("The game composites four DLSS views before OpenXR. Frame generation uses the two periphery views' depth and motion for the whole eye.");
     if(quad&&settings.fg.peripheral_method>2)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
     const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable DLSS Frame Generation (2x)", &s.enabled);
     test_control("FgEnabled");
-    ImGui::TextWrapped(quad?"Experimental D3D11 quad views: the selected FG method processes the center, with a cheaper peripheral method. Requires all four view assignments and matching OpenXR support.":
-        "Experimental. Requires a D3D11 or D3D12 OpenXR stereo session and the matching Cheeky OpenXR support. Changes save automatically.");
+    ImGui::TextWrapped("Experimental. Requires an OpenXR game (D3D11 or D3D12) whose render resolution matches the headset resolution.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
     else if (!flag(fg, "controls_supported"))
@@ -895,10 +893,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         const auto detail = plain(member(fg, "diagnostic"));
         if (!detail.empty()) ImGui::TextWrapped("%s", detail.c_str());
     }
-    if(quad)ImGui::TextWrapped("The layer captures depth and motion from all four assigned views before reuse, then assembles full-eye guides at quad submission. Missing or ambiguous captures keep native presentation.");
-    else ImGui::TextWrapped("Standalone matches exactly one submitted stereo guide pair at xrEndFrame. Native frames continue when guides are missing or ambiguous. OpenVR, LibOVR and desktop presentation are not supported by this FG presenter.");
-    if(dx11&&!quad)ImGui::TextWrapped("D3D11 / OpenComposite: shader methods in both regions use native D3D11. Selecting DLSS for either region requires DX12 transport.");
-    if (!s.enabled) return;
 
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
     combo("FG center method", s.center_method,
@@ -921,23 +915,18 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             slider("FG transition width", s.feather, 0.F, .3F);
         }
         }
-        ImGui::Checkbox("Show blue FG region border", &s.show_border);
         fg_percent("FG periphery scale", s.peripheral_percent);
         combo("FG periphery method", s.peripheral_method,
             quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0":"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0");
         if(quad)ImGui::TextWrapped("The center region follows the submitted quad-view FOV. A peripheral DLSS-G pass is not used.");
-        if(!native_shader11()){
-        int depth = s.depth_bits == 16 ? 0 : 1, motion = s.motion_bits == 16 ? 0 : 1;
-        if (ImGui::Combo("FG depth precision", &depth, "16-bit\0" "32-bit\0")) s.depth_bits = depth ? 32 : 16;
-        if (ImGui::Combo("FG motion precision", &motion, "16-bit\0" "32-bit\0")) s.motion_bits = motion ? 32 : 16;
-        }
     }
-    if(native_shader11())ImGui::TextWrapped("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.");
-    combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
-    if (s.pacing_clock != 0)
-        ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
-    if (ImGui::TreeNode("FG scheduling and storage")) {
-        if(!native_shader11()){
+    if (ImGui::TreeNode("Advanced settings")) {
+        if (s.foveated||quad) ImGui::Checkbox("Show blue FG region border", &s.show_border);
+        combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
+        if (s.pacing_clock != 0)
+            ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
+        if(native_shader11())ImGui::TextWrapped("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.");
+        else{
         combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         }
@@ -947,60 +936,54 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             ImGui::TextWrapped("Experimental: the game is paced only by the headset clock and never waits for frame generation. Generated frames may arrive later; best when the GPU is the limit.");
         else if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.");
-        ImGui::Checkbox("Submit repeat frames", &s.submit_repeats);
         if(native_shader11()){
             combo("FG output destination", s.direct_xr_output, "Private image + copy\0Direct OpenXR image (experimental)\0");
-            combo("Periphery shading", s.direct_peripheral_shading, "Full-resolution warp\0Coarse blocks\0Coarse grid + bilinear filtering\0");
-            ImGui::TextWrapped("Coarse modes shade the periphery once per FG periphery-scale cell instead of once per pixel.");
             ImGui::Checkbox("Reuse whole-image eye captures (experimental)", &s.native11_skip_identity_crop);
             ImGui::TextWrapped("Per-eye swapchains and quad views: use the captured eye directly instead of copying it again.");
         }
-        if(!native_shader11()){
-        ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
-        if(!quad){combo("FG guide capture", s.guide_capture_mode, "Raw snapshots\0Prepared FG layouts\0");
-        combo("FG frame storage", s.compact_storage, "Full-resolution frames\0Compact center + periphery\0");}
-        combo("FG color capture", s.color_capture_mode, "Full snapshot + eye crops\0Direct eye capture\0");
-        combo("FG OpenXR uploads", s.upload_mode, "Per-image submissions\0Batch stereo and UI uploads\0");
-        if(!dx11&&!quad) {
+        else if(!dx11&&!quad)
             combo("FG output destination", s.direct_xr_output, "Compact intermediate\0Direct OpenXR image (experimental)\0");
-            combo("Direct periphery shading", s.direct_peripheral_shading, "Full-resolution warp\0Coarse blocks\0Coarse grid + bilinear filtering\0");
-        }
-        }
         combo("FG latency diagnostics", s.latency_diagnostics, "Off\0Calibrated timeline (1 in 17 jobs)\0");
-        if(!native_shader11())combo("FG diagnostic mode", s.diagnostic_mode, "Normal (both eyes)\0Prepare both eyes first\0Left NGX only\0Right NGX only\0Split command lists\0");
-        if (s.diagnostic_mode == 2 || s.diagnostic_mode == 3)
-            warning("Diagnostic mode interpolates only one eye; avoid normal VR play.");
         ImGui::TreePop();
     }
+    // Settings stay editable while FG is off; measurements only exist while it runs.
+    if (!s.enabled) return;
+    const auto rows = [](std::string_view object,
+        std::initializer_list<std::pair<const char*, const char*>> fields, bool milliseconds = false) {
+        if (ImGui::BeginTable("values", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Metric", ImGuiTableColumnFlags_WidthStretch, 1.4F);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.F);
+            for (const auto& [label, key] : fields) {
+                ImGui::TableNextRow(); ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", label); ImGui::TableNextColumn();
+                if (member(object, key).empty()) ImGui::TextUnformatted("Unavailable");
+                else if (milliseconds) ImGui::Text("%.2f ms", number(object, key));
+                else { auto value = plain(member(object, key));
+                    if (value == "true") value = "Yes"; else if (value == "false") value = "No";
+                    ImGui::TextWrapped("%s", value.c_str()); }
+            }
+            ImGui::EndTable();
+        }
+    };
     ImGui::SeparatorText("Performance");
-    diagnostic_line(fg, "Native frames", "native_frames");
-    diagnostic_line(fg, "Generated frames presented", "generated_frames");
-    diagnostic_line(fg, "Fallback frames", "fallback_frames");
+    ImGui::Text("Total frames (native / generated / fallback): %.0f / %.0f / %.0f",
+        number(fg, "native_frames"), number(fg, "generated_frames"), number(fg, "fallback_frames"));
     const auto cadence = member(fg, "cadence");
     if (flag(cadence, "valid")) {
-        ImGui::Text("Game / native / generated: %.1f / %.1f / %.1f FPS", number(cadence,"game_fps"), number(cadence,"native_fps"), number(cadence,"generated_fps"));
-        ImGui::Text("Unique output: %.1f FPS", number(cadence,"unique_fps"));
-        ImGui::Text("Repeated / total submissions: %.1f / %.1f FPS", number(cadence,"repeat_fps"), number(cadence,"submission_fps"));
-        ImGui::TextWrapped("Unique output excludes repeats. Headset refresh target is not measured output FPS.");
+        ImGui::Text("FPS (game / native / generated): %.1f / %.1f / %.1f", number(cadence,"game_fps"), number(cadence,"native_fps"), number(cadence,"generated_fps"));
+        ImGui::Text("Unique FPS output: %.1f FPS", number(cadence,"unique_fps"));
     } else ImGui::TextUnformatted("Measuring presentation cadence...");
-    {
-        // Whole-system load, sampled once per second, to tell CPU- from GPU-bound stretches.
-        const auto load = member(snapshot, "system_load");
-        const auto vram = member(member(snapshot, "gpu_memory"), "local");
-        if (flag(load, "valid")) {
-            ImGui::Text("CPU: %.0f%% total, busiest core %.0f%%, game %.0f%%", number(load, "cpu_total_percent"),
-                number(load, "cpu_busiest_core_percent"), number(load, "cpu_game_percent"));
-            if (flag(load, "gpu_valid"))
-                ImGui::Text("GPU: %.0f%% busy, game %.0f%%, video encode %.0f%%", number(load, "gpu_busy_percent"), number(load, "gpu_game_percent"), number(load, "gpu_encode_percent"));
-            else ImGui::TextUnformatted("GPU: utilization counters unavailable");
-        }
-        if (flag(vram, "valid"))
-            ImGui::Text("VRAM (game): %.1f / %.1f GB budget", number(vram, "usage_bytes") / 1073741824.0, number(vram, "budget_bytes") / 1073741824.0);
-    }
+    ImGui::SeparatorText("Frame latency (game frame captured -> sent to headset)");
+    ImGui::PushID("latency");
+    rows(member(fg, "presentation"), {{"Real frame", "native_age_ms"},
+        {"Generated frame (from the midpoint of its two real frames)", "generated_age_ms"},
+        {"Newer real frame behind a generated frame", "newest_input_age_ms"}}, true);
+    ImGui::PopID();
+    ImGui::SeparatorText("GPU timings, both eyes (average / last ms)");
     const auto gpu = member(fg, "performance");
-    if (!flag(gpu, "supported")) ImGui::TextWrapped("FG GPU timings: install the matching OpenXR layer update.");
+    if (!flag(gpu, "supported")) ImGui::TextWrapped("Install the matching OpenXR layer update.");
     else if (flag(gpu, "gpu_valid")) {
-        // Same stages as the UEVR menu, for every FG method (DLSS-G and shader).
+        // Same stages as the UEVR menu, for every FG method (DLSS-G and shader), in pipeline order.
         const auto extra = member(fg, "overhead");
         const bool stages = flag(extra, "supported");
         const bool focused = number(gpu, "foveated_eyes") > 0;
@@ -1011,8 +994,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             if (focused) ImGui::Text("Periphery input: %.0f x %.0f", number(gpu, "peripheral_width"), number(gpu, "peripheral_height"));
             ImGui::Text("Output per eye: %.0f x %.0f", number(gpu, "output_width"), number(gpu, "output_height"));
         }
-        ImGui::TextWrapped("GPU timings, both eyes: average / last (ms)");
-        double sum{}, sum_last{};
         if (ImGui::BeginTable("fg_gpu_timings", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
             ImGui::TableSetupColumn("Stage", ImGuiTableColumnFlags_WidthStretch, 1.6F);
             ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthStretch, 1.F);
@@ -1020,30 +1001,38 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
                 ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextWrapped("%s", label); ImGui::TableNextColumn();
                 if (sampled) ImGui::Text("%.3f / %.3f", mean, last); else ImGui::TextUnformatted("Waiting for GPU samples");
             };
+            double sum{}, sum_last{};
+            // Adds a sampled overhead stage to its group subtotal.
+            const auto stage = [&](const char* label, const char* samples, const char* mean, const char* last, double& group, double& group_last) {
+                const bool sampled = number(extra, samples) > 0;
+                row(label, number(extra, mean), number(extra, last), sampled);
+                if (sampled) { group += number(extra, mean); group_last += number(extra, last); }
+            };
+            if (stages) {
+                double capture{}, capture_last{};
+                stage("Guide capture (per real frame)", "guide_samples", "guide_ms", "guide_last_ms", capture, capture_last);
+                stage("Color capture + guide handoff (per real frame)", "capture_samples", "capture_ms", "capture_last_ms", capture, capture_last);
+                row("  Capture subtotal", capture, capture_last);
+                sum += capture; sum_last += capture_last;
+            }
+            row("Color / guide preparation", number(gpu, "preparation_ms"), number(gpu, "preparation_last_ms"));
             row(focused ? "DLSS-FG / shader center" : "FG full frame", number(gpu, "center_ms"), number(gpu, "center_last_ms"));
             if (focused || resized) row(resized ? "Output resize" : "Periphery + output assembly", number(gpu, "periphery_ms"), number(gpu, "periphery_last_ms"));
-            row("Color / guide preparation", number(gpu, "preparation_ms"), number(gpu, "preparation_last_ms"));
-            row(stages ? "FG processing subtotal" : "FG GPU total", number(gpu, "total_ms"), number(gpu, "total_last_ms"));
-            sum = number(gpu, "total_ms"); sum_last = number(gpu, "total_last_ms");
+            row(stages ? "  Generation subtotal" : "FG GPU total", number(gpu, "total_ms"), number(gpu, "total_last_ms"));
+            sum += number(gpu, "total_ms"); sum_last += number(gpu, "total_last_ms");
             if (stages) {
-                const auto stage = [&](const char* label, const char* samples, const char* mean, const char* last) {
-                    const bool sampled = number(extra, samples) > 0;
-                    row(label, number(extra, mean), number(extra, last), sampled);
-                    if (sampled) { sum += number(extra, mean); sum_last += number(extra, last); }
-                };
-                stage("Guide capture / preparation (per native)", "guide_samples", "guide_ms", "guide_last_ms");
-                stage("Color capture + guide handoff (per native)", "capture_samples", "capture_ms", "capture_last_ms");
-                stage("Generated output copy (per generated)", "publication_samples", "publication_ms", "publication_last_ms");
-                stage("OpenXR uploads (per presentation)", "upload_samples", "upload_ms", "upload_last_ms");
+                double present{}, present_last{};
+                stage("Generated output copy (per generated frame)", "publication_samples", "publication_ms", "publication_last_ms", present, present_last);
+                stage("OpenXR uploads (per presentation)", "upload_samples", "upload_ms", "upload_last_ms", present, present_last);
+                row("  Presentation subtotal", present, present_last);
+                sum += present; sum_last += present_last;
                 row("All FG GPU work", sum, sum_last);
             }
             ImGui::EndTable();
         }
-        ImGui::TextWrapped(stages ? "All FG GPU work adds the processing subtotal and the capture, copy and upload stages. Stages are elapsed GPU intervals and can overlap or include contention; runtime compositor work is excluded."
-                                  : "Average of up to 60 completed stereo pairs. Update the OpenXR layer for capture, copy and upload stages.");
     } else if (!flag(gpu, "gpu_supported") && number(gpu, "gpu_samples") == 0)
-        ImGui::TextWrapped("FG GPU timings: GPU timestamps unavailable or FG has not started.");
-    else ImGui::TextWrapped("FG GPU timings: waiting for a complete GPU timing sample.");
+        ImGui::TextWrapped("GPU timestamps unavailable or FG has not started.");
+    else ImGui::TextWrapped("Waiting for a complete GPU timing sample.");
     if (ImGui::TreeNode("FG capture and presentation diagnostics")) {
         if(quad){const auto guides=member(member(snapshot,"quad_views"),"fg");
             ImGui::TextUnformatted("Frame source: Four-view OpenXR submission");
@@ -1055,31 +1044,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         diagnostic_line(fg, "Guide matching", "match_reason");
         }
         diagnostic_line(member(fg,"direct_output"), "Direct output fallback", "reason_text");
-        const auto rows = [](std::string_view object,
-            std::initializer_list<std::pair<const char*, const char*>> fields, bool milliseconds = false) {
-            if (ImGui::BeginTable("values", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
-                ImGui::TableSetupColumn("Metric", ImGuiTableColumnFlags_WidthStretch, 1.4F);
-                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.F);
-                for (const auto& [label, key] : fields) {
-                    ImGui::TableNextRow(); ImGui::TableNextColumn();
-                    ImGui::TextWrapped("%s", label); ImGui::TableNextColumn();
-                    if (member(object, key).empty()) ImGui::TextUnformatted("Unavailable");
-                    else if (milliseconds) ImGui::Text("%.2f ms", number(object, key));
-                    else { auto value = plain(member(object, key));
-                        if (value == "true") value = "Yes"; else if (value == "false") value = "No";
-                        ImGui::TextWrapped("%s", value.c_str()); }
-                }
-                ImGui::EndTable();
-            }
-        };
-        if (ImGui::TreeNode("Frame matching")) {
-            rows(fg, {{"Eligible guides", "eligible_guides"}, {"Pending guides", "pending_guides"},
-                {"Foreign guides", "foreign_guides"}});
-            ImGui::PushID("matching");
-            rows(gpu, {{"Color token", "color_token"}, {"Guide token", "guide_token"},
-                {"Mismatched guide intervals", "mismatched_guides"}});
-            ImGui::PopID(); ImGui::TreePop();
-        }
         if (ImGui::TreeNode("CPU waits and pacing")) {
             ImGui::TextWrapped("Rolling averages; separate stages can overlap.");
             rows(member(fg, "pacing_timeline"), {{"Game waits for credit", "game_wait_credit_ms"},
@@ -1089,40 +1053,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
                 {"FG submit to completion", "fg_submit_to_complete_ms"}}, true);
             ImGui::TreePop();
         }
-        if (ImGui::TreeNode("Frame age at submission")) {
-            rows(member(fg, "presentation"), {{"Native frame age", "native_age_ms"},
-                {"Generated frame age", "generated_age_ms"}, {"Newest input age", "newest_input_age_ms"},
-                {"Repeat frame age", "repeat_age_ms"}}, true);
-            ImGui::TreePop();
-        }
-        if (ImGui::TreeNode("GPU workload and transport")) {
-            rows(gpu, {{"Shared game queue", "shared_gpu_queue"}, {"Foveated eyes", "foveated_eyes"},
-                {"Center width", "center_width"}, {"Center height", "center_height"},
-                {"Periphery width", "peripheral_width"}, {"Periphery height", "peripheral_height"},
-                {"Output width", "output_width"}, {"Output height", "output_height"}});
-            ImGui::PushID("transport");
-            rows(member(fg, "overhead"), {{"Capture CPU time", "capture_ms"}, {"Upload CPU time", "upload_ms"}}, true);
-            ImGui::PopID(); ImGui::TreePop();
-        }
         if (ImGui::Button("Copy FG diagnostic JSON")) ImGui::SetClipboardText(std::string(fg).c_str());
         ImGui::TextWrapped("The support bundle includes the complete diagnostic snapshot.");
         ImGui::TreePop();
-    }
-}
-
-template<class T> void raw_setting(const char* name, T& value) {
-    if constexpr (std::is_same_v<T, bool>) {
-        ImGui::Checkbox(name, &value);
-    } else {
-        ImGui::PushID(name);
-        ImGui::TextUnformatted(name);
-        ImGui::SetNextItemWidth(-1);
-        if constexpr (std::is_floating_point_v<T>) ImGui::InputFloat("##value", &value, 0.0F, 0.0F, "%.6g");
-        else {
-            std::uint32_t number = static_cast<std::uint32_t>(value);
-            if (ImGui::InputScalar("##value", ImGuiDataType_U32, &number)) value = static_cast<T>(number);
-        }
-        ImGui::PopID();
     }
 }
 
@@ -1151,6 +1084,24 @@ std::string menu_key_name(unsigned key) {
     return "Key " + std::to_string(key);
 }
 
+// Whole-system load (sampled once per second) and output FPS, shown above the tabs.
+void draw_system_load(std::string_view snapshot) {
+    const auto load = member(snapshot, "system_load");
+    const auto vram = member(member(snapshot, "gpu_memory"), "local");
+    const auto cadence = member(member(snapshot, "fg"), "cadence");
+    if (flag(load, "valid")) {
+        ImGui::Text("CPU: %.0f%% total, busiest core %.0f%%, game %.0f%%", number(load, "cpu_total_percent"),
+            number(load, "cpu_busiest_core_percent"), number(load, "cpu_game_percent"));
+        if (flag(load, "gpu_valid"))
+            ImGui::Text("GPU: %.0f%% busy, game %.0f%%, video encode %.0f%%", number(load, "gpu_busy_percent"), number(load, "gpu_game_percent"), number(load, "gpu_encode_percent"));
+        else ImGui::TextUnformatted("GPU: utilization counters unavailable");
+    }
+    if (flag(vram, "valid"))
+        ImGui::Text("VRAM (game): %.1f / %.1f GB budget", number(vram, "usage_bytes") / 1073741824.0, number(vram, "budget_bytes") / 1073741824.0);
+    if (flag(cadence, "valid"))
+        ImGui::Text("FPS: %.1f game, %.1f unique output", number(cadence, "game_fps"), number(cadence, "unique_fps"));
+}
+
 void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState& input,const char* renderer,const char* status,bool& open) {
     refresh(r, runtime);
     if (const auto rebound = consume_menu_key_rebind(input)) {
@@ -1168,8 +1119,10 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
         const auto key_name = menu_key_name(input.menu_key.load());
         ImGui::TextDisabled("v" CHEEKY_VERSION " | %s | %s | %s to close",
             runtime.host_name ? runtime.host_name : "Standalone", renderer, key_name.c_str());
-        ImGui::TextWrapped("Changes apply when you release a control and are saved automatically.");
-        if (!r.message.empty()) ImGui::TextWrapped("%s", r.message.c_str());
+        draw_system_load(r.snapshot);
+        // Routine confirmations stay hidden; errors and action results still show.
+        if (!r.message.empty() && r.message != "Settings applied" && !r.message.starts_with("Ready."))
+            ImGui::TextWrapped("%s", r.message.c_str());
         ImGui::Separator();
         const auto previous = r.draft;
         if (ImGui::BeginTabBar("controls")) {
@@ -1189,19 +1142,10 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                 bool headset_pointer = input.headset_pointer.load();
                 if (ImGui::Checkbox("VR controllers and hands control the menu", &headset_pointer))
                     r.menu_key_error = save_headset_pointer(input, headset_pointer) ? "" : "Could not save the menu pointer setting.";
-                ImGui::TextWrapped("Off: only the desktop mouse and keyboard move the menu cursor and click, so tracked hands cannot pull it away.");
                 if (std::string_view(renderer) != "Vulkan") {
                     ImGui::SeparatorText("Compatibility");
                     ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);
                     ImGui::TextWrapped("Required for DLSS-NR in DX11 games.");
-                    if (r.draft.d3d11_use_d3d12_transport || fg_requires_d3d12(r.draft)) {
-                        ImGui::Checkbox("Transport: share full-frame guides (experimental)", &r.draft.d3d11_transport_shared_guides);
-                        ImGui::TextWrapped("With peripheral DLAA on, DLSS-FG and NR before upscaling reuse its depth and motion copies instead of making their own.");
-                        ImGui::Checkbox("Transport: single-buffer textures (experimental)", &r.draft.d3d11_transport_single_buffer);
-                        ImGui::TextWrapped("Keeps one set of shared textures per eye instead of three. Saves VRAM; the GPU work is already serialized.");
-                    }
-                    ImGui::Checkbox("Rescan hooks only when modules load (experimental)", &r.draft.hook_rescan_on_module_change);
-                    ImGui::TextWrapped("The import-table and LibOVR scans run only when the game loads or unloads a DLL, instead of every 250 ms and every second.");
                     ImGui::Checkbox("Wait for quad-view composition (DX12)", &r.draft.d3d12_quad_compose_wait);
                     ImGui::TextWrapped("Off: DX12 quad-view games such as MSFS return from xrEndFrame once the four-view composition is submitted, instead of waiting for the GPU to finish it.");
                     ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);
@@ -1298,13 +1242,6 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     ImGui::EndChild();
                     ImGui::TreePop();
                 }
-                end_tab();
-            }
-            if (begin_tab("All settings")) {
-                ImGui::TextWrapped("Advanced values use the same keys as the configuration file. The runtime validates and clamps each transaction.");
-#define CHEEKY_SETTING(name, field) if (!std::string_view(name).starts_with("EyeCalibrationLearned")) raw_setting(name, r.draft.field);
-#include "settings_fields.inc"
-#undef CHEEKY_SETTING
                 end_tab();
             }
             ImGui::EndTabBar();

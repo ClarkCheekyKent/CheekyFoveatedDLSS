@@ -170,8 +170,8 @@ These are scheduling experiments, not an established fix for gameplay slowdown.
 (baseline)**. Prepared capture normalizes depth and motion immediately after the
 native DLSS evaluation, retaining only the center and required peripheral guide
 grids. Inference borrows those exact allocations under the stereo frame lease;
-it does not allocate or normalize another guide set. Center guides keep 32-bit
-precision; peripheral guides retain the selected precision and algorithm.
+it does not allocate or normalize another guide set. Center and peripheral
+guides use 32-bit depth and motion.
 
 Install the matching plugin/runtime/Lua files and OpenXR installer, then restart
 the game. This changes the guide-pair ABI. For clean memory comparisons, restart
@@ -262,8 +262,8 @@ unsupported periphery modes/runtime images use the existing compact path.
 The default remains **Compact intermediate**. Settings persist and apply live.
 
 Direct output waits for generation on the presentation thread. **Direct periphery
-shading** offers three live A/B modes: full-resolution warping, coarse blocks
-(default), and a coarse grid with bilinear filtering. Coarse modes evaluate the
+shading** offers three live A/B modes: full-resolution warping (default), coarse
+blocks, and a coarse grid with bilinear filtering. Coarse modes evaluate the
 expensive motion/depth work at **FG periphery scale**, then expand into the final
 XR image without an intermediate texture. Blocks replicate one warped color;
 bilinear filtering shares a tile of coarse samples and smooths between them.
