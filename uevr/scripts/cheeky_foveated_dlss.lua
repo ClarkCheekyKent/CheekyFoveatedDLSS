@@ -574,7 +574,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             text("The enable preference is preserved and FG will resume automatically on return to Native Stereo.")
         else
             check("Enable DLSS Frame Generation (2x)", "FgEnabled")
-            text("Experimental. Requires an OpenXR game (D3D11 or D3D12) whose render resolution matches the headset resolution.")
+            text("Experimental. Requires a D3D11 or D3D12 OpenXR session and the matching OpenXR layer.")
             text("Runs only in UEVR Native Stereo. AER, sequential and AFW pause FG automatically; the checkbox stays enabled.")
             local fg = status.fg or {}
             if not fg.layer_present then
@@ -681,7 +681,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if cadence and cadence.supported then
                     if cadence.valid then
                         rows("fg_cadence", {{"FPS (game / native / generated)", string.format("%.1f / %.1f / %.1f",cadence.game_fps or 0,cadence.native_fps or 0,cadence.generated_fps or 0)},
-                            {"Unique FPS output",string.format("%.1f FPS",cadence.unique_fps or 0)}})
+                            {"Unique FPS output",string.format("%.1f FPS",cadence.unique_fps or 0)},
+                            {"Repeated / total OpenXR submissions",string.format("%.1f / %.1f FPS",cadence.repeat_fps or 0,cadence.submission_fps or 0)}})
                     else text("Measuring actual presentation cadence...") end
                 elseif p and p.asynchronous_presenter then
                     text("Update the OpenXR layer for measured unique-output FPS.")
@@ -691,11 +692,12 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     local function age(samples, mean, last)
                         return (samples or 0)>0 and string.format("%.3f / %.3f ms",mean or 0,last or 0) or "No samples yet"
                     end
-                    section("Frame latency (game frame captured -> sent to headset)")
+                    section("Content age at OpenXR submission (average / last ms)")
+                    text("Capture-to-submit age, not rendering time or headset display latency.")
                     rows("fg_frame_age", {
                         {"Real frame",age(presentation.native_samples,presentation.native_age_ms,presentation.native_age_last_ms)},
                         {"Generated frame (from the midpoint of its two real frames)",age(presentation.generated_samples,presentation.generated_age_ms,presentation.generated_age_last_ms)},
-                        {"Newer real frame behind a generated frame",age(presentation.generated_samples,presentation.newest_input_age_ms,presentation.newest_input_age_last_ms)}})
+                        {"Newest input used for the generated frame",age(presentation.generated_samples,presentation.newest_input_age_ms,presentation.newest_input_age_last_ms)}})
                 end
                 if fg.frame_source then
                     rows("fg_source", {{"Frame ID source",fg.frame_source},
@@ -736,7 +738,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             local capture = {0, 0}
                             stage("Guide capture (per real frame)", extra.guide_samples, extra.guide_ms, extra.guide_last_ms, capture)
                             stage("Color capture + guide handoff (per real frame)", extra.capture_samples, extra.capture_ms, extra.capture_last_ms, capture)
-                            entries[#entries+1] = {"  Capture subtotal", gpu_ms(capture[1], capture[2])}
+                            entries[#entries+1] = {"  Capture subtotal", (extra.guide_samples or 0)>0 and (extra.capture_samples or 0)>0 and gpu_ms(capture[1], capture[2]) or "Waiting for GPU samples"}
                             sum, sum_last = sum + capture[1], sum_last + capture[2]
                         end
                         entries[#entries+1] = {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)}
@@ -750,11 +752,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             local present = {0, 0}
                             stage("Generated output copy (per generated frame)", extra.publication_samples, extra.publication_ms, extra.publication_last_ms, present)
                             stage("OpenXR uploads (per presentation)", extra.upload_samples, extra.upload_ms, extra.upload_last_ms, present)
-                            entries[#entries+1] = {"  Presentation subtotal", gpu_ms(present[1], present[2])}
+                            entries[#entries+1] = {"  Presentation subtotal", (extra.publication_samples or 0)>0 and (extra.upload_samples or 0)>0 and gpu_ms(present[1], present[2]) or "Waiting for GPU samples"}
                             sum, sum_last = sum + present[1], sum_last + present[2]
-                            entries[#entries+1] = {"All FG GPU work", gpu_ms(sum, sum_last)}
+                            local complete = (extra.guide_samples or 0)>0 and (extra.capture_samples or 0)>0 and (extra.publication_samples or 0)>0 and (extra.upload_samples or 0)>0
+                            entries[#entries+1] = {"Measured GPU stage sum", complete and gpu_ms(sum, sum_last) or "Waiting for GPU samples"}
                         end
                         rows("fg_gpu_timings", entries)
+                        text("Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.")
                     elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then
                         text("GPU timestamps unavailable or FG has not started.")
                     else

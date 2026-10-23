@@ -156,8 +156,8 @@ latency, source-age, pacing-wait, and FPS windows restart for the new queue.
 Capture/upload overhead measurements are not reset. Support logs identify
 both the requested and actual queue, including unavailable-priority fallback.
 
-For an A/B test, keep the scene, release policy, quality settings, and repeats
-unchanged; use repeats OFF. Allow 10 seconds to settle after each switch and
+For an A/B test, keep the scene, release policy and quality settings unchanged.
+Repeat submissions are fixed OFF. Allow 10 seconds to settle after each switch and
 record about 20 seconds per mode. Compare native and unique FPS as well as GPU
 queue entry, capture dependency, and FG GPU work. Shared queue markers reach the
 GPU after preceding work on the game queue, so dependency time may move into
@@ -166,8 +166,8 @@ These are scheduling experiments, not an established fix for gameplay slowdown.
 
 ## Prepared FG guide capture
 
-**FG guide capture** selects **Prepared FG layouts** (default) or **Raw snapshots
-(baseline)**. Prepared capture normalizes depth and motion immediately after the
+FG guide capture uses **Prepared FG layouts** as a fixed setting. Prepared capture
+normalizes depth and motion immediately after the
 native DLSS evaluation, retaining only the center and required peripheral guide
 grids. Inference borrows those exact allocations under the stereo frame lease;
 it does not allocate or normalize another guide set. Center and peripheral
@@ -175,7 +175,7 @@ guides use 32-bit depth and motion.
 
 Install the matching plugin/runtime/Lua files and OpenXR installer, then restart
 the game. This changes the guide-pair ABI. For clean memory comparisons, restart
-after changing modes and keep the same scene and quality settings. Captured guide
+and keep the same scene and quality settings. Captured guide
 rows include producer-prepared allocations; worker-owned depth/motion should
 show zero in prepared mode. An unsupported source layout falls back to raw
 capture. Logs report prepared/raw/fallback eye counts, allocated and leased eye
@@ -261,16 +261,11 @@ destination or scaled center uses center scratch with direct final assembly;
 unsupported periphery modes/runtime images use the existing compact path.
 The default remains **Compact intermediate**. Settings persist and apply live.
 
-Direct output waits for generation on the presentation thread. **Direct periphery
-shading** offers three live A/B modes: full-resolution warping (default), coarse
-blocks, and a coarse grid with bilinear filtering. Coarse modes evaluate the
-expensive motion/depth work at **FG periphery scale**, then expand into the final
-XR image without an intermediate texture. Blocks replicate one warped color;
-bilinear filtering shares a tile of coarse samples and smooths between them.
-Final pixel stores and center feather blending remain at output resolution.
-At 100% periphery scale all modes use full-resolution warping. Lua/support JSON
-report the last successful direct mode, shading grid, output extent and coarse/
-full-rate frame counts. Compact fallback keeps its existing low-resolution path.
+Direct output waits for generation on the presentation thread. Direct periphery
+shading uses full-resolution warping as a fixed setting. Final pixel stores and
+center feather blending remain at output resolution. Support JSON retains the
+actual shading mode and grid diagnostics. Compact fallback keeps its existing
+low-resolution path.
 SDR uses writable linear UNORM XR images with gamma conversion in final assembly;
 check dark gradients as linear 8-bit storage has less shadow precision than sRGB.
 Lua and support diagnostics show direct/fallback frames, direct/scratch NGX eyes,
@@ -285,4 +280,4 @@ actual formats/extents, resource flags and API error in Lua, support JSON and
 the layer log. Unsupported backing images are cached by size/format so fallback
 does not add an acquisition handshake every native frame; toggle the output
 mode off/on to retry. A fallback wake never enables repeated native submissions
-when the repeat setting is off.
+under the fixed fresh-only policy.

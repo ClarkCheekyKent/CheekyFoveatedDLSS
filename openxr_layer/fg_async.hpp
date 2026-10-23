@@ -163,6 +163,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t deferred_credits{},released_deferred_credits{},submitted_native_id{};
     bool credit_deferred{};
     unsigned inflight_release_point{},last_release_point{},active_release_point{};
+    // Bootstrap runtime predictions/credits before a first guide-bearing job
+    // installs its policy. Starting fresh-only here would wait for game input
+    // while the game itself is waiting for that initial runtime prediction.
     bool inflight_prepared{},release_policy_known{},submit_repeat_frames{true},clock_pacing_active{};
     double late_wait_budget_ms{};
     TimingAverage producer_cpu,pacing_wait;

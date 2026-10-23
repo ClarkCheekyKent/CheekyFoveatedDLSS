@@ -880,7 +880,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable DLSS Frame Generation (2x)", &s.enabled);
     test_control("FgEnabled");
-    ImGui::TextWrapped("Experimental. Requires an OpenXR game (D3D11 or D3D12) whose render resolution matches the headset resolution.");
+    ImGui::TextWrapped("Experimental. Requires a D3D11 or D3D12 OpenXR session and the matching OpenXR layer.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
     else if (!flag(fg, "controls_supported"))
@@ -943,7 +943,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         }
         else if(!dx11&&!quad)
             combo("FG output destination", s.direct_xr_output, "Compact intermediate\0Direct OpenXR image (experimental)\0");
-        combo("FG latency diagnostics", s.latency_diagnostics, "Off\0Calibrated timeline (1 in 17 jobs)\0");
+        if(!native_shader11())combo("FG latency diagnostics", s.latency_diagnostics, "Off\0Calibrated timeline (1 in 17 jobs)\0");
         ImGui::TreePop();
     }
     // Settings stay editable while FG is off; measurements only exist while it runs.
@@ -972,12 +972,17 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     if (flag(cadence, "valid")) {
         ImGui::Text("FPS (game / native / generated): %.1f / %.1f / %.1f", number(cadence,"game_fps"), number(cadence,"native_fps"), number(cadence,"generated_fps"));
         ImGui::Text("Unique FPS output: %.1f FPS", number(cadence,"unique_fps"));
+        ImGui::Text("Repeated / total OpenXR submissions: %.1f / %.1f FPS", number(cadence,"repeat_fps"), number(cadence,"submission_fps"));
     } else ImGui::TextUnformatted("Measuring presentation cadence...");
-    ImGui::SeparatorText("Frame latency (game frame captured -> sent to headset)");
+    ImGui::SeparatorText("Content age at OpenXR submission (average ms)");
+    ImGui::TextWrapped("Capture-to-submit age, not rendering time or headset display latency.");
     ImGui::PushID("latency");
-    rows(member(fg, "presentation"), {{"Real frame", "native_age_ms"},
+    const auto presentation=member(fg,"presentation");
+    if(number(presentation,"native_samples")>0)rows(presentation, {{"Real frame", "native_age_ms"}}, true);
+    if(number(presentation,"generated_samples")>0)rows(presentation, {
         {"Generated frame (from the midpoint of its two real frames)", "generated_age_ms"},
-        {"Newer real frame behind a generated frame", "newest_input_age_ms"}}, true);
+        {"Newest input used for the generated frame", "newest_input_age_ms"}}, true);
+    if(number(presentation,"native_samples")==0&&number(presentation,"generated_samples")==0)ImGui::TextUnformatted("No content-age samples yet.");
     ImGui::PopID();
     ImGui::SeparatorText("GPU timings, both eyes (average / last ms)");
     const auto gpu = member(fg, "performance");
@@ -1012,7 +1017,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
                 double capture{}, capture_last{};
                 stage("Guide capture (per real frame)", "guide_samples", "guide_ms", "guide_last_ms", capture, capture_last);
                 stage("Color capture + guide handoff (per real frame)", "capture_samples", "capture_ms", "capture_last_ms", capture, capture_last);
-                row("  Capture subtotal", capture, capture_last);
+                row("  Capture subtotal", capture, capture_last, number(extra,"guide_samples")>0&&number(extra,"capture_samples")>0);
                 sum += capture; sum_last += capture_last;
             }
             row("Color / guide preparation", number(gpu, "preparation_ms"), number(gpu, "preparation_last_ms"));
@@ -1024,12 +1029,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
                 double present{}, present_last{};
                 stage("Generated output copy (per generated frame)", "publication_samples", "publication_ms", "publication_last_ms", present, present_last);
                 stage("OpenXR uploads (per presentation)", "upload_samples", "upload_ms", "upload_last_ms", present, present_last);
-                row("  Presentation subtotal", present, present_last);
+                row("  Presentation subtotal", present, present_last, number(extra,"publication_samples")>0&&number(extra,"upload_samples")>0);
                 sum += present; sum_last += present_last;
-                row("All FG GPU work", sum, sum_last);
+                row("Measured GPU stage sum", sum, sum_last, number(extra,"guide_samples")>0&&number(extra,"capture_samples")>0&&number(extra,"publication_samples")>0&&number(extra,"upload_samples")>0);
             }
             ImGui::EndTable();
         }
+        ImGui::TextWrapped("Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.");
     } else if (!flag(gpu, "gpu_supported") && number(gpu, "gpu_samples") == 0)
         ImGui::TextWrapped("GPU timestamps unavailable or FG has not started.");
     else ImGui::TextWrapped("Waiting for a complete GPU timing sample.");
@@ -1088,7 +1094,8 @@ std::string menu_key_name(unsigned key) {
 void draw_system_load(std::string_view snapshot) {
     const auto load = member(snapshot, "system_load");
     const auto vram = member(member(snapshot, "gpu_memory"), "local");
-    const auto cadence = member(member(snapshot, "fg"), "cadence");
+    const auto fg=member(snapshot,"fg");
+    const auto cadence = member(fg, "cadence");
     if (flag(load, "valid")) {
         ImGui::Text("CPU: %.0f%% total, busiest core %.0f%%, game %.0f%%", number(load, "cpu_total_percent"),
             number(load, "cpu_busiest_core_percent"), number(load, "cpu_game_percent"));
@@ -1098,8 +1105,10 @@ void draw_system_load(std::string_view snapshot) {
     }
     if (flag(vram, "valid"))
         ImGui::Text("VRAM (game): %.1f / %.1f GB budget", number(vram, "usage_bytes") / 1073741824.0, number(vram, "budget_bytes") / 1073741824.0);
-    if (flag(cadence, "valid"))
+    if (flag(fg,"active")&&flag(cadence, "valid"))
         ImGui::Text("FPS: %.1f game, %.1f unique output", number(cadence, "game_fps"), number(cadence, "unique_fps"));
+    else if(const auto ms=number(member(snapshot,"frame"),"present_ms");ms>0)
+        ImGui::Text("FPS: %.1f game present",1000./ms);
 }
 
 void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState& input,const char* renderer,const char* status,bool& open) {

@@ -198,7 +198,9 @@ inline void fg_backend11_pipelined(bool direct=false){
     }
     // Disable exactly as xrWaitFrame does, while the render thread may still
     // own the last frame: finish application frames, then drain.
-    const auto generated=p.generated_count,native=p.native_count;
+    std::uint64_t generated{},native{},repeats{};bool fresh_only{};
+    {std::lock_guard lock(p.mx);generated=p.generated_count;native=p.native_count;
+        repeats=p.repeated_presentations;fresh_only=!p.submit_repeat_frames;}
     auto disable=std::async(std::launch::async,[&]{p.finish_application_frame();p.invalidate_temporal();});
     const bool disabled=disable.wait_for(std::chrono::seconds(5))==std::future_status::ready;
     if(!disabled){std::cerr<<"backend11 disable hung\n";std::_Exit(3);}
@@ -211,6 +213,7 @@ inline void fg_backend11_pipelined(bool direct=false){
     check(!Runtime::errors,"Presenter alone owns runtime frames and private swapchain image order");
     check(!app_errors,"Application wait/begin/capture/end succeed with overlapping frames");
     check(generated>=frames/4,"Native D3D11 interpolation reaches the headset with overlapping application frames");
+    check(fresh_only&&repeats==0,"Native D3D11 honors the fixed fresh-only policy for copied and direct output");
     check(retired.size()>=2&&Runtime::chains.size()==retired.size(),"Teardown hands private D3D11 swapchains to the layer instead of destroying them");
     for(auto chain:retired)Runtime::destroy(chain);
     check(Runtime::chains.empty(),"Retired private D3D11 swapchains are destroyed later by the layer");

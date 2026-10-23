@@ -211,9 +211,11 @@ identity proof.
 
 The tab includes full/foveated FG, matching the SR region and gaze placement,
 manual region controls, center/peripheral scales and peripheral methods. An
-**Advanced settings** section holds pacing, queue scheduling, capture/storage/
-output experiments and diagnostics. Reset restores the FG defaults. Status, generated frame counts, measured unique output FPS and GPU
+**Advanced settings** section holds pacing, queue scheduling, output experiments
+and diagnostics. Capture/storage choices are fixed internally. Reset restores the FG defaults. Status, generated frame counts, measured unique output FPS and GPU
 timings use the shared presenter diagnostics. Unique FPS excludes repeats.
+Repeat and total submission rates remain visible separately. Content age is
+measured at OpenXR submission, not at physical display or as GPU rendering cost.
 
 This path requires the same NVIDIA DLSS-G capability as UEVR. Vulkan,
 OpenVR, LibOVR, alternate-eye rendering and flat-screen FG presentation are not

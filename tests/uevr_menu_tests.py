@@ -138,6 +138,12 @@ def run(engine):
     g.callbacks.on_frame()
     assert last().endswith("\nget")
     state = copy.deepcopy(baseline)
+    # Native host snapshots have no live UEVR rendering mode. Exercise the
+    # Native Stereo menu explicitly, then test other modes below.
+    state["settings"]["FgEnabled"] = False
+    state["settings"]["FgMatchSrRegion"] = False
+    state["afw_experiment"]["rendering_mode_known"] = True
+    state["afw_experiment"]["rendering_mode"] = 0
     if "--fg-center" in sys.argv:
         state["settings"]["FgEnabled"] = False
         state["settings"]["FgCenterMethod"] = 0
@@ -325,7 +331,7 @@ def run(engine):
     draw()
     for label in ("  Generation subtotal","Guide capture (per real frame)","Color capture + guide handoff (per real frame)",
                   "  Capture subtotal","1.500 / 1.300","Generated output copy (per generated frame)","OpenXR uploads (per presentation)",
-                  "  Presentation subtotal","0.700 / 0.500","All FG GPU work","6.100 / 5.300","1.300 / 1.200"):
+                  "  Presentation subtotal","0.700 / 0.500","Measured GPU stage sum","6.100 / 5.300","1.300 / 1.200"):
         assert label in list(g.drawn.values()), "Missing separately measured GPU stage: " + label
     assert "FG GPU total" not in list(g.drawn.values()), "Do not label a partial processing interval as complete FG overhead"
     assert len(g.sent) == count, "Reading additional GPU stages must not change settings"
@@ -355,6 +361,7 @@ def run(engine):
     receive(state)
     draw()
     for label in ("FPS (game / native / generated)","32.0 / 32.0 / 32.0","Unique FPS output","64.0 FPS",
+                  "Repeated / total OpenXR submissions","56.0 / 120.0 FPS",
                   "Game image wait / call","Presenter image wait / call","Runtime begin / end","6.000 / 7.000 ms"):
         assert label in list(g.drawn.values()), "Missing measured cadence: " + label
     assert len(g.sent) == count, "Reading cadence must not change settings"
@@ -365,9 +372,9 @@ def run(engine):
         "wait_samples":20,"wait_arrivals":12,"wait_timeouts":8,"late_wait_ms":2,"late_wait_last_ms":3,"wait_budget_ms":4.333}
     receive(state)
     draw()
-    for label in ("Frame latency (game frame captured -> sent to headset)","Real frame","30.000 / 31.000 ms",
+    for label in ("Content age at OpenXR submission (average / last ms)","Real frame","30.000 / 31.000 ms",
                   "Generated frame (from the midpoint of its two real frames)","22.000 / 23.000 ms",
-                  "Newer real frame behind a generated frame","12.000 / 13.000 ms"):
+                  "Newest input used for the generated frame","12.000 / 13.000 ms"):
         assert label in list(g.drawn.values()), "Missing frame latency telemetry: " + label
     assert "40.000 / 41.000 ms" not in list(g.drawn.values()), "Repeat submissions are fixed off"
     assert len(g.sent) == count, "Frame-age telemetry must never apply settings"

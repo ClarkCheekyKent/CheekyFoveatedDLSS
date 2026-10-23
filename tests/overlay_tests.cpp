@@ -161,19 +161,21 @@ void test_ui_diagnostics() {
     require(render("DLSS-FG").find("Waiting for a running D3D11 or D3D12 OpenXR stereo session") != text.npos,
         "FG does not report an incompatible session as generating");
     state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":true,
-        "state":"Generating frames","generated_frames":17,"cadence":{"valid":true,"unique_fps":90},
+        "state":"Generating frames","generated_frames":17,"cadence":{"valid":true,"unique_fps":90,"repeat_fps":30,"submission_fps":120},
         "performance":{"supported":true,"gpu_valid":true,"total_ms":2.5,"total_last_ms":2.25},
         "overhead":{"supported":true,"guide_samples":4,"guide_ms":0.25,"guide_last_ms":0.25,"capture_samples":4,"capture_ms":0.125,
             "capture_last_ms":0.125,"publication_samples":0,"upload_samples":4,"upload_ms":0.5,"upload_last_ms":0.375}}})";
     text = render("DLSS-FG");
     require(text.find("Generating frames") != text.npos && text.find("Total frames (native / generated / fallback): 0 / 17 / 0") != text.npos &&
         text.find("Unique FPS output: 90.0 FPS") != text.npos && text.find("Generation subtotal") != text.npos &&
+        text.find("Repeated / total OpenXR submissions: 30.0 / 120.0 FPS") != text.npos &&
         text.find("Capture subtotal") != text.npos && text.find("Presentation subtotal") != text.npos &&
         text.find("2.500 / 2.250") != text.npos && text.find("OpenXR uploads (per presentation)") != text.npos &&
-        text.find("Waiting for GPU samples") != text.npos && text.find("All FG GPU work") != text.npos &&
-        text.find("3.375 / 3.000") != text.npos,
+        text.find("Waiting for GPU samples") != text.npos && text.find("Measured GPU stage sum") != text.npos &&
+        text.find("3.375 / 3.000") == text.npos,
         "FG reports actual presented frames, unique cadence and every GPU stage with a total");
-    require(text.find("CPU waits and pacing") != text.npos && text.find("Frame latency (game frame captured") != text.npos &&
+    require(text.find("CPU waits and pacing") != text.npos && text.find("Content age at OpenXR submission") != text.npos &&
+        text.find("No content-age samples yet.") != text.npos &&
         text.find("Frame matching") == text.npos && text.find("GPU workload and transport") == text.npos &&
         text.find("Copy FG diagnostic JSON") != text.npos && text.find("{\"layer_present\"") == text.npos,
         "FG diagnostics must use readable groups without dumping raw JSON");
@@ -214,6 +216,7 @@ void test_ui_diagnostics() {
         "Calibration controls belong in Stereo / Gaze");
     require(text.find("Eye tracking details") == text.npos && text.find("Corrections applied") == text.npos, "Tracking details belong in Diagnostics");
     render("General"); text = render("General");
+    require(text.find("FPS: 100.0 game present")!=text.npos,"Header keeps game-present FPS available while FG is off");
     require(text.find("Change menu key") != text.npos && text.find("DX11 -> DX12 transport") != text.npos &&
         text.find("Use lower DLSS hook (DX12)") != text.npos && text.find("Runtime ready") != text.npos &&
         text.find("DLSS hook change saved") != text.npos, "General controls and statuses missing");

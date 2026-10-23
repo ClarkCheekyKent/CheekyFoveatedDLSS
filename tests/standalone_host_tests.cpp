@@ -142,6 +142,10 @@ void verify_fg11(ID3D11Device* device) {
         require(value.capture_token&&acquire(&value),"DX11 native evaluations provide an OpenXR stereo guide pair");
         require(value.eyes[0].depth_width==64&&value.eyes[1].motion_width==128&&!value.enable_frame_id,
             "DX11 FG keeps full-eye guides independently of the cropped SR resolution");
+        require(value.eyes[0].prepared_guides&&value.eyes[1].prepared_guides&&
+            value.eyes[0].depth->GetDesc().Format==DXGI_FORMAT_R32_FLOAT&&
+            value.eyes[0].motion->GetDesc().Format==DXGI_FORMAT_R32G32_FLOAT,
+            "Default prepared guides use 32-bit depth and normalized 32-bit motion");
         ComPtr<ID3D12Device> gpu;check(value.producer_queue->GetDevice(IID_PPV_ARGS(&gpu)),"DX11 FG snapshot device");
         ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
         check(gpu->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"DX11 FG read allocator");
@@ -173,26 +177,28 @@ void verify_fg11(ID3D11Device* device) {
         check(value.producer_queue->Signal(fence.Get(),1),"DX11 FG read signal");
         while(fence->GetCompletedValue()<1)Sleep(1);
         void* mapped{};D3D12_RANGE range{0,static_cast<SIZE_T>(bytes*2)};check(read->Map(0,&range,&mapped),"DX11 FG map depth snapshots");
-        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,63u})for(unsigned x:{0u,63u}) {
+        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,desc.Height-1})for(unsigned x:{0u,unsigned(desc.Width)-1}) {
             const auto* pixel=reinterpret_cast<const float*>(static_cast<const unsigned char*>(mapped)+eye*bytes+y*footprint.Footprint.RowPitch+x*4);
             require(*pixel==(eye?.75f:.25f),"DX11 FG full-depth corner pixels preserve each eye beyond the SR crop");
         }
         read->Unmap(0,nullptr);
         D3D12_RANGE motion_range{0,static_cast<SIZE_T>(motion_bytes*2)};
         check(motion_read->Map(0,&motion_range,&mapped),"DX11 FG motion map");
-        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,127u})for(unsigned x:{0u,127u}) {
-            const auto* pixel=reinterpret_cast<const std::uint16_t*>(static_cast<const unsigned char*>(mapped)+eye*motion_bytes+y*motion_footprint.Footprint.RowPitch+x*4);
-            require(pixel[0]==(eye?0xcc00:0x4800)&&pixel[1]==(eye?0x4000:0xc400),
-                "ACC-style output-resolution motion keeps each eye's full signed vectors independently of SR/depth crop");
+        for(unsigned eye=0;eye<2;++eye)for(unsigned y:{0u,motion_desc.Height-1})for(unsigned x:{0u,unsigned(motion_desc.Width)-1}) {
+            const auto* pixel=reinterpret_cast<const float*>(static_cast<const unsigned char*>(mapped)+eye*motion_bytes+y*motion_footprint.Footprint.RowPitch+x*8);
+            const auto& guides=value.eyes[eye];
+            require(pixel[0]==(eye?-.125f:.0625f)/guides.focus_width&&pixel[1]==(eye?.015625f:-.03125f)/guides.focus_height,
+                "Prepared ACC motion preserves each eye's signed vectors normalized to its FG region, independently of SR/depth crop");
         }
         motion_read->Unmap(0,nullptr);
         release(&value);
     };
     eyes(2);pair();eyes(1);require(!complete(1),"DX11 incomplete stereo falls back");eyes(2);pair();
-    command("1\n301\nset\nEnabled=false");eyes(2);pair();
-    command("1\n302\nset\nFgEnabled=false");eyes(2);require(!complete(1),"DX11 FG disabled capture");
-    command("1\n303\nset\nFgEnabled=true");eyes(2);pair();
-    command("1\n304\ndefaults_fg\n");frame();
+    command("1\n301\nset\nFgFoveated=true");eyes(2);pair();
+    command("1\n302\nset\nEnabled=false");eyes(2);pair();
+    command("1\n303\nset\nFgEnabled=false");eyes(2);require(!complete(1),"DX11 FG disabled capture");
+    command("1\n304\nset\nFgEnabled=true");eyes(2);pair();
+    command("1\n305\ndefaults_fg\n");frame();
     require(ngx_succeeded(proc<NgxResult(*)(NgxHandle*)>(ngx,"NVSDK_NGX_D3D11_ReleaseFeature")(handle)),"DX11 FG game feature release");
     std::puts("PASS: DX11 FG automatic transport, full-eye guides, native stereo matching, SR off and disabled capture");
 }
