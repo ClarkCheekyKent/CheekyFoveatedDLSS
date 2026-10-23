@@ -1,4 +1,4 @@
 #pragma once
 
 // Release version shared by the UI, CMake, and installer build script.
-#define CHEEKY_VERSION "0.5.5"
+#define CHEEKY_VERSION "0.6.0"
