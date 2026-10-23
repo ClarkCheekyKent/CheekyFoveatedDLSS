@@ -35,7 +35,14 @@ int main(){
     for(unsigned i=5;i<=7;++i)frame(map,i);
     s=map.snapshot(1,8,80);
     check(s.active&&s.status==2&&s.views[2].dlss_view==100&&s.views[0].dlss_view==102,"Restore saved manual layout on rediscovery");
-    frame(map,8,false);frame(map,9,false);s=map.snapshot(1,10,100);
+    for(uint64_t key=8;key<14;key+=2){ // One game frame split across two display-time keys.
+        for(unsigned i=0;i<2;++i)map.observe(1,key,key*10,100+i,10+i,1047,981);
+        for(unsigned i=2;i<4;++i)map.observe(1,key+1,key*10+5,100+i,10+i,1047,981);}
+    const auto split_revision=map.snapshot(1,14,140).revision;
+    check(map.detected(),"Split frames of the known set must not end quad mode");
+    frame(map,15);check(map.snapshot(1,16,160).revision==split_revision,"Split frames must not reset the quad revision");
+    // Switching to stereo that reuses two of the handles: the other two go idle.
+    for(uint64_t key=20;key<=120;key+=10)frame(map,key,false);s=map.snapshot(1,130,1300);
     check(!s.active&&!map.detected(),"Stereo frames must end quad mode");
     AppQuadViews pair;
     for(unsigned key=1;key<=3;++key)for(unsigned i=0;i<2;++i)pair.observe(1,key,key*10,300+i,30+i,1024,1024);
@@ -44,6 +51,6 @@ int main(){
     for(unsigned key=1;key<=3;++key)for(unsigned i=0;i<4;++i)different.observe(1,key,key*10,400+i,40+i,i<2?800:1200,1000);
     check(different.snapshot(1,4,40).active,"Two differently sized stereo pairs must activate");
     check(!different.snapshot(2,1,100).active,"New XR session clears old sources");
-    check(!map.snapshot(1,10,3000).active,"Idle views must not remain active");
+    check(!map.snapshot(1,140,5000).active,"Idle views must not remain active");
     std::puts("App quad views: detection, default order, manual overrides, saved roles, stereo/session transitions passed");
 }

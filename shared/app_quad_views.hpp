@@ -13,6 +13,7 @@ class AppQuadViews {
     struct Source { uint64_t id{},generation{}; unsigned width{},height{}; };
     std::mutex mutex;
     std::array<Source,8> frame{},candidate{},sources{};
+    std::array<uint64_t,8> member_seen{}; // Last observation of each active source.
     std::array<unsigned,8> roles{},saved{};
     uint64_t xr_session{},frame_key{},epoch{},revision{},last_seen{};
     unsigned confirmations{},misses{},saved_count{};
@@ -25,7 +26,7 @@ class AppQuadViews {
         if(!active||!manual||!restore_pending||saved_count!=4)return;
         roles=saved;restore_pending=false;++revision;
     }
-    void finish_frame() {
+    void finish_frame(uint64_t now) {
         std::array<Source,8> selected{};unsigned count{};
         if(!overflow)for(const auto& a:frame)if(a.id){
             const auto matches=std::count_if(frame.begin(),frame.end(),[&](const Source& b){return b.id&&a.width==b.width&&a.height==b.height;});
@@ -40,16 +41,26 @@ class AppQuadViews {
             const auto rank=[&](const auto& s){return std::find_if(order.begin(),order.end(),[&](const auto& old){return old.id==s.id&&old.generation==s.generation;})-order.begin();};
             return rank(a)<rank(b);
         });
+        if(active&&count!=4){
+            // FG pacing can move the display-time key between a frame's four
+            // evaluations, splitting one game frame across two keys. Views that
+            // are all known members of the set are not a miss: only an unknown
+            // view (another rendering setup) or release/idleness ends the set.
+            const bool known=!overflow&&std::all_of(frame.begin(),frame.end(),[&](const Source& f){
+                return !f.id||std::any_of(sources.begin(),sources.end(),[&](const Source& s){return same(s,f);});});
+            bool live=true;for(unsigned i=0;i<8;++i)live&=!sources[i].id||now-member_seen[i]<=750;
+            if(known&&live){misses=0;return;}
+        }
         if(count!=4){confirmations=0;candidate={};if(active&&++misses>=2)clear();return;}
         misses=0;
         if(active&&!std::equal(selected.begin(),selected.end(),sources.begin(),same))clear();
         if(!std::equal(selected.begin(),selected.end(),candidate.begin(),same)){candidate=selected;confirmations=0;}
         if(confirmations<3)++confirmations;
-        if(!active&&confirmations>=3){sources=selected;active=true;roles={};restore_pending=true;++epoch;++revision;restore();}
+        if(!active&&confirmations>=3){sources=selected;member_seen.fill(now);active=true;roles={};restore_pending=true;++epoch;++revision;restore();}
     }
     void advance(uint64_t session,uint64_t key,uint64_t now) {
         if(xr_session!=session){clear();frame={};frame_key=0;xr_session=session;}
-        if(frame_key&&key!=frame_key){finish_frame();frame={};overflow=false;}
+        if(frame_key&&key!=frame_key){finish_frame(now);frame={};overflow=false;}
         frame_key=key;
         if(last_seen&&now-last_seen>2000){clear();frame={};last_seen=0;}
     }
@@ -61,6 +72,7 @@ class AppQuadViews {
         auto found=std::find_if(frame.begin(),frame.end(),[&](const auto& s){return s.id==id||!s.id;});
         if(found==frame.end()){overflow=true;return;}
         *found={id,generation,w,h};
+        for(unsigned i=0;i<8;++i)if(same(sources[i],*found))member_seen[i]=now;
     }
     CheekyQuadViewsV1 snapshot(uint64_t session,uint64_t key,uint64_t now) {
         std::lock_guard lock(mutex);advance(session,key,now);
