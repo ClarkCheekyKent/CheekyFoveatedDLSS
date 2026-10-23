@@ -87,10 +87,41 @@ void quad_role_mapping_validation() {
     for(unsigned frame=300;frame<380&&mapper.snapshot().status!=2;++frame){evaluate();postprocess();const auto token=mapper.capture(targets,frame);mapper.complete(token,true);Sleep(1);}
     result=mapper.snapshot();
     for(unsigned i=0;i<4;++i)check(result.status==2&&result.views[i].dlss_view==metadata[submitted_order[i]].dlss_view,"Recreated quad views were not re-proved after renumbering");
+    // Keep the same source set alive while transition images fail proof. Use
+    // explicit monotonic time to exercise five-second boundaries without sleeps.
+    RoleMapping11 retry_mapper(device.Get());uint64_t retry_now=10000;int64_t retry_frame_id=1000;
+    const auto retry_frame=[&](bool duplicate){
+        for(auto i:evaluation_order){context->ClearRenderTargetView(source_targets[i].Get(),gray);retry_mapper.observe(metadata[i],retry_now);}
+        postprocess(duplicate);
+        const auto token=retry_mapper.capture(targets,++retry_frame_id,retry_now);retry_mapper.complete(token,true);Sleep(1);return token;
+    };
+    for(unsigned frame=0;frame<400&&retry_mapper.snapshot().status!=3;++frame)retry_frame(true);
+    check(retry_mapper.snapshot().status==3&&retry_mapper.snapshot().captures==120,"Initial quad proof budget was not bounded to 120 captures");
+    retry_now=14999;
+    check(retry_frame(false)==0&&retry_mapper.snapshot().captures==120,"Quad proof retried before the five-second cooldown");
+    clean=read(sources[0].Get());
+    check(std::abs(cheeky::foveated_dlss::calibration_decode(clean.first.data()+12*clean.second+12*8,DXGI_FORMAT_R16G16B16A16_FLOAT).r-.2f)<.01f,
+        "Quad markers kept stamping during the retry cooldown");
+    retry_now=15000;
+    for(unsigned frame=0;frame<80&&retry_mapper.snapshot().captures<128;++frame)retry_frame(true);
+    check(retry_mapper.snapshot().status==3&&retry_mapper.snapshot().captures==128,"Five-second quad retry did not stop after eight captures");
+    retry_now=19999;
+    check(retry_frame(false)==0&&retry_mapper.snapshot().captures==128,"Failed quad retry did not enforce another five-second cooldown");
+    retry_now=20000;
+    for(unsigned frame=0;frame<80&&retry_mapper.snapshot().status!=2;++frame)retry_frame(false);
+    result=retry_mapper.snapshot();
+    check(result.status==2&&result.confirmations>=2&&result.captures>128&&result.captures<=136,
+        "Quad proof did not recover automatically on a later five-second retry");
+    for(unsigned i=0;i<4;++i)check(result.views[i].verified&&result.views[i].dlss_view==metadata[submitted_order[i]].dlss_view,
+        "Automatic quad retry published the wrong source roles");
+    retry_now+=10000;
+    check(retry_frame(false)==0&&retry_mapper.snapshot().captures==result.captures,"Verified quad mapping restarted periodic captures");
+    retry_mapper.configure(true,false);retry_now+=10000;
+    check(retry_frame(false)==0&&retry_mapper.snapshot().captures==result.captures,"Periodic quad retry ran in manual mode");
     context->ClearState();context->Flush();
     if(errors)for(UINT64 i=0;i<errors->GetNumStoredMessages();++i){SIZE_T size{};errors->GetMessage(i,nullptr,&size);std::vector<char> storage(size);
         auto* message=reinterpret_cast<D3D11_MESSAGE*>(storage.data());errors->GetMessage(i,message,&size);
         if(message->Severity<=D3D11_MESSAGE_SEVERITY_ERROR){std::cerr<<message->pDescription<<'\n';check(false,"Quad role mapping D3D11 debug error");}}
-    std::cout<<"PASS quad role pixel proof through FP16->SRGB postprocessing, shuffled handles, manual bijection, independent repeated numbers, generation invalidation and ambiguous rejection (WARP)\n";
+    std::cout<<"PASS quad role pixel proof through FP16->SRGB postprocessing, shuffled handles, manual bijection, independent repeated numbers, generation invalidation, ambiguous rejection and bounded five-second retry recovery (WARP)\n";
 }
 }

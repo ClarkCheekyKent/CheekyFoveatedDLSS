@@ -16,6 +16,8 @@ class RoleMapping11 {
     template<class T> using Ptr=Microsoft::WRL::ComPtr<T>;
     using Pixel=cheeky::foveated_dlss::CalibrationPixel;
     static constexpr unsigned count=8, block=40, sample=60;
+    static constexpr unsigned initial_attempts=120, retry_attempts=8;
+    static constexpr uint64_t retry_interval_ms=5000;
     static constexpr uint32_t codes[count]{0x1305e6aU,0x15c952cU,0xb5447cU,0x9aa60fU,0x19333a4U,0x426d5dU,0x14cda46U,0xcd6968U};
     struct Source {
         uint64_t id{},generation{},last_ms{};unsigned width{},height{};
@@ -39,13 +41,25 @@ class RoleMapping11 {
     std::array<unsigned,count> saved_roles{};unsigned saved_count{};bool restore_pending{true};
     CheekyQuadViewsV1 value{};
     std::array<unsigned,4> candidate{};
-    uint64_t revision{1},ticket{},last_confirmation{};unsigned attempts{},confirmations{};
+    uint64_t revision{1},ticket{},last_confirmation{},retry_at{};
+    unsigned attempts{},confirmations{},attempt_limit{initial_attempts};
     bool verified{},manual{},numbers{};
     struct Guard {ID3D11Multithread* p;explicit Guard(ID3D11Multithread* v):p(v){p->Enter();}~Guard(){p->Leave();}};
     void invalidate(bool clear_manual) {
         ++revision;verified=false;confirmations=attempts=0;last_confirmation=0;
+        retry_at=0;attempt_limit=initial_attempts;
         if(clear_manual){manual_roles={};restore_pending=true;}
         for(auto& v:value.views){v.dlss_view=v.registration_generation=0;v.verified=0;}
+    }
+    bool acquiring(uint64_t now) {
+        if(manual||verified)return false;
+        if(attempts>=attempt_limit){
+            if(now<retry_at)return false;
+            // Re-arm stamping before the next DLSS output is submitted. A short
+            // burst allows two independent proofs plus asynchronous readback.
+            invalidate(false);attempt_limit=retry_attempts;
+        }
+        return true;
     }
     // Numbers follow slots, so keep live sources in slots 1..n. A game that
     // creates its next views before releasing the old ones (DCS mission
@@ -172,7 +186,7 @@ public:
         if(role)for(unsigned i=0;i<count;++i)if(i!=slot&&manual_roles[i]==role)return false;
         manual_roles[slot]=role;restore_pending=false;++revision;return true;
     }
-    void observe(const CheekyQuadSourceD3D11V1& input) {
+    void observe(const CheekyQuadSourceD3D11V1& input,uint64_t now=GetTickCount64()) {
         if(!context||!input.dlss_view||!input.registration_generation)return;
         Guard guard(protection.Get());std::lock_guard lock(mutex);
         auto* caller=static_cast<ID3D11DeviceContext*>(input.context);if(caller!=context.Get())return;
@@ -181,16 +195,16 @@ public:
             uint64_t(input.x)+input.width>desc.Width||uint64_t(input.y)+input.height>desc.Height)return;
         poll();unsigned slot=count;
         for(unsigned i=0;i<count;++i)if(sources[i].id==input.dlss_view){slot=i;break;}
-        if(slot==count){const bool evicted=evict_idle(GetTickCount64());if(compact()||evicted)invalidate(true);}
+        if(slot==count){const bool evicted=evict_idle(now);if(compact()||evicted)invalidate(true);}
         if(slot==count)for(unsigned i=0;i<count;++i)if(!sources[i].id){slot=i;break;}
         if(slot==count){slot=unsigned(std::min_element(sources.begin(),sources.end(),[](const auto& a,const auto& b){return a.last_ms<b.last_ms;})-sources.begin());}
         auto& source=sources[slot];
         if(source.id!=input.dlss_view||source.generation!=input.registration_generation||source.width!=input.width||source.height!=input.height||source.format!=desc.Format){
             source={};source.id=input.dlss_view;source.generation=input.registration_generation;source.width=input.width;source.height=input.height;source.format=desc.Format;invalidate(true);}
-        source.last_ms=GetTickCount64();
+        source.last_ms=now;
         restore_saved();
         const auto bytes=cheeky::foveated_dlss::calibration_pixel_bytes(desc.Format);
-        if(!manual&&!verified&&attempts<120&&bytes&&input.width>=64&&input.height>=64){
+        if(acquiring(now)&&bytes&&input.width>=64&&input.height>=64){
             if(!source.marker){std::vector<unsigned char> data(block*block*bytes);
                 for(unsigned y=0;y<block;++y)for(unsigned x=0;x<block;++x)
                     cheeky::foveated_dlss::calibration_encode_pattern(data.data()+(y*block+x)*bytes,desc.Format,0,x,y,codes[slot]);
@@ -200,11 +214,11 @@ public:
         }
         if(numbers)draw_number(source,slot,input,texture,desc);
     }
-    uint64_t capture(const std::array<Input,4>& inputs,int64_t display_time) {
+    uint64_t capture(const std::array<Input,4>& inputs,int64_t display_time,uint64_t now=GetTickCount64()) {
         if(!context)return 0;Guard guard(protection.Get());std::lock_guard lock(mutex);poll();
         for(unsigned i=0;i<4;++i){auto& view=value.views[i];view.view_index=i;view.eye_index=i%2;view.focus=i>=2;
             view.submitted_resource=inputs[i].identity;view.array_slice=inputs[i].slice;view.width=inputs[i].width;view.height=inputs[i].height;}
-        if(manual||verified||attempts>=120)return 0;
+        if(!acquiring(now))return 0;
         auto found=std::find_if(frames.begin(),frames.end(),[](const auto& frame){return !frame.busy;});if(found==frames.end())return 0;
         auto& frame=*found;
         for(unsigned i=0;i<4;++i){const auto& input=inputs[i];if(!input.texture||input.width<64||input.height<64)return 0;
@@ -222,13 +236,14 @@ public:
         if(!frame.done){D3D11_QUERY_DESC query{D3D11_QUERY_EVENT,0};if(FAILED(device->CreateQuery(&query,&frame.done)))return 0;}
         for(unsigned i=0;i<count;++i)frame.sources[i]={sources[i].id,sources[i].generation,sources[i].width,sources[i].height};
         frame.busy=true;frame.finalized=frame.submitted=false;frame.revision=revision;frame.ticket=++ticket;frame.time=display_time;
-        ++value.captures;++attempts;context->End(frame.done.Get());context->Flush();return frame.ticket;
+        ++value.captures;if(++attempts>=attempt_limit)retry_at=now+retry_interval_ms;
+        context->End(frame.done.Get());context->Flush();return frame.ticket;
     }
     void complete(uint64_t token,bool submitted){if(!token)return;std::lock_guard lock(mutex);for(auto& frame:frames)
         if(frame.busy&&frame.ticket==token){frame.finalized=true;frame.submitted=submitted;break;}}
     CheekyQuadViewsV1 snapshot(){std::lock_guard lock(mutex);auto out=value;out.version=CHEEKY_QUAD_VIEWS_VERSION;out.size=sizeof(out);
         out.revision=revision;out.confirmations=confirmations;out.manual_mode=manual;out.show_numbers=numbers;
-        out.status=verified?2:attempts>=120?3:1;
+        out.status=verified?2:attempts>=attempt_limit?3:1;
         if(manual){unsigned assigned{};for(auto& view:out.views){view.dlss_view=view.registration_generation=0;view.verified=0;}
             for(unsigned i=0;i<count;++i)if(manual_roles[i]&&sources[i].id){auto& view=out.views[manual_roles[i]-1];view.dlss_view=sources[i].id;view.registration_generation=sources[i].generation;++assigned;}
             out.status=assigned==4?2:1;}

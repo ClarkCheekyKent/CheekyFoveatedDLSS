@@ -1,3 +1,15 @@
+# D3D11 quad role assignment retries
+
+`CheekyOpenXRBindingTests.exe --quad-roles` checks four-view marker proof on
+WARP, including mission view replacement and automatic recovery after failed
+proofs. The initial acquisition allows 120 captures. If unresolved, markers and
+captures pause for five seconds, then resume for at most eight captures to allow
+two matching proofs plus asynchronous readback. Failed bursts repeat after
+another five-second cooldown. Verified and manual mappings do not retry.
+The regression uses explicit monotonic times to check cooldown boundaries,
+marker suppression, repeated failure and later recovery without a manual reset.
+This validates the assignment path; DCS headset timing still needs an in-game check.
+
 # Shader FG without a D3D12 bridge
 
 `CheekyOpenXRBindingTests --fg-shader11` runs the native D3D11 presenter on WARP.
