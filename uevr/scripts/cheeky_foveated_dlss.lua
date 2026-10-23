@@ -574,8 +574,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             text("The enable preference is preserved and FG will resume automatically on return to Native Stereo.")
         else
             check("Enable DLSS Frame Generation (2x)", "FgEnabled")
-            text("Experimental. Requires a D3D11 or D3D12 OpenXR session and the matching OpenXR layer.")
-            text("Runs only in UEVR Native Stereo. AER, sequential and AFW pause FG automatically; the checkbox stays enabled.")
             local fg = status.fg or {}
             if not fg.layer_present then
                 text("OpenXR layer not loaded. Install the updated OpenXR support and restart the game.")
@@ -620,14 +618,9 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         combo("FG periphery scale", "FgPeripheralPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                         combo("FG periphery method", "FgPeripheralMethod", {[0]="None (previous frame)", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS"})
                     end
-                end
-                if native_shader11 then
-                    text("Native D3D11: shader FG writes directly to OpenXR. Uses serialized presentation and full-eye 32-bit guide history.")
+                    if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end
                 end
                 if imgui.tree_node("Advanced settings") then
-                    if draft.FgFoveated and draft.FgShowBorder ~= nil then
-                        check("Show blue FG region border", "FgShowBorder")
-                    end
                     if draft.FgPacingClock ~= nil then
                         combo("FG pacing clock", "FgPacingClock", {
                             [0]="Independent display clock", [1]="Follow presented frames", [2]="Follow presented frames + vsync lock"})
@@ -694,6 +687,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     end
                     section("Content age at OpenXR submission (average / last ms)")
                     text("Capture-to-submit age, not rendering time or headset display latency.")
+                    text("Reference values for comparing modes; not a measurement of added FG delay.")
                     rows("fg_frame_age", {
                         {"Real frame",age(presentation.native_samples,presentation.native_age_ms,presentation.native_age_last_ms)},
                         {"Generated frame (from the midpoint of its two real frames)",age(presentation.generated_samples,presentation.generated_age_ms,presentation.generated_age_last_ms)},
@@ -720,7 +714,9 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         local focused = (p.foveated_eyes or 0) > 0
                         local resized = not focused and (p.center_width or 0)>0 and
                             (p.center_width~=p.output_width or p.center_height~=p.output_height)
-                        if (p.center_width or 0) > 0 then
+                        if native_shader11 and (p.output_width or 0)>0 then
+                            rows("fg_resolutions", {{"Output per eye", size(p.output_width,p.output_height)}})
+                        elseif (p.center_width or 0) > 0 then
                             rows("fg_resolutions", {{focused and "Center FG input" or "Full-frame FG input", size(p.center_width,p.center_height)},
                                 {"Periphery input", focused and size(p.peripheral_width,p.peripheral_height) or "Not used"},
                                 {"Output per eye", size(p.output_width,p.output_height)}})
@@ -741,12 +737,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             entries[#entries+1] = {"  Capture subtotal", (extra.guide_samples or 0)>0 and (extra.capture_samples or 0)>0 and gpu_ms(capture[1], capture[2]) or "Waiting for GPU samples"}
                             sum, sum_last = sum + capture[1], sum_last + capture[2]
                         end
+                        if native_shader11 then
+                            entries[#entries+1] = {"Shader generation (center + periphery)",gpu_ms(p.total_ms,p.total_last_ms)}
+                        else
                         entries[#entries+1] = {"Color / guide preparation", gpu_ms(p.preparation_ms, p.preparation_last_ms)}
                         entries[#entries+1] = {focused and "DLSS-FG center" or "DLSS-FG full frame", gpu_ms(p.center_ms, p.center_last_ms)}
                         if focused or resized then
                             entries[#entries+1] = {resized and "Output resize" or "Periphery + output assembly", gpu_ms(p.periphery_ms,p.periphery_last_ms)}
                         end
                         entries[#entries+1] = {stages and "  Generation subtotal" or "FG GPU total", gpu_ms(p.total_ms, p.total_last_ms)}
+                        end
                         sum, sum_last = sum + (p.total_ms or 0), sum_last + (p.total_last_ms or 0)
                         if stages then
                             local present = {0, 0}
@@ -758,7 +758,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             entries[#entries+1] = {"Measured GPU stage sum", complete and gpu_ms(sum, sum_last) or "Waiting for GPU samples"}
                         end
                         rows("fg_gpu_timings", entries)
-                        text("Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.")
+                        text(native_shader11 and "GPU shader time for both eyes, with center and periphery measured together. Capture, copies and runtime work are excluded." or
+                            "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.")
                     elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then
                         text("GPU timestamps unavailable or FG has not started.")
                     else

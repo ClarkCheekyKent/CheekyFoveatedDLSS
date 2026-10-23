@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_transport.hpp"
 #include "fg_matrices.hpp"
+#include "fg_timing11.hpp"
 #include "../shared/cheeky_fg_shader11.hpp"
 #include "../shared/fg_interpolation_shader.hpp"
 #include "../shared/fg_guide_layout.hpp"
@@ -56,6 +57,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     ComPtr<ID3DDeviceContextState> state; // Our own pipeline state on the immediate context.
     ComPtr<ID3D11Multithread> protection;
     std::recursive_mutex* dispatch{}; // Shared with the game's NGX evaluation in stereo and quad modes.
+    ShaderTimings11 gpu_timings;
     ComPtr<ID3D11ComputeShader> snapshot;
     ComPtr<ID3D11VertexShader> vertex;
     ComPtr<ID3D11PixelShader> pixel,periphery_pixel;
@@ -97,6 +99,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     template<class Record> bool submit(Record&& record,bool flush) {
         std::unique_lock<std::recursive_mutex> serialized;if(dispatch)serialized=std::unique_lock(*dispatch);
         Guard guard(protection.Get());
+        gpu_timings.collect(context.Get());
         const bool recorded=record(context.Get());
         if(flush)context->Flush();
         return recorded&&SUCCEEDED(device->GetDeviceRemovedReason());
@@ -124,6 +127,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         auto result=submit();flush();return result;
     }
     void flush() noexcept {if(context&&protection){Guard guard(protection.Get());context->Flush();}}
+    void cancel_gpu_timing() {submit([&](ID3D11DeviceContext* commands){gpu_timings.cancel(commands);return true;},false);}
     // The single immediate context retains every referenced texture until its
     // queued GPU work finishes, so an image is reusable once only the pool owns it.
     Image image(const D3D11_TEXTURE2D_DESC& wanted,bool srv) {
@@ -270,6 +274,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         D3D11_TEXTURE2D_DESC desc{};
         // Coarse periphery: shaded once per grid cell, then expanded.
         Image periphery;ComPtr<ID3D11RenderTargetView> periphery_target;
+        ShaderTimings11::Ticket timing;unsigned timing_part{};
     };
     void record_draw(ID3D11DeviceContext* commands,const DeferredDraw& draw,ID3D11RenderTargetView* target) {
         auto* cb=draw.constants.Get();auto* ss=sampler.Get();
@@ -347,9 +352,17 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             out[eye]=image(e,true);if(!out[eye])return false;
             if(FAILED(device->CreateRenderTargetView(out[eye]->texture11.Get(),nullptr,&targets[eye])))return false;
         }
-        if(deferred_output)return true;
+        const auto& meta=new_guides[0]->source.meta;
+        const unsigned focused=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
+        if(deferred_output)return submit([&](ID3D11DeviceContext*){
+            auto timing=gpu_timings.reserve(device.Get(),2,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
+            for(unsigned eye=0;eye<2;++eye){draws[eye]->timing=timing;draws[eye]->timing_part=eye;}
+            return true;},false);
         return submit_shader([&](ID3D11DeviceContext* commands){
+            auto timing=gpu_timings.reserve(device.Get(),1,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
+            const bool measured=gpu_timings.begin(commands,timing,0);
             for(unsigned eye=0;eye<2;++eye)record_draw(commands,*draws[eye],targets[eye].Get());
+            if(measured)gpu_timings.end(commands,timing,0);
             return true;},true);
     }
     // Renders a deferred pass into an acquired OpenXR image of the same size.
@@ -361,7 +374,11 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         view.ViewDimension=t.ArraySize>1?D3D11_RTV_DIMENSION_TEXTURE2DARRAY:D3D11_RTV_DIMENSION_TEXTURE2D;
         if(t.ArraySize>1){view.Texture2DArray.ArraySize=1;}
         ComPtr<ID3D11RenderTargetView> rtv;if(FAILED(device->CreateRenderTargetView(target,&view,&rtv)))return false;
-        return submit_shader([&](ID3D11DeviceContext* commands){record_draw(commands,*draw,rtv.Get());return true;},true);
+        return submit_shader([&](ID3D11DeviceContext* commands){
+            const bool measured=gpu_timings.begin(commands,draw->timing,draw->timing_part);
+            record_draw(commands,*draw,rtv.Get());
+            if(measured)gpu_timings.end(commands,draw->timing,draw->timing_part);
+            return true;},true);
     }
     // Copies an immutable frame into an acquired OpenXR image (presentation thread).
     bool upload(ID3D11Texture2D* target,const Image& source) {

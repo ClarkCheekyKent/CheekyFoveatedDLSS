@@ -880,7 +880,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable DLSS Frame Generation (2x)", &s.enabled);
     test_control("FgEnabled");
-    ImGui::TextWrapped("Experimental. Requires a D3D11 or D3D12 OpenXR session and the matching OpenXR layer.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
     else if (!flag(fg, "controls_supported"))
@@ -891,13 +890,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     else {
         diagnostic_line(fg, "Status", "state");
         const auto detail = plain(member(fg, "diagnostic"));
-        if (!detail.empty()) ImGui::TextWrapped("%s", detail.c_str());
+        if (plain(member(fg, "state")) != "Generating frames" && !detail.empty())
+            ImGui::TextWrapped("%s", detail.c_str());
     }
 
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
     combo("FG center method", s.center_method,
         "DLSS\0Simple motion-vector warping\0Bidirectional interpolation\0");
-    if(s.center_method)ImGui::TextWrapped("Shader FG uses captured motion vectors and color history; bidirectional interpolation also uses depth history. With shader methods in both regions, D3D11 writes directly into the final OpenXR images.");
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
     ImGui::Checkbox("Foveated frame generation", &s.foveated);
@@ -918,10 +917,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         fg_percent("FG periphery scale", s.peripheral_percent);
         combo("FG periphery method", s.peripheral_method,
             quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0":"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0");
-        if(quad)ImGui::TextWrapped("The center region follows the submitted quad-view FOV. A peripheral DLSS-G pass is not used.");
+        ImGui::Checkbox("Show blue FG region border", &s.show_border);
     }
     if (ImGui::TreeNode("Advanced settings")) {
-        if (s.foveated||quad) ImGui::Checkbox("Show blue FG region border", &s.show_border);
         combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
         if (s.pacing_clock != 0)
             ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
@@ -976,6 +974,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     } else ImGui::TextUnformatted("Measuring presentation cadence...");
     ImGui::SeparatorText("Content age at OpenXR submission (average ms)");
     ImGui::TextWrapped("Capture-to-submit age, not rendering time or headset display latency.");
+    ImGui::TextWrapped("Reference values for comparing modes; not a measurement of added FG delay.");
     ImGui::PushID("latency");
     const auto presentation=member(fg,"presentation");
     if(number(presentation,"native_samples")>0)rows(presentation, {{"Real frame", "native_age_ms"}}, true);
@@ -994,7 +993,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         const bool focused = number(gpu, "foveated_eyes") > 0;
         const bool resized = !focused && number(gpu, "center_width") > 0 &&
             (number(gpu, "center_width") != number(gpu, "output_width") || number(gpu, "center_height") != number(gpu, "output_height"));
-        if (number(gpu, "center_width") > 0) {
+        if(native_shader11()&&number(gpu,"output_width")>0)
+            ImGui::Text("Output per eye: %.0f x %.0f",number(gpu,"output_width"),number(gpu,"output_height"));
+        else if (number(gpu, "center_width") > 0) {
             ImGui::Text("%s: %.0f x %.0f", focused ? "Center FG input" : "Full-frame FG input", number(gpu, "center_width"), number(gpu, "center_height"));
             if (focused) ImGui::Text("Periphery input: %.0f x %.0f", number(gpu, "peripheral_width"), number(gpu, "peripheral_height"));
             ImGui::Text("Output per eye: %.0f x %.0f", number(gpu, "output_width"), number(gpu, "output_height"));
@@ -1020,10 +1021,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
                 row("  Capture subtotal", capture, capture_last, number(extra,"guide_samples")>0&&number(extra,"capture_samples")>0);
                 sum += capture; sum_last += capture_last;
             }
+            if(native_shader11())row("Shader generation (center + periphery)",number(gpu,"total_ms"),number(gpu,"total_last_ms"));
+            else {
             row("Color / guide preparation", number(gpu, "preparation_ms"), number(gpu, "preparation_last_ms"));
             row(focused ? "DLSS-FG / shader center" : "FG full frame", number(gpu, "center_ms"), number(gpu, "center_last_ms"));
             if (focused || resized) row(resized ? "Output resize" : "Periphery + output assembly", number(gpu, "periphery_ms"), number(gpu, "periphery_last_ms"));
             row(stages ? "  Generation subtotal" : "FG GPU total", number(gpu, "total_ms"), number(gpu, "total_last_ms"));
+            }
             sum += number(gpu, "total_ms"); sum_last += number(gpu, "total_last_ms");
             if (stages) {
                 double present{}, present_last{};
@@ -1035,7 +1039,8 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             }
             ImGui::EndTable();
         }
-        ImGui::TextWrapped("Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.");
+        ImGui::TextWrapped(native_shader11()?"GPU shader time for both eyes, with center and periphery measured together. Capture, copies and runtime work are excluded.":
+            "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.");
     } else if (!flag(gpu, "gpu_supported") && number(gpu, "gpu_samples") == 0)
         ImGui::TextWrapped("GPU timestamps unavailable or FG has not started.");
     else ImGui::TextWrapped("Waiting for a complete GPU timing sample.");
@@ -1104,7 +1109,7 @@ void draw_system_load(std::string_view snapshot) {
         else ImGui::TextUnformatted("GPU: utilization counters unavailable");
     }
     if (flag(vram, "valid"))
-        ImGui::Text("VRAM (game): %.1f / %.1f GB budget", number(vram, "usage_bytes") / 1073741824.0, number(vram, "budget_bytes") / 1073741824.0);
+        ImGui::Text("VRAM (game): %.2f / %.2f GB budget", number(vram, "usage_bytes") / 1073741824.0, number(vram, "budget_bytes") / 1073741824.0);
     if (flag(fg,"active")&&flag(cadence, "valid"))
         ImGui::Text("FPS: %.1f game, %.1f unique output", number(cadence, "game_fps"), number(cadence, "unique_fps"));
     else if(const auto ms=number(member(snapshot,"frame"),"present_ms");ms>0)

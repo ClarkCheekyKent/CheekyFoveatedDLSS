@@ -161,7 +161,7 @@ struct BufferedBackend11 final : FrameBackend {
     bool publish(const BufferedPair& pair,const std::array<Image,2>& images,
         std::array<XrCompositionLayerProjectionView,2>& views,FrameLayers& layers,bool) override {
         for(unsigned eye=0;eye<2;++eye){
-            auto& chain=owner.scene_chains[eye];if(!owner.upload11(chain,images[eye]))return false;
+            auto& chain=owner.scene_chains[eye];if(!owner.upload11(chain,images[eye])){owner.native11->cancel_gpu_timing();return false;}
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
             views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
         }
@@ -171,6 +171,7 @@ struct BufferedBackend11 final : FrameBackend {
         return true;
     }
     void retire() override {
+        owner.native11->cancel_gpu_timing();
         owner.native11->flush();owner.native11->clear_guides();
         std::lock_guard lock(owner.composed11_mutex);owner.composed11.clear();
     }
@@ -181,12 +182,11 @@ struct BufferedBackend11 final : FrameBackend {
     void reset_generation() override {}
     // The bidirectional shader still samples previous-interval depth.
     void retire_guides(BufferedNative&) override {}
-    void reset_statistics(bool) override {}
+    void reset_statistics(bool) override {owner.native11->gpu_timings.reset();}
     GenerationStatus generation_status() const override {return {false,false,0,owner.native11->diagnostic};}
-    void snapshot(CheekyFgPerformance& performance,CheekyFgOverhead&,
+    void snapshot(CheekyFgPerformance& performance,CheekyFgOverhead& overhead,
         CheekyFgExperimentDiagnostics& experiments) const override {
-        performance=owner.Presenter::performance();owner.worker.latency.snapshot(experiments);
-        performance.shared_gpu_queue=1;
+        performance=owner.native11->gpu_timings.snapshot();overhead={};owner.worker.latency.snapshot(experiments);
     }
     XrResult end_frame(const XrFrameEndInfo* end) override {
         return owner.native11->runtime_submit([&]{return owner.xr.end_frame(owner.session,end);});

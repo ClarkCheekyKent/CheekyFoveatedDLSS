@@ -192,7 +192,7 @@ def run(engine):
         assert g["values"]["FG periphery method"] == 1
         assert g["values"]["FG GPU queue"] is None
         assert g["values"]["Release game rendering"] == state["settings"]["FgReleasePoint"]
-        assert any("Native D3D11" in text for text in g.drawn.values())
+        assert not any("Native D3D11: shader FG" in text for text in g.drawn.values())
         state["settings"]["FgPeripheralMethod"] = 3
         receive(state)
         draw()

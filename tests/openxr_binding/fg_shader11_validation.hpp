@@ -198,9 +198,9 @@ inline void fg_backend11_pipelined(bool direct=false){
     }
     // Disable exactly as xrWaitFrame does, while the render thread may still
     // own the last frame: finish application frames, then drain.
-    std::uint64_t generated{},native{},repeats{};bool fresh_only{};
+    std::uint64_t generated{},native{},repeats{};bool fresh_only{};CheekyFgPerformance gpu;
     {std::lock_guard lock(p.mx);generated=p.generated_count;native=p.native_count;
-        repeats=p.repeated_presentations;fresh_only=!p.submit_repeat_frames;}
+        repeats=p.repeated_presentations;fresh_only=!p.submit_repeat_frames;gpu=p.performance();}
     auto disable=std::async(std::launch::async,[&]{p.finish_application_frame();p.invalidate_temporal();});
     const bool disabled=disable.wait_for(std::chrono::seconds(5))==std::future_status::ready;
     if(!disabled){std::cerr<<"backend11 disable hung\n";std::_Exit(3);}
@@ -214,6 +214,11 @@ inline void fg_backend11_pipelined(bool direct=false){
     check(!app_errors,"Application wait/begin/capture/end succeed with overlapping frames");
     check(generated>=frames/4,"Native D3D11 interpolation reaches the headset with overlapping application frames");
     check(fresh_only&&repeats==0,"Native D3D11 honors the fixed fresh-only policy for copied and direct output");
+    check(gpu.gpu_supported&&gpu.gpu_valid&&gpu.gpu_samples>0&&gpu.window_samples>0&&
+        gpu.total_ms>0&&gpu.total_last_ms>0&&gpu.output_width==64&&gpu.output_height==64,
+        "Native D3D11 reports completed GPU timestamps for both copied and direct stereo generation");
+    std::cout<<"PASS native D3D11 GPU timestamps: direct="<<direct<<" samples="<<gpu.gpu_samples
+        <<" stereo_shader_ms="<<gpu.total_ms<<" last_ms="<<gpu.total_last_ms<<'\n';
     check(retired.size()>=2&&Runtime::chains.size()==retired.size(),"Teardown hands private D3D11 swapchains to the layer instead of destroying them");
     for(auto chain:retired)Runtime::destroy(chain);
     check(Runtime::chains.empty(),"Retired private D3D11 swapchains are destroyed later by the layer");
@@ -362,9 +367,46 @@ inline void fg_backend11_fence_stress(){
         "D3D11 driver worker completes every concurrent fence signal");
     std::cout<<"PASS native D3D11 fence stress: 3000 copies plus concurrent shader work, "<<signals.load()<<" signals\n";
 }
+inline void fg_backend11_timing_retirement(){
+    using namespace shader11_fixture;using namespace cheeky::fg;
+    Backend11 backend;check(backend.initialize(device.Get(),7,nullptr),backend.diagnostic);
+    std::array<ShaderTimings11::Ticket,16> held;
+    check(backend.submit([&](ID3D11DeviceContext*){
+        for(auto& ticket:held){ticket=backend.gpu_timings.reserve(device.Get(),1,64,64,2,1,55);check(bool(ticket),"Reserve bounded GPU timing slots");}
+        check(!backend.gpu_timings.reserve(device.Get(),1,64,64,2,1,55),"A full GPU query pool skips timing without waiting");
+        return true;},false),"Reserve timestamp pool");
+    held={};ShaderTimings11::Ticket partial;
+    check(backend.submit([&](ID3D11DeviceContext* commands){
+        partial=backend.gpu_timings.reserve(device.Get(),2,64,64,2,1,55);
+        check(backend.gpu_timings.begin(commands,partial,0),"Begin direct first-eye timestamp");
+        backend.gpu_timings.end(commands,partial,0);backend.gpu_timings.cancel(commands);
+        return true;},true),"Cancel incomplete stereo timing");
+    const auto until=GetTickCount64()+3000;
+    while(partial->pending&&GetTickCount64()<until){backend.submit([](ID3D11DeviceContext*){return true;},false);Sleep(1);}
+    check(!partial->pending&&!backend.gpu_timings.active&&!backend.gpu_timings.snapshot().gpu_valid,
+        "Canceled first-eye timing retires safely and is never shown as a stereo sample");
+    ShaderTimings11::Ticket stale;
+    check(backend.submit([&](ID3D11DeviceContext* commands){
+        stale=backend.gpu_timings.reserve(device.Get(),1,64,64,2,1,55);
+        check(backend.gpu_timings.begin(commands,stale,0),"Begin pre-reset GPU timing");
+        backend.gpu_timings.end(commands,stale,0);backend.gpu_timings.reset();return true;},true),"Reset GPU timing window");
+    const auto reset_until=GetTickCount64()+3000;
+    while(stale->pending&&GetTickCount64()<reset_until){backend.submit([](ID3D11DeviceContext*){return true;},false);Sleep(1);}
+    check(!stale->pending&&!backend.gpu_timings.snapshot().gpu_valid,"Pre-reset GPU results cannot repopulate a new timing window");
+    std::cout<<"PASS native D3D11 timing retirement: bounded pool, incomplete stereo, reset epoch\n";
+}
 void fg_shader11_validation(bool hardware=false){
     using namespace shader11_fixture;
+    {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{1000,FALSE};
+        const std::array<UINT64,4> ticks{10,12,100,103};
+        check(cheeky::fg::ShaderTimings11::duration(clock,ticks,2)==5.,"Stereo GPU timing sums only both draw intervals, excluding their scheduling gap");
+        clock.Disjoint=TRUE;check(std::isnan(cheeky::fg::ShaderTimings11::duration(clock,ticks,2)),"Reject disjoint GPU clocks");
+        clock={0,FALSE};check(std::isnan(cheeky::fg::ShaderTimings11::duration(clock,ticks,2)),"Reject zero GPU timestamp frequency");
+        clock={1000,FALSE};check(std::isnan(cheeky::fg::ShaderTimings11::duration(clock,{12,10,100,103},2)),"Reject reversed GPU timestamps");
+    }
     check(SUCCEEDED(D3D11CreateDevice(nullptr,hardware?D3D_DRIVER_TYPE_HARDWARE:D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"Native shader D3D11 device");
+    fg_backend11_timing_retirement();
     fg_backend11_copy_state();
     fg_backend11_dispatch_gate();
     fg_backend11_openvr_calibration();
