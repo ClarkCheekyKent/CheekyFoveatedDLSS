@@ -85,8 +85,8 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // both NGX histories every time a release mode was changed live.
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{unsigned(s.foveated),unsigned(s.match_sr_region),s.compact_storage,s.guide_capture_mode,s.resolution_percent,s.peripheral_percent,
-        s.center_method,s.peripheral_method,s.depth_bits,s.motion_bits,std::bit_cast<unsigned>(s.width),
+    for(const auto n:{unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
+        s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
     return hash;
@@ -261,8 +261,6 @@ void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,co
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.center_method=settings.fg.center_method;
-    m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
-    m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
     // calibration_session 0 means OpenVR calibration (OpenComposite); the
     // layer binds it to its single running D3D11 OpenXR session.
     if(!assignment.calibrated||assignment.eye_index>1)return;
@@ -307,11 +305,10 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
     m.motion_scale_x=f(p,"MV.Scale.X",1);m.motion_scale_y=f(p,"MV.Scale.Y",1);m.jitter_x=f(p,"Jitter.Offset.X");m.jitter_y=f(p,"Jitter.Offset.Y");
     m.reset=ui(p,"Reset");m.resolution_percent=settings.fg.resolution_percent;m.peripheral_percent=settings.fg.peripheral_percent;
     m.center_method=settings.fg.center_method;
-    m.peripheral_method=std::min(settings.fg.peripheral_method,2u);m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
+    m.peripheral_method=std::min(settings.fg.peripheral_method,2u);
     m.focus_feather=settings.fg.feather;m.show_foveation_border=settings.fg.show_border;m.configuration=configuration(settings);
     source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;
-    // Quad native frame identities are assigned at the four-view xrEndFrame.
-    source.frame_id=0;observe(&source);
+    observe(&source);
 }catch(...){}
 void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
                     const NgxParameters* p,NgxResult result) noexcept try {
@@ -441,8 +438,6 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.center_method=settings.fg.center_method;
-    m.depth_bits=settings.fg.depth_bits;m.motion_bits=settings.fg.motion_bits;
-    m.guide_capture_mode=settings.fg.guide_capture_mode==1u?1u:0u;
     // Include the primary foveated-SR ON/OFF state, even if the game keeps
     // both NGX-SR feature handles alive while the mod changes rendering paths.
     const auto settings_configuration=configuration(settings);
@@ -569,11 +564,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetUevrModeV2(CheekyFgUev
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(CheekyFgTransportOptions* out) noexcept {
-    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
-    const auto settings=cheeky::foveated_dlss::current_settings().fg;
-    out->color_capture_mode=settings.color_capture_mode==1u?1u:0u;
-    out->upload_mode=settings.upload_mode==1u?1u:0u;
-    out->latency_diagnostics=settings.latency_diagnostics==1u?1u:0u;return true;
+    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
+    out->latency_diagnostics=cheeky::foveated_dlss::current_settings().fg.latency_diagnostics==1u?1u:0u;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(CheekyFgPacingOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
@@ -597,7 +589,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
     const auto& s=settings.fg;
     // Dynamic gaze uses existing full-eye native captures as previous/current
     // color history. No additional full-resolution history copy is allocated.
-    out->compact=s.compact_storage==1u&&s.foveated&&
+    out->compact=s.foveated&&
         settings.center_mode==cheeky::foveated_dlss::FoveationCenterMode::fixed &&
         !settings.eye_calibration_continuous;
     out->peripheral_percent=s.peripheral_percent;
@@ -639,10 +631,6 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectOutputOptionsV1(
     const auto settings=cheeky::foveated_dlss::current_settings().fg;
     out->requested=settings.enabled&&settings.direct_xr_output==1u;return true;
 }
-extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDirectShadingOptionsV1(CheekyFgDirectShading* out) noexcept {
-    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
-    out->requested_mode=cheeky::foveated_dlss::current_settings().fg.direct_peripheral_shading;return true;
-}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFgMemory* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
     using namespace cheeky::foveated_dlss;
@@ -669,11 +657,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     // Capture the persisted UEVR Lua setting alongside this guide pair.
     // Read settings before taking the snapshot mutex (consistent with enabled()).
     const auto settings=current_settings().fg;
-    const auto mode=settings.diagnostic_mode;
     std::lock_guard lock(mutex);
     if(!snapshots().acquire(*out))return false;
-    out->diagnostic_mode=mode;
-    out->enable_frame_id=0; // There is no native frame number to pass as BackbufferFrameID.
     out->fg_queue_priority=settings.queue_priority <= 2u ? settings.queue_priority : 1u;
     out->release_point=settings.release_point<=5u?settings.release_point:0u;
     return true;
@@ -785,9 +770,5 @@ bool fg_direct_output_details(CheekyFgDirectOutputDetails& out) noexcept {
     const auto query=layer?reinterpret_cast<CheekyFgDirectOutputDetailsFn>(GetProcAddress(layer,"CheekyFG_GetDirectOutputDetailsV1")):nullptr;
     return query&&query(&out);
 }
-bool fg_direct_shading_diagnostics(CheekyFgDirectShading& out) noexcept {
-    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
-    const auto query=layer?reinterpret_cast<CheekyFgDirectShadingFn>(GetProcAddress(layer,"CheekyFG_GetDirectShadingDiagnosticsV1")):nullptr;
-    return query&&query(&out);
-}
+
 }

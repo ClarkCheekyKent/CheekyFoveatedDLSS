@@ -77,7 +77,6 @@ struct GpuTimings {
     // identity from evaluation order: one eye alternates into the first slot.
     std::array<TimingAverage,2> eye_center,center_by_position;
     std::array<std::array<TimingAverage,3>,2> ngx_parts,ngx_by_position;
-    unsigned active_eye_mask{3};
     std::array<TimingAverage,2> preparation_by_first;
     std::array<std::array<TimingAverage,2>,2> eye_preparation_by_first,center_dispatch_by_first,eye_center_by_first;
     std::array<std::uint64_t,2> order_samples{},order_detail_samples{};
@@ -93,7 +92,7 @@ struct GpuTimings {
     void reset() noexcept {
         heap.Reset();readback.Reset();frequency=samples=0;
         preparation={};center={};periphery={};total={};publication={};eye_preparation={};
-        eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};active_eye_mask=3;foveated_eyes=0;valid=false;
+        eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};foveated_eyes=0;valid=false;
         preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
         preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};first_eye=0;
         record_preparation=preparation_valid=false;
@@ -167,7 +166,7 @@ struct GpuTimings {
         }
         preparation.add(prep);center.add(ngx);periphery.add(edge);total.add(whole);
         for(unsigned eye=0;eye<2;++eye)
-            if(active_eye_mask&(1u<<eye))for(unsigned part=0;part<3;++part) {
+            for(unsigned part=0;part<3;++part) {
                 ngx_parts[eye][part].add(ngx_sub[eye][part]);
                 ngx_by_position[eye==first_eye?0:1][part].add(ngx_sub[eye][part]);
             }

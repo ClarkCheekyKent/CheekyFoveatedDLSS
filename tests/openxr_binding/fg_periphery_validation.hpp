@@ -59,10 +59,10 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(pipeline.prepare_inputs(device,list.Get(),0,0,current.Get(),guides,region,32,32),"Independent cropped center guides");
     check(pipeline.inputs[0][0].color->GetDesc().Width==32&&pipeline.inputs[0][0].depth->GetDesc().Width==16&&
         pipeline.inputs[0][0].motion->GetDesc().Height==16,"Center color and source-sized cropped guides must have independent grids");
-    check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Typeless depth / FP16 motion normalization");
-    check(pipeline.inputs[0][1].depth->GetDesc().Format==DXGI_FORMAT_R16_FLOAT&&
-        pipeline.inputs[0][1].motion->GetDesc().Format==DXGI_FORMAT_R16G16_FLOAT&&
-        pipeline.inputs[0][1].depth->GetDesc().Width==16,"Periphery precision controls and source-sized guide grid");
+    check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Typeless depth / FP16 motion normalization");
+    check(pipeline.inputs[0][1].depth->GetDesc().Format==DXGI_FORMAT_R32_FLOAT&&
+        pipeline.inputs[0][1].motion->GetDesc().Format==DXGI_FORMAT_R32G32_FLOAT&&
+        pipeline.inputs[0][1].depth->GetDesc().Width==16,"Periphery guides are 32-bit on a source-sized grid");
     check(pipeline.save_depth(device,list.Get(),0),"Periphery depth history");
     auto& normalized=pipeline.inputs[0][0];
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT guide_footprints[2]{};UINT64 guide_bytes[2]{};
@@ -125,7 +125,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         begin();guides.peripheral_method=method;
         // Supply no depth in simple warp and no guides at all in previous mode.
         guides.depth=method==2?depth.Get():nullptr;guides.motion=method?motion.Get():nullptr;
-        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Prepare only inputs used by the periphery mode");
+        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Prepare only inputs used by the periphery mode");
         check(!pipeline.inputs[0][1].color&&bool(pipeline.inputs[0][1].depth)==(method==2)&&
             bool(pipeline.inputs[0][1].motion)==(method!=0),"Custom periphery must omit unused color/depth/motion resources");
         check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera),"Periphery dispatch");
@@ -218,7 +218,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         readback->Unmap(0,nullptr);return pixels;};
     for(unsigned method=0;method<3;++method)for(float feather:{0.f,.04f,.16f}){
         layout.feather=feather;guides.peripheral_method=method;guides.depth=depth.Get();guides.motion=motion.Get();begin();
-        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Compact periphery preparation");
+        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Compact periphery preparation");
         check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera),"Complete context reference");
         auto* compact_center=pipeline.inputs[0][0].color.Get();
         check(pipeline.pack_frame(device,list.Get(),0,compact_center,pipeline.peripheral_output[0].Get(),reference.Get(),D3D12_RESOURCE_STATE_COMMON,layout,false,false),"Exact region copy packing");execute();
@@ -236,11 +236,10 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     }
     std::cout<<"PASS direct compact periphery: all three custom modes, asymmetric crop, three feather widths, exact center/context copies, XR reconstruction matches every reference pixel with NaN-poisoned interior\n";
     auto final_image=make_output(64,64,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    for(unsigned mode:{0u,1u,2u})for(unsigned method=0;method<3;++method){guides.peripheral_method=method;begin();
-        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32,16,16),"Final-image periphery preparation");
+    for(unsigned method=0;method<3;++method){guides.peripheral_method=method;begin();
+        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Final-image periphery preparation");
         auto* small_center=pipeline.inputs[0][0].color.Get();
         cheeky::fg::FocusPipeline::FinalOutput final{small_center,{13,9,32,32,.04f,true},64,64,false,false};
-        final.shading_mode=mode;
         check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera,D3D12_RESOURCE_STATE_COMMON,
             final_image.Get(),D3D12_RESOURCE_STATE_COMMON,nullptr,&final),"Final-image assembly from center scratch");execute();
         const auto expected=reconstruct(final_image.Get(),false);begin();
@@ -259,58 +258,6 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         check(reconstruct(final_image.Get(),false)==expected,"In-place HDR center/feather pixels must match center-scratch assembly without reading unwritten periphery");
     }
     std::cout<<"PASS final XR image assembly: in-place center matches scratch path for all custom periphery modes, asymmetric placement and feather; unwritten periphery poisoned with HDR NaNs\n";
-    // A spatial pattern and CPU expansion reference catch block ownership,
-    // interpolation halos and missing pixels that flat-color tests conceal.
-    begin();const auto native_desc=previous->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT upload_fp{};UINT64 upload_bytes{};
-    device->GetCopyableFootprints(&native_desc,0,1,0,&upload_fp,nullptr,nullptr,&upload_bytes);
-    D3D12_HEAP_PROPERTIES upload_heap{};upload_heap.Type=D3D12_HEAP_TYPE_UPLOAD;
-    auto upload_desc=rd;upload_desc.Width=upload_bytes;ComPtr<ID3D12Resource> pattern;
-    check(SUCCEEDED(device->CreateCommittedResource(&upload_heap,D3D12_HEAP_FLAG_NONE,&upload_desc,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&pattern))),"Pattern upload");
-    void* upload_data{};check(SUCCEEDED(pattern->Map(0,nullptr,&upload_data)),"Pattern map");
-    for(unsigned y=0;y<64;++y)for(unsigned x=0;x<64;++x){auto* p=static_cast<unsigned char*>(upload_data)+upload_fp.Offset+y*upload_fp.Footprint.RowPitch+x*4;
-        p[0]=static_cast<unsigned char>((x*13+y*7)%256);p[1]=static_cast<unsigned char>((x*3+y*19)%256);p[2]=static_cast<unsigned char>((x*23+y*5)%256);p[3]=255;}
-    pattern->Unmap(0,nullptr);
-    for(auto* image:{previous.Get(),current.Get()}){cheeky::fg::color_transition(list.Get(),image,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
-        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=pattern.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=upload_fp;
-        to.pResource=image;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
-        cheeky::fg::color_transition(list.Get(),image,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);}execute();
-    auto read_pixels=[&](ID3D12Resource* image){begin();const auto d=image->GetDesc();D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};UINT64 size{};
-        device->GetCopyableFootprints(&d,0,1,0,&f,nullptr,nullptr,&size);auto buffer=rd;buffer.Width=size;ComPtr<ID3D12Resource> rb;
-        check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&rb))),"Pattern readback");
-        cheeky::fg::color_transition(list.Get(),image,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=image;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        to.pResource=rb.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=f;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
-        cheeky::fg::color_transition(list.Get(),image,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);execute();
-        void* data{};check(SUCCEEDED(rb->Map(0,nullptr,&data)),"Pattern readback map");std::vector<float> pixels(size_t(d.Width)*d.Height*4);
-        for(unsigned y=0;y<d.Height;++y){const auto* row=reinterpret_cast<const unsigned short*>(static_cast<const unsigned char*>(data)+f.Offset+y*f.Footprint.RowPitch);
-            for(unsigned x=0;x<d.Width*4;++x){const auto v=row[x];const unsigned exponent=(v>>10)&31,mantissa=v&1023;
-                pixels[(size_t(y)*d.Width*4)+x]=exponent==31?NAN:std::ldexp(float(exponent?1024+mantissa:mantissa),exponent?int(exponent)-25:-24)*(v&0x8000?-1.f:1.f);}}
-        rb->Unmap(0,nullptr);return pixels;};
-    struct GridCase{unsigned w,h,gw,gh;};
-    for(const auto shape:{GridCase{64,64,32,32},GridCase{128,128,32,32},GridCase{67,59,32,32},GridCase{73,61,41,35}})
-    for(unsigned method=0;method<3;++method){guides.peripheral_method=method;begin();
-        check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,shape.gw,shape.gh,16,16),"Pattern coarse inputs");
-        check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera),"Pattern low-resolution reference");execute();
-        const auto coarse=read_pixels(pipeline.peripheral_output[0].Get());
-        auto image=make_output(shape.w,shape.h,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-        for(unsigned mode:{1u,2u}){begin();auto handle=rtvs->GetCPUDescriptorHandleForHeapStart();handle.ptr+=stride*2;
-            device->CreateRenderTargetView(image.Get(),nullptr,handle);cheeky::fg::color_transition(list.Get(),image.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
-            const float poison[]{NAN,NAN,NAN,NAN};list->ClearRenderTargetView(handle,poison,0,nullptr);
-            cheeky::fg::color_transition(list.Get(),image.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COMMON);
-            cheeky::fg::FocusPipeline::FinalOutput final{center.Get(),{13,9,32,32,.04f,true},shape.w,shape.h,false,false,mode};
-            check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera,D3D12_RESOURCE_STATE_COMMON,image.Get(),D3D12_RESOURCE_STATE_COMMON,nullptr,&final),"Pattern direct expansion");execute();
-            const auto actual=read_pixels(image.Get());
-            auto sample=[&](int x,int y,unsigned c){x=std::clamp(x,0,int(shape.gw)-1);y=std::clamp(y,0,int(shape.gh)-1);return coarse[(size_t(y)*shape.gw+x)*4+c];};
-            for(unsigned y=0;y<shape.h;++y)for(unsigned x=0;x<shape.w;++x){const float u=(x+.5f)/shape.w,v=(y+.5f)/shape.h;
-                const float sx=u*shape.gw-.5f,sy=v*shape.gh-.5f;const int bx=int(std::floor(sx)),by=int(std::floor(sy));const float fx=sx-bx,fy=sy-by;
-                const float edge=std::min({u-13.f/shape.w,v-9.f/shape.h,45.f/shape.w-u,41.f/shape.h-v}),fade=std::clamp(edge/.04f,0.f,1.f);
-                for(unsigned c=0;c<4;++c){const float periphery=mode==1?sample(int(u*shape.gw),int(v*shape.gh),c):
-                    (1-fy)*((1-fx)*sample(bx,by,c)+fx*sample(bx+1,by,c))+fy*((1-fx)*sample(bx,by+1,c)+fx*sample(bx+1,by+1,c));
-                    const float expected=periphery*(1-fade)+(c==1||c==3?1.f:0.f)*fade,value=actual[(size_t(y)*shape.w+x)*4+c];
-                    check(std::isfinite(value)&&std::abs(value-expected)<.002f,"Coarse block/bilinear output must match independent low-resolution reference at every pixel, including odd grid/tile edges");}}
-        }
-    }
-    std::cout<<"PASS coarse shading: patterned source, nonzero motion, all custom modes, 2x/4x/odd ratios, block and bilinear CPU references, feather and complete NaN-poisoned output coverage\n";
     check(SUCCEEDED(device->GetDeviceRemovedReason()),"Periphery pipeline device removal");
     std::cout << "PASS actual periphery pixels: previous/simple red, bidirectional purple, independent green center; source-sized guide crop and nonzero UV motion; unused inputs omitted\n";
     std::cout << "PASS direct composition: original pixels retained through a newer output, distinct UAV/copy pools, retired GENERIC_READ reuse and alias rejection\n";

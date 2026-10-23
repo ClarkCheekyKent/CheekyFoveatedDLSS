@@ -9,7 +9,7 @@ namespace cheeky::fg {
 struct BufferedAuxiliary {XrSwapchain source{};Image image;};
 struct BufferedNative {
     std::uint64_t id{},ready{},epoch{};
-    unsigned capture_mode{},upload_mode{},direct_output_mode{},direct_shading_mode{1};bool latency_diagnostics{};
+    unsigned direct_output_mode{};bool latency_diagnostics{};
     TimingClock::time_point captured_at{},handed_off_at{};
     std::array<Image,2> color;
     std::array<ColorReady,2> color_ready;
@@ -30,7 +30,6 @@ struct BufferedNative {
 };
 struct BufferedPair {
     std::uint64_t native_id{},current_id{},ready{};
-    unsigned upload_mode{};
     TimingClock::time_point native_captured{},current_captured{},completed_at{},handed_off_at{},worker_started_at{},submitted_at{};
     std::array<Image,2> native,generated,current;
     std::array<ColorReady,2> native_color_ready,current_color_ready;

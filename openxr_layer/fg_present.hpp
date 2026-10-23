@@ -113,7 +113,6 @@ struct Presenter {
     virtual CheekyFgExperimentDiagnostics experiments() const noexcept {return {};}
     virtual CheekyFgDirectOutput direct_output() const noexcept {return {};}
     virtual CheekyFgDirectOutputDetails direct_output_details() const noexcept {return {};}
-    virtual CheekyFgDirectShading direct_shading() const noexcept {return {};}
     virtual CheekyFgMemory memory() const noexcept {return {};}
     virtual void note_app_image_wait(double) noexcept {}
     virtual void note_app_call(unsigned,double) noexcept {}

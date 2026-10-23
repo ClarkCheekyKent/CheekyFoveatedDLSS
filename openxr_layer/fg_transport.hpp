@@ -274,16 +274,6 @@ struct Transport {
         color_transition(c.list.Get(),source->texture.Get(),read_state,source->state);
         c.images.push_back(source);c.borrowed.emplace_back(target);return true;
     }
-    bool upload(const Image& source,ID3D12Resource* target,std::uint64_t frame=0,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false,D3D12_RESOURCE_STATES target_state=D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        if(!source)return false;
-        auto* c=begin(frame);
-        // Only the background presenter uses upload(). Allocator pressure here
-        // may wait for retirement without turning a transient busy ring into a
-        // permanent presentation failure. Producer begin() remains nonblocking.
-        if(!c){drain();c=begin(frame);}if(!c)return false;
-        if(!record_upload(*c,source,target,target_format,linear_target,target_state)){c->list->Close();return false;}
-        std::uint64_t ticket{};return execute(*c,ticket);
-    }
     void freeze(Context& c,const Image& image) {
         color_transition(c.list.Get(),image->texture.Get(),image->state,D3D12_RESOURCE_STATE_GENERIC_READ);
         image->state=D3D12_RESOURCE_STATE_GENERIC_READ;c.images.push_back(image);

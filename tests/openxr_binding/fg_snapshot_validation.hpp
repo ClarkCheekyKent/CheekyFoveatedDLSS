@@ -93,7 +93,9 @@ void fg_snapshot_validation(ID3D12Device* device) {
     }
     list->Close();queue->ExecuteCommandLists(1,lists);wait();
     void* mapped{};D3D12_RANGE range{0,SIZE_T(bytes*4)};check(SUCCEEDED(rb->Map(0,&range,&mapped)),"Snapshot readback map");
-    for(unsigned i=0;i<4;++i)check(std::abs(*reinterpret_cast<float*>(static_cast<char*>(mapped)+bytes*i)-(i<2?.25f:.75f))<.0001f,
+    // Guides are prepared at capture: depth is copied, motion is normalized to
+    // UV displacement (scale 1 over a 16-pixel motion grid).
+    for(unsigned i=0;i<4;++i)check(std::abs(*reinterpret_cast<float*>(static_cast<char*>(mapped)+bytes*i)-(i<2?.25f:.75f)/(i%2?16.f:1.f))<.0001f,
         "Depth/motion snapshot must retain the correct eye and native frame despite source reuse");
     D3D12_RANGE empty{};rb->Unmap(0,&empty);
     };read_retained();
@@ -206,10 +208,11 @@ void fg_snapshot_validation(ID3D12Device* device) {
     check(aliased.token()==2,"Native submission must commit guides recorded through an opaque alias");
     CheekyFgPair alias_pair;alias_pair.capture_token=2;
     check(aliased.acquire(alias_pair),"Opaque alias must preserve the exact native frame's guide lease");
-    check(alias_pair.eyes[0].depth->GetDesc().Width==7&&alias_pair.eyes[0].depth->GetDesc().Height==9&&
-        alias_pair.eyes[0].motion->GetDesc().Width==8&&alias_pair.eyes[0].motion->GetDesc().Height==6&&
-        alias_pair.eyes[0].depth_base_x==0&&alias_pair.eyes[0].motion_base_y==0,
-        "Snapshots retain only each active guide rectangle and rebase offsets without changing the logical frame");release(alias_pair);
+    // Prepared guides cover only the active depth/motion rectangles, on the
+    // shared grid (the smaller of the two: 7x6).
+    check(alias_pair.eyes[0].prepared_guides&&alias_pair.eyes[0].depth->GetDesc().Width==7&&alias_pair.eyes[0].depth->GetDesc().Height==6&&
+        alias_pair.eyes[0].motion->GetDesc().Width==7&&alias_pair.eyes[0].motion->GetDesc().Height==6,
+        "Snapshots retain only the active guide rectangles");release(alias_pair);
     check(alias.references==0,"Alias guide/color command references retire after native enqueue");
     aliased.retire();const auto guide_gpu=aliased.capture_gpu();
     check(guide_gpu.samples==1&&guide_gpu.mean>0,"Both completed eye snapshots must contribute one measured stereo guide-copy sample");

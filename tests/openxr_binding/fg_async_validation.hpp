@@ -18,12 +18,10 @@ struct Runtime {
     static inline CheekyFgPair guides;
     static inline CheekyFgTransportOptions options;
     static inline std::atomic<unsigned> direct_mode{};
-    static inline std::atomic<unsigned> shading_mode{1};
     static inline std::atomic<bool> reject_writable{};
     static inline std::atomic<bool> typeless_writable{},omit_writable_flag{};
     static inline std::unordered_map<XrSwapchain,unsigned> direct_states;
     static bool __cdecl direct_options(CheekyFgDirectOutput* out){out->requested=direct_mode.load();return true;}
-    static bool __cdecl shading_options(CheekyFgDirectShading* out){out->requested_mode=shading_mode.load();return true;}
     static inline std::uint64_t predicted_qpc{};
     static inline std::atomic<bool> block_generated_end{},generated_end_entered{},allow_generated_end{};
     static bool __cdecl transport_options(CheekyFgTransportOptions* out){*out=options;return true;}
@@ -313,7 +311,7 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
     commands->ClearRenderTargetView(rtv->GetCPUDescriptorHandleForHeapStart(),blue,1,&right_rect);execute();
     const auto scene=h<XrSwapchain>(500);
     cheeky::fg::BufferedPresenter::CapturePlan plan;plan.desc=source->GetDesc();
-    plan.slices={{{{0,0},{8,16}},0},{{{8,0},{8,16}},0}};p.capture_plans[scene]=plan;p.color_capture_mode=1;
+    plan.slices={{{{0,0},{8,16}},0},{{{8,0},{8,16}},0}};p.capture_plans[scene]=plan;
     const auto full_before=p.producer.full_copies.load();
     check(p.capture(scene,0,source.Get(),16,16,1,DXGI_FORMAT_B8G8R8A8_UNORM),"Direct side-by-side capture");
     p.producer.drain();check(p.capture_ready.at(scene)&&p.capture_ready.at(scene)->ready_qpc>0,
@@ -620,7 +618,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     auto motion=texture(2,DXGI_FORMAT_R16G16_FLOAT,DXGI_FORMAT_R16G16_FLOAT,zero);execute();
     cheeky::fg::BufferedPresenter p;check(p.setup(h<XrSession>(2),Runtime::functions(),device,queue.Get()),"Buffered presenter setup");
     Runtime::options={};Runtime::direct_mode=0;Runtime::reject_writable=false;Runtime::typeless_writable=Runtime::omit_writable_flag=false;
-    p.transport_options_query=Runtime::transport_options;p.direct_output_query=Runtime::direct_options;p.direct_shading_query=Runtime::shading_options;Runtime::shading_mode=1;
+    p.transport_options_query=Runtime::transport_options;p.direct_output_query=Runtime::direct_options;
     cheeky::foveated_dlss::FgSnapshots snapshots;
     if(models) {
         p.trace=Runtime::trace;
@@ -628,7 +626,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         Runtime::guides={};Runtime::guides.producer_queue=queue.Get();
         for(auto& eye:Runtime::guides.eyes){eye.depth=depth.Get();eye.motion=motion.Get();eye.width=eye.height=width;
             eye.depth_width=eye.depth_height=eye.motion_width=eye.motion_height=width/2;
-            eye.focus_width=.55f;eye.focus_height=.45f;eye.peripheral_method=method;eye.configuration=123;eye.guide_capture_mode=prepared_capture?1u:0u;}
+            eye.focus_width=.55f;eye.focus_height=.45f;eye.peripheral_method=method;eye.configuration=123;}
         p.guide_acquire=Runtime::acquire_guides;p.guide_release=Runtime::release_guides;p.guide_stamp=Runtime::stamp;
         check(snapshots.initialize(queue.Get()),"Real FG guide snapshot queue");Runtime::snapshots=&snapshots;
     }
@@ -696,22 +694,21 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         check(Runtime::ends==submitted,"No new content must mean no further XR frame submissions, including empty frames");
         std::cout<<"PASS fresh-only native fallback: fresh images advance; stalled content produces zero XR submissions\n";
     }
-    for(unsigned capture_mode:{0u,1u})for(unsigned upload_mode:{0u,1u}){
-        Runtime::options.color_capture_mode=capture_mode;Runtime::options.upload_mode=upload_mode;
+    {
         const auto direct_before=p.direct_eye_copies.load();
         for(unsigned frame=0;frame<(models?36u:8u);++frame){
-            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Live transport dropdown frame");
+            check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Direct eye capture frame");
             end.displayTime=state.predictedDisplayTime;Runtime::capture_token+=2;snapshot_inputs();
             check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
                 p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
                 XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Live optimized capture/upload handoff");
         }
-        {std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return p.inflight_id==0&&p.pending.empty();}),"Transport experiment retirement");
-            const auto exp=p.experiments();check(exp.color_capture_mode==capture_mode&&exp.upload_mode==upload_mode,"Dropdown modes reach actual presenter");
+        {std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return p.inflight_id==0&&p.pending.empty();}),"Direct eye capture retirement");
+            const auto exp=p.experiments();
             if(models)check(exp.latency_enabled&&exp.latency_valid&&exp.latency_samples>0&&exp.gpu_ready_samples>0&&exp.predicted_samples>0,
-                "Physical FG records valid GPU-ready ages and calibrated timelines in every transport mode");}
-        check(!capture_mode||p.direct_eye_copies>direct_before,"Live projection learns direct eye capture layout");
-        std::cout<<"PASS live transport experiment: capture="<<capture_mode<<" upload="<<upload_mode<<"\n";
+                "Physical FG records valid GPU-ready ages and calibrated timelines");}
+        check(p.direct_eye_copies>direct_before,"Live projection learns direct eye capture layout");
+        std::cout<<"PASS direct eye capture with batched uploads\n";
     }
     if(models&&method<=2){
         Runtime::guides.release_point=3;
@@ -726,11 +723,6 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             const auto direct=p.direct_output();std::cout<<"Direct XR: frames="<<direct.frames<<" attempts="<<direct.attempts<<" fallback="<<direct.fallbacks<<" unsupported="<<direct.unsupported<<" not_ready="<<direct.not_ready<<" NGX direct/scratch="<<direct.ngx_direct_eyes<<'/'<<direct.ngx_scratch_eyes<<'\n';
             check(direct.requested&&direct.frames>0&&direct.ngx_direct_eyes+direct.ngx_scratch_eyes>=direct.frames*2,"Direct XR toggle must change the actual generated destination");}
         for(unsigned point:{0u,1u,2u,3u}){Runtime::guides.release_point=point;frames(8);}
-        for(unsigned mode:{0u,2u,1u}){Runtime::shading_mode=mode;frames(10);
-            std::unique_lock lock(p.mx);check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return !p.inflight_id&&p.pending.empty();}),"Shading toggle retirement");
-            const auto shading=p.direct_shading();
-            check(shading.valid&&shading.requested_mode==mode&&shading.active_mode==mode&&shading.output_width==width&&
-                shading.grid_width==(mode?p.worker.peripheral_width:width),"Live shading toggle must change actual GPU grid and mode");}
         Runtime::direct_mode=0;frames(6);
         std::uint64_t direct_before{};{std::lock_guard lock(p.mx);direct_before=p.direct_stats.frames;}
         Runtime::typeless_writable=true;Runtime::direct_mode=1;frames(24);

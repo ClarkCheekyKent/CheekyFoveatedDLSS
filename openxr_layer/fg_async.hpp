@@ -40,7 +40,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     static const char* queue_mode_name(unsigned mode) noexcept {
         return mode==2u?"shared-game":mode==0u?"separate-NORMAL":"separate-HIGH";
     }
-    std::atomic<unsigned> color_capture_mode{},upload_mode{},latency_diagnostics{1};
+    std::atomic<unsigned> latency_diagnostics{1};
     // Native credit clock (FG pacing clock setting). 0 keeps the independent
     // display clock. 1 slows it toward the rate native frames actually reach
     // the runtime, so a late presenter is not fed frames it will drop. 2 does
@@ -277,7 +277,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         auto out=direct_stats;out.supported=1;out.requested=direct_output_mode;return out;
     }
     CheekyFgDirectOutputDetails direct_output_details() const noexcept override {auto out=direct_details;out.supported=1;return out;}
-    CheekyFgDirectShading direct_shading() const noexcept override {auto out=shading_stats;out.supported=1;out.requested_mode=direct_shading_mode;return out;}
 
     CheekyFgPresentation presentation() const noexcept override {
         CheekyFgPresentation out;out.supported=1;
@@ -480,10 +479,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         const auto output_query=direct_output_query?direct_output_query:runtime?
             reinterpret_cast<CheekyFgDirectOutputFn>(GetProcAddress(runtime,"CheekyFG_GetDirectOutputOptionsV1")):nullptr;
         CheekyFgDirectOutput direct_options;
-        const auto shading_query=direct_shading_query?direct_shading_query:runtime?
-            reinterpret_cast<CheekyFgDirectShadingFn>(GetProcAddress(runtime,"CheekyFG_GetDirectShadingOptionsV1")):nullptr;
-        CheekyFgDirectShading shading_options;
-        if(shading_query&&shading_query(&shading_options))direct_shading_mode=std::min(shading_options.requested_mode,2u);
         if(output_query&&output_query(&direct_options)){
             const unsigned mode=backend->supports_direct_output() && direct_options.requested==1u;
             if(direct_output_mode.exchange(mode)!=mode)direct_blocked_target=0;
@@ -493,18 +488,14 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 trace(direct_options.requested==1u?"FG native D3D11 output=direct OpenXR image":"FG native D3D11 output=private image + copy");
         }
         if(query&&query(&options)){
-            const auto old_color=color_capture_mode.exchange(options.color_capture_mode==1u?1u:0u);
-            const auto old_upload=upload_mode.exchange(options.upload_mode==1u?1u:0u);
             const auto old_diagnostics=latency_diagnostics.exchange(options.latency_diagnostics==1u?1u:0u);
             if(old_diagnostics!=latency_diagnostics.load()){
                 std::lock_guard lock(mx);
                 pending_native_submissions.clear();native_ready_to_submit={};native_hold={};submit_ahead={};native_capture_to_submit={};
                 native_latency_samples=native_latency_missing=native_latency_held=native_latency_early=0;
             }
-            if(trace&&(old_color!=color_capture_mode||old_upload!=upload_mode||old_diagnostics!=latency_diagnostics)){
-                char message[192]{};sprintf_s(message,"FG transport A/B: color=%s uploads=%s latency=%s (next native frame)",
-                    color_capture_mode?"direct-eyes":"full-snapshot",upload_mode?"batched":"per-image",latency_diagnostics?"1-in-17":"OFF");trace(message);
-            }
+            if(trace&&old_diagnostics!=latency_diagnostics)
+                trace(latency_diagnostics?"FG latency diagnostics=1-in-17 (next native frame)":"FG latency diagnostics=OFF (next native frame)");
         }
         const auto native11_query=runtime&&native11?reinterpret_cast<CheekyFgNative11OptionsFn>(GetProcAddress(runtime,"CheekyFG_GetNative11OptionsV1")):nullptr;
         CheekyFgNative11Options native11_options;
@@ -656,7 +647,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // snapshots are immutable once published; use the last proven
                 // FG region (one native frame behind for dynamic gaze).
                 for(unsigned eye=0;eye<2;++eye)job->color[eye]->fg_border=last_fg_borders[eye];
-                Pair native;native.upload_mode=job->upload_mode;native.native_id=native.current_id=id;native.ready=job->ready;
+                Pair native;native.native_id=native.current_id=id;native.ready=job->ready;
                 native.native_color_ready=native.current_color_ready=job->color_ready;
                 native.native_final_ready=native.current_final_ready=job->final_color_ready;
                 native.native_captured=native.current_captured=job->captured_at;
@@ -688,7 +679,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void generation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky FG completion");
         std::shared_ptr<Native> previous;bool reset_history=true;
-        unsigned measured_capture=UINT32_MAX,measured_upload=UINT32_MAX,measured_diagnostics=UINT32_MAX;std::uint64_t logged_samples{};
+        unsigned measured_diagnostics=UINT32_MAX;std::uint64_t logged_samples{};
         try {for(;;) {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
@@ -703,11 +694,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             if(measured_diagnostics!=unsigned(job->latency_diagnostics)){
                 measured_diagnostics=unsigned(job->latency_diagnostics);logged_samples=0;
                 std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
-            }
-            if(measured_capture!=job->capture_mode||measured_upload!=job->upload_mode){
-                measured_capture=job->capture_mode;measured_upload=job->upload_mode;logged_samples=0;
-                backend->reset_statistics(true);
-                std::lock_guard lock(mx);cadence_window={};gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
             }
             if(job->guides_valid) {
                 const auto point=job->policy.release_point;
@@ -726,7 +712,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 }
                 release_policy_known=true;
             }
-            Pair pair;pair.upload_mode=job->upload_mode;pair.native_id=pair.current_id=job->id;pair.native=pair.current=job->color;
+            Pair pair;pair.native_id=pair.current_id=job->id;pair.native=pair.current=job->color;
             std::shared_ptr<DirectRequest> direct_job;
             struct CompleteRequest {BufferedPresenter& owner;std::shared_ptr<DirectRequest>& request;
                 ~CompleteRequest(){if(request){std::lock_guard lock(owner.mx);request->complete=true;owner.changed.notify_all();}}} complete_request{*this,direct_job};
@@ -759,13 +745,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
                 const auto status=backend->generation_status();
                 CheekyFgPerformance gpu_performance;backend->snapshot(gpu_performance,extra_gpu,experiment_state);
-                experiment_state.color_capture_mode=job->capture_mode;experiment_state.upload_mode=job->upload_mode;
                 if(trace&&experiment_state.latency_valid&&experiment_state.latency_samples!=logged_samples){
                     const auto copies=experiments();
                     logged_samples=experiment_state.latency_samples;
                     const auto& d=experiment_state;char message[768]{};
-                    sprintf_s(message,"FG calibrated latency sample=%llu rejected=%llu color=%u uploads=%u release=%u queue=%s mean_ms: queue_entry=%.3f capture_dependency=%.3f ready_to_fg=%.3f gpu_work=%.3f gpu_to_observed=%.3f enqueue_total=%.3f submit_total=%.3f; copies(full/direct/crop)=%llu/%llu/%llu uploads(copies/batches)=%llu/%llu",
-                        d.latency_samples,d.latency_rejected,job->capture_mode,job->upload_mode,active_release_point,queue_mode_name(reported_queue_mode),
+                    sprintf_s(message,"FG calibrated latency sample=%llu rejected=%llu release=%u queue=%s mean_ms: queue_entry=%.3f capture_dependency=%.3f ready_to_fg=%.3f gpu_work=%.3f gpu_to_observed=%.3f enqueue_total=%.3f submit_total=%.3f; copies(full/direct/crop)=%llu/%llu/%llu uploads(copies/batches)=%llu/%llu",
+                        d.latency_samples,d.latency_rejected,active_release_point,queue_mode_name(reported_queue_mode),
                         d.queue_entry.mean,d.capture_dependency.mean,d.ready_to_fg.mean,d.gpu_work.mean,d.gpu_to_observed.mean,d.enqueue_to_observed.mean,d.submit_to_observed.mean,
                         copies.full_color_copies,copies.direct_eye_copies,copies.eye_crop_copies,copies.upload_copies,copies.upload_batches);trace(message);
                 }

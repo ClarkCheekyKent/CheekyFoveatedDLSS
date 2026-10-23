@@ -25,7 +25,7 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
 // real NVIDIA inference, without starting a game or an OpenXR session.
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
     unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
-    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false,bool final_xr=false,bool typeless_output=false,unsigned shading_mode=1,
+    bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false,bool final_xr=false,bool typeless_output=false,
     bool crop_motion=false,unsigned crop_axis=0,bool crop_scene_motion=false) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
@@ -71,7 +71,6 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         eye.peripheral_method=method;eye.resolution_percent=scale;eye.peripheral_percent=peripheral_scale;
         eye.depth_inverted=1;
         if(motion_test){eye.motion_scale_x=float(width);eye.motion_scale_y=float(height);}
-        if(game_guides&&!full_guides)eye.depth_bits=eye.motion_bits=16;
     }
     XrCompositionLayerProjectionView view{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
     view.pose.orientation.w=1;view.fov={-.7f,.7f,.7f,-.7f};
@@ -102,7 +101,6 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
             compact_outputs[eye]=compact_transport.image(d,final_xr?D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET:D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
             check(bool(compact_outputs[eye]),"Compact physical NGX destination");
             compact_copies[eye]={compact_outputs[eye]->texture.Get(),compact_outputs[eye]->state,final_xr?cheeky::fg::CompactLayout{}:output_layout,final_xr};
-            compact_copies[eye].shading_mode=shading_mode;
         }
         std::uint64_t ticket{};check(compact_transport.execute(*context,ticket),"Compact physical capture submission");compact_transport.drain();
         if(!crop_motion)worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
@@ -115,7 +113,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     if(prepared_capture){
         check(!motion_test&&prepared_snapshots.initialize(queue.Get()),"Prepared physical capture queue");
         allocator->Reset();list->Reset(allocator.Get(),nullptr);
-        for(auto g:guides.eyes){g.guide_capture_mode=1;g.render_frame=77;
+        for(auto g:guides.eyes){g.render_frame=77;
             for(auto* resource:{g.depth,g.motion})cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             check(prepared_snapshots.record(list.Get(),g),"Prepared physical capture record");
             for(auto* resource:{g.depth,g.motion})cheeky::fg::color_transition(list.Get(),resource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
@@ -197,7 +195,6 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     std::cout << "Actual inputs: center=" << worker.center_width << 'x' << worker.center_height
         << " periphery=" << worker.peripheral_width << 'x' << worker.peripheral_height
         << " method=" << method << " source-depth=" << worker.source_depth_format << " source-motion=" << worker.source_motion_format << '\n';
-    if(final_xr)std::cout<<"Direct periphery shading="<<(worker.focus.coarse_output[0]?(shading_mode==1?"coarse blocks":"coarse filtered"):"full rate")<<'\n';
     std::cout << "Actual center guides=" << center_input.depth->GetDesc().Width << 'x' << center_input.depth->GetDesc().Height;
     if(worker.focus.inputs[0][1].motion)std::cout << " periphery guides=" << worker.focus.inputs[0][1].motion->GetDesc().Width << 'x' << worker.focus.inputs[0][1].motion->GetDesc().Height;
     std::cout << '\n';

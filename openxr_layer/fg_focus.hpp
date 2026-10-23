@@ -17,11 +17,10 @@ struct FocusInput {
     bool borrowed_guides{};
 };
 struct FocusPipeline {
-    struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};unsigned shading_mode{1};};
+    struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};};
     DXGI_FORMAT color_format{DXGI_FORMAT_R16G16B16A16_FLOAT};
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12PipelineState> prepare,peripheral,center_shader,peripheral_coarse,peripheral_coarse2,peripheral_coarse4,peripheral_blocks,peripheral_blocks2,peripheral_blocks4,compose,pack,recenter;
-    std::array<bool,2> coarse_output{};
+    ComPtr<ID3D12PipelineState> prepare,peripheral,center_shader,compose,pack,recenter;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     unsigned stride{};
     FocusInput inputs[2][2]; // eye, center/full or periphery
@@ -33,7 +32,7 @@ struct FocusPipeline {
     bool initialize(ID3D12Device*);
     bool prepare_inputs(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,unsigned pass,
         ID3D12Resource* color,const CheekyFgEye&,const FocusRect&,unsigned width,unsigned height,
-        unsigned depth_bits=32,unsigned motion_bits=32,D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
         GpuTimings* timings=nullptr,float crop_motion_dx=0.f,float crop_motion_dy=0.f);
     // Re-express a midpoint-crop NGX result in the current crop's coordinates.
     // Newly uncovered pixels use the prepared current native crop.

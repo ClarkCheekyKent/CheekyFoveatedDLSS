@@ -1143,7 +1143,7 @@ int main(int argc,char** argv) {
                 if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,argc>3&&std::string(argv[3])=="foveated",1,100,50,false,512,512,true);
                 if(ready&&std::string(argv[1])=="--fg-crop-motion")fg_hardware_probe(worker,device.Get(),false,true,1,
                     argc>3?unsigned(std::stoul(argv[3])):100u,50,false,512,512,true,false,
-                    argc>5&&std::string(argv[5])=="atlas",false,false,argc>5&&std::string(argv[5])=="xr",false,1,
+                    argc>5&&std::string(argv[5])=="atlas",false,false,argc>5&&std::string(argv[5])=="xr",false,
                     true,argc>4?unsigned(std::stoul(argv[4])):0u,argc>6&&std::string(argv[6])=="scene");
                 if(ready&&std::string(argv[1])=="--fg-generate")fg_hardware_probe(worker,device.Get(),argc>3&&std::string(argv[3])=="bgra",argc>4&&std::string(argv[4])=="foveated",
                     argc>5?unsigned(std::stoul(argv[5])):2u,argc>6?unsigned(std::stoul(argv[6])):100u,
@@ -1151,7 +1151,7 @@ int main(int argc,char** argv) {
                     argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u,
                     false,argc>8&&std::string(argv[8])=="full-guides",argc>12&&std::string(argv[12])=="compact",argc>13&&std::string(argv[13])=="prepared",
                     argc>14&&std::string(argv[14])=="periphery-baseline",argc>14&&(std::string(argv[14])=="final-xr"||std::string(argv[14])=="final-xr-typeless"),
-                    argc>14&&std::string(argv[14])=="final-xr-typeless",argc>15&&std::string(argv[15])=="full-rate"?0u:argc>15&&std::string(argv[15])=="filtered"?2u:1u);
+                    argc>14&&std::string(argv[14])=="final-xr-typeless");
                 return ready?0:2;
             }
             throw std::runtime_error("No NVIDIA adapter found");

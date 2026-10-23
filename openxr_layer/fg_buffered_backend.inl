@@ -25,8 +25,7 @@ inline CheekyFgOverhead BufferedPresenter::overhead() const noexcept {
 
 inline CheekyFgExperimentDiagnostics BufferedPresenter::experiments() const noexcept {
     auto out=experiment_state;out.supported=1;
-    if(out.color_capture_mode!=color_capture_mode||out.upload_mode!=upload_mode||out.latency_enabled!=latency_diagnostics)out.latency_valid=0;
-    out.color_capture_mode=color_capture_mode.load();out.upload_mode=upload_mode.load();
+    if(out.latency_enabled!=latency_diagnostics)out.latency_valid=0;
     out.latency_enabled=latency_diagnostics.load();out.full_color_copies=producer.full_copies.load();
     out.direct_eye_copies=direct_eye_copies.load();out.eye_crop_copies=eye_crop_copies.load();out.capture_fallbacks=capture_fallbacks.load();
     out.upload_copies=uploads.upload_copies.load();out.upload_batches=uploads.submissions.load();

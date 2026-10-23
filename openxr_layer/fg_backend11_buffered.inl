@@ -123,7 +123,7 @@ struct BufferedBackend11 final : FrameBackend {
     CaptureOutcome capture(const std::shared_ptr<BufferedNative>& frame,
         const XrCompositionLayerProjection* projection,bool inference_slot,
         const CheekyFgPair*,CheekyFgCompleteHooklessFrameFn) override {
-        frame->capture_mode=frame->upload_mode=frame->direct_output_mode=frame->direct_shading_mode=0;
+        frame->direct_output_mode=0;
         frame->latency_diagnostics=false;frame->ready=0;
         return owner.prepare_native11(*frame,projection,inference_slot)?CaptureOutcome::captured:CaptureOutcome::unavailable;
     }
@@ -148,7 +148,7 @@ struct BufferedBackend11 final : FrameBackend {
             if(!history_was_reset){
                 pair.submitted_at=TimingClock::now();
                 success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,pair.generated,
-                    owner.direct11_requested.load(),owner.direct_shading_mode.load());
+                    owner.direct11_requested.load());
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
                     strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}

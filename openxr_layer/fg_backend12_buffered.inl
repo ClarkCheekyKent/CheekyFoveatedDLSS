@@ -193,7 +193,7 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
     const auto ready_stamp=captured_cpu?producer.mark_color_ready(*c,captured_cpu):ColorReady{};
     const auto desc=original->GetDesc();captured_descs[sc]=desc;
     const auto plan=capture_plans.find(sc);
-    const bool direct=!quad_input&&color_capture_mode==1u&&plan!=capture_plans.end()&&!plan->second.full_required&&
+    const bool direct=!quad_input&&plan!=capture_plans.end()&&!plan->second.full_required&&
         !plan->second.slices.empty()&&plan->second.desc.Width==desc.Width&&plan->second.desc.Height==desc.Height&&
         plan->second.desc.DepthOrArraySize==desc.DepthOrArraySize&&plan->second.desc.Format==desc.Format;
     DirectCapture eyes;Image copy;
@@ -209,7 +209,7 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
         }
     }else {
         copy=producer.copy(*c,original,xr_image_state(),format);
-        if(color_capture_mode==1u&&(plan==capture_plans.end()||!plan->second.full_required))++capture_fallbacks;
+        if(plan==capture_plans.end()||!plan->second.full_required)++capture_fallbacks;
         if(!copy){capture_overflow=true;c->list->Close();return false;}
     }
     std::uint64_t ticket{};if(!producer.execute(*c,ticket))return false;
@@ -254,43 +254,8 @@ inline bool BufferedPresenter::ensure_chain(Chain& chain,const Image& image,bool
 }
 
 inline bool BufferedPresenter::upload_image(Chain& chain,const Image& source,bool scene) {
-    if(!ensure_chain(chain,source,scene))return false;
-    // xrEndFrame uses the most recently released image. Resubmitting that
-    // image needs no acquire/copy/release when its immutable content has
-    // not changed. A new content ID on every pool lease prevents recycled
-    // pointers from being mistaken for the previously uploaded pixels.
-    if(chain.uploaded==source->identity)return true;
-    unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if(XR_FAILED(xr.acquire(chain.handle,&acquire,&index)))return false;
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-    const auto wait_begin=TimingClock::now();const auto wait_result=xr.wait_image(chain.handle,&wait);
-    {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-    bool copied=false;
-    if(XR_SUCCEEDED(wait_result)&&index<chain.images.size()){
-        auto* target=chain.images[index].texture;
-        if(!burst.recording_frame&&!burst.strict)
-            copied=uploads.upload(source,target,ticks,chain.desc.Format,chain.linear_color,xr_image_state());
-        else {
-            auto* context=uploads.begin(ticks);
-            if(!context){uploads.drain();context=uploads.begin(ticks);}
-            if(context&&uploads.record_upload(*context,source,target,chain.desc.Format,chain.linear_color,xr_image_state())){
-                if(scene&&burst.recording_frame){
-                    const unsigned eye=&chain==&scene_chains[0]?0u:1u;
-                    burst.record(device.Get(),context->list.Get(),source->texture.Get(),source->state,
-                        "source",eye,index,burst_native,burst_current,burst_generated,burst_presentation);
-                    burst.record(device.Get(),context->list.Get(),target,xr_image_state(),
-                        "openxr",eye,index,burst_native,burst_current,burst_generated,burst_presentation);
-                }
-                std::uint64_t ticket{};copied=uploads.execute(*context,ticket);
-                if(copied){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
-                else burst.abandon();
-            }else {if(context)context->list->Close();burst.abandon();}
-        }
-    }
-    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    const bool released=XR_SUCCEEDED(release_image(chain.handle,index,&release));
-    if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
-    return released&&copied;
+    // One image through the same batched path as presentation.
+    return ensure_chain(chain,source,scene)&&upload_batch({{&chain,source}});
 }
 
 inline bool BufferedPresenter::upload_batch(const std::vector<std::pair<Chain*,Image>>& requests) {
@@ -373,9 +338,8 @@ struct BufferedBackend12 final : FrameBackend {
         }
         owner.subimages(job->layers,[&](XrSwapchainSubImage& sub){next_plans[sub.swapchain].full_required=true;return true;});
         owner.capture_plans=std::move(next_plans);
-        job->capture_mode=owner.color_capture_mode.load();job->upload_mode=owner.upload_mode.load();job->latency_diagnostics=owner.latency_diagnostics!=0;
+        job->latency_diagnostics=owner.latency_diagnostics!=0;
         job->direct_output_mode=owner.quad_input?0u:owner.direct_output_mode.load();
-        job->direct_shading_mode=owner.direct_shading_mode.load();
         auto* c=owner.producer.begin(job->id,true);
         if(!c){
             if(inference_slot&&hookless_complete)hookless_complete(0);
@@ -638,7 +602,7 @@ struct BufferedBackend12 final : FrameBackend {
                         std::unique_lock lock(owner.mx);++owner.direct_stats.attempts;owner.direct_request=direct_job;owner.changed.notify_all();
                         owner.changed.wait(lock,[&]{return owner.stopping||job->epoch!=owner.epoch||direct_job->decided;});
                         if(direct_job->allowed){copies=direct_job->targets;pair.direct_xr=true;
-                            for(unsigned eye=0;eye<2;++eye){copies[eye].shading_mode=job->direct_shading_mode;pair.generated[eye]=std::make_shared<TransportImage>();
+                            for(unsigned eye=0;eye<2;++eye){pair.generated[eye]=std::make_shared<TransportImage>();
                                 pair.generated[eye]->texture=copies[eye].texture;pair.generated[eye]->state=copies[eye].state;}}
                     }else{std::lock_guard lock(owner.mx);++owner.direct_stats.unsupported;++owner.direct_stats.fallbacks;owner.direct_stats.last_path=3;
                         owner.note_direct_failure_locked(CheekyFgDirectReason::configuration);}
@@ -669,12 +633,6 @@ struct BufferedBackend12 final : FrameBackend {
                     }
                     if(pair.direct_xr){std::lock_guard lock(owner.mx);
                         direct_job->fence=owner.worker.fence;direct_job->serial=owner.worker.serial;
-                        if(success){const bool coarse=owner.worker.focus.coarse_output[0]&&owner.worker.focus.coarse_output[1];
-                            owner.shading_stats.valid=1;owner.shading_stats.active_mode=coarse?job->direct_shading_mode:0u;
-                            owner.shading_stats.grid_width=coarse?owner.worker.peripheral_width:owner.worker.width;
-                            owner.shading_stats.grid_height=coarse?owner.worker.peripheral_height:owner.worker.height;
-                            owner.shading_stats.output_width=owner.worker.width;owner.shading_stats.output_height=owner.worker.height;
-                            if(coarse)++owner.shading_stats.coarse_frames;else ++owner.shading_stats.full_frames;}
                         for(const auto& f:owner.worker.features)if(f.direct)++owner.direct_stats.ngx_direct_eyes;else ++owner.direct_stats.ngx_scratch_eyes;
                         owner.direct_stats.last_path=owner.worker.features[0].direct&&owner.worker.features[1].direct?1u:2u;}
                 }
@@ -688,16 +646,14 @@ struct BufferedBackend12 final : FrameBackend {
         std::vector<std::pair<Chain*,Image>> batch;
         for(unsigned eye=0;eye<2;++eye) {
             auto& chain=owner.scene_chains[eye];
-            if(generated&&pair.direct_xr){}else if(pair.upload_mode==1u){if(!owner.ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
-            else if(!owner.upload_image(chain,images[eye],true))return false;
+            if(!(generated&&pair.direct_xr)){if(!owner.ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
             views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
         }
         for(auto& a:pair.auxiliary){
-            if(pair.upload_mode==1u){auto& chain=owner.auxiliary_chains[a.source];if(!owner.ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});}
-            else if(!owner.upload_image(owner.auxiliary_chains[a.source],a.image))return false;
+            auto& chain=owner.auxiliary_chains[a.source];if(!owner.ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});
         }
-        if(pair.upload_mode==1u&&!owner.upload_batch(batch))return false;
+        if(!owner.upload_batch(batch))return false;
         owner.uploads.close_profile_frame(owner.ticks);
         if(!owner.subimages(layers,[&](XrSwapchainSubImage& sub){const auto i=owner.auxiliary_chains.find(sub.swapchain);
             if(i==owner.auxiliary_chains.end())return false;sub.swapchain=i->second.handle;return true;}))return false;

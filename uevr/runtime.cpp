@@ -142,7 +142,6 @@ std::string snapshot_locked(State& s) {
     CheekyFgExperimentDiagnostics fg_exp;fg_experiment_diagnostics(fg_exp);
     CheekyFgDirectOutput fg_direct;fg_direct_output_diagnostics(fg_direct);
     CheekyFgDirectOutputDetails fg_direct_details;fg_direct_output_details(fg_direct_details);
-    CheekyFgDirectShading fg_shading;fg_direct_shading_diagnostics(fg_shading);
     CheekyFgCaptureHealth fg_capture;
     if(auto self=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"))
         if(auto query=reinterpret_cast<CheekyFgCaptureHealthFn>(GetProcAddress(self,"CheekyFG_GetCaptureHealth")))query(&fg_capture);
@@ -279,14 +278,8 @@ std::string snapshot_locked(State& s) {
         << ",\"expected_width\":" << fg_direct_details.expected_width << ",\"expected_height\":" << fg_direct_details.expected_height
         << ",\"chain_width\":" << fg_direct_details.chain_width << ",\"chain_height\":" << fg_direct_details.chain_height
         << ",\"image_width\":" << fg_direct_details.image_width << ",\"image_height\":" << fg_direct_details.image_height
-        << ",\"api_result\":" << fg_direct_details.xr_result
-        << ",\"shading\":{\"supported\":" << bool(fg_shading.supported) << ",\"valid\":" << bool(fg_shading.valid)
-        << ",\"requested_mode\":" << fg_shading.requested_mode << ",\"active_mode\":" << fg_shading.active_mode
-        << ",\"grid_width\":" << fg_shading.grid_width << ",\"grid_height\":" << fg_shading.grid_height
-        << ",\"output_width\":" << fg_shading.output_width << ",\"output_height\":" << fg_shading.output_height
-        << ",\"coarse_frames\":" << fg_shading.coarse_frames << ",\"full_frames\":" << fg_shading.full_frames << "}}"
+        << ",\"api_result\":" << fg_direct_details.xr_result << "}"
         << ",\"experiments\":{\"supported\":" << bool(fg_exp.supported)
-        << ",\"color_capture_mode\":" << fg_exp.color_capture_mode << ",\"upload_mode\":" << fg_exp.upload_mode
         << ",\"latency_enabled\":" << bool(fg_exp.latency_enabled) << ",\"latency_valid\":" << bool(fg_exp.latency_valid)
         << ",\"full_color_copies\":" << fg_exp.full_color_copies << ",\"direct_eye_copies\":" << fg_exp.direct_eye_copies
         << ",\"eye_crop_copies\":" << fg_exp.eye_crop_copies << ",\"capture_fallbacks\":" << fg_exp.capture_fallbacks

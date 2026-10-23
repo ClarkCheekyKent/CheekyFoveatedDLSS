@@ -80,7 +80,7 @@ void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
     auto pair = [&] {
         const auto token=complete(1); require(token!=0,"Standalone xrEndFrame claims a submitted stereo interval");
         CheekyFgPair value; value.capture_token=token;
-        require(acquire(&value)&&!value.enable_frame_id&&!value.render_frame&&value.release_point==3&&
+        require(acquire(&value)&&!value.render_frame&&value.release_point==3&&
             value.eyes[0].evaluation+1==value.eyes[1].evaluation,"Standalone frame-free stereo pair preserves scheduling");
         release(&value);
     };
@@ -139,7 +139,7 @@ void verify_fg11(ID3D11Device* device) {
     auto pair=[&] {
         CheekyFgPair value;value.capture_token=complete(1);
         require(value.capture_token&&acquire(&value),"DX11 native evaluations provide an OpenXR stereo guide pair");
-        require(value.eyes[0].depth_width==64&&value.eyes[1].motion_width==128&&!value.enable_frame_id,
+        require(value.eyes[0].depth_width==64&&value.eyes[1].motion_width==128,
             "DX11 FG keeps full-eye guides independently of the cropped SR resolution");
         require(value.eyes[0].prepared_guides&&value.eyes[1].prepared_guides&&
             value.eyes[0].depth->GetDesc().Format==DXGI_FORMAT_R32_FLOAT&&

@@ -105,8 +105,8 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         // Complete all fallible allocation/validation before altering the list.
         for(unsigned pass=0;pass<2;++pass){const auto& grid=grids[pass];auto& p=buffers.passes[pass];
             if(!grid.depth)p.depth.Reset();if(!grid.motion)p.motion.Reset();
-            if((grid.depth&&!allocate(device,p.depth,grid.width,grid.height,grid.depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT))||
-               (grid.motion&&!allocate(device,p.motion,grid.width,grid.height,grid.motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT)))return false;
+            if((grid.depth&&!allocate(device,p.depth,grid.width,grid.height,DXGI_FORMAT_R32_FLOAT))||
+               (grid.motion&&!allocate(device,p.motion,grid.width,grid.height,DXGI_FORMAT_R32G32_FLOAT)))return false;
         }
         if(!buffers.descriptors){D3D12_DESCRIPTOR_HEAP_DESC desc{};desc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;desc.NumDescriptors=8;desc.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if(FAILED(device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&buffers.descriptors))))return false;}
@@ -138,7 +138,7 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
             Constants c;c.rect[0]=float(grid.x)/g.width;c.rect[1]=float(grid.y)/g.height;c.rect[2]=float(grid.w)/g.width;c.rect[3]=float(grid.h)/g.height;
             c.offset[0]=float(g.depth_base_x);c.offset[1]=float(g.depth_base_y);c.offset[2]=float(g.motion_base_x);c.offset[3]=float(g.motion_base_y);
             c.dimensions[0]=float(dw);c.dimensions[1]=float(dh);c.dimensions[2]=float(mw);c.dimensions[3]=float(mh);
-            c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);c.motion[2]=grid.motion_bits==16?65504.f:3.402823466e38f;
+            c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);c.motion[2]=3.402823466e38f;
             c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];
             c.options[0]=grid.depth?1.f:0.f;c.options[1]=grid.motion?1.f:0.f;c.options[2]=float(grid.width);c.options[3]=float(grid.height);
             for(auto* texture:{p.depth.Get(),p.motion.Get()})barrier(list,texture,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

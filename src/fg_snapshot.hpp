@@ -321,13 +321,14 @@ public:
         prior=meta;prior.depth=prior.motion=nullptr;prior.peripheral_depth=prior.peripheral_motion=nullptr;
         tag_recording(commands);
         if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
-        const bool prepared=meta.guide_capture_mode==1u&&preparation.record(device.Get(),commands,meta,slot->prepared);
+        // Raw snapshots are only the fallback for guides preparation cannot handle.
+        const bool prepared=preparation.record(device.Get(),commands,meta,slot->prepared);
         if(prepared){slot->depth.Reset();slot->motion.Reset();++prepared_captures;}
         else {
             // Never silently pass a multi-slice raw depth texture to the FG
             // consumer, which expects one 2D guide per physical eye.
             if(meta.depth->GetDesc().DepthOrArraySize>1){failed_record=id;return false;}
-            if(meta.guide_capture_mode==1u)++preparation_fallbacks;
+            ++preparation_fallbacks;
             slot->prepared.clear();
             if(!allocate(meta.depth,slot->depth,dr)||!allocate(meta.motion,slot->motion,mr)){failed_record=id;return false;}
             copy(commands,meta.depth,slot->depth.Get(),dr);copy(commands,meta.motion,slot->motion.Get(),mr);++raw_captures;

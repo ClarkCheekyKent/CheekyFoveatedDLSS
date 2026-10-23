@@ -47,20 +47,19 @@ void fg_prepared_validation(ID3D12Device* device) {
         for(unsigned y=0;y<d.Height;++y)std::memcpy(out.data()+SIZE_T(y)*d.Width*pixel_bytes,static_cast<char*>(data)+y*fp.Footprint.RowPitch,SIZE_T(d.Width)*pixel_bytes);
         result->Unmap(0,nullptr);return out;
     };
-    for(unsigned method=0;method<4;++method)for(unsigned bits:{16u,32u}){
+    for(unsigned method=0;method<4;++method){
         upload(depth.Get(),false);upload(motion.Get(),true);
         CheekyFgEye g;g.depth=depth.Get();g.motion=motion.Get();g.width=640;g.height=512;
         g.depth_base_x=7;g.depth_base_y=5;g.depth_width=256;g.depth_height=192;
         g.motion_base_x=11;g.motion_base_y=9;g.motion_width=384;g.motion_height=256;
         g.focus_width=.55f;g.focus_height=.45f;g.focus_x=.0625f;g.focus_y=-.0625f;g.resolution_percent=75;g.peripheral_percent=50;
-        g.peripheral_method=method;g.depth_bits=g.motion_bits=bits;g.motion_scale_x=2;g.motion_scale_y=-4;
+        g.peripheral_method=method;g.motion_scale_x=2;g.motion_scale_y=-4;
         g.jitter_correction_x=.00390625f;g.jitter_correction_y=-.0078125f;g.render_frame=77;
         FocusPipeline reference;reference.color_format=DXGI_FORMAT_R8G8B8A8_UNORM;
         for(unsigned pass=0;pass<2;++pass){const auto grid=guide_grid(g,256,192,384,256,pass);
             FocusRect r{grid.x,grid.y,grid.w,grid.h,0,pass==0};
-            check(reference.prepare_inputs(device,list.Get(),0,pass,color.Get(),g,r,grid.color_width,grid.color_height,pass?bits:32,pass?bits:32),"Legacy guide preparation reference");}
+            check(reference.prepare_inputs(device,list.Get(),0,pass,color.Get(),g,r,grid.color_width,grid.color_height),"Legacy guide preparation reference");}
         execute();FgSnapshots snapshots;check(snapshots.initialize(queue.Get()),"Prepared snapshot producer");
-        g.guide_capture_mode=1;
         color_transition(list.Get(),depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         color_transition(list.Get(),motion.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         TimingListAlias alias(list.Get());check(snapshots.record(alias.get(),g)&&snapshots.record(alias.get(),g),"Prepare both eyes at capture through opaque facade");
@@ -77,7 +76,7 @@ void fg_prepared_validation(ID3D12Device* device) {
         FocusPipeline consumer;consumer.color_format=DXGI_FORMAT_R8G8B8A8_UNORM;
         for(unsigned pass=0;pass<2;++pass){const auto& meta=pair.eyes[0];const auto grid=guide_grid(meta,256,192,384,256,pass);
             FocusRect r{grid.x,grid.y,grid.w,grid.h,0,pass==0};
-            check(consumer.prepare_inputs(device,list.Get(),0,pass,color.Get(),meta,r,grid.color_width,grid.color_height,pass?bits:32,pass?bits:32),"Consume prepared guides without re-normalization");}
+            check(consumer.prepare_inputs(device,list.Get(),0,pass,color.Get(),meta,r,grid.color_width,grid.color_height),"Consume prepared guides without re-normalization");}
         execute();
         for(unsigned pass=0;pass<2;++pass){const auto& actual=consumer.inputs[0][pass];const auto& old=reference.inputs[0][pass];
             check(actual.borrowed_guides,"Consumer marks borrowed capture allocations");
@@ -92,7 +91,7 @@ void fg_prepared_validation(ID3D12Device* device) {
         const auto center_grid=guide_grid(pair.eyes[0],256,192,384,256,0);
         FocusRect center_rect{center_grid.x,center_grid.y,center_grid.w,center_grid.h,0,true};
         check(consumer.prepare_inputs(device,list.Get(),0,0,color.Get(),pair.eyes[0],center_rect,
-            center_grid.color_width,center_grid.color_height,32,32,D3D12_RESOURCE_STATE_COMMON,nullptr,.03125f,-.015625f),
+            center_grid.color_width,center_grid.color_height,D3D12_RESOURCE_STATE_COMMON,nullptr,.03125f,-.015625f),
             "Moving-crop correction on producer-prepared guides");execute();
         const auto corrected_motion=read(consumer.inputs[0][0].motion.Get());
         check(consumer.inputs[0][0].motion.Get()!=pair.eyes[0].motion&&read(pair.eyes[0].motion)==original_motion,
@@ -111,5 +110,5 @@ void fg_prepared_validation(ID3D12Device* device) {
         check(alias.references==0,"Prepared capture releases opaque command-list references");
     }
     list->Close();
-    std::cout<<"PASS prepared guide capture: exact legacy pixels at 16/32 bits, all periphery methods, source offsets/reuse, jitter, invalid vectors and direct leased consumption\n";
+    std::cout<<"PASS prepared guide capture: exact legacy pixels, all periphery methods, source offsets/reuse, jitter, invalid vectors and direct leased consumption\n";
 }

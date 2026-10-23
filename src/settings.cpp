@@ -260,11 +260,6 @@ Settings current_settings() noexcept {
 void update_settings(const Settings& settings) noexcept {
     std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
-    // Fixed FG choices; the alternatives remain only as internal A/B paths.
-    fg_settings.guide_capture_mode=fg_settings.compact_storage=1;
-    fg_settings.color_capture_mode=fg_settings.upload_mode=1;
-    fg_settings.direct_peripheral_shading=0;
-    fg_settings.diagnostic_mode=0;
     const auto bounded = [](float value, float lo, float hi, float fallback) {
         return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
     };
@@ -278,7 +273,6 @@ void update_settings(const Settings& settings) noexcept {
     fg_settings.peripheral_percent=fg_percent(fg_settings.peripheral_percent);
     fg_settings.peripheral_method=std::min(fg_settings.peripheral_method,3u);
     fg_settings.center_method=std::min(fg_settings.center_method,2u);
-    fg_settings.depth_bits=fg_settings.motion_bits=32;
     d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(

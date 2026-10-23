@@ -23,17 +23,14 @@ struct BufferedResources12 {
     std::shared_ptr<BufferedDirectRequest> direct_request; // Handshake guarded by mx; only presenter calls XR.
     CheekyFgDirectOutput direct_stats;
     CheekyFgDirectOutputDetails direct_details;
-    CheekyFgDirectShading shading_stats;
     CheekyFgDirectOutputDetails logged_direct_details;
     TimingAverage direct_wait;
     std::atomic<unsigned> direct_output_mode{};
-    std::atomic<unsigned> direct_shading_mode{1};
     std::atomic<std::uint64_t> direct_blocked_target{};
     static std::uint64_t direct_target_key(unsigned w,unsigned h,DXGI_FORMAT format) noexcept {
         return (std::uint64_t(w)<<32)|(std::uint64_t(h)<<8)|unsigned(format);
     }
     CheekyFgDirectOutputFn direct_output_query{};
-    CheekyFgDirectShadingFn direct_shading_query{};
 
     Transport producer,output,uploads;
     // Default: dedicated HIGH-priority inference queue. Lua can also select a

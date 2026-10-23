@@ -123,12 +123,12 @@ void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,uns
 DXGI_FORMAT depth_srv_format(DXGI_FORMAT f) noexcept {return guide_depth_format(f);}
 DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {return guide_motion_format(f);}
 void FocusPipeline::reset() noexcept {
- root.Reset();prepare.Reset();peripheral.Reset();center_shader.Reset();peripheral_coarse.Reset();peripheral_coarse2.Reset();peripheral_coarse4.Reset();peripheral_blocks.Reset();peripheral_blocks2.Reset();peripheral_blocks4.Reset();compose.Reset();pack.Reset();recenter.Reset();descriptors.Reset();stride=0;coarse_output={};
+ root.Reset();prepare.Reset();peripheral.Reset();center_shader.Reset();compose.Reset();pack.Reset();recenter.Reset();descriptors.Reset();stride=0;
  for(auto& eye:inputs)for(auto& input:eye)input={};
  for(unsigned i=0;i<2;++i){peripheral_output[i].Reset();full[i].Reset();previous_depth[i].Reset();history[i]=false;center_output[i].Reset();previous_center_depth[i].Reset();center_history[i]=false;}
 }
 bool FocusPipeline::initialize(ID3D12Device* dev){
- if(root&&prepare&&center_shader&&peripheral&&peripheral_coarse&&peripheral_coarse2&&peripheral_coarse4&&peripheral_blocks&&peripheral_blocks2&&peripheral_blocks4&&compose&&pack&&recenter&&descriptors)return true;
+ if(root&&prepare&&center_shader&&peripheral&&compose&&pack&&recenter&&descriptors)return true;
  D3D12_DESCRIPTOR_RANGE ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,6,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,3,0,0,6}};
  D3D12_ROOT_PARAMETER params[2]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable={2,ranges};
  params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;params[1].Constants={0,0,sizeof(Constants)/4};
@@ -142,15 +142,13 @@ bool FocusPipeline::initialize(ID3D12Device* dev){
   if(FAILED(D3DCompile(source,strlen(source),nullptr,nullptr,nullptr,entry,"cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors))){
    if(errors)std::fprintf(stderr,"FG shader %s: %s\n",entry,static_cast<const char*>(errors->GetBufferPointer()));return false;}
   D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};return SUCCEEDED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(&target)));};
- if(!compile(interpolation_shader,center_shader,"CenterMain")||!compile(prepare_shader,prepare)||!compile(interpolation_shader,peripheral)||!compile(interpolation_shader,peripheral_coarse,"Coarse")||!compile(compose_shader,compose)||!compile(pack_shader,pack)||!compile(recenter_shader,recenter))return false;
- if(!compile(interpolation_shader,peripheral_coarse2,"Coarse2")||!compile(interpolation_shader,peripheral_coarse4,"Coarse4"))return false;
- if(!compile(interpolation_shader,peripheral_blocks,"Blocks")||!compile(interpolation_shader,peripheral_blocks2,"Blocks2")||!compile(interpolation_shader,peripheral_blocks4,"Blocks4"))return false;
+ if(!compile(interpolation_shader,center_shader,"CenterMain")||!compile(prepare_shader,prepare)||!compile(interpolation_shader,peripheral)||!compile(compose_shader,compose)||!compile(pack_shader,pack)||!compile(recenter_shader,recenter))return false;
  D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=126;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
  if(FAILED(dev->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&descriptors))))return false;
  stride=dev->GetDescriptorHandleIncrementSize(heap.Type);return true;
 }
 bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,unsigned pass,
- ID3D12Resource* color,const CheekyFgEye& g,const FocusRect& r,unsigned w,unsigned h,unsigned depth_bits,unsigned motion_bits,
+ ID3D12Resource* color,const CheekyFgEye& g,const FocusRect& r,unsigned w,unsigned h,
  D3D12_RESOURCE_STATES color_state,GpuTimings* timings,float crop_motion_dx,float crop_motion_dy){
  if(eye>1||pass>1||!color||!w||!h||!r.w||!r.h||!initialize(dev))return false;
  const bool need_color=pass==0||g.peripheral_method==3;
@@ -177,8 +175,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
   gw=grid.width;gh=grid.height;
   auto valid=[&](ID3D12Resource* resource,DXGI_FORMAT format){if(!resource)return true;const auto d=resource->GetDesc();
    return d.Width==gw&&d.Height==gh&&d.Format==format;};
-  if(!valid(s.depth.Get(),depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT)||
-     !valid(s.motion.Get(),motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT))return false;
+  if(!valid(s.depth.Get(),DXGI_FORMAT_R32_FLOAT)||!valid(s.motion.Get(),DXGI_FORMAT_R32G32_FLOAT))return false;
  }else{
   if((need_depth&&!g.depth)||(need_motion&&!g.motion))return false;
   df=need_depth?depth_srv_format(g.depth->GetDesc().Format):DXGI_FORMAT_R32_FLOAT;
@@ -194,10 +191,10 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
   gw=std::clamp(unsigned(std::round(double(sw)*r.w/cd.Width*std::min(1.,double(w)/r.w))),1u,w);
   gh=std::clamp(unsigned(std::round(double(sh)*r.h/cd.Height*std::min(1.,double(h)/r.h))),1u,h);
  }
- if(prepared&&adjust_motion&&(!need_motion||!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.corrected_motion)))return false;
+ if(prepared&&adjust_motion&&(!need_motion||!allocate(dev,gw,gh,DXGI_FORMAT_R32G32_FLOAT,s.corrected_motion)))return false;
  if((need_color&&!allocate(dev,w,h,color_format,s.color))||
-    (!prepared&&need_depth&&!allocate(dev,gw,gh,depth_bits==16?DXGI_FORMAT_R16_FLOAT:DXGI_FORMAT_R32_FLOAT,s.depth))||
-    (!prepared&&need_motion&&!allocate(dev,gw,gh,motion_bits==16?DXGI_FORMAT_R16G16_FLOAT:DXGI_FORMAT_R32G32_FLOAT,s.motion)))return false;
+    (!prepared&&need_depth&&!allocate(dev,gw,gh,DXGI_FORMAT_R32_FLOAT,s.depth))||
+    (!prepared&&need_motion&&!allocate(dev,gw,gh,DXGI_FORMAT_R32G32_FLOAT,s.motion)))return false;
  if(prepared&&!need_color){
   if(timings)for(unsigned phase=0;phase<4;++phase)timings->preparation_stamp(list,eye,pass,phase);
   return true;
@@ -207,7 +204,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  c.offset[0]=float(g.depth_base_x);c.offset[1]=float(g.depth_base_y);c.offset[2]=float(g.motion_base_x);c.offset[3]=float(g.motion_base_y);
  c.dimensions[0]=float(dw);c.dimensions[1]=float(dh);c.dimensions[2]=float(mw);c.dimensions[3]=float(mh);
  if(!prepared){c.motion[0]=g.motion_scale_x/(mw*c.rect[2]);c.motion[1]=g.motion_scale_y/(mh*c.rect[3]);
-  c.motion[2]=motion_bits==16?65504.f:3.402823466e38f;c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];}
+  c.motion[2]=3.402823466e38f;c.jitter[0]=g.jitter_correction_x/c.rect[2];c.jitter[1]=g.jitter_correction_y/c.rect[3];}
  c.jitter[2]=crop_motion_dx;c.jitter[3]=crop_motion_dy;
  c.options[0]=need_color?1.f:0.f;c.options[1]=!prepared&&need_depth?1.f:0.f;c.options[2]=!prepared&&need_motion?1.f:0.f;
  c.options[3]=srgb_color(cd.Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
@@ -229,7 +226,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
   adjusted.rect[2]=adjusted.rect[3]=1.f;
   adjusted.dimensions[2]=float(gw);adjusted.dimensions[3]=float(gh);
   adjusted.motion[0]=adjusted.motion[1]=1.f;
-  adjusted.motion[2]=motion_bits==16?65504.f:3.402823466e38f;
+  adjusted.motion[2]=3.402823466e38f;
   adjusted.jitter[2]=crop_motion_dx;adjusted.jitter[3]=crop_motion_dy;
   adjusted.options[2]=1.f;
   transition(list,s.corrected_motion.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -293,18 +290,12 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  auto* mv=need_motion?s.motion.Get():nullptr;auto* depth=need_depth?s.depth.Get():nullptr;
  auto* old=need_depth?(valid_history?prior_depth.Get():depth):nullptr;
  c.dimensions[0]=float(s.output_width);c.dimensions[1]=float(s.output_height);
- const bool coarse=final&&final->shading_mode!=0&&(s.output_width<final->width||s.output_height<final->height);
- const bool blocks=coarse&&final->shading_mode==1;
- coarse_output[eye]=coarse;unsigned cells=8;
  if(final){
   c.dimensions[0]=float(final->width);c.dimensions[1]=float(final->height);
   c.rect[0]=float(final->region.x)/final->width;c.rect[1]=float(final->region.y)/final->height;
   c.rect[2]=float(final->region.w)/final->width;c.rect[3]=float(final->region.h)/final->height;
   c.offset[0]=final->region.feather;c.offset[1]=final->linear_sdr?1.f:0.f;
   c.jitter[2]=final->center_direct?1.f:0.f;c.jitter[3]=1.f;
-  if(coarse){c.dimensions[2]=float(s.output_width);c.dimensions[3]=float(s.output_height);
-   c.motion[0]=color_format==DXGI_FORMAT_R8G8B8A8_UNORM?8.f:color_format==DXGI_FORMAT_R10G10B10A2_UNORM?10.f:16.f;
-   cells=std::clamp(unsigned(32.*std::min(double(s.output_width)/final->width,double(s.output_height)/final->height)),1u,8u);c.motion[1]=float(cells);}
  }else if(region){
   c.rect[0]=float(region->x)/g.width;c.rect[1]=float(region->y)/g.height;
   c.rect[2]=float(region->w)/g.width;c.rect[3]=float(region->h)/g.height;c.offset[3]=1.f;
@@ -322,18 +313,11 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  if(old!=depth)transition(list,old,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
  auto* center=final&&!final->center_direct?final->center:nullptr;
  transition(list,center,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
- auto* shader=region?center_shader.Get():coarse?peripheral_coarse.Get():peripheral.Get();
- if(coarse&&s.output_width*2==final->width&&s.output_height*2==final->height){shader=peripheral_coarse2.Get();cells=8;}
- if(coarse&&s.output_width*4==final->width&&s.output_height*4==final->height){shader=peripheral_coarse4.Get();cells=8;}
- if(blocks){shader=peripheral_blocks.Get();
-  if(s.output_width*2==final->width&&s.output_height*2==final->height)shader=peripheral_blocks2.Get();
-  if(s.output_width*4==final->width&&s.output_height*4==final->height)shader=peripheral_blocks4.Get();}
+ auto* shader=region?center_shader.Get():peripheral.Get();
  bind(*this,dev,list,eye,region?6:2,shader,{previous,current,mv,depth,old},
   {previous->GetDesc().Format,current->GetDesc().Format,mv?mv->GetDesc().Format:DXGI_FORMAT_R32G32_FLOAT,
    depth?depth->GetDesc().Format:DXGI_FORMAT_R32_FLOAT,old?old->GetDesc().Format:DXGI_FORMAT_R32_FLOAT},{output,nullptr,nullptr},c,center);
- if(blocks)list->Dispatch((s.output_width+7)/8,(s.output_height+7)/8,1);
- else if(coarse)list->Dispatch((s.output_width+cells)/cells,(s.output_height+cells)/cells,1);
- else list->Dispatch((unsigned(c.dimensions[0])+7)/8,(unsigned(c.dimensions[1])+7)/8,1);
+ list->Dispatch((unsigned(c.dimensions[0])+7)/8,(unsigned(c.dimensions[1])+7)/8,1);
  transition(list,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
  transition(list,center,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
  for(auto* source:{mv,depth})transition(list,source,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);

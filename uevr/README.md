@@ -157,7 +157,7 @@ Capture/upload overhead measurements are not reset. Support logs identify
 both the requested and actual queue, including unavailable-priority fallback.
 
 For an A/B test, keep the scene, release policy and quality settings unchanged.
-Repeat submissions are fixed OFF. Allow 10 seconds to settle after each switch and
+The presenter never resubmits unchanged frames. Allow 10 seconds to settle after each switch and
 record about 20 seconds per mode. Compare native and unique FPS as well as GPU
 queue entry, capture dependency, and FG GPU work. Shared queue markers reach the
 GPU after preceding work on the game queue, so dependency time may move into
@@ -166,7 +166,7 @@ These are scheduling experiments, not an established fix for gameplay slowdown.
 
 ## Prepared FG guide capture
 
-FG guide capture uses **Prepared FG layouts** as a fixed setting. Prepared capture
+FG guides are always captured into prepared FG layouts. Prepared capture
 normalizes depth and motion immediately after the
 native DLSS evaluation, retaining only the center and required peripheral guide
 grids. Inference borrows those exact allocations under the stereo frame lease;
@@ -186,8 +186,8 @@ Savings depend on the number of live eye slots and guide dimensions. For the
 reported 198.8 MiB raw snapshots plus 53.2 MiB worker guide preparation, four
 prepared eye slots would require about 106.4 MiB, a provisional 145.6 MiB saving.
 Larger in-flight pools reduce that saving; allocation counters establish the
-actual result. GPU pixel comparisons cover all periphery methods, 16/32-bit
-guides, source crops, jitter, invalid vectors and reused engine textures. Real
+actual result. GPU pixel comparisons cover all periphery methods, source
+crops, jitter, invalid vectors and reused engine textures. Real
 NGX generation and sustained queue/release-policy checks also pass.
 
 ## GPU memory diagnostics
@@ -261,10 +261,9 @@ destination or scaled center uses center scratch with direct final assembly;
 unsupported periphery modes/runtime images use the existing compact path.
 The default remains **Compact intermediate**. Settings persist and apply live.
 
-Direct output waits for generation on the presentation thread. Direct periphery
-shading uses full-resolution warping as a fixed setting. Final pixel stores and
-center feather blending remain at output resolution. Support JSON retains the
-actual shading mode and grid diagnostics. Compact fallback keeps its existing
+Direct output waits for generation on the presentation thread. The periphery
+is warped at full output resolution. Final pixel stores and center feather
+blending remain at output resolution. Compact fallback keeps its existing
 low-resolution path.
 SDR uses writable linear UNORM XR images with gamma conversion in final assembly;
 check dark gradients as linear 8-bit storage has less shadow precision than sRGB.
@@ -279,5 +278,4 @@ UAV for final assembly. Rejection details report the exact stage, requested and
 actual formats/extents, resource flags and API error in Lua, support JSON and
 the layer log. Unsupported backing images are cached by size/format so fallback
 does not add an acquisition handshake every native frame; toggle the output
-mode off/on to retry. A fallback wake never enables repeated native submissions
-under the fixed fresh-only policy.
+mode off/on to retry. A fallback wake never resubmits a native frame.

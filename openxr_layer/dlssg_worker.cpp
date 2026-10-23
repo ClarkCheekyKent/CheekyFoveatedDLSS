@@ -70,9 +70,9 @@ void Worker::reset_features() noexcept {
 void Worker::reset() noexcept {
     std::lock_guard lock(ngx_mutex);wait_idle();reset_features();
     latency.reset();gpu_timings.reset();completion_wait={};submitted_at={};
-    if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();split_allocator.Reset();list.Reset();split_list.Reset();fence.Reset();
+    if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();second_allocator.Reset();list.Reset();second_list.Reset();fence.Reset();
     allocate=nullptr;destroy=nullptr;create=nullptr;evaluate=nullptr;release=nullptr;
-    configured=false;serial=prepared_serial=0;width=height=0;diagnostic_mode=DiagnosticMode::Normal;frame_id_enabled=true;last_frame_id_logged=false;last_frame_id_sample=0;init=nullptr;capabilities=nullptr;
+    configured=false;serial=prepared_serial=0;width=height=0;init=nullptr;capabilities=nullptr;
 }
 void Worker::report(const char* stage,std::uint32_t code) noexcept {
     sprintf_s(diagnostic,"%s: 0x%08x",stage,code);
@@ -178,35 +178,6 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(!wait_idle())return false;
     ngx_burst.trace=trace;
     ngx_burst.start(guides.render_frame,guides.capture_token);
-    // This code runs on the FG generation worker, after the previous dispatch
-    // has completed. No other thread writes diagnostic_mode or GPU statistics.
-    const auto new_mode=static_cast<DiagnosticMode>(guides.diagnostic_mode<=4u?guides.diagnostic_mode:0u);
-    if(diagnostic_mode!=new_mode) {
-        diagnostic_mode=new_mode;
-        // Avoid mixing normal/prepare-first or one-eye/two-eye samples.
-        // DO NOT reset NGX features: their separate temporal histories survive.
-        gpu_timings.initialize(device.Get(),queue.Get());
-        if(trace) {
-            const char* name=diagnostic_mode==DiagnosticMode::PrepareFirst?"prepare-first":
-                diagnostic_mode==DiagnosticMode::LeftOnly?"left-only":
-                diagnostic_mode==DiagnosticMode::RightOnly?"right-only":
-                diagnostic_mode==DiagnosticMode::SplitLists?"split-lists":"normal";
-            char msg[160]{};
-            sprintf_s(msg,"FG diagnostic mode=%s (UEVR Lua, live; FG queue retained)",name);
-            trace(msg);
-        }
-    }
-    // BackbufferFrameID belongs to a fully rendered native frame (not a generated eye).
-    // Both feature handles, including optional peripheral FG, receive the same ID.
-    // When disabling it for an A/B run, discard old NGX parameter maps: Set()
-    // retains old keys and cannot otherwise make an optional key truly absent.
-    const bool requested_frame_id=guides.enable_frame_id!=0;
-    if(frame_id_enabled!=requested_frame_id) {
-        frame_id_enabled=requested_frame_id;
-        reset_features();gpu_timings.initialize(device.Get(),queue.Get());
-        if(trace)trace(frame_id_enabled?"FG BackbufferFrameID=ON (native render-frame ID; NGX histories reset)":
-            "FG BackbufferFrameID=OFF (parameter absent; NGX histories reset)");
-    }
     if(configuration!=guides.eyes[0].configuration) {
         const bool previously_failed=failed;
         reset_features();configuration=guides.eyes[0].configuration;gpu_timings.initialize(device.Get(),queue.Get());completion_wait={};
@@ -223,40 +194,27 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
     if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
-    const bool release_after_prepare=guides.release_point==1u;
-    const bool split_lists=diagnostic_mode==DiagnosticMode::SplitLists&&!release_after_prepare;
-    const bool two_lists=split_lists||release_after_prepare;
-    // One mode/ID is latched per captured pair; no CPU-side changes between eyes.
-    if(trace && (!last_frame_id_logged || (gpu_timings.samples && gpu_timings.samples%240==0 &&
-            last_frame_id_sample!=gpu_timings.samples))) {
-        last_frame_id_logged=true;last_frame_id_sample=gpu_timings.samples;
-        char msg[200]{};
-        sprintf_s(msg,"FG frame identity: provided=%u native_id=%llu capture_token=%llu same_for_both_eyes=yes queue=%s",
-            frame_id_enabled&&guides.render_frame?1u:0u,
-            static_cast<unsigned long long>(guides.render_frame),
-            static_cast<unsigned long long>(guides.capture_token),
-            queue->GetDesc().Priority==D3D12_COMMAND_QUEUE_PRIORITY_HIGH?"HIGH":
-            queue->GetDesc().Priority==D3D12_COMMAND_QUEUE_PRIORITY_NORMAL?"NORMAL":"OTHER");
-        trace(msg);
-    }
-    // Lazily allocate the diagnostic list: normal FG is unaffected by its availability.
-    // Both allocators are reused only after the previous frame's final fence retires.
+    // Release point 1 records both eyes' preparation on list A and NGX and
+    // composition on list B, with a GPU milestone between them.
+    const bool two_lists=guides.release_point==1u;
+    // Lazily allocate the second list. Both allocators are reused only after
+    // the previous frame's final fence retires.
     if(two_lists) {
-        if(!split_allocator && FAILED(device->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&split_allocator)))) {
-            if(trace)trace("FG split-lists: cannot allocate second command allocator");
+        if(!second_allocator && FAILED(device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&second_allocator)))) {
+            if(trace)trace("FG preparation gate: cannot allocate second command allocator");
             list->Close();return false;
         }
-        if(!split_list) {
+        if(!second_list) {
             if(FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    split_allocator.Get(),nullptr,IID_PPV_ARGS(&split_list)))) {
-                if(trace)trace("FG split-lists: cannot create second command list");
+                    second_allocator.Get(),nullptr,IID_PPV_ARGS(&second_list)))) {
+                if(trace)trace("FG preparation gate: cannot create second command list");
                 list->Close();return false;
             }
-            if(FAILED(split_list->Close())) {list->Close();return false;}
+            if(FAILED(second_list->Close())) {list->Close();return false;}
         }
-        if(FAILED(split_allocator->Reset())||FAILED(split_list->Reset(split_allocator.Get(),nullptr))) {
-            if(trace)trace("FG split-lists: cannot reset second command list");
+        if(FAILED(second_allocator->Reset())||FAILED(second_list->Reset(second_allocator.Get(),nullptr))) {
+            if(trace)trace("FG preparation gate: cannot reset second command list");
             list->Close();return false;
         }
     }
@@ -284,7 +242,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             direct=(*copies)[eye].texture!=colors[source]&&(*copies)[eye].texture!=previous[source]&&
                 (*copies)[eye].texture!=guides.eyes[source].depth&&(*copies)[eye].texture!=guides.eyes[source].motion;
     }
-    if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed()||(*copies)[0].final_xr||(*copies)[1].final_xr)){list->Close();if(two_lists)split_list->Close();return false;}
+    if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed()||(*copies)[0].final_xr||(*copies)[1].final_xr)){list->Close();if(two_lists)second_list->Close();return false;}
     // wait_idle above retired every earlier use of these private scratch images.
     if(direct&&direct_periphery)for(unsigned eye=0;eye<2;++eye)
         if(((*copies)[eye].layout.packed()||(*copies)[eye].final_xr)&&guides.eyes[eye].peripheral_method<=2){
@@ -392,11 +350,6 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         p->Set("DLSSG.ColorBuffersHDR",desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?1u:0u);p->Set("DLSSG.MvecDilated",0u);
         p->Set("DLSSG.MvecInvalidValue",input.motion->GetDesc().Format==DXGI_FORMAT_R16G16_FLOAT?65504.f:(std::numeric_limits<float>::max)());
         p->Set("DLSSG.Reset",g.reset||created||(center_pass&&moving_crop_reset[eye])?1u:0u);p->Set("DLSSG.MultiFrameCount",1u);p->Set("DLSSG.MultiFrameIndex",1u);
-        // NVIDIA defines BackbufferFrameID as uint64_t, incremented once per *real*
-        // rendered frame (even while FG is disabled). Use the matched UEVR frame
-        // identity, not serial (FG submission), capture token, or eye evaluation.
-        if(frame_id_enabled && guides.render_frame)
-            p->Set("DLSSG.BackbufferFrameID",static_cast<unsigned long long>(guides.render_frame));
         p->Set("DLSSG.Backbuffer",input.color.Get());p->Set("DLSSG.Depth",input.depth.Get());p->Set("DLSSG.MVecs",input.motion.Get());
         p->Set("DLSSG.OutputInterpolated",f.target);p->Set("DLSSG.OutputDisableInterpolation",f.disable.Get());
         for(const char* key:{"DLSSG.BackbufferSubrectBaseX","DLSSG.BackbufferSubrectBaseY","DLSSG.InputBackbufferSubrectBaseX","DLSSG.InputBackbufferSubrectBaseY",
@@ -412,8 +365,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     };
     auto dispatch_pass=[&](Feature& f,unsigned eye,bool center_pass) {
         // Detailed GPU timestamp boundaries: pre-UAV transitions, NGX commands,
-        // post-UAV transitions and disable-interpolation readback copy. In
-        // split-lists mode the second eye uses another list on the same queue.
+        // post-UAV transitions and disable-interpolation readback copy.
         if(center_pass)gpu_timings.ngx_stamp(commands,eye,0);
         barrier(commands,f.target,f.direct?(*copies)[f.eye].state:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -462,20 +414,15 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     bool foveated[2]{};
     std::array<FocusRect,2> center_rects{};
     std::array<unsigned,2> center_output_width{},center_output_height{};
-    // Default ordering remains exactly preparation -> NGX -> composition per
-    // eye. "prepare-first" records both guides, evaluates both center NGX
-    // features, then composes both eyes, in that order. Queue, histories,
-    // resource ownership and producer/consumer fences are unchanged.
-    const bool prepare_first=diagnostic_mode==DiagnosticMode::PrepareFirst||release_after_prepare;
-    const unsigned active_mask=diagnostic_mode==DiagnosticMode::LeftOnly?1u:
-        diagnostic_mode==DiagnosticMode::RightOnly?2u:3u;
-    gpu_timings.active_eye_mask=active_mask;
+    // Ordering is preparation -> NGX -> composition per eye. With the
+    // preparation gate both guides are prepared first, then both center NGX
+    // features are evaluated, then both eyes are composed.
+    const bool prepare_first=two_lists;
     for(unsigned phase=0;phase<(prepare_first?3u:1u)&&good;++phase) {
         for(unsigned step=0;step<2&&good;++step) {
             const unsigned eye=(gpu_timings.first_eye+step)%2;
             const auto& g=guides.eyes[eye];const unsigned query=2+eye*6;
             const Camera& camera=cameras[eye];
-            const bool evaluate_center=(active_mask&(1u<<eye))!=0;
             if(!prepare_first||phase==0) {
                 gpu_timings.stamp(commands,query);
                 if(!g.depth||!g.motion||g.width!=width||g.height!=height){report("FG guide/output dimensions disagree",unsigned(E_INVALIDARG));failed=true;good=false;break;}
@@ -515,16 +462,16 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 peripheral_width=rect.active?scaled(width,g.peripheral_percent):0;
                 peripheral_height=rect.active?scaled(height,g.peripheral_percent):0;
                 auto* detail=gpu_timings.record_preparation?&gpu_timings:nullptr;
-                if(!focus.prepare_inputs(device.Get(),commands,eye,0,colors[eye],g,rect,center_width,center_height,32,32,input_color_state,detail,motion_crop_dx[eye],motion_crop_dy[eye])) {
+                if(!focus.prepare_inputs(device.Get(),commands,eye,0,colors[eye],g,rect,center_width,center_height,input_color_state,detail,motion_crop_dx[eye],motion_crop_dy[eye])) {
                     report("FG center guide conversion",unsigned(E_FAIL));failed=true;good=false;break;
                 }
-                if(rect.active&&!focus.prepare_inputs(device.Get(),commands,eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,g.depth_bits,g.motion_bits,input_color_state,detail)) {
+                if(rect.active&&!focus.prepare_inputs(device.Get(),commands,eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,input_color_state,detail)) {
                     report("FG periphery guide conversion",unsigned(E_FAIL));failed=true;good=false;break;
                 }
                 if(!rect.active)for(unsigned part=0;part<4;++part)gpu_timings.preparation_stamp(commands,eye,1,part);
-                // Feature creation can record GPU commands. In prepare-first
-                // mode configure both feature instances before either evaluates.
-                if(prepare_first&&evaluate_center&&g.center_method==0&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)) {
+                // Feature creation can record GPU commands. With the preparation
+                // gate, configure both feature instances before either evaluates.
+                if(prepare_first&&g.center_method==0&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)) {
                     good=false;break;
                 }
                 gpu_timings.stamp(commands,query+1);
@@ -532,40 +479,25 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(prepare_first&&phase==0)continue;
             const auto& rect=center_rects[eye];
             if(!prepare_first||phase==1) {
-                // Split exactly at the second center NGX evaluation: both guides
-                // and the first NGX call are recorded on A; the second NGX call,
-                // composition, publication and query resolve are recorded on B.
-                // Do not submit A yet: record B first to avoid an artificial GPU
-                // idle bubble and to keep failure paths free of in-flight work.
-                if(split_lists && step==1) {
-                    if(FAILED(commands->Close())) {good=false;break;}
-                    commands=split_list.Get();
-                    cut_to_second_list=true;
-                }
                 gpu_timings.stamp(commands,query+2);
-                if(evaluate_center&&g.center_method) {
+                if(g.center_method) {
                     const auto& last=features[eye];
                     focus.center_history[eye]=focus.center_history[eye]&&!g.reset&&last.evaluated_crop_valid&&
                         last.evaluated_crop.x==rect.x&&last.evaluated_crop.y==rect.y&&last.evaluated_crop.w==rect.w&&last.evaluated_crop.h==rect.h;
                     good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                         nullptr,D3D12_RESOURCE_STATE_COMMON,nullptr,nullptr,&rect);
                     for(unsigned mark=0;mark<4;++mark)gpu_timings.ngx_stamp(commands,eye,mark);
-                } else if(evaluate_center) {
+                } else {
                     good=prepare_first?dispatch_pass(features[eye],eye,true):
                         (configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)&&dispatch_pass(features[eye],eye,true));
-                } else {
-                    // In single-eye mode the skipped eye displays its current
-                    // native source. Not an interpolated stereo pair: only for
-                    // short diagnostics, never normal VR gameplay.
-                    for(unsigned mark=0;mark<4;++mark)gpu_timings.ngx_stamp(commands,eye,mark);
                 }
                 gpu_timings.stamp(commands,query+3);
                 if(!good)break;
             }
             if(prepare_first&&phase==1)continue;
             gpu_timings.stamp(commands,query+4);
-            auto* center=evaluate_center?(g.center_method?focus.center_output[eye].Get():features[eye].target):focus.inputs[eye][0].color.Get();
-            if(evaluate_center&&(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f)){
+            auto* center=g.center_method?focus.center_output[eye].Get():features[eye].target;
+            if(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f){
                 // For a static full-eye point P and crop origins A -> B, NGX
                 // interpolates (P-A)/size -> (P-B)/size. Its midpoint belongs
                 // at (A+B)/2. Sampling at uv+(B-A)/(2*size) re-expresses that
@@ -579,17 +511,15 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             bool custom_context_direct=false;
             const bool final_xr=direct&&(*copies)[eye].final_xr;
             if(final_xr){
-                FocusPipeline::FinalOutput final{center,rect,width,height,evaluate_center&&features[eye].direct,
-                    focus.color_format==DXGI_FORMAT_R8G8B8A8_UNORM&&srgb_color(format),(*copies)[eye].shading_mode};
+                FocusPipeline::FinalOutput final{center,rect,width,height,features[eye].direct,
+                    focus.color_format==DXGI_FORMAT_R8G8B8A8_UNORM&&srgb_color(format)};
                 good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                     (*copies)[eye].texture,(*copies)[eye].state,nullptr,&final);
                 (*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;outputs[eye]=(*copies)[eye].texture;
             }else if(rect.active) {
                 if(g.peripheral_method==3) {
-                    if(evaluate_center) {
-                        good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
-                        base=peripheral_features[eye].target;
-                    } else base=focus.inputs[eye][1].color.Get();
+                    good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
+                    base=peripheral_features[eye].target;
                 }else {
                     custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed();
                     auto* target=custom_context_direct?(*copies)[eye].texture:nullptr;
@@ -601,8 +531,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 }
             }
             if(final_xr){}else if(good&&copies&&(*copies)[eye].layout.packed()) {
-                const bool center_direct=evaluate_center&&features[eye].direct;
-                const bool context_direct=custom_context_direct||(evaluate_center&&g.peripheral_method==3&&peripheral_features[eye].direct);
+                const bool center_direct=features[eye].direct;
+                const bool context_direct=custom_context_direct||(g.peripheral_method==3&&peripheral_features[eye].direct);
                 good=focus.pack_frame(device.Get(),commands,eye,center,base,(*copies)[eye].texture,(*copies)[eye].state,
                     (*copies)[eye].layout,center_direct,context_direct);
                 outputs[eye]=(*copies)[eye].texture;(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
@@ -617,12 +547,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
             gpu_timings.stamp(commands,query+5);
         }
-        if(good&&release_after_prepare&&phase==0) {
+        if(good&&two_lists&&phase==0) {
             // Both eyes' GPU preparation is on A; NGX/composition is on B.
             // Record B before submitting either list to avoid a CPU-created
             // gap between preparation and inference.
             if(FAILED(commands->Close())) {good=false;break;}
-            commands=split_list.Get();cut_to_second_list=true;
+            commands=second_list.Get();cut_to_second_list=true;
         }
     }
     if(good&&direct)for(auto& copy:*copies){
@@ -644,26 +574,22 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(FAILED(close_result)||!good) {
         ngx_burst.abandon();
         if(FAILED(close_result))report("FG command list close",unsigned(close_result));
-        // A split-mode failure before the cut leaves list B recording. Close
-        // it too before reusing its allocator on the next frame. Neither list
-        // has been submitted, so nothing may still reference captured inputs.
-        if(two_lists && !cut_to_second_list && split_list)split_list->Close();
+        // A failure before the cut leaves list B recording. Close it too
+        // before reusing its allocator on the next frame. Neither list has
+        // been submitted, so nothing may still reference captured inputs.
+        if(two_lists && !cut_to_second_list && second_list)second_list->Close();
         return false;
     }
     if(two_lists && cut_to_second_list) {
         // Two actual ExecuteCommandLists calls on the SAME HIGH-priority queue,
         // strictly ordered, no CPU fence wait and no inter-list GPU signal.
         ID3D12CommandList* first[]{list.Get()};
-        ID3D12CommandList* second[]{split_list.Get()};
+        ID3D12CommandList* second[]{second_list.Get()};
         queue->ExecuteCommandLists(1,first);
-        if(release_after_prepare) {
-            prepared_serial=++serial;
-            if(FAILED(queue->Signal(fence.Get(),prepared_serial)))return false;
-        }
+        prepared_serial=++serial;
+        if(FAILED(queue->Signal(fence.Get(),prepared_serial)))return false;
         queue->ExecuteCommandLists(1,second);
-        if(trace && gpu_timings.samples==0)
-            trace(release_after_prepare?"FG preparation gate: both eyes on list A; GPU milestone before NGX list B":
-                "FG split-lists: two ordered ExecuteCommandLists submissions (selected FG queue)");
+        if(trace && gpu_timings.samples==0)trace("FG preparation gate: both eyes on list A; GPU milestone before NGX list B");
     } else {
         ID3D12CommandList* lists[]{commands};queue->ExecuteCommandLists(1,lists);
     }
@@ -673,7 +599,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // Only submitted evaluations advance NGX history. The pair can fail after
     // recording EvaluateFeature (e.g. during final composition), in which case
     // the command list is discarded and these crops must not be published.
-    for(unsigned eye=0;eye<2;++eye)if((active_mask&(1u<<eye))!=0){
+    for(unsigned eye=0;eye<2;++eye){
         auto& done=features[eye];
         done.evaluated_crop=center_rects[eye];done.evaluated_crop_valid=true;
         done.evaluated_frame=guides.render_frame;
@@ -684,7 +610,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // finish, but must not let it overtake a still-unsubmitted FG job.
     if(on_submitted)on_submitted(submitted_context);
     const auto wait_begin=TimingClock::now();
-    if(release_after_prepare) {
+    if(two_lists) {
         if(!wait_fence(prepared_serial))return false;
         if(on_prepared)on_prepared(submitted_context);
     }
@@ -701,30 +627,24 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             const auto& phase=gpu_timings.ngx_parts[eye];
             char detail_msg[512]{};
             sprintf_s(detail_msg,
-                "FG NGX breakdown GPU ms: mode=%s eye=%s active=%u samples=%llu "
+                "FG NGX breakdown GPU ms: eye=%s samples=%llu "
                 "before_avg=%.3f before_p95=%.3f ngx_avg=%.3f ngx_p50=%.3f ngx_p95=%.3f "
                 "after_avg=%.3f after_p95=%.3f",
-                diagnostic_mode==DiagnosticMode::PrepareFirst?"prepare-first":
-                    diagnostic_mode==DiagnosticMode::LeftOnly?"left-only":
-                    diagnostic_mode==DiagnosticMode::RightOnly?"right-only":
-                    diagnostic_mode==DiagnosticMode::SplitLists?"split-lists":"normal",
-                eye?"right":"left",(gpu_timings.active_eye_mask>>eye)&1u,
+                eye?"right":"left",
                 static_cast<unsigned long long>(gpu_timings.samples),
                 phase[0].mean(),phase[0].percentile(95),
                 phase[1].mean(),phase[1].percentile(50),phase[1].percentile(95),
                 phase[2].mean(),phase[2].percentile(95));
             trace(detail_msg);
         }
-        if(gpu_timings.active_eye_mask==3u) {
+        {
             const auto& first=gpu_timings.ngx_by_position[0];
             const auto& second=gpu_timings.ngx_by_position[1];
             char order_msg[480]{};
             sprintf_s(order_msg,
-                "FG NGX breakdown order GPU ms: mode=%s samples=%llu "
+                "FG NGX breakdown order GPU ms: samples=%llu "
                 "first_before=%.3f first_ngx=%.3f first_ngx_p95=%.3f first_after=%.3f "
                 "second_before=%.3f second_ngx=%.3f second_ngx_p95=%.3f second_after=%.3f",
-                diagnostic_mode==DiagnosticMode::PrepareFirst?"prepare-first":
-                    diagnostic_mode==DiagnosticMode::SplitLists?"split-lists":"normal",
                 static_cast<unsigned long long>(gpu_timings.samples),
                 first[0].mean(),first[1].mean(),first[1].percentile(95),first[2].mean(),
                 second[0].mean(),second[1].mean(),second[1].percentile(95),second[2].mean());
@@ -798,7 +718,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     bool enabled=true;
     for(unsigned eye=0;eye<2;++eye){
         focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
-        focus.center_history[eye]=(active_mask&(1u<<eye))&&guides.eyes[eye].center_method==2;
+        focus.center_history[eye]=guides.eyes[eye].center_method==2;
         for(auto* f:{&features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==3?&peripheral_features[eye]:nullptr}) {
             if(!f)continue;
             if(!f->handle)continue;void* data{};if(FAILED(f->readback->Map(0,nullptr,&data))||!data)return false;

@@ -244,7 +244,7 @@ public:
             auto& g=result.pair.eyes[eye];g=selected[eye+2]->metadata.meta;g.depth=frame->depth[eye].Get();g.motion=frame->motion[eye].Get();
             g.width=widths[eye];g.height=heights[eye];g.depth_width=g.motion_width=target.width;g.depth_height=g.motion_height=target.height;
             g.depth_base_x=g.depth_base_y=g.motion_base_x=g.motion_base_y=0;g.motion_scale_x=float(target.width);g.motion_scale_y=float(target.height);
-            g.jitter_x=g.jitter_y=g.jitter_correction_x=g.jitter_correction_y=0;g.motion_jittered=0;g.guide_capture_mode=g.prepared_guides=0;
+            g.jitter_x=g.jitter_y=g.jitter_correction_x=g.jitter_correction_y=0;g.motion_jittered=0;g.prepared_guides=0;
             g.focus_width=insets[eye][2];g.focus_height=insets[eye][3];g.focus_x=insets[eye][0]+g.focus_width*.5f-.5f;g.focus_y=insets[eye][1]+g.focus_height*.5f-.5f;
             g.focus_feather=2.f/std::min(widths[eye],heights[eye]);
             g.peripheral_method=std::min(g.peripheral_method,2u);g.peripheral_depth=g.peripheral_motion=nullptr;
@@ -254,7 +254,6 @@ public:
         last_configuration=configuration;last_built_interval=interval;const auto token=(++serial)*2;
         auto& pair=result.pair;pair.capture_token=token;pair.render_frame=serial;pair.producer_queue=bridge.queue.Get();
         const auto& options=selected[0]->metadata;pair.fg_queue_priority=options.queue_priority;pair.release_point=options.release_point;
-        pair.enable_frame_id=options.frame_id;
         for(unsigned i=0;i<2;++i){pair.eyes[i].render_frame=serial;pair.eyes[i].evaluation=token-1+i;}
         result.lease.Attach(new Lease(std::move(frame)));pair.lease=result.lease.Get();diagnostics.assembly_stage=4;++diagnostics.guide_pairs;atlas_ready=true;return result;
     }

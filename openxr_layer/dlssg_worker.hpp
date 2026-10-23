@@ -22,7 +22,7 @@ struct Worker {
         std::uint64_t evaluated_frame{};
         bool evaluated_crop_valid{};
     };
-    struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;bool final_xr{};unsigned shading_mode{1};};
+    struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;bool final_xr{};};
     using Init=decltype(&NVSDK_NGX_D3D12_Init_with_ProjectID);
     using Caps=decltype(&NVSDK_NGX_D3D12_GetCapabilityParameters);
     Init init{}; Caps capabilities{};
@@ -33,17 +33,13 @@ struct Worker {
     using Release=decltype(&NVSDK_NGX_D3D12_ReleaseFeature);
     Allocate allocate{};Destroy destroy{};Create create{};Evaluate evaluate{};Release release{};
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> allocator,split_allocator;
-    ComPtr<ID3D12GraphicsCommandList> list,split_list;
+    ComPtr<ID3D12CommandAllocator> allocator,second_allocator;
+    ComPtr<ID3D12GraphicsCommandList> list,second_list;
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;
     std::array<CompactLayout,2> color_layouts,previous_layouts;
     D3D12_RESOURCE_STATES input_color_state{D3D12_RESOURCE_STATE_COMMON};
-    enum class DiagnosticMode { Normal, PrepareFirst, LeftOnly, RightOnly, SplitLists };
-    DiagnosticMode diagnostic_mode{DiagnosticMode::Normal};
-    bool frame_id_enabled{true},last_frame_id_logged{};
-    std::uint64_t last_frame_id_sample{};
     bool temporal_evaluation_completed{}; // Last generate() finished processing both eyes, even if output was suppressed.
     std::uint64_t crop_diagnostic_frame{};
     bool force_fp16{}; // Explicit A/B probe only; preserve SDR precision by default.

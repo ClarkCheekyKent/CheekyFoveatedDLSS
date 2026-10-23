@@ -28,7 +28,6 @@ inline DXGI_FORMAT guide_motion_format(DXGI_FORMAT f) noexcept {
 struct GuideGrid {
     unsigned x{},y{},w{},h{},color_width{},color_height{},width{},height{};
     bool depth{},motion{};
-    unsigned depth_bits{32},motion_bits{32};
 };
 // The producer and consumer use exactly the same crop, rounding and source-grid
 // calculation. Normalization is independent of the physical color atlas.
@@ -46,7 +45,6 @@ inline GuideGrid guide_grid(const CheekyFgEye& g,unsigned dw,unsigned dh,unsigne
     const unsigned scale=pass?g.peripheral_percent:g.resolution_percent;
     r.color_width=std::max(32u,(r.w*scale+50u)/100u);r.color_height=std::max(32u,(r.h*scale+50u)/100u);
     r.depth=pass==0||g.peripheral_method>=2;r.motion=pass==0||g.peripheral_method!=0;
-    r.depth_bits=pass?g.depth_bits:32;r.motion_bits=pass?g.motion_bits:32;
     const unsigned sw=r.depth?std::min(dw,mw):mw,sh=r.depth?std::min(dh,mh):mh;
     r.width=std::clamp(unsigned(std::round(double(sw)*r.w/g.width*std::min(1.,double(r.color_width)/r.w))),1u,r.color_width);
     r.height=std::clamp(unsigned(std::round(double(sh)*r.h/g.height*std::min(1.,double(r.color_height)/r.h))),1u,r.color_height);

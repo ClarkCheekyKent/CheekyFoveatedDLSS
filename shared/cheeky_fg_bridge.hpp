@@ -6,7 +6,7 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473B; // CFG11: independently selected center FG method.
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473C; // CFG12: retired guide precision, diagnostic and frame-ID fields.
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -26,10 +26,10 @@ struct CheekyFgEye {
     float focus_width{1},focus_height{1},focus_x{},focus_y{},focus_feather{0.04f};
     std::uint32_t show_foveation_border{}; // Blue border on FG generated output only (not history).
     std::uint32_t resolution_percent{100},peripheral_percent{50};
-    std::uint32_t peripheral_method{2},depth_bits{32},motion_bits{32};
+    std::uint32_t peripheral_method{2};
     std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
     std::uint64_t configuration{};
-    std::uint32_t guide_capture_mode{},prepared_guides{}; // Requested mode / actual immutable representation.
+    std::uint32_t prepared_guides{}; // Guides are prepared FG grids rather than raw snapshots.
     ID3D12Resource* peripheral_depth{};
     ID3D12Resource* peripheral_motion{};
 };
@@ -40,12 +40,9 @@ struct CheekyFgPair {
     ID3D12CommandQueue* producer_queue{};
     std::uint64_t capture_token{}; // Required input: token observed at color release.
     IUnknown* lease{}; // Retain until the consumer GPU has finished reading guides.
-    std::uint64_t render_frame{}; // Required identity received with the color stamp.
-    std::uint32_t diagnostic_mode{}; // 0 normal, 1 prepare-first, 2 left-only, 3 right-only, 4 split-lists.
-    std::uint32_t enable_frame_id{1}; // Optional NGX BackbufferFrameID A/B; applied to each feature.
+    std::uint64_t render_frame{}; // Producer frame serial (quad views); 0 for pairs matched at xrEndFrame.
     std::uint32_t fg_queue_priority{1}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
     std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
-    std::uint32_t submit_repeats{}; // Retired: the presenter never resubmits unchanged content. Kept for ABI layout.
 };
 inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
     for(const auto& g:pair.eyes)
@@ -199,8 +196,8 @@ using CheekyFgPresentationFn=bool(__cdecl*)(CheekyFgPresentation*);
 
 // Additive experiments API: preserve the existing pair/status layouts.
 struct CheekyFgTransportOptions {
-    std::uint32_t abi{1},size{sizeof(CheekyFgTransportOptions)};
-    std::uint32_t color_capture_mode{},upload_mode{},latency_diagnostics{1};
+    std::uint32_t abi{2},size{sizeof(CheekyFgTransportOptions)};
+    std::uint32_t latency_diagnostics{1};
 };
 using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
 // Separate export so the transport layout keeps its exact-size check.
@@ -249,13 +246,6 @@ struct CheekyFgDirectOutputDetails {
     std::uint64_t rejections{};
 };
 using CheekyFgDirectOutputDetailsFn=bool(__cdecl*)(CheekyFgDirectOutputDetails*);
-// Optional shading controls/telemetry; keep the existing direct-output ABI stable.
-struct CheekyFgDirectShading {
-    std::uint32_t abi{1},size{sizeof(CheekyFgDirectShading)},supported{},requested_mode{1},active_mode{},valid{};
-    std::uint32_t grid_width{},grid_height{},output_width{},output_height{};
-    std::uint64_t coarse_frames{},full_frames{};
-};
-using CheekyFgDirectShadingFn=bool(__cdecl*)(CheekyFgDirectShading*);
 struct CheekyFgStorageOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgStorageOptions)};
     std::uint32_t compact{},peripheral_percent{25};
@@ -284,8 +274,8 @@ struct CheekyFgCaptureCropsV2 {
 using CheekyFgCaptureCropsFn=bool(__cdecl*)(CheekyFgCaptureCropsV2*);
 struct CheekyFgTimingValue {double mean{},last{};};
 struct CheekyFgExperimentDiagnostics {
-    std::uint32_t abi{1},size{sizeof(CheekyFgExperimentDiagnostics)},supported{};
-    std::uint32_t color_capture_mode{},upload_mode{},latency_enabled{},latency_valid{};
+    std::uint32_t abi{2},size{sizeof(CheekyFgExperimentDiagnostics)},supported{};
+    std::uint32_t latency_enabled{},latency_valid{};
     std::uint64_t full_color_copies{},direct_eye_copies{},eye_crop_copies{},capture_fallbacks{};
     std::uint64_t upload_copies{},upload_batches{},latency_samples{},latency_rejected{};
     CheekyFgTimingValue queue_entry,capture_dependency,ready_to_fg,gpu_work,gpu_to_observed,enqueue_to_observed,submit_to_observed;

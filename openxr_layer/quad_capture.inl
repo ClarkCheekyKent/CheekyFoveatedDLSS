@@ -395,7 +395,7 @@ extern "C" __declspec(dllexport) uint32_t __cdecl CheekyQuad_SetSavedLayoutV1(co
     try{const auto owner=quad_role_owner();return owner&&owner->d3d11&&owner->d3d11->mapping&&owner->d3d11->mapping->saved_layout(*layout);}catch(...){return 0;}
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyQuadFG_ObserveD3D11V1(const CheekyQuadFgSourceV1* input) noexcept {
-    if(!input||input->abi!=1||input->size!=sizeof(*input)||!input->context)return false;
+    if(!input||input->abi!=2||input->size!=sizeof(*input)||!input->context)return false;
     try{Microsoft::WRL::ComPtr<ID3D11Device> device;static_cast<ID3D11DeviceContext*>(input->context)->GetDevice(&device);
         const auto owner=quad_role_owner(nullptr,device.Get());return owner&&owner->d3d11&&owner->d3d11->fg_guides&&owner->d3d11->fg_guides->observe(*input);
     }catch(...){return false;}
