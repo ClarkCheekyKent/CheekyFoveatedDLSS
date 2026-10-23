@@ -224,6 +224,12 @@ struct CheekyQuadComposeOptions {
     std::uint32_t wait_gpu{1}; // 1 wait for the composition to execute (baseline); 0 only wait on an in-flight recording.
 };
 using CheekyQuadComposeOptionsFn=bool(__cdecl*)(CheekyQuadComposeOptions*);
+// Independent export: native D3D11 FG capture options.
+struct CheekyFgNative11Options {
+    std::uint32_t abi{1},size{sizeof(CheekyFgNative11Options)};
+    std::uint32_t skip_identity_crop{}; // 1 reuse a whole-image eye capture instead of copying it again.
+};
+using CheekyFgNative11OptionsFn=bool(__cdecl*)(CheekyFgNative11Options*);
 // Independent export: older transport/pair layouts remain compatible.
 struct CheekyFgDirectOutput {
     std::uint32_t abi{1},size{sizeof(CheekyFgDirectOutput)},supported{},requested{};

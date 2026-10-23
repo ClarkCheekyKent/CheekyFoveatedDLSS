@@ -950,6 +950,8 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             combo("FG output destination", s.direct_xr_output, "Private image + copy\0Direct OpenXR image (experimental)\0");
             combo("Periphery shading", s.direct_peripheral_shading, "Full-resolution warp\0Coarse blocks\0Coarse grid + bilinear filtering\0");
             ImGui::TextWrapped("Coarse modes shade the periphery once per FG periphery-scale cell instead of once per pixel.");
+            ImGui::Checkbox("Reuse whole-image eye captures (experimental)", &s.native11_skip_identity_crop);
+            ImGui::TextWrapped("Per-eye swapchains and quad views: use the captured eye directly instead of copying it again.");
         }
         if(!native_shader11()){
         ImGui::TextWrapped("Hook-free guide matching is automatic in standalone. Native BackbufferFrameID is omitted.");
@@ -1178,6 +1180,8 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                         ImGui::Checkbox("Transport: single-buffer textures (experimental)", &r.draft.d3d11_transport_single_buffer);
                         ImGui::TextWrapped("Keeps one set of shared textures per eye instead of three. Saves VRAM; the GPU work is already serialized.");
                     }
+                    ImGui::Checkbox("Rescan hooks only when modules load (experimental)", &r.draft.hook_rescan_on_module_change);
+                    ImGui::TextWrapped("The import-table and LibOVR scans run only when the game loads or unloads a DLL, instead of every 250 ms and every second.");
                     ImGui::Checkbox("Wait for quad-view composition (DX12)", &r.draft.d3d12_quad_compose_wait);
                     ImGui::TextWrapped("Off: DX12 quad-view games such as MSFS return from xrEndFrame once the four-view composition is submitted, instead of waiting for the GPU to finish it.");
                     ImGui::Checkbox("Use lower DLSS hook (DX12)", &r.draft.d3d12_lower_hook);

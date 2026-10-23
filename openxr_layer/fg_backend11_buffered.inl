@@ -45,7 +45,8 @@ inline bool BufferedPresenter::prepare_native11(Native& job,const XrCompositionL
             if(found!=composed11.end()){full=found->second.first;captured_at=found->second.second;}}
         else if(const auto found=captured.find(sub.swapchain);found!=captured.end()){full=found->second;captured_at=capture_times[sub.swapchain];}
         if(!full)return false;
-        job.color[eye]=native11->crop(full,sub);if(!job.color[eye])return false;++eye_crop_copies;
+        job.color[eye]=native11->crop(full,sub,native11_skip_identity_crop.load(std::memory_order_relaxed));if(!job.color[eye])return false;
+        if(job.color[eye]!=full)++eye_crop_copies;
         if(!eye||captured_at<job.captured_at)job.captured_at=captured_at;
         job.views[eye]=projection->views[eye];
     }

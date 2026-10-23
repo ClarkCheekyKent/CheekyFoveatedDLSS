@@ -46,6 +46,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // the runtime, so a late presenter is not fed frames it will drop. 2 does
     // that and also phase-locks clock ticks to the runtime xrWaitFrame wakes.
     std::atomic<unsigned> pacing_clock_mode{};
+    std::atomic<bool> native11_skip_identity_crop{}; // Runtime option; native D3D11 eye crops.
     double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
     TimingClock::time_point last_native_present{},runtime_wake{};
     std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{};
@@ -505,6 +506,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     color_capture_mode?"direct-eyes":"full-snapshot",upload_mode?"batched":"per-image",latency_diagnostics?"1-in-17":"OFF");trace(message);
             }
         }
+        const auto native11_query=runtime&&native11?reinterpret_cast<CheekyFgNative11OptionsFn>(GetProcAddress(runtime,"CheekyFG_GetNative11OptionsV1")):nullptr;
+        CheekyFgNative11Options native11_options;
+        if(native11_query&&native11_query(&native11_options)&&native11_skip_identity_crop.exchange(native11_options.skip_identity_crop!=0)!=(native11_options.skip_identity_crop!=0)&&trace)
+            trace(native11_options.skip_identity_crop?"FG native D3D11 whole-image eyes=reuse capture":"FG native D3D11 whole-image eyes=crop copy");
         const auto pacing_query=runtime?reinterpret_cast<CheekyFgPacingOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetPacingOptionsV1")):nullptr;
         CheekyFgPacingOptions pacing;
         if(pacing_query&&pacing_query(&pacing)){

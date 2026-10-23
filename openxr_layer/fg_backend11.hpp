@@ -145,15 +145,20 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     Image copy(ID3D11Texture2D* source,DXGI_FORMAT declared) {
         if(!source)return {};D3D11_TEXTURE2D_DESC d{};source->GetDesc(&d);
         const auto format=capture_format(d.Format,declared);if(format==DXGI_FORMAT_UNKNOWN||d.SampleDesc.Count!=1)return {};
-        d.Format=format;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=0;d.CPUAccessFlags=0;d.MiscFlags=0;
-        auto out=image(d,false);if(!out)return {};
+        // Single images are sampleable, so a whole-image eye needs no crop copy.
+        const bool single=d.ArraySize==1&&d.MipLevels==1;
+        d.Format=format;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=single?D3D11_BIND_SHADER_RESOURCE:0;d.CPUAccessFlags=0;d.MiscFlags=0;
+        auto out=image(d,single);if(!out)return {};
         return submit([&](ID3D11DeviceContext* c){c->CopyResource(out->texture11.Get(),source);return true;},false)?out:Image{};
     }
     // One eye's subimage as an independent, sampleable texture.
-    Image crop(const Image& full,const XrSwapchainSubImage& sub) {
+    Image crop(const Image& full,const XrSwapchainSubImage& sub,bool reuse_whole=false) {
         if(!full||!full->texture11)return {};D3D11_TEXTURE2D_DESC d{};full->texture11->GetDesc(&d);const auto& r=sub.imageRect;
         if(r.offset.x<0||r.offset.y<0||r.extent.width<=0||r.extent.height<=0||sub.imageArrayIndex>=d.ArraySize||
             std::uint64_t(r.offset.x)+r.extent.width>d.Width||std::uint64_t(r.offset.y)+r.extent.height>d.Height)return {};
+        // Per-eye swapchains and composed quad eyes: the capture already is the eye.
+        if(reuse_whole&&full->srv11&&d.ArraySize==1&&d.MipLevels==1&&r.offset.x==0&&r.offset.y==0&&
+            unsigned(r.extent.width)==d.Width&&unsigned(r.extent.height)==d.Height)return full;
         D3D11_TEXTURE2D_DESC e{};e.Width=unsigned(r.extent.width);e.Height=unsigned(r.extent.height);e.MipLevels=e.ArraySize=1;
         e.Format=d.Format;e.SampleDesc.Count=1;e.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         auto out=image(e,true);if(!out)return {};

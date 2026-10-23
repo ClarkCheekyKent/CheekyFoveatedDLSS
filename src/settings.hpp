@@ -61,6 +61,7 @@ struct Settings {
         std::uint32_t guide_capture_mode{1}; // 0 raw snapshots; 1 capture directly into prepared FG guide grids.
         std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.
         std::uint32_t direct_peripheral_shading{1}; // 0 full rate, 1 coarse blocks, 2 filtered coarse grid.
+        bool native11_skip_identity_crop{false}; // Native D3D11: reuse a whole-image eye capture instead of copying it again.
     } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
@@ -69,6 +70,7 @@ struct Settings {
     bool d3d11_transport_shared_guides{false}; // FG and NR-before reuse the peripheral full-frame depth/motion copies.
     bool d3d11_transport_single_buffer{false}; // One set of shared textures instead of one per ring slot.
     bool d3d12_quad_compose_wait{true}; // D3D12 quad views: xrEndFrame waits for the composition GPU work.
+    bool hook_rescan_on_module_change{false}; // Import-table/LibOVR scans only when the loaded-module list changes.
     bool peripheral_dlaa_enabled{true};
     float peripheral_dlaa_scale{0.75F};
     std::uint32_t center_preset{};
