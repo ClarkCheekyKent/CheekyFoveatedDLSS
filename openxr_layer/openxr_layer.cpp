@@ -1111,11 +1111,17 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         if (shared_mutex) static_cast<void>(shared_mutex->ReleaseSync(0));
         static_cast<IUnknown*>(frame.texture)->Release();
     };
+    // MSFS's mirror and XR devices are one D3D12 device behind a proxy
+    // (Streamline): pointers differ, but resources and queues interoperate.
+    const bool same_device = frame.device == state.graphics_device ||
+        (frame.graphics_api == 12 && state.graphics_api == 12 && frame.device && state.graphics_device &&
+         cheeky::foveated_dlss::same_d3d12_device(static_cast<ID3D12Device*>(frame.device),
+             static_cast<ID3D12Device*>(state.graphics_device)));
     if (!frame.texture || frame.graphics_api != state.graphics_api ||
-        frame.device != state.graphics_device ||
+        !same_device ||
         (state.graphics_api == 12 && (!frame.queue || !state.graphics_queue))) {
         report_menu_status(frame.graphics_api != state.graphics_api ? cheeky_xr_menu_graphics_mismatch :
-            frame.device != state.graphics_device ? cheeky_xr_menu_device_mismatch : cheeky_xr_menu_copy_failed);
+            !same_device ? cheeky_xr_menu_device_mismatch : cheeky_xr_menu_copy_failed);
         static bool reported_d3d12_devices{};
         if (frame.graphics_api == 12 && state.graphics_api == 12 && frame.device != state.graphics_device &&
             frame.device && state.graphics_device && !std::exchange(reported_d3d12_devices, true)) {
@@ -1130,6 +1136,9 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         if (frame.texture) release_source();
         return end(info);
     }
+    // Build the menu converter on the XR device itself, never on its proxy:
+    // its command lists execute on the runtime's queue.
+    frame.device = state.graphics_device;
     if (state.menu_recenter_time && info->displayTime >= state.menu_recenter_time) {
         state.menu.anchored = false;
         state.menu_recenter_time = 0;
