@@ -24,6 +24,7 @@
 #include "../shared/openxr_menu_bridge.hpp"
 #include "menu_geometry.hpp"
 #include "../src/realvr_runtime.hpp"
+#include "../src/d3d12_native.hpp"
 #include <wrl/client.h>
 #include <deque>
 
@@ -37,6 +38,7 @@
 #include <cwchar>
 #include <cmath>
 #include <mutex>
+#include <shared_mutex>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -657,7 +659,66 @@ bool initialize_menu_converter12(SessionState::Menu& menu, ID3D12Device* device)
     return true;
 }
 
+// FG presenters submit runtime frames from their own thread, more than one per
+// app frame. The app thread copies the menu and publishes its ready layer here;
+// the presenter's runtime xrEndFrame appends it to every frame it submits.
+struct PublishedMenu {
+    PFN_xrEndFrame next{};
+    XrSwapchain swapchain{XR_NULL_HANDLE};
+    std::uint32_t max_layers{};
+    bool cylinder{};
+    XrCompositionLayerCylinderKHR cylinder_layer{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+    std::vector<XrCompositionLayerQuad> strips;
+};
+std::mutex published_menu_mutex;
+// Shared while a presenter submits; exclusive before a menu swapchain is destroyed.
+std::shared_mutex published_menu_lifetime;
+std::unordered_map<XrSession, PublishedMenu> published_menus;
+
+void register_presenter_end_frame(const XrSession session, const PFN_xrEndFrame next) {
+    std::lock_guard lock(published_menu_mutex);
+    auto& published = published_menus[session];
+    published = {};
+    published.next = next;
+}
+
+void unpublish_menu(const XrSession session) {
+    std::lock_guard lock(published_menu_mutex);
+    const auto found = published_menus.find(session);
+    if (found != published_menus.end()) found->second.swapchain = XR_NULL_HANDLE;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL presenter_end_frame_with_menu(
+    const XrSession session, const XrFrameEndInfo* const info) {
+    std::shared_lock lifetime(published_menu_lifetime);
+    PublishedMenu menu;
+    {
+        std::lock_guard lock(published_menu_mutex);
+        const auto found = published_menus.find(session);
+        if (found == published_menus.end() || !found->second.next) return XR_ERROR_HANDLE_INVALID;
+        menu = found->second;
+    }
+    const auto count = menu.cylinder ? 1U : static_cast<std::uint32_t>(menu.strips.size());
+    if (!info || menu.swapchain == XR_NULL_HANDLE || !count || (info->layerCount && !info->layers) ||
+        info->layerCount + count > menu.max_layers) return menu.next(session, info);
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    if (info->layerCount) layers.assign(info->layers, info->layers + info->layerCount);
+    if (menu.cylinder) layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu.cylinder_layer));
+    else for (const auto& strip : menu.strips) layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&strip));
+    auto forwarded = *info;
+    forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
+    forwarded.layers = layers.data();
+    return menu.next(session, &forwarded);
+}
+
 void destroy_menu(SessionState::Menu& menu, const Dispatch& dispatch) noexcept {
+    if (menu.swapchain != XR_NULL_HANDLE) {
+        // Wait out a presenter submission that may still reference this swapchain.
+        std::unique_lock lifetime(published_menu_lifetime);
+        std::lock_guard lock(published_menu_mutex);
+        for (auto& published : published_menus)
+            if (published.second.swapchain == menu.swapchain) published.second.swapchain = XR_NULL_HANDLE;
+    }
     if (menu.swapchain != XR_NULL_HANDLE && dispatch.destroy_swapchain)
         static_cast<void>(dispatch.destroy_swapchain(menu.swapchain));
     menu = {};
@@ -677,7 +738,9 @@ bool anchor_menu(SessionState& session, const Dispatch& dispatch,
     const CheekyOpenXRMenuFrame& frame, const XrTime time) {
     auto& menu = session.menu;
     XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
-    locate.viewConfigurationType = session.view_configuration;
+    // The runtime only knows stereo when the layer composes an app's quad views.
+    locate.viewConfigurationType = session.quad_capture ?
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO : session.view_configuration;
     locate.displayTime = time;
     locate.space = session.calibration_local_space;
     XrViewState view_state{XR_TYPE_VIEW_STATE};
@@ -988,28 +1051,36 @@ void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
     }
 }
 
-XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
-    const Dispatch& dispatch, SessionState& state) {
-    if (!dispatch.end_frame || !info || !state.running ||
-        state.view_configuration != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO ||
+// Copies the open F8 menu into its swapchain, then hands the frame to `end`
+// (the runtime, the FG presenter or the quad compositor). Without a presenter
+// the menu layer follows the app's layers here; a presenter instead takes the
+// published layer into each runtime frame it submits.
+template <class EndFrame>
+XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
+    SessionState& state, const bool presenter, EndFrame&& end) {
+    // Quad sessions reach the runtime as stereo after composition.
+    if (!info || !state.running ||
+        (state.view_configuration != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO && !state.quad_capture) ||
         (state.graphics_api != 11 && state.graphics_api != 12))
-        return dispatch.end_frame(session, info);
+        return end(info);
     const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
     const auto acquire = host ? reinterpret_cast<CheekyOpenXRMenuAcquire>(
         GetProcAddress(host, "CheekyOpenXRMenuAcquireFrame")) : nullptr;
-    if (!acquire) return dispatch.end_frame(session, info);
+    if (!acquire) return end(info);
     CheekyOpenXRMenuFrame frame{};
     if (!acquire(&frame)) {
         { std::lock_guard lock(state_mutex); state.diagnostic_menu_visible = false; }
         state.menu.anchored = false; // Reopening places the panel in front of the current head pose.
         state.menu_pointer_hand = -1;
         state.menu_submission_disabled = false;
-        return dispatch.end_frame(session, info);
+        unpublish_menu(state.session);
+        return end(info);
     }
     { std::lock_guard lock(state_mutex); state.diagnostic_menu_visible = true; }
     if (state.menu_submission_disabled) {
         if (frame.texture) static_cast<IUnknown*>(frame.texture)->Release();
-        return dispatch.end_frame(session, info);
+        unpublish_menu(state.session);
+        return end(info);
     }
     Microsoft::WRL::ComPtr<IDXGIKeyedMutex> shared_mutex;
     if (frame.texture && frame.graphics_api == 11 && state.graphics_api == 11 &&
@@ -1029,7 +1100,7 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
                 report_menu_status(cheeky_xr_menu_copy_failed);
             }
             static_cast<IUnknown*>(frame.texture)->Release();
-            return dispatch.end_frame(session, info);
+            return end(info);
         }
         static_cast<IUnknown*>(frame.texture)->Release();
         frame.texture = texture;
@@ -1045,8 +1116,19 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
         (state.graphics_api == 12 && (!frame.queue || !state.graphics_queue))) {
         report_menu_status(frame.graphics_api != state.graphics_api ? cheeky_xr_menu_graphics_mismatch :
             frame.device != state.graphics_device ? cheeky_xr_menu_device_mismatch : cheeky_xr_menu_copy_failed);
+        static bool reported_d3d12_devices{};
+        if (frame.graphics_api == 12 && state.graphics_api == 12 && frame.device != state.graphics_device &&
+            frame.device && state.graphics_device && !std::exchange(reported_d3d12_devices, true)) {
+            // A proxy (Streamline, ReShade) can wrap one of the two; record whether
+            // they are one underlying device before the menu can bridge them.
+            char message[192]{};
+            std::snprintf(message, sizeof(message), "OpenXR menu: D3D12 mirror device %p, XR device %p, same underlying device %u",
+                frame.device, state.graphics_device, unsigned(cheeky::foveated_dlss::same_d3d12_device(
+                    static_cast<ID3D12Device*>(frame.device), static_cast<ID3D12Device*>(state.graphics_device))));
+            report_menu_diagnostic(message);
+        }
         if (frame.texture) release_source();
-        return dispatch.end_frame(session, info);
+        return end(info);
     }
     if (state.menu_recenter_time && info->displayTime >= state.menu_recenter_time) {
         state.menu.anchored = false;
@@ -1054,11 +1136,11 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
         report_menu_diagnostic("OpenXR menu: reanchoring after runtime recenter");
     }
     if (!initialize_menu(state, dispatch, frame, info->displayTime)) {
-        release_source(); return dispatch.end_frame(session, info);
+        release_source(); return end(info);
     }
     auto& menu = state.menu;
     const auto available_layers = state.max_layers > info->layerCount ? state.max_layers - info->layerCount : 0U;
-    if (!available_layers) { release_source(); return dispatch.end_frame(session, info); }
+    if (!available_layers) { release_source(); return end(info); }
     menu.cylinder = state.menu_cylinder_enabled;
     menu.strips = menu.cylinder ? 1U : cheeky::xr_menu::fallback_layers(available_layers);
     if (menu.fence_value == 0 && state.graphics_api == 12)
@@ -1070,14 +1152,14 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
     if (!dispatch.acquire_swapchain_image || !dispatch.wait_swapchain_image || !dispatch.release_swapchain_image ||
         XR_FAILED(dispatch.acquire_swapchain_image(menu.swapchain, &acquire_info, &index))) {
         report_menu_status(cheeky_xr_menu_image_failed);
-        release_source(); return dispatch.end_frame(session, info);
+        release_source(); return end(info);
     }
     const XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, XR_INFINITE_DURATION};
     if (XR_FAILED(dispatch.wait_swapchain_image(menu.swapchain, &wait_info))) {
         report_menu_status(cheeky_xr_menu_image_failed);
         const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
-        release_source(); return dispatch.end_frame(session, info);
+        release_source(); return end(info);
     }
     // Runtime availability does not imply our previous queue submission has
     // completed yet. A busy allocator is backpressure, not a permanent copy
@@ -1088,7 +1170,7 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
         const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
         release_source();
-        return dispatch.end_frame(session, info);
+        return end(info);
     }
     bool copied{};
     const char* copy_failure_stage = "image, allocator or fence not ready";
@@ -1189,7 +1271,7 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
             state.menu_submission_disabled = true;
         }
         report_menu_status(copied ? cheeky_xr_menu_image_failed : cheeky_xr_menu_copy_failed);
-        return dispatch.end_frame(session, info);
+        return end(info);
     }
     std::vector<const XrCompositionLayerBaseHeader*> layers;
     if (info->layerCount && info->layers) layers.assign(info->layers, info->layers + info->layerCount);
@@ -1233,10 +1315,25 @@ XrResult submit_menu_frame(const XrSession session, const XrFrameEndInfo* info,
             layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
         }
     }
+    if (presenter) {
+        {
+            std::lock_guard lock(published_menu_mutex);
+            auto& published = published_menus[state.session];
+            published.swapchain = menu.swapchain;
+            published.max_layers = state.max_layers;
+            published.cylinder = menu.cylinder;
+            published.cylinder_layer = cylinder;
+            published.strips = strips;
+        }
+        const auto result = end(info);
+        report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
+        return result;
+    }
+    unpublish_menu(state.session);
     auto forwarded = *info;
     forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
     forwarded.layers = layers.data();
-    const auto result = dispatch.end_frame(session, &forwarded);
+    const auto result = end(&forwarded);
     report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
     return result;
 }
@@ -3618,7 +3715,9 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
         fn.create=d.create_swapchain;fn.destroy=d.destroy_swapchain;
         fn.enumerate=d.enumerate_swapchain_images;fn.acquire=d.acquire_swapchain_image;
         fn.wait_image=d.wait_swapchain_image;fn.release=d.release_swapchain_image;
-        fn.wait_frame=d.wait_frame;fn.begin_frame=d.begin_frame;fn.end_frame=d.end_frame;
+        fn.wait_frame=d.wait_frame;fn.begin_frame=d.begin_frame;
+        // The presenter's runtime frames carry the F8 menu's published layer.
+        register_presenter_end_frame(owner.session,d.end_frame);fn.end_frame=presenter_end_frame_with_menu;
         if(owner.graphics_api==11&&native_shader11){
             // Same buffered pacing as DLSS-G; native D3D11 GPU stages, no bridge.
             auto candidate=std::make_shared<cheeky::fg::BufferedPresenter>();
@@ -4069,7 +4168,15 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
         }
     }
     if(quad){
-        const auto result=quad_capture_end(session,frame_end_info,quad_dispatch,quad,quad_presenter);
+        std::unique_lock menu_lock(menu_mutex);
+        SessionState* menu_session{};
+        {std::lock_guard lock(state_mutex);const auto found=sessions.find(session);if(found!=sessions.end())menu_session=&found->second;}
+        const auto compose=[&](const XrFrameEndInfo* info){
+            // The menu is ready; composition and FG pacing must not hold up recenter or teardown.
+            if(menu_lock.owns_lock())menu_lock.unlock();
+            return quad_capture_end(session,info,quad_dispatch,quad,quad_presenter);};
+        const auto result=menu_session?submit_menu_frame(frame_end_info,quad_dispatch,*menu_session,bool(quad_presenter),compose)
+                                      :compose(frame_end_info);
         if(trace_transition())log_startup("FG-TRANSITION xrEndFrame quad thread=%lu path=%s result=%d\n",GetCurrentThreadId(),
             quad_presenter?"presenter":"native",int(result));
         if(XR_SUCCEEDED(result)){std::lock_guard lock(state_mutex);auto found=sessions.find(session);if(found!=sessions.end()){
@@ -4132,10 +4239,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
             }
         }
     }
-    const auto result = presenter
-        ? presenter->end_frame(frame_end_info,release_indices,fg_projection)
-        : menu_session ? submit_menu_frame(session,frame_end_info,menu_dispatch,*menu_session)
-                       : next(session,frame_end_info);
+    const auto downstream=[&](const XrFrameEndInfo* info){
+        return presenter?presenter->end_frame(info,release_indices,fg_projection):next(session,info);};
+    const auto result = menu_session ? submit_menu_frame(frame_end_info,menu_dispatch,*menu_session,bool(presenter),downstream)
+                                     : downstream(frame_end_info);
     menu_lock.unlock();
     std::unique_lock lock(state_mutex);
     if(native_end && XR_SUCCEEDED(result)) {

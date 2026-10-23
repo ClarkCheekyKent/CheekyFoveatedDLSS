@@ -331,6 +331,28 @@ XrResult XRAPI_CALL bound_host_trigger(XrSession, const XrActionStateGetInfo* in
     check(info->subactionPath == 401 || info->subactionPath == 402, "Fallback trigger lost subaction");
     output->isActive = XR_TRUE; output->currentState = fallback_trigger[info->subactionPath - 401]; return XR_SUCCESS;
 }
+std::uint32_t presenter_menu_layers{};
+XrResult XRAPI_CALL count_presenter_layers(XrSession, const XrFrameEndInfo* info) {
+    presenter_menu_layers = info ? info->layerCount : 0; return XR_SUCCESS;
+}
+void presenter_menu_layer_test() {
+    // FG presenters submit runtime frames themselves; the open F8 menu must ride along.
+    const auto session = h<XrSession>(7700);
+    register_presenter_end_frame(session, count_presenter_layers);
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
+    check(XR_SUCCEEDED(presenter_end_frame_with_menu(session, &end)) && presenter_menu_layers == 0, "closed menu added a presenter layer");
+    {
+        std::lock_guard lock(published_menu_mutex);
+        auto& published = published_menus[session];
+        published.swapchain = h<XrSwapchain>(7701); published.max_layers = 16; published.cylinder = true;
+    }
+    presenter_end_frame_with_menu(session, &end);
+    check(presenter_menu_layers == 1, "presenter frame lost the open menu");
+    SessionState::Menu menu; menu.swapchain = h<XrSwapchain>(7701);
+    destroy_menu(menu, Dispatch{});
+    presenter_end_frame_with_menu(session, &end);
+    check(presenter_menu_layers == 0, "presenter submitted a destroyed menu swapchain");
+}
 void custom_binding_menu_test() {
     reset();
     auto& inst = instances.at(instance);
@@ -1137,7 +1159,7 @@ int main(int argc,char** argv) {
         if(argc>1 && std::string(argv[1])=="--fg-d3d11") {fg_d3d11_validation();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-crop-gpu-validation") {fg_copy_validation_test(false);return 0;}
-        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
+        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); presenter_menu_layer_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }
