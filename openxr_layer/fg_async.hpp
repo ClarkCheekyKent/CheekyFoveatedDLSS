@@ -51,6 +51,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     TimingClock::time_point last_native_present{},runtime_wake{};
     std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{};
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
+    // Hold mx. Follow modes slow the clock only while game frames are being
+    // dropped. Without drops the presented rate is the game's own rate, and
+    // following it would cap the game below the display rate.
+    std::uint64_t follow_game_mark{},follow_shown_mark{};
+    TimingClock::time_point follow_window_start{};
+    bool follow_dropping{};
     // Native D3D11 frames carry no release policy (point 0: release the game
     // at FG submission). Nonzero applies that release point to them instead.
     std::atomic<bool> direct11_requested{};
@@ -420,7 +426,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;submit_repeat_frames=true;
         distinct_native=repeated_presentations=runtime_submissions=0;
-        presented_native_ms=native_clock_ms=0;last_native_present=runtime_wake={};runtime_wakes=adapted_ticks=phase_corrections=0;
+        presented_native_ms=native_clock_ms=0;last_native_present=runtime_wake={};
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -516,7 +523,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const auto mode=std::min(pacing.clock_mode,2u);
             if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
                 mode==1u?"FG pacing clock=presented native rate":"FG pacing clock=independent display clock");
-            const auto point=std::min(pacing.native11_release_point,4u);
+            const auto point=std::min(pacing.native11_release_point,5u);
             if(native11_release_point.exchange(point)!=point&&trace){char message[96]{};
                 sprintf_s(message,"FG native D3D11 release point=%u (3 = after generated frame submission)",point);trace(message);}
         }
@@ -663,7 +670,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 native.native=native.current=job->color;native.native_views=native.current_views=job->views;
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
                 latest_native=std::move(native);
-                if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),4u);
+                if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),5u);
                 if(inference_slot){pending.push_back(job);while(pending.size()>2){pending.front()->clear_guides();pending.pop_front();++skipped;}}
                 ++frames;held_valid=true;changed.notify_all();
             }
@@ -717,7 +724,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     {std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;}
                     if(release_policy_known)backend->reset_statistics(true);
                     last_release_point=point;
-                    if(trace)trace(point==3u?"FG native release=after generated frame OpenXR submission (Lua; histories retained)":
+                    if(trace)trace(point==5u?"FG native release=never held (display clock only; FG fits around the game)":
+                        point==3u?"FG native release=after generated frame OpenXR submission (Lua; histories retained)":
                         point==2u?"FG native release=after stereo GPU completion (Lua; histories retained)":
                         point==1u?"FG native release=after both-eye GPU preparation (Lua; histories retained)":
                         point==4u?"FG native release=4 ms after FG command submission (Lua; CPU timer, no GPU wait)":
@@ -877,10 +885,17 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
                     double native_ms=std::max(1.,display_ms*(pacing_active?2.:1.));
+                    if(follow_window_start==TimingClock::time_point{}||now-follow_window_start>=std::chrono::milliseconds(500)) {
+                        // More than 5% of rendered frames never reached the runtime.
+                        const auto rendered=native_count-std::min(native_count,follow_game_mark);
+                        const auto shown=distinct_native-std::min(distinct_native,follow_shown_mark);
+                        follow_dropping=follow_window_start!=TimingClock::time_point{}&&rendered>shown+std::max<std::uint64_t>(1,rendered/20);
+                        follow_game_mark=native_count;follow_shown_mark=distinct_native;follow_window_start=now;
+                    }
                     // Stay 8% faster than the measured presentation rate so
                     // the clock keeps probing upward and returns to the
                     // display rate as soon as the presenter catches up.
-                    if(mode!=0u&&pacing_active&&presented_native_ms*.92>native_ms){
+                    if(mode!=0u&&pacing_active&&follow_dropping&&presented_native_ms*.92>native_ms){
                         native_ms=std::min(presented_native_ms*.92,display_ms*4.);++adapted_ticks;}
                     native_clock_ms=native_ms;
                     const auto period=std::chrono::duration_cast<TimingClock::duration>(
@@ -900,8 +915,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
+    // Release point 5 never holds the game: its jobs neither gate nor defer credits.
     bool unsubmitted_native() const noexcept {
-        return inflight_id>submitted_native_id||(!pending.empty()&&pending.back()->id>submitted_native_id);
+        return (inflight_id>submitted_native_id&&inflight_release_point!=5u)||
+            (!pending.empty()&&pending.back()->id>submitted_native_id&&pending.back()->policy.release_point!=5u);
     }
     bool release_gate_active() const noexcept {
         // Hold mx. Inspect pending jobs as well as the worker's latched policy
@@ -909,10 +926,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(stopping||raw||degraded)return false;
         if(awaiting_generated_submission)return true;
         if(release_delay_until!=TimingClock::time_point{}&&TimingClock::now()<release_delay_until)return true;
-        if(inflight_id&&(inflight_id>submitted_native_id||inflight_release_point==2u||inflight_release_point==3u||
+        if(inflight_id&&inflight_release_point!=5u&&(inflight_id>submitted_native_id||inflight_release_point==2u||inflight_release_point==3u||
             (inflight_release_point==1u&&!inflight_prepared)))return true;
         return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
-            return job->guides_valid&&(job->policy.release_point!=0||job->id>submitted_native_id);
+            return job->guides_valid&&job->policy.release_point!=5u&&(job->policy.release_point!=0||job->id>submitted_native_id);
         });
     }
     bool generated_submission_pending() const noexcept {
@@ -1248,7 +1265,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
                     const auto c=cadence();
                     sprintf_s(cadence_log,"FG experiment cadence: release=%s repeats=%s queue=%s clock=%s clock_ms=%.3f valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f repeated=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f",
-                        active_release_point==3u?"generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
+                        active_release_point==5u?"never":active_release_point==3u?"generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
                         submit_repeat_frames?"ON":"OFF",queue_mode_name(reported_queue_mode),
                         pacing_clock_mode==2u?"presented+phase":pacing_clock_mode==1u?"presented":"independent",native_clock_ms,c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.repeat_fps,c.submission_fps,
                         xr_wait.mean(),runtime_end.mean(),present_cpu.mean());

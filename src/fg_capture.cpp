@@ -748,7 +748,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     out->clock_mode=fg.pacing_clock<=2u?fg.pacing_clock:0u;
     // Native D3D11 follows the shared release setting (default: after the
     // generated frame is submitted), like the D3D12 path.
-    out->native11_release_point=fg.release_point<=4u?fg.release_point:3u;return true;
+    out->native11_release_point=fg.release_point<=5u?fg.release_point:3u;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetNative11OptionsV1(CheekyFgNative11Options* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
@@ -849,7 +849,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
     out->diagnostic_mode=mode;
     out->enable_frame_id=!hookless_selected(settings)&&settings.backbuffer_frame_id ? 1u : 0u;
     out->fg_queue_priority=settings.queue_priority <= 2u ? settings.queue_priority : 1u;
-    out->release_point=settings.release_point<=4u?settings.release_point:0u;
+    out->release_point=settings.release_point<=5u?settings.release_point:0u;
     out->submit_repeats=settings.submit_repeats?1u:0u;
     return true;
 }

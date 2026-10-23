@@ -942,8 +942,10 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         }
         combo("Release game rendering", s.release_point,
-            "After FG submission\0After GPU preparation\0After FG completion\0After generated frame submission\0" "4 ms after FG submission\0");
-        if (s.release_point != 3)
+            "After FG submission\0After GPU preparation\0After FG completion\0After generated frame submission\0" "4 ms after FG submission\0" "Never (display clock only)\0");
+        if (s.release_point == 5)
+            ImGui::TextWrapped("Experimental: the game is paced only by the headset clock and never waits for frame generation. Generated frames may arrive later; best when the GPU is the limit.");
+        else if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.");
         ImGui::Checkbox("Submit repeat frames", &s.submit_repeats);
         if(native_shader11()){

@@ -114,7 +114,7 @@ void settings_tests(const std::filesystem::path& root) {
             "FG settings validate types");
         require(set_named_setting(fg,"FgReleasePoint","1")&&fg.fg.release_point==1&&
             set_named_setting(fg,"FgReleasePoint","3")&&set_named_setting(fg,"FgReleasePoint","4")&&fg.fg.release_point==4&&
-            !set_named_setting(fg,"FgReleasePoint","5")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
+            set_named_setting(fg,"FgReleasePoint","5")&&fg.fg.release_point==5&&!set_named_setting(fg,"FgReleasePoint","6")&&!set_named_setting(fg,"FgReleasePoint","-1")&&
             set_named_setting(fg,"FgSubmitRepeats","false")&&!fg.fg.submit_repeats,"Release points and repeat experiment validate");
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
         require(!fg.fg.hookless_mode3&&set_named_setting(fg,"FgHooklessMode3","true")&&fg.fg.hookless_mode3&&

@@ -484,6 +484,16 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         check(ordered.credits==0,"Shutdown must not release a deferred render credit");
     }
     {
+        // Release point 5 never holds the game: unsubmitted jobs neither gate nor defer.
+        P free;free.started=true;free.pacing_active=true;
+        auto job=std::make_shared<P::Native>();job->id=5;job->guides_valid=true;job->policy.release_point=5;
+        free.pending.push_back(job);
+        check(!free.release_gate_active()&&!free.unsubmitted_native(),"Never-hold release ignores a pending unsubmitted job");
+        free.pending.clear();free.inflight_id=5;free.inflight_release_point=5;free.submitted_native_id=4;
+        check(!free.release_gate_active()&&!free.unsubmitted_native(),"Never-hold release ignores an in-flight unsubmitted job");
+        free.inflight_id=0;
+    }
+    {
         P held;held.started=true;held.credits=2;held.pacing_active=true;held.ticks=2;
         auto job=std::make_shared<P::Native>();job->id=5;job->guides_valid=true;job->policy.release_point=2;
         held.pending.push_back(job);held.wake_producer();
