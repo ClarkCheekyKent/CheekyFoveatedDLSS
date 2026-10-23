@@ -182,7 +182,8 @@ struct BufferedBackend11 final : FrameBackend {
     void reset_generation() override {}
     // The bidirectional shader still samples previous-interval depth.
     void retire_guides(BufferedNative&) override {}
-    void reset_statistics(bool) override {owner.native11->gpu_timings.reset();}
+    void reset_statistics(bool) override {owner.native11->gpu_timings.reset();owner.native11->capture_timings.reset();
+        owner.native11->guide_timings.reset();owner.native11->upload_timings.reset();}
     GenerationStatus generation_status() const override {return {false,false,0,owner.native11->diagnostic};}
     void snapshot(CheekyFgPerformance& performance,CheekyFgOverhead& overhead,
         CheekyFgExperimentDiagnostics& experiments) const override {

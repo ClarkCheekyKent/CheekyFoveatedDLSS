@@ -148,6 +148,9 @@ void fg_snapshot_validation(ID3D12Device* device) {
         read_retained();release(pair);mapped.retire();wait();
     };
     start_mapped();record_mapped(0,11);record_mapped(1,11);submit_mapped();acquire_mapped(true);
+    mapped.collect_completed();const auto standalone_guide_gpu=mapped.capture_gpu();
+    check(standalone_guide_gpu.samples==1&&standalone_guide_gpu.mean>0,
+        "Standalone guide timestamps are grouped by the matched stereo pair even without a game-frame ticket");
     start_mapped();record_mapped(0,11);record_mapped(1,11);submit_mapped();acquire_mapped(false);
     start_mapped();record_mapped(1,11);record_mapped(0,11);submit_mapped();acquire_mapped(true);
     start_mapped();record_mapped(1,11);record_mapped(0,11);submit_mapped();acquire_mapped(false);

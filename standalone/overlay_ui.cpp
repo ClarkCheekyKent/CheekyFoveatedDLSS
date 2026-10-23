@@ -3,6 +3,7 @@
 #include "version.h"
 #include "cheeky_gaze_abi.h"
 #include <imgui.h>
+#include <shellapi.h>
 #include <array>
 #include <algorithm>
 #include <cfloat>
@@ -13,6 +14,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#pragma comment(lib, "shell32.lib")
 void report_openxr_menu_diagnostic(const char*) noexcept;
 namespace cheeky::standalone {
 using namespace cheeky::foveated_dlss;
@@ -1017,8 +1019,8 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             if (stages) {
                 double capture{}, capture_last{};
                 stage("Guide capture (per real frame)", "guide_samples", "guide_ms", "guide_last_ms", capture, capture_last);
-                stage("Color capture + guide handoff (per real frame)", "capture_samples", "capture_ms", "capture_last_ms", capture, capture_last);
-                row("  Capture subtotal", capture, capture_last, number(extra,"guide_samples")>0&&number(extra,"capture_samples")>0);
+                stage(native_shader11()?"Color capture / eye crop (per copy)":"Color capture + guide handoff (per real frame)", "capture_samples", "capture_ms", "capture_last_ms", capture, capture_last);
+                if(!native_shader11())row("  Capture subtotal", capture, capture_last, number(extra,"guide_samples")>0&&number(extra,"capture_samples")>0);
                 sum += capture; sum_last += capture_last;
             }
             if(native_shader11())row("Shader generation (center + periphery)",number(gpu,"total_ms"),number(gpu,"total_last_ms"));
@@ -1031,15 +1033,17 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             sum += number(gpu, "total_ms"); sum_last += number(gpu, "total_last_ms");
             if (stages) {
                 double present{}, present_last{};
-                stage("Generated output copy (per generated frame)", "publication_samples", "publication_ms", "publication_last_ms", present, present_last);
-                stage("OpenXR uploads (per presentation)", "upload_samples", "upload_ms", "upload_last_ms", present, present_last);
+                if(!native_shader11())stage("Generated output copy (per generated frame)", "publication_samples", "publication_ms", "publication_last_ms", present, present_last);
+                stage(native_shader11()?"OpenXR image copy (per copy)":"OpenXR uploads (per presentation)", "upload_samples", "upload_ms", "upload_last_ms", present, present_last);
+                if(!native_shader11()){
                 row("  Presentation subtotal", present, present_last, number(extra,"publication_samples")>0&&number(extra,"upload_samples")>0);
                 sum += present; sum_last += present_last;
                 row("Measured GPU stage sum", sum, sum_last, number(extra,"guide_samples")>0&&number(extra,"capture_samples")>0&&number(extra,"publication_samples")>0&&number(extra,"upload_samples")>0);
+                }
             }
             ImGui::EndTable();
         }
-        ImGui::TextWrapped(native_shader11()?"GPU shader time for both eyes, with center and periphery measured together. Capture, copies and runtime work are excluded.":
+        ImGui::TextWrapped(native_shader11()?"Shader time covers both eyes. Copy times are per copy. Runtime work is excluded.":
             "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.");
     } else if (!flag(gpu, "gpu_supported") && number(gpu, "gpu_samples") == 0)
         ImGui::TextWrapped("GPU timestamps unavailable or FG has not started.");
@@ -1116,6 +1120,37 @@ void draw_system_load(std::string_view snapshot) {
         ImGui::Text("FPS: %.1f game present",1000./ms);
 }
 
+void draw_donate_button(OverlayUiState& state) {
+    // Do not remove this donation button or change its original destination when
+    // this project is forked or integrated into another project.
+    constexpr auto url = L"https://linktr.ee/clarkcheekykent";
+    const float font = ImGui::GetFontSize();
+    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(214, 61, 85, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(232, 77, 102, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(184, 43, 66, 255));
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 255, 255, 255));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, font * .3F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(.73F, .5F));
+    const bool clicked = ImGui::Button("Donate", ImVec2(font * 6.6F, font * 1.7F));
+    test_control("Donate");
+    const auto min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
+    auto* draw = ImGui::GetWindowDrawList();
+    const float size = font * .95F;
+    const ImVec2 origin(min.x + font * .55F, (min.y + max.y - size) * .5F);
+    const auto point = [&](float x, float y) { return ImVec2(origin.x + x * size, origin.y + y * size); };
+    draw->PathLineTo(point(.5F, .95F));
+    draw->PathBezierCubicCurveTo(point(.35F, .8F), point(-.05F, .5F), point(.03F, .25F));
+    draw->PathBezierCubicCurveTo(point(.08F, -.02F), point(.38F, -.06F), point(.5F, .2F));
+    draw->PathBezierCubicCurveTo(point(.62F, -.06F), point(.92F, -.02F), point(.97F, .25F));
+    draw->PathBezierCubicCurveTo(point(1.05F, .5F), point(.65F, .8F), point(.5F, .95F));
+    draw->PathFillConcave(IM_COL32(255, 255, 255, 255));
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(4);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("https://linktr.ee/clarkcheekykent");
+    if (clicked && reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+        state.message = "Could not open the donation page in your browser.";
+}
+
 void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState& input,const char* renderer,const char* status,bool& open) {
     refresh(r, runtime);
     if (const auto rebound = consume_menu_key_rebind(input)) {
@@ -1131,9 +1166,20 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
     ImGui::SetNextWindowSizeConstraints(ImVec2(420, 300), ImVec2(FLT_MAX, FLT_MAX));
     if (ImGui::Begin("Cheeky Foveated DLSS###CheekyStandalone", &open, ImGuiWindowFlags_NoCollapse)) {
         const auto key_name = menu_key_name(input.menu_key.load());
-        ImGui::TextDisabled("v" CHEEKY_VERSION " | %s | %s | %s to close",
-            runtime.host_name ? runtime.host_name : "Standalone", renderer, key_name.c_str());
-        draw_system_load(r.snapshot);
+        if (ImGui::BeginTable("header", 2, ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Support", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 6.6F);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushTextWrapPos(0);
+            ImGui::TextDisabled("v" CHEEKY_VERSION " | %s | %s | %s to close",
+                runtime.host_name ? runtime.host_name : "Standalone", renderer, key_name.c_str());
+            draw_system_load(r.snapshot);
+            ImGui::PopTextWrapPos();
+            ImGui::TableNextColumn();
+            draw_donate_button(r);
+            ImGui::EndTable();
+        }
         // Routine confirmations stay hidden; errors and action results still show.
         if (!r.message.empty() && r.message != "Settings applied" && !r.message.starts_with("Ready."))
             ImGui::TextWrapped("%s", r.message.c_str());

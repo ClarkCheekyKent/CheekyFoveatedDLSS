@@ -198,9 +198,9 @@ inline void fg_backend11_pipelined(bool direct=false){
     }
     // Disable exactly as xrWaitFrame does, while the render thread may still
     // own the last frame: finish application frames, then drain.
-    std::uint64_t generated{},native{},repeats{};bool fresh_only{};CheekyFgPerformance gpu;
+    std::uint64_t generated{},native{},repeats{};bool fresh_only{};CheekyFgPerformance gpu;CheekyFgOverhead overhead;
     {std::lock_guard lock(p.mx);generated=p.generated_count;native=p.native_count;
-        repeats=p.repeated_presentations;fresh_only=!p.submit_repeat_frames;gpu=p.performance();}
+        repeats=p.repeated_presentations;fresh_only=!p.submit_repeat_frames;gpu=p.performance();overhead=p.overhead();}
     auto disable=std::async(std::launch::async,[&]{p.finish_application_frame();p.invalidate_temporal();});
     const bool disabled=disable.wait_for(std::chrono::seconds(5))==std::future_status::ready;
     if(!disabled){std::cerr<<"backend11 disable hung\n";std::_Exit(3);}
@@ -217,6 +217,9 @@ inline void fg_backend11_pipelined(bool direct=false){
     check(gpu.gpu_supported&&gpu.gpu_valid&&gpu.gpu_samples>0&&gpu.window_samples>0&&
         gpu.total_ms>0&&gpu.total_last_ms>0&&gpu.output_width==64&&gpu.output_height==64,
         "Native D3D11 reports completed GPU timestamps for both copied and direct stereo generation");
+    check(overhead.capture_samples&&overhead.guide_samples&&overhead.upload_samples&&
+        overhead.capture_ms>0&&overhead.guide_ms>0&&overhead.upload_ms>0,
+        "Native D3D11 reports real capture, stereo guide and OpenXR copy GPU timings");
     std::cout<<"PASS native D3D11 GPU timestamps: direct="<<direct<<" samples="<<gpu.gpu_samples
         <<" stereo_shader_ms="<<gpu.total_ms<<" last_ms="<<gpu.total_last_ms<<'\n';
     check(retired.size()>=2&&Runtime::chains.size()==retired.size(),"Teardown hands private D3D11 swapchains to the layer instead of destroying them");
@@ -444,7 +447,9 @@ void fg_shader11_validation(bool hardware=false){
         quad.finish();observe_quad();auto second=quad.build_native(roles,projection,insets);
         check(second.valid&&!second.meta[0].reset&&first.depth[0]!=second.depth[0]&&value(first.depth[0].Get(),64,64)==.75f,
             "Quad native guide history remains immutable while the next interval is assembled");
-        quad.finish();observe_quad();roles.views[2].registration_generation=2;
+        quad.finish();const auto guide_cost=quad.guide_cost();
+        check(guide_cost.samples&&guide_cost.mean>0,"Quad GPU timing sums all four source snapshots and both eye atlases");
+        observe_quad();roles.views[2].registration_generation=2;
         check(!quad.build_native(roles,projection,insets).valid,"Native quad assembly rejects stale source assignments");
     }
     device.Reset();context.Reset();

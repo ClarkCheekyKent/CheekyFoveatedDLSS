@@ -58,6 +58,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     ComPtr<ID3D11Multithread> protection;
     std::recursive_mutex* dispatch{}; // Shared with the game's NGX evaluation in stereo and quad modes.
     ShaderTimings11 gpu_timings;
+    StageTimings11 capture_timings,guide_timings,upload_timings;
+    std::atomic<std::uint64_t> guide_interval{1};
     ComPtr<ID3D11ComputeShader> snapshot;
     ComPtr<ID3D11VertexShader> vertex;
     ComPtr<ID3D11PixelShader> pixel,periphery_pixel;
@@ -100,6 +102,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         std::unique_lock<std::recursive_mutex> serialized;if(dispatch)serialized=std::unique_lock(*dispatch);
         Guard guard(protection.Get());
         gpu_timings.collect(context.Get());
+        capture_timings.collect(context.Get());guide_timings.collect(context.Get());upload_timings.collect(context.Get());
         const bool recorded=record(context.Get());
         if(flush)context->Flush();
         return recorded&&SUCCEEDED(device->GetDeviceRemovedReason());
@@ -153,7 +156,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         const bool single=d.ArraySize==1&&d.MipLevels==1;
         d.Format=format;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=single?D3D11_BIND_SHADER_RESOURCE:0;d.CPUAccessFlags=0;d.MiscFlags=0;
         auto out=image(d,single);if(!out)return {};
-        return submit([&](ID3D11DeviceContext* c){c->CopyResource(out->texture11.Get(),source);return true;},false)?out:Image{};
+        return submit([&](ID3D11DeviceContext* c){return capture_timings.measure(device.Get(),c,0,1,[&]{
+            c->CopyResource(out->texture11.Get(),source);return true;});},false)?out:Image{};
     }
     // One eye's subimage as an independent, sampleable texture.
     Image crop(const Image& full,const XrSwapchainSubImage& sub,bool reuse_whole=false) {
@@ -167,8 +171,9 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         e.Format=d.Format;e.SampleDesc.Count=1;e.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         auto out=image(e,true);if(!out)return {};
         D3D11_BOX box{unsigned(r.offset.x),unsigned(r.offset.y),0,unsigned(r.offset.x+r.extent.width),unsigned(r.offset.y+r.extent.height),1};
-        return submit([&](ID3D11DeviceContext* c){c->CopySubresourceRegion(out->texture11.Get(),0,0,0,0,full->texture11.Get(),
-            D3D11CalcSubresource(0,sub.imageArrayIndex,d.MipLevels),&box);return true;},false)?out:Image{};
+        return submit([&](ID3D11DeviceContext* c){return capture_timings.measure(device.Get(),c,0,1,[&]{
+            c->CopySubresourceRegion(out->texture11.Get(),0,0,0,0,full->texture11.Get(),
+            D3D11CalcSubresource(0,sub.imageArrayIndex,d.MipLevels),&box);return true;});},false)?out:Image{};
     }
     // Called from the outer game NGX evaluation, before it can reuse its guides.
     bool observe(const CheekyFgShaderSource11V1& input) {
@@ -233,6 +238,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         ComPtr<ID3D11Buffer> constants;D3D11_BUFFER_DESC b{};b.ByteWidth=sizeof(c);b.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         D3D11_SUBRESOURCE_DATA initial{&c};if(FAILED(device->CreateBuffer(&b,&initial,&constants)))return false;
         if(!submit_shader([&](ID3D11DeviceContext* commands){
+            return guide_timings.measure(device.Get(),commands,guide_interval.load(),2,[&]{
             commands->CopyResource(depth.Get(),input.depth);commands->CopyResource(motion.Get(),input.motion);
             auto* cb=constants.Get();ID3D11ShaderResourceView* srvs[]{depth_srv.Get(),motion_srv.Get()};
             ID3D11UnorderedAccessView* uavs[]{depth_uav.Get(),motion_uav.Get()};
@@ -241,7 +247,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             commands->Dispatch((c.size[0]+7)/8,(c.size[1]+7)/8,1);
             ID3D11ShaderResourceView* no_srvs[2]{};ID3D11UnorderedAccessView* no_uavs[2]{};
             commands->CSSetShaderResources(0,2,no_srvs);commands->CSSetUnorderedAccessViews(0,2,no_uavs,nullptr);
-            return true;},false))return false;
+            return true;});},false))return false;
         // Only immutable snapshots cross from the game evaluation to xrEndFrame.
         next->source.context=nullptr;next->source.depth=next->source.motion=nullptr;
         std::lock_guard lock(guide_mutex);auto& slot=pending_guides[input.eye];if(slot){++slot->observations;return false;}
@@ -257,7 +263,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     }
     // Claims this interval's stereo guides. Ambiguous intervals claim nothing.
     bool take_guides(std::array<std::shared_ptr<Guides>,2>& out) {
-        std::lock_guard lock(guide_mutex);auto taken=std::move(pending_guides);pending_guides={};
+        std::lock_guard lock(guide_mutex);auto taken=std::move(pending_guides);pending_guides={};++guide_interval;
         if(!taken[0]||!taken[1]||taken[0]->observations!=1||taken[1]->observations!=1||
             taken[0]->source.meta.configuration!=taken[1]->source.meta.configuration||
             taken[0]->source.mapping_revision!=taken[1]->source.mapping_revision)return false;
@@ -383,7 +389,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     // Copies an immutable frame into an acquired OpenXR image (presentation thread).
     bool upload(ID3D11Texture2D* target,const Image& source) {
         if(!target||!source||!source->texture11)return false;
-        return submit([&](ID3D11DeviceContext* c){c->CopyResource(target,source->texture11.Get());return true;},true);
+        return submit([&](ID3D11DeviceContext* c){return upload_timings.measure(device.Get(),c,0,1,[&]{
+            c->CopyResource(target,source->texture11.Get());return true;});},true);
     }
 };
 }

@@ -59,7 +59,7 @@ struct State {
     ULONGLONG next_memory_log{};std::uint64_t logged_local_usage{}; // Memory lines: every 30 s or on a 64 MB change.
     ULONGLONG next_timing_log{},next_load_log{};
     std::string message{"Not initialized"};
-    std::atomic<bool> save_requested{}, report_requested{};
+    std::atomic<bool> save_requested{}, report_requested{}, donate_requested{};
     std::atomic<bool> report_busy{}, report_browser{};
     std::atomic<unsigned> report_open{};
     std::filesystem::path report_zip;
@@ -476,6 +476,13 @@ DWORD WINAPI persistence_worker(void*) {
     for (;;) {
         WaitForSingleObject(s.save_event, INFINITE);
         try {
+            if (s.donate_requested.exchange(false)) {
+                // Preserve the original donation destination in forks and integrations.
+                if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", L"https://linktr.ee/clarkcheekykent", nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
+                    std::lock_guard lock(s.mutex);
+                    s.message = "Could not open the donation page in your browser.";
+                }
+            }
             if (s.save_requested.exchange(false)) {
                 Settings settings; std::uint64_t revision;
                 { std::lock_guard lock(s.mutex); settings = configured_settings(); revision = s.revision; }
@@ -801,6 +808,9 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
         if (parsed.ec != std::errc{} || parsed.ptr != request.data()+request.size()) return false;
         s.request = id;
         if (action == "get") return true;
+        if (action == "donate") {
+            s.donate_requested = true; SetEvent(s.save_event); return true;
+        }
         if(action=="quad_assign"){
             uint64_t session{},source_id{},generation{};unsigned number{},role{};
             if(!(in>>session>>number>>role>>source_id>>generation)||!number||number>8||role>4)return false;

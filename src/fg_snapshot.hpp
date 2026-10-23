@@ -34,6 +34,9 @@ class FgSnapshots {
         std::uint64_t last_used_tick{};
         bool submitted{},foreign{},cancelled{};
         cheeky::gpu::Span gpu_span;
+        std::uint64_t profile_frame{};
+        double profile_ms{};
+        bool profile_ready{};
     };
     class Lease final : public IUnknown {
         std::atomic<ULONG> references{1};
@@ -267,11 +270,15 @@ public:
         }
         collect_completed();
     }
+    void collect_profile(Shot& shot) {
+        double ms{};if(shot.gpu_span.collect(timestamp_frequency,ms)){shot.profile_ms=ms;shot.profile_ready=true;}
+        if(shot.profile_ready&&shot.profile_frame){gpu_cost.add(shot.profile_frame,shot.profile_ms,false,2);shot.profile_ready=false;}
+    }
     void collect_completed() {
         if(!fence)return;
         const auto done=fence->GetCompletedValue();
         for(auto& s:shots)if(s->retired&&s->retired<=done){
-            double ms{};if(s->gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(s->meta.render_frame,ms,false,2);
+            collect_profile(*s);
             s->source_depth.Reset();s->source_motion.Reset();
         }
         gpu_cost.commit();
@@ -299,7 +306,7 @@ public:
         if(!slot){if(shots.size()>=24){failed_record=id;return false;}slot=std::make_shared<Shot>();shots.push_back(slot);}
         slot->last_used_tick=now;
         if(slot->retired&&slot->retired<=done) {
-            double ms{};if(slot->gpu_span.collect(timestamp_frequency,ms))gpu_cost.add(slot->meta.render_frame,ms,false,2);
+            collect_profile(*slot);
             gpu_cost.commit();
         }
         const auto dr=region(meta.depth,meta.depth_base_x,meta.depth_base_y,meta.depth_width,meta.depth_height),
@@ -348,7 +355,7 @@ public:
             if(!mr.full){meta.motion_base_x=meta.motion_base_y=0;meta.motion_width=mr.w;meta.motion_height=mr.h;}
             meta.depth=slot->depth.Get();meta.motion=slot->motion.Get();meta.prepared_guides=0;
         }
-        slot->meta=meta;return true;
+        slot->meta=meta;slot->profile_frame=meta.render_frame;slot->profile_ms=0;slot->profile_ready=false;return true;
     }
     unsigned submitted(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* commands,bool discover_queue=false) {
         unsigned found{};
@@ -431,6 +438,9 @@ public:
         if(!a||!b||(render_frame&&(a->meta.render_frame!=render_frame||b->meta.render_frame!=render_frame))||
             (hookless&&(a->meta.render_frame||b->meta.render_frame))){last_match.reason="Guide pair is interrupted";return 0;}
         if(!compatible_eyes(*a,*b)){last_match.reason="Guide eye mapping changed or stereo identities are ambiguous";return 0;}
+        // Standalone has no game-frame ticket. Group its timestamps only after
+        // this exact stereo pair has been matched to a released color image.
+        if(!a->meta.render_frame&&!b->meta.render_frame){a->profile_frame=b->profile_frame=(1ull<<63)|latest;}
         // Pin guides at COLOR release, not later at EndFrame. A future DLSS
         // recording must not recycle either snapshot while color awaits submit.
         if(latched.size()>=4)latched.erase(latched.begin());

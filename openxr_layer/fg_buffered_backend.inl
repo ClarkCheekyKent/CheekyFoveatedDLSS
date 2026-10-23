@@ -10,6 +10,13 @@ inline BufferedPresenter::BufferedPresenter():backend(make_frame_backend12(*this
 
 inline CheekyFgOverhead BufferedPresenter::overhead() const noexcept {
     auto result=extra_gpu;result.supported=1;
+    if(native11){
+        const auto capture=native11->capture_timings.summary(),guide=native11->guide_timings.summary(),upload=native11->upload_timings.summary();
+        result.capture_samples=capture.samples;result.capture_ms=capture.mean;result.capture_last_ms=capture.last;
+        result.guide_samples=guide.samples;result.guide_ms=guide.mean;result.guide_last_ms=guide.last;
+        result.upload_samples=upload.samples;result.upload_ms=upload.mean;result.upload_last_ms=upload.last;
+        return result;
+    }
     const auto capture=producer.gpu_cost.summary(),upload=uploads.gpu_cost.summary();
     result.capture_samples=capture.samples;result.capture_ms=capture.mean;result.capture_last_ms=capture.last;
     result.upload_samples=upload.samples;result.upload_ms=upload.mean;result.upload_last_ms=upload.last;

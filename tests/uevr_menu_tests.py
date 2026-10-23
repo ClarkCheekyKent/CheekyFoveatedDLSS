@@ -68,6 +68,18 @@ def run(engine):
             return false, current
         end
         imgui = {
+            ColumnFlags = {WidthStretch=8, WidthFixed=16},
+            ImGuiStyleVar = {FrameRounding=12},
+            push_style_color = function() style_colors = (style_colors or 0) + 1 end,
+            pop_style_color = function(n) style_colors = style_colors - n; assert(style_colors >= 0) end,
+            push_style_var = function() style_vars = (style_vars or 0) + 1 end,
+            pop_style_var = function(n) style_vars = style_vars - n; assert(style_vars >= 0) end,
+            calc_text_size = function(s) return {x=#s*7,y=14} end,
+            get_cursor_screen_pos = function() return {x=10,y=10} end,
+            draw_list_path_clear = function() end,
+            draw_list_path_line_to = function(p) assert(p[1]==p[1] and p[2]==p[2]) end,
+            draw_list_path_stroke = function() end,
+            table_setup_column = function() end,
             tree_node = function(label)
                 trees[label] = true; tree_parents[label] = tree_stack[#tree_stack]
                 table.insert(tree_order, label)
@@ -126,6 +138,7 @@ def run(engine):
         g.callbacks.script_panel()
         assert len(g.disabled) == 1, "Unbalanced disabled scope"
         assert len(g.tree_stack) == 0, "Unbalanced tree scope"
+        assert (g.style_colors or 0) == 0 and (g.style_vars or 0) == 0, "Donate button leaked its style into the UEVR menu"
 
     def receive(value):
         g.callbacks.on_lua_event("cheeky.foveated_dlss.snapshot.v1", json.dumps(value))
@@ -694,7 +707,7 @@ def run(engine):
     receive(state)
     state["support"] = {"busy": False, "zip": "C:/test/support/report.zip"}
     receive(state)
-    for label, action in (("Report an issue...", "report_issue"), ("Create support ZIP only", "report"),
+    for label, action in (("Donate", "donate"), ("Report an issue...", "report_issue"), ("Create support ZIP only", "report"),
                           ("Show ZIP", "show_report"), ("Open GitHub issue", "open_issue")):
         draw(label)
         assert last().endswith("\n" + action), "Wrong report action"

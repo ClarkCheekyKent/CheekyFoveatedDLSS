@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_timing.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
+#include "../shared/cheeky_gpu_span.hpp"
 #include <d3d11.h>
 #include <atomic>
 #include <memory>
@@ -15,7 +16,8 @@ struct ShaderTimings11 {
         Microsoft::WRL::ComPtr<ID3D11Query> disjoint;
         std::array<Microsoft::WRL::ComPtr<ID3D11Query>,4> stamps;
         unsigned parts{},mask{},width{},height{},foveated_eyes{},peripheral_method{};
-        std::uint64_t epoch{},sequence{};
+        std::uint64_t epoch{},sequence{},group{};
+        unsigned expected{};
         bool open{},pending{};
     };
     using Ticket=std::shared_ptr<Sample>;
@@ -83,7 +85,8 @@ struct ShaderTimings11 {
             // Retire the disjoint query before reusing a partially recorded ticket.
             active->pending=true;active.reset();}
     }
-    void collect(ID3D11DeviceContext* context) {
+    void collect(ID3D11DeviceContext* context) {collect(context,[](const Sample&,double){});}
+    template<class Complete> void collect(ID3D11DeviceContext* context,Complete&& complete) {
         for(const auto& slot:pool){
             if(!slot||!slot->pending)continue;
             D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock{};
@@ -104,6 +107,7 @@ struct ShaderTimings11 {
             if(slot->sequence<last_sequence)total.last=last;else last_sequence=slot->sequence;
             ++samples;width=slot->width;height=slot->height;
             foveated_eyes=slot->foveated_eyes;peripheral_method=slot->peripheral_method;
+            complete(*slot,ms);
         }
     }
     CheekyFgPerformance snapshot() const {
@@ -116,5 +120,29 @@ struct ShaderTimings11 {
         out.output_width=width;out.output_height=height;out.peripheral_method=peripheral_method;
         out.shared_gpu_queue=1;return out;
     }
+};
+
+// Short GPU stages grouped by their actual capture interval. Each measurement
+// surrounds only its GPU commands; collection never waits or flushes.
+struct StageTimings11 {
+    ShaderTimings11 queries;
+    cheeky::gpu::Groups groups;
+    std::uint64_t serial{};
+    void collect(ID3D11DeviceContext* context) {
+        queries.collect(context,[&](const auto& sample,double ms){groups.add(sample.group,ms,false,sample.expected);});
+        groups.commit();
+    }
+    template<class Record> bool measure(ID3D11Device* device,ID3D11DeviceContext* context,
+        std::uint64_t group,unsigned expected,Record&& record) {
+        collect(context);
+        auto ticket=queries.reserve(device,1,0,0,0,0,1);
+        if(ticket){ticket->group=group?group:++serial;ticket->expected=expected;}
+        const bool measured=queries.begin(context,ticket,0);
+        const bool result=record();
+        if(measured)queries.end(context,ticket,0);
+        return result;
+    }
+    void reset(){queries.reset();groups.reset();}
+    cheeky::gpu::Summary summary() const {return groups.summary();}
 };
 }

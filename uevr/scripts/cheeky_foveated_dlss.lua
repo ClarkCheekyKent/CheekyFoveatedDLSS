@@ -150,6 +150,44 @@ local function combo(label, key, values)
     if changed then draft[key], dirty[key], ready_edits[key] = value, value, value end
 end
 local function text(s) imgui.text(tostring(s)) end
+local function donate_button()
+    -- Do not remove this donation button or change its original destination when
+    -- this project is forked or integrated into another project.
+    -- The native donate command opens https://linktr.ee/clarkcheekykent.
+    local styled = imgui.push_style_color and imgui.pop_style_color
+    if styled then
+        -- UEVR accepts ImGui color indices and signed packed ABGR colors.
+        imgui.push_style_color(21, 0xFF553DD6 - 0x100000000) -- Button
+        imgui.push_style_color(22, 0xFF664DE8 - 0x100000000) -- ButtonHovered
+        imgui.push_style_color(23, 0xFF422BB8 - 0x100000000) -- ButtonActive
+        imgui.push_style_color(0, -1) -- Text: white
+    end
+    local rounded = imgui.push_style_var and imgui.pop_style_var and imgui.ImGuiStyleVar
+    local font = imgui.calc_text_size and imgui.calc_text_size("Donate").y or 17
+    if rounded then imgui.push_style_var(imgui.ImGuiStyleVar.FrameRounding, font * 0.3) end
+    local heart = imgui.get_cursor_screen_pos and imgui.draw_list_path_clear and
+        imgui.draw_list_path_line_to and imgui.draw_list_path_stroke
+    local origin = heart and imgui.get_cursor_screen_pos()
+    local clicked = imgui.button("Donate", {font * 6.6, font * 1.7})
+    if heart then
+        local size = font * 0.95
+        imgui.draw_list_path_clear()
+        for i = 0, 39 do
+            local t = i * math.pi * 2 / 40
+            local x = 0.5 + 0.5 * math.sin(t)^3
+            local y = (12 - (13 * math.cos(t) - 5 * math.cos(2*t) - 2 * math.cos(3*t) - math.cos(4*t))) / 29
+            imgui.draw_list_path_line_to({origin.x + font * 0.4 + size * x,
+                origin.y + (font * 1.7 - size) * 0.5 + size * y})
+        end
+        imgui.draw_list_path_stroke(0xFFFFFFFF, true, font * 0.11)
+    end
+    if rounded then imgui.pop_style_var(1) end
+    if styled then imgui.pop_style_color(4) end
+    if imgui.is_item_hovered and imgui.is_item_hovered() then
+        imgui.set_tooltip("https://linktr.ee/clarkcheekykent")
+    end
+    if clicked then send("donate") end
+end
 local function apply_buttons(id)
     if imgui.button("Apply changes##" .. id) then
         if next(dirty) and not pending_apply then
@@ -398,13 +436,24 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         imgui.tree_pop()
         return
     end
-    text("Cheeky " .. tostring(status.version))
-    text(status.message)
+    if imgui.table_setup_column and imgui.ColumnFlags and imgui.begin_table("cheeky_header", 2, 0, {0, 0}, 0) then
+        imgui.table_setup_column("Version", imgui.ColumnFlags.WidthStretch, 1.0, 0)
+        local font = imgui.calc_text_size("Donate").y
+        imgui.table_setup_column("Support", imgui.ColumnFlags.WidthFixed, font * 6.6, 0)
+        imgui.table_next_row(0, 0)
+        imgui.table_next_column(); text("Cheeky " .. tostring(status.version))
+        imgui.table_next_column(); donate_button()
+        imgui.end_table()
+    else
+        text("Cheeky " .. tostring(status.version))
+        imgui.same_line(); donate_button()
+    end
+    local message = tostring(status.message or "")
+    if message ~= "" and message ~= "Settings applied" and not message:match("^Ready%.") then text(message) end
     local afw = status.afw_experiment or {}
     local afw_available = afw.enabled and afw.coverage_enabled ~= false
     local afw_active = afw_available and (draft.AfwAutomaticCoverage or draft.AfwManualCoverage)
     if not status.ready then text("Processing is paused.") end
-    text("Sliders apply on release. Other controls apply immediately and save automatically.")
     text("Alt+Shift+/ toggles SR.")
     local d = (status.apis or {})[status.renderer == 1 and 2 or 1] or {}
     local f = status.frame or {}
@@ -426,7 +475,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     if afw.enabled then rows("afw_overview", {{"AFW", afw_mode(afw)}}) end
     -- A reset is a native transaction. Wait for its authoritative snapshot before editing again.
     imgui.begin_disabled(pending_apply ~= nil and pending_apply.reset_group ~= nil)
-    apply_buttons("top")
 
     if imgui.tree_node("Stereo and gaze") then
         combo("Foveation center", "CenterMode", {[0]="Fixed",[1]="Runtime gaze (OpenXR / OpenVR)",[2]="Simulated gaze"})
@@ -733,8 +781,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         if stages then
                             local capture = {0, 0}
                             stage("Guide capture (per real frame)", extra.guide_samples, extra.guide_ms, extra.guide_last_ms, capture)
-                            stage("Color capture + guide handoff (per real frame)", extra.capture_samples, extra.capture_ms, extra.capture_last_ms, capture)
-                            entries[#entries+1] = {"  Capture subtotal", (extra.guide_samples or 0)>0 and (extra.capture_samples or 0)>0 and gpu_ms(capture[1], capture[2]) or "Waiting for GPU samples"}
+                            stage(native_shader11 and "Color capture / eye crop (per copy)" or "Color capture + guide handoff (per real frame)", extra.capture_samples, extra.capture_ms, extra.capture_last_ms, capture)
+                            if not native_shader11 then entries[#entries+1] = {"  Capture subtotal", (extra.guide_samples or 0)>0 and (extra.capture_samples or 0)>0 and gpu_ms(capture[1], capture[2]) or "Waiting for GPU samples"} end
                             sum, sum_last = sum + capture[1], sum_last + capture[2]
                         end
                         if native_shader11 then
@@ -750,15 +798,17 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         sum, sum_last = sum + (p.total_ms or 0), sum_last + (p.total_last_ms or 0)
                         if stages then
                             local present = {0, 0}
-                            stage("Generated output copy (per generated frame)", extra.publication_samples, extra.publication_ms, extra.publication_last_ms, present)
-                            stage("OpenXR uploads (per presentation)", extra.upload_samples, extra.upload_ms, extra.upload_last_ms, present)
+                            if not native_shader11 then stage("Generated output copy (per generated frame)", extra.publication_samples, extra.publication_ms, extra.publication_last_ms, present) end
+                            stage(native_shader11 and "OpenXR image copy (per copy)" or "OpenXR uploads (per presentation)", extra.upload_samples, extra.upload_ms, extra.upload_last_ms, present)
+                            if not native_shader11 then
                             entries[#entries+1] = {"  Presentation subtotal", (extra.publication_samples or 0)>0 and (extra.upload_samples or 0)>0 and gpu_ms(present[1], present[2]) or "Waiting for GPU samples"}
                             sum, sum_last = sum + present[1], sum_last + present[2]
                             local complete = (extra.guide_samples or 0)>0 and (extra.capture_samples or 0)>0 and (extra.publication_samples or 0)>0 and (extra.upload_samples or 0)>0
                             entries[#entries+1] = {"Measured GPU stage sum", complete and gpu_ms(sum, sum_last) or "Waiting for GPU samples"}
+                            end
                         end
                         rows("fg_gpu_timings", entries)
-                        text(native_shader11 and "GPU shader time for both eyes, with center and periphery measured together. Capture, copies and runtime work are excluded." or
+                        text(native_shader11 and "Shader time covers both eyes. Copy times are per copy. Runtime work is excluded." or
                             "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.")
                     elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then
                         text("GPU timestamps unavailable or FG has not started.")
@@ -942,7 +992,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         reset_group("Reset DLSS-NR defaults", "nr")
         imgui.tree_pop()
     end
-    apply_buttons("bottom")
+    if next(dirty) or pending_apply then apply_buttons("bottom") end
 
     if imgui.tree_node("Performance") then performance(d, f); imgui.tree_pop() end
 

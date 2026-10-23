@@ -3,6 +3,7 @@
 #include "../shared/cheeky_quad_views.h"
 #include "../shared/fg_guide_layout.hpp"
 #include "fg_d3d11.hpp"
+#include "fg_timing11.hpp"
 #include <d3dcompiler.h>
 #include <atomic>
 #include <array>
@@ -40,6 +41,7 @@ class QuadFg11 {
     std::array<Source,8> sources;std::array<std::shared_ptr<Frame>,4> frames;
     uint64_t interval{1},serial{},last_configuration{},last_built_interval{};
     CheekyQuadFgStatsV1 diagnostics;
+    cheeky::fg::StageTimings11 guide_timings;
     struct Guard {ID3D11Multithread* p;explicit Guard(ID3D11Multithread* v):p(v){p->Enter();}~Guard(){p->Leave();}};
     struct Constants {unsigned depth_base[2]{},depth_size[2]{},motion_base[2]{},motion_size[2]{},size[2]{};
         float scale[2]{},jitter[2]{},pad[2]{},inset[4]{};};
@@ -100,13 +102,14 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     // Caller holds a StateScope.
     bool record(ID3D11ComputeShader* shader,const Constants& c,const std::array<ID3D11ShaderResourceView*,4>& srvs,Pair11& target){
         auto* commands=context.Get();
+        return guide_timings.measure(device.Get(),commands,interval,6,[&]{
         commands->UpdateSubresource(constants.Get(),0,nullptr,&c,0,0);auto* cb=constants.Get();
         commands->CSSetShader(shader,nullptr,0);commands->CSSetConstantBuffers(0,1,&cb);commands->CSSetShaderResources(0,4,srvs.data());
         ID3D11UnorderedAccessView* uavs[]{target.depth_uav.Get(),target.motion_uav.Get()};commands->CSSetUnorderedAccessViews(0,2,uavs,nullptr);
         commands->Dispatch((c.size[0]+7)/8,(c.size[1]+7)/8,1);
         ID3D11ShaderResourceView* empty[4]{};ID3D11UnorderedAccessView* empty_uav[2]{};
         commands->CSSetShaderResources(0,4,empty);commands->CSSetUnorderedAccessViews(0,2,empty_uav,nullptr);
-        return true;
+        return true;});
     }
     bool execute(){return SUCCEEDED(device->GetDeviceRemovedReason());}
 public:
@@ -162,10 +165,11 @@ public:
     struct Result {CheekyFgPair pair;Ptr<IUnknown> lease;};
     explicit QuadFg11(ID3D11Device* d):device(d){device->GetImmediateContext(&context);context.As(&protection);
         if(protection)protection->SetMultithreadProtected(TRUE);}
-    void enable(bool e){enabled=e;if(!e)atlas_ready=false;}
+    void enable(bool e){if(enabled.exchange(e)!=e)guide_timings.reset();if(!e)atlas_ready=false;}
     bool ready()const noexcept{return enabled&&atlas_ready;}
+    cheeky::gpu::Summary guide_cost() const {return guide_timings.summary();}
     CheekyQuadFgStatsV1 stats(){std::lock_guard lock(mutex);auto value=diagnostics;value.enabled=enabled;return value;}
-    void finish(){std::lock_guard lock(mutex);++interval;
+    void finish(){if(!protection)return;Guard guard(protection.Get());std::lock_guard lock(mutex);guide_timings.collect(context.Get());++interval;
         if(!enabled){sources={};frames={};last_configuration=last_built_interval=0;}}
     bool observe(const CheekyQuadFgSourceV1& input){
         if(!enabled||!protection||input.context!=context.Get()||!input.meta.feature||!input.generation||!input.depth||!input.motion)return false;

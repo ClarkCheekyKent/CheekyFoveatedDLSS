@@ -4069,7 +4069,12 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetOverheadV1(CheekyFgOve
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
     *out=CheekyFgOverhead{};std::lock_guard lock(state_mutex);
     for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
-        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->overhead();return true;}
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->overhead();
+        if(owner.quad_capture&&owner.quad_capture->d3d11&&owner.quad_capture->d3d11->fg_guides){
+            const auto guide=owner.quad_capture->d3d11->fg_guides->guide_cost();
+            out->guide_samples=guide.samples;out->guide_ms=guide.mean;out->guide_last_ms=guide.last;
+        }
+        return true;}
     return true;
 }
 

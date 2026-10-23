@@ -925,7 +925,10 @@ bool fg_overhead(CheekyFgOverhead& out) noexcept {
     const auto query=layer?reinterpret_cast<CheekyFgOverheadFn>(GetProcAddress(layer,"CheekyFG_GetOverheadV1")):nullptr;
     const bool supported=query&&query(&out);
     std::lock_guard lock(mutex);snapshots().collect_completed();const auto guide=snapshots().capture_gpu();
-    out.guide_samples=guide.samples;out.guide_ms=guide.mean;out.guide_last_ms=guide.last;return supported;
+    // Native/quad guide capture is measured by the layer, outside this DX12
+    // stereo snapshot pool. Do not overwrite its samples with an empty pool.
+    if(!out.guide_samples&&guide.samples){out.guide_samples=guide.samples;out.guide_ms=guide.mean;out.guide_last_ms=guide.last;}
+    return supported;
 }
 bool fg_presentation(CheekyFgPresentation& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
