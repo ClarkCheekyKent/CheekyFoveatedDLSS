@@ -307,6 +307,13 @@ bool save_menu_key(InputState& input, unsigned key) {
     return true;
 }
 
+bool save_headset_pointer(InputState& input, bool enabled) {
+    if (input.config_path.empty() || !WritePrivateProfileStringW(L"Overlay", L"HeadsetPointer",
+            enabled ? L"1" : L"0", input.config_path.c_str())) return false;
+    input.headset_pointer = enabled;
+    return true;
+}
+
 LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     auto* input = static_cast<InputState*>(GetPropW(window, input_property));
     if (!input || !input->previous) return DefWindowProcW(window, message, wparam, lparam);
@@ -411,6 +418,7 @@ InputState* attach_input(HWND window) {
     if (!input->config_path.empty()) {
         const auto saved = GetPrivateProfileIntW(L"Overlay", L"MenuKey", VK_F8, input->config_path.c_str());
         if (valid_menu_key(saved)) input->menu_key = saved;
+        input->headset_pointer = GetPrivateProfileIntW(L"Overlay", L"HeadsetPointer", 1, input->config_path.c_str()) != 0;
     }
     input->previous = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC));
     if (!input->previous || !SetPropW(window, input_property, input)) { delete input; return nullptr; }

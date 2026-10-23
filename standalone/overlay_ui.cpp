@@ -1170,6 +1170,10 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                         r.menu_key_error = save_menu_key(input, VK_F8) ? "" : "Could not save the menu key.";
                 }
                 if (!r.menu_key_error.empty()) ImGui::TextWrapped("%s", r.menu_key_error.c_str());
+                bool headset_pointer = input.headset_pointer.load();
+                if (ImGui::Checkbox("VR controllers and hands control the menu", &headset_pointer))
+                    r.menu_key_error = save_headset_pointer(input, headset_pointer) ? "" : "Could not save the menu pointer setting.";
+                ImGui::TextWrapped("Off: only the desktop mouse and keyboard move the menu cursor and click, so tracked hands cannot pull it away.");
                 if (std::string_view(renderer) != "Vulkan") {
                     ImGui::SeparatorText("Compatibility");
                     ImGui::Checkbox("DX11 -> DX12 transport", &r.draft.d3d11_use_d3d12_transport);

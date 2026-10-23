@@ -16,6 +16,8 @@ struct InputState {
     std::atomic<unsigned> menu_key{VK_F8};
     std::atomic<bool> menu_key_down{}, rebinding{};
     std::atomic<unsigned> rebound_key{};
+    // Off: only the desktop mouse/keyboard drive the menu; VR controllers and hands are ignored.
+    std::atomic<bool> headset_pointer{true};
     std::wstring config_path;
     std::atomic<ULONGLONG> desktop_pointer_tick{};
     std::atomic<bool> desktop_button_down{};
@@ -39,6 +41,7 @@ void poll_overlay_hotkey(InputState&);
 void begin_menu_key_rebind(InputState&);
 unsigned consume_menu_key_rebind(InputState&);
 bool save_menu_key(InputState&, unsigned);
+bool save_headset_pointer(InputState&, bool);
 void process_overlay_input(InputState&, unsigned controller_buttons = 0);
 void queue_raw_motion(InputState&, LONG dx, LONG dy);
 void apply_desktop_pointer(InputState&, int first_event);

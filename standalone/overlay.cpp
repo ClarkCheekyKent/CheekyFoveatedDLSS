@@ -417,6 +417,12 @@ void release_headset_input(Renderer& r) {
 
 void poll_headset_input(Renderer& r, bool ready, int desktop_events_begin) {
     if (!ready || r.xr_menu_owner || !r.vr_overlay) { release_headset_input(r); return; }
+    if (!r.input->headset_pointer) {
+        // Desktop-only menu input. Drain SteamVR's queue so re-enabling does not replay stale clicks.
+        vr::VREvent_t event{};
+        while (r.vr_overlay->PollNextOverlayEvent(r.vr_handle, &event, sizeof(event))) {}
+        release_headset_input(r); return;
+    }
     auto& io = ImGui::GetIO();
     // A click can already be queued even if SteamVR's current hover query no
     // longer targets us. Decide pointer ownership from the whole event batch.
@@ -706,6 +712,12 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
         const bool headset_ready = prepare_headset(r);
         poll_headset_input(r, headset_ready, desktop_events_begin);
+        if (!r.input->headset_pointer) {
+            // Desktop-only menu input: drop OpenXR controller/hand pointer samples.
+            global.xr_inputs = {};
+            if (r.xr_pointer_down) ImGui::GetIO().AddMouseButtonEvent(0, false);
+            r.xr_pointer_down = r.xr_pointer_active = false;
+        }
         if (global.xr_inputs.count) {
             const auto pointer = global.xr_inputs.pop();
             const bool active = headset_ready && controller_pointer_owns(pointer.active,
