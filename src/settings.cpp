@@ -19,6 +19,8 @@ std::atomic<bool> processing_allowed{true};
 std::atomic<bool> enabled{true};
 std::atomic<bool> d3d12_lower_hook{true};
 std::atomic<bool> d3d11_use_d3d12_transport{false};
+std::atomic<bool> d3d11_transport_shared_guides{false}, d3d11_transport_single_buffer{false};
+std::atomic<bool> d3d12_quad_compose_wait{true}, hook_rescan_on_module_change{false};
 std::atomic<bool> peripheral_dlaa_enabled{true};
 std::atomic<std::uint32_t> peripheral_dlaa_scale_bits{0x3F400000U};
 std::atomic<std::uint32_t> center_preset{};
@@ -166,6 +168,10 @@ Settings configured_settings() noexcept {
     settings.d3d12_lower_hook = d3d12_lower_hook.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
         d3d11_use_d3d12_transport.load(std::memory_order_acquire);
+    settings.d3d11_transport_shared_guides = d3d11_transport_shared_guides.load(std::memory_order_acquire);
+    settings.d3d11_transport_single_buffer = d3d11_transport_single_buffer.load(std::memory_order_acquire);
+    settings.d3d12_quad_compose_wait = d3d12_quad_compose_wait.load(std::memory_order_acquire);
+    settings.hook_rescan_on_module_change = hook_rescan_on_module_change.load(std::memory_order_acquire);
     settings.peripheral_dlaa_enabled =
         peripheral_dlaa_enabled.load(std::memory_order_acquire);
     settings.peripheral_dlaa_scale = load_float(peripheral_dlaa_scale_bits);
@@ -280,6 +286,10 @@ void update_settings(const Settings& settings) noexcept {
         settings.d3d11_use_d3d12_transport,
         std::memory_order_release
     );
+    d3d11_transport_shared_guides.store(settings.d3d11_transport_shared_guides, std::memory_order_release);
+    d3d11_transport_single_buffer.store(settings.d3d11_transport_single_buffer, std::memory_order_release);
+    d3d12_quad_compose_wait.store(settings.d3d12_quad_compose_wait, std::memory_order_release);
+    hook_rescan_on_module_change.store(settings.hook_rescan_on_module_change, std::memory_order_release);
     peripheral_dlaa_enabled.store(
         settings.peripheral_dlaa_enabled,
         std::memory_order_release
