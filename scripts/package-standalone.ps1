@@ -4,6 +4,7 @@ param(
     [ValidateSet("Standalone", "OptiScaler", "Both")][string]$Mode = "Both",
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build",
     [string]$BinaryRoot = "",
+    [string]$OpenXRSetupPath,
     [switch]$IncludeOpenXRSetup = $true,
     [switch]$IncludeVulkan = $true,
     [switch]$VulkanFixedSrTest
@@ -14,6 +15,7 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $BinaryRoot) { $BinaryRoot = Join-Path $projectRoot "bin\$Configuration" }
 $BinaryRoot = [IO.Path]::GetFullPath($BinaryRoot)
+if (-not $OpenXRSetupPath) { $OpenXRSetupPath = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe" }
 $versionText = Get-Content -LiteralPath (Join-Path $projectRoot "shared\version.h") -Raw
 if ($versionText -notmatch '#define CHEEKY_VERSION "([0-9.]+)"') { throw "Version not found." }
 $version = $Matches[1]
@@ -50,7 +52,7 @@ foreach ($packageMode in $modes) {
         $files["Vulkan-Test-README.txt"] = Join-Path $projectRoot "vulkan_layer\TEST-README.txt"
     }
     if ($IncludeOpenXRSetup) {
-        $files["OpenXR\CheekyOpenXRSetup.exe"] = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe"
+        $files["OpenXR\CheekyOpenXRSetup.exe"] = $OpenXRSetupPath
     }
     foreach ($fileSource in $files.Values) {
         if (-not (Test-Path -LiteralPath $fileSource -PathType Leaf)) { throw "Missing input: $fileSource. Build first." }

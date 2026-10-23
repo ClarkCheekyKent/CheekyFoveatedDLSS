@@ -1,0 +1,113 @@
+name: SignPath test signing
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: Submit to SignPath (disable to build an unsigned sample first)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test-signing:
+    if: github.repository == 'ClarkCheekyKent/CheekyFoveatedDLSS' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check signing and package plumbing
+        run: ./tests/signpath_packaging_tests.ps1
+
+      - name: Check signing settings
+        if: inputs.sign
+        env:
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if (-not $env:SIGNPATH_ORGANIZATION_ID) { throw 'Set the SIGNPATH_ORGANIZATION_ID repository variable.' }
+          if (-not $env:SIGNPATH_API_TOKEN) { throw 'Set the SIGNPATH_API_TOKEN repository secret.' }
+
+      # Hardware-dependent runtime tests are a separate validation step.
+      - name: Build Release binaries from source
+        run: ./scripts/build.ps1 -Configuration Release -SkipTests
+
+      - name: Stage project binaries
+        id: stage
+        run: ./scripts/stage-signpath.ps1
+
+      - name: Upload unsigned binaries as a ZIP artifact
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: signpath-unsigned-binaries
+          path: ${{ steps.stage.outputs.directory }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Request test signatures
+        if: inputs.sign
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: CheekyFoveatedDLSS
+          signing-policy-slug: test-signing
+          artifact-configuration-slug: binaries
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: build/signpath-signed
+
+      - name: Verify signed binaries and build OpenXR installer
+        if: inputs.sign
+        run: |
+          ./scripts/verify-signpath.ps1 -BinaryRoot build/signpath-signed
+          Copy-Item -LiteralPath bin/Release/XR_APILAYER_CHEEKY_foveated_dlss.json -Destination build/signpath-signed/
+          ./scripts/build-installer.ps1 -SkipBuild -ArtifactsDirectory build/signpath-signed
+
+      # Inno Setup embeds the already signed layer. Sign its outer EXE separately.
+      - name: Upload installer for signing
+        if: inputs.sign
+        id: unsigned-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: signpath-unsigned-installer
+          path: bin/installer/CheekyOpenXRSetup.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Request installer test signature
+        if: inputs.sign
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: CheekyFoveatedDLSS
+          signing-policy-slug: test-signing
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: build/signpath-signed-installer
+
+      - name: Package UEVR and Standalone with signed files
+        if: inputs.sign
+        id: packages
+        run: ./scripts/package-signpath.ps1 -BinaryRoot build/signpath-signed -InstallerPath build/signpath-signed-installer/CheekyOpenXRSetup.exe
+
+      - name: Upload test-signed release packages
+        if: inputs.sign
+        uses: actions/upload-artifact@v4
+        with:
+          name: signpath-TEST-SIGNED-packages
+          path: ${{ steps.packages.outputs.directory }}/
+          if-no-files-found: error
+          retention-days: 14

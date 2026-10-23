@@ -2,6 +2,8 @@
 param(
     [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.-]*$')][string]$Label = "build",
+    [string]$BinaryRoot,
+    [string]$OpenXRSetupPath,
     [switch]$IncludeOpenXRSetup = $true,
     [string]$FrameBridgeBackend,
     [string]$ReadmePath,
@@ -12,7 +14,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$binaryRoot = Join-Path $projectRoot "bin\$Configuration"
+if (-not $BinaryRoot) { $BinaryRoot = Join-Path $projectRoot "bin\$Configuration" }
+$binaryRoot = [IO.Path]::GetFullPath($BinaryRoot)
+if (-not $OpenXRSetupPath) { $OpenXRSetupPath = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe" }
 $versionText = Get-Content -LiteralPath (Join-Path $projectRoot "shared\version.h") -Raw
 if ($versionText -notmatch '#define CHEEKY_VERSION "([0-9.]+)"') { throw "Version not found." }
 $version = $Matches[1]
@@ -29,7 +33,7 @@ $files = [ordered]@{
     "licenses\NVIDIA-NGX.txt" = Join-Path $projectRoot "third_party\ngx-sdk\LICENSE.txt"
 }
 if ($IncludeOpenXRSetup) {
-    $files["OpenXR\CheekyOpenXRSetup.exe"] = Join-Path $projectRoot "bin\installer\CheekyOpenXRSetup.exe"
+    $files["OpenXR\CheekyOpenXRSetup.exe"] = $OpenXRSetupPath
 }
 if ($FrameBridgeBackend) {$files["UEVR\UEVRBackend.dll"]=$FrameBridgeBackend}
 if ($ReadmePath) {$files["README.txt"]=$ReadmePath}
