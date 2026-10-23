@@ -775,6 +775,33 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
 extern "C" __declspec(dllexport) void CheekyUEVR_Tick(std::uint64_t attachment, std::uint32_t renderer, void* device, void* queue) {
     CheekyRuntime_Tick(attachment, renderer, device, queue);
 }
+// Copies the snapshot's FG object, matching the standalone menu's Copy FG diagnostic JSON.
+static bool copy_fg_diagnostics(const std::string& snapshot) {
+    const auto start = snapshot.find(",\"fg\":{\"layer_present\"");
+    if (start == std::string::npos) return false;
+    const auto begin = start + 6;
+    std::size_t end = begin; int depth{}; bool quoted{}, escaped{};
+    for (; end < snapshot.size(); ++end) {
+        const char c = snapshot[end];
+        if (quoted) { if (escaped) escaped = false; else if (c == '\\') escaped = true; else if (c == '"') quoted = false; }
+        else if (c == '"') quoted = true;
+        else if (c == '{') ++depth;
+        else if (c == '}' && --depth == 0) break;
+    }
+    if (end == snapshot.size() || !OpenClipboard(nullptr)) return false;
+    bool copied{};
+    EmptyClipboard();
+    if (auto memory = GlobalAlloc(GMEM_MOVEABLE, end - begin + 2)) {
+        if (auto* text = static_cast<char*>(GlobalLock(memory))) {
+            memcpy(text, snapshot.data() + begin, end - begin + 1); text[end - begin + 1] = 0;
+            GlobalUnlock(memory);
+            copied = SetClipboardData(CF_TEXT, memory) != nullptr;
+        }
+        if (!copied) GlobalFree(memory);
+    }
+    CloseClipboard();
+    return copied;
+}
 extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attachment, const char* command) {
     try {
         if (!command || strnlen_s(command, 8193) > 8192 || !adapter_attached.load() || attachment != active_attachment.load()) return false;
@@ -811,6 +838,11 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
             trace_event("GPU memory baseline marked=%u tick=%llu fg_enabled=%u local=%llu nonlocal=%llu (process bytes)",
                 marked?1u:0u,s.memory.baseline_at,s.memory.baseline_fg_enabled?1u:0u,s.memory.baseline_local,s.memory.baseline_nonlocal);
             return marked;
+        }
+        if (action == "copy_fg_diagnostics") {
+            const bool copied = copy_fg_diagnostics(snapshot_locked(s));
+            s.message = copied ? "FG diagnostic JSON copied" : "Could not copy FG diagnostic JSON";
+            return copied;
         }
         if (action == "calibration_enable" || action == "calibration_disable") {
             eye_calibration_enable(action == "calibration_enable" && !configured_settings().manual_stereo_mapping); return true;

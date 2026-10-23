@@ -220,6 +220,7 @@ def run(engine):
         assert g["values"][retired] is None, "Fixed FG option must not be drawn: " + retired
     assert g.tree_parents["Advanced settings"] == "DLSS-FG (experimental)"
     assert g.tree_parents["Advanced settings"] is not None and g["values"]["FG pacing clock"] is not None
+    assert "FG resource memory breakdown##fg" not in g.trees, "GPU memory belongs to Performance, not the FG menu"
     state["gpu_memory"] = {"supported":True,"scope":"process","adapter":"Test GPU","dedicated_capacity_bytes":12288*1048576,
         "local":{"valid":True,"usage_bytes":9000*1048576,"budget_bytes":8192*1048576,"headroom_bytes":0,
                  "over_budget_bytes":808*1048576,"peak_bytes":10000*1048576,"over_budget_samples":3},
@@ -229,11 +230,11 @@ def run(engine):
     draw()
     for value in ("9000.0 MiB / 8192.0 MiB", "OVER LOCAL BUDGET by 808.0 MiB", "+500.0 MiB", "-256.0 MiB"):
         assert value in list(g.drawn.values()), "Missing memory diagnostic: " + value
-    draw("Mark VRAM baseline##fg")
+    draw("Mark VRAM baseline##performance")
     assert last().endswith("\nmark_vram_baseline"), "VRAM baseline button did not reach the runtime"
     state["settings"]["FgEnabled"] = False
     receive(state)
-    draw("Mark VRAM baseline##fg")
+    draw("Mark VRAM baseline##performance")
     assert last().endswith("\nmark_vram_baseline"), "VRAM baseline must remain accessible with FG OFF"
     state["settings"]["FgEnabled"] = True
     state["gpu_memory"]["local"]["valid"] = False
@@ -293,9 +294,14 @@ def run(engine):
             draw()
             assert g["values"][label] == option
     assert "Frame ID source" not in list(g.drawn.values())
-    for text in ("Guides captured","38","Matching guides (ready / pending)","0 / 2","Guides await submission"):
-        assert text in list(g.drawn.values()), "Missing precise match diagnostic: " + text
-    assert any("matching OpenXR update for FG timings" in t for t in g.drawn.values())
+    for text in ("Captured guides: 38","Guide matching: Guides await submission","Direct output fallback: unavailable"):
+        assert text in list(g.drawn.values()), "Missing capture diagnostic: " + text
+    assert g.tree_parents["CPU waits and pacing"] == "FG capture and presentation diagnostics"
+    assert "Game waits for credit" in list(g.drawn.values())
+    count = len(g.sent)
+    draw("Copy FG diagnostic JSON")
+    assert last().endswith("\ncopy_fg_diagnostics"), "Copy FG diagnostic JSON did not reach the runtime"
+    assert "Install the matching OpenXR layer update." in list(g.drawn.values())
     performance = {"supported": True, "gpu_supported": True, "gpu_valid": True, "gpu_samples": 42,
                    "window_samples": 42, "foveated_eyes": 2, "center_ms": 2.75, "center_last_ms": 2.5,
                    "periphery_ms": .4, "periphery_last_ms": .35, "preparation_ms": .6,
@@ -307,32 +313,19 @@ def run(engine):
     count = len(g.sent)
     receive(state)
     draw()
-    for text in ("DLSS-FG center", "Periphery + output assembly", "2.750 / 2.500", "0.400 / 0.350",
-                 "FG GPU total", "4.200 ms", "18.200 ms", "11.111 ms", "280 x 232", "256 x 256", "512 x 512"):
+    count = len(g.sent)
+    for text in ("DLSS-FG / shader center", "Periphery + output assembly", "2.750 / 2.500", "0.400 / 0.350",
+                 "FG GPU total", "280 x 232", "256 x 256", "512 x 512"):
         assert text in list(g.drawn.values()), "Missing FG timing: " + text
+    for text in ("4.200 ms", "18.200 ms", "Headset frame period"):
+        assert text not in list(g.drawn.values()), "Standalone does not show CPU wait rows: " + text
     assert len(g.sent) == count, "Reading FG performance must not change settings"
     state["fg"]["experiments"] = {"supported":True,"latency_enabled":True,"latency_valid":True,
-        "latency_samples":12,"latency_rejected":1,"full_color_copies":5,"direct_eye_copies":20,
-        "eye_crop_copies":10,"upload_copies":30,"upload_batches":10,
-        "capture_dependency":{"mean":9.5,"last":9.0},"gpu_work":{"mean":3.18,"last":3.1}}
-    state["fg"]["experiments"].update({"gpu_ready_samples":10,"native_gpu_tail":{"mean":10,"last":9.5},
-        "gpu_ready_to_submit":{"mean":3.4,"last":3.2},"display_time_supported":False})
+        "latency_samples":12,"capture_dependency":{"mean":9.5,"last":9.0}}
     receive(state)
     draw()
-    for label in ("Capture-fence dependency","9.500 / 9.000","GPU end to CPU observation","3.180 / 3.100","30 / 10",
-                  "Native GPU tail (excluded)","GPU color-ready to generated submit","3.400 / 3.200","Runtime clock conversion unavailable"):
-        assert label in list(g.drawn.values()), "Missing calibrated latency: " + label
-    state["fg"]["experiments"].update({"display_time_supported":True,"predicted_samples":10,
-        "gpu_ready_to_display":{"mean":11.7,"last":11.5}})
-    receive(state)
-    draw()
-    assert "11.700 / 11.500" in list(g.drawn.values())
-    assert "Submit is measured; display is the runtime's predicted target, not confirmed physical display." in list(g.drawn.values())
-    state["fg"]["experiments"]["latency_valid"] = False
-    receive(state)
-    draw()
-    assert "Waiting for a valid calibrated timeline sample." in list(g.drawn.values())
-    assert "9.500 / 9.000" not in list(g.drawn.values()), "Invalid calibration cannot display stale timings"
+    for label in ("Capture-fence dependency","9.500 / 9.000","Native GPU tail (excluded)"):
+        assert label not in list(g.drawn.values()), "Standalone does not show calibrated latency rows: " + label
     state["fg"]["overhead"] = {"supported":True,"guide_samples":10,"capture_samples":10,
         "publication_samples":10,"upload_samples":20,"guide_ms":.2,"guide_last_ms":.1,
         "capture_ms":1.3,"capture_last_ms":1.2,"publication_ms":.3,"publication_last_ms":.2,
@@ -356,22 +349,17 @@ def run(engine):
     performance["mismatched_guides"] = 3
     receive(state)
     draw()
-    for label in ("FG completion wait (background)", "OpenXR waits (presenter)",
-                  "Game frame handoff (CPU)", "Game pacing wait", "Skipped FG jobs (busy)",
-                  "Color / guide submission", "42 / 42", "Rejected guide matches",
-                  "FG input color", "RGBA8 SDR",
-                  "FG GPU queue", "Game queue; background CPU worker"):
-        assert label in list(g.drawn.values()), "Missing buffered FG diagnostic: " + label
-    assert "FG completion wait (CPU)" not in list(g.drawn.values())
+    for label in ("FG completion wait (background)", "Game frame handoff (CPU)", "Rejected guide matches", "RGBA8 SDR"):
+        assert label not in list(g.drawn.values()), "Standalone does not show buffered presenter rows: " + label
     state["fg"]["cadence"] = {"supported":True,"valid":True,"game_fps":32,"native_target_fps":60,
         "native_fps":32,"generated_fps":32,"unique_fps":64,"submission_fps":120,"refresh_hz":120,
         "app_image_wait_ms":4,"present_image_wait_ms":5,"begin_ms":6,"end_ms":7,"present_cpu_ms":8}
     count = len(g.sent)
     receive(state)
     draw()
-    for label in ("FPS (game / native / generated)","32.0 / 32.0 / 32.0","Unique FPS output","64.0 FPS",
-                  "Game image wait / call","Presenter image wait / call","Runtime begin / end","6.000 / 7.000 ms"):
+    for label in ("FPS (game / native / generated)","32.0 / 32.0 / 32.0","Unique FPS output","64.0 FPS"):
         assert label in list(g.drawn.values()), "Missing measured cadence: " + label
+    assert "Game image wait / call" not in list(g.drawn.values())
     assert len(g.sent) == count, "Reading cadence must not change settings"
     assert "Real frame" not in list(g.drawn.values()), "Older layers must not show zero as a measured frame age"
     state["fg"]["presentation"] = {"supported":True,"native_samples":10,"generated_samples":9,
@@ -379,25 +367,26 @@ def run(engine):
         "newest_input_age_ms":12,"newest_input_age_last_ms":13}
     receive(state)
     draw()
-    for label in ("Content age at OpenXR submission (average / last ms)","Real frame","30.000 / 31.000 ms",
-                  "Generated frame (from the midpoint of its two real frames)","22.000 / 23.000 ms",
-                  "Newest input used for the generated frame","12.000 / 13.000 ms"):
+    for label in ("Real frame","30.00 ms",
+                  "Generated frame (from the midpoint of its two real frames)","22.00 ms",
+                  "Newest input used for the generated frame","12.00 ms"):
         assert label in list(g.drawn.values()), "Missing frame latency telemetry: " + label
     assert len(g.sent) == count, "Frame-age telemetry must never apply settings"
     state["fg"]["presentation"]["generated_samples"] = 0
     receive(state)
     draw()
-    assert "No samples yet" in list(g.drawn.values()) and "22.000 / 23.000 ms" not in list(g.drawn.values())
-    state["fg"]["presentation"]["supported"] = False
+    assert "Real frame" in list(g.drawn.values()) and "22.00 ms" not in list(g.drawn.values())
+    del state["fg"]["presentation"]
     receive(state)
     draw()
     assert "Real frame" not in list(g.drawn.values()), "Missing optional export must preserve older layer compatibility"
+    assert "No content-age samples yet." in list(g.drawn.values())
     performance["asynchronous_presenter"] = False
     performance["foveated_eyes"] = 0
     performance["center_width"] = performance["center_height"] = 512
     receive(state)
     draw()
-    assert "DLSS-FG full frame" in list(g.drawn.values())
+    assert "FG full frame" in list(g.drawn.values())
     assert "0.400 / 0.350" not in list(g.drawn.values()), "Do not present full-frame FG as a measured periphery pass"
     performance["gpu_valid"] = False
     receive(state)
@@ -426,9 +415,9 @@ def run(engine):
     old_layer["fg"]["controls_supported"] = False
     receive(old_layer)
     draw()
-    assert any("layer needs updating" in t for t in g.drawn.values())
+    assert "Update the OpenXR layer and restart the game." in list(g.drawn.values())
     receive(state)
-    draw("Reset DLSS-FG defaults")
+    draw("Reset FG defaults")
     assert last().endswith("\ndefaults_fg")
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     for key, value in baseline["settings"].items():
