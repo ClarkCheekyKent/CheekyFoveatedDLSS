@@ -3,6 +3,7 @@
 #include "settings_io.hpp"
 #include "frame_cadence.hpp"
 #include "gpu_memory.hpp"
+#include "system_load.hpp"
 #include "support_bundle.hpp"
 #include "eye_calibration_capture.hpp"
 #include <shellapi.h>
@@ -56,7 +57,7 @@ struct State {
     std::uint64_t next_fg_memory_sample{};
     std::uint64_t logged_memory_sample{};
     ULONGLONG next_memory_log{};std::uint64_t logged_local_usage{}; // Memory lines: every 30 s or on a 64 MB change.
-    ULONGLONG next_timing_log{};
+    ULONGLONG next_timing_log{},next_load_log{};
     std::string message{"Not initialized"};
     std::atomic<bool> save_requested{}, report_requested{};
     std::atomic<bool> report_busy{}, report_browser{};
@@ -65,6 +66,8 @@ struct State {
     std::string report_summary;
 };
 State& state() { static auto* instance = new State; return *instance; }
+// Never destroyed: its sampler thread may outlive DLL teardown until it exits.
+SystemLoadSampler& system_load() { static auto* instance = new SystemLoadSampler; return *instance; }
 void sample_fg_memory(State& s,std::uint64_t now) {
     if(now<s.next_fg_memory_sample)return;
     CheekyFgMemory value;fg_memory_diagnostics(value);s.fg_memory=value;s.next_fg_memory_sample=now+1000;
@@ -171,7 +174,13 @@ std::string snapshot_locked(State& s) {
         << ",\"local_bytes\":" << memory.baseline_local << ",\"nonlocal_bytes\":" << memory.baseline_nonlocal
         << ",\"local_delta_bytes\":" << (memory.baseline_valid&&memory.local.valid?std::int64_t(memory.local.usage)-std::int64_t(memory.baseline_local):0)
         << ",\"nonlocal_delta_bytes\":" << (memory.baseline_nonlocal_valid&&memory.nonlocal.valid?std::int64_t(memory.nonlocal.usage)-std::int64_t(memory.baseline_nonlocal):0) << "}"
-        << ",\"fg_resources\":" << fg_memory_json(s.fg_memory) << "}"
+        << ",\"fg_resources\":" << fg_memory_json(s.fg_memory) << "}";
+    const auto load=system_load().latest();
+    out << ",\"system_load\":{\"valid\":" << load.valid << ",\"gpu_valid\":" << load.gpu_valid
+        << ",\"sample_age_ms\":" << (load.tick?GetTickCount64()-load.tick:0)
+        << ",\"cpu_total_percent\":" << load.cpu_total << ",\"cpu_busiest_core_percent\":" << load.cpu_busiest_core
+        << ",\"cpu_game_percent\":" << load.cpu_process << ",\"gpu_busy_percent\":" << load.gpu_busy
+        << ",\"gpu_game_percent\":" << load.gpu_game << ",\"gpu_encode_percent\":" << load.gpu_encode << ",\"gpu_engine\":\"" << json_escape(load.gpu_engine) << "\"}"
         << ",\"fg\":{\"layer_present\":" << bool(fg.layer_present)
         << ",\"controls_supported\":" << bool(fg.controls_supported)
         << ",\"compatible_session\":" << bool(fg.compatible_session)
@@ -660,6 +669,7 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Detach(std::uint64_t attachm
     if(state().host == CheekyRuntimeHost::uevr)fg_uevr_mode_detached();
     allow_afw_stereo_projection(false);
     eye_calibration_suspend();
+    system_load().stop();
     set_processing_allowed(false);
 }
 extern "C" __declspec(dllexport) void CheekyUEVR_Detach(std::uint64_t attachment) { CheekyRuntime_Detach(attachment); }
@@ -721,6 +731,18 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
         if(s.graphics_ready&&s.memory.samples!=s.logged_memory_sample){
             s.logged_memory_sample=s.memory.samples;
             sample_fg_memory(s,GetTickCount64());
+        }
+        if(s.graphics_ready){system_load().set_adapter(s.memory.luid);system_load().ensure_started();}
+        if(s.graphics_ready&&GetTickCount64()>=s.next_load_log){
+            // Periodic load line so a support bundle shows whether slow stretches are CPU- or GPU-bound.
+            s.next_load_log=GetTickCount64()+5000;
+            const auto load=system_load().latest();
+            if(load.valid){
+                CheekyFgCadence fg_rates;fg_cadence(fg_rates);
+                trace_event("SYSTEM load cpu_total=%.0f%% cpu_busiest_core=%.0f%% cpu_game=%.0f%% gpu=%.0f%% (%s) gpu_game=%.0f%% gpu_encode=%.0f%% gpu_valid=%u vram_used_mb=%llu vram_budget_mb=%llu game_fps=%.1f native_fps=%.1f generated_fps=%.1f cadence_valid=%u",
+                    load.cpu_total,load.cpu_busiest_core,load.cpu_process,load.gpu_busy,load.gpu_engine,load.gpu_game,load.gpu_encode,unsigned(load.gpu_valid),
+                    s.memory.local.usage>>20,s.memory.local.budget>>20,fg_rates.game_fps,fg_rates.native_fps,fg_rates.generated_fps,fg_rates.valid);
+            }
         }
         constexpr std::uint64_t memory_log_change=64ull<<20;
         const auto local_change=s.memory.local.usage>s.logged_local_usage?s.memory.local.usage-s.logged_local_usage:s.logged_local_usage-s.memory.local.usage;

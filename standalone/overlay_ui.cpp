@@ -983,6 +983,20 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::Text("Repeated / total submissions: %.1f / %.1f FPS", number(cadence,"repeat_fps"), number(cadence,"submission_fps"));
         ImGui::TextWrapped("Unique output excludes repeats. Headset refresh target is not measured output FPS.");
     } else ImGui::TextUnformatted("Measuring presentation cadence...");
+    {
+        // Whole-system load, sampled once per second, to tell CPU- from GPU-bound stretches.
+        const auto load = member(snapshot, "system_load");
+        const auto vram = member(member(snapshot, "gpu_memory"), "local");
+        if (flag(load, "valid")) {
+            ImGui::Text("CPU: %.0f%% total, busiest core %.0f%%, game %.0f%%", number(load, "cpu_total_percent"),
+                number(load, "cpu_busiest_core_percent"), number(load, "cpu_game_percent"));
+            if (flag(load, "gpu_valid"))
+                ImGui::Text("GPU: %.0f%% busy, game %.0f%%, video encode %.0f%%", number(load, "gpu_busy_percent"), number(load, "gpu_game_percent"), number(load, "gpu_encode_percent"));
+            else ImGui::TextUnformatted("GPU: utilization counters unavailable");
+        }
+        if (flag(vram, "valid"))
+            ImGui::Text("VRAM (game): %.1f / %.1f GB budget", number(vram, "usage_bytes") / 1073741824.0, number(vram, "budget_bytes") / 1073741824.0);
+    }
     const auto gpu = member(fg, "performance");
     if (!flag(gpu, "supported")) ImGui::TextWrapped("FG GPU timings: install the matching OpenXR layer update.");
     else if (flag(gpu, "gpu_valid")) {
