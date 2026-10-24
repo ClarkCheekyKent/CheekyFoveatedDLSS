@@ -880,8 +880,12 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     auto& s = settings.fg;
     const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
     const auto fg = member(snapshot, "fg");
-    ImGui::Checkbox("Enable DLSS Frame Generation (2x)", &s.enabled);
+    ImGui::Checkbox("Enable Frame Generation", &s.enabled);
     test_control("FgEnabled");
+    int multiplier=int(s.multiplier)-2;
+    if(ImGui::Combo("FG multiplier",&multiplier,"2x\0" "3x\0" "4x\0"))s.multiplier=unsigned(multiplier+2);
+    test_control("FgMultiplier");
+    if(s.multiplier>2)ImGui::TextWrapped("DLSS requires multi-frame support from the GPU and runtime. Shader methods support all multipliers. Higher multipliers lower the game's target frame rate.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
     else if (!flag(fg, "controls_supported"))
@@ -980,7 +984,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const auto presentation=member(fg,"presentation");
     if(number(presentation,"native_samples")>0)rows(presentation, {{"Real frame", "native_age_ms"}}, true);
     if(number(presentation,"generated_samples")>0)rows(presentation, {
-        {"Generated frame (from the midpoint of its two real frames)", "generated_age_ms"},
+        {"Generated frame (at its interpolated time)", "generated_age_ms"},
         {"Newest input used for the generated frame", "newest_input_age_ms"}}, true);
     if(number(presentation,"native_samples")==0&&number(presentation,"generated_samples")==0)ImGui::TextUnformatted("No content-age samples yet.");
     ImGui::PopID();

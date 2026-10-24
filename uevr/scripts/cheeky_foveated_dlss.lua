@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -621,7 +621,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             text("DLSS-FG controls are available only in UEVR Native Stereo.")
         else
             -- Same content and order as the standalone F8 DLSS-FG tab.
-            check("Enable DLSS Frame Generation (2x)", "FgEnabled")
+            check("Enable Frame Generation", "FgEnabled")
+            if draft.FgMultiplier ~= nil then
+                combo("FG multiplier", "FgMultiplier", {[2]="2x", [3]="3x", [4]="4x"})
+                if draft.FgMultiplier > 2 then text("DLSS requires multi-frame support from the GPU and runtime. Shader methods support all multipliers. Higher multipliers lower the game's target frame rate.") end
+            end
             local fg = status.fg or {}
             if not fg.layer_present then
                 text("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.")
@@ -724,7 +728,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 local ages = {}
                 if (presentation.native_samples or 0) > 0 then ages[#ages+1] = {"Real frame", ms(presentation, "native_age_ms")} end
                 if (presentation.generated_samples or 0) > 0 then
-                    ages[#ages+1] = {"Generated frame (from the midpoint of its two real frames)", ms(presentation, "generated_age_ms")}
+                    ages[#ages+1] = {"Generated frame (at its interpolated time)", ms(presentation, "generated_age_ms")}
                     ages[#ages+1] = {"Newest input used for the generated frame", ms(presentation, "newest_input_age_ms")}
                 end
                 if #ages > 0 then rows("fg_frame_age", ages) else text("No content-age samples yet.") end

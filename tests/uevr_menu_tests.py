@@ -172,8 +172,15 @@ def run(engine):
     draw()
     assert g["values"]["Use lower DLSS hook (DX12)"] is True
     assert "DLSS-FG (experimental)" in g.trees
-    assert g["values"]["Enable DLSS Frame Generation (2x)"] is False
-    draw(changes={"Enable DLSS Frame Generation (2x)": True})
+    assert g["values"]["Enable Frame Generation"] is False
+    state["settings"]["FgMultiplier"] = 2
+    receive(state)
+    draw(changes={"FG multiplier": 4})
+    assert "FgMultiplier=4" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["FgMultiplier"] = 4
+    receive(state)
+    draw(changes={"Enable Frame Generation": True})
     assert "FgEnabled=true" in last()
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["FgEnabled"] = True
@@ -368,7 +375,7 @@ def run(engine):
     receive(state)
     draw()
     for label in ("Real frame","30.00 ms",
-                  "Generated frame (from the midpoint of its two real frames)","22.00 ms",
+                  "Generated frame (at its interpolated time)","22.00 ms",
                   "Newest input used for the generated frame","12.00 ms"):
         assert label in list(g.drawn.values()), "Missing frame latency telemetry: " + label
     assert len(g.sent) == count, "Frame-age telemetry must never apply settings"
@@ -425,7 +432,7 @@ def run(engine):
             state["settings"][key] = value
     receive(state)
     draw()
-    assert g["values"]["Enable DLSS Frame Generation (2x)"] is False
+    assert g["values"]["Enable Frame Generation"] is False
     draw(changes={"Use lower DLSS hook (DX12)": False})
     assert "D3D12LowerHook=false" in last()
     state["request"] = state["applied_request"] = int(last().splitlines()[1])

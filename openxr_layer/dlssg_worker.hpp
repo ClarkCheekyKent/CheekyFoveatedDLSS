@@ -57,6 +57,7 @@ struct Worker {
     bool configured{},ngx_required{true};
     ComPtr<ID3D12Device> probed_device;
     bool probe_attempted{}, capability_ready{}, failed{};
+    unsigned max_generated_frames{1};
     char diagnostic[384]{"NGX capability has not been checked"};
     void (*trace)(const char*) noexcept {};
     bool probe(ID3D12Device*,const wchar_t* model_directory=nullptr) noexcept;
@@ -68,14 +69,14 @@ struct Worker {
     bool initialize(ID3D12Device*,ID3D12CommandQueue*,unsigned,unsigned,DXGI_FORMAT,bool require_ngx=true) noexcept;
     static bool record_output_copies(ID3D12GraphicsCommandList*,const std::array<ID3D12Resource*,2>&,
                                     const std::array<OutputCopy,2>&) noexcept;
-    // prev and current are both retained by caller; each call records a 2x
-    // interpolation with eye-specific histories and camera matrices.
+    // One indexed output of a real-frame interval. Histories advance on its last output.
     bool generate(const CheekyFgPair&,const std::array<ID3D12Resource*,2>& color,
                   const std::array<ID3D12Resource*,2>& previous,
                   const std::array<Camera,2>& camera,
                   std::array<ID3D12Resource*,2>& output,
                   std::array<OutputCopy,2>* copies=nullptr,
                   void(*on_submitted)(void*) noexcept=nullptr,void* submitted_context=nullptr,
-                  void(*on_prepared)(void*) noexcept=nullptr) noexcept;
+                  void(*on_prepared)(void*) noexcept=nullptr,
+                  unsigned frame_count=1,unsigned frame_index=1) noexcept;
 };
 }

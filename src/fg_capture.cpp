@@ -85,7 +85,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // both NGX histories every time a release mode was changed live.
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
+    for(const auto n:{s.multiplier,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
@@ -566,6 +566,10 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetUevrModeV2(CheekyFgUev
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetTransportOptionsV1(CheekyFgTransportOptions* out) noexcept {
     if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
     out->latency_diagnostics=cheeky::foveated_dlss::current_settings().fg.latency_diagnostics==1u?1u:0u;return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetRateOptionsV1(CheekyFgRateOptions* out) noexcept {
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    out->multiplier=std::clamp(cheeky::foveated_dlss::current_settings().fg.multiplier,2u,4u);return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(CheekyFgPacingOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;

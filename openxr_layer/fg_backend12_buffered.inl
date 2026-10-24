@@ -490,6 +490,23 @@ struct BufferedBackend12 final : FrameBackend {
         const std::shared_ptr<BufferedNative>& job,BufferedPair& pair,
         bool& reset_history,std::uint64_t& logged_samples,
         std::shared_ptr<BufferedDirectRequest>& direct_job) override {
+        pair.generated_count=std::clamp(job->multiplier,2u,4u)-1;
+        GenerationOutcome total{true,true,false};
+        for(unsigned index=0;index<pair.generated_count;++index){
+            pair.generated_index=index;
+            if(index)pair.generated.swap(pair.extra_generated[index-1]);
+            const auto result=generate_one(previous,job,pair,reset_history,logged_samples,direct_job);
+            if(index)pair.generated.swap(pair.extra_generated[index-1]);
+            total.success&=result.success;total.attempted&=result.attempted;total.history_reset|=result.history_reset;
+            if(!result.attempted)break;
+        }
+        pair.generated_index=0;
+        return total;
+    }
+    GenerationOutcome generate_one(const std::shared_ptr<BufferedNative>& previous,
+        const std::shared_ptr<BufferedNative>& job,BufferedPair& pair,
+        bool& reset_history,std::uint64_t& logged_samples,
+        std::shared_ptr<BufferedDirectRequest>& direct_job) {
         GenerationOutcome outcome;auto& success=outcome.success;auto& attempted=outcome.attempted;auto& history_was_reset=outcome.history_reset;
         const auto* job_guides=guides12(*job);
         if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&job_guides&&
@@ -593,7 +610,7 @@ struct BufferedBackend12 final : FrameBackend {
                 const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;});
                 const bool blocked_direct=job->direct_output_mode&&(border_upload||owner.direct_blocked_target==owner.direct_target_key(owner.worker.width,owner.worker.height,owner.worker.focus.color_format));
                 if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;}
-                if(camera_pair_valid&&job->direct_output_mode&&!blocked_direct){
+                if(camera_pair_valid&&pair.generated_count==1&&job->direct_output_mode&&!blocked_direct){
                     const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
                         return g.peripheral_method<=2&&(g.focus_width<.999f||g.focus_height<.999f);});
                     if(supported){
@@ -620,11 +637,12 @@ struct BufferedBackend12 final : FrameBackend {
                     copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};
                 }
                 if(available&&camera_pair_valid) {
-                    success=owner.worker.generate(guides,input,prior,cameras,result,&copies,[](void* context) noexcept {
+                    const bool last=pair.generated_index+1==pair.generated_count;
+                    success=owner.worker.generate(guides,input,prior,cameras,result,&copies,last?+[](void* context) noexcept {
                         static_cast<BufferedPresenter*>(context)->inference_submitted();
-                    },&owner,[](void* context) noexcept {
+                    }:nullptr,&owner,last?+[](void* context) noexcept {
                         static_cast<BufferedPresenter*>(context)->inference_prepared();
-                    });attempted=!owner.worker.failed&&owner.worker.temporal_evaluation_completed;
+                    }:nullptr,pair.generated_count,pair.generated_index+1);attempted=!owner.worker.failed&&owner.worker.temporal_evaluation_completed;
                     pair.submitted_at=owner.worker.submitted_at;
                     for(unsigned eye=0;eye<2;++eye) {
                         pair.generated[eye]->state=copies[eye].state;

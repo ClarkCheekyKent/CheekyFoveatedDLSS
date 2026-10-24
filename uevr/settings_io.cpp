@@ -39,6 +39,7 @@ std::string_view trim(std::string_view s) {
 }
 }
 bool set_named_setting(Settings& s, std::string_view key, std::string_view value) {
+    if(key=="FgMultiplier") {unsigned n{};if(!parse(value,n)||n<2||n>4)return false;s.fg.multiplier=n;return true;}
     if(key=="FgCenterMethod") {unsigned method{};if(!parse(value,method)||method>2)return false;s.fg.center_method=method;return true;}
     if(key=="QuadSavedSourceCount"){unsigned count{};if(!parse(value,count)||count>8)return false;s.quad_saved_source_count=count;return true;}
     if(key.size()==13&&key.starts_with("QuadView")&&key.ends_with("Role")&&key[8]>='1'&&key[8]<='8'){

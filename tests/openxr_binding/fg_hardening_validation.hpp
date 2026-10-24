@@ -1,5 +1,6 @@
 #pragma once
 #include <variant>
+#include <unordered_set>
 
 // Invalid inputs must be rejected before they can advance FG's camera history.
 void fg_camera_validation() {
@@ -67,6 +68,7 @@ struct Parameters final : NVSDK_NGX_Parameter {
 inline Microsoft::WRL::ComPtr<ID3D12Resource> flag_upload;
 inline unsigned calls{},fail_at{},created{};
 inline std::vector<unsigned> reset_flags;
+inline std::vector<std::pair<unsigned,unsigned>> frame_indices;
 NVSDK_NGX_Result NVSDK_CONV allocate(NVSDK_NGX_Parameter** out){*out=new Parameters;return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV destroy(NVSDK_NGX_Parameter* p){delete static_cast<Parameters*>(p);return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature,NVSDK_NGX_Parameter*,NVSDK_NGX_Handle** out){
@@ -74,6 +76,9 @@ NVSDK_NGX_Result NVSDK_CONV create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature,
 }
 NVSDK_NGX_Result NVSDK_CONV release(NVSDK_NGX_Handle* h){delete reinterpret_cast<unsigned*>(h);return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV evaluate(ID3D12GraphicsCommandList* list,const NVSDK_NGX_Handle*,const NVSDK_NGX_Parameter* p,PFN_NVSDK_NGX_ProgressCallback){
+    unsigned count{},index{};
+    check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.MultiFrameCount",&count))&&NVSDK_NGX_SUCCEED(p->Get("DLSSG.MultiFrameIndex",&index)),"NGX receives multi-frame parameters");
+    frame_indices.emplace_back(count,index);
     unsigned reset{};check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.Reset",&reset)),"Fixture receives actual NGX reset policy");reset_flags.push_back(reset);
     if(++calls==fail_at)return NVSDK_NGX_Result_FAIL_InvalidParameter;
     ID3D12Resource* disable{};check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.OutputDisableInterpolation",&disable))&&disable,"Fixture receives disable-output buffer");
@@ -153,6 +158,21 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(generate(cameras)&&worker.temporal_evaluation_completed&&!worker.failed,"Recover after discarded publication");
     worker.reset_features();check(!worker.temporal_evaluation_completed,"Feature reset invalidates completion state");
     check(generate(cameras)&&worker.temporal_evaluation_completed,"Generation resumes after resetting features");
+    for(unsigned count:{2u,3u}){
+        const auto before=calls;worker.max_generated_frames=1;
+        check(!worker.generate(guides,colors,colors,cameras,output,nullptr,nullptr,nullptr,nullptr,count,1)&&calls==before&&!worker.failed,
+            "Unsupported DLSS multiplier rejects before evaluation without a sticky failure");
+        worker.max_generated_frames=3;++guides.render_frame;
+        const auto previous_frame=worker.features[0].evaluated_frame;
+        for(unsigned index=1;index<=count;++index){
+            frame_indices.clear();
+            check(worker.generate(guides,colors,colors,cameras,output,nullptr,nullptr,nullptr,nullptr,count,index),"NGX multi-frame indexed evaluation");
+            check(frame_indices.size()==2&&frame_indices[0]==std::pair{count,index}&&frame_indices[1]==std::pair{count,index},
+                "Each eye receives the same count and successive index");
+            check(worker.features[0].evaluated_frame==(index==count?guides.render_frame:previous_frame),
+                "Crop history advances once per real frame after the last output");
+        }
+    }
     worker.reset();check(!worker.temporal_evaluation_completed,"Worker reset clears completion state");flag_upload.Reset();
     worker.probe_attempted=true;worker.capability_ready=false;worker.failed=true;
     check(worker.initialize(device,queue,64,64,DXGI_FORMAT_R8G8B8A8_UNORM,false),"Shader-only D3D12 FG bypasses unavailable NGX capability");
@@ -180,6 +200,26 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(shader_pixel[0]==255&&shader_pixel[1]==0&&shader_pixel[2]==0,"D3D12 cropped shader center produces actual source pixels without NGX");
     shader_readback->Unmap(0,nullptr);
     worker.reset();
+    // Exercise the production D3D12 backend's complete batch and output leases.
+    for(unsigned multiplier:{3u,4u}){
+        BufferedPresenter presenter;
+        check(presenter.setup(h<XrSession>(2),buffered_probe::Runtime::functions(),device,queue),"D3D12 multi-frame backend setup");
+        auto previous=std::make_shared<BufferedNative>(),current=std::make_shared<BufferedNative>();
+        previous->id=1;current->id=2;previous->guide_token=2;current->guide_token=4;
+        previous->source_configuration=current->source_configuration=guides.eyes[0].configuration;
+        previous->views=current->views={view,view};current->multiplier=multiplier;current->policy.queue_priority=2;
+        for(unsigned eye=0;eye<2;++eye){previous->color[eye]=current->color[eye]=std::make_shared<TransportImage>();
+            current->color[eye]->texture=color;current->color[eye]->state=D3D12_RESOURCE_STATE_GENERIC_READ;}
+        auto payload=std::make_shared<FrameGuides12>();payload->retain(guides);current->guides=payload;current->guides_valid=true;
+        BufferedPair pair;bool reset=true;std::uint64_t logged{};std::shared_ptr<BufferedDirectRequest> direct;
+        const auto generated=presenter.backend->generate(previous,current,pair,reset,logged,direct);
+        check(generated.success&&generated.attempted&&pair.generated_count==multiplier-1,"D3D12 backend generates the complete indexed batch");
+        std::unordered_set<ID3D12Resource*> outputs;
+        for(unsigned index=0;index<pair.generated_count;++index)for(const auto& image:index?pair.extra_generated[index-1]:pair.generated){
+            check(image&&image->state==D3D12_RESOURCE_STATE_GENERIC_READ&&outputs.insert(image->texture.Get()).second,
+                "Every D3D12 output eye has its own retained publication image");}
+        presenter.reset();
+    }
     std::cout<<"PASS FG evaluation completion: warm-up/resume, early rejection, partial recording, NGX failure, failed publication, recovery and reset\n";
 }
 

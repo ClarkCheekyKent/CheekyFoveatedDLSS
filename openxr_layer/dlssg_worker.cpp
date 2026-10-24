@@ -133,6 +133,9 @@ bool Worker::probe(ID3D12Device* dev,const wchar_t* model_directory) noexcept {
     caps->Get(NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver,&needs_driver);
     caps->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor,&major);
     caps->Get(NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor,&minor);
+    max_generated_frames=1;
+    unsigned maximum{};
+    if(ok(caps->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax,&maximum)))max_generated_frames=std::max(1u,maximum);
     destroy(caps);
     capability_ready=ok(available_result)&&available!=0;failed=!capability_ready;
     sprintf_s(diagnostic,"NGX FG available=%d query=0x%08x feature=0x%08x needs_driver=%d minimum_driver=%u.%u",
@@ -171,9 +174,17 @@ bool Worker::initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsig
 bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource*,2>& colors,
     const std::array<ID3D12Resource*,2>& previous,const std::array<Camera,2>& cameras,
     std::array<ID3D12Resource*,2>& outputs,std::array<OutputCopy,2>* copies,
-    void(*on_submitted)(void*) noexcept,void* submitted_context,void(*on_prepared)(void*) noexcept) noexcept {
+    void(*on_submitted)(void*) noexcept,void* submitted_context,void(*on_prepared)(void*) noexcept,
+    unsigned frame_count,unsigned frame_index) noexcept {
     submitted_at={};prepared_serial=0;temporal_evaluation_completed=false;
     std::lock_guard lock(ngx_mutex);
+    if(frame_count<1||frame_count>3||frame_index<1||frame_index>frame_count)return false;
+    if(cheeky_fg_needs_ngx(guides)&&frame_count>max_generated_frames){
+        sprintf_s(diagnostic,"DLSS %ux FG unavailable: this GPU/runtime supports at most %ux; select a supported multiplier or shader methods",
+            frame_count+1,max_generated_frames+1);if(trace)trace(diagnostic);return false;
+    }
+    const float fraction=float(frame_index)/float(frame_count+1);
+    const bool last_output=frame_index==frame_count;
     if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||guides.eyes[0].center_method>2||guides.eyes[1].center_method>2||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!wait_idle())return false;
     ngx_burst.trace=trace;
@@ -193,6 +204,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         }
     }
     focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
+    focus.interpolation_fraction=fraction;
     if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
     // Release point 1 records both eyes' preparation on list A and NGX and
     // composition on list B, with a GPU milestone between them.
@@ -288,6 +300,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(f.direct)f.output.Reset(); // Prior GPU work retired before configure_pass.
         if(!f.params) {const auto result=allocate(&f.params);if(!ok(result)||!f.params){report("NGX FG parameters",result);failed=true;return false;}}
         bool created=false;auto* p=f.params;
+        p->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount,frame_count);
+        p->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex,frame_index);
         if(!f.handle) {
             p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);p->Set("Width",tw);p->Set("Height",th);
             p->Set("DLSSG.BackbufferFormat",unsigned(desc.Format));p->Set("DLSSG.InternalWidth",gw);p->Set("DLSSG.InternalHeight",gh);p->Set("DLSSG.DynamicResolution",1u);
@@ -349,7 +363,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         p->Set("DLSSG.DepthInverted",g.depth_inverted);p->Set("DLSSG.CameraMotionIncluded",1u);
         p->Set("DLSSG.ColorBuffersHDR",desc.Format==DXGI_FORMAT_R16G16B16A16_FLOAT?1u:0u);p->Set("DLSSG.MvecDilated",0u);
         p->Set("DLSSG.MvecInvalidValue",input.motion->GetDesc().Format==DXGI_FORMAT_R16G16_FLOAT?65504.f:(std::numeric_limits<float>::max)());
-        p->Set("DLSSG.Reset",g.reset||created||(center_pass&&moving_crop_reset[eye])?1u:0u);p->Set("DLSSG.MultiFrameCount",1u);p->Set("DLSSG.MultiFrameIndex",1u);
+        p->Set("DLSSG.Reset",g.reset||created||(center_pass&&moving_crop_reset[eye])?1u:0u);
         p->Set("DLSSG.Backbuffer",input.color.Get());p->Set("DLSSG.Depth",input.depth.Get());p->Set("DLSSG.MVecs",input.motion.Get());
         p->Set("DLSSG.OutputInterpolated",f.target);p->Set("DLSSG.OutputDisableInterpolation",f.disable.Get());
         for(const char* key:{"DLSSG.BackbufferSubrectBaseX","DLSSG.BackbufferSubrectBaseY","DLSSG.InputBackbufferSubrectBaseX","DLSSG.InputBackbufferSubrectBaseY",
@@ -499,10 +513,10 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             auto* center=g.center_method?focus.center_output[eye].Get():features[eye].target;
             if(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f){
                 // For a static full-eye point P and crop origins A -> B, NGX
-                // interpolates (P-A)/size -> (P-B)/size. Its midpoint belongs
-                // at (A+B)/2. Sampling at uv+(B-A)/(2*size) re-expresses that
+                // interpolates (P-A)/size -> (P-B)/size. Its output at t belongs
+                // at lerp(A,B,t). Sampling at uv+(1-t)*(B-A)/size re-expresses that
                 // image in B without changing the real scene's interpolation.
-                if(!focus.recenter_frame(device.Get(),commands,eye,center,.5f*motion_crop_dx[eye],.5f*motion_crop_dy[eye])){
+                if(!focus.recenter_frame(device.Get(),commands,eye,center,(1-fraction)*motion_crop_dx[eye],(1-fraction)*motion_crop_dy[eye])){
                     report("FG moving-crop output recenter",unsigned(E_FAIL));failed=true;good=false;break;
                 }
                 center=focus.inputs[eye][0].recentered_color.Get();
@@ -542,8 +556,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 outputs[eye]=direct?(*copies)[eye].texture:focus.full[eye].Get();
                 if(direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_GENERIC_READ;
             } else outputs[eye]=base;
-            if(good&&rect.active&&g.peripheral_method==2)good=focus.save_depth(device.Get(),commands,eye);
-            if(good&&g.center_method==2)good=focus.save_depth(device.Get(),commands,eye,0);
+            if(good&&last_output&&rect.active&&g.peripheral_method==2)good=focus.save_depth(device.Get(),commands,eye);
+            if(good&&last_output&&g.center_method==2)good=focus.save_depth(device.Get(),commands,eye,0);
             if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
             gpu_timings.stamp(commands,query+5);
         }
@@ -599,7 +613,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // Only submitted evaluations advance NGX history. The pair can fail after
     // recording EvaluateFeature (e.g. during final composition), in which case
     // the command list is discarded and these crops must not be published.
-    for(unsigned eye=0;eye<2;++eye){
+    for(unsigned eye=0;last_output&&eye<2;++eye){
         auto& done=features[eye];
         done.evaluated_crop=center_rects[eye];done.evaluated_crop_valid=true;
         done.evaluated_frame=guides.render_frame;
@@ -717,8 +731,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     bool enabled=true;
     for(unsigned eye=0;eye<2;++eye){
-        focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
-        focus.center_history[eye]=guides.eyes[eye].center_method==2;
+        if(last_output){focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
+            focus.center_history[eye]=guides.eyes[eye].center_method==2;}
         for(auto* f:{&features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==3?&peripheral_features[eye]:nullptr}) {
             if(!f)continue;
             if(!f->handle)continue;void* data{};if(FAILED(f->readback->Map(0,nullptr,&data))||!data)return false;

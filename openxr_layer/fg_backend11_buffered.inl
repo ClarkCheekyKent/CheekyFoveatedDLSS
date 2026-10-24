@@ -147,8 +147,13 @@ struct BufferedBackend11 final : FrameBackend {
             attempted=true;
             if(!history_was_reset){
                 pair.submitted_at=TimingClock::now();
-                success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,pair.generated,
-                    owner.direct11_requested.load());
+                pair.generated_count=std::clamp(job->multiplier,2u,4u)-1;
+                success=true;
+                for(unsigned index=0;index<pair.generated_count&&success;++index){
+                    auto& output=index?pair.extra_generated[index-1]:pair.generated;
+                    success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,output,
+                        owner.direct11_requested.load(),float(index+1)/float(pair.generated_count+1));
+                }
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
                     strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}

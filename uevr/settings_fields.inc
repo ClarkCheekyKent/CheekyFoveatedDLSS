@@ -1,5 +1,6 @@
 // Persisted settings shared with the ReShade key names.
 CHEEKY_SETTING("FgEnabled", fg.enabled)
+CHEEKY_SETTING("FgMultiplier", fg.multiplier)
 CHEEKY_SETTING("FgQueuePriority", fg.queue_priority)
 CHEEKY_SETTING("FgReleasePoint", fg.release_point)
 CHEEKY_SETTING("FgPacingClock", fg.pacing_clock)

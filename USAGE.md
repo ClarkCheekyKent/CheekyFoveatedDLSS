@@ -300,6 +300,16 @@ The saved setting is `D3D12LowerHook=true` (`false` selects higher). Restart the
 
 ## Shader frame generation
 
+Choose **FG multiplier** in the standalone/OptiScaler FG tab or UEVR FG panel:
+**2x** (default), **3x**, or **4x** (`FgMultiplier=2`, `3`, or `4`). These produce
+one, two, or three distinct interpolated frames between real frames. The game
+targets headset refresh divided by the selected multiplier once FG is running.
+Shader methods support all three multipliers. DLSS regions require the GPU and
+NGX runtime to report support for the selected count; otherwise native frames
+continue and the FG status explains the unsupported multiplier. The D3D12
+direct-OpenXR experiment uses intermediate outputs at 3x/4x. Replace the runtime,
+OpenXR layer, and UEVR script together when updating.
+
 The FG center method can be **DLSS**, **Simple motion-vector warping**, or
 **Bidirectional interpolation** (`FgCenterMethod=0`, `1`, or `2`). The periphery
 method remains independent. DLSS is the default center method.

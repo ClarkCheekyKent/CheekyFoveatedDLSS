@@ -31,7 +31,7 @@ inline std::array<std::array<Frame,2>,2> scenes(){
     }
     return out;
 }
-inline CheekyFgEye meta(unsigned center,unsigned periphery,bool foveated){
+inline CheekyFgEye meta(unsigned center,unsigned periphery,bool foveated,float fraction=.5f){
     CheekyFgEye g;g.width=g.height=g.depth_width=g.depth_height=g.motion_width=g.motion_height=size;
     g.center_method=center;g.peripheral_method=periphery;g.resolution_percent=g.peripheral_percent=100;
     g.focus_width=g.focus_height=foveated?.5f:1.f;g.focus_feather=0;g.configuration=91;return g;
@@ -98,8 +98,9 @@ struct D3D12 {
 
 // D3D12 shader-FG stages as the buffered backend uses them for one eye.
 inline std::vector<std::uint32_t> generate12(D3D12& gpu,cheeky::fg::FocusPipeline& pipeline,unsigned eye,
-    const std::array<Frame,2>& frames,unsigned center,unsigned periphery,bool foveated){
+    const std::array<Frame,2>& frames,unsigned center,unsigned periphery,bool foveated,float fraction=.5f){
     using namespace cheeky::fg;
+    pipeline.interpolation_fraction=fraction;
     std::array<ComPtr<ID3D12Resource>,2> color,depth,motion;
     for(unsigned f=0;f<2;++f){color[f]=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,frames[f].color.data(),4);
         depth[f]=gpu.texture(DXGI_FORMAT_R32_FLOAT,frames[f].depth.data(),4);motion[f]=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,frames[f].motion.data(),8);}
@@ -123,7 +124,7 @@ inline std::vector<std::uint32_t> generate12(D3D12& gpu,cheeky::fg::FocusPipelin
     gpu.execute();return gpu.read(pipeline.full[eye].Get());
 }
 
-inline std::array<std::vector<std::uint32_t>,2> generate11(const std::array<std::array<Frame,2>,2>& scene,unsigned center,unsigned periphery,bool foveated){
+inline std::array<std::vector<std::uint32_t>,2> generate11(const std::array<std::array<Frame,2>,2>& scene,unsigned center,unsigned periphery,bool foveated,float fraction=.5f){
     using namespace shader11_fixture;using namespace cheeky::fg;
     Backend11 b;check(b.initialize(device.Get(),7,nullptr),b.diagnostic);
     auto upload=[&](DXGI_FORMAT format,const void* data,unsigned texel){D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=size;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;
@@ -141,7 +142,7 @@ inline std::array<std::vector<std::uint32_t>,2> generate11(const std::array<std:
             check(colors[f][eye]&&b.observe(s),"Parity D3D11 capture");}
         check(b.take_guides(guides[f]),"Parity D3D11 guide interval");}
     check(!guides[1][0]->source.meta.reset,"Parity D3D11 keeps history");
-    std::array<Image,2> generated;check(b.generate(colors[0],colors[1],guides[0],guides[1],views,views,generated),"Parity D3D11 interpolation");
+    std::array<Image,2> generated;check(b.generate(colors[0],colors[1],guides[0],guides[1],views,views,generated,false,fraction),"Parity D3D11 interpolation");
     std::array<std::vector<std::uint32_t>,2> out;
     for(unsigned eye=0;eye<2;++eye){auto* t=generated[eye]->texture11.Get();D3D11_TEXTURE2D_DESC d{};t->GetDesc(&d);
         d.Usage=D3D11_USAGE_STAGING;d.CPUAccessFlags=D3D11_CPU_ACCESS_READ;d.BindFlags=d.MiscFlags=0;
@@ -160,12 +161,12 @@ inline void fg_cross_api_parity(){
     check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"Parity D3D11 device");
     D3D12 gpu;const auto scene=scenes();unsigned cases{};
     struct Case {unsigned center,periphery;bool foveated;};
-    for(const auto c:{Case{1,0,false},Case{2,0,false},Case{1,0,true},Case{2,1,true},Case{2,2,true},Case{1,2,true}}){
+    for(float fraction:{.25f,1.f/3,.5f,2.f/3,.75f})for(const auto c:{Case{1,0,false},Case{2,0,false},Case{1,0,true},Case{2,1,true},Case{2,2,true},Case{1,2,true}}){
         cheeky::fg::FocusPipeline pipeline;pipeline.color_format=DXGI_FORMAT_R8G8B8A8_UNORM;
         check(pipeline.initialize(gpu.device.Get()),"Parity D3D12 focus pipeline");
-        const auto native=generate11(scene,c.center,c.periphery,c.foveated);unsigned total_changed{};
+        const auto native=generate11(scene,c.center,c.periphery,c.foveated,fraction);unsigned total_changed{};
         for(unsigned eye=0;eye<2;++eye){
-            const auto transported=generate12(gpu,pipeline,eye,scene[eye],c.center,c.periphery,c.foveated);
+            const auto transported=generate12(gpu,pipeline,eye,scene[eye],c.center,c.periphery,c.foveated,fraction);
             unsigned mismatched{},first=UINT32_MAX,changed{},edge_band{};
             for(unsigned i=0;i<size*size;++i){
                 changed+=native[eye][i]!=scene[eye][1].color[i];
@@ -177,7 +178,7 @@ inline void fg_cross_api_parity(){
                     // the region (half the 16 px motion) falls back to the
                     // unwarped color. Native D3D11 keeps full-eye guides.
                     const int x=int(i%size),y=int(i/size),inset=std::min({x-16,47-x,y-16,47-y});
-                    if(c.foveated&&inset>=0&&inset<8)++edge_band;
+                    if(c.foveated&&inset>=0&&inset<int(std::ceil(16*std::max(fraction,1-fraction))))++edge_band;
                     else{++mismatched;first=std::min(first,i);}
                     break;}}
             if(edge_band)std::cout<<"Parity center-edge guide crop difference center="<<c.center<<" periphery="<<c.periphery<<" eye="<<eye<<" pixels="<<edge_band<<'\n';

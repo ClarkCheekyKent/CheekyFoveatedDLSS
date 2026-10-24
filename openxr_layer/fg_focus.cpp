@@ -284,7 +284,7 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  }else if(!allocate(dev,s.output_width,s.output_height,color_format,scratch))return false;
  if(need_depth&&(!prior_depth||prior_depth->GetDesc().Width!=s.depth->GetDesc().Width||
      prior_depth->GetDesc().Height!=s.depth->GetDesc().Height))valid_history=false;
- Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);float unused[4];previous_layouts[eye].constants(c.prior_crop,c.prior_spans,unused);c.options[0]=float(method);c.options[1]=.5f;
+ Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);float unused[4];previous_layouts[eye].constants(c.prior_crop,c.prior_spans,unused);c.options[0]=float(method);c.options[1]=interpolation_fraction;
  c.options[2]=(!need_depth||valid_history)&&!g.reset?1.f:0.f;c.previous=camera.clip_to_prev;
  c.options[3]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
  auto* mv=need_motion?s.motion.Get():nullptr;auto* depth=need_depth?s.depth.Get():nullptr;

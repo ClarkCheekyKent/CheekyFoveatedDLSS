@@ -83,6 +83,11 @@ struct CheekyFgControl {
     std::uint64_t configuration{};
 };
 using CheekyFgControlFn = bool(__cdecl*)(CheekyFgControl*);
+// Optional extension; older runtime/layer pairs retain 2x behavior.
+struct CheekyFgRateOptions {
+    std::uint32_t abi{1},size{sizeof(CheekyFgRateOptions)},multiplier{2};
+};
+using CheekyFgRateOptionsFn=bool(__cdecl*)(CheekyFgRateOptions*);
 // Optional status extension. Keeps the existing FG control/status ABI intact.
 struct CheekyFgUevrModeV1 {
     std::uint32_t abi{1}, size{sizeof(CheekyFgUevrModeV1)};
@@ -185,7 +190,7 @@ using CheekyFgOverheadFn=bool(__cdecl*)(CheekyFgOverhead*);
 
 // Optional presentation telemetry; previous export layouts remain unchanged.
 // CPU color-capture observation -> xrEndFrame entry, NOT motion-to-photon.
-// Generated content time is the midpoint of its two native capture times.
+// Generated content time uses its interpolation fraction between native capture times.
 struct CheekyFgPresentation {
     std::uint32_t abi{2},size{sizeof(CheekyFgPresentation)},supported{};
     std::uint64_t native_samples{},generated_samples{};

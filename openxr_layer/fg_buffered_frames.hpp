@@ -8,6 +8,7 @@ namespace cheeky::fg {
 // produced them dereferences graphics resources or GPU completion tokens.
 struct BufferedAuxiliary {XrSwapchain source{};Image image;};
 struct BufferedNative {
+    unsigned multiplier{2};
     std::uint64_t id{},ready{},epoch{};
     unsigned direct_output_mode{};bool latency_diagnostics{};
     TimingClock::time_point captured_at{},handed_off_at{};
@@ -29,6 +30,10 @@ struct BufferedNative {
     std::uint64_t render_frame{};
 };
 struct BufferedPair {
+    // First output retains its existing name for the direct-output 2x path.
+    std::array<std::array<Image,2>,2> extra_generated;
+    unsigned generated_count{1},generated_index{};
+    float fraction() const noexcept {return float(generated_index+1)/float(generated_count+1);}
     std::uint64_t native_id{},current_id{},ready{};
     TimingClock::time_point native_captured{},current_captured{},completed_at{},handed_off_at{},worker_started_at{},submitted_at{};
     std::array<Image,2> native,generated,current;

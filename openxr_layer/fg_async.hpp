@@ -46,6 +46,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // the runtime, so a late presenter is not fed frames it will drop. 2 does
     // that and also phase-locks clock ticks to the runtime xrWaitFrame wakes.
     std::atomic<unsigned> pacing_clock_mode{};
+    std::atomic<unsigned> multiplier{2};
+    unsigned active_multiplier{2}; // Hold mx; set only when a complete interval is selected.
     std::atomic<bool> native11_skip_identity_crop{}; // Runtime option; native D3D11 eye crops.
     double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
     TimingClock::time_point last_native_present{},runtime_wake{};
@@ -107,7 +109,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     Chain scene_chains[2]; // Native and generated presentations share each eye's destination.
     CheekyFgPerformance telemetry;
     CheekyFgOverhead extra_gpu;
-    // Unique native, generated midpoint, newest FG input.
+    // Unique native, generated interpolation time, newest FG input.
     std::array<TimingAverage,3> frame_ages;
     std::array<std::uint64_t,3> age_samples{};
     TimingAverage capture_to_completion,completion_to_native,completion_to_generated;
@@ -263,7 +265,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         result.valid=cadence_window.rates(rates);result.game_fps=rates[0];result.native_fps=rates[1];result.generated_fps=rates[2];
         result.unique_fps=rates[1]+rates[2];result.submission_fps=rates[3];
         result.refresh_hz=telemetry.xr_period_ms>0?1000./telemetry.xr_period_ms:0;
-        result.application_period_ms=telemetry.xr_period_ms*(pacing_active?2:1);
+        result.application_period_ms=telemetry.xr_period_ms*(pacing_active?active_multiplier:1);
         result.native_target_fps=result.application_period_ms>0?1000./result.application_period_ms:0;
         result.app_image_wait_ms=app_image_wait.mean();result.present_image_wait_ms=present_image_wait.mean();
         result.begin_ms=runtime_begin.mean();result.end_ms=runtime_end.mean();result.present_cpu_ms=present_cpu.mean();
@@ -295,7 +297,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         };
         if(generated) {
             if(pair.native_captured!=TimingClock::time_point{}&&pair.current_captured>=pair.native_captured)
-                add(1,pair.native_captured+(pair.current_captured-pair.native_captured)/2);
+                add(1,pair.native_captured+std::chrono::duration_cast<TimingClock::duration>((pair.current_captured-pair.native_captured)*pair.fraction()));
             add(2,pair.current_captured);
         }else add(0,pair.native_captured);
         if(pair.interpolated&&pair.completed_at!=TimingClock::time_point{}&&pair.completed_at<=submitted_at) {
@@ -503,6 +505,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             trace(native11_options.skip_identity_crop?"FG native D3D11 whole-image eyes=reuse capture":"FG native D3D11 whole-image eyes=crop copy");
         const auto pacing_query=runtime?reinterpret_cast<CheekyFgPacingOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetPacingOptionsV1")):nullptr;
         CheekyFgPacingOptions pacing;
+        const auto rate_query=runtime?reinterpret_cast<CheekyFgRateOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV1")):nullptr;
+        CheekyFgRateOptions rate;
+        if(rate_query&&rate_query(&rate))multiplier=std::clamp(rate.multiplier,2u,4u);
         if(pacing_query&&pacing_query(&pacing)){
             const auto mode=std::min(pacing.clock_mode,2u);
             if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
@@ -524,11 +529,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(stopping||XR_FAILED(terminal))return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         --credits;++waited;
         const auto next=frame->next;*frame=predicted;frame->next=next;
-        // Predict a native frame two display intervals ahead; keep one display
+        // Predict a native frame at least two display intervals ahead; keep one display
         // time consistent across all engine stages and strictly increasing.
         const auto period=std::max<XrDuration>(1,predicted.predictedDisplayPeriod);
-        frame->predictedDisplayTime=std::max(predicted.predictedDisplayTime+2*period,app_display_time+period*(pacing_active?2:1));
-        if(pacing_active&&period<=INT64_MAX/2)frame->predictedDisplayPeriod=period*2;
+        const auto factor=pacing_active?active_multiplier:1u;
+        frame->predictedDisplayTime=std::max(predicted.predictedDisplayTime+period*std::max(2u,factor),app_display_time+period*factor);
+        if(pacing_active&&period<=INT64_MAX/factor)frame->predictedDisplayPeriod=period*factor;
         app_display_time=frame->predictedDisplayTime;return XR_SUCCESS;
     }
     XrResult begin_frame(const XrFrameBeginInfo* info) noexcept override {
@@ -634,6 +640,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         else {
             std::unique_lock capture_lock(capture_mutex);
             job->id=id;
+            job->multiplier=multiplier.load();
             const auto capture_result=backend->capture(job,projection,inference_slot,external,hookless_complete);
             if(capture_result==CaptureOutcome::busy){
                 std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;
@@ -663,15 +670,16 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         return result;
     }
     static std::array<XrCompositionLayerProjectionView,2> midpoint(
-        const std::array<XrCompositionLayerProjectionView,2>& a,const std::array<XrCompositionLayerProjectionView,2>& b) {
+        const std::array<XrCompositionLayerProjectionView,2>& a,const std::array<XrCompositionLayerProjectionView,2>& b,float t=.5f) {
         auto result=b;
         for(unsigned eye=0;eye<2;++eye) {
-            auto& p=result[eye].pose;for(unsigned k=0;k<3;++k)(&p.position.x)[k]=.5f*((&a[eye].pose.position.x)[k]+(&b[eye].pose.position.x)[k]);
+            auto& p=result[eye].pose;for(unsigned k=0;k<3;++k)(&p.position.x)[k]=(1-t)*(&a[eye].pose.position.x)[k]+t*(&b[eye].pose.position.x)[k];
             auto x=a[eye].pose.orientation,y=b[eye].pose.orientation;
             if(x.x*y.x+x.y*y.y+x.z*y.z+x.w*y.w<0)y={-y.x,-y.y,-y.z,-y.w};
+            x={x.x*(1-t),x.y*(1-t),x.z*(1-t),x.w*(1-t)};y={y.x*t,y.y*t,y.z*t,y.w*t};
             const float n=std::sqrt((x.x+y.x)*(x.x+y.x)+(x.y+y.y)*(x.y+y.y)+(x.z+y.z)*(x.z+y.z)+(x.w+y.w)*(x.w+y.w));
             p.orientation=n>0?XrQuaternionf{(x.x+y.x)/n,(x.y+y.y)/n,(x.z+y.z)/n,(x.w+y.w)/n}:b[eye].pose.orientation;
-            for(unsigned k=0;k<4;++k)(&result[eye].fov.angleLeft)[k]=.5f*((&a[eye].fov.angleLeft)[k]+(&b[eye].fov.angleLeft)[k]);
+            for(unsigned k=0;k<4;++k)(&result[eye].fov.angleLeft)[k]=(1-t)*(&a[eye].fov.angleLeft)[k]+t*(&b[eye].fov.angleLeft)[k];
         }
         return result;
     }
@@ -728,7 +736,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 pair.native_color_ready=previous->color_ready;
                 pair.native_final_ready=previous->final_color_ready;
                 pair.native_captured=previous->captured_at;
-                pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views);
+                pair.native_views=previous->views;pair.generated_views=midpoint(previous->views,job->views,pair.fraction());
                 pair.completed_at=TimingClock::now();}
             // Completed NGX warm-up advances history even when it supplies no
             // interpolated output. An early return or failed batch does not.
@@ -811,7 +819,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // Early late-selection wake and ordinary submission share one credit.
         if(last_credit_tick==ticks)return;
         last_credit_tick=ticks;
-        if(!stopping&&!raw&&(!pacing_active||(ticks%2)==0)) {
+        if(!stopping&&!raw&&(!pacing_active||(ticks%active_multiplier)==0)) {
             if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                 // Default: hold until FG submission. The opt-in completion
                 // policy holds through both eyes' ordinary completion fence.
@@ -854,7 +862,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(now>=next) {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
-                    double native_ms=std::max(1.,display_ms*(pacing_active?2.:1.));
+                    double native_ms=std::max(1.,display_ms*(pacing_active?double(active_multiplier):1.));
                     if(follow_window_start==TimingClock::time_point{}||now-follow_window_start>=std::chrono::milliseconds(500)) {
                         // More than 5% of rendered frames never reached the runtime.
                         const auto rendered=native_count-std::min(native_count,follow_game_mark);
@@ -866,7 +874,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     // the clock keeps probing upward and returns to the
                     // display rate as soon as the presenter catches up.
                     if(mode!=0u&&pacing_active&&follow_dropping&&presented_native_ms*.92>native_ms){
-                        native_ms=std::min(presented_native_ms*.92,display_ms*4.);++adapted_ticks;}
+                        native_ms=std::min(presented_native_ms*.92,display_ms*active_multiplier*2.);++adapted_ticks;}
                     native_clock_ms=native_ms;
                     const auto period=std::chrono::duration_cast<TimingClock::duration>(
                         std::chrono::duration<double,std::milli>(native_ms));
@@ -971,7 +979,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     native_capture_to_submit.add(std::chrono::duration<double,std::milli>(submitted_at-pair.native_captured).count());
             }}
         if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);note_frame_age(pair,generated,submitted_at);
-            if(generated){note_gpu_ready_age(pair,submitted_cpu,display_cpu);finish_generated_gate(pair.current_id,true);}}
+            if(generated){note_gpu_ready_age(pair,submitted_cpu,display_cpu);
+                if(pair.generated_index+1==pair.generated_count)finish_generated_gate(pair.current_id,true);}}
         return XR_SUCCEEDED(result);
     }
     bool fresh_content(const Pair& active,bool have_active,bool generated_phase,double position) {
@@ -1047,7 +1056,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             Pair direct_pair;
             const bool have_direct=frame.shouldRender==XR_TRUE&&backend->service_direct_output(last_position,direct_pair);
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
-                if(have_direct&&!raw_frame&&!stop_now&&!degraded){active=std::move(direct_pair);have_active=true;generated_phase=true;fg_active=pacing_active=true;
+                if(have_direct&&!raw_frame&&!stop_now&&!degraded){active=std::move(direct_pair);have_active=true;generated_phase=true;fg_active=pacing_active=true;active_multiplier=active.generated_count+1;
                     while(!ready.empty()&&ready.front().current_id<=active.current_id)ready.pop_front();}
                 else if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
                     auto selected=newest_ready_pair(last_position);
@@ -1058,7 +1067,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                             double(active.current_id)>last_position)generated_phase=true;
                         // A transient skipped/reset pair must not accelerate
                         // native production to 1x and overload FG again.
-                        if(fg_active)pacing_active=true;
+                        if(fg_active){pacing_active=true;active_multiplier=active.generated_count+1;}
                     }
                     // Prioritize a usable interpolation pair. During NGX
                     // startup, keep showing new native frames even when every
@@ -1083,14 +1092,14 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 wake_producer();
             }else if(have_active&&!stop_now&&frame.shouldRender==XR_TRUE) {
                 is_generated=generated_phase&&active.interpolated;
-                const auto& images=is_generated?active.generated:active.native;
-                const auto& views=is_generated?active.generated_views:active.native_views;
+                const auto& images=is_generated?(active.generated_index?active.extra_generated[active.generated_index-1]:active.generated):active.native;
+                const auto views=is_generated?midpoint(active.native_views,active.current_views,active.fraction()):active.native_views;
                 stale=!is_generated&&double(active.native_id)==last_position;
                 // Snapshot identity BEFORE the generated submission advances
                 // active.native_id/current_views to the next real frame.
                 trace_native_id=active.native_id;
                 trace_current_id=active.current_id;
-                trace_source_position=double(active.native_id)+(is_generated?.5:0.);
+                trace_source_position=double(active.native_id)+(is_generated?active.fraction():0.);
                 trace_source_left=images[0]?images[0]->identity:0;
                 trace_source_right=images[1]?images[1]->identity:0;
                 trace_direct=is_generated&&active.direct_xr;
@@ -1098,8 +1107,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // that wake to resubmit the preceding native frame.
                 if(!stale)submitted=render(active,images,views,is_generated,frame.predictedDisplayTime,result,closed);
                 if(submitted) {
-                    last_position=double(active.native_id)+(is_generated?.5:0.);
-                    if(is_generated){active.native=active.current;active.native_views=active.current_views;active.native_id=active.current_id;
+                    last_position=double(active.native_id)+(is_generated?active.fraction():0.);
+                    if(is_generated&&++active.generated_index==active.generated_count){active.native=active.current;active.native_views=active.current_views;active.native_id=active.current_id;
                         active.native_color_ready=active.current_color_ready;
                         active.native_final_ready=active.current_final_ready;
                         active.native_captured=active.current_captured;generated_phase=false;}
@@ -1159,7 +1168,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     char timeline[680]{};
                     sprintf_s(timeline,
                         "FG XR-TIMELINE event=%llu epoch=%llu xr_tick=%llu kind=%s native=%llu current=%llu "
-                        "position=%.1f left_tex=%llu right_tex=%llu xr_left=%u xr_right=%u "
+                        "position=%.3f left_tex=%llu right_tex=%llu xr_left=%u xr_right=%u "
                         "upload_match=%u display_ns=%lld period_ns=%lld "
                         "should_render=%u xr_result=%ld forward=%u time_forward=%u gap=%u stale=%u "
                         "predicted_lead_ms=%.3f ready_pairs=%llu generated_total=%llu anomalies=%llu",

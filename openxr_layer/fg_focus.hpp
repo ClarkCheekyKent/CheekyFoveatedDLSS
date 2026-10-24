@@ -17,6 +17,7 @@ struct FocusInput {
     bool borrowed_guides{};
 };
 struct FocusPipeline {
+    float interpolation_fraction{.5f};
     struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};};
     DXGI_FORMAT color_format{DXGI_FORMAT_R16G16B16A16_FLOAT};
     ComPtr<ID3D12RootSignature> root;
@@ -34,7 +35,7 @@ struct FocusPipeline {
         ID3D12Resource* color,const CheekyFgEye&,const FocusRect&,unsigned width,unsigned height,
         D3D12_RESOURCE_STATES color_state=D3D12_RESOURCE_STATE_COMMON,
         GpuTimings* timings=nullptr,float crop_motion_dx=0.f,float crop_motion_dy=0.f);
-    // Re-express a midpoint-crop NGX result in the current crop's coordinates.
+    // Re-express an interpolated-crop NGX result in the current crop's coordinates.
     // Newly uncovered pixels use the prepared current native crop.
     bool recenter_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* generated,float sample_shift_x,float sample_shift_y);

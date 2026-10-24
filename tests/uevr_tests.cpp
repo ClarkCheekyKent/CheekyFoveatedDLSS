@@ -90,6 +90,9 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
 void settings_tests(const std::filesystem::path& root) {
     {
         Settings fg;
+        require(fg.fg.multiplier==2&&set_named_setting(fg,"FgMultiplier","3")&&fg.fg.multiplier==3&&
+            set_named_setting(fg,"FgMultiplier","4")&&!set_named_setting(fg,"FgMultiplier","1")&&
+            !set_named_setting(fg,"FgMultiplier","5")&&!set_named_setting(fg,"FgMultiplier","-1"),"FG multiplier validates 2x/3x/4x");
         require(!fg.fg.enabled && set_named_setting(fg,"FgEnabled","true") && fg.fg.enabled,
             "FG is opt-in and configurable");
         require(fg.fg.match_sr_region && !fg.fg.show_border &&
@@ -135,12 +138,12 @@ void settings_tests(const std::filesystem::path& root) {
         Settings restored;
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.center_method==2&&restored.fg.peripheral_method==3&&
+            restored.fg.multiplier==4&&restored.fg.center_method==2&&restored.fg.peripheral_method==3&&
             restored.fg.release_point==3&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1,
             "FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
-            restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
+            restored.fg.multiplier==2&&restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
             "FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
@@ -530,6 +533,14 @@ int main(int argc, char** argv) {
             command("1\n908\nset\nFgReleasePoint=3");
             require(control_fn(&control)&&control.enabled&&control.configuration==before_release_configuration,
                 "Switching release modes preserves an enabled FG pipeline and its temporal configuration");
+            const auto rate_fn=reinterpret_cast<CheekyFgRateOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV1"));
+            CheekyFgRateOptions rate;
+            require(rate_fn&&rate_fn(&rate)&&rate.multiplier==2,"Older configurations retain 2x default");
+            command("1\n909\nset\nFgMultiplier=4");
+            require(rate_fn(&rate)&&rate.multiplier==4&&control_fn(&control)&&control.configuration!=before_release_configuration,
+                "Multiplier reaches layer export and retires the old presenter configuration");
+            rate.abi=999;require(!rate_fn(&rate),"FG rate export validates ABI");
+            command("1\n910\nset\nFgMultiplier=2");
             command("1\n903\nset\nEnabled=false");
             command("1\n905\nset\nFgReleasePoint=0");
             require(snapshot(get).find("\"FgReleasePoint\":0")!=std::string::npos,

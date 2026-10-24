@@ -260,6 +260,7 @@ Settings current_settings() noexcept {
 void update_settings(const Settings& settings) noexcept {
     std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
+    fg_settings.multiplier=std::clamp(fg_settings.multiplier,2u,4u);
     const auto bounded = [](float value, float lo, float hi, float fallback) {
         return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
     };

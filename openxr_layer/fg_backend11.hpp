@@ -301,14 +301,14 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     bool generate(const std::array<Image,2>& previous,const std::array<Image,2>& current,
         const std::array<std::shared_ptr<Guides>,2>& old_guides,const std::array<std::shared_ptr<Guides>,2>& new_guides,
         const std::array<XrCompositionLayerProjectionView,2>& previous_views,const std::array<XrCompositionLayerProjectionView,2>& current_views,
-        std::array<Image,2>& out,bool deferred_output=false) {
+        std::array<Image,2>& out,bool deferred_output=false,float fraction=.5f) {
         // Prepare both eyes first; then issue all commands in one submission.
         std::array<std::shared_ptr<DeferredDraw>,2> draws;std::array<ComPtr<ID3D11RenderTargetView>,2> targets;
         for(unsigned eye=0;eye<2;++eye){
             const auto& now=*new_guides[eye];const auto& g=now.source.meta;
             D3D11_TEXTURE2D_DESC d{};current[eye]->texture11->GetDesc(&d);
             auto cam=camera(current_views[eye],&previous_views[eye],g.depth_inverted!=0);if(!cam.valid)return false;
-            Constants c;c.previous=cam.clip_to_prev;c.options[0]=float(g.peripheral_method);c.options[1]=.5f;c.options[2]=g.reset?0.f:1.f;
+            Constants c;c.previous=cam.clip_to_prev;c.options[0]=float(g.peripheral_method);c.options[1]=fraction;c.options[2]=g.reset?0.f:1.f;
             c.dimensions[0]=float(d.Width);c.dimensions[1]=float(d.Height);
             c.dimensions[2]=g.resolution_percent*.01f;
             const bool focused=g.focus_width<.999f||g.focus_height<.999f;
