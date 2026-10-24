@@ -220,6 +220,58 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
                 "Every D3D12 output eye has its own retained publication image");}
         presenter.reset();
     }
+    {
+        Transport transport;check(transport.initialize(device,queue),"Application timing transport");
+        ApplicationTimer12 timer;
+        Sleep(20); // Deliberate pacing before the work bracket must be excluded.
+        timer.begin(transport,true);Sleep(4);
+        auto* c=transport.begin();check(c!=nullptr,"Application timing end packet");timer.end(c->list.Get());
+        std::uint64_t ticket{};check(transport.execute(*c,ticket),"Submit application timing");timer.submitted(ticket);
+        transport.drain();timer.begin(transport,false);
+        const auto sample=timer.sample();check(sample.sequence&&sample.gpu_ms>0&&sample.cpu_ms>=3&&sample.cpu_ms<20,
+            "D3D12 Auto measures GPU/CPU work and excludes the preceding pacing wait");
+        timer.begin(transport,true);transport.drain();timer.reset(transport);
+        check(!timer.sample().sequence,"Discard/reset retires an unfinished timestamp bracket safely");
+    }
+    {
+        using Runtime=buffered_probe::Runtime;
+        Runtime::device=device;Runtime::chains.clear();Runtime::direct_states.clear();Runtime::snapshots=nullptr;
+        Runtime::owner=Runtime::phase=Runtime::next_chain=0;Runtime::capture_token=0;Runtime::errors=0;
+        Runtime::waits=Runtime::begins=Runtime::ends=Runtime::generated=0;
+        Runtime::paused=Runtime::reject_private=Runtime::block_generated_end=false;Runtime::upload_serial=nullptr;
+        Runtime::guides=guides;Runtime::guides.release_point=3;Runtime::guides.fg_queue_priority=2;
+        for(auto& g:Runtime::guides.eyes){g.center_method=2;g.peripheral_method=0;g.focus_width=g.focus_height=1;g.reset=0;}
+        check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Auto native source state");
+        color_transition(list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        check(SUCCEEDED(list->Close()),"Auto source state close");ID3D12CommandList* source_lists[]{list.Get()};queue->ExecuteCommandLists(1,source_lists);
+        BufferedPresenter presenter;check(presenter.setup(h<XrSession>(2),Runtime::functions(),device,queue),"D3D12 Auto presenter setup");
+        presenter.automatic_multiplier=true;presenter.guide_stamp=Runtime::stamp;
+        presenter.guide_acquire=Runtime::acquire_guides;presenter.guide_release=Runtime::release_guides;
+        std::array<XrCompositionLayerProjectionView,2> views{view,view},helper_views{view,view};
+        for(unsigned eye=0;eye<2;++eye){views[eye].subImage={h<XrSwapchain>(200),{{0,0},{64,64}},0};helper_views[eye].subImage={h<XrSwapchain>(201),{{0,0},{4,4}},0};}
+        XrCompositionLayerProjection scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION},helper{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        scene.space=helper.space=h<XrSpace>(1);scene.views=views.data();helper.views=helper_views.data();scene.viewCount=helper.viewCount=2;
+        XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};quad.space=scene.space;quad.pose.orientation.w=1;quad.size={1,1};
+        quad.subImage={h<XrSwapchain>(201),{{0,0},{64,64}},0};
+        const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&helper),reinterpret_cast<const XrCompositionLayerBaseHeader*>(&scene),reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad)};
+        const auto frames=[&](unsigned count,unsigned work){for(unsigned frame=0;frame<count;++frame){
+            XrFrameState state{XR_TYPE_FRAME_STATE};check(XR_SUCCEEDED(presenter.wait_frame(nullptr,&state))&&XR_SUCCEEDED(presenter.begin_frame(nullptr)),"Auto D3D12 application frame");
+            Sleep(work);Runtime::capture_token+=2;
+            check(presenter.capture(h<XrSwapchain>(200),0,color.Get(),64,64,1,DXGI_FORMAT_R8G8B8A8_UNORM)&&
+                presenter.capture(h<XrSwapchain>(201),0,color.Get(),64,64,1,DXGI_FORMAT_R8G8B8A8_UNORM),"Auto D3D12 capture");
+            XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=state.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            end.layerCount=3;end.layers=layers;check(XR_SUCCEEDED(presenter.end_frame(&end,{},&scene)),"Auto D3D12 handoff");
+        }};
+        frames(40,21);
+        {std::lock_guard lock(presenter.mx);const auto status=presenter.automatic_status();
+            check(status.valid&&status.switches&&status.selected>=3&&presenter.epoch==0&&presenter.history_reset_events<=1,
+                "Real D3D12 Auto changes count under load while retaining shader color/depth history");}
+        presenter.automatic_multiplier=false;frames(6,3);
+        {std::lock_guard lock(presenter.mx);check(!presenter.automatic_status().enabled&&presenter.auto_multiplier.selected==2&&presenter.epoch==0,
+            "Auto off restores the manual count without restarting D3D12 presentation");}
+        presenter.reset();check(!Runtime::errors,"Auto D3D12 preserves runtime frame ownership and image ordering");
+        std::cout<<"PASS live D3D12 Auto FG: measured load, 2x->3x transition, history continuity and manual recovery\n";
+    }
     std::cout<<"PASS FG evaluation completion: warm-up/resume, early rejection, partial recording, NGX failure, failed publication, recovery and reset\n";
 }
 

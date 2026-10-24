@@ -882,10 +882,20 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable Frame Generation", &s.enabled);
     test_control("FgEnabled");
+    ImGui::Checkbox("Automatic FG multiplier",&s.automatic_multiplier);
+    test_control("FgAutoMultiplier");
+    ImGui::BeginDisabled(s.automatic_multiplier);
     int multiplier=int(s.multiplier)-2;
     if(ImGui::Combo("FG multiplier",&multiplier,"2x\0" "3x\0" "4x\0"))s.multiplier=unsigned(multiplier+2);
     test_control("FgMultiplier");
-    if(s.multiplier>2)ImGui::TextWrapped("DLSS requires multi-frame support from the GPU and runtime. Shader methods support all multipliers. Higher multipliers lower the game's target frame rate.");
+    ImGui::EndDisabled();
+    if(s.automatic_multiplier){
+        const auto automatic=member(fg,"automatic");
+        if(!flag(automatic,"supported"))ImGui::TextWrapped("Auto requires the matching OpenXR layer update.");
+        else ImGui::Text("Auto: %.0fx selected / %.0fx presenting (maximum %.0fx)%s",number(automatic,"selected"),number(automatic,"presented"),number(automatic,"maximum"),flag(automatic,"valid")?"":" - measuring");
+        ImGui::TextWrapped("Adapts 2x-4x to rendering load. Increases after sustained overload; decreases after 1.5 seconds of headroom.");
+    }
+    if(s.multiplier>2||s.automatic_multiplier)ImGui::TextWrapped("DLSS requires multi-frame support from the GPU and runtime. Shader methods support all multipliers. Higher multipliers lower the game's target frame rate.");
     if (!flag(fg, "layer_present"))
         warning("OpenXR layer not loaded. Install the matching OpenXR support and restart the game.");
     else if (!flag(fg, "controls_supported"))

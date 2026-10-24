@@ -135,6 +135,7 @@ std::string snapshot_locked(State& s) {
     sample_fg_memory(s,GetTickCount64());
     CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
+    CheekyFgAutoStatus fg_auto;fg_auto_status(fg_auto);
     CheekyFgPacingTimeline fg_pacing;fg_pacing_timeline(fg_pacing);
     CheekyFgNativeSubmissionLatency fg_native_latency;fg_native_submission_latency(fg_native_latency);
     CheekyFgOverhead fg_extra;fg_overhead(fg_extra);
@@ -194,6 +195,10 @@ std::string snapshot_locked(State& s) {
         << ",\"pending_guides\":" << fg_capture.pending
         << ",\"foreign_guides\":" << fg_capture.foreign
         << ",\"match_reason\":\"" << json_escape(quad_guides?(quad_fg.assembly_stage==4?"Quad guide assembly ready":"Waiting for four current view guides"):fg_capture.match_reason) << "\""
+        << ",\"automatic\":{\"supported\":" << bool(fg_auto.supported) << ",\"enabled\":" << bool(fg_auto.enabled)
+        << ",\"valid\":" << bool(fg_auto.valid) << ",\"selected\":" << fg_auto.selected << ",\"presented\":" << fg_auto.presented
+        << ",\"maximum\":" << fg_auto.maximum << ",\"reason\":" << fg_auto.reason << ",\"samples\":" << fg_auto.samples
+        << ",\"switches\":" << fg_auto.switches << ",\"cpu_ms\":" << fg_auto.cpu_ms << ",\"gpu_ms\":" << fg_auto.gpu_ms << ",\"fg_ms\":" << fg_auto.fg_ms << "}"
         << ",\"performance\":{\"supported\":" << fg_time_supported
         << ",\"gpu_supported\":" << bool(fg_time.gpu_supported)
         << ",\"gpu_valid\":" << bool(fg_time.gpu_valid)

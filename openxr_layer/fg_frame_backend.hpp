@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include "fg_auto.hpp"
 
 struct CheekyFgPair;
 struct CheekyFgPerformance;
@@ -44,6 +45,9 @@ struct GenerationStatus {
 struct FrameBackend {
     virtual ~FrameBackend()=default;
     virtual bool ready(std::uint64_t ticket) const=0;
+    virtual void begin_application_frame(bool) {}
+    virtual ApplicationTiming application_timing() const {return {};}
+    virtual unsigned maximum_multiplier(const BufferedNative&) const {return 4;}
     virtual CaptureOutcome capture(const std::shared_ptr<BufferedNative>& frame,
         const XrCompositionLayerProjection* projection,bool inference_slot,
         const CheekyFgPair* external,std::uint64_t (*complete_hookless)(unsigned))=0;

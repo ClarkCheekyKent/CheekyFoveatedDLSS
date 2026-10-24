@@ -42,6 +42,7 @@ struct Settings {
     struct FrameGeneration {
         bool enabled{false};
         std::uint32_t multiplier{2}; // Total presentations per real frame: 2, 3 or 4.
+        bool automatic_multiplier{false}; // Adapt 2x-4x from measured work, retaining temporal history.
         bool foveated{true};
         bool match_sr_region{true}; // Copy SR size and effective per-eye placement when enabled.
         bool show_border{false}; // Blue FG debug outline, drawn after FG into OpenXR output.

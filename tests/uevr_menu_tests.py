@@ -180,6 +180,21 @@ def run(engine):
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["FgMultiplier"] = 4
     receive(state)
+    state["settings"]["FgAutoMultiplier"] = False
+    receive(state)
+    draw(changes={"Automatic FG multiplier": True})
+    assert "FgAutoMultiplier=true" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["FgAutoMultiplier"] = True
+    state["fg"] = {"automatic": {"supported": True, "selected": 3, "presented": 2, "maximum": 4, "valid": True}}
+    receive(state)
+    draw()
+    assert any("Auto: 3x selected / 2x presenting (maximum 4x)" in t for t in g.drawn.values())
+    draw(changes={"Automatic FG multiplier": False})
+    assert "FgAutoMultiplier=false" in last()
+    state["request"] = state["applied_request"] = int(last().splitlines()[1])
+    state["settings"]["FgAutoMultiplier"] = False
+    receive(state)
     draw(changes={"Enable Frame Generation": True})
     assert "FgEnabled=true" in last()
     state["request"] = state["applied_request"] = int(last().splitlines()[1])

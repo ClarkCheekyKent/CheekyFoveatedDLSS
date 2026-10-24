@@ -9,6 +9,7 @@ namespace cheeky::fg {
 struct BufferedAuxiliary {XrSwapchain source{};Image image;};
 struct BufferedNative {
     unsigned multiplier{2};
+    bool automatic_multiplier{};
     std::uint64_t id{},ready{},epoch{};
     unsigned direct_output_mode{};bool latency_diagnostics{};
     TimingClock::time_point captured_at{},handed_off_at{};

@@ -91,6 +91,8 @@ if ($LASTEXITCODE -ne 0) { throw "OpenXR binding and pointer regressions failed.
 if ($LASTEXITCODE -ne 0) { throw "FG OpenXR image state and software GPU copy regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-shader11
 if ($LASTEXITCODE -ne 0) { throw "Native D3D11 shader frame generation regressions failed." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-auto
+if ($LASTEXITCODE -ne 0) { throw "Automatic frame-generation controller regressions failed." }
 & $testExecutable --calibration-search
 if ($LASTEXITCODE -ne 0) { throw "Calibration locator scale and ambiguity regressions failed." }
 & $testExecutable --libovr-policy

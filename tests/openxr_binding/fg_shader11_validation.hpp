@@ -157,7 +157,7 @@ inline void fg_backend11_pixels(){
 }
 // BufferedPresenter + Backend11 driven like DCS: the simulation thread waits
 // for frame N+1 while the render thread still owns frame N.
-inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2){
+inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2,bool automatic=false){
     using namespace shader11_fixture;using namespace cheeky::fg;
     Runtime::reset();
     auto presenter=std::make_unique<BufferedPresenter>();auto& p=*presenter;
@@ -167,6 +167,7 @@ inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2){
     check(!p.device&&!p.queue&&!p.interop11,"Native D3D11 backend creates no D3D12 objects");
     p.direct11_requested=direct;
     p.multiplier=multiplier;
+    p.automatic_multiplier=automatic;
     const auto format=DXGI_FORMAT_R8G8B8A8_UNORM;
     auto depth=texture(DXGI_FORMAT_R32_FLOAT,{.5f,0,0,0});auto motion=texture(DXGI_FORMAT_R32G32_FLOAT,{0,0,0,0});
     std::array<ComPtr<ID3D11Texture2D>,2> app_colors{texture(format,{1,0,0,1}),texture(format,{0,0,1,1})};
@@ -186,7 +187,7 @@ inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2){
             XrCompositionLayerProjection scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION};scene.space=reinterpret_cast<XrSpace>(1);scene.views=views.data();scene.viewCount=2;
             const auto* layer=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&scene);XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
             end.displayTime=time;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=1;end.layers=&layer;
-            Sleep(3); // Render work overlapping the next xrWaitFrame.
+            Sleep(automatic&&n<30?14:3); // Measured render work; separate from Wait/Begin pacing.
             if(XR_FAILED(p.end_frame(&end,{},&scene)))++app_errors;
         }
     });
@@ -199,7 +200,10 @@ inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2){
     // own the last frame: finish application frames, then drain.
     std::uint64_t generated{},native{};CheekyFgPerformance gpu;CheekyFgOverhead overhead;CheekyFgCadence cadence;
     {std::lock_guard lock(p.mx);generated=p.generated_count;native=p.native_count;
-        gpu=p.performance();overhead=p.overhead();cadence=p.cadence();}
+        gpu=p.performance();overhead=p.overhead();cadence=p.cadence();
+        if(automatic){const auto status=p.automatic_status();
+            check(status.enabled&&status.valid&&status.samples&&status.switches&&status.selected>=3&&p.epoch==0,
+                "Real DX11 Auto timings drive a live count change without resetting frame history");}}
     auto disable=std::async(std::launch::async,[&]{p.finish_application_frame();p.invalidate_temporal();});
     const bool disabled=disable.wait_for(std::chrono::seconds(5))==std::future_status::ready;
     if(!disabled){std::cerr<<"backend11 disable hung\n";std::_Exit(3);}
@@ -212,8 +216,8 @@ inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2){
     check(!Runtime::errors,"Presenter alone owns runtime frames and private swapchain image order");
     check(!app_errors,"Application wait/begin/capture/end succeed with overlapping frames");
     check(generated>=frames/4,"Native D3D11 interpolation reaches the headset with overlapping application frames");
-    check(Runtime::longest_generated_run==multiplier-1,"Presenter submits all indexed outputs in order before advancing to the next native");
-    check(std::abs(cadence.application_period_ms-5.555555*multiplier)<.001,"Native target period follows the selected multiplier");
+    check(automatic?(Runtime::longest_generated_run>=2&&Runtime::longest_generated_run<=3):Runtime::longest_generated_run==multiplier-1,"Presenter submits all indexed outputs in order before advancing to the next native");
+    if(!automatic)check(std::abs(cadence.application_period_ms-5.555555*multiplier)<.001,"Native target period follows the selected multiplier");
     check(gpu.gpu_supported&&gpu.gpu_valid&&gpu.gpu_samples>0&&gpu.window_samples>0&&
         gpu.total_ms>0&&gpu.total_last_ms>0&&gpu.output_width==64&&gpu.output_height==64,
         "Native D3D11 reports completed GPU timestamps for both copied and direct stereo generation");
@@ -419,6 +423,7 @@ void fg_shader11_validation(bool hardware=false){
     fg_backend11_pipelined();
     fg_backend11_pipelined(true);
     for(unsigned multiplier:{3u,4u}){fg_backend11_pipelined(false,multiplier);fg_backend11_pipelined(true,multiplier);}
+    fg_backend11_pipelined(false,2,true);fg_backend11_pipelined(true,2,true);
     {
         cheeky::quad_capture::QuadFg11 quad(device.Get());quad.enable(true);
         auto input=[&](DXGI_FORMAT f,float x){D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=64;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;

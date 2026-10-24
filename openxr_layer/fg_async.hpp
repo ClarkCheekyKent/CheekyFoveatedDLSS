@@ -47,7 +47,17 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // that and also phase-locks clock ticks to the runtime xrWaitFrame wakes.
     std::atomic<unsigned> pacing_clock_mode{};
     std::atomic<unsigned> multiplier{2};
+    std::atomic<bool> automatic_multiplier{};
+    AutoMultiplier auto_multiplier; // Hold mx; decisions latch on a complete native interval.
     unsigned active_multiplier{2}; // Hold mx; set only when a complete interval is selected.
+    CheekyFgAutoStatus automatic_status() const noexcept {
+        CheekyFgAutoStatus out;out.supported=1;out.enabled=automatic_multiplier.load();
+        const auto now=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
+        out.valid=auto_multiplier.valid&&now-auto_multiplier.last_sample_ms<=500;
+        out.selected=auto_multiplier.selected;out.presented=pacing_active?active_multiplier:1;
+        out.maximum=auto_multiplier.maximum;out.reason=auto_multiplier.reason;out.samples=auto_multiplier.samples;
+        out.switches=auto_multiplier.switches;out.cpu_ms=auto_multiplier.cpu_ms;out.gpu_ms=auto_multiplier.gpu_ms;out.fg_ms=auto_multiplier.fg_ms;return out;
+    }
     std::atomic<bool> native11_skip_identity_crop{}; // Runtime option; native D3D11 eye crops.
     double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
     TimingClock::time_point last_native_present{},runtime_wake{};
@@ -420,6 +430,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;
         distinct_native=runtime_submissions=0;
+        auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=0;last_native_present=runtime_wake={};
         follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
@@ -508,6 +519,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         const auto rate_query=runtime?reinterpret_cast<CheekyFgRateOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV1")):nullptr;
         CheekyFgRateOptions rate;
         if(rate_query&&rate_query(&rate))multiplier=std::clamp(rate.multiplier,2u,4u);
+        const auto automatic_query=runtime?reinterpret_cast<CheekyFgRateOptionsV2Fn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV2")):nullptr;
+        CheekyFgRateOptionsV2 automatic_options;
+        if(automatic_query&&automatic_query(&automatic_options)){
+            multiplier=std::clamp(automatic_options.multiplier,2u,4u);automatic_multiplier=automatic_options.automatic!=0;
+        }
         if(pacing_query&&pacing_query(&pacing)){
             const auto mode=std::min(pacing.clock_mode,2u);
             if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
@@ -562,7 +578,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         changed.wait(lock,[&]{return stopping||!release_gate_active();});
         begin_gate_wait.add(elapsed_ms(gate_started));
         if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
-        ++begun;changed.notify_all();return discarded?XR_FRAME_DISCARDED:XR_SUCCESS;
+        ++begun;changed.notify_all();lock.unlock();capture_lock.lock();
+        {std::lock_guard state_lock(mx);if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;}
+        backend->begin_application_frame(automatic_multiplier.load());
+        return discarded?XR_FRAME_DISCARDED:XR_SUCCESS;
     }
 
     template<class Fn> static bool subimages(FrameLayers& layers,Fn&& visit) {
@@ -641,6 +660,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             std::unique_lock capture_lock(capture_mutex);
             job->id=id;
             job->multiplier=multiplier.load();
+            job->automatic_multiplier=automatic_multiplier.load();
             const auto capture_result=backend->capture(job,projection,inference_slot,external,hookless_complete);
             if(capture_result==CaptureOutcome::busy){
                 std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;
@@ -730,6 +750,23 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             pair.handed_off_at=job->handed_off_at;pair.worker_started_at=TimingClock::now();
             pair.native_views=pair.current_views=job->views;pair.layers=job->layers;pair.auxiliary=job->auxiliary;
             pair.space=job->space;pair.blend=job->blend;pair.ready=job->ready;
+            {
+                const auto sample=backend->application_timing();
+                const auto maximum=backend->maximum_multiplier(*job);
+                const auto publication_cost=overhead();
+                std::lock_guard lock(mx);
+                auto_multiplier.mode(job->automatic_multiplier,job->multiplier,maximum);
+                if(job->automatic_multiplier){
+                    if(job->guides_valid&&previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&telemetry.gpu_valid){
+                        const double now=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
+                        const auto generated_ms=telemetry.total_last_ms+publication_cost.publication_last_ms+publication_cost.upload_last_ms;
+                        if(auto_multiplier.observe(now,sample,generated_ms,telemetry.xr_period_ms)&&trace){char message[180]{};
+                            sprintf_s(message,"FG Auto selected=%ux max=%ux render_ms=%.3f generated_ms=%.3f reason=%u (histories retained)",
+                                auto_multiplier.selected,maximum,auto_multiplier.render_ms,auto_multiplier.fg_ms,auto_multiplier.reason);trace(message);}
+                    }
+                    job->multiplier=auto_multiplier.selected;
+                }
+            }
             const auto generation=backend->generate(previous,job,pair,reset_history,logged_samples,direct_job);
             const auto success=generation.success,attempted=generation.attempted,history_was_reset=generation.history_reset;
             if(success){pair.interpolated=true;pair.native_id=previous->id;pair.native=previous->color;

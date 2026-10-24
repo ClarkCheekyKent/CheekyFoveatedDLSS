@@ -4048,6 +4048,15 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCadenceV1(CheekyFgCade
         std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->cadence();return true;}
     return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetAutoStatusV1(CheekyFgAutoStatus* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgAutoStatus{};out->supported=1;out->presented=1;std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){
+        const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner.fg);if(!buffered)continue;
+        std::lock_guard fg_lock(buffered->mx);*out=buffered->automatic_status();return true;
+    }
+    return true;
+}
 
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingTimelineV1(CheekyFgPacingTimeline* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;

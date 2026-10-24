@@ -1,4 +1,5 @@
 // D3D12 capture, interpolation and publication behind the shared pacing core.
+#include "fg_application_timing.hpp"
 #include "../src/d3d12_native.hpp"
 namespace cheeky::fg {
 inline bool BufferedPresenter::accept_guide_queue(const CheekyFgPair& guides,FrameGuides12& payload,bool hookless) noexcept {
@@ -315,8 +316,15 @@ struct BufferedBackend12 final : FrameBackend {
     using DirectRequest=BufferedDirectRequest;using Chain=BufferedChain;
     using CapturePlan=BufferedResources12::CapturePlan;using Slice=BufferedResources12::Slice;
     BufferedPresenter& owner;
+    ApplicationTimer12 application_timer;
     explicit BufferedBackend12(BufferedPresenter& host):owner(host){}
     bool ready(std::uint64_t ticket) const override {return owner.producer.completed(ticket);}
+    void begin_application_frame(bool measure) override {application_timer.begin(owner.producer,measure);}
+    ApplicationTiming application_timing() const override {return application_timer.sample();}
+    unsigned maximum_multiplier(const BufferedNative& frame) const override {
+        const auto* payload=guides12(frame);
+        return payload&&cheeky_fg_needs_ngx(payload->pair)?std::min(4u,owner.worker.max_generated_frames+1):4u;
+    }
     CaptureOutcome capture(const std::shared_ptr<BufferedNative>& job,
         const XrCompositionLayerProjection* projection,bool inference_slot,
         const CheekyFgPair* external,CheekyFgCompleteHooklessFrameFn hookless_complete) override {
@@ -474,7 +482,10 @@ struct BufferedBackend12 final : FrameBackend {
                 if(inference_slot&&job->guide_state==CheekyFgState::guide_frame_mismatch)++owner.telemetry.mismatched_guides;}
             if(job->latency_diagnostics)
                 job->final_color_ready=owner.producer.mark_color_ready(*c,LatencyProbe::cpu_now());
+            application_timer.end(c->list.Get());
             good=owner.producer.execute(*c,job->ready);
+            if(good)application_timer.submitted(job->ready);
+            else application_timer.cancel();
             if(!good&&inference_slot&&hookless_complete)hookless_complete(0);
         }else if(c){
             if(inference_slot&&hookless_complete)hookless_complete(0);
@@ -679,6 +690,7 @@ struct BufferedBackend12 final : FrameBackend {
     }
     void retire() override {
         owner.producer.drain();owner.output.drain();owner.uploads.drain();owner.worker.wait_idle();
+        application_timer.reset(owner.producer);
     }
     void discard_captures(bool session) override {
         owner.direct_captures.clear();if(session){owner.capture_plans.clear();owner.captured_descs.clear();}

@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -623,7 +623,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             -- Same content and order as the standalone F8 DLSS-FG tab.
             check("Enable Frame Generation", "FgEnabled")
             if draft.FgMultiplier ~= nil then
+                if draft.FgAutoMultiplier ~= nil then check("Automatic FG multiplier", "FgAutoMultiplier") end
+                if imgui.begin_disabled then imgui.begin_disabled(draft.FgAutoMultiplier == true) end
                 combo("FG multiplier", "FgMultiplier", {[2]="2x", [3]="3x", [4]="4x"})
+                if imgui.end_disabled then imgui.end_disabled() end
+                if draft.FgAutoMultiplier then
+                    local automatic = (status.fg or {}).automatic or {}
+                    if not automatic.supported then text("Auto requires the matching OpenXR layer update.")
+                    else text(string.format("Auto: %dx selected / %dx presenting (maximum %dx)%s", automatic.selected or 2, automatic.presented or 2, automatic.maximum or 4, automatic.valid and "" or " - measuring")) end
+                    text("Adapts 2x-4x to rendering load. Increases after sustained overload; decreases after 1.5 seconds of headroom.")
+                end
                 if draft.FgMultiplier > 2 then text("DLSS requires multi-frame support from the GPU and runtime. Shader methods support all multipliers. Higher multipliers lower the game's target frame rate.") end
             end
             local fg = status.fg or {}

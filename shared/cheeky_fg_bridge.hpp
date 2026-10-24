@@ -88,6 +88,17 @@ struct CheekyFgRateOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgRateOptions)},multiplier{2};
 };
 using CheekyFgRateOptionsFn=bool(__cdecl*)(CheekyFgRateOptions*);
+struct CheekyFgRateOptionsV2 {
+    std::uint32_t abi{2},size{sizeof(CheekyFgRateOptionsV2)},multiplier{2},automatic{};
+};
+using CheekyFgRateOptionsV2Fn=bool(__cdecl*)(CheekyFgRateOptionsV2*);
+struct CheekyFgAutoStatus {
+    std::uint32_t abi{1},size{sizeof(CheekyFgAutoStatus)},supported{},enabled{},valid{};
+    std::uint32_t selected{2},presented{2},maximum{4},reason{};
+    std::uint64_t samples{},switches{};
+    double cpu_ms{},gpu_ms{},fg_ms{};
+};
+using CheekyFgAutoStatusFn=bool(__cdecl*)(CheekyFgAutoStatus*);
 // Optional status extension. Keeps the existing FG control/status ABI intact.
 struct CheekyFgUevrModeV1 {
     std::uint32_t abi{1}, size{sizeof(CheekyFgUevrModeV1)};

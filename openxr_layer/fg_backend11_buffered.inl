@@ -116,16 +116,24 @@ struct BufferedBackend11 final : FrameBackend {
     using DirectRequest=BufferedDirectRequest;using Chain=BufferedChain;
     using CapturePlan=BufferedResources12::CapturePlan;using Slice=BufferedResources12::Slice;
     BufferedPresenter& owner;
+    ApplicationTimer11 application_timer;
     explicit BufferedBackend11(BufferedPresenter& host):owner(host){}
     // Every stage is queued on the same immediate context. Preserve the native
     // D3D11 ordering contract: queued work is ready for ordered publication.
     bool ready(std::uint64_t) const override {return true;}
+    void begin_application_frame(bool measure) override {
+        if(!measure&&!application_timer.queries.next_sequence)return;
+        owner.native11->submit([&](ID3D11DeviceContext* context){application_timer.begin(owner.native11->device.Get(),context,measure);return true;},false);
+    }
+    ApplicationTiming application_timing() const override {return application_timer.sample();}
     CaptureOutcome capture(const std::shared_ptr<BufferedNative>& frame,
         const XrCompositionLayerProjection* projection,bool inference_slot,
         const CheekyFgPair*,CheekyFgCompleteHooklessFrameFn) override {
         frame->direct_output_mode=0;
         frame->latency_diagnostics=false;frame->ready=0;
-        return owner.prepare_native11(*frame,projection,inference_slot)?CaptureOutcome::captured:CaptureOutcome::unavailable;
+        const bool captured=owner.prepare_native11(*frame,projection,inference_slot);
+        if(captured&&application_timer.open)owner.native11->submit([&](ID3D11DeviceContext* context){application_timer.end(context);return true;},false);
+        return captured?CaptureOutcome::captured:CaptureOutcome::unavailable;
     }
     GenerationOutcome generate(const std::shared_ptr<BufferedNative>& previous,
         const std::shared_ptr<BufferedNative>& job,BufferedPair& pair,
@@ -176,6 +184,7 @@ struct BufferedBackend11 final : FrameBackend {
         return true;
     }
     void retire() override {
+        owner.native11->submit([&](ID3D11DeviceContext* context){application_timer.reset(context);return true;},false);
         owner.native11->cancel_gpu_timing();
         owner.native11->flush();owner.native11->clear_guides();
         std::lock_guard lock(owner.composed11_mutex);owner.composed11.clear();

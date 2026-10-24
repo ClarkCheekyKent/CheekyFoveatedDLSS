@@ -90,6 +90,8 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
 void settings_tests(const std::filesystem::path& root) {
     {
         Settings fg;
+        require(!fg.fg.automatic_multiplier&&set_named_setting(fg,"FgAutoMultiplier","true")&&fg.fg.automatic_multiplier&&
+            !set_named_setting(fg,"FgAutoMultiplier","invalid"),"Auto FG is opt-in and validates boolean values");
         require(fg.fg.multiplier==2&&set_named_setting(fg,"FgMultiplier","3")&&fg.fg.multiplier==3&&
             set_named_setting(fg,"FgMultiplier","4")&&!set_named_setting(fg,"FgMultiplier","1")&&
             !set_named_setting(fg,"FgMultiplier","5")&&!set_named_setting(fg,"FgMultiplier","-1"),"FG multiplier validates 2x/3x/4x");
@@ -138,12 +140,12 @@ void settings_tests(const std::filesystem::path& root) {
         Settings restored;
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.multiplier==4&&restored.fg.center_method==2&&restored.fg.peripheral_method==3&&
+            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.center_method==2&&restored.fg.peripheral_method==3&&
             restored.fg.release_point==3&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1,
             "FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
-            restored.fg.multiplier==2&&restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
+            !restored.fg.automatic_multiplier&&restored.fg.multiplier==2&&restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
             "FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
@@ -541,6 +543,14 @@ int main(int argc, char** argv) {
                 "Multiplier reaches layer export and retires the old presenter configuration");
             rate.abi=999;require(!rate_fn(&rate),"FG rate export validates ABI");
             command("1\n910\nset\nFgMultiplier=2");
+            require(control_fn(&control),"Read current fixed multiplier configuration");const auto fixed_configuration=control.configuration;
+            const auto automatic_fn=reinterpret_cast<CheekyFgRateOptionsV2Fn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV2"));
+            CheekyFgRateOptionsV2 automatic;
+            command("1\n911\nset\nFgAutoMultiplier=true");
+            require(automatic_fn&&automatic_fn(&automatic)&&automatic.automatic&&automatic.multiplier==2&&
+                control_fn(&control)&&control.configuration==fixed_configuration,"Auto toggle retains the source configuration and temporal history");
+            automatic.abi=1;require(!automatic_fn(&automatic),"Rate V2 rejects old ABI");
+            command("1\n912\nset\nFgAutoMultiplier=false");
             command("1\n903\nset\nEnabled=false");
             command("1\n905\nset\nFgReleasePoint=0");
             require(snapshot(get).find("\"FgReleasePoint\":0")!=std::string::npos,

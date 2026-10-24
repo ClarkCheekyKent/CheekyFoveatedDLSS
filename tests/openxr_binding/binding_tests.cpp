@@ -635,6 +635,9 @@ void fg_toggle_test() {
     CheekyFgCadence cadence;
     check(CheekyFG_GetCadenceV1(&cadence)&&cadence.supported,"Optional measured-cadence export");
     cadence.abi=999;check(!CheekyFG_GetCadenceV1(&cadence),"Reject mismatched cadence ABI");
+    CheekyFgAutoStatus automatic;
+    check(CheekyFG_GetAutoStatusV1(&automatic)&&automatic.supported,"Auto capability remains available before a buffered presenter starts");
+    automatic.abi=999;check(!CheekyFG_GetAutoStatusV1(&automatic),"Auto status validates ABI");
     CheekyFgNativeSubmissionLatency native_latency;
     check(CheekyFG_GetNativeSubmissionLatencyV1(&native_latency)&&native_latency.supported,
         "Optional native GPU-ready-to-OpenXR submit diagnostic export");
@@ -971,6 +974,7 @@ void fg_copy_validation_test(bool include_buffered=true) {
 }
 #include "fg_hardware_probe.hpp"
 #include "fg_hardening_validation.hpp"
+#include "fg_auto_validation.hpp"
 void frame_space_lifetime_test() {
     reset();const auto session=h<XrSession>(9100);
     SessionState owner{};owner.instance=instance;owner.session=session;sessions.emplace(session,std::move(owner));
@@ -1099,6 +1103,12 @@ void diagnostic_lifetime_test() {
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--fg-auto") {fg_auto_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-auto-live11") {
+            using namespace shader11_fixture;
+            check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"Auto WARP D3D11 device");
+            fg_backend11_pipelined(false,2,true);fg_backend11_pipelined(true,2,true);return 0;
+        }
         if(argc>1&&std::string(argv[1])=="--fg-shader11") {fg_shader11_validation();fg_cross_api_parity();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shader11-hardware") {fg_shader11_validation(true);return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shader11-nvapi") {fg_shader11_nvapi_probe(argc<3?"ungated":argv[2]);return 0;}

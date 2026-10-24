@@ -310,6 +310,18 @@ continue and the FG status explains the unsupported multiplier. The D3D12
 direct-OpenXR experiment uses intermediate outputs at 3x/4x. Replace the runtime,
 OpenXR layer, and UEVR script together when updating.
 
+**Automatic FG multiplier** (`FgAutoMultiplier=true`, off by default) chooses
+2x-4x from CPU/GPU work timings and the measured cost of generated frames. It
+excludes the layer's deliberate Wait/Begin pacing, increases after at least
+150 ms and three fresh overloaded samples, and reduces one step after 1.5 s
+of headroom. Query delivery and smoothing add response time. The readout shows
+the selected and currently presented multiplier and the supported maximum.
+DLSS limits are respected; shader FG can use all three counts. Auto changes
+apply to complete stereo intervals without restarting the presenter or clearing
+color/depth history. It will not increase the count when extra interpolation
+would worsen GPU load. Missing timings retain the current count. The manual
+selection is restored when Auto is turned off.
+
 The FG center method can be **DLSS**, **Simple motion-vector warping**, or
 **Bidirectional interpolation** (`FgCenterMethod=0`, `1`, or `2`). The periphery
 method remains independent. DLSS is the default center method.

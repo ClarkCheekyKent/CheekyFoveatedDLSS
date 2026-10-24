@@ -571,6 +571,11 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetRateOptionsV1(CheekyFg
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
     out->multiplier=std::clamp(cheeky::foveated_dlss::current_settings().fg.multiplier,2u,4u);return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetRateOptionsV2(CheekyFgRateOptionsV2* out) noexcept {
+    if(!out||out->abi!=2||out->size<sizeof(*out))return false;
+    const auto& fg=cheeky::foveated_dlss::current_settings().fg;
+    out->multiplier=std::clamp(fg.multiplier,2u,4u);out->automatic=fg.automatic_multiplier;return true;
+}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(CheekyFgPacingOptions* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;
     const auto& fg=cheeky::foveated_dlss::current_settings().fg;
@@ -721,6 +726,11 @@ bool fg_performance(CheekyFgPerformance& out) noexcept {
 bool fg_cadence(CheekyFgCadence& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
     const auto query=layer?reinterpret_cast<CheekyFgCadenceFn>(GetProcAddress(layer,"CheekyFG_GetCadenceV1")):nullptr;
+    return query&&query(&out);
+}
+bool fg_auto_status(CheekyFgAutoStatus& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgAutoStatusFn>(GetProcAddress(layer,"CheekyFG_GetAutoStatusV1")):nullptr;
     return query&&query(&out);
 }
 bool fg_pacing_timeline(CheekyFgPacingTimeline& out) noexcept {
