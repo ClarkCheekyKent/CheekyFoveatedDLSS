@@ -10,6 +10,7 @@ This directory contains minimal, pinned source snapshots needed to build the add
 | OpenXR SDK | 1.1.61, tag `release-1.1.61` | Core, platform, and API-layer negotiation headers | https://github.com/KhronosGroup/OpenXR-SDK |
 | OpenVR SDK | 2.15.6, commit `0924064316de3effbcd1acf1e309182a2deb1c05` | Public `openvr.h`; no runtime DLL replacement | https://github.com/ValveSoftware/openvr |
 | UEVR | API 2.39.0, commit `4ee5c6b6162dee2291fc75f9dfc57667f6d45a2d` | Public C `API.h` only (separately MIT licensed) | https://github.com/praydog/UEVR |
+| NVIDIA Optical Flow | API 5.0 | Common, D3D11 and D3D12 interface headers; MIT notices retained | https://developer.nvidia.com/optical-flow-sdk |
 
 Upstream license files are retained beside each dependency.
 The UEVR header also retains its complete MIT notice. The UEVR runtime uses

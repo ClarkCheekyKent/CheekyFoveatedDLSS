@@ -5,6 +5,7 @@ inline constexpr char interpolation_shader[]=CHEEKY_FG_COMPACT_HLSL R"HLSL(
 Texture2D<float4> Previous:register(t0);Texture2D<float4> Current:register(t1);
 Texture2D<float2> Motion:register(t2);Texture2D<float> Depth:register(t3);Texture2D<float> PreviousDepth:register(t4);
 Texture2D<float4> Center:register(t5);
+Texture2D<float4> OpticalCenter:register(t6);Texture2D<float4> OpticalPeriphery:register(t7);
 RWTexture2D<float4> Output:register(u0);
 cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
 SamplerState LinearClamp:register(s0);
@@ -54,8 +55,8 @@ float4 regionsAt(uint2 pixel){
  float4 c=0,b=0;
  if(fade>0){float2 grid=max(float2(1,1),round(Rect.zw*float2(w,h)*Dimensions.z));
   float2 q=Rect.xy+(floor(saturate((uv-Rect.xy)/Rect.zw)*grid)+.5)/grid*Rect.zw;
-  c=interpolateAt(q,w,h,MotionAdjust.z);}
- if(fade<1)b=peripheralAt(uv,w,h);
+  c=MotionAdjust.z>3.5?OpticalCenter.SampleLevel(LinearClamp,saturate((q-Rect.xy)/Rect.zw),0):interpolateAt(q,w,h,MotionAdjust.z);}
+ if(fade<1)b=Options.x>3.5?OpticalPeriphery.SampleLevel(LinearClamp,uv,0):peripheralAt(uv,w,h);
  float4 result=fade>=1?c:fade<=0?b:lerp(b,c,fade);
  if(GuideOffset.z>.5&&MotionAdjust.w>.5){float2 edge=abs(min(uv-Rect.xy,Rect.xy+Rect.zw-uv))*float2(w,h);
   if(all(uv>=Rect.xy-2/float2(w,h))&&all(uv<=Rect.xy+Rect.zw+2/float2(w,h))&&min(edge.x,edge.y)<2)result=float4(0,.25,1,1);}

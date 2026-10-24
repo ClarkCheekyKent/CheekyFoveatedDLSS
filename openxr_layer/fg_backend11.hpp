@@ -2,6 +2,7 @@
 #include "fg_transport.hpp"
 #include "fg_matrices.hpp"
 #include "fg_timing11.hpp"
+#include "fg_optical.hpp"
 #include "../shared/cheeky_fg_shader11.hpp"
 #include "../shared/fg_interpolation_shader.hpp"
 #include "../shared/fg_guide_layout.hpp"
@@ -21,6 +22,8 @@ namespace cheeky::fg {
 // One immediate context orders every stage, so no fences are needed: a frame
 // is "ready" as soon as its commands are queued.
 struct Backend11 {
+    optical::Session11 optical[2][2];
+    std::array<float,4> optical_quad_regions[2]; // Latched by quad capture before this frame's metadata.
     struct Guides {
         ComPtr<ID3D11Texture2D> depth,motion;
         ComPtr<ID3D11ShaderResourceView> depth_srv,motion_srv;
@@ -58,6 +61,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
     ComPtr<ID3D11Multithread> protection;
     std::recursive_mutex* dispatch{}; // Shared with the game's NGX evaluation in stereo and quad modes.
     ShaderTimings11 gpu_timings;
+    ShaderTimings11 optical_timings;
     StageTimings11 capture_timings,guide_timings,upload_timings;
     std::atomic<std::uint64_t> guide_interval{1};
     ComPtr<ID3D11ComputeShader> snapshot;
@@ -101,6 +105,7 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         std::unique_lock<std::recursive_mutex> serialized;if(dispatch)serialized=std::unique_lock(*dispatch);
         Guard guard(protection.Get());
         gpu_timings.collect(context.Get());
+        optical_timings.collect(context.Get());
         capture_timings.collect(context.Get());guide_timings.collect(context.Get());upload_timings.collect(context.Get());
         const bool recorded=record(context.Get());
         if(flush)context->Flush();
@@ -276,22 +281,25 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         Image previous,current;
         std::shared_ptr<Guides> old_guides,new_guides;
         ComPtr<ID3D11Buffer> constants;
+        ComPtr<ID3D11Texture2D> optical_color[2];
+        ComPtr<ID3D11ShaderResourceView> optical_view[2];
         D3D11_TEXTURE2D_DESC desc{};
         ShaderTimings11::Ticket timing;unsigned timing_part{};
     };
     void record_draw(ID3D11DeviceContext* commands,const DeferredDraw& draw,ID3D11RenderTargetView* target) {
         auto* cb=draw.constants.Get();auto* ss=sampler.Get();
         ID3D11ShaderResourceView* srvs[]{draw.previous->srv11.Get(),draw.current->srv11.Get(),
-            draw.new_guides->motion_srv.Get(),draw.new_guides->depth_srv.Get(),draw.old_guides->depth_srv.Get()};
+            draw.new_guides->motion_srv.Get(),draw.new_guides->depth_srv.Get(),draw.old_guides->depth_srv.Get(),nullptr,
+            draw.optical_view[0].Get(),draw.optical_view[1].Get()};
         commands->OMSetDepthStencilState(nullptr,0);
         commands->OMSetBlendState(nullptr,nullptr,~0u);commands->RSSetState(rasterizer.Get());
         commands->IASetInputLayout(nullptr);commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         commands->VSSetShader(vertex.Get(),nullptr,0);
-        commands->PSSetConstantBuffers(0,1,&cb);commands->PSSetSamplers(0,1,&ss);commands->PSSetShaderResources(0,5,srvs);
+        commands->PSSetConstantBuffers(0,1,&cb);commands->PSSetSamplers(0,1,&ss);commands->PSSetShaderResources(0,8,srvs);
         commands->OMSetRenderTargets(1,&target,nullptr);
         const D3D11_VIEWPORT viewport{0,0,float(draw.desc.Width),float(draw.desc.Height),0,1};
         commands->RSSetViewports(1,&viewport);commands->PSSetShader(pixel.Get(),nullptr,0);commands->Draw(3,0);
-        ID3D11ShaderResourceView* empty[5]{};commands->PSSetShaderResources(0,5,empty);commands->OMSetRenderTargets(0,nullptr,nullptr);
+        ID3D11ShaderResourceView* empty[8]{};commands->PSSetShaderResources(0,8,empty);commands->OMSetRenderTargets(0,nullptr,nullptr);
     }
     static const DeferredDraw* deferred(const Image& image) noexcept {
         return image?static_cast<const DeferredDraw*>(image->pending11.get()):nullptr;
@@ -304,6 +312,14 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         std::array<Image,2>& out,bool deferred_output=false,float fraction=.5f) {
         // Prepare both eyes first; then issue all commands in one submission.
         std::array<std::shared_ptr<DeferredDraw>,2> draws;std::array<ComPtr<ID3D11RenderTargetView>,2> targets;
+        const auto& meta=new_guides[0]->source.meta;
+        const unsigned focused_eyes=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
+        const bool uses_flow=cheeky_fg_uses_flow(meta.center_method,meta.peripheral_method,focused_eyes!=0);
+        ShaderTimings11::Ticket optical_timing;bool optical_measured=false;
+        if(uses_flow){D3D11_TEXTURE2D_DESC d{};current[0]->texture11->GetDesc(&d);
+            submit([&](ID3D11DeviceContext* c){optical_timing=optical_timings.reserve(device.Get(),1,d.Width,d.Height,focused_eyes,meta.peripheral_method,meta.configuration);
+                optical_measured=optical_timings.begin(c,optical_timing,0);return true;},false);}
+        struct CancelMeasurement {Backend11& backend;bool armed;~CancelMeasurement(){if(armed)backend.submit([&](ID3D11DeviceContext* c){backend.optical_timings.cancel(c);return true;},false);}} cancel{*this,uses_flow};
         for(unsigned eye=0;eye<2;++eye){
             const auto& now=*new_guides[eye];const auto& g=now.source.meta;
             D3D11_TEXTURE2D_DESC d{};current[eye]->texture11->GetDesc(&d);
@@ -321,6 +337,22 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             c.offset[0]=g.focus_feather;c.offset[2]=float(g.show_foveation_border);c.motion[2]=float(g.center_method);c.motion[3]=focused?1.f:0.f;
             auto& draw=draws[eye];draw=std::make_shared<DeferredDraw>();
             draw->previous=previous[eye];draw->current=current[eye];draw->old_guides=old_guides[eye];draw->new_guides=new_guides[eye];
+            for(unsigned pass=0;pass<2;++pass){
+                if((pass?g.peripheral_method:g.center_method)!=4||(pass&&!focused))continue;
+                auto meta=g;meta.width=d.Width;meta.height=d.Height;
+                const float full[4]{0,0,1,1};const auto* rect=pass?full:c.rect;
+                const auto scale=pass?g.peripheral_percent:g.resolution_percent;
+                auto params=optical::constants(meta,pass,rect,previous[eye]->layout,current[eye]->layout,
+                    std::max(32u,unsigned(std::round(d.Width*rect[2]*scale*.01f))),
+                    std::max(32u,unsigned(std::round(d.Height*rect[3]*scale*.01f))));
+                const auto quality=pass?g.optical.peripheral_preset:g.optical.center_preset;
+                if(!submit_shader([&](ID3D11DeviceContext* context){
+                    return optical[eye][pass].render(context,previous[eye]->srv11.Get(),current[eye]->srv11.Get(),
+                        previous[eye]->identity,current[eye]->identity,quality,params,fraction,g.reset!=0,
+                        draw->optical_color[pass],draw->optical_view[pass]);},true)){
+                    strcpy_s(diagnostic,optical[eye][pass].diagnostic);return false;
+                }
+            }
             // Render-target output works for every swapchain color format,
             // including BGRA and sRGB, which typed UAVs do not.
             D3D11_TEXTURE2D_DESC e{};e.Width=d.Width;e.Height=d.Height;e.MipLevels=e.ArraySize=1;e.Format=d.Format;e.SampleDesc.Count=1;
@@ -335,7 +367,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             out[eye]=image(e,true);if(!out[eye])return false;
             if(FAILED(device->CreateRenderTargetView(out[eye]->texture11.Get(),nullptr,&targets[eye])))return false;
         }
-        const auto& meta=new_guides[0]->source.meta;
+        if(optical_measured)submit([&](ID3D11DeviceContext* c){optical_timings.end(c,optical_timing,0);return true;},false);
+        cancel.armed=false;
         const unsigned focused=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
         if(deferred_output)return submit([&](ID3D11DeviceContext*){
             auto timing=gpu_timings.reserve(device.Get(),2,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);

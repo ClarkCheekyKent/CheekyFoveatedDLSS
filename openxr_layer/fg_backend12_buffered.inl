@@ -421,7 +421,8 @@ struct BufferedBackend12 final : FrameBackend {
             auto acquire=owner.guide_acquire?owner.guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
             auto release=owner.guide_release?owner.guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
             CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
-            const bool acquired=inference_slot&&tokens_match&&expected_token&&
+            CheekyFgColorOptionsV1 color_options;const bool color_only=optical::color_options(color_options);
+            const bool acquired=!color_only&&inference_slot&&tokens_match&&expected_token&&
                 (external?(guides=*external,true):(acquire&&release&&acquire(&guides)));
             // render_frame is deliberately zero for hook-free mode 3.
             // The nonzero color token still identifies the immutable pair.
@@ -477,6 +478,16 @@ struct BufferedBackend12 final : FrameBackend {
                 }
                 if(!external)release(&guides);
             }else if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
+            if(color_only&&inference_slot){
+                auto payload=std::make_shared<FrameGuides12>();
+                for(unsigned eye=0;eye<2;++eye){auto g=color_options.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
+                    const auto& layout=job->color[eye]->layout;g.width=layout.width?layout.width:unsigned(d.Width);g.height=layout.height?layout.height:d.Height;
+                    payload->pair.eyes[eye]=g;}
+                payload->pair.capture_token=job->id*2;payload->pair.fg_queue_priority=color_options.queue_priority;payload->pair.release_point=color_options.release_point;
+                job->guides=std::move(payload);job->source_configuration=color_options.eyes[0].configuration;
+                job->guide_token=job->id*2;job->render_frame=0;job->guides_valid=true;job->guide_state=CheekyFgState::waiting_for_history;
+                job->policy={color_options.release_point,color_options.queue_priority,true};
+            }
             {std::lock_guard lock(owner.mx);owner.telemetry.color_token=expected_token;owner.telemetry.guide_token=job->guide_token;
                 owner.telemetry.color_render_frame=expected_frame;owner.telemetry.guide_render_frame=job->guides_valid?expected_frame:0;
                 if(inference_slot&&job->guide_state==CheekyFgState::guide_frame_mismatch)++owner.telemetry.mismatched_guides;}
@@ -623,7 +634,7 @@ struct BufferedBackend12 final : FrameBackend {
                 if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;}
                 if(camera_pair_valid&&pair.generated_count==1&&job->direct_output_mode&&!blocked_direct){
                     const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
-                        return g.peripheral_method<=2&&(g.focus_width<.999f||g.focus_height<.999f);});
+                        return (g.peripheral_method<=2||g.peripheral_method==4)&&(g.focus_width<.999f||g.focus_height<.999f);});
                     if(supported){
                         direct_job=std::make_shared<DirectRequest>();direct_job->epoch=job->epoch;direct_job->native_id=previous->id;
                         direct_job->previous=previous->color;direct_job->format=owner.worker.focus.color_format;direct_job->width=owner.worker.width;direct_job->height=owner.worker.height;

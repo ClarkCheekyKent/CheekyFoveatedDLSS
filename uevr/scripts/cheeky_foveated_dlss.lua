@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -651,11 +651,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
             end
             local dx11 = status.renderer == 0
-            local native_shader11 = dx11 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) < 3)
+            local native_shader11 = dx11 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) ~= 3)
             local percent = {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"}
             section("Foveation")
             if draft.FgCenterMethod ~= nil then
-                combo("FG center method", "FgCenterMethod", {[0]="DLSS", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation"})
+                combo("FG center method", "FgCenterMethod", {[0]="DLSS", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [4]="NVIDIA Optical Flow"})
+            end
+            local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
+            if draft.FgCenterMethod == 4 then
+                if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
+                if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
             end
             if draft.FgResolutionPercent ~= nil then combo("FG scale", "FgResolutionPercent", percent) end
             check("Foveated frame generation", "FgFoveated")
@@ -672,7 +677,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgPeripheralPercent ~= nil then
                     combo("FG periphery scale", "FgPeripheralPercent", percent)
-                    combo("FG periphery method", "FgPeripheralMethod", {[0]="Previous frame", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS"})
+                    combo("FG periphery method", "FgPeripheralMethod", {[0]="Previous frame", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS", [4]="NVIDIA Optical Flow"})
+                    if draft.FgPeripheralMethod == 4 then
+                        if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
+                        if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
+                    end
                 end
                 if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end
             end

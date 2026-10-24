@@ -42,6 +42,7 @@ foreach ($packageMode in $modes) {
     $files["licenses\MinHook.txt"] = Join-Path $projectRoot "third_party\reshade\deps\minhook\LICENSE.txt"
     $files["licenses\OpenVR.txt"] = Join-Path $projectRoot "third_party\openvr\LICENSE"
     $files["licenses\DearImGui.txt"] = Join-Path $projectRoot "third_party\reshade\deps\imgui\LICENSE.txt"
+    $files["licenses\NVIDIA-Optical-Flow-MIT.txt"] = Join-Path $projectRoot "third_party\nvof\LICENSE.txt"
     if ($IncludeVulkan -or $VulkanFixedSrTest) {
         $files["CheekyVulkanLayer.dll"] = Join-Path $BinaryRoot "CheekyVulkanLayer.dll"
         $files[$prefix + "CheekyFoveatedDLSS\Vulkan\Cheeky.json"] = Join-Path $projectRoot $(if($prefix){"vulkan_layer\Cheeky-OptiScaler.json"}else{"vulkan_layer\Cheeky.json"})

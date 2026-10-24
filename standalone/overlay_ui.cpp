@@ -876,7 +876,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     // Game-composited quad views submit stereo, so they keep the stereo FG controls.
     const bool outer_guides=flag(member(snapshot,"quad_views"),"fg_outer_guides");
     const bool quad=flag(member(snapshot,"quad_views"),"active")&&!outer_guides;
-    if(quad&&settings.fg.peripheral_method>2)settings.fg.peripheral_method=2;
+    if(quad&&settings.fg.peripheral_method==3)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
     const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
     const auto fg = member(snapshot, "fg");
@@ -911,8 +911,14 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     }
 
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
-    combo("FG center method", s.center_method,
-        "DLSS\0Simple motion-vector warping\0Bidirectional interpolation\0");
+    unsigned center_choice=s.center_method==4?3:s.center_method;
+    combo("FG center method", center_choice,
+        "DLSS\0Simple motion-vector warping\0Bidirectional interpolation\0NVIDIA Optical Flow\0");
+    s.center_method=center_choice==3?4:center_choice;
+    if(s.center_method==4){
+        combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
+        fg_percent("Center optical flow resolution",s.optical.center_percent);
+    }
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
     ImGui::Checkbox("Foveated frame generation", &s.foveated);
@@ -931,8 +937,14 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         }
         }
         fg_percent("FG periphery scale", s.peripheral_percent);
-        combo("FG periphery method", s.peripheral_method,
-            quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0":"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0");
+        unsigned periphery_choice=quad&&s.peripheral_method==4?3:s.peripheral_method;
+        combo("FG periphery method", periphery_choice,
+            quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0NVIDIA Optical Flow\0":"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0NVIDIA Optical Flow\0");
+        s.peripheral_method=quad&&periphery_choice==3?4:periphery_choice;
+        if(s.peripheral_method==4){
+            combo("Periphery optical flow preset",s.optical.peripheral_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
+            fg_percent("Periphery optical flow resolution",s.optical.peripheral_percent);
+        }
         ImGui::Checkbox("Show blue FG region border", &s.show_border);
     }
     if (ImGui::TreeNode("Advanced settings")) {

@@ -759,7 +759,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(job->automatic_multiplier){
                     if(job->guides_valid&&previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&telemetry.gpu_valid){
                         const double now=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
-                        const auto generated_ms=telemetry.total_last_ms+publication_cost.publication_last_ms+publication_cost.upload_last_ms;
+                        const auto generated_ms=(job->policy.optical_flow?telemetry.total_ms:telemetry.total_last_ms)+publication_cost.publication_last_ms+publication_cost.upload_last_ms;
                         if(auto_multiplier.observe(now,sample,generated_ms,telemetry.xr_period_ms)&&trace){char message[180]{};
                             sprintf_s(message,"FG Auto selected=%ux max=%ux render_ms=%.3f generated_ms=%.3f reason=%u (histories retained)",
                                 auto_multiplier.selected,maximum,auto_multiplier.render_ms,auto_multiplier.fg_ms,auto_multiplier.reason);trace(message);}

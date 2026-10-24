@@ -42,6 +42,8 @@ std::uint64_t game_sr_revision{1};
 // physical-eye NGX evaluation. Guarded by `mutex`.
 CheekyFgStaticEyeCropsV1 static_eye_crops;
 std::uint64_t static_eye_crop_configuration{},static_eye_crop_mapping{};
+struct ColorMetadata {CheekyFgEye eye;std::uint64_t configuration{},time{};};
+ColorMetadata color_metadata[2];
 
 // GPU recordings can outlive a runtime detach. Keep queue generations until
 // their recorded work and every consumer lease have retired.
@@ -86,6 +88,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{s.multiplier,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
+        s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
@@ -261,6 +264,7 @@ void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,co
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.center_method=settings.fg.center_method;
+    m.optical=settings.fg.optical;
     // calibration_session 0 means OpenVR calibration (OpenComposite); the
     // layer binds it to its single running D3D11 OpenXR session.
     if(!assignment.calibrated||assignment.eye_index>1)return;
@@ -273,7 +277,12 @@ void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,co
         if(!crop.valid)continue;
         source.crop[0]=crop.valid?crop.x:0;source.crop[1]=crop.valid?crop.y:0;
         source.crop[2]=crop.valid?crop.width:1;source.crop[3]=crop.valid?crop.height:1;
-        observe(&source);
+        {auto meta=m;meta.focus_width=std::min(1.f,m.focus_width/source.crop[2]);meta.focus_height=std::min(1.f,m.focus_height/source.crop[3]);
+         meta.focus_x=(.5f+m.focus_x-source.crop[0])/source.crop[2]-.5f;
+         meta.focus_y=(.5f+m.focus_y-source.crop[1])/source.crop[3]-.5f;if(source.vertical_flip)meta.focus_y=-meta.focus_y;
+         meta.depth=nullptr;meta.motion=nullptr;
+         std::lock_guard lock(mutex);color_metadata[eye]={meta,configuration(settings),GetTickCount64()};}
+        if(!cheeky_fg_image_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))observe(&source);
     }
 }catch(...){}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetShaderOptionsV1(CheekyFgShaderOptionsV1* out) noexcept {
@@ -284,6 +293,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetShaderOptionsV1(Cheeky
 void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* p) noexcept try {
     if(!enabled()||!context||!handle||!p)return;
     const auto settings=current_settings();const auto quad=quad_view_snapshot();
+    if(cheeky_fg_image_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
     const auto id=reinterpret_cast<uintptr_t>(handle),generation=stereo_view_generation(id);
     if(!quad_view_assignment(quad,id,generation))return;
     const auto layer=quad_view_module();const auto observe=layer?reinterpret_cast<CheekyQuadFgObserveFn>(GetProcAddress(layer,"CheekyQuadFG_ObserveD3D11V1")):nullptr;
@@ -305,7 +315,8 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
     m.motion_scale_x=f(p,"MV.Scale.X",1);m.motion_scale_y=f(p,"MV.Scale.Y",1);m.jitter_x=f(p,"Jitter.Offset.X");m.jitter_y=f(p,"Jitter.Offset.Y");
     m.reset=ui(p,"Reset");m.resolution_percent=settings.fg.resolution_percent;m.peripheral_percent=settings.fg.peripheral_percent;
     m.center_method=settings.fg.center_method;
-    m.peripheral_method=std::min(settings.fg.peripheral_method,2u);
+    m.optical=settings.fg.optical;
+    m.peripheral_method=settings.fg.peripheral_method==3?2u:settings.fg.peripheral_method;
     m.focus_feather=settings.fg.feather;m.show_foveation_border=settings.fg.show_border;m.configuration=configuration(settings);
     source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;
     observe(&source);
@@ -438,6 +449,7 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.resolution_percent=settings.fg.resolution_percent;
     m.peripheral_percent=settings.fg.peripheral_percent;m.peripheral_method=settings.fg.peripheral_method;
     m.center_method=settings.fg.center_method;
+    m.optical=settings.fg.optical;
     // Include the primary foveated-SR ON/OFF state, even if the game keeps
     // both NGX-SR feature handles alive while the mod changes rendering paths.
     const auto settings_configuration=configuration(settings);
@@ -448,6 +460,9 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     // snapshot recording. A stereo pair spanning a DLSS quality change is
     // rejected by FgSnapshots::acquire rather than mixing old/new guides.
     m.configuration=fg_source_configuration(settings_configuration,game_sr_revision);
+    if(identity.eye<2){auto meta=m;meta.depth=meta.motion=meta.peripheral_depth=meta.peripheral_motion=nullptr;
+        color_metadata[identity.eye]={meta,settings_configuration,GetTickCount64()};}
+    if(cheeky_fg_image_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
     static std::uint64_t logged_mapping{};
     if(logged_mapping!=identity.mapping_revision){
         logged_mapping=identity.mapping_revision;
@@ -598,11 +613,36 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
     const auto& s=settings.fg;
     // Dynamic gaze uses existing full-eye native captures as previous/current
     // color history. No additional full-resolution history copy is allocated.
-    out->compact=s.foveated&&
+    out->compact=s.foveated&&!cheeky_fg_image_only(s.center_method,s.peripheral_method,s.foveated)&&
         settings.center_mode==cheeky::foveated_dlss::FoveationCenterMode::fixed &&
         !settings.eye_calibration_continuous;
     out->peripheral_percent=s.peripheral_percent;
     out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyFgColorOptionsV1* out) noexcept {
+    using namespace cheeky::foveated_dlss;
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    const auto s=current_settings();const auto& f=s.fg;const auto key=configuration(s);
+    out->enabled=enabled()&&cheeky_fg_image_only(f.center_method,f.peripheral_method,f.foveated);
+    out->foveated=f.foveated;out->queue_priority=f.queue_priority;out->release_point=f.release_point;
+    std::lock_guard lock(mutex);
+    for(unsigned eye=0;eye<2;++eye){
+        auto& g=out->eyes[eye];g={};
+        const auto& cached=color_metadata[eye];
+        if(cached.configuration==key&&GetTickCount64()-cached.time<500)g=cached.eye;
+        else {
+            g.focus_width=f.foveated?(f.match_sr_region?s.width:f.width):1.f;
+            g.focus_height=f.foveated?(f.match_sr_region?s.height:f.height):1.f;
+            g.focus_feather=f.match_sr_region?s.transition_width:f.feather;
+            const float sx=(bool(eye==1)!=s.invert_stereo_x_offset)?-s.x_offset:s.x_offset;
+            g.focus_x=fg_fallback_center(s.width,sx)-.5f+(f.match_sr_region?0.f:f.x);
+            g.focus_y=fg_fallback_center(s.height,s.height_offset)-.5f+(f.match_sr_region?0.f:f.y);
+        }
+        g.center_method=f.center_method;g.peripheral_method=f.peripheral_method;g.optical=f.optical;
+        g.resolution_percent=f.resolution_percent;g.peripheral_percent=f.peripheral_percent;
+        g.show_foveation_border=f.foveated&&f.show_border;g.configuration=key;
+    }
+    return true;
 }
 // Read the unconsumed, actually submitted stereo guides for the current native
 // interval. No "last good" crop is allowed here: a 2-pixel SR movement is

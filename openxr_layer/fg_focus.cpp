@@ -45,19 +45,20 @@ constexpr char compose_shader[]=R"HLSL(
 Texture2D<float4> Periphery:register(t0);Texture2D<float4> Center:register(t1);RWTexture2D<float4> Output:register(u0);
 cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;float4 MotionAdjust;float4 Options;float4 JitterCorrection;float4 AtlasCrop;float4 AtlasSpans;float4 AtlasTexel;float4 PriorCrop;float4 PriorSpans;row_major float4x4 ClipToPrevious;}
 SamplerState LinearClamp:register(s0);
+float4 composeColor(float4 c){if(Options.y>.5)c.rgb=lerp(c.rgb/12.92,pow((max(c.rgb,0)+.055)/1.055,2.4),step(.04045,c.rgb));return c;}
 [numthreads(8,8,1)]void Main(uint3 id:SV_DispatchThreadID){
  uint w,h;Output.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
  float2 uv=(float2(id.xy)+.5)/float2(w,h);
- if(Options.z<.5){Output[id.xy]=Periphery.SampleLevel(LinearClamp,uv,0);return;}
+ if(Options.z<.5){Output[id.xy]=composeColor(Periphery.SampleLevel(LinearClamp,uv,0));return;}
  float2 local=(uv-Rect.xy)/Rect.zw;
  float2 edge=min(uv-Rect.xy,Rect.xy+Rect.zw-uv);
  float fade=Options.w>0?saturate(min(edge.x,edge.y)/Options.w):(all(local>=0)&&all(local<=1)?1:0);
  // Fully covered fovea must never access the periphery. Sampling it first
  // can propagate NaNs even when lerp's center weight is exactly one.
- [branch]if(fade>=1){Output[id.xy]=Center.SampleLevel(LinearClamp,saturate(local),0);return;}
+ [branch]if(fade>=1){Output[id.xy]=composeColor(Center.SampleLevel(LinearClamp,saturate(local),0));return;}
  float4 base=Periphery.SampleLevel(LinearClamp,uv,0);
- [branch]if(fade<=0){Output[id.xy]=base;return;}
- Output[id.xy]=lerp(base,Center.SampleLevel(LinearClamp,saturate(local),0),fade);
+ [branch]if(fade<=0){Output[id.xy]=composeColor(base);return;}
+ Output[id.xy]=composeColor(lerp(base,Center.SampleLevel(LinearClamp,saturate(local),0),fade));
 })HLSL";
 constexpr char pack_shader[]=R"HLSL(
 Texture2D<float4> Periphery:register(t0);Texture2D<float4> Center:register(t1);RWTexture2D<float4> Output:register(u0);
@@ -123,6 +124,7 @@ void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,uns
 DXGI_FORMAT depth_srv_format(DXGI_FORMAT f) noexcept {return guide_depth_format(f);}
 DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {return guide_motion_format(f);}
 void FocusPipeline::reset() noexcept {
+ for(auto& eye:optical)for(auto& session:eye)session.reset();
  root.Reset();prepare.Reset();peripheral.Reset();center_shader.Reset();compose.Reset();pack.Reset();recenter.Reset();descriptors.Reset();stride=0;
  for(auto& eye:inputs)for(auto& input:eye)input={};
  for(unsigned i=0;i<2;++i){peripheral_output[i].Reset();full[i].Reset();previous_depth[i].Reset();history[i]=false;center_output[i].Reset();previous_center_depth[i].Reset();center_history[i]=false;}
@@ -157,6 +159,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  const bool prepared=g.prepared_guides!=0;
  const bool adjust_motion=pass==0&&(crop_motion_dx!=0.f||crop_motion_dy!=0.f);
  auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;
+ if((pass?g.peripheral_method:g.center_method)==4){s.depth.Reset();s.motion.Reset();return true;}
  if(s.borrowed_guides!=prepared){s.depth.Reset();s.motion.Reset();}
  s.borrowed_guides=prepared;
  if(!need_color)s.color.Reset();if(!need_depth)s.depth.Reset();if(!need_motion)s.motion.Reset();
@@ -269,7 +272,20 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  auto& prior_depth=region?previous_center_depth[eye]:previous_depth[eye];
  auto& valid_history=region?center_history[eye]:history[eye];
  auto& scratch=region?center_output[eye]:peripheral_output[eye];
- if(!s.output_width||!s.output_height||!previous||!current||method>2)return false;
+ if(!s.output_width||!s.output_height||!previous||!current||(method>2&&method!=4))return false;
+ if(method==4){
+  auto c=optical_constants[eye][pass];
+  c.flags[1]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
+  if(!optical[eye][pass].render(list,previous,current,c,interpolation_fraction,color_format,color_state,
+       previous->GetDesc().Format,current->GetDesc().Format,scratch))return false;
+  // Optical periphery uses the ordinary composition/packing path. The worker
+  // never requests a partial packed destination for this method.
+  if(destination&&final){
+   if(!compose_frame(dev,list,eye,final->center,scratch.Get(),final->region,final->width,final->height,destination,destination_state,final->linear_sdr))return false;
+   transition(list,destination,D3D12_RESOURCE_STATE_GENERIC_READ,D3D12_RESOURCE_STATE_COMMON);return true;
+  }
+  return destination==nullptr;
+ }
  const bool need_motion=method!=0,need_depth=method==2;
  if((need_motion&&!s.motion)||(need_depth&&!s.depth))return false;
  if(destination){
@@ -328,14 +344,14 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
 }
 bool FocusPipeline::compose_frame(ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,
  ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect& r,unsigned w,unsigned h,
- ID3D12Resource* destination,D3D12_RESOURCE_STATES destination_state){
+ ID3D12Resource* destination,D3D12_RESOURCE_STATES destination_state,bool linear_sdr){
  if(!center||!periphery||eye>=2)return false;
  if(destination){const auto d=destination->GetDesc();
   if(destination==center||destination==periphery||d.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||
      d.Width!=w||d.Height!=h||d.DepthOrArraySize!=1||d.MipLevels!=1||d.SampleDesc.Count!=1||
-     d.Format!=color_format||!(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))return false;
+     !writable_color(d.Format,color_format)||!(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))return false;
  }else if(!allocate(dev,w,h,color_format,full[eye]))return false;
- Constants c{};c.rect[0]=float(r.x)/w;c.rect[1]=float(r.y)/h;c.rect[2]=float(r.w)/w;c.rect[3]=float(r.h)/h;c.options[2]=r.active?1.f:0.f;c.options[3]=r.feather;
+ Constants c{};c.rect[0]=float(r.x)/w;c.rect[1]=float(r.y)/h;c.rect[2]=float(r.w)/w;c.rect[3]=float(r.h)/h;c.options[1]=linear_sdr?1.f:0.f;c.options[2]=r.active?1.f:0.f;c.options[3]=r.feather;
  auto* output=destination?destination:full[eye].Get();
  transition(list,output,destination?destination_state:D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
  transition(list,center,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

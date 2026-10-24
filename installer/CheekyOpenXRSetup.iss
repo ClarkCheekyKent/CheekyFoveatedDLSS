@@ -37,6 +37,7 @@ Source: "{#SourceDir}\XR_APILAYER_CHEEKY_foveated_dlss.json"; DestDir: "{app}"; 
 Source: "..\LICENSE"; DestDir: "{app}"
 Source: "..\third_party\openxr\LICENSE.txt"; DestDir: "{app}"; DestName: "OpenXR-LICENSE.txt"
 Source: "..\third_party\ngx-sdk\LICENSE.txt"; DestDir: "{app}"; DestName: "NVIDIA-NGX-LICENSE.txt"
+Source: "..\third_party\nvof\LICENSE.txt"; DestDir: "{app}"; DestName: "NVIDIA-Optical-Flow-MIT.txt"
 
 [Registry]
 ; Remove only our manifest value on uninstall, never the shared OpenXR key.

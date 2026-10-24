@@ -31,6 +31,7 @@ $files = [ordered]@{
     "licenses\OpenVR.txt" = Join-Path $projectRoot "third_party\openvr\LICENSE"
     "licenses\UEVR-API-MIT.txt" = Join-Path $projectRoot "third_party\uevr\LICENSE.txt"
     "licenses\NVIDIA-NGX.txt" = Join-Path $projectRoot "third_party\ngx-sdk\LICENSE.txt"
+    "licenses\NVIDIA-Optical-Flow-MIT.txt" = Join-Path $projectRoot "third_party\nvof\LICENSE.txt"
 }
 if ($IncludeOpenXRSetup) {
     $files["OpenXR\CheekyOpenXRSetup.exe"] = $OpenXRSetupPath

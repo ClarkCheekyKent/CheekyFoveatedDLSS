@@ -271,7 +271,9 @@ XrResult quad_capture_end(XrSession session,const XrFrameEndInfo* info,const Dis
         auto& eleven=*compositor->d3d11;auto roles=eleven.mapping->snapshot();roles.active=1;
         std::array<std::array<float,4>,2> insets;
         for(unsigned eye=0;eye<2;++eye)insets[eye]=cheeky::quad_capture::inset_rect(corrected[eye].fov,corrected[eye+2].fov);
+        CheekyFgColorOptionsV1 color_options;const bool color_only=cheeky::fg::optical::color_options(color_options);
         auto guides=eleven.fg_guides->build_native(roles,projection,insets);
+        if(color_only)for(unsigned eye=0;eye<2;++eye)native11->native11->optical_quad_regions[eye]=insets[eye];
         if(guides.valid)for(unsigned eye=0;eye<2;++eye){
             auto meta=guides.meta[eye];meta.focus_feather=2.f/std::max(1u,std::min(compositor->recommended[eye].recommendedImageRectWidth,
                 compositor->recommended[eye].recommendedImageRectHeight));

@@ -133,14 +133,22 @@ void settings_tests(const std::filesystem::path& root) {
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
         require(fg.fg.center_method==0&&set_named_setting(fg,"FgCenterMethod","1")&&set_named_setting(fg,"FgCenterMethod","2")&&
             !set_named_setting(fg,"FgCenterMethod","3")&&!set_named_setting(fg,"FgCenterMethod","-1"),"Center FG defaults to DLSS and validates shader methods");
+        require(set_named_setting(fg,"FgCenterMethod","4")&&set_named_setting(fg,"FgPeripheralMethod","4")&&
+            set_named_setting(fg,"FgOpticalCenterPreset","0")&&set_named_setting(fg,"FgOpticalPeripheralPreset","2")&&
+            set_named_setting(fg,"FgOpticalCenterPercent","75")&&set_named_setting(fg,"FgOpticalPeripheralPercent","25")&&
+            !set_named_setting(fg,"FgOpticalCenterPercent","0")&&!set_named_setting(fg,"FgOpticalPeripheralPreset","3"),
+            "Independent optical flow controls accept valid presets/scales and reject malformed settings");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","3"),"FG quality and periphery controls parse");
         require(write_settings_file(path,fg,error),"Save FG settings");
         Settings restored;
+        require(read_settings_file(path,restored,error)&&restored.fg.optical.center_preset==0&&restored.fg.optical.peripheral_preset==2&&
+            restored.fg.optical.center_percent==75&&restored.fg.optical.peripheral_percent==25&&restored.fg.center_method==4,
+            "Optical flow center method and independent controls survive profile round trip");
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.center_method==2&&restored.fg.peripheral_method==3&&
+            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.center_method==4&&restored.fg.peripheral_method==3&&
             restored.fg.release_point==3&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1,
             "FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");

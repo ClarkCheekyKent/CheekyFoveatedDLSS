@@ -22,6 +22,7 @@ using Image=std::shared_ptr<TransportImage>;
 struct FramePolicy {
     std::uint32_t release_point{};  // 0 submission, 1 preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
     std::uint32_t queue_priority{1}; // 0 separate NORMAL, 1 separate HIGH, 2 shared game queue.
+    bool optical_flow{}; // Flow is shared by all phases: use its amortized generation cost for Auto.
 };
 // Backend-owned per-frame guide state (textures, leases, GPU dependencies).
 // Pacing only holds and drops it; each backend defines its own subtype.

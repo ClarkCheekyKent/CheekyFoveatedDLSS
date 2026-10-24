@@ -185,7 +185,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     const float fraction=float(frame_index)/float(frame_count+1);
     const bool last_output=frame_index==frame_count;
-    if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||guides.eyes[0].center_method>2||guides.eyes[1].center_method>2||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
+    if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||!cheeky_fg_center_valid(guides.eyes[0].center_method)||!cheeky_fg_center_valid(guides.eyes[1].center_method)||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!wait_idle())return false;
     ngx_burst.trace=trace;
     ngx_burst.start(guides.render_frame,guides.capture_token);
@@ -205,6 +205,36 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
     focus.interpolation_fraction=fraction;
+    bool optical_timing_started=false;
+    // NVOFA submits work outside this command list. Prepare once per native
+    // pair, then reuse the same forward/backward fields at all 2x/3x/4x phases.
+    if(frame_index==1)for(unsigned eye=0;eye<2;++eye){
+        const auto& g=guides.eyes[eye];const bool focused=g.focus_width<.999f||g.focus_height<.999f;
+        for(unsigned pass=0;pass<2;++pass){
+            if((pass?g.peripheral_method:g.center_method)!=4||(pass&&!focused))continue;
+            const unsigned rw=pass||!focused?width:std::clamp(unsigned(std::round(width*g.focus_width)),1u,width);
+            const unsigned rh=pass||!focused?height:std::clamp(unsigned(std::round(height*g.focus_height)),1u,height);
+            const unsigned rx=pass||!focused?0:unsigned(std::clamp((width-rw)*.5f+g.focus_x*width,0.f,float(width-rw)));
+            const unsigned ry=pass||!focused?0:unsigned(std::clamp((height-rh)*.5f+g.focus_y*height,0.f,float(height-rh)));
+            const float rect[]{float(rx)/width,float(ry)/height,float(rw)/width,float(rh)/height};
+            const unsigned scale=pass?g.peripheral_percent:g.resolution_percent;
+            auto c=optical::constants(g,pass,rect,previous_layouts[eye],color_layouts[eye],
+                std::max(32u,(rw*scale+50)/100),std::max(32u,(rh*scale+50)/100));
+            focus.optical_constants[eye][pass]=c;
+            if(!optical_timing_started){
+                if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
+                latency.begin(list.Get());gpu_timings.begin(list.Get());
+                if(FAILED(list->Close()))return false;ID3D12CommandList* start[]{list.Get()};queue->ExecuteCommandLists(1,start);
+                if(FAILED(queue->Signal(fence.Get(),++serial))||!wait_idle())return false;
+                optical_timing_started=true;
+            }
+            auto& session=focus.optical[eye][pass];
+            if(!session.prepare(device.Get(),queue.Get(),previous[eye],colors[eye],pass?g.optical.peripheral_preset:g.optical.center_preset,
+                c,g.reset!=0,input_color_state,previous[eye]->GetDesc().Format,colors[eye]->GetDesc().Format)){
+                strcpy_s(diagnostic,session.diagnostic);failed=true;return false;
+            }
+        }
+    }
     if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
     // Release point 1 records both eyes' preparation on list A and NGX and
     // composition on list B, with a GPU milestone between them.
@@ -234,7 +264,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // A mode switch is safe because the previous job was fully retired above.
     ID3D12GraphicsCommandList* commands=list.Get();
     bool cut_to_second_list=false;
-    latency.begin(commands);gpu_timings.begin(commands);
+    if(!optical_timing_started){latency.begin(commands);gpu_timings.begin(commands);}
     bool good=true;unsigned focused{};
     const bool crop_diagnostic=trace&&((++crop_diagnostic_frame%60u)==1u);
     auto scaled=[](unsigned dimension,unsigned percent){return std::max(32u,(dimension*percent+50u)/100u);};
@@ -284,7 +314,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         // It must be resampled before publication, so it cannot write directly
         // into the atlas/XR destination that represents the current origin.
         const bool recenter_output=center_pass&&(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f);
-        if(!recenter_output&&direct&&copies&&((*copies)[eye].layout.packed()||final_xr)&&!(final_xr?f.xr_direct_rejected:f.direct_rejected)){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
+        if(!recenter_output&&direct&&copies&&!(final_xr&&g.peripheral_method==4)&&((*copies)[eye].layout.packed()||final_xr)&&!(final_xr?f.xr_direct_rejected:f.direct_rejected)){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
             const auto& layout=destination.layout;
             f.offset_x=final_xr?rect.x:0;f.offset_y=final_xr?rect.y:layout.packed()&&!center_pass?layout.center_height:0;
             f.direct=writable_color(d.Format,desc.Format)&&(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)&&
@@ -439,9 +469,11 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             const Camera& camera=cameras[eye];
             if(!prepare_first||phase==0) {
                 gpu_timings.stamp(commands,query);
-                if(!g.depth||!g.motion||g.width!=width||g.height!=height){report("FG guide/output dimensions disagree",unsigned(E_INVALIDARG));failed=true;good=false;break;}
-                source_depth_format=unsigned(g.depth->GetDesc().Format);source_motion_format=unsigned(g.motion->GetDesc().Format);
-                if(depth_srv_format(DXGI_FORMAT(source_depth_format))==DXGI_FORMAT_UNKNOWN||motion_srv_format(DXGI_FORMAT(source_motion_format))==DXGI_FORMAT_UNKNOWN){
+                const bool image_only=cheeky_fg_image_only(g.center_method,g.peripheral_method,g.focus_width<.999f||g.focus_height<.999f);
+                if((!image_only&&(!g.depth||!g.motion))||g.width!=width||g.height!=height){report("FG guide/output dimensions disagree",unsigned(E_INVALIDARG));failed=true;good=false;break;}
+                source_depth_format=g.depth?unsigned(g.depth->GetDesc().Format):0;source_motion_format=g.motion?unsigned(g.motion->GetDesc().Format):0;
+                if(!image_only&&
+                   (depth_srv_format(DXGI_FORMAT(source_depth_format))==DXGI_FORMAT_UNKNOWN||motion_srv_format(DXGI_FORMAT(source_motion_format))==DXGI_FORMAT_UNKNOWN)){
                     sprintf_s(diagnostic,"FG guide conversion unsupported: depth=%u motion=%u; displaying native frames",source_depth_format,source_motion_format);
                     if(trace)trace(diagnostic);failed=true;good=false;break;
                 }
@@ -535,7 +567,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                     good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
                     base=peripheral_features[eye].target;
                 }else {
-                    custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed();
+                    custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed()&&g.peripheral_method!=4;
                     auto* target=custom_context_direct?(*copies)[eye].texture:nullptr;
                     good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                         target,custom_context_direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON,

@@ -42,10 +42,10 @@ struct D3D12 {
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;std::uint64_t serial{};
     std::vector<ComPtr<ID3D12Resource>> staging;
-    D3D12(){
+    explicit D3D12(IDXGIAdapter* hardware=nullptr){
         ComPtr<IDXGIFactory4> factory;ComPtr<IDXGIAdapter> warp;
         check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))&&SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))),"Parity WARP adapter");
-        check(SUCCEEDED(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"Parity D3D12 device");
+        check(SUCCEEDED(D3D12CreateDevice(hardware?hardware:warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"Parity D3D12 device");
         D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
         check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)))&&
             SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))&&
@@ -65,14 +65,14 @@ struct D3D12 {
         ComPtr<ID3D12Resource> out;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&out))),"Parity buffer");return out;
     }
     // Recorded on the current list; the texture is in COMMON once it executes.
-    ComPtr<ID3D12Resource> texture(DXGI_FORMAT format,const void* data,unsigned texel){
+    ComPtr<ID3D12Resource> texture(DXGI_FORMAT format,const void* data,unsigned texel,unsigned edge=size){
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        d.Width=d.Height=size;d.DepthOrArraySize=d.MipLevels=1;d.Format=format;d.SampleDesc.Count=1;
+        d.Width=d.Height=edge;d.DepthOrArraySize=d.MipLevels=1;d.Format=format;d.SampleDesc.Count=1;
         ComPtr<ID3D12Resource> out;check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&out))),"Parity texture");
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT64 bytes{};device->GetCopyableFootprints(&d,0,1,0,&fp,nullptr,nullptr,&bytes);
         auto upload=buffer(D3D12_HEAP_TYPE_UPLOAD,bytes,D3D12_RESOURCE_STATE_GENERIC_READ);void* mapped{};
         check(SUCCEEDED(upload->Map(0,nullptr,&mapped)),"Parity upload map");
-        for(unsigned y=0;y<size;++y)std::memcpy(static_cast<char*>(mapped)+fp.Offset+y*fp.Footprint.RowPitch,static_cast<const char*>(data)+y*size*texel,size*texel);
+        for(unsigned y=0;y<edge;++y)std::memcpy(static_cast<char*>(mapped)+fp.Offset+y*fp.Footprint.RowPitch,static_cast<const char*>(data)+y*edge*texel,edge*texel);
         upload->Unmap(0,nullptr);
         D3D12_TEXTURE_COPY_LOCATION to{},from{};to.pResource=out.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         from.pResource=upload.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=fp;

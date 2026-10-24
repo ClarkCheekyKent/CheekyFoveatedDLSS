@@ -62,12 +62,28 @@ inline bool BufferedPresenter::prepare_native11(Native& job,const XrCompositionL
     });
     if(!good)return false;
     if(inference_slot){
+        CheekyFgColorOptionsV1 options;
+        if(optical::color_options(options)){
+            auto payload=std::make_shared<FrameGuides11>();
+            for(unsigned eye=0;eye<2;++eye){auto guide=std::make_shared<Backend11::Guides>();
+                guide->source.meta=options.eyes[eye];D3D11_TEXTURE2D_DESC d{};job.color[eye]->texture11->GetDesc(&d);
+                guide->source.meta.width=d.Width;guide->source.meta.height=d.Height;
+                if(quad_input){auto& g=guide->source.meta;const auto& r=native11->optical_quad_regions[eye];
+                    g.focus_width=r[2];g.focus_height=r[3];g.focus_x=r[0]+r[2]*.5f-.5f;g.focus_y=r[1]+r[3]*.5f-.5f;
+                    g.focus_feather=2.f/std::max(1u,std::min(d.Width,d.Height));}
+                guide->source.mapping_revision=guide->source.meta.configuration;payload->eyes[eye]=std::move(guide);}
+            job.source_configuration=options.eyes[0].configuration;job.guide_token=job.id*2;
+            job.guides=std::move(payload);job.policy={options.release_point,options.queue_priority,true};job.guides_valid=true;
+            job.guide_state=CheekyFgState::waiting_for_history;return true;
+        }
         std::array<std::shared_ptr<Backend11::Guides>,2> guides;
         if(native11->take_guides(guides)){
             auto payload=std::make_shared<FrameGuides11>();payload->eyes=std::move(guides);
             job.source_configuration=payload->eyes[0]->source.meta.configuration;
             job.guide_token=payload->eyes[0]->source.mapping_revision;
-            job.guides=std::move(payload);job.policy={};job.guides_valid=true;job.guide_state=CheekyFgState::waiting_for_history;
+            const auto& g=payload->eyes[0]->source.meta;
+            job.policy={};job.policy.optical_flow=cheeky_fg_uses_flow(g.center_method,g.peripheral_method,g.focus_width<.999f||g.focus_height<.999f);
+            job.guides=std::move(payload);job.guides_valid=true;job.guide_state=CheekyFgState::waiting_for_history;
         }else job.guide_state=CheekyFgState::waiting_for_guides;
     }
     return true;
@@ -164,8 +180,9 @@ struct BufferedBackend11 final : FrameBackend {
                 }
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
-                    strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}
-                else strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: generating (no D3D12 bridge or NGX)");
+                    if(!cheeky_fg_uses_flow(now[0]->source.meta.center_method,now[0]->source.meta.peripheral_method,true))
+                        strcpy_s(owner.native11->diagnostic,"Native D3D11 shader FG: interpolation pass failed; native presentation continues");}
+                else strcpy_s(owner.native11->diagnostic,"Native D3D11 FG: generating (no D3D12 bridge or NGX)");
             }
         }
 
@@ -196,12 +213,14 @@ struct BufferedBackend11 final : FrameBackend {
     void reset_generation() override {}
     // The bidirectional shader still samples previous-interval depth.
     void retire_guides(BufferedNative&) override {}
-    void reset_statistics(bool) override {owner.native11->gpu_timings.reset();owner.native11->capture_timings.reset();
+    void reset_statistics(bool) override {owner.native11->gpu_timings.reset();owner.native11->optical_timings.reset();owner.native11->capture_timings.reset();
         owner.native11->guide_timings.reset();owner.native11->upload_timings.reset();}
     GenerationStatus generation_status() const override {return {false,false,0,owner.native11->diagnostic};}
     void snapshot(CheekyFgPerformance& performance,CheekyFgOverhead& overhead,
         CheekyFgExperimentDiagnostics& experiments) const override {
         performance=owner.native11->gpu_timings.snapshot();overhead={};owner.worker.latency.snapshot(experiments);
+        const auto optical=owner.native11->optical_timings.snapshot();
+        performance.total_ms+=optical.total_ms;performance.total_last_ms+=optical.total_last_ms;
     }
     XrResult end_frame(const XrFrameEndInfo* end) override {
         return owner.native11->runtime_submit([&]{return owner.xr.end_frame(owner.session,end);});

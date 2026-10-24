@@ -2,11 +2,12 @@
 // ABI boundary between UEVR NGX interception and the OpenXR presentation layer.
 // A returned pair owns COM references; receiver must call CheekyFG_ReleasePair.
 #include <cstdint>
+#include "fg_methods.hpp"
 struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473C; // CFG12: retired guide precision, diagnostic and frame-ID fields.
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473D; // Optical flow settings; install runtime and layer together.
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -28,6 +29,7 @@ struct CheekyFgEye {
     std::uint32_t resolution_percent{100},peripheral_percent{50};
     std::uint32_t peripheral_method{2};
     std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
+    CheekyFgOpticalSettings optical;
     std::uint64_t configuration{};
     std::uint32_t prepared_guides{}; // Guides are prepared FG grids rather than raw snapshots.
     ID3D12Resource* peripheral_depth{};

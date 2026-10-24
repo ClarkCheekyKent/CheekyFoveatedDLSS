@@ -49,6 +49,7 @@ struct Settings {
         std::uint32_t resolution_percent{100},peripheral_percent{50};
         std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
         std::uint32_t peripheral_method{1};
+        CheekyFgOpticalSettings optical;
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
         std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
         std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held.

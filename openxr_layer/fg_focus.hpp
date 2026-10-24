@@ -1,6 +1,7 @@
 #pragma once
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "fg_matrices.hpp"
+#include "fg_optical.hpp"
 #include "../shared/fg_compact.hpp"
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -17,6 +18,8 @@ struct FocusInput {
     bool borrowed_guides{};
 };
 struct FocusPipeline {
+    optical::Session12 optical[2][2];
+    OpticalConstants optical_constants[2][2];
     float interpolation_fraction{.5f};
     struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};};
     DXGI_FORMAT color_format{DXGI_FORMAT_R16G16B16A16_FLOAT};
@@ -47,7 +50,7 @@ struct FocusPipeline {
         const FocusRect* center_region=nullptr);
     bool compose_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,
         ID3D12Resource* center,ID3D12Resource* periphery,const FocusRect&,unsigned width,unsigned height,
-        ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON);
+        ID3D12Resource* destination=nullptr,D3D12_RESOURCE_STATES destination_state=D3D12_RESOURCE_STATE_COMMON,bool linear_sdr=false);
     bool save_depth(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,unsigned pass=1);
     bool pack_frame(ID3D12Device*,ID3D12GraphicsCommandList*,unsigned eye,ID3D12Resource* center,ID3D12Resource* context,
         ID3D12Resource* destination,D3D12_RESOURCE_STATES,const CompactLayout&,bool center_direct,bool context_direct);

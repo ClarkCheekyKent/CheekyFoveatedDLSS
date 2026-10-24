@@ -34,7 +34,7 @@ struct GuideGrid {
 inline GuideGrid guide_grid(const CheekyFgEye& g,unsigned dw,unsigned dh,unsigned mw,unsigned mh,unsigned pass) noexcept {
     GuideGrid r;r.w=g.width;r.h=g.height;
     const bool focused=g.focus_width<.999f||g.focus_height<.999f;
-    if(!g.width||!g.height||pass>1||g.peripheral_method>3)return {};
+    if(!g.width||!g.height||pass>1||!cheeky_fg_periphery_valid(g.peripheral_method))return {};
     if(pass==0&&focused){
         r.w=std::clamp(unsigned(std::round(g.width*g.focus_width)),1u,g.width);
         r.h=std::clamp(unsigned(std::round(g.height*g.focus_height)),1u,g.height);
@@ -44,7 +44,8 @@ inline GuideGrid guide_grid(const CheekyFgEye& g,unsigned dw,unsigned dh,unsigne
     if(pass==1&&!focused)return r;
     const unsigned scale=pass?g.peripheral_percent:g.resolution_percent;
     r.color_width=std::max(32u,(r.w*scale+50u)/100u);r.color_height=std::max(32u,(r.h*scale+50u)/100u);
-    r.depth=pass==0||g.peripheral_method>=2;r.motion=pass==0||g.peripheral_method!=0;
+    r.depth=pass==0?g.center_method!=4:(g.peripheral_method==2||g.peripheral_method==3);
+    r.motion=pass==0?g.center_method!=4:(g.peripheral_method>=1&&g.peripheral_method<=3);
     const unsigned sw=r.depth?std::min(dw,mw):mw,sh=r.depth?std::min(dh,mh):mh;
     r.width=std::clamp(unsigned(std::round(double(sw)*r.w/g.width*std::min(1.,double(r.color_width)/r.w))),1u,r.color_width);
     r.height=std::clamp(unsigned(std::round(double(sh)*r.h/g.height*std::min(1.,double(r.color_height)/r.h))),1u,r.color_height);
