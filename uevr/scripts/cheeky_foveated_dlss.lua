@@ -710,13 +710,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgReleasePoint ~= nil then
                     combo("Release game rendering", "FgReleasePoint", {
-                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After generated frame submission", [4]="4 ms after FG submission", [5]="Never (display clock only)", [6]="After first generated frame submission"})
+                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After all generated frames submitted", [4]="4 ms after FG submission", [5]="Never (display clock only)", [6]="After first generated frame submission", [7]="After second generated frame submission"})
                     if draft.FgReleasePoint == 5 then
                         text("Experimental: the game is paced only by the headset clock and never waits for frame generation. Generated frames may arrive later; best when the GPU is the limit.")
-                    elseif draft.FgReleasePoint == 6 then
-                        text("The game starts its next frame once the first generated frame is handed to the headset, instead of waiting for all of them.")
+                    elseif draft.FgReleasePoint == 6 or draft.FgReleasePoint == 7 then
+                        text("The game starts its next frame once that generated frame is handed to the headset, instead of waiting for all of them. At 2x the second is the only one.")
                     elseif draft.FgReleasePoint ~= 3 then
-                        text("Experimental overlap: capture order alone cannot prove frame identity. Use After generated frame submission for serialized matching.")
+                        text("Experimental overlap: capture order alone cannot prove frame identity. Use After all generated frames submitted for serialized matching.")
                     end
                 end
                 if draft.FgDirectXrOutput ~= nil then

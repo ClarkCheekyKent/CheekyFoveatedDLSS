@@ -204,7 +204,7 @@ integration coverage; ACC and headset compatibility still require game testing.
 Standalone and UEVR both match guide pairs at `xrEndFrame`. Each native frame
 must supply exactly two submitted eye evaluations. Missing, partial or ambiguous guide intervals retain native
 presentation and recover on a later complete stereo frame. Keep **Release game
-rendering** at **After generated frame submission** (the default) for serialized
+rendering** at **After all generated frames submitted** (the default) for serialized
 matching. Other release modes allow experimental overlap without native frame
 identity proof.
 
