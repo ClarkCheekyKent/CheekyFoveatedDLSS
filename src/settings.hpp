@@ -59,6 +59,7 @@ struct Settings {
         bool native11_skip_identity_crop{false}; // Native D3D11: reuse a whole-image eye capture instead of copying it again.
         bool dedicated_present_queue{false}; // D3D12: the OpenXR runtime syncs on a layer-owned queue instead of the game's; applies at session creation.
         bool gpu_waited_present{false}; // D3D12 + dedicated present queue: generated frames go to the runtime once queued; the upload waits on the GPU.
+        bool limit_gpu_ahead{false}; // Follow clock + release Never: the game waits while its previous frame is not yet captured on the GPU.
         bool extra_frame_slots{false}; // 4 banked render credits and 5 capture slots instead of 2/3; costs two more stereo color copies of VRAM.
         bool force_reflex_off{false}; // Per-game override, independent of FG enable.
     } fg;

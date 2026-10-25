@@ -969,6 +969,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::Checkbox("Present without waiting on the GPU (D3D12)", &s.gpu_waited_present);
         if (s.gpu_waited_present)
             ImGui::TextWrapped("Generated frames go to the headset as soon as their GPU work is queued; the upload waits on the GPU instead of the presenter thread, so headset slots are not missed. Needs the dedicated GPU queue.");
+        ImGui::Checkbox("Keep the GPU from falling behind (Never + Follow)", &s.limit_gpu_ahead);
+        if (s.limit_gpu_ahead)
+            ImGui::TextWrapped("With a Follow pacing clock and release Never: the game waits whenever its previous frame has not yet been captured on the GPU, so the GPU cannot fall a frame behind and add latency.");
         ImGui::Checkbox("Extra frame slots (more VRAM)", &s.extra_frame_slots);
         if (s.extra_frame_slots)
             ImGui::TextWrapped("Lets the game render up to 4 frames ahead while frame generation catches up. Uses two more full stereo frame copies of VRAM.");

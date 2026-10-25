@@ -117,6 +117,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // presenter thread polling it. Only with a layer-owned runtime queue: a
     // GPU wait on the game's queue would stall the game behind generation.
     std::atomic<bool> gpu_waited_present{};
+    std::atomic<bool> limit_gpu_ahead{}; // Follow clock + release Never: hold while the GPU is a frame behind.
     std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
     std::uint64_t upload_capture_ticket{}; // Presenter thread only; producer fence value the next upload waits on.
     bool gpu_waited_uploads() const noexcept {return runtime_queue&&gpu_waited_present.load(std::memory_order_relaxed);}
@@ -560,6 +561,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const auto mode=std::min(pacing.clock_mode,2u);
             const bool extra=pacing.extra_frame_slots!=0;
             if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
+            const bool gpu_ahead=pacing.limit_gpu_ahead!=0;
+            if(limit_gpu_ahead.exchange(gpu_ahead)!=gpu_ahead&&trace)trace(gpu_ahead?"FG limit GPU ahead=ON":"FG limit GPU ahead=OFF");
             const bool gpu_waited=pacing.gpu_waited_present!=0;
             if(gpu_waited_present.exchange(gpu_waited)!=gpu_waited&&trace)
                 trace(gpu_waited?(runtime_queue?"FG GPU-waited present=ON":"FG GPU-waited present requested; inactive without the dedicated present queue"):"FG GPU-waited present=OFF");
@@ -1010,7 +1013,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     // running ahead of its GPU: a previous frame still not
                     // captured on the GPU at the next tick means a GPU-side
                     // backlog that delays every generated frame behind it.
-                    const bool gpu_behind=active_release_point==5u&&latest_native&&!capture_completed(latest_native->ready);
+                    const bool gpu_behind=limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&
+                        latest_native&&!capture_completed(latest_native->ready);
                     const bool backlog=mode!=0u&&pacing_active&&
                         (backlog_detected||gpu_behind||ready.size()>=max_pending()||pending.size()>=max_pending());
                     if(mode!=0u&&pacing_active&&gpu_behind)++gpu_behind_holds;
