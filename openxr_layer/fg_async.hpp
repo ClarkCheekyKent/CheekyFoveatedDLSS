@@ -197,6 +197,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool started{},stopping{},bypass{},fg_active{},pacing_active{},degraded{};
     bool native_frame_pending{}; // Hold mx; the pre-activation frame still owns runtime Begin/End.
     unsigned credits{},app_waiters{};
+    std::uint64_t granted_credits{},consumed_credits{},capped_credits{}; // Pacing diagnostics: clock grants, game uses, grants lost at the 2-credit cap.
     std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{};
     std::uint64_t last_credit_tick{},completed_pair_id{},inflight_id{};
     XrFrameState predicted{XR_TYPE_FRAME_STATE};
@@ -543,7 +544,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // finish so the layer can retry against the current presenter.
         if(stopping&&!XR_FAILED(terminal))changed.wait(lock,[&]{return !stop_in_progress||XR_FAILED(terminal);});
         if(stopping||XR_FAILED(terminal))return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
-        --credits;++waited;
+        --credits;++consumed_credits;++waited;
         const auto next=frame->next;*frame=predicted;frame->next=next;
         // Predict a native frame at least two display intervals ahead; keep one display
         // time consistent across all engine stages and strictly increasing.
@@ -919,7 +920,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                             mark_credit_deferred();
                         }else if(credit_deferred)release_deferred_credit();
-                        else credits=std::min(2u,credits+1);
+                        else{++granted_credits;if(credits>=2u)++capped_credits;credits=std::min(2u,credits+1);}
                         changed.notify_all();
                     }
                     next+=period;if(next<=now)next=now+period;
@@ -1246,11 +1247,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     cadence_window.add(now_ms,{native_count,distinct_native,generated_count,runtime_submissions});}
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
                     const auto c=cadence();
-                    sprintf_s(cadence_log,"FG experiment cadence: release=%s queue=%s clock=%s clock_ms=%.3f valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f",
+                    sprintf_s(cadence_log,"FG experiment cadence: release=%s queue=%s clock=%s clock_ms=%.3f valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f; game_end_ms=%.3f last=%.3f capture_cpu_ms=%.3f credit_wait_last=%.3f credits granted=%llu consumed=%llu capped=%llu",
                         active_release_point==5u?"never":active_release_point==3u?"generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
                         queue_mode_name(reported_queue_mode),
                         pacing_clock_mode==2u?"presented+phase":pacing_clock_mode==1u?"presented":"independent",native_clock_ms,c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.submission_fps,
-                        xr_wait.mean(),runtime_end.mean(),present_cpu.mean());
+                        xr_wait.mean(),runtime_end.mean(),present_cpu.mean(),app_calls[1].mean(),app_calls[1].last,producer_cpu.mean(),pacing_wait.last,
+                        static_cast<unsigned long long>(granted_credits),static_cast<unsigned long long>(consumed_credits),static_cast<unsigned long long>(capped_credits));
                     sprintf_s(age_log,"FG source-age CPU ms: generated_samples=%llu latest_capture_to_complete=%.3f complete_to_generated_submit=%.3f newest_input_age=%.3f complete_to_native_submit=%.3f",
                         static_cast<unsigned long long>(generated_count),capture_to_completion.mean(),completion_to_generated.mean(),
                         frame_ages[2].mean(),completion_to_native.mean());
