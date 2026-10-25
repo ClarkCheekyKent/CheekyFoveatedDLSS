@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -709,6 +709,20 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     if draft.FgPacingClock ~= 0 then
                         text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
                     end
+                end
+                if draft.FgCarryMissedTicks ~= nil and draft.FgPacingClock ~= 0 then
+                    check("Carry missed go-aheads", "FgCarryMissedTicks")
+                    if draft.FgCarryMissedTicks then
+                        text("The Follow clock runs at exactly the target rate, so a go-ahead that gets merged into one still waiting (for the generated frame, or for the GPU) is lost for good, and the game ends up just under the target. This hands at most one such go-ahead over as soon as the game may start again.")
+                    end
+                end
+                if draft.FgPacingHeadroom ~= nil and draft.FgPacingClock == 1 then
+                    check("Pace the game slightly above the headset rate", "FgPacingHeadroom")
+                    if draft.FgPacingHeadroom then
+                        text("Paces the game 2.5% above multiplier x headset rate so occasional lost go-aheads do not drop it below the target; surplus frames are skipped by the backlog drain.")
+                    end
+                elseif draft.FgPacingHeadroom ~= nil and draft.FgPacingClock == 2 then
+                    text("Pacing headroom: Not available with the vsync lock: the lock pins every go-ahead to a headset slot, which cancels any headroom. Use Carry missed go-aheads there.")
                 end
                 if draft.FgDedicatedPresentQueue ~= nil then
                     check("Present from a dedicated GPU queue (D3D12)", "FgDedicatedPresentQueue")

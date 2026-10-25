@@ -119,6 +119,18 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // GPU wait on the game's queue would stall the game behind generation.
     std::atomic<bool> gpu_waited_present{};
     std::atomic<bool> limit_gpu_ahead{}; // Follow clock + release Never: hold while the GPU is a frame behind.
+    // Follow clocks run at exactly the target rate, so a tick merged into a
+    // deferred or held go-ahead is never made up. With carry_missed_ticks one
+    // such tick is owed and handed over with the next go-ahead. Hold mx.
+    std::atomic<bool> carry_missed_ticks{};
+    bool owed_tick{};
+    std::uint64_t carried_ticks{},clock_ticks{};
+    void owe_tick() noexcept {if(carry_missed_ticks.load(std::memory_order_relaxed))owed_tick=true;}
+    unsigned take_owed() noexcept {if(!owed_tick)return 0;owed_tick=false;++carried_ticks;return 1;}
+    // Plain Follow clock: pace the game 2.5% above the target rate; the
+    // backlog skip drops the surplus. Not with the vsync lock, which pins
+    // ticks to the headset's slots.
+    std::atomic<bool> pacing_headroom{};
     // Hold mx. The previous frame is still on the GPU.
     bool gpu_behind_now() const {return latest_native&&!capture_completed(latest_native->ready);}
     std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
@@ -477,7 +489,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;backlog_detected=gpu_behind_credit=false;
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;owed_tick=false;carried_ticks=clock_ticks=0;backlog_detected=gpu_behind_credit=false;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -575,6 +587,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
             const bool gpu_ahead=pacing.limit_gpu_ahead!=0;
             if(limit_gpu_ahead.exchange(gpu_ahead)!=gpu_ahead&&trace)trace(gpu_ahead?"FG limit GPU ahead=ON":"FG limit GPU ahead=OFF");
+            const bool carry=pacing.carry_missed_ticks!=0;
+            if(carry_missed_ticks.exchange(carry)!=carry&&trace)trace(carry?"FG carry missed go-aheads=ON":"FG carry missed go-aheads=OFF");
+            const bool headroom=pacing.pacing_headroom!=0;
+            if(pacing_headroom.exchange(headroom)!=headroom&&trace)trace(headroom?"FG pacing headroom=ON (plain Follow clock +2.5%)":"FG pacing headroom=OFF");
             const bool gpu_waited=pacing.gpu_waited_present!=0;
             if(gpu_waited_present.exchange(gpu_waited)!=gpu_waited&&trace)
                 trace(gpu_waited?(runtime_queue?"FG GPU-waited present=ON":"FG GPU-waited present requested; inactive without the dedicated present queue"):"FG GPU-waited present=OFF");
@@ -1017,13 +1033,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // next tick quantizes the game to multiples of the tick.
                 if(gpu_behind_credit&&!gpu_behind_now()) {
                     gpu_behind_credit=false;
-                    if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1);changed.notify_all();}
+                    if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1+take_owed());changed.notify_all();}
                 }
                 if(now>=next) {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=mode!=0u?follow_display_ms():
                         telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
                     double native_ms=std::max(1.,display_ms*(pacing_active?double(active_multiplier):1.));
+                    if(mode==1u&&pacing_active&&pacing_headroom.load(std::memory_order_relaxed))native_ms/=1.025;
+                    ++clock_ticks;
                     if(follow_window_start==TimingClock::time_point{}||now-follow_window_start>=std::chrono::milliseconds(500)) {
                         // More than 5% of rendered frames never reached the runtime.
                         const auto rendered=native_count-std::min(native_count,follow_game_mark);
@@ -1054,11 +1072,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     backlog_detected=false;
                     // A banked credit would let the game run ahead regardless.
                     if(backlog){++backlog_holds;if(credits>0)--credits;}
-                    if(hold_for_gpu){++gpu_behind_holds;if(credits>0)--credits;gpu_behind_credit=true;}
+                    if(hold_for_gpu){++gpu_behind_holds;if(credits>0||gpu_behind_credit)owe_tick();if(credits>0)--credits;gpu_behind_credit=true;}
                     if(!raw&&!backlog&&!hold_for_gpu) {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
+                            if(credit_deferred)owe_tick();
                             mark_credit_deferred();
-                        }else if(credit_deferred)release_deferred_credit();
+                        }else if(credit_deferred){owe_tick();release_deferred_credit();}
                         else{++granted_credits;if(credits>=max_credits())++capped_credits;credits=std::min(max_credits(),credits+1);}
                         changed.notify_all();
                     }
@@ -1108,7 +1127,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void release_deferred_credit() noexcept {
         // Hold mx. Coalesce missed ticks rather than bursting queued renders.
         if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()&&!release_gate_active()) {
-            credits=std::min(max_credits(),credits+1);credit_deferred=false;++released_deferred_credits;
+            credits=std::min(max_credits(),credits+1+take_owed());credit_deferred=false;++released_deferred_credits;
             if(credit_deferred_since!=TimingClock::time_point{})credit_deferral.add(elapsed_ms(credit_deferred_since));
             credit_deferred_since={};changed.notify_all();
         }
@@ -1460,11 +1479,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         generation_stages[3].mean(),generation_stages[0].mean()+generation_stages[1].mean()+generation_stages[2].mean()+generation_stages[3].mean(),
                         static_cast<unsigned long long>(deferred_credits),static_cast<unsigned long long>(released_deferred_credits),unsigned(credit_deferred));
                     const auto time=pacing_timeline();
-                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu",
+                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu carried_ticks=%llu clock_ticks=%llu",
                         time.clock_late_ms,time.credit_deferred_ms,time.game_wait_credit_ms,time.game_begin_gate_ms,
                         time.presenter_content_ms,time.native_xr_end_ms,time.generated_xr_end_ms,
                         time.fg_submit_to_complete_ms,time.deferred_events,time.deferred_releases,
-                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits));
+                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits),
+                        static_cast<unsigned long long>(carried_ticks),static_cast<unsigned long long>(clock_ticks));
                     const auto native_latency=native_submission_latency();
                     sprintf_s(native_latency_log,"FG NATIVE submit latency (GPU final stereo capture end to xrEndFrame ENTER): enabled=%u samples=%llu pending=%llu missing=%llu signed_ms=%.3f last=%.3f hold_after_ready=%.3f early_before_ready=%.3f CPU_capture_to_submit=%.3f; NO FG-off baseline",
                         native_latency.enabled,static_cast<unsigned long long>(native_latency.gpu_samples),

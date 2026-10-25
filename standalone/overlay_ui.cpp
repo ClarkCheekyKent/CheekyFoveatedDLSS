@@ -963,6 +963,17 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
         if (s.pacing_clock != 0)
             ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
+        if (s.pacing_clock != 0) {
+            ImGui::Checkbox("Carry missed go-aheads", &s.carry_missed_ticks);
+            if (s.carry_missed_ticks)
+                ImGui::TextWrapped("The Follow clock runs at exactly the target rate, so a go-ahead that gets merged into one still waiting (for the generated frame, or for the GPU) is lost for good, and the game ends up just under the target. This hands at most one such go-ahead over as soon as the game may start again.");
+            if (s.pacing_clock == 1) {
+                ImGui::Checkbox("Pace the game slightly above the headset rate", &s.pacing_headroom);
+                if (s.pacing_headroom)
+                    ImGui::TextWrapped("Paces the game 2.5% above multiplier x headset rate so occasional lost go-aheads do not drop it below the target; surplus frames are skipped by the backlog drain.");
+            } else
+                ImGui::TextWrapped("Pacing headroom: Not available with the vsync lock: the lock pins every go-ahead to a headset slot, which cancels any headroom. Use Carry missed go-aheads there.");
+        }
         ImGui::Checkbox("Present from a dedicated GPU queue (D3D12)", &s.dedicated_present_queue);
         if (s.dedicated_present_queue)
             ImGui::TextWrapped("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.");

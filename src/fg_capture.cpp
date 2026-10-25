@@ -602,7 +602,9 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     if(out->size>=offsetof(CheekyFgPacingOptions,dedicated_present_queue))out->extra_frame_slots=fg.extra_frame_slots?1u:0u;
     if(out->size>=offsetof(CheekyFgPacingOptions,gpu_waited_present))out->dedicated_present_queue=fg.dedicated_present_queue?1u:0u;
     if(out->size>=offsetof(CheekyFgPacingOptions,limit_gpu_ahead))out->gpu_waited_present=fg.gpu_waited_present?1u:0u;
-    if(out->size>=sizeof(*out))out->limit_gpu_ahead=fg.limit_gpu_ahead?1u:0u;
+    if(out->size>=offsetof(CheekyFgPacingOptions,carry_missed_ticks))out->limit_gpu_ahead=fg.limit_gpu_ahead?1u:0u;
+    if(out->size>=offsetof(CheekyFgPacingOptions,pacing_headroom))out->carry_missed_ticks=fg.carry_missed_ticks?1u:0u;
+    if(out->size>=sizeof(*out))out->pacing_headroom=fg.pacing_headroom?1u:0u;
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetNative11OptionsV1(CheekyFgNative11Options* out) noexcept {

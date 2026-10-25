@@ -239,6 +239,8 @@ struct CheekyFgPacingOptions {
     std::uint32_t dedicated_present_queue{}; // 1: give the OpenXR runtime the layer's own D3D12 queue at session creation.
     std::uint32_t gpu_waited_present{}; // 1: hand generated frames to the runtime once queued; the upload waits on the GPU, not the presenter's CPU.
     std::uint32_t limit_gpu_ahead{}; // 1: Follow clock + release Never hold the game while its previous frame is not yet captured on the GPU.
+    std::uint32_t carry_missed_ticks{}; // 1: Follow clocks hand over a go-ahead merged into a deferred or held one later.
+    std::uint32_t pacing_headroom{}; // 1: plain Follow clock paces the game 2.5% above the target rate.
 };
 using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
 // Independent export: D3D12 quad-view composition in xrEndFrame.
