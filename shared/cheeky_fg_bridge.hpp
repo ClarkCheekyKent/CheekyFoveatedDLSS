@@ -154,6 +154,18 @@ struct CheekyFgPerformance {
 };
 using CheekyFgPerformanceFn=bool(__cdecl*)(CheekyFgPerformance*);
 
+// Optional extension: one native-pair batch and its generated stereo phases.
+// Includes immutable output publication, excludes capture, XR upload and pacing.
+// Phase 1 includes shared optical-flow preparation/estimation when present.
+struct CheekyFgBatchTimingsV1 {
+    std::uint32_t abi{1},size{sizeof(CheekyFgBatchTimingsV1)},supported{},valid{};
+    std::uint32_t generated_count{},optical_regions{};
+    std::uint64_t samples{};
+    double batch_ms{},batch_last_ms{};
+    double phase_ms[3]{},phase_last_ms[3]{};
+};
+using CheekyFgBatchTimingsFn=bool(__cdecl*)(CheekyFgBatchTimingsV1*);
+
 // Separate optional export: v15's performance structure remains unchanged.
 struct CheekyFgCadence {
     std::uint32_t abi{2},size{sizeof(CheekyFgCadence)},supported{},valid{};

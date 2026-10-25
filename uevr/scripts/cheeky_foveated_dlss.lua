@@ -808,7 +808,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         row("Color / guide preparation", p.preparation_ms, p.preparation_last_ms)
                         row(focused and "DLSS-FG / shader center" or "FG full frame", p.center_ms, p.center_last_ms)
                         if focused or resized then row(resized and "Output resize" or "Periphery + output assembly", p.periphery_ms, p.periphery_last_ms) end
-                        row(stages and "  Generation subtotal" or "FG GPU total", p.total_ms, p.total_last_ms)
+                        row(stages and "  Generation subtotal (per generated frame)" or "FG GPU total (per generated frame)", p.total_ms, p.total_last_ms)
                     end
                     sum, sum_last = sum + (p.total_ms or 0), sum_last + (p.total_last_ms or 0)
                     if stages then
@@ -822,6 +822,17 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         end
                     end
                     rows("fg_gpu_timings", entries)
+                    local batch = fg.batch_timing
+                    if batch and batch.supported and batch.valid then
+                        local batch_rows = {{"Whole batch incl. output copies (per real frame)", gpu_ms(batch.batch_ms, batch.batch_last_ms)}}
+                        for _, phase in ipairs(batch.phases or {}) do
+                            local label = "Generated stereo frame " .. tostring(phase.index or "?")
+                            if phase.index == 1 and (batch.optical_regions or 0) > 0 then label = label .. " (includes optical flow)" end
+                            batch_rows[#batch_rows+1] = {label, gpu_ms(phase.ms, phase.last_ms)}
+                        end
+                        rows("fg_batch_timings", batch_rows)
+                        text("Batch and generated-frame times cover both eyes, including composition and output copies. Capture, XR uploads and pacing are excluded.")
+                    end
                     text(native_shader11 and "Shader time covers both eyes. Copy times are per copy. Runtime work is excluded." or
                         "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.")
                 elseif not p.gpu_supported and (p.gpu_samples or 0) == 0 then

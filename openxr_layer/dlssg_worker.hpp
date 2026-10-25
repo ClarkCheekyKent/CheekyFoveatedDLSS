@@ -38,6 +38,11 @@ struct Worker {
     // Lists for the 2nd/3rd generated frame of a batched (non-NGX) interval.
     std::array<ComPtr<ID3D12CommandAllocator>,2> batch_allocators;
     std::array<ComPtr<ID3D12GraphicsCommandList>,2> batch_lists;
+    // A first phase may split at each of four independent optical consumers.
+    // Every allocator remains leased until the native-pair completion fence.
+    std::array<ComPtr<ID3D12CommandAllocator>,4> optical_consumer_allocators;
+    std::array<ComPtr<ID3D12GraphicsCommandList>,4> optical_consumer_lists;
+    bool optical_pending[2][2]{};
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;
@@ -53,6 +58,13 @@ struct Worker {
     bool direct_periphery{true}; // Test A/B override; custom compact output needs no periphery intermediate.
     void reset_features() noexcept;
     GpuTimings gpu_timings;
+    std::array<GpuTimings,3> phase_timings;
+    BatchGpuTimings batch_timings;
+    void initialize_timings() noexcept {
+        gpu_timings.initialize(device.Get(),queue.Get());
+        for(auto& t:phase_timings)t.initialize(device.Get(),queue.Get());
+        batch_timings.reset();
+    }
     LatencyProbe latency;
     TimingAverage completion_wait;
     TimingClock::time_point submitted_at{};

@@ -134,6 +134,7 @@ struct Presenter {
         out.source_depth_format=worker.source_depth_format;out.source_motion_format=worker.source_motion_format;
         return out;
     }
+    virtual CheekyFgBatchTimingsV1 batch_timing() const noexcept {return {};}
     std::deque<ColorCopy> copies;
     std::array<ComPtr<ID3D12Resource>,2> held{};
     std::array<ComPtr<ID3D12Resource>,2> generated{}, fallback{};

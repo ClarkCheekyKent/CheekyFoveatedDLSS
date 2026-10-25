@@ -119,6 +119,9 @@ inline void fg_optical_validation(){
         for(unsigned multiplier=2;multiplier<=4;++multiplier)for(unsigned phase=1;phase<multiplier;++phase){
             check(worker.generate(pair,current,previous,cameras,output,nullptr,nullptr,nullptr,nullptr,multiplier-1,phase),worker.diagnostic);
             validate(gpu.read(output[0]),float(phase)/multiplier,"D3D12");
+            if(phase==multiplier-1){const auto batch=worker.batch_timings.snapshot();
+                check(batch.valid&&batch.generated_count==multiplier-1&&batch.optical_regions==4,
+                    "Optical batch timings retain all generated phases and four deferred regional dependencies");}
         }
     }
     {

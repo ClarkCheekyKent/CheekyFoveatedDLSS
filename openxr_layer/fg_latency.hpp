@@ -73,7 +73,7 @@ struct LatencyProbe {
         list->ResolveQueryData(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,0,4,readback.Get(),0);end_recorded=true;
     }
     void submitted(ID3D12Fence* fence,std::uint64_t value) noexcept {
-        if(!active)return;retire_fence=fence;retire_value=value;submitted_cpu=cpu_now();
+        if(!active)return;retire_fence=fence;retire_value=value;if(!submitted_cpu)submitted_cpu=cpu_now();
     }
     bool collect(ID3D12CommandQueue* queue,std::uint64_t observed) noexcept {
         if(!active||!end_recorded||!submitted_cpu)return false;

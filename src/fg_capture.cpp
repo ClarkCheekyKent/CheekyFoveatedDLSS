@@ -766,6 +766,11 @@ bool fg_performance(CheekyFgPerformance& out) noexcept {
     const auto query=layer?reinterpret_cast<CheekyFgPerformanceFn>(GetProcAddress(layer,"CheekyFG_GetPerformance")):nullptr;
     return query&&query(&out);
 }
+bool fg_batch_timings(CheekyFgBatchTimingsV1& out) noexcept {
+    const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
+    const auto query=layer?reinterpret_cast<CheekyFgBatchTimingsFn>(GetProcAddress(layer,"CheekyFG_GetBatchTimingsV1")):nullptr;
+    return query&&query(&out);
+}
 bool fg_cadence(CheekyFgCadence& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
     const auto query=layer?reinterpret_cast<CheekyFgCadenceFn>(GetProcAddress(layer,"CheekyFG_GetCadenceV1")):nullptr;

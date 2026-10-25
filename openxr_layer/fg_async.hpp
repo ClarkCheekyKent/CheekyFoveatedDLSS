@@ -128,6 +128,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unordered_map<XrSwapchain,Chain> auxiliary_chains;
     Chain scene_chains[2]; // Native and generated presentations share each eye's destination.
     CheekyFgPerformance telemetry;
+    CheekyFgBatchTimingsV1 batch_telemetry;
+    std::weak_ptr<Pair::Progress> inflight_progress;
+    CheekyFgBatchTimingsV1 batch_timing() const noexcept override {return batch_telemetry;}
     CheekyFgOverhead extra_gpu;
     // Unique native, generated interpolation time, newest FG input.
     std::array<TimingAverage,3> frame_ages;
@@ -183,6 +186,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool credit_deferred{};
     unsigned inflight_release_point{},last_release_point{},active_release_point{};
     bool inflight_prepared{},release_policy_known{},clock_pacing_active{};
+    bool inflight_generated_gate_released{};
     TimingAverage producer_cpu,pacing_wait;
     TimingAverage clock_late,credit_deferral,begin_gate_wait,presenter_content_wait;
     TimingAverage native_xr_end,generated_xr_end;
@@ -360,6 +364,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // Hold mx. Startup/FG failure has no generated gate; stale/hidden
         // content cancels it so runtime transitions cannot strand the game.
         if(!awaiting_generated_submission||current_id<awaiting_generated_submission)return;
+        if(current_id==inflight_id)inflight_generated_gate_released=true;
         awaiting_generated_submission=0;if(submitted)++generated_gate_releases;else ++generated_gate_skips;
         release_deferred_credit();changed.notify_all();
     }
@@ -410,7 +415,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // submitted inference, so their raw snapshot leases can retire immediately.
     std::uint64_t passthrough_events{};
     std::uint64_t history_reset_events{};
-    void discard_pending() noexcept {for(auto& job:pending)job->clear_guides();pending.clear();}
+    void discard_pending() noexcept {
+        if(auto progress=inflight_progress.lock())progress->failed=true;
+        for(auto& job:pending)job->clear_guides();pending.clear();
+    }
     void stop() noexcept {
         {std::lock_guard lock(mx);stopping=true;stop_in_progress=true;changed.notify_all();}
         if(presentation_thread.joinable())presentation_thread.join();
@@ -426,7 +434,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
-        reset_gpu_metrics();extra_gpu={};
+        reset_gpu_metrics();extra_gpu={};batch_telemetry={};inflight_progress.reset();
         frame_ages={};age_samples={};
         last_credit_tick=completed_pair_id=inflight_id=0;
         capture_to_completion={};completion_to_native={};completion_to_generated={};
@@ -720,6 +728,37 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         return result;
     }
 
+    // Called only by the DX12 generation thread, after both immutable eye
+    // outputs AND their worker fence have been submitted. No CPU GPU wait.
+    void announce_generated_phase(const std::shared_ptr<Native>& previous,const std::shared_ptr<Native>& job,
+                                  Pair& pair,std::shared_ptr<FrameCompletion> completion) {
+        std::lock_guard lock(mx);
+        if(stopping||degraded||job->epoch!=epoch||!previous||pair.direct_xr||(pair.progress&&pair.progress->failed))return;
+        const bool first=!pair.progress;
+        if(first){pair.progress=std::make_shared<Pair::Progress>();inflight_progress=pair.progress;}
+        const unsigned index=pair.generated_index;
+        auto& phase=pair.progress->phases[index];phase.images=pair.generated;
+        phase.completion=std::move(completion);phase.submitted_at=pair.submitted_at;
+        if(first){
+            Pair published=pair;published.generated_index=0;published.interpolated=true;
+            published.native_id=previous->id;published.native=previous->color;
+            published.native_color_ready=previous->color_ready;published.native_final_ready=previous->final_color_ready;
+            published.native_captured=previous->captured_at;published.native_views=previous->views;
+            published.generated_views=midpoint(previous->views,job->views,published.fraction());
+            ready.push_back(std::move(published));while(ready.size()>max_pending())ready.pop_front();
+            if(active_release_point==3u||active_release_point==6u||active_release_point==7u)awaiting_generated_submission=job->id;
+            if(!fg_active)transition_until=ticks+8;
+        }
+        changed.notify_all();
+    }
+    bool phase_ready(const Pair& pair,unsigned index) const {
+        // Hold mx. Non-streaming backends retain their completed-batch path.
+        if(!pair.progress)return true;
+        if(pair.progress->failed||index>=pair.generated_count)return false;
+        const auto& p=pair.progress->phases[index];
+        return p.images[0]&&p.images[1]&&p.completion&&p.completion->ready();
+    }
+
     void generation_loop() noexcept {
         SetThreadDescription(GetCurrentThread(),L"Cheeky FG completion");
         std::shared_ptr<Native> previous;bool reset_history=true;
@@ -727,7 +766,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         try {for(;;) {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
-             job=pending.front();pending.pop_front();inflight_id=job->id;
+             job=pending.front();pending.pop_front();inflight_id=job->id;inflight_generated_gate_released=false;inflight_progress.reset();
              inflight_release_point=job->guides_valid?job->policy.release_point:0u;inflight_prepared=false;
              if(job->guides_valid){
                  if(active_release_point!=job->policy.release_point)cadence_window={};
@@ -803,7 +842,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // The D3D11 shader samples the previous interval's depth.
                 backend->retire_guides(*job);
                 if(success&&!pair.direct_xr)for(unsigned eye=0;eye<2;++eye)last_fg_borders[eye]=pair.generated[eye]->fg_border;
-                if(success&&(active_release_point==3u||active_release_point==6u||active_release_point==7u)&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
+                if(pair.progress){pair.progress->complete=true;pair.progress->failed|=!success||job->epoch!=epoch||degraded;
+                    if(pair.progress->failed){std::erase_if(ready,[&](const auto& p){return p.progress==pair.progress;});finish_generated_gate(job->id,false);}}
+                if(success&&!pair.progress&&(active_release_point==3u||active_release_point==6u||active_release_point==7u)&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
                 const auto status=backend->generation_status();
                 CheekyFgPerformance gpu_performance;backend->snapshot(gpu_performance,extra_gpu,experiment_state);
@@ -836,7 +877,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                             static_cast<unsigned long long>(status.serial));
                         trace(publication);
                     }
-                    ready.push_back(std::move(pair));while(ready.size()>max_pending())ready.pop_front();
+                    if(!pair.progress){ready.push_back(std::move(pair));while(ready.size()>max_pending())ready.pop_front();}
                 }
                 if(success)completed_pair_id=job->id;
                 // Once real interpolation is available, briefly stop the
@@ -861,6 +902,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 else strcpy_s(diagnostic,status.diagnostic);changed.notify_all();}
             previous=std::move(job);
         }}catch(...) {std::lock_guard lock(mx);state=CheekyFgState::generation_failed;degraded=true;fg_active=pacing_active=false;
+            if(auto p=inflight_progress.lock())p->failed=true;
             discard_pending();ready.clear();awaiting_generated_submission=0;inflight_id=0;inflight_release_point=0;inflight_prepared=false;++epoch;strcpy_s(diagnostic,"FG background processing failed; using original native submissions");changed.notify_all();}
         backend->finish_generation();
     }
@@ -958,14 +1000,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(stopping||raw||degraded)return false;
         if(awaiting_generated_submission)return true;
         if(release_delay_until!=TimingClock::time_point{}&&TimingClock::now()<release_delay_until)return true;
-        if(inflight_id&&inflight_release_point!=5u&&(inflight_id>submitted_native_id||inflight_release_point==2u||inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u||
+        if(inflight_id&&inflight_release_point!=5u&&(inflight_id>submitted_native_id||inflight_release_point==2u||
+            (!inflight_generated_gate_released&&(inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
             (inflight_release_point==1u&&!inflight_prepared)))return true;
         return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
             return job->guides_valid&&job->policy.release_point!=5u&&(job->policy.release_point!=0||job->id>submitted_native_id);
         });
     }
     bool generated_submission_pending() const noexcept {
-        return awaiting_generated_submission||(inflight_id&&(inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
+        return awaiting_generated_submission||(inflight_id&&!inflight_generated_gate_released&&(inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
             std::any_of(pending.begin(),pending.end(),[](const auto& job){return job->guides_valid&&(job->policy.release_point==3u||job->policy.release_point==6u||job->policy.release_point==7u);});
     }
     void mark_credit_deferred() noexcept {
@@ -997,16 +1040,19 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // The next pair in order, not the newest: a backlog is shown, not skipped,
         // so every real frame keeps its generated frames.
         for(auto it=ready.begin();it!=ready.end();++it)
-            if(capture_completed(it->ready)&&double(it->native_id)>=position){selected=it;break;}
+            if(capture_completed(it->ready)&&(!it->progress||phase_ready(*it,0))&&double(it->native_id)>=position){selected=it;break;}
         return selected;
     }
     bool render(Pair& pair,const std::array<Image,2>& images,
                 const std::array<XrCompositionLayerProjectionView,2>& original_views,bool generated,XrTime time,
                 XrResult& result,bool& closed) {
-        // An interpolated pair is published only after the worker's single
-        // inference + immutable-copy fence completes. Native pairs retain the
-        // producer fence; both paths therefore refer to the original job here.
+        // Streaming DX12 phases each own a stereo immutable-output fence.
+        // Native pairs retain their original producer dependency.
         if(!capture_completed(pair.ready))return false;
+        if(generated&&pair.progress){std::lock_guard lock(mx);
+            if(!phase_ready(pair,pair.generated_index))return false;
+            pair.submitted_at=pair.progress->phases[pair.generated_index].submitted_at;
+            pair.completed_at=TimingClock::now();}
         burst_native=pair.native_id;burst_current=pair.current_id;burst_generated=generated;
         burst_presentation=ticks;
         burst.begin_submission();
@@ -1045,7 +1091,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool fresh_content(const Pair& active,bool have_active,bool generated_phase,double position) {
         // Hold mx. A pair whose native image was already displayed can still
         // contribute its interpolation; do not submit that native image twice.
-        if(have_active&&(generated_phase||double(active.native_id)>position))return true;
+        if(have_active&&active.progress&&active.progress->failed)return true; // Retire failed partial interval below.
+        if(have_active&&generated_phase)return phase_ready(active,active.generated_index);
+        if(have_active&&double(active.native_id)>position)return true;
         const auto selected=newest_ready_pair(position);
         if(selected!=ready.end()&&(double(selected->native_id)>position||
             (selected->interpolated&&double(selected->current_id)>position)))return true;
@@ -1064,8 +1112,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
-            const bool producer_pending=(!fg_active&&latest_native&&!capture_completed(latest_native->ready))||
-                std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !capture_completed(pair.ready);});
+            const bool producer_pending=(have_active&&generated_phase&&active.progress&&!phase_ready(active,active.generated_index))||
+                (!fg_active&&latest_native&&!capture_completed(latest_native->ready))||
+                std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !capture_completed(pair.ready)||(pair.progress&&!phase_ready(pair,0));});
             if(producer_pending)changed.wait_for(lock,std::chrono::milliseconds(1));
             else changed.wait(lock);
         }
@@ -1103,6 +1152,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             if(XR_FAILED(result)){runtime_failure("runtime xrBeginFrame",result);break;}
             const XrFrameEndInfo* raw_frame{};bool stop_now{};
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
+                if(have_active&&active.progress&&active.progress->failed){have_active=false;generated_phase=false;fg_active=false;active={};}
                 if(awaiting_generated_submission&&(last_position>=double(awaiting_generated_submission)||frame.shouldRender!=XR_TRUE))
                     finish_generated_gate(awaiting_generated_submission,false);
                 if(frame.shouldRender!=XR_TRUE&&direct_request&&!direct_request->decided){
@@ -1151,7 +1201,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 wake_producer();
             }else if(have_active&&!stop_now&&frame.shouldRender==XR_TRUE) {
                 is_generated=generated_phase&&active.interpolated;
-                const auto& images=is_generated?(active.generated_index?active.extra_generated[active.generated_index-1]:active.generated):active.native;
+                auto images=is_generated?(active.generated_index?active.extra_generated[active.generated_index-1]:active.generated):active.native;
+                if(is_generated&&active.progress){std::lock_guard lock(mx);images=active.progress->phases[active.generated_index].images;}
                 const auto views=is_generated?midpoint(active.native_views,active.current_views,active.fraction()):active.native_views;
                 stale=!is_generated&&double(active.native_id)==last_position;
                 // Snapshot identity BEFORE the generated submission advances

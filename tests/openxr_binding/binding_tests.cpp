@@ -632,6 +632,12 @@ void fg_toggle_test() {
         std::abs(performance.xr_period_ms-.0001)<1e-9,"FG performance must preserve raw headset period before any cadence scaling");
     performance.abi=999;
     check(!CheekyFG_GetPerformance(&performance),"Reject mismatched FG performance ABI");
+    CheekyFgBatchTimingsV1 batch_timing;
+    check(CheekyFG_GetBatchTimingsV1(&batch_timing)&&!batch_timing.valid&&batch_timing.samples==0,
+        "Optional batch timing export has no fabricated samples before generation");
+    batch_timing.abi=999;check(!CheekyFG_GetBatchTimingsV1(&batch_timing),"Batch timing validates ABI");
+    batch_timing={};--batch_timing.size;
+    check(!CheekyFG_GetBatchTimingsV1(&batch_timing)&&!CheekyFG_GetBatchTimingsV1(nullptr),"Batch timing validates size and pointer");
     CheekyFgCadence cadence;
     check(CheekyFG_GetCadenceV1(&cadence)&&cadence.supported,"Optional measured-cadence export");
     cadence.abi=999;check(!CheekyFG_GetCadenceV1(&cadence),"Reject mismatched cadence ABI");

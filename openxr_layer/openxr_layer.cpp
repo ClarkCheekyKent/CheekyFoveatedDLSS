@@ -4041,6 +4041,14 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPerformance(CheekyFgPe
     }
     return true;
 }
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetBatchTimingsV1(CheekyFgBatchTimingsV1* out) noexcept {
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    *out=CheekyFgBatchTimingsV1{};
+    std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->batch_timing();return true;}
+    return true;
+}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCadenceV1(CheekyFgCadence* out) noexcept {
     if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
     *out=CheekyFgCadence{};std::lock_guard lock(state_mutex);

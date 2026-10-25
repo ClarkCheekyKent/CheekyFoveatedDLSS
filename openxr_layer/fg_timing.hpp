@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include "../shared/cheeky_gpu_span.hpp"
+#include "../shared/cheeky_fg_bridge.hpp"
 
 namespace cheeky::fg {
 // A bounded arithmetic mean, with independent windows for GPU samples and
@@ -89,12 +91,15 @@ struct GpuTimings {
     bool record_preparation{},preparation_valid{};
     unsigned foveated_eyes{};
     bool valid{};
-    void reset() noexcept {
-        heap.Reset();readback.Reset();frequency=samples=0;
+    void clear_averages() noexcept {
+        samples=0;
         preparation={};center={};periphery={};total={};publication={};eye_preparation={};
-        eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};foveated_eyes=0;valid=false;
+        eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};valid=false;
         preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
-        preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};first_eye=0;
+        preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};
+    }
+    void reset() noexcept {
+        heap.Reset();readback.Reset();frequency=0;clear_averages();foveated_eyes=first_eye=0;
         record_preparation=preparation_valid=false;
     }
     bool initialize(ID3D12Device* device,ID3D12CommandQueue* queue) noexcept {
@@ -113,6 +118,30 @@ struct GpuTimings {
         return true;
     }
     bool supported() const noexcept {return heap&&readback&&frequency;}
+    // Aggregate completed phase samples without sharing their query storage.
+    void append_latest(const GpuTimings& p) noexcept {
+        if(!p.valid)return;
+        if(samples&&foveated_eyes!=p.foveated_eyes)clear_averages();
+        preparation.add(p.preparation.last);center.add(p.center.last);periphery.add(p.periphery.last);
+        total.add(p.total.last);publication.add(p.publication.last);
+        for(unsigned eye=0;eye<2;++eye){
+            eye_preparation[eye].add(p.eye_preparation[eye].last);eye_center[eye].add(p.eye_center[eye].last);
+            center_by_position[eye].add(p.center_by_position[eye].last);
+            for(unsigned part=0;part<3;++part){ngx_parts[eye][part].add(p.ngx_parts[eye][part].last);ngx_by_position[eye][part].add(p.ngx_by_position[eye][part].last);}
+            eye_center_by_first[p.first_eye][eye].add(p.eye_center_by_first[p.first_eye][eye].last);
+            eye_preparation_by_first[p.first_eye][eye].add(p.eye_preparation_by_first[p.first_eye][eye].last);
+        }
+        preparation_by_first[p.first_eye].add(p.preparation_by_first[p.first_eye].last);++order_samples[p.first_eye];
+        preparation_valid=p.preparation_valid;
+        if(p.preparation_valid){
+            for(unsigned pass=0;pass<4;++pass)for(unsigned part=0;part<3;++part)
+                preparation_parts[pass][part].add(p.preparation_parts[pass][part].last);
+            sampled_preparation.add(p.sampled_preparation.last);preparation_gaps.add(p.preparation_gaps.last);++preparation_samples;
+            for(unsigned eye=0;eye<2;++eye)center_dispatch_by_first[p.first_eye][eye].add(p.center_dispatch_by_first[p.first_eye][eye].last);
+            ++order_detail_samples[p.first_eye];
+        }
+        foveated_eyes=p.foveated_eyes;first_eye=p.first_eye;valid=true;++samples;
+    }
     void stamp(ID3D12GraphicsCommandList* list,unsigned index) noexcept {
         if(supported())list->EndQuery(heap.Get(),D3D12_QUERY_TYPE_TIMESTAMP,index);
     }
@@ -147,12 +176,7 @@ struct GpuTimings {
         const double whole=ms(0),prep=ms(2)+ms(8),ngx=ms(4)+ms(10),edge=ms(6)+ms(12);
         // Reject incomplete/unordered samples instead of showing fabricated 0ms.
         if(!std::isfinite(whole)||whole<=0||prep+ngx+edge>whole+0.001)return false;
-        if(samples&&foveated_eyes!=focused_eyes) {
-            preparation={};center={};periphery={};total={};publication={};eye_preparation={};
-            eye_center={};center_by_position={};eye_center_by_first={};ngx_parts=ngx_by_position={};samples=0;
-            preparation_parts={};sampled_preparation={};preparation_gaps={};preparation_samples=0;
-            preparation_by_first={};eye_preparation_by_first={};center_dispatch_by_first={};order_samples=order_detail_samples={};
-        }
+        if(samples&&foveated_eyes!=focused_eyes)clear_averages();
         // The subregions must remain ordered and bounded by the legacy NGX
         // interval; discard a malformed window instead of logging bad timing.
         std::array<std::array<double,3>,2> ngx_sub{};
@@ -206,6 +230,34 @@ struct GpuTimings {
             }
         }
         foveated_eyes=focused_eyes;++samples;valid=true;return true;
+    }
+};
+
+struct BatchGpuTimings {
+    cheeky::gpu::Span span;
+    TimingAverage batch;
+    std::array<TimingAverage,3> phases;
+    unsigned count{},optical_regions{};
+    std::uint64_t samples{};
+    bool valid{};
+    void reset() noexcept {span={};batch={};phases={};count=optical_regions=0;samples=0;valid=false;}
+    void begin(ID3D12Device* device,ID3D12GraphicsCommandList* commands,unsigned n,unsigned regions) {
+        if(count!=n||optical_regions!=regions){batch={};phases={};samples=0;}
+        count=n;optical_regions=regions;valid=false;span.begin(device,commands);
+    }
+    void end(ID3D12GraphicsCommandList* commands) {span.end(commands);}
+    void collect(std::uint64_t frequency,const std::array<GpuTimings,3>& timing) {
+        double ms{};valid=false;
+        if(!span.collect(frequency,ms)||!count||count>3)return;
+        for(unsigned i=0;i<count;++i)if(!timing[i].valid)return;
+        batch.add(ms);for(unsigned i=0;i<count;++i)phases[i].add(timing[i].total.last+timing[i].publication.last);
+        ++samples;valid=true;
+    }
+    CheekyFgBatchTimingsV1 snapshot() const noexcept {
+        CheekyFgBatchTimingsV1 out;out.supported=1;out.valid=valid;out.generated_count=count;
+        out.optical_regions=optical_regions;out.samples=samples;out.batch_ms=batch.mean();out.batch_last_ms=batch.last;
+        for(unsigned i=0;i<count&&i<3;++i){out.phase_ms[i]=phases[i].mean();out.phase_last_ms[i]=phases[i].last;}
+        return out;
     }
 };
 }

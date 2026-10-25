@@ -241,7 +241,7 @@ struct Session12 : Error {
         auto* h=heap.Get();commands->SetDescriptorHeaps(1,&h);commands->SetComputeRootSignature(root.Get());commands->SetPipelineState(preparing?prepare_shader.Get():interpolate_shader.Get());auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=base*stride;commands->SetComputeRootDescriptorTable(0,gpu);commands->SetComputeRoot32BitConstants(1,sizeof(c)/4,&c,0);
     }
     bool prepare(ID3D12Device* dev,ID3D12CommandQueue* q,ID3D12Resource* old,ID3D12Resource* now,unsigned quality,OpticalConstants c,bool reset_history,
-        D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format){
+        D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format,bool defer_completion=false){
         // Only this session's previous submission must retire before its
         // allocator is reused. The flow engine waits on the queue-side fence
         // below, which follows every earlier render that sampled our vectors,
@@ -260,9 +260,12 @@ struct Session12 : Error {
         in.disableTemporalHints=(!history||reset_history||memcmp(crop,c.flow_rect,sizeof(crop)))?NV_OF_TRUE:NV_OF_FALSE;
         NV_OF_EXECUTE_OUTPUT_PARAMS_D3D12 out{};out.outputBuffer=buffers[2];out.bwdOutputBuffer=buffers[3];out.outputCostBuffer=buffers[4];out.bwdOutputCostBuffer=buffers[5];out.fencePoint=&done;
         auto status=api.nvOFExecuteD3D12(handle,&in,&out);if(status){--serial;return fail("flow execution",status);}
-        if(FAILED(queue->Wait(fence.Get(),done.value)))return fail("optical flow dependency");
+        if(!defer_completion&&!consume())return false;
         std::copy_n(c.flow_rect,4,crop);history=true;strcpy_s(diagnostic,"NVIDIA Optical Flow: generating");return true;
     }
+    // GPU-side dependency only. The caller first submits earlier independent
+    // work, then consumes this result immediately before recording its reader.
+    bool consume(){return SUCCEEDED(queue->Wait(fence.Get(),serial))||fail("optical flow dependency");}
     // depth (R32_FLOAT, COMMON state) is read when c.flags[2] enables it.
     bool render(ID3D12GraphicsCommandList* commands,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* depth,OpticalConstants c,float fraction,DXGI_FORMAT format,
         D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ComPtr<ID3D12Resource>& output){

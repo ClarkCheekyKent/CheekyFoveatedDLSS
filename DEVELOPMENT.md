@@ -413,3 +413,31 @@ presents them as an ordinary stereo frame. Guides use the same periphery pair
 (pairing at xrEndFrame). The composed eye rects are published as the
 submitted views. D3D12 quad has no automatic role proof yet, so it uses the
 default evaluation order unless roles are assigned manually.
+
+## DX12 generated-frame scheduling and timing
+
+The buffered shader/optical path submits luma preparation for the independent
+eye/region sessions before waiting for flow completion. It splits interpolation
+lists at the consuming region, submitting the preceding work before inserting
+that region's GPU fence wait. Optical flow is prepared once per real-frame pair
+and reused by all generated phases. NGX and the two-list preparation-release
+mode retain their existing submission contract.
+
+Each submitted generated stereo frame has its own immutable eye images and
+completion-fence value. The presenter can upload G1 while G2/G3 are still being
+generated, in interpolation order and only after both eyes are complete. Epoch
+changes and failures cancel partial intervals and release pending game gates.
+
+The optional `CheekyFG_GetBatchTimingsV1` export adds a whole-pair GPU span and
+separate G1/G2/G3 scopes without changing the existing performance ABI. The UEVR
+HUD shows these as whole batch and generated stereo frame rows. Phase 1 includes
+shared optical preparation and flow waits; every phase includes composition and
+output publication. The batch includes gaps between phase submissions. Capture,
+OpenXR upload, runtime work and display pacing are outside these spans. Queries
+are collected at the existing final fence wait, without another profiling wait.
+
+Focused correctness checks: `CheekyOpenXRBindingTests --fg-hardening` (phase
+fences, stereo leases, cancellation, game gates and independent timing storage),
+`--fg-optical` (real optical-flow image correctness), the ordinary binding suite,
+`CheekyUEVRTests`, and `python tests/uevr_menu_tests.py`. These are not performance
+benchmarks; headset latency still needs validation in a running game.

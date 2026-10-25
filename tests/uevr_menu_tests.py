@@ -360,7 +360,7 @@ def run(engine):
     draw()
     count = len(g.sent)
     for text in ("DLSS-FG / shader center", "Periphery + output assembly", "2.750 / 2.500", "0.400 / 0.350",
-                 "FG GPU total", "280 x 232", "256 x 256", "512 x 512"):
+                 "FG GPU total (per generated frame)", "280 x 232", "256 x 256", "512 x 512"):
         assert text in list(g.drawn.values()), "Missing FG timing: " + text
     for text in ("4.200 ms", "18.200 ms", "Headset frame period"):
         assert text not in list(g.drawn.values()), "Standalone does not show CPU wait rows: " + text
@@ -377,12 +377,26 @@ def run(engine):
         "upload_ms":.4,"upload_last_ms":.3}
     receive(state)
     draw()
-    for label in ("  Generation subtotal","Guide capture (per real frame)","Color capture + guide handoff (per real frame)",
+    for label in ("  Generation subtotal (per generated frame)","Guide capture (per real frame)","Color capture + guide handoff (per real frame)",
                   "  Capture subtotal","1.500 / 1.300","Generated output copy (per generated frame)","OpenXR uploads (per presentation)",
                   "  Presentation subtotal","0.700 / 0.500","Measured GPU stage sum","6.100 / 5.300","1.300 / 1.200"):
         assert label in list(g.drawn.values()), "Missing separately measured GPU stage: " + label
-    assert "FG GPU total" not in list(g.drawn.values()), "Do not label a partial processing interval as complete FG overhead"
+    assert "FG GPU total (per generated frame)" not in list(g.drawn.values()), "Do not label a partial processing interval as complete FG overhead"
     assert len(g.sent) == count, "Reading additional GPU stages must not change settings"
+    state["fg"]["batch_timing"] = {"supported": True, "valid": True, "generated_count": 3,
+        "optical_regions": 4, "batch_ms": 7.2, "batch_last_ms": 7.0,
+        "phases": [{"index": 1, "ms": 5.0, "last_ms": 4.8}, {"index": 2, "ms": 1.0, "last_ms": 1.0},
+                   {"index": 3, "ms": 1.0, "last_ms": 1.0}]}
+    receive(state)
+    draw()
+    for label in ("Whole batch incl. output copies (per real frame)", "Generated stereo frame 1 (includes optical flow)",
+                  "Generated stereo frame 2", "Generated stereo frame 3", "7.200 / 7.000", "5.000 / 4.800"):
+        assert label in list(g.drawn.values()), "Missing distinct batch/phase scope: " + label
+    assert len(g.sent) == count, "Reading batch timings must not change settings"
+    state["fg"]["batch_timing"]["valid"] = False
+    receive(state)
+    draw()
+    assert "Generated stereo frame 1 (includes optical flow)" not in list(g.drawn.values()), "Hide invalid batch timings"
     performance["asynchronous_presenter"] = True
     performance["producer_cpu_ms"] = .25
     performance["pacing_wait_ms"] = 12

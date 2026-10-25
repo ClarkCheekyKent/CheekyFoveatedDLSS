@@ -5,6 +5,7 @@ namespace cheeky::foveated_dlss {
 CheekyFgStatus fg_status() noexcept;
 CheekyFgDiagnostic fg_diagnostic() noexcept;
 bool fg_performance(CheekyFgPerformance&) noexcept;
+bool fg_batch_timings(CheekyFgBatchTimingsV1&) noexcept;
 bool fg_cadence(CheekyFgCadence&) noexcept;
 bool fg_auto_status(CheekyFgAutoStatus&) noexcept;
 bool fg_pacing_timeline(CheekyFgPacingTimeline&) noexcept;

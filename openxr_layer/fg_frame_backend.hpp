@@ -27,6 +27,10 @@ struct FramePolicy {
 // Backend-owned per-frame guide state (textures, leases, GPU dependencies).
 // Pacing only holds and drops it; each backend defines its own subtype.
 struct FrameGuides {virtual ~FrameGuides()=default;};
+struct FrameCompletion {
+    virtual ~FrameCompletion()=default;
+    virtual bool ready() const noexcept=0; // Poll only; never wait or call OpenXR.
+};
 
 enum class CaptureOutcome { captured, unavailable, busy };
 struct GenerationOutcome {

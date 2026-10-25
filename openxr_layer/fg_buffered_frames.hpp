@@ -31,6 +31,18 @@ struct BufferedNative {
     std::uint64_t render_frame{};
 };
 struct BufferedPair {
+    struct Phase {
+        std::array<Image,2> images;
+        std::shared_ptr<FrameCompletion> completion;
+        TimingClock::time_point submitted_at{};
+    };
+    struct Progress {
+        // Every access is protected by BufferedPresenter::mx. A published
+        // phase's images and fence are immutable and retain their own leases.
+        std::array<Phase,3> phases;
+        bool complete{},failed{};
+    };
+    std::shared_ptr<Progress> progress;
     // First output retains its existing name for the direct-output 2x path.
     std::array<std::array<Image,2>,2> extra_generated;
     unsigned generated_count{1},generated_index{};

@@ -134,6 +134,7 @@ std::string snapshot_locked(State& s) {
     s.memory.poll(GetTickCount64());
     sample_fg_memory(s,GetTickCount64());
     CheekyFgPerformance fg_time;const bool fg_time_supported=fg_performance(fg_time);
+    CheekyFgBatchTimingsV1 fg_batch;fg_batch_timings(fg_batch);
     CheekyFgCadence fg_rates;fg_cadence(fg_rates);
     CheekyFgAutoStatus fg_auto;fg_auto_status(fg_auto);
     CheekyFgPacingTimeline fg_pacing;fg_pacing_timeline(fg_pacing);
@@ -226,6 +227,13 @@ std::string snapshot_locked(State& s) {
         << ",\"peripheral_method\":" << fg_time.peripheral_method
         << ",\"source_depth_format\":" << fg_time.source_depth_format
         << ",\"source_motion_format\":" << fg_time.source_motion_format << "}"
+        << ",\"batch_timing\":{\"supported\":" << bool(fg_batch.supported) << ",\"valid\":" << bool(fg_batch.valid)
+        << ",\"samples\":" << fg_batch.samples << ",\"generated_count\":" << fg_batch.generated_count
+        << ",\"optical_regions\":" << fg_batch.optical_regions << ",\"batch_ms\":" << fg_batch.batch_ms
+        << ",\"batch_last_ms\":" << fg_batch.batch_last_ms << ",\"phases\":[";
+    for(unsigned i=0;i<fg_batch.generated_count&&i<3;++i){if(i)out << ',';
+        out << "{\"index\":" << i+1 << ",\"ms\":" << fg_batch.phase_ms[i] << ",\"last_ms\":" << fg_batch.phase_last_ms[i] << '}';}
+    out << "]}"
         << ",\"pacing_timeline\":{\"supported\":" << bool(fg_pacing.supported)
         << ",\"recent_generated\":" << bool(fg_pacing.recent_generated)
         << ",\"generated_last_tick\":" << fg_pacing.generated_last_tick

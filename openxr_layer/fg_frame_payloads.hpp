@@ -30,6 +30,13 @@ struct FrameGuides12 final : FrameGuides {
 };
 inline FrameGuides12* guides12(const BufferedNative& frame) noexcept {return dynamic_cast<FrameGuides12*>(frame.guides.get());}
 
+struct FrameCompletion12 final : FrameCompletion {
+    ComPtr<ID3D12Fence> fence;
+    std::uint64_t value{};
+    FrameCompletion12(ID3D12Fence* f,std::uint64_t v):fence(f),value(v){}
+    bool ready() const noexcept override {return fence&&fence->GetCompletedValue()>=value;}
+};
+
 // Native D3D11: per-eye snapshots from Backend11 (interpolation also samples
 // the previous interval's depth, so these outlive generation).
 struct FrameGuides11 final : FrameGuides {

@@ -211,13 +211,57 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         for(unsigned eye=0;eye<2;++eye){previous->color[eye]=current->color[eye]=std::make_shared<TransportImage>();
             current->color[eye]->texture=color;current->color[eye]->state=D3D12_RESOURCE_STATE_GENERIC_READ;}
         auto payload=std::make_shared<FrameGuides12>();payload->retain(guides);current->guides=payload;current->guides_valid=true;
-        BufferedPair pair;bool reset=true;std::uint64_t logged{};std::shared_ptr<BufferedDirectRequest> direct;
+        BufferedPair pair;pair.native_id=pair.current_id=current->id;pair.native=pair.current=current->color;
+        pair.native_views=pair.current_views=current->views;
+        bool reset=true;std::uint64_t logged{};std::shared_ptr<BufferedDirectRequest> direct;
         const auto generated=presenter.backend->generate(previous,current,pair,reset,logged,direct);
         check(generated.success&&generated.attempted&&pair.generated_count==multiplier-1,"D3D12 backend generates the complete indexed batch");
         std::unordered_set<ID3D12Resource*> outputs;
         for(unsigned index=0;index<pair.generated_count;++index)for(const auto& image:index?pair.extra_generated[index-1]:pair.generated){
             check(image&&image->state==D3D12_RESOURCE_STATE_GENERIC_READ&&outputs.insert(image->texture.Get()).second,
                 "Every D3D12 output eye has its own retained publication image");}
+        {
+            std::lock_guard lock(presenter.mx);
+            check(pair.progress&&presenter.ready.size()==1&&presenter.ready.front().progress==pair.progress,
+                "DX12 publishes one shared interval while submitting its individual stereo phases");
+            auto active=presenter.ready.front();
+            check(active.native_id==previous->id&&active.current_id==current->id&&active.native==previous->color,
+                "Early publication retains the previous native frame and current interval identity");
+            for(unsigned index=0;index<pair.generated_count;++index){
+                const auto& images=index?pair.extra_generated[index-1]:pair.generated;
+                check(pair.progress->phases[index].images==images&&presenter.phase_ready(active,index),
+                    "Each completed phase publishes both retained eyes with its own GPU fence");
+            }
+            struct Pending final : FrameCompletion {bool done{};bool ready() const noexcept override{return done;}};
+            auto later=std::make_shared<Pending>();pair.progress->phases[1].completion=later;
+            check(presenter.phase_ready(active,0)&&!presenter.phase_ready(active,1)&&
+                presenter.fresh_content(active,true,true,1.),
+                "G1 is presentable while G2 is pending, without waiting for the complete batch");
+            active.generated_index=1;
+            check(!presenter.fresh_content(active,true,true,1.25),"Pending G2 cannot be skipped for a later completed phase");
+            later->done=true;auto right=pair.progress->phases[1].images[1];pair.progress->phases[1].images[1].reset();
+            check(!presenter.phase_ready(active,1),"A generated phase requires both stereo eyes");
+            pair.progress->phases[1].images[1]=right;
+            check(presenter.fresh_content(active,true,true,1.25),"G2 becomes presentable at its own completion");
+            presenter.inflight_id=current->id;presenter.submitted_native_id=current->id;
+            presenter.inflight_release_point=6;presenter.awaiting_generated_submission=current->id;
+            check(presenter.release_gate_active(),"First-generated submission policy initially holds the game");
+            presenter.finish_generated_gate(current->id,true);
+            check(!presenter.release_gate_active()&&!presenter.generated_submission_pending()&&presenter.inflight_id,
+                "First generated submission releases the game while later phases remain in flight");
+            presenter.discard_pending();
+            check(!presenter.phase_ready(active,1)&&presenter.fresh_content(active,true,true,1.25),
+                "Epoch cancellation retires a partial interval instead of stranding its presenter wait");
+        }
+        const auto batch=presenter.worker.batch_timings.snapshot();double sum{};
+        for(unsigned index=0;index<multiplier-1;++index){
+            check(batch.phase_last_ms[index]>0&&presenter.worker.phase_timings[index].samples==1,
+                "Every generated stereo phase retains its own timing queries through batch retirement");
+            sum+=batch.phase_last_ms[index];
+        }
+        check(batch.valid&&batch.generated_count==multiplier-1&&batch.samples==1&&batch.batch_last_ms+.01>=sum&&
+            presenter.worker.gpu_timings.samples==multiplier-1,
+            "Whole-batch GPU span contains all independent phase scopes and the legacy metric averages every phase");
         presenter.reset();
     }
     {

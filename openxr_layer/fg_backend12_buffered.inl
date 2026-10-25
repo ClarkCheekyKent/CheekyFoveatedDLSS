@@ -519,11 +519,15 @@ struct BufferedBackend12 final : FrameBackend {
             pair.generated_index=index;
             if(index)pair.generated.swap(pair.extra_generated[index-1]);
             const auto result=generate_one(previous,job,pair,reset_history,logged_samples,direct_job);
+            const auto* payload=guides12(*job);
+            if(result.success&&result.attempted&&!pair.direct_xr&&payload&&!cheeky_fg_needs_ngx(payload->pair)&&job->policy.release_point!=1u)
+                owner.announce_generated_phase(previous,job,pair,std::make_shared<FrameCompletion12>(owner.worker.fence.Get(),owner.worker.serial));
             if(index)pair.generated.swap(pair.extra_generated[index-1]);
             total.success&=result.success;total.attempted&=result.attempted;total.history_reset|=result.history_reset;
             if(!result.attempted)break;
         }
         pair.generated_index=0;
+        if(!total.success)owner.worker.wait_idle();
         return total;
     }
     GenerationOutcome generate_one(const std::shared_ptr<BufferedNative>& previous,
@@ -582,7 +586,10 @@ struct BufferedBackend12 final : FrameBackend {
                     owner.generation_queue->Wait(job_guides->sync_fence.Get(),job_guides->sync_value) : S_OK;
                 if(FAILED(guides_ready)){owner.worker.failed=true;owner.worker.report("FG guide cross-queue GPU wait",unsigned(guides_ready));
                     throw std::runtime_error("FG guide cross-queue GPU wait failed");}
-                const auto ready_result=owner.worker.latency.enqueue_wait(owner.device.Get(),owner.generation_queue.Get(),owner.producer.fence.Get(),job->ready,job->latency_diagnostics);
+                const bool continuing=pair.generated_index>0&&!cheeky_fg_needs_ngx(job_guides->pair)&&job->policy.release_point!=1u;
+                // The first phase already submitted this capture dependency.
+                // Preserve its calibrated latency bracket across the batch.
+                const auto ready_result=continuing?S_OK:owner.worker.latency.enqueue_wait(owner.device.Get(),owner.generation_queue.Get(),owner.producer.fence.Get(),job->ready,job->latency_diagnostics);
                 if(FAILED(ready_result)){owner.worker.failed=true;owner.worker.report("FG capture dependency queue wait",unsigned(ready_result));}
                 if(FAILED(ready_result))throw std::runtime_error("FG capture dependency queue wait failed");
                 auto guides=job_guides->pair;guides.producer_queue=owner.generation_queue.Get();
@@ -714,7 +721,7 @@ struct BufferedBackend12 final : FrameBackend {
     }
     void reset_statistics(bool reset_gpu) override {
         auto& worker=owner.worker;worker.latency.clear_statistics();
-        if(reset_gpu&&worker.device&&worker.queue)worker.gpu_timings.initialize(worker.device.Get(),worker.queue.Get());
+        if(reset_gpu&&worker.device&&worker.queue){worker.wait_idle();worker.initialize_timings();}
     }
     GenerationStatus generation_status() const override {
         const auto& worker=owner.worker;return {worker.failed,worker.capability_ready,worker.serial,worker.diagnostic};
@@ -722,6 +729,7 @@ struct BufferedBackend12 final : FrameBackend {
     void snapshot(CheekyFgPerformance& performance,CheekyFgOverhead& overhead,
         CheekyFgExperimentDiagnostics& experiments) const override {
         performance=owner.Presenter::performance();owner.worker.latency.snapshot(experiments);
+        owner.batch_telemetry=owner.worker.batch_timings.snapshot();
         performance.inference_color_format=unsigned(owner.worker.focus.color_format);
         performance.shared_gpu_queue=owner.generation_queue.Get()==owner.queue.Get()?1u:0u;
         if(owner.worker.gpu_timings.valid){
