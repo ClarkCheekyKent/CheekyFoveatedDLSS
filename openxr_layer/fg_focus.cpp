@@ -107,7 +107,7 @@ struct Constants {float rect[4]{},offset[4]{},dimensions[4]{},motion[4]{},option
 void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,unsigned eye,unsigned operation,
  ID3D12PipelineState* state,const std::array<ID3D12Resource*,5>& in,const std::array<DXGI_FORMAT,5>& formats,
  const std::array<ID3D12Resource*,3>& out,const Constants& constants,ID3D12Resource* center=nullptr){
- const unsigned base=(eye*7+operation)*9;auto cpu=p.descriptors->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=base*p.stride;
+ const unsigned base=p.descriptor_set*126+(eye*7+operation)*9;auto cpu=p.descriptors->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=base*p.stride;
  for(unsigned i=0;i<5;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=formats[i];v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
   v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;dev->CreateShaderResourceView(in[i],&v,cpu);cpu.ptr+=p.stride;}
  D3D12_SHADER_RESOURCE_VIEW_DESC cv{};cv.Format=center?center->GetDesc().Format:p.color_format;cv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -147,7 +147,7 @@ bool FocusPipeline::initialize(ID3D12Device* dev){
    if(errors)std::fprintf(stderr,"FG shader %s: %s\n",entry,static_cast<const char*>(errors->GetBufferPointer()));return false;}
   D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};return SUCCEEDED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(&target)));};
  if(!compile(interpolation_shader,center_shader,"CenterMain")||!compile(prepare_shader,prepare)||!compile(interpolation_shader,peripheral)||!compile(compose_shader,compose)||!compile(pack_shader,pack)||!compile(recenter_shader,recenter))return false;
- D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=126;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+ D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=3*126;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
  if(FAILED(dev->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&descriptors))))return false;
  stride=dev->GetDescriptorHandleIncrementSize(heap.Type);return true;
 }
@@ -286,6 +286,7 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
   // Prepared depth covers this pass's output region in eye coordinates.
   c.flags[2]=depth?1.f:0.f;c.flags[3]=float(g.depth_inverted);std::copy_n(c.output_rect,4,c.depth_rect);
   if(camera.valid)optical::pose_mapping(c,camera.previous_pose,camera.previous_fov,camera.pose,camera.view_fov,interpolation_fraction);
+  optical[eye][pass].descriptor_set=descriptor_set;
   if(!optical[eye][pass].render(list,previous,current,depth,c,interpolation_fraction,color_format,color_state,
        previous->GetDesc().Format,current->GetDesc().Format,scratch))return false;
   // Optical periphery uses the ordinary composition/packing path. The worker

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 namespace optical_fixture {
 using Microsoft::WRL::ComPtr;
 constexpr unsigned edge=256;
@@ -159,4 +159,33 @@ inline void fg_optical_validation(){
         }
     }
     std::cout<<"PASS NVIDIA Optical Flow: D3D11/D3D12, color-only and DLSS-depth variants, all presets and vector grids, independent regional scales, head rotation, all 2x/3x/4x phases\n";
+}
+// CPU cost of the D3D12 optical flow worker at a VR eye size, per phase.
+inline void fg_optical_profile(){
+    using namespace cheeky::fg;using namespace optical_fixture;
+    ComPtr<ID3D11Device> device11;ComPtr<ID3D11DeviceContext> context;
+    check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device11,nullptr,&context)),"Optical hardware device");
+    ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;check(SUCCEEDED(device11.As(&dxgi))&&SUCCEEDED(dxgi->GetAdapter(&adapter)),"Optical adapter");
+    constexpr unsigned size=2816;fg_parity::D3D12 gpu(adapter.Get());
+    std::vector<std::uint32_t> a(size*size),b(size*size);
+    for(unsigned y=0;y<size;++y)for(unsigned x=0;x<size;++x){a[y*size+x]=scene(float(x),float(y));b[y*size+x]=scene(float(x)-20,float(y));}
+    auto old12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,a.data(),4,size),now12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,b.data(),4,size);gpu.execute();
+    const unsigned settings[][2]{{2,50},{1,50},{0,50},{2,100},{1,100}};
+    for(const auto& setting:settings){
+    Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),size,size,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
+    auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));for(auto& v:views)v.subImage.imageRect.extent={int(size),int(size)};
+    CheekyFgPair pair;pair.producer_queue=gpu.queue.Get();
+    for(auto& g:pair.eyes){g.width=g.height=size;g.center_method=g.peripheral_method=4;g.focus_width=.55f;g.focus_height=.45f;
+        g.optical.center_preset=setting[0];g.optical.peripheral_preset=2;g.optical.center_percent=setting[1];g.optical.peripheral_percent=25;g.peripheral_percent=25;g.configuration=1;}
+    std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye],false);
+    std::array<ID3D12Resource*,2> previous{old12.Get(),old12.Get()},current{now12.Get(),now12.Get()},output;
+    double phase_ms[3]{};constexpr unsigned frames=60;
+    for(unsigned frame=0;frame<frames+5;++frame)for(unsigned phase=1;phase<=2;++phase){
+        const auto start=std::chrono::steady_clock::now();
+        check(worker.generate(pair,current,previous,cameras,output,nullptr,nullptr,nullptr,nullptr,2,phase),worker.diagnostic);
+        if(frame>=5)phase_ms[phase]+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        if(phase==2)std::swap(previous,current);
+    }
+    std::cout<<"D3D12 optical worker CPU ms per generate (3x, 2816 eye, periphery 25% fast) center preset="<<setting[0]<<" "<<setting[1]<<"%: phase1="<<phase_ms[1]/frames<<" phase2="<<phase_ms[2]/frames<<"\n";
+    }
 }

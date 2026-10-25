@@ -182,6 +182,7 @@ struct Session12 : Error {
     ComPtr<ID3D12DescriptorHeap> heap;unsigned stride{};
     std::array<ComPtr<ID3D12Resource>,6> textures;std::array<NvOFGPUBufferHandle,6> buffers{};
     unsigned width{},height{},preset{},grid{4};float crop[4]{};bool history{},initialized{};
+    unsigned descriptor_set{}; // Generated frame within the interval; renders may be in flight together.
     Session12()=default;Session12(const Session12&)=delete;Session12& operator=(const Session12&)=delete;
     ~Session12(){reset();}
     bool wait(){if(!fence||fence->GetCompletedValue()>=serial)return true;
@@ -228,7 +229,7 @@ struct Session12 : Error {
         D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=2;rs.pParameters=rp;rs.NumStaticSamplers=1;rs.pStaticSamplers=&s;
         ComPtr<ID3DBlob> blob,error;if(FAILED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error))||FAILED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))))return fail("root signature");
         for(unsigned i=0;i<2;++i){ComPtr<ID3DBlob> code;if(!compile(i?"Interpolate":"Prepare","cs_5_1",code))return fail("shader compilation");D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};if(FAILED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(i?&interpolate_shader:&prepare_shader))))return fail("compute pipeline");}
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=18;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=9*4;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))))return fail("descriptor heap");stride=dev->GetDescriptorHandleIncrementSize(hd.Type);initialized=true;return true;
     }
     // Each bind uses 9 descriptors: 7 SRVs, then 2 UAVs.
@@ -271,7 +272,7 @@ struct Session12 : Error {
         for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(commands,output.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(commands,depth,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        c.flags[0]=fraction;bind(commands,9,old,now,output.Get(),c,false,old_format,now_format,depth);commands->Dispatch((unsigned(c.sizes[2])+7)/8,(unsigned(c.sizes[3])+7)/8,1);
+        c.flags[0]=fraction;bind(commands,9*(1+descriptor_set),old,now,output.Get(),c,false,old_format,now_format,depth);commands->Dispatch((unsigned(c.sizes[2])+7)/8,(unsigned(c.sizes[3])+7)/8,1);
         barrier(commands,output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         barrier(commands,depth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);

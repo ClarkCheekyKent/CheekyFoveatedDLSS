@@ -27,6 +27,7 @@ struct FocusPipeline {
     ComPtr<ID3D12PipelineState> prepare,peripheral,center_shader,compose,pack,recenter;
     ComPtr<ID3D12DescriptorHeap> descriptors;
     unsigned stride{};
+    unsigned descriptor_set{}; // Generated frame within the interval (0-2); each has its own descriptors.
     FocusInput inputs[2][2]; // eye, center/full or periphery
     ComPtr<ID3D12Resource> peripheral_output[2],full[2],previous_depth[2];
     bool history[2]{};

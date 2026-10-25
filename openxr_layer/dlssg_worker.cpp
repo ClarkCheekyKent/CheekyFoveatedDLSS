@@ -70,7 +70,7 @@ void Worker::reset_features() noexcept {
 void Worker::reset() noexcept {
     std::lock_guard lock(ngx_mutex);wait_idle();reset_features();
     latency.reset();gpu_timings.reset();completion_wait={};submitted_at={};
-    if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();second_allocator.Reset();optical_allocator.Reset();list.Reset();second_list.Reset();optical_list.Reset();fence.Reset();
+    if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();second_allocator.Reset();optical_allocator.Reset();list.Reset();second_list.Reset();optical_list.Reset();for(auto& a:batch_allocators)a.Reset();for(auto& l:batch_lists)l.Reset();fence.Reset();
     allocate=nullptr;destroy=nullptr;create=nullptr;evaluate=nullptr;release=nullptr;
     configured=false;serial=prepared_serial=0;width=height=0;init=nullptr;capabilities=nullptr;
 }
@@ -185,8 +185,14 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     const float fraction=float(frame_index)/float(frame_count+1);
     const bool last_output=frame_index==frame_count;
+    // Shader and optical flow intervals submit each generated frame without a
+    // CPU round trip; the queue keeps them ordered. The last frame's wait
+    // retires the whole interval before the caller publishes any output.
+    // NGX keeps one evaluation in flight, as its multi-frame contract expects.
+    const bool batched=!cheeky_fg_needs_ngx(guides)&&guides.release_point!=1u;
+    const bool continuing=batched&&frame_index>1;
     if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||!cheeky_fg_center_valid(guides.eyes[0].center_method)||!cheeky_fg_center_valid(guides.eyes[1].center_method)||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
-    if(!wait_idle())return false;
+    if(!continuing&&!wait_idle())return false;
     ngx_burst.trace=trace;
     ngx_burst.start(guides.render_frame,guides.capture_token);
     if(configuration!=guides.eyes[0].configuration) {
@@ -204,7 +210,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         }
     }
     focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
-    focus.interpolation_fraction=fraction;
+    focus.interpolation_fraction=fraction;focus.descriptor_set=batched?frame_index-1:0;
     bool optical_timing_started=false;
     // NVOFA submits work outside this command list. Prepare once per native
     // pair, then reuse the same forward/backward fields at all 2x/3x/4x phases.
@@ -240,7 +246,14 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             }
         }
     }
-    if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
+    if(continuing&&!batch_allocators[frame_index-2]){
+        auto& a=batch_allocators[frame_index-2];auto& l=batch_lists[frame_index-2];
+        if(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&a)))||
+           FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,a.Get(),nullptr,IID_PPV_ARGS(&l)))||FAILED(l->Close())){a.Reset();l.Reset();return false;}
+    }
+    auto& phase_allocator=continuing?batch_allocators[frame_index-2]:allocator;
+    auto& phase_list=continuing?batch_lists[frame_index-2]:list;
+    if(FAILED(phase_allocator->Reset())||FAILED(phase_list->Reset(phase_allocator.Get(),nullptr)))return false;
     // Release point 1 records both eyes' preparation on list A and NGX and
     // composition on list B, with a GPU milestone between them.
     const bool two_lists=guides.release_point==1u;
@@ -267,7 +280,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     // The lambdas and timestamp recording follow the active command list.
     // A mode switch is safe because the previous job was fully retired above.
-    ID3D12GraphicsCommandList* commands=list.Get();
+    ID3D12GraphicsCommandList* commands=phase_list.Get();
     bool cut_to_second_list=false;
     if(!optical_timing_started){latency.begin(commands);gpu_timings.begin(commands);}
     bool good=true;unsigned focused{};
@@ -291,7 +304,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed()||(*copies)[0].final_xr||(*copies)[1].final_xr)){list->Close();if(two_lists)second_list->Close();return false;}
     // wait_idle above retired every earlier use of these private scratch images.
-    if(direct&&direct_periphery)for(unsigned eye=0;eye<2;++eye)
+    // Not while earlier frames of this interval may still sample them.
+    if(direct&&direct_periphery&&!continuing)for(unsigned eye=0;eye<2;++eye)
         if(((*copies)[eye].layout.packed()||(*copies)[eye].final_xr)&&guides.eyes[eye].peripheral_method<=2){
             focus.peripheral_output[eye].Reset();if((*copies)[eye].final_xr)focus.full[eye].Reset();}
     std::array<bool,2> moving_crop_reset{};
@@ -663,6 +677,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // presenter may release the next native render without waiting for FG to
     // finish, but must not let it overtake a still-unsubmitted FG job.
     if(on_submitted)on_submitted(submitted_context);
+    // Earlier frames of a batched interval are retired by the last frame's wait.
+    if(batched&&!last_output){direct_publication=direct;temporal_evaluation_completed=true;return true;}
     const auto wait_begin=TimingClock::now();
     if(two_lists) {
         if(!wait_fence(prepared_serial))return false;

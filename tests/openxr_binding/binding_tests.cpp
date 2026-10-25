@@ -1105,6 +1105,7 @@ int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
         if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-optical-profile") {fg_optical_profile();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto") {fg_auto_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto-live11") {
             using namespace shader11_fixture;

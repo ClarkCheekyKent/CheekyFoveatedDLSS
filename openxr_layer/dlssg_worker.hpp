@@ -35,6 +35,9 @@ struct Worker {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12CommandAllocator> allocator,second_allocator,optical_allocator;
     ComPtr<ID3D12GraphicsCommandList> list,second_list,optical_list;
+    // Lists for the 2nd/3rd generated frame of a batched (non-NGX) interval.
+    std::array<ComPtr<ID3D12CommandAllocator>,2> batch_allocators;
+    std::array<ComPtr<ID3D12GraphicsCommandList>,2> batch_lists;
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;
