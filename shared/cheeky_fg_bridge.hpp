@@ -223,6 +223,7 @@ struct CheekyFgPacingOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgPacingOptions)};
     std::uint32_t clock_mode{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
     std::uint32_t native11_release_point{3}; // Shared release setting: 0 FG submission ... 3 generated frame submission, 4 submission + 4 ms.
+    std::uint32_t extra_frame_slots{}; // 1: 4 banked credits and 5 capture slots (more VRAM). Absent in older layers.
 };
 using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
 // Independent export: D3D12 quad-view composition in xrEndFrame.

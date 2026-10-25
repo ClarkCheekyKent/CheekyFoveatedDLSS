@@ -592,12 +592,15 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetRateOptionsV2(CheekyFg
     out->multiplier=std::clamp(fg.multiplier,2u,4u);out->automatic=fg.automatic_multiplier;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(CheekyFgPacingOptions* out) noexcept {
-    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    // Layers built before extra_frame_slots pass the shorter structure.
+    if(!out||out->abi!=1||out->size<offsetof(CheekyFgPacingOptions,extra_frame_slots))return false;
     const auto& fg=cheeky::foveated_dlss::current_settings().fg;
     out->clock_mode=fg.pacing_clock<=2u?fg.pacing_clock:0u;
     // Native D3D11 follows the shared release setting (default: after the
     // generated frame is submitted), like the D3D12 path.
-    out->native11_release_point=fg.release_point<=5u?fg.release_point:3u;return true;
+    out->native11_release_point=fg.release_point<=5u?fg.release_point:3u;
+    if(out->size>=sizeof(*out))out->extra_frame_slots=fg.extra_frame_slots?1u:0u;
+    return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetNative11OptionsV1(CheekyFgNative11Options* out) noexcept {
     if(!out||out->abi!=1||out->size<sizeof(*out))return false;

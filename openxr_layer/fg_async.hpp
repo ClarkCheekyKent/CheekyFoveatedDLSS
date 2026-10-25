@@ -103,12 +103,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unordered_map<XrSwapchain,ColorReady> capture_ready;
     bool capture_overflow{};
     // Render credits the clock may bank, and capture slots for real frames in
-    // flight (pending, generating, history, presenting). More of both lets the
-    // game keep rendering while slower frame generation catches up.
-    static constexpr unsigned max_credits=4;
+    // flight (pending, generating, history, presenting). The opt-in extra slots
+    // let the game keep rendering while slower frame generation catches up, at
+    // the cost of two more full stereo color copies of VRAM.
+    std::atomic<bool> extra_frame_slots{};
+    unsigned max_credits() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?4u:2u;}
+    std::size_t slot_count() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?5u:3u;}
     // Captured real frames waiting for generation. Kept in order: interpolation
     // needs consecutive real frames, so a burst is worked off instead of skipped.
-    static constexpr std::size_t max_pending=3;
+    std::size_t max_pending() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?3u:2u;}
     std::array<std::shared_ptr<Native>,5> slots;
     void release_idle_slots() noexcept {
         // Hold mx. Only the slot itself owns these completed jobs; pending and
@@ -534,6 +537,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         }
         if(pacing_query&&pacing_query(&pacing)){
             const auto mode=std::min(pacing.clock_mode,2u);
+            const bool extra=pacing.extra_frame_slots!=0;
+            if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
             if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
                 mode==1u?"FG pacing clock=presented native rate":"FG pacing clock=independent display clock");
             const auto point=std::min(pacing.native11_release_point,5u);
@@ -647,7 +652,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         std::shared_ptr<Native> job;
         {
             std::lock_guard lock(mx);
-            for(auto& slot:slots) {
+            // Slots beyond the active count are released once idle, freeing their VRAM.
+            for(std::size_t i=slot_count();i<slots.size();++i)if(slots[i]&&slots[i].use_count()==1&&capture_completed(slots[i]->ready))slots[i].reset();
+            for(std::size_t i=0;i<slot_count();++i) {
+                auto& slot=slots[i];
                 if(!slot)slot=std::make_shared<Native>();
                 if(slot.use_count()==1&&capture_completed(slot->ready)){job=slot;break;}
             }
@@ -690,7 +698,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
                 latest_native=std::move(native);
                 if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),5u);
-                if(inference_slot){pending.push_back(job);while(pending.size()>max_pending){pending.front()->clear_guides();pending.pop_front();++skipped;}}
+                if(inference_slot){pending.push_back(job);while(pending.size()>max_pending()){pending.front()->clear_guides();pending.pop_front();++skipped;}}
                 ++frames;held_valid=true;changed.notify_all();
             }
         }
@@ -826,7 +834,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                             static_cast<unsigned long long>(status.serial));
                         trace(publication);
                     }
-                    ready.push_back(std::move(pair));while(ready.size()>max_pending)ready.pop_front();
+                    ready.push_back(std::move(pair));while(ready.size()>max_pending())ready.pop_front();
                 }
                 if(success)completed_pair_id=job->id;
                 // Once real interpolation is available, briefly stop the
@@ -869,7 +877,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // policy holds through both eyes' ordinary completion fence.
                 // Coalesce pacing ticks while either policy blocks production.
                 mark_credit_deferred();
-            }else credits=std::min(max_credits,credits+(ticks==1?2u:1u));
+            }else credits=std::min(max_credits(),credits+(ticks==1?2u:1u));
         }
         changed.notify_all();
     }
@@ -926,7 +934,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                             mark_credit_deferred();
                         }else if(credit_deferred)release_deferred_credit();
-                        else{++granted_credits;if(credits>=max_credits)++capped_credits;credits=std::min(max_credits,credits+1);}
+                        else{++granted_credits;if(credits>=max_credits())++capped_credits;credits=std::min(max_credits(),credits+1);}
                         changed.notify_all();
                     }
                     next+=period;if(next<=now)next=now+period;
@@ -965,7 +973,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void release_deferred_credit() noexcept {
         // Hold mx. Coalesce missed ticks rather than bursting queued renders.
         if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()&&!release_gate_active()) {
-            credits=std::min(max_credits,credits+1);credit_deferred=false;++released_deferred_credits;
+            credits=std::min(max_credits(),credits+1);credit_deferred=false;++released_deferred_credits;
             if(credit_deferred_since!=TimingClock::time_point{})credit_deferral.add(elapsed_ms(credit_deferred_since));
             credit_deferred_since={};changed.notify_all();
         }
