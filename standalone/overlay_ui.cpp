@@ -972,14 +972,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::Checkbox("Keep the GPU from falling behind (Never + Follow)", &s.limit_gpu_ahead);
         if (s.limit_gpu_ahead)
             ImGui::TextWrapped("With a Follow pacing clock and release Never: the game waits whenever its previous frame has not yet been captured on the GPU, so the GPU cannot fall a frame behind and add latency.");
-        if (s.limit_gpu_ahead) {
-            ImGui::Checkbox("Also wait for frame generation on the GPU", &s.hold_for_generation);
-            if (s.hold_for_generation)
-                ImGui::TextWrapped("Also waits until the generated frames queued after the game's previous frame have finished on the GPU, so the next game frame cannot push frame generation behind it and add latency.");
-            ImGui::Checkbox("Adaptive GPU lead", &s.adaptive_gpu_lead);
-            if (s.adaptive_gpu_lead)
-                ImGui::TextWrapped("Lets the game start its next frame slightly before the GPU finishes the previous one, by a lead that tunes itself so the GPU stays busy without a frame queuing up.");
-        }
         ImGui::Checkbox("Extra frame slots (more VRAM)", &s.extra_frame_slots);
         if (s.extra_frame_slots)
             ImGui::TextWrapped("Lets the game render up to 4 frames ahead while frame generation catches up. Uses two more full stereo frame copies of VRAM.");

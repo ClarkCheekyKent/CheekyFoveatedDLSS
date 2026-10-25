@@ -119,56 +119,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // GPU wait on the game's queue would stall the game behind generation.
     std::atomic<bool> gpu_waited_present{};
     std::atomic<bool> limit_gpu_ahead{}; // Follow clock + release Never: hold while the GPU is a frame behind.
-    std::atomic<bool> adaptive_gpu_lead{}; // With limit_gpu_ahead: release a self-tuned lead before the predicted capture completion.
-    // Hold mx. The game's CPU needs some time before its first GPU work, so a
-    // release exactly at capture completion leaves the GPU idle for it. The
-    // lead is steered by the capture's own latency (CPU handoff to GPU
-    // completion): it grows while that stays at its floor and backs off as
-    // soon as it rises, which is a frame starting to queue on the GPU.
-    double gpu_lead_ms{},capture_complete_ms{},capture_floor_ms{};
-    std::uint64_t stamped_capture_ticket{};
-    // With limit_gpu_ahead: the hold also covers the frame generation queued
-    // after the newest capture. That work needs only captures already handed
-    // off, so waiting on it before releasing the next game frame cannot cycle.
-    // Hold mx. latest_generation is the newest announced generated phase.
-    std::atomic<bool> hold_for_generation{};
-    std::shared_ptr<FrameCompletion> latest_generation;
-    std::uint64_t generation_holds{},generation_hold_timeouts{},generation_hold_frame{};
-    TimingClock::time_point generation_hold_started{};
-    TimingAverage generation_hold;
-    // Hold mx. Generation for the newest capture not yet queued by the worker,
-    // or queued generation still on the GPU. Both resolve on their own; a
-    // dropped or restarted generation falls back to capture-only after one
-    // game frame.
-    bool generation_behind(TimingClock::time_point now) {
-        bool behind=false;
-        if(hold_for_generation.load(std::memory_order_relaxed)&&latest_native) {
-            const auto id=latest_native->native_id;
-            behind=inflight_id==id||(latest_generation&&!latest_generation->ready())||
-                std::any_of(pending.begin(),pending.end(),[&](const auto& job){return job->id==id&&job->guides_valid;});
-            if(behind&&generation_hold_frame!=id){generation_hold_frame=id;generation_hold_started=now;++generation_holds;}
-            const double limit=native_clock_ms>0?native_clock_ms:20.;
-            if(behind&&generation_hold_started!=TimingClock::time_point{}&&
-               std::chrono::duration<double,std::milli>(now-generation_hold_started).count()>limit){
-                ++generation_hold_timeouts;generation_hold.add(limit);generation_hold_started={};}
-            if(behind&&generation_hold_started==TimingClock::time_point{})behind=false;
-        }
-        if(!behind&&generation_hold_started!=TimingClock::time_point{}){
-            generation_hold.add(std::chrono::duration<double,std::milli>(now-generation_hold_started).count());generation_hold_started={};}
-        return behind;
-    }
-    bool adaptive_lead_active() const noexcept {
-        return limit_gpu_ahead.load(std::memory_order_relaxed)&&adaptive_gpu_lead.load(std::memory_order_relaxed)&&active_release_point==5u;
-    }
-    // Hold mx. The previous frame is still on the GPU beyond the lead.
-    bool gpu_behind_now(TimingClock::time_point now) {
-        if(!latest_native)return false;
-        if(capture_completed(latest_native->ready))return generation_behind(now);
-        if(!adaptive_lead_active()||capture_floor_ms<=0||latest_native->native_captured==TimingClock::time_point{})return true;
-        const auto predicted=latest_native->native_captured+std::chrono::duration_cast<TimingClock::duration>(
-            std::chrono::duration<double,std::milli>(capture_floor_ms-gpu_lead_ms));
-        return now<predicted;
-    }
+    // Hold mx. The previous frame is still on the GPU.
+    bool gpu_behind_now() const {return latest_native&&!capture_completed(latest_native->ready);}
     std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
     std::uint64_t upload_capture_ticket{}; // Presenter thread only; producer fence value the next upload waits on.
     bool gpu_waited_uploads() const noexcept {return runtime_queue&&gpu_waited_present.load(std::memory_order_relaxed);}
@@ -516,8 +468,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;backlog_detected=gpu_behind_credit=false;gpu_lead_ms=capture_complete_ms=capture_floor_ms=0;stamped_capture_ticket=0;
-        latest_generation.reset();generation_holds=generation_hold_timeouts=generation_hold_frame=0;generation_hold_started={};generation_hold={};
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;backlog_detected=gpu_behind_credit=false;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -613,10 +564,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const auto mode=std::min(pacing.clock_mode,2u);
             const bool extra=pacing.extra_frame_slots!=0;
             if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
-            const bool lead=pacing.adaptive_gpu_lead!=0;
-            if(adaptive_gpu_lead.exchange(lead)!=lead&&trace)trace(lead?"FG adaptive GPU lead=ON":"FG adaptive GPU lead=OFF");
-            const bool generation=pacing.hold_for_generation!=0;
-            if(hold_for_generation.exchange(generation)!=generation&&trace)trace(generation?"FG GPU-behind hold waits for generation=ON":"FG GPU-behind hold waits for generation=OFF");
             const bool gpu_ahead=pacing.limit_gpu_ahead!=0;
             if(limit_gpu_ahead.exchange(gpu_ahead)!=gpu_ahead&&trace)trace(gpu_ahead?"FG limit GPU ahead=ON":"FG limit GPU ahead=OFF");
             const bool gpu_waited=pacing.gpu_waited_present!=0;
@@ -637,7 +584,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // credit is spent, not only where it is granted. GPU completion does
         // not notify, so poll while it blocks.
         const auto gpu_gate=[&]{return pacing_clock_mode.load(std::memory_order_relaxed)!=0u&&pacing_active&&
-            limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now(TimingClock::now());};
+            limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now();};
         for(bool counted=false;;) {
             changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw&&!release_gate_active());});
             if(stopping||XR_FAILED(terminal)||!gpu_gate())break;
@@ -790,7 +737,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 native.native_captured=native.current_captured=job->captured_at;
                 native.native=native.current=job->color;native.native_views=native.current_views=job->views;
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
-                if(!adaptive_lead_active())gpu_lead_ms=capture_floor_ms=0;
                 latest_native=std::move(native);
                 if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),7u);
                 if(inference_slot){pending.push_back(job);while(pending.size()>max_pending()){pending.front()->clear_guides();pending.pop_front();++skipped;}}
@@ -825,7 +771,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(first){pair.progress=std::make_shared<Pair::Progress>();inflight_progress=pair.progress;}
         const unsigned index=pair.generated_index;
         auto& phase=pair.progress->phases[index];phase.images=pair.generated;
-        phase.completion=std::move(completion);phase.submitted_at=pair.submitted_at;latest_generation=phase.completion;
+        phase.completion=std::move(completion);phase.submitted_at=pair.submitted_at;
         if(first){
             Pair published=pair;published.generated_index=0;published.interpolated=true;
             published.native_id=previous->id;published.native=previous->color;
@@ -1056,20 +1002,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // A tick held for the GPU is granted the moment the previous
                 // capture finishes, not a whole tick later: waiting for the
                 // next tick quantizes the game to multiples of the tick.
-                // Capture duration (CPU handoff to GPU completion), polled.
-                if(adaptive_lead_active()&&latest_native&&latest_native->ready!=stamped_capture_ticket&&
-                   capture_completed(latest_native->ready)&&latest_native->native_captured!=TimingClock::time_point{}) {
-                    const double d=std::chrono::duration<double,std::milli>(now-latest_native->native_captured).count();
-                    capture_complete_ms=capture_complete_ms>0?capture_complete_ms*.9+d*.1:d;
-                    stamped_capture_ticket=latest_native->ready;
-                    // The floor follows the unqueued latency and creeps up so
-                    // heavier scenes are adopted within a few seconds.
-                    capture_floor_ms=capture_floor_ms>0?std::min(capture_floor_ms+.02,d):d;
-                    const double max_lead=std::min(native_clock_ms*.5,capture_floor_ms);
-                    if(d>capture_floor_ms+2.)gpu_lead_ms=std::max(0.,gpu_lead_ms-1.);
-                    else gpu_lead_ms=std::min(std::max(0.,max_lead),gpu_lead_ms+.25);
-                }
-                if(gpu_behind_credit&&!gpu_behind_now(now)) {
+                if(gpu_behind_credit&&!gpu_behind_now()) {
                     gpu_behind_credit=false;
                     if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1);changed.notify_all();}
                 }
@@ -1101,7 +1034,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     // running ahead of its GPU: a previous frame still not
                     // captured on the GPU at the next tick means a GPU-side
                     // backlog that delays every generated frame behind it.
-                    const bool gpu_behind=limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now(now);
+                    const bool gpu_behind=limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now();
                     const bool backlog=mode!=0u&&pacing_active&&
                         (backlog_detected||ready.size()>=max_pending()||pending.size()>=max_pending());
                     const bool hold_for_gpu=!backlog&&mode!=0u&&pacing_active&&gpu_behind;
@@ -1121,8 +1054,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 auto wake=release_delay_until!=TimingClock::time_point{}?
                     std::min(next,release_delay_until):next;
                 // GPU completion does not notify; poll only while a tick is held for it.
-                if(gpu_behind_credit||(adaptive_lead_active()&&latest_native&&latest_native->ready!=stamped_capture_ticket))
-                    wake=std::min(wake,TimingClock::now()+std::chrono::microseconds(500));
+                if(gpu_behind_credit)wake=std::min(wake,TimingClock::now()+std::chrono::microseconds(500));
                 changed.wait_until(lock,wake);
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
@@ -1474,7 +1406,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 }
             }
             measure_presenter_memory();
-            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[768]{},native_latency_log[512]{};
+            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{},native_latency_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted){++generated_count;last_generated_submit_tick=GetTickCount64();}
                 if(submitted&&!is_generated&&!raw_frame){++distinct_native;
@@ -1505,12 +1437,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         generation_stages[3].mean(),generation_stages[0].mean()+generation_stages[1].mean()+generation_stages[2].mean()+generation_stages[3].mean(),
                         static_cast<unsigned long long>(deferred_credits),static_cast<unsigned long long>(released_deferred_credits),unsigned(credit_deferred));
                     const auto time=pacing_timeline();
-                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu gpu_lead_ms=%.2f capture_complete_ms=%.2f capture_floor_ms=%.2f generation_holds=%llu generation_hold_ms=%.2f generation_hold_timeouts=%llu",
+                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu",
                         time.clock_late_ms,time.credit_deferred_ms,time.game_wait_credit_ms,time.game_begin_gate_ms,
                         time.presenter_content_ms,time.native_xr_end_ms,time.generated_xr_end_ms,
                         time.fg_submit_to_complete_ms,time.deferred_events,time.deferred_releases,
-                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits),gpu_lead_ms,capture_complete_ms,capture_floor_ms,
-                        static_cast<unsigned long long>(generation_holds),generation_hold.mean(),static_cast<unsigned long long>(generation_hold_timeouts));
+                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits));
                     const auto native_latency=native_submission_latency();
                     sprintf_s(native_latency_log,"FG NATIVE submit latency (GPU final stereo capture end to xrEndFrame ENTER): enabled=%u samples=%llu pending=%llu missing=%llu signed_ms=%.3f last=%.3f hold_after_ready=%.3f early_before_ready=%.3f CPU_capture_to_submit=%.3f; NO FG-off baseline",
                         native_latency.enabled,static_cast<unsigned long long>(native_latency.gpu_samples),
