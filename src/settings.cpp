@@ -1,5 +1,6 @@
 #include "settings.hpp"
 #include "quad_view_bridge.hpp"
+#include "reflex_override_state.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -260,6 +261,7 @@ Settings current_settings() noexcept {
 void update_settings(const Settings& settings) noexcept {
     std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
+    reflex_override::requested.store(settings.fg.force_reflex_off,std::memory_order_release);
     fg_settings.multiplier=std::clamp(fg_settings.multiplier,2u,4u);
     const auto bounded = [](float value, float lo, float hi, float fallback) {
         return std::isfinite(value) ? std::clamp(value, lo, hi) : fallback;
@@ -447,6 +449,7 @@ void update_settings(const Settings& settings) noexcept {
 
 void set_processing_allowed(bool allowed) noexcept {
     processing_allowed.store(allowed, std::memory_order_release);
+    reflex_override::processing.store(allowed,std::memory_order_release);
 }
 
 void register_stereo_view(const std::uint64_t view_id) noexcept {

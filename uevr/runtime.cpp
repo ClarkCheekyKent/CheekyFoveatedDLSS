@@ -22,6 +22,7 @@
 #include "dlss_nr.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "fg_capture.hpp"
+#include "reflex_override.hpp"
 #include "afw_compatibility.hpp"
 #include "version.h"
 #include <atomic>
@@ -158,6 +159,10 @@ std::string snapshot_locked(State& s) {
         << ",\"renderer\":" << s.renderer << ",\"message\":\"" << json_escape(s.message)
         << "\",\"settings\":" << settings_json(configured_settings())
         << ",\"setting_groups\":" << setting_groups_json();
+    out << ",\"reflex_override\":{\"requested\":" << reflex_override::requested.load()
+        << ",\"active\":" << reflex_override::active() << ",\"hooked\":" << reflex_override::installed.load()
+        << ",\"sleep_calls_bypassed\":" << reflex_override::suppressed_calls.load()
+        << ",\"last_status\":" << reflex_override::last_status.load() << "}";
     const auto& memory=s.memory;
     out << ",\"gpu_memory\":{\"supported\":" << bool(memory.adapter)
         << ",\"scope\":\"process\",\"adapter\":\"" << json_escape(memory.name) << "\",\"node\":" << memory.node

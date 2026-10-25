@@ -958,9 +958,14 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::Checkbox("Show blue FG region border", &s.show_border);
     }
     if (ImGui::TreeNode("Advanced settings")) {
+        ImGui::Checkbox("Force NVIDIA Reflex off", &s.force_reflex_off);
+        if(s.force_reflex_off)ImGui::TextWrapped("Disables NVIDIA Reflex sleep and its frame limiter. Applies even when frame generation is off.");
         combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
         if (s.pacing_clock != 0)
             ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
+        ImGui::Checkbox("Present from a dedicated GPU queue (D3D12)", &s.dedicated_present_queue);
+        if (s.dedicated_present_queue)
+            ImGui::TextWrapped("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.");
         ImGui::Checkbox("Extra frame slots (more VRAM)", &s.extra_frame_slots);
         if (s.extra_frame_slots)
             ImGui::TextWrapped("Lets the game render up to 4 frames ahead while frame generation catches up. Uses two more full stereo frame copies of VRAM.");

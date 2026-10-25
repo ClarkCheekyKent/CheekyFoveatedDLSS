@@ -300,6 +300,16 @@ The saved setting is `D3D12LowerHook=true` (`false` selects higher). Restart the
 
 ## Shader frame generation
 
+**Force NVIDIA Reflex off** is under **FG → Advanced settings** and defaults
+off (`FgForceReflexOff=0`). Checking it disables NVIDIA's DX11/DX12 Reflex
+sleep and Reflex-owned frame limiter, even while FG itself is off. Other
+game frame limiters and latency markers remain active. The UEVR panel counts
+blocked sleep calls so you can verify the override is taking effect.
+Unchecking restores the latest intercepted game options. If injection happened
+after the game configured Reflex, only its prior low-latency enable state can
+be recovered; reapply the game's Reflex setting to restore Boost/frame-limit
+options that were set before injection.
+
 Choose **FG multiplier** in the standalone/OptiScaler FG tab or UEVR FG panel:
 **2x** (default), **3x**, or **4x** (`FgMultiplier=2`, `3`, or `4`). These produce
 one, two, or three distinct interpolated frames between real frames. The game

@@ -65,7 +65,9 @@ inline bool BufferedPresenter::setup(XrSession s,const XrFns& f,ID3D12Device* de
             generation_high_priority?"HIGH":fg_normal_queue?"NORMAL":"shared fallback");
         trace(message);
     }
-    return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
+    // Captures follow the game's rendering on its queue. Uploads target images
+    // the runtime synchronizes on its own binding queue.
+    return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,runtime_queue?runtime_queue.Get():q);
 }
 
 inline void BufferedPresenter::measure_worker_memory() {

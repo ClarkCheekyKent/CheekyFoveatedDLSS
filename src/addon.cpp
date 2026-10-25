@@ -766,6 +766,7 @@ void draw_openxr_gaze_diagnostics() {
 
 void load_settings_from_reshade() noexcept {
     auto settings = current_settings();
+    static_cast<void>(reshade::get_config_value(nullptr,config_section,"FgForceReflexOff",settings.fg.force_reflex_off));
     static_cast<void>(reshade::get_config_value(
         nullptr, config_section, "D3D12LowerHook", settings.d3d12_lower_hook
     ));
@@ -964,6 +965,7 @@ void load_settings_from_reshade() noexcept {
 }
 
 void save_settings_to_reshade(const Settings& settings) noexcept {
+    reshade::set_config_value(nullptr,config_section,"FgForceReflexOff",settings.fg.force_reflex_off);
     reshade::set_config_value(nullptr, config_section, "D3D12LowerHook", settings.d3d12_lower_hook);
     reshade::set_config_value(
         nullptr, config_section, "Enabled", settings.enabled

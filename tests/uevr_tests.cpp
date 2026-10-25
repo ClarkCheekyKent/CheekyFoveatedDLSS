@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include "../src/fg_source_lifecycle.hpp"
+#include "reflex_override_tests.hpp"
 
 using namespace cheeky::foveated_dlss;
 using Microsoft::WRL::ComPtr;
@@ -283,6 +284,9 @@ int main(int argc, char** argv) {
     static_assert(a!=b && fg_same_source_history(a,a) &&
         !fg_same_source_history(a,b) && !fg_same_source_history(0,a));
     try {
+        if(argc>1&&std::string(argv[1])=="--reflex-override"){
+            cheeky::tests::reflex_override_tests();puts("Reflex cached-entry hooks, live toggle, restoration and settings passed");return 0;
+        }
         wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
         const auto bin = std::filesystem::path(exe).parent_path();
         // Windows reuses PIDs. Keep fixtures from earlier runs from masquerading

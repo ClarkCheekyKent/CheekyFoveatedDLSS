@@ -31,6 +31,7 @@
 #include "fg_capture.hpp"
 #include "fg_sr_region.hpp"
 #include "nvapi_d3d11_guard.hpp"
+#include "reflex_override.hpp"
 
 #include <Windows.h>
 #include <winver.h>
@@ -6745,6 +6746,11 @@ DWORD WINAPI interception_worker(void*) noexcept {
         drain_hook_debug_loader_events();
         poll_openvr_hooks();
         poll_libovr_hooks();
+        if(minhook_initialized.load(std::memory_order_acquire)&&
+           !reflex_override::attempted.load(std::memory_order_acquire)&&GetModuleHandleW(L"nvapi64.dll")){
+            const bool hooked=reflex_override::install();
+            trace_event("NVIDIA Reflex override hooks %s (NvAPI D3D Sleep / SetSleepMode)",hooked?"armed":"unavailable");
+        }
         if (minhook_initialized.load(std::memory_order_acquire) &&
             !nvapi_guard::installed.load(std::memory_order_acquire) &&
             GetModuleHandleW(L"nvapi64.dll") != nullptr) {
@@ -6882,6 +6888,7 @@ LateAttachStatus late_attach_status() noexcept {
 
 bool start_interception() noexcept {
     if (started.exchange(true, std::memory_order_acq_rel)) return true;
+    reflex_override::running.store(true,std::memory_order_release);
     configure_d3d12_hook_path(configured_settings().d3d12_lower_hook);
     trace_event("D3D12 DLSS hook path: %s (changes require restart)",
         d3d12_lower_hook_enabled() ? "Lower feature runtime" : "Higher call");
@@ -6935,6 +6942,7 @@ bool start_interception() noexcept {
         shutdown_direct_export_hooks();
         restore_patched_slots();
         started.store(false, std::memory_order_release);
+        reflex_override::running.store(false,std::memory_order_release);
         uninstall_hook_debug_diagnostics();
         return false;
     }
@@ -6953,6 +6961,7 @@ bool start_interception() noexcept {
         shutdown_direct_export_hooks();
         restore_patched_slots();
         started.store(false, std::memory_order_release);
+        reflex_override::running.store(false,std::memory_order_release);
         uninstall_hook_debug_diagnostics();
         return false;
     }
@@ -6962,6 +6971,7 @@ bool start_interception() noexcept {
 
 void stop_interception() noexcept {
     if (!started.exchange(false, std::memory_order_acq_rel)) return;
+    reflex_override::running.store(false,std::memory_order_release);
     const auto event = stop_event.exchange(nullptr, std::memory_order_acq_rel);
     const auto thread = worker_thread.exchange(nullptr, std::memory_order_acq_rel);
     if (event != nullptr) SetEvent(event);

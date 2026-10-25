@@ -228,7 +228,8 @@ struct Compositor {
     PFN_xrCreateSwapchain create{};PFN_xrDestroySwapchain destroy{};
     PFN_xrEnumerateSwapchainImages enumerate_images{};
     PFN_xrAcquireSwapchainImage acquire{};PFN_xrWaitSwapchainImage wait{};PFN_xrReleaseSwapchainImage release{};
-    ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;ComPtr<ID3D12CommandQueue> runtime_queue; // Set when the runtime was given a layer-owned queue.
+    ComPtr<ID3D12Fence> runtime_fence;std::uint64_t runtime_serial{}; // Runtime access to acquired images before composition.
     ComPtr<ID3D11Device> device11;std::unique_ptr<Compositor11> d3d11;
     // One recording per in-flight composition; allocator/list/srvs alias the current one.
     struct Recording {
@@ -362,9 +363,17 @@ struct Compositor {
         }
         const HRESULT closed=list->Close();
         if(XR_SUCCEEDED(result)&&FAILED(closed))result=XR_ERROR_RUNTIME_FAILURE;
+        // With a layer-owned runtime queue, the composition queue must follow
+        // the runtime's own access to the images it just acquired.
+        if(result==XR_SUCCESS&&runtime_queue){
+            if(!runtime_fence&&FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&runtime_fence))))result=XR_ERROR_RUNTIME_FAILURE;
+            else if(FAILED(runtime_queue->Signal(runtime_fence.Get(),++runtime_serial))||FAILED(queue->Wait(runtime_fence.Get(),runtime_serial)))result=XR_ERROR_RUNTIME_FAILURE;
+        }
         if(result==XR_SUCCESS){ID3D12CommandList* commands[]{list.Get()};queue->ExecuteCommandLists(1,commands);
             if(FAILED(queue->Signal(fence.Get(),++serial)))result=XR_ERROR_RUNTIME_FAILURE;
-            else{current.serial=serial;if(wait_gpu&&!idle())result=XR_ERROR_RUNTIME_FAILURE;}}
+            else{current.serial=serial;if(wait_gpu&&!idle())result=XR_ERROR_RUNTIME_FAILURE;
+                // A layer-owned runtime queue must see the composition before release.
+                else if(runtime_queue&&FAILED(runtime_queue->Wait(fence.Get(),serial)))result=XR_ERROR_RUNTIME_FAILURE;}}
         for(unsigned eye=0;eye<2;++eye)if(acquired[eye]&&waited[eye]){
             if(result==XR_SUCCESS&&capture_output12)capture_output12(eye,eyes[eye].chain,indices[eye],eyes[eye].images[indices[eye]].texture,
                 eyes[eye].width,eyes[eye].height,eyes[eye].format);

@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgExtraFrameSlots", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -689,11 +689,31 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end
             end
             if imgui.tree_node("Advanced settings") then
+                if draft.FgForceReflexOff ~= nil then
+                    check("Force NVIDIA Reflex off", "FgForceReflexOff")
+                    if draft.FgForceReflexOff then
+                        text("Disables NVIDIA Reflex sleep and its frame limiter. Applies even when frame generation is off.")
+                        local reflex = status.reflex_override or {}
+                        if reflex.last_status and reflex.last_status ~= 0 then
+                            text("Reflex override driver status: " .. tostring(reflex.last_status))
+                        elseif reflex.hooked then
+                            text(string.format("Reflex sleep calls blocked: %.0f", reflex.sleep_calls_bypassed or 0))
+                        else
+                            text("Waiting for NVIDIA Reflex.")
+                        end
+                    end
+                end
                 if draft.FgPacingClock ~= nil then
                     combo("FG pacing clock", "FgPacingClock", {
                         [0]="Independent display clock", [1]="Follow presented frames", [2]="Follow presented frames + vsync lock"})
                     if draft.FgPacingClock ~= 0 then
                         text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
+                    end
+                end
+                if draft.FgDedicatedPresentQueue ~= nil then
+                    check("Present from a dedicated GPU queue (D3D12)", "FgDedicatedPresentQueue")
+                    if draft.FgDedicatedPresentQueue then
+                        text("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.")
                     end
                 end
                 if draft.FgExtraFrameSlots ~= nil then

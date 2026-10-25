@@ -63,6 +63,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     TimingClock::time_point last_native_present{},runtime_wake{};
     std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{};
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
+    // Hold mx. Smoothed interval between runtime xrWaitFrame wakes. Some
+    // runtimes report a display period that does not match how often they
+    // actually take frames (e.g. 8.33 ms while running at 72 Hz).
+    double measured_wake_ms{};
     // Hold mx. Follow modes slow the clock only while game frames are being
     // dropped. Without drops the presented rate is the game's own rate, and
     // following it would cap the game below the display rate.
@@ -450,7 +454,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
-        presented_native_ms=native_clock_ms=0;last_native_present=runtime_wake={};
+        presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
         follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
@@ -940,7 +944,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     // Pull the next tick toward the runtime's wake grid (either
                     // parity). Gain 1/4 converges in a few frames and tracks a
                     // runtime period that differs from its reported value.
-                    seen_wakes=runtime_wakes;const double v=telemetry.xr_period_ms;
+                    seen_wakes=runtime_wakes;const double v=follow_display_ms();
                     double error=std::fmod(std::chrono::duration<double,std::milli>(next-runtime_wake).count(),v);
                     if(error<0)error+=v;if(error>v/2)error-=v;
                     if(std::abs(error)>.05){next-=std::chrono::duration_cast<TimingClock::duration>(
@@ -957,7 +961,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 }
                 if(now>=next) {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
-                    const double display_ms=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
+                    const double display_ms=mode!=0u?follow_display_ms():
+                        telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
                     double native_ms=std::max(1.,display_ms*(pacing_active?double(active_multiplier):1.));
                     if(follow_window_start==TimingClock::time_point{}||now-follow_window_start>=std::chrono::milliseconds(500)) {
                         // More than 5% of rendered frames never reached the runtime.
@@ -988,6 +993,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 changed.wait_until(lock,wake);
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
+    }
+    // Hold mx. Follow modes pace to how often the runtime actually takes
+    // frames, never faster than its reported period. 3% headroom keeps the
+    // clock probing upward when the presenter speeds up again.
+    double follow_display_ms() const noexcept {
+        const double reported=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
+        return std::max(reported,measured_wake_ms*.97);
     }
     // Release point 5 never holds the game: its jobs neither gate nor defer credits.
     bool unsubmitted_native() const noexcept {
@@ -1159,7 +1171,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     note_direct_failure_locked(CheekyFgDirectReason::cancelled,0,direct_request.get());
                     direct_request->decided=true;direct_request.reset();++direct_stats.fallbacks;direct_stats.last_path=3;changed.notify_all();}
                 predicted=frame;telemetry.xr_period_ms=double(frame.predictedDisplayPeriod)/1000000.;
-                runtime_wake=TimingClock::now();++runtime_wakes;
+                {const auto wake_now=TimingClock::now();
+                    if(runtime_wakes&&telemetry.xr_period_ms>0){
+                        const double interval=std::chrono::duration<double,std::milli>(wake_now-runtime_wake).count();
+                        // Ignore stalls (loading, menus) so they do not drag the average.
+                        if(interval>0&&interval<telemetry.xr_period_ms*4.)
+                            measured_wake_ms=measured_wake_ms>0?measured_wake_ms*.95+interval*.05:interval;
+                    }
+                    runtime_wake=wake_now;}
+                ++runtime_wakes;
                 xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;changed.notify_all();
             }
             Pair direct_pair;

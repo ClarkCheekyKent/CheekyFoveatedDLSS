@@ -84,7 +84,7 @@ inline bool BufferedPresenter::service_direct_output(double position,Pair& resul
     }
     // Order the binding queue after inference even when inference used a
     // separate queue. Release lets the runtime enqueue work on that queue.
-    if(request->fence){const auto hr=queue->Wait(request->fence.Get(),request->serial);if(FAILED(hr)){
+    if(request->fence){const auto hr=release_queue()->Wait(request->fence.Get(),request->serial);if(FAILED(hr)){
         good=false;std::lock_guard lock(mx);note_direct_failure_locked(CheekyFgDirectReason::queue_wait,0,request.get(),nullptr,nullptr,hr);}}
     for(unsigned eye=0;eye<2;++eye)if(acquired[eye]){
         scene_chains[eye].uploaded=0;
