@@ -61,7 +61,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::atomic<bool> native11_skip_identity_crop{}; // Runtime option; native D3D11 eye crops.
     double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
     TimingClock::time_point last_native_present{},runtime_wake{};
-    std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{},backlog_holds{},gpu_behind_holds{};
+    std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{},backlog_holds{},gpu_behind_holds{},gpu_behind_waits{};
     bool backlog_detected{}; // Hold mx. Set by the presenter, consumed by the pacing clock.
     bool gpu_behind_credit{}; // Hold mx. A tick's credit held until the previous capture finishes on the GPU.
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
@@ -485,7 +485,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=0;backlog_detected=gpu_behind_credit=false;gpu_lead_ms=capture_complete_ms=capture_floor_ms=0;stamped_capture_ticket=0;
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;backlog_detected=gpu_behind_credit=false;gpu_lead_ms=capture_complete_ms=capture_floor_ms=0;stamped_capture_ticket=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -598,7 +598,18 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(!start())return XR_ERROR_RUNTIME_FAILURE;
         const auto wait_begin=TimingClock::now();
         ++app_waiters;
-        changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw&&!release_gate_active());});
+        // A credit banked earlier must not start a frame while the GPU is
+        // still on the previous one: check the GPU-behind gate where the
+        // credit is spent, not only where it is granted. GPU completion does
+        // not notify, so poll while it blocks.
+        const auto gpu_gate=[&]{return pacing_clock_mode.load(std::memory_order_relaxed)!=0u&&pacing_active&&
+            limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now(TimingClock::now());};
+        for(bool counted=false;;) {
+            changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw&&!release_gate_active());});
+            if(stopping||XR_FAILED(terminal)||!gpu_gate())break;
+            if(!counted){++gpu_behind_waits;counted=true;}
+            changed.wait_for(lock,std::chrono::microseconds(500));
+        }
         --app_waiters;
         pacing_wait.add(elapsed_ms(wait_begin));
         // Interrupted by a retirement or reset on another thread: let the stop
@@ -1460,11 +1471,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         generation_stages[3].mean(),generation_stages[0].mean()+generation_stages[1].mean()+generation_stages[2].mean()+generation_stages[3].mean(),
                         static_cast<unsigned long long>(deferred_credits),static_cast<unsigned long long>(released_deferred_credits),unsigned(credit_deferred));
                     const auto time=pacing_timeline();
-                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_lead_ms=%.2f capture_complete_ms=%.2f capture_floor_ms=%.2f",
+                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu gpu_lead_ms=%.2f capture_complete_ms=%.2f capture_floor_ms=%.2f",
                         time.clock_late_ms,time.credit_deferred_ms,time.game_wait_credit_ms,time.game_begin_gate_ms,
                         time.presenter_content_ms,time.native_xr_end_ms,time.generated_xr_end_ms,
                         time.fg_submit_to_complete_ms,time.deferred_events,time.deferred_releases,
-                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),gpu_lead_ms,capture_complete_ms,capture_floor_ms);
+                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits),gpu_lead_ms,capture_complete_ms,capture_floor_ms);
                     const auto native_latency=native_submission_latency();
                     sprintf_s(native_latency_log,"FG NATIVE submit latency (GPU final stereo capture end to xrEndFrame ENTER): enabled=%u samples=%llu pending=%llu missing=%llu signed_ms=%.3f last=%.3f hold_after_ready=%.3f early_before_ready=%.3f CPU_capture_to_submit=%.3f; NO FG-off baseline",
                         native_latency.enabled,static_cast<unsigned long long>(native_latency.gpu_samples),
