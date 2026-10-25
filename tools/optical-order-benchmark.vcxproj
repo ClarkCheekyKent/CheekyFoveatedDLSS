@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{E41D3B60-13F6-45DF-9CBD-D99105C885AC}</ProjectGuid><RootNamespace>OpticalOrderBenchmark</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>Application</ConfigurationType><TargetName>optical-order-benchmark</TargetName><CheekyLibraries>d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib</CheekyLibraries></PropertyGroup>
+  <Import Project="..\standalone\build.props" />
+  <PropertyGroup><OutDir>$(MSBuildProjectDirectory)\..\build\optical-order-benchmark\bin\</OutDir><IntDir>$(MSBuildProjectDirectory)\..\build\optical-order-benchmark\obj\</IntDir></PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\..\third_party\openxr\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
+    <Link><GenerateDebugInformation>false</GenerateDebugInformation><LinkTimeCodeGeneration>Default</LinkTimeCodeGeneration></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="optical_order_benchmark.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

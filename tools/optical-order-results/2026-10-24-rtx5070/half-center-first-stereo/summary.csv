@@ -1,0 +1,5 @@
+"Workload","Mode","Samples","GpuMeanMs","GpuP50Ms","GpuP95Ms","CpuMeanMs","FirstStereoMeanMs","PairsPerBatch"
+"Foveated","centers-first","180","8.1261","8.0939","8.7144","8.2383","6.034","1"
+"Foveated","consume-per-eye","180","7.3898","7.0996","8.7874","7.5028","6.3501","1"
+"Foveated","consume-per-region","180","7.1888","7.0177","8.4929","7.3045","6.1486","1"
+"Foveated","first-stereo","180","8.1058","8.1348","8.6427","8.2281","6.0004","1"

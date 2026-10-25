@@ -1,0 +1,7 @@
+"Workload","Mode","Samples","GpuMeanMs","GpuP50Ms","GpuP95Ms","CpuMeanMs","FirstStereoMeanMs","PairsPerBatch"
+"Foveated","consume-per-eye","180","7.4795","7.1619","9.2714","7.6136","6.4287","1"
+"Foveated","consume-per-region","180","7.295","7.0617","8.654","7.4425","6.2259","1"
+"Foveated","eye-queues","180","7.5518","7.2978","9.0052","7.6571","7.5486","1"
+"Foveated","phase-queues","180","7.4739","7.4079","8.2006","7.5723","7.4707","1"
+"Foveated","serial","180","9.9616","9.8606","10.8587","10.0826","8.9239","1"
+"Foveated","two-pair-pipeline","180","6.8648","6.8625","7.7554","6.9201","11.2056","2"

@@ -1,0 +1,32 @@
+{
+  "timestamp": "2026-10-24T21:59:20.8366825-07:00",
+  "size": 3000,
+  "eyes": 2,
+  "generated_frames": 3,
+  "preset": "Medium",
+  "flow_percent": 100,
+  "grid": 4,
+  "samples": 60,
+  "rounds": 3,
+  "warmup": 8,
+  "workloads": [
+    "Foveated"
+  ],
+  "debug_layer": false,
+  "center_width": 0.5,
+  "center_height": 0.5,
+  "peripheral_flow_percent": 25,
+  "peripheral_preset": "Fast",
+  "peripheral_output_percent": 50,
+  "temporal_hints": "disabled for deterministic ordering comparisons",
+  "modes": [
+    "consume-per-eye",
+    "consume-per-region",
+    "first-stereo",
+    "centers-first"
+  ],
+  "scope": "GPU-resident synthetic A/B and optional B/C; luma preparation, bidirectional NVOF, interpolation; no game, capture, composition, upload, OpenXR, NVENC, or runtime pacing",
+  "git_commit": "65b454b4032224855e90144f85d904b4e4f572ad",
+  "binary_sha256": "82C5377945C12D8943858045965436E94B74C67EB8073A277012B3061B368C2C",
+  "gpu_before": "NVIDIA GeForce RTX 5070, 616.92, 2 %, 3 %, 1877 MiB, 12227 MiB"
+}

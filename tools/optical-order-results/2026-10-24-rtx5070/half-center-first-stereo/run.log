@@ -1,0 +1,92 @@
+Adapter: NVIDIA GeForce RTX 5070
+Two 3000x3000 eyes, 3 generated outputs per eye. Temporal hints OFF. Max two pairs.
+Foveated establishing serial output reference
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+Foveated round=0 mode=consume-per-eye
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 7.55284 ms; first stereo output: 6.50674 ms
+Foveated round=0 mode=consume-per-region
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 7.23597 ms; first stereo output: 6.19491 ms
+Foveated round=0 mode=first-stereo
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 8.13363 ms; first stereo output: 6.00326 ms
+Foveated round=0 mode=centers-first
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 8.13042 ms; first stereo output: 6.04759 ms
+Foveated round=1 mode=consume-per-region
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 7.05666 ms; first stereo output: 6.01645 ms
+Foveated round=1 mode=centers-first
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 8.11132 ms; first stereo output: 6.04549 ms
+Foveated round=1 mode=consume-per-eye
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 7.31669 ms; first stereo output: 6.27445 ms
+Foveated round=1 mode=first-stereo
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 8.01826 ms; first stereo output: 5.87509 ms
+Foveated round=2 mode=consume-per-region
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 7.27392 ms; first stereo output: 6.23435 ms
+Foveated round=2 mode=consume-per-eye
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 7.29993 ms; first stereo output: 6.26912 ms
+Foveated round=2 mode=first-stereo
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 8.16541 ms; first stereo output: 6.12287 ms
+Foveated round=2 mode=centers-first
+  eye=0 region=0 flow=1804x1804 output=1500x1500
+  eye=0 region=1 flow=752x752 output=1500x1500
+  eye=1 region=0 flow=1804x1804 output=1500x1500
+  eye=1 region=1 flow=752x752 output=1500x1500
+  All 12 output hashes match serial baseline.
+  GPU mean per-pair: 8.13641 ms; first stereo output: 6.00892 ms
+PASS: real NVIDIA optical flow, all schedules bit-identical to serial; raw samples saved.
