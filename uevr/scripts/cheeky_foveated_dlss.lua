@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgAdaptiveGpuLead", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -726,6 +726,12 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     check("Keep the GPU from falling behind (Never + Follow)", "FgLimitGpuAhead")
                     if draft.FgLimitGpuAhead then
                         text("With a Follow pacing clock and release Never: the game waits whenever its previous frame has not yet been captured on the GPU, so the GPU cannot fall a frame behind and add latency.")
+                    end
+                end
+                if draft.FgAdaptiveGpuLead ~= nil and draft.FgLimitGpuAhead then
+                    check("Adaptive GPU lead", "FgAdaptiveGpuLead")
+                    if draft.FgAdaptiveGpuLead then
+                        text("Lets the game start its next frame slightly before the GPU finishes the previous one, by a lead that tunes itself so the GPU stays busy without a frame queuing up.")
                     end
                 end
                 if draft.FgExtraFrameSlots ~= nil then
