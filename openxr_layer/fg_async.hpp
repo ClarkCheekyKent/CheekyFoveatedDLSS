@@ -102,11 +102,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unordered_map<XrSwapchain,TimingClock::time_point> capture_times;
     std::unordered_map<XrSwapchain,ColorReady> capture_ready;
     bool capture_overflow{};
-    // Render credits the clock may bank, and capture slots for real frames in
-    // flight (pending, generating, history, presenting). More of both lets the
-    // game keep rendering while slower frame generation catches up.
-    static constexpr unsigned max_credits=4;
-    std::array<std::shared_ptr<Native>,5> slots;
+    std::array<std::shared_ptr<Native>,3> slots;
     void release_idle_slots() noexcept {
         // Hold mx. Only the slot itself owns these completed jobs; pending and
         // worker/history users retain the Native, and ready/upload users retain
@@ -867,7 +863,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // policy holds through both eyes' ordinary completion fence.
                 // Coalesce pacing ticks while either policy blocks production.
                 mark_credit_deferred();
-            }else credits=std::min(max_credits,credits+(ticks==1?2u:1u));
+            }else credits=std::min(2u,credits+(ticks==1?2u:1u));
         }
         changed.notify_all();
     }
@@ -924,7 +920,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                             mark_credit_deferred();
                         }else if(credit_deferred)release_deferred_credit();
-                        else{++granted_credits;if(credits>=max_credits)++capped_credits;credits=std::min(max_credits,credits+1);}
+                        else{++granted_credits;if(credits>=2u)++capped_credits;credits=std::min(2u,credits+1);}
                         changed.notify_all();
                     }
                     next+=period;if(next<=now)next=now+period;
@@ -963,7 +959,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void release_deferred_credit() noexcept {
         // Hold mx. Coalesce missed ticks rather than bursting queued renders.
         if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()&&!release_gate_active()) {
-            credits=std::min(max_credits,credits+1);credit_deferred=false;++released_deferred_credits;
+            credits=std::min(2u,credits+1);credit_deferred=false;++released_deferred_credits;
             if(credit_deferred_since!=TimingClock::time_point{})credit_deferral.add(elapsed_ms(credit_deferred_since));
             credit_deferred_since={};changed.notify_all();
         }
