@@ -231,6 +231,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t granted_credits{},consumed_credits{},capped_credits{}; // Pacing diagnostics: clock grants, game uses, grants lost at the 2-credit cap.
     std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{};
     std::uint64_t last_credit_tick{},completed_pair_id{},inflight_id{};
+    TimingClock::time_point inflight_started{}; // Hold mx. When the worker took inflight_id.
+    std::uint64_t stalled_natives{}; // Hold mx. Native frames shown because generation stalled.
+    // Hold mx. Generation has run for over 100 ms (e.g. a driver session
+    // rebuild). The presenter then shows a newer finished native frame
+    // instead of freezing on the interval it was waiting for.
+    bool stalled_native(double position) const {
+        return inflight_id&&TimingClock::now()-inflight_started>std::chrono::milliseconds(100)&&
+            latest_native&&capture_completed(latest_native->ready)&&double(latest_native->native_id)>position;
+    }
     XrFrameState predicted{XR_TYPE_FRAME_STATE};
     XrTime app_display_time{};
     XrResult terminal{XR_SUCCESS},raw_result{XR_SUCCESS};
@@ -453,7 +462,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
         reset_gpu_metrics();extra_gpu={};batch_telemetry={};inflight_progress.reset();
         frame_ages={};age_samples={};
-        last_credit_tick=completed_pair_id=inflight_id=0;
+        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=0;
         capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
         gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
@@ -808,7 +817,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         try {for(;;) {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
-             job=pending.front();pending.pop_front();inflight_id=job->id;inflight_generated_gate_released=false;inflight_progress.reset();
+             job=pending.front();pending.pop_front();inflight_id=job->id;inflight_started=TimingClock::now();inflight_generated_gate_released=false;inflight_progress.reset();
              inflight_release_point=job->guides_valid?job->policy.release_point:0u;inflight_prepared=false;
              if(job->guides_valid){
                  if(active_release_point!=job->policy.release_point)cadence_window={};
@@ -865,7 +874,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     job->multiplier=auto_multiplier.selected;
                 }
             }
+            const auto generate_started=TimingClock::now();const auto rebuilds_before=optical::rebuilds.load();
             const auto generation=backend->generate(previous,job,pair,reset_history,logged_samples,direct_job);
+            if(const auto generate_ms=elapsed_ms(generate_started);generate_ms>100.&&trace){char message[192]{};
+                sprintf_s(message,"FG worker stall: native=%llu generate_ms=%.1f optical_flow_session_rebuilds=%llu",
+                    static_cast<unsigned long long>(job->id),generate_ms,static_cast<unsigned long long>(optical::rebuilds.load()-rebuilds_before));trace(message);}
             const auto success=generation.success,attempted=generation.attempted,history_was_reset=generation.history_reset;
             if(success){pair.interpolated=true;pair.native_id=previous->id;pair.native=previous->color;
                 pair.native_color_ready=previous->color_ready;
@@ -1184,6 +1197,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // Hold mx. A pair whose native image was already displayed can still
         // contribute its interpolation; do not submit that native image twice.
         if(have_active&&active.progress&&active.progress->failed)return true; // Retire failed partial interval below.
+        if(stalled_native(position))return true;
         if(have_active&&generated_phase)return phase_presentable(active,active.generated_index);
         if(have_active&&double(active.native_id)>position)return true;
         const auto selected=newest_ready_pair(position);
@@ -1207,7 +1221,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const bool producer_pending=(have_active&&generated_phase&&active.progress&&!phase_presentable(active,active.generated_index))||
                 (!fg_active&&latest_native&&!capture_completed(latest_native->ready))||
                 std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !capture_completed(pair.ready)||(pair.progress&&!phase_ready(pair,0));});
+            // A running generation may stall; recheck so a newer native frame can be shown.
             if(producer_pending)changed.wait_for(lock,std::chrono::milliseconds(1));
+            else if(inflight_id)changed.wait_for(lock,std::chrono::milliseconds(5));
             else changed.wait(lock);
         }
         if(waited_for_content)presenter_content_wait.add(elapsed_ms(started_wait));
@@ -1267,6 +1283,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(have_direct&&!raw_frame&&!stop_now&&!degraded){active=std::move(direct_pair);have_active=true;generated_phase=true;fg_active=pacing_active=true;active_multiplier=active.generated_count+1;
                     while(!ready.empty()&&ready.front().current_id<=active.current_id)ready.pop_front();}
+                else if(!raw_frame&&!stop_now&&!degraded&&stalled_native(last_position)) {
+                    active=*latest_native;have_active=true;generated_phase=false;
+                    if(trace&&(++stalled_natives<=3||stalled_natives%60==0)){char message[160]{};
+                        sprintf_s(message,"FG presenter: generation stalled %.0f ms; showing native=%llu (count=%llu)",
+                            std::chrono::duration<double,std::milli>(TimingClock::now()-inflight_started).count(),
+                            static_cast<unsigned long long>(active.native_id),static_cast<unsigned long long>(stalled_natives));trace(message);}
+                }
                 else if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
                     auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {

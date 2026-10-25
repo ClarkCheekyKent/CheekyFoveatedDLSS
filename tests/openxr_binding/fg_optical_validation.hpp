@@ -192,3 +192,25 @@ inline void fg_optical_profile(){
     std::cout<<"D3D12 optical worker CPU ms per generate (3x, 2816 eye, periphery 25% fast) center preset="<<setting[0]<<" "<<setting[1]<<"%: phase1="<<phase_ms[1]/frames<<" phase2="<<phase_ms[2]/frames<<"\n";
     }
 }
+
+// A fast head turn moves the foveated region to an eye edge or far from the
+// previous one. The flow window must keep its size (its size is the driver
+// session's size), and a one-frame full-eye request must not rebuild the
+// session: each rebuild stalled generation for about two seconds.
+inline void fg_optical_size_stability(){
+    using namespace cheeky::fg;
+    CheekyFgEye g;g.width=2000;g.height=1800;g.optical.center_percent=75;
+    const CompactLayout none{};
+    const float centered[]{.3f,.3f,.4f,.4f},edge_left[]{0,.6f,.4f,.4f},edge_right[]{.6f,0,.4f,.4f};
+    const auto a=optical::constants(g,0,centered,none,none,800,720),b=optical::constants(g,0,edge_left,none,none,800,720),
+        c=optical::constants(g,0,edge_right,none,none,800,720);
+    check(a.sizes[0]==b.sizes[0]&&a.sizes[1]==b.sizes[1]&&a.sizes[0]==c.sizes[0]&&a.sizes[1]==c.sizes[1],"Optical flow window must keep its size at eye edges and across far jumps");
+    for(const auto* k:{&a,&b,&c})check(k->flow_rect[0]>=0&&k->flow_rect[1]>=0&&k->flow_rect[0]+k->flow_rect[2]<=1.0001f&&k->flow_rect[1]+k->flow_rect[3]<=1.0001f,"Optical flow window must stay inside the eye");
+    check(b.flow_rect[0]<=edge_left[0]&&b.flow_rect[0]+b.flow_rect[2]>=edge_left[0]+edge_left[2],"Optical flow window must still cover the region at an edge");
+    optical::Session12 session;session.width=unsigned(a.sizes[0]);session.height=unsigned(a.sizes[1]);
+    check(session.keep_size(unsigned(a.sizes[0]),unsigned(a.sizes[1]))&&session.keep_size(2000,1800)&&session.keep_size(unsigned(a.sizes[0]),unsigned(a.sizes[1])),
+        "A transient full-eye flow request must keep the optical flow session");
+    bool kept=true;for(unsigned i=0;i<100;++i)kept=session.keep_size(2000,1800);
+    check(!kept,"A lasting flow size change must rebuild the optical flow session");
+    std::cout<<"PASS optical flow session size stability (edge, far jump, transient full eye)\n";
+}

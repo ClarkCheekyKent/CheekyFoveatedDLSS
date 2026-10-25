@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <atomic>
 #include <cstdio>
 #include <vector>
 namespace cheeky::fg {
@@ -21,6 +22,8 @@ inline bool color_options(CheekyFgColorOptionsV1& options){
     const auto get=runtime?reinterpret_cast<CheekyFgColorOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetColorOptionsV1")):nullptr;
     return get&&get(&options)&&options.enabled;
 }
+// Sessions rebuilt after their first initialization (each stalls generation).
+inline std::atomic<std::uint64_t> rebuilds{};
 inline HMODULE module(){static HMODULE dll=LoadLibraryExW(L"nvofapi64.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);return dll;}
 inline NV_OF_INIT_PARAMS parameters(unsigned w,unsigned h,unsigned preset,unsigned grid){
     NV_OF_INIT_PARAMS p{};p.width=w;p.height=h;p.outGridSize=NV_OF_OUTPUT_VECTOR_GRID_SIZE(grid);
@@ -48,10 +51,11 @@ inline OpticalConstants constants(const CheekyFgEye& g,unsigned pass,const float
     OpticalConstants c;std::copy_n(rect,4,c.output_rect);std::copy_n(rect,4,c.flow_rect);
     // Include a halo so trajectories can cross the center/periphery boundary.
     // Head turns move content tens of pixels per native frame at low rates.
+    // At an eye edge the window slides inward instead of shrinking: its size
+    // sets the flow session's size, and a new size rebuilds the session.
     if(pass==0){const float halo_x=std::max(.05f,32.f/std::max(1u,g.width)),halo_y=std::max(.05f,32.f/std::max(1u,g.height));
-        const float right=std::min(1.f,rect[0]+rect[2]+halo_x),bottom=std::min(1.f,rect[1]+rect[3]+halo_y);
-        c.flow_rect[0]=std::max(0.f,rect[0]-halo_x);c.flow_rect[1]=std::max(0.f,rect[1]-halo_y);
-        c.flow_rect[2]=right-c.flow_rect[0];c.flow_rect[3]=bottom-c.flow_rect[1];}
+        c.flow_rect[2]=std::min(1.f,rect[2]+2*halo_x);c.flow_rect[3]=std::min(1.f,rect[3]+2*halo_y);
+        c.flow_rect[0]=std::clamp(rect[0]-halo_x,0.f,1.f-c.flow_rect[2]);c.flow_rect[1]=std::clamp(rect[1]-halo_y,0.f,1.f-c.flow_rect[3]);}
     const auto percent=pass?g.optical.peripheral_percent:g.optical.center_percent;
     const auto grid=pass?g.optical.peripheral_grid:g.optical.center_grid;
     c.sizes[0]=float(std::max(64u,(unsigned(std::ceil(g.width*c.flow_rect[2]*percent*.01f))+3u)&~3u));
@@ -104,6 +108,16 @@ struct Session11 : Error {
     ComPtr<ID3D11UnorderedAccessView> input_uavs[2];
     unsigned width{},height{},preset{},grid{4};std::uint64_t old_id{},new_id{};
     float crop[4]{};bool history{},initialized{};
+    // Rebuilding a session (driver init, registrations, shader compiles)
+    // stalls generation for seconds. The current session samples any flow
+    // window at its own size; it is rebuilt only once a different size has
+    // been requested for about a second, not for a transient full-eye frame.
+    unsigned size_mismatch{};
+    bool keep_size(unsigned w,unsigned h) noexcept {
+        const bool close=w<=width&&h<=height&&3ull*w*h>=2ull*width*height;
+        size_mismatch=close?0u:size_mismatch+1u;
+        return size_mismatch<90u;
+    }
     Session11()=default;Session11(const Session11&)=delete;Session11& operator=(const Session11&)=delete;
     ~Session11(){reset();}
     void reset(){
@@ -113,7 +127,8 @@ struct Session11 : Error {
         device.Reset();prepare_shader.Reset();interpolate_shader.Reset();sampler.Reset();old_id=new_id=0;history=false;initialized=false;
     }
     bool initialize(ID3D11Device* dev,ID3D11DeviceContext* context,unsigned w,unsigned h,unsigned quality,unsigned cells){
-        if(initialized&&device.Get()==dev&&width==w&&height==h&&preset==quality&&grid==cells)return true;
+        if(initialized&&device.Get()==dev&&preset==quality&&grid==cells&&keep_size(w,h))return true;
+        if(initialized)++rebuilds;size_mismatch=0;
         reset();auto dll=module();if(!dll)return fail("driver API unavailable",GetLastError());
         using Create=decltype(&NvOFAPICreateInstanceD3D11);auto create=reinterpret_cast<Create>(GetProcAddress(dll,"NvOFAPICreateInstanceD3D11"));
         if(!create)return fail("D3D11 API unavailable");
@@ -149,6 +164,7 @@ struct Session11 : Error {
         ComPtr<ID3D11Texture2D>& output,ComPtr<ID3D11ShaderResourceView>& output_view){
         ID3D11Device* dev{};ctx->GetDevice(&dev);ComPtr<ID3D11Device> owned;owned.Attach(dev);
         if(!initialize(dev,ctx,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0])))return false;
+        c.sizes[0]=float(width);c.sizes[1]=float(height);
         if(old_id!=previous_id||new_id!=current_id){
             if(!bind(ctx,c))return false;
             ID3D11ShaderResourceView* srvs[]{old,now};ID3D11UnorderedAccessView* uavs[]{input_uavs[0].Get(),input_uavs[1].Get()};
@@ -183,6 +199,16 @@ struct Session12 : Error {
     std::array<ComPtr<ID3D12Resource>,6> textures;std::array<NvOFGPUBufferHandle,6> buffers{};
     unsigned width{},height{},preset{},grid{4};float crop[4]{};bool history{},initialized{};
     unsigned descriptor_set{}; // Generated frame within the interval; renders may be in flight together.
+    // Rebuilding a session (driver init, registrations, shader compiles)
+    // stalls generation for seconds. The current session samples any flow
+    // window at its own size; it is rebuilt only once a different size has
+    // been requested for about a second, not for a transient full-eye frame.
+    unsigned size_mismatch{};
+    bool keep_size(unsigned w,unsigned h) noexcept {
+        const bool close=w<=width&&h<=height&&3ull*w*h>=2ull*width*height;
+        size_mismatch=close?0u:size_mismatch+1u;
+        return size_mismatch<90u;
+    }
     Session12()=default;Session12(const Session12&)=delete;Session12& operator=(const Session12&)=delete;
     ~Session12(){reset();}
     bool wait(){if(!fence||fence->GetCompletedValue()>=serial)return true;
@@ -204,7 +230,8 @@ struct Session12 : Error {
         return SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out)));
     }
     bool initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsigned h,unsigned quality,unsigned cells){
-        if(initialized&&device.Get()==dev&&queue.Get()==q&&width==w&&height==h&&preset==quality&&grid==cells)return true;
+        if(initialized&&device.Get()==dev&&queue.Get()==q&&preset==quality&&grid==cells&&keep_size(w,h))return true;
+        if(initialized)++rebuilds;size_mismatch=0;
         reset();auto dll=module();if(!dll)return fail("driver API unavailable",GetLastError());
         using Create=decltype(&NvOFAPICreateInstanceD3D12);auto create=reinterpret_cast<Create>(GetProcAddress(dll,"NvOFAPICreateInstanceD3D12"));if(!create)return fail("D3D12 API unavailable");
         auto status=create(NV_OF_API_VERSION,&api);if(status)return fail("D3D12 API version",status);
@@ -247,6 +274,7 @@ struct Session12 : Error {
         // below, which follows every earlier render that sampled our vectors,
         // so the CPU never waits for unrelated (game) work on a shared queue.
         if(!initialize(dev,q,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0]))||!wait())return false;
+        c.sizes[0]=float(width);c.sizes[1]=float(height);
         if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return fail("command reset");
         barrier(list.Get(),old,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);if(now!=old)barrier(list.Get(),now,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(unsigned i=0;i<2;++i)barrier(list.Get(),textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -270,6 +298,7 @@ struct Session12 : Error {
     bool render(ID3D12GraphicsCommandList* commands,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* depth,OpticalConstants c,float fraction,DXGI_FORMAT format,
         D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ComPtr<ID3D12Resource>& output){
         if(!handle)return false;
+        c.sizes[0]=float(width);c.sizes[1]=float(height);
         if(!output||output->GetDesc().Width!=unsigned(c.sizes[2])||output->GetDesc().Height!=unsigned(c.sizes[3])||output->GetDesc().Format!=format){output.Reset();if(!texture(unsigned(c.sizes[2]),unsigned(c.sizes[3]),format,true,output))return fail("generated image");}
         barrier(commands,old,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);if(now!=old)barrier(commands,now,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

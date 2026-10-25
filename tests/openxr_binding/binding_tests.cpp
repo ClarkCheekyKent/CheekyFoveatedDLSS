@@ -1178,7 +1178,7 @@ int main(int argc,char** argv) {
         if(argc>1 && std::string(argv[1])=="--fg-d3d11") {fg_d3d11_validation();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-crop-gpu-validation") {fg_copy_validation_test(false);return 0;}
-        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); presenter_menu_layer_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
+        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); presenter_menu_layer_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); fg_optical_size_stability(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }
