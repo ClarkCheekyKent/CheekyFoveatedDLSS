@@ -197,7 +197,14 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         if(input.crop[0]<0||input.crop[1]<0||input.crop[2]<=0||input.crop[3]<=0||
             input.crop[0]+input.crop[2]>1.0001f||input.crop[1]+input.crop[3]>1.0001f)return false;
         const auto df=guide_depth_format(dd.Format),mf=guide_motion_format(md.Format);
-        if(df==DXGI_FORMAT_UNKNOWN||mf==DXGI_FORMAT_UNKNOWN)return false;
+        // Snapshot only what the selected methods read: simple warping needs no
+        // depth, and the optical flow methods estimate their own motion.
+        const bool focused=g.focus_width<.999f||g.focus_height<.999f;
+        const unsigned center=g.center_method,periphery=focused?g.peripheral_method:0u;
+        const bool need_depth=center==2||center==5||periphery==2||periphery==5;
+        const bool need_motion=center==1||center==2||periphery==1||periphery==2;
+        if(!need_depth&&!need_motion)return false;
+        if((need_depth&&df==DXGI_FORMAT_UNKNOWN)||(need_motion&&mf==DXGI_FORMAT_UNKNOWN))return false;
         const bool same=old&&old->source.meta.feature==g.feature&&old->source.generation==input.generation&&
             old->source.mapping_revision==input.mapping_revision&&old->source.meta.configuration==g.configuration&&
             old->source.meta.depth_width==g.depth_width&&old->source.meta.depth_height==g.depth_height&&
@@ -224,8 +231,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             return SUCCEEDED(device->CreateTexture2D(&d,nullptr,&texture))&&SUCCEEDED(device->CreateShaderResourceView(texture.Get(),nullptr,&srv))&&
                 SUCCEEDED(device->CreateUnorderedAccessView(texture.Get(),nullptr,&uav));};
         ComPtr<ID3D11UnorderedAccessView> depth_uav,motion_uav;
-        if(!writable(DXGI_FORMAT_R32_FLOAT,next->depth,next->depth_srv,depth_uav)||
-            !writable(DXGI_FORMAT_R32G32_FLOAT,next->motion,next->motion_srv,motion_uav))return false;
+        if((need_depth&&!writable(DXGI_FORMAT_R32_FLOAT,next->depth,next->depth_srv,depth_uav))||
+            (need_motion&&!writable(DXGI_FORMAT_R32G32_FLOAT,next->motion,next->motion_srv,motion_uav)))return false;
         // Depth textures need not have been created with SHADER_RESOURCE binding.
         // Copy them into private sampleable allocations before normalization.
         auto readable=[&](ID3D11Texture2D* original,D3D11_TEXTURE2D_DESC d,DXGI_FORMAT format,ComPtr<ID3D11Texture2D>& texture,ComPtr<ID3D11ShaderResourceView>& srv){
@@ -238,12 +245,13 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             D3D11_SHADER_RESOURCE_VIEW_DESC v{};v.Format=format;v.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;v.Texture2D.MipLevels=1;
             return SUCCEEDED(device->CreateShaderResourceView(texture.Get(),&v,&srv));};
         ComPtr<ID3D11Texture2D> depth,motion;ComPtr<ID3D11ShaderResourceView> depth_srv,motion_srv;
-        if(!readable(input.depth,dd,df,depth,depth_srv)||!readable(input.motion,md,mf,motion,motion_srv))return false;
+        if((need_depth&&!readable(input.depth,dd,df,depth,depth_srv))||(need_motion&&!readable(input.motion,md,mf,motion,motion_srv)))return false;
         ComPtr<ID3D11Buffer> constants;D3D11_BUFFER_DESC b{};b.ByteWidth=sizeof(c);b.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         D3D11_SUBRESOURCE_DATA initial{&c};if(FAILED(device->CreateBuffer(&b,&initial,&constants)))return false;
         if(!submit_shader([&](ID3D11DeviceContext* commands){
             return guide_timings.measure(device.Get(),commands,guide_interval.load(),2,[&]{
-            commands->CopyResource(depth.Get(),input.depth);commands->CopyResource(motion.Get(),input.motion);
+            // Unbound outputs are skipped by the snapshot shader's null UAV writes.
+            if(need_depth)commands->CopyResource(depth.Get(),input.depth);if(need_motion)commands->CopyResource(motion.Get(),input.motion);
             auto* cb=constants.Get();ID3D11ShaderResourceView* srvs[]{depth_srv.Get(),motion_srv.Get()};
             ID3D11UnorderedAccessView* uavs[]{depth_uav.Get(),motion_uav.Get()};
             commands->CSSetShader(snapshot.Get(),nullptr,0);commands->CSSetConstantBuffers(0,1,&cb);
@@ -338,7 +346,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             auto& draw=draws[eye];draw=std::make_shared<DeferredDraw>();
             draw->previous=previous[eye];draw->current=current[eye];draw->old_guides=old_guides[eye];draw->new_guides=new_guides[eye];
             for(unsigned pass=0;pass<2;++pass){
-                if((pass?g.peripheral_method:g.center_method)!=4||(pass&&!focused))continue;
+                const unsigned method=pass?g.peripheral_method:g.center_method;
+                if(!cheeky_fg_optical(method)||(pass&&!focused))continue;
                 auto meta=g;meta.width=d.Width;meta.height=d.Height;
                 const float full[4]{0,0,1,1};const auto* rect=pass?full:c.rect;
                 const auto scale=pass?g.peripheral_percent:g.resolution_percent;
@@ -346,8 +355,13 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
                     std::max(32u,unsigned(std::round(d.Width*rect[2]*scale*.01f))),
                     std::max(32u,unsigned(std::round(d.Height*rect[3]*scale*.01f))));
                 const auto quality=pass?g.optical.peripheral_preset:g.optical.center_preset;
+                // The guide snapshot is already normalized to full-eye coordinates.
+                auto* depth=method==cheeky_fg_optical_depth?now.depth_srv.Get():nullptr;
+                if(method==cheeky_fg_optical_depth&&!depth){strcpy_s(diagnostic,"NVIDIA Optical Flow + depth: waiting for depth guides");return false;}
+                params.flags[2]=depth?1.f:0.f;params.flags[3]=float(g.depth_inverted);
+                optical::pose_mapping(params,previous_views[eye].pose,previous_views[eye].fov,current_views[eye].pose,current_views[eye].fov,fraction);
                 if(!submit_shader([&](ID3D11DeviceContext* context){
-                    return optical[eye][pass].render(context,previous[eye]->srv11.Get(),current[eye]->srv11.Get(),
+                    return optical[eye][pass].render(context,previous[eye]->srv11.Get(),current[eye]->srv11.Get(),depth,
                         previous[eye]->identity,current[eye]->identity,quality,params,fraction,g.reset!=0,
                         draw->optical_color[pass],draw->optical_view[pass]);},true)){
                     strcpy_s(diagnostic,optical[eye][pass].diagnostic);return false;

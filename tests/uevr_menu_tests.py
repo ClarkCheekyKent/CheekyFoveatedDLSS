@@ -207,7 +207,7 @@ def run(engine):
     receive(state)
     draw()
     if "--fg-center" in sys.argv:
-        for method in (1, 2, 4, 0):
+        for method in (1, 2, 4, 5, 0):
             draw(changes={"FG center method": method})
             assert f"FgCenterMethod={method}" in last()
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
@@ -230,19 +230,28 @@ def run(engine):
         draw()
         assert g["values"]["FG GPU queue"] is not None
         state["settings"].update(FgCenterMethod=4, FgPeripheralMethod=4, FgOpticalCenterPreset=1,
-                                 FgOpticalPeripheralPreset=2, FgOpticalCenterPercent=100, FgOpticalPeripheralPercent=50)
+                                 FgOpticalPeripheralPreset=2, FgOpticalCenterPercent=100, FgOpticalPeripheralPercent=50,
+                                 FgOpticalCenterGrid=4, FgOpticalPeripheralGrid=4)
         receive(state)
         draw()
         assert g["values"]["FG GPU queue"] is None
         for label, key, value in (("Center optical flow preset", "FgOpticalCenterPreset", 0),
                                   ("Periphery optical flow preset", "FgOpticalPeripheralPreset", 1),
                                   ("Center optical flow resolution", "FgOpticalCenterPercent", 75),
-                                  ("Periphery optical flow resolution", "FgOpticalPeripheralPercent", 25)):
+                                  ("Periphery optical flow resolution", "FgOpticalPeripheralPercent", 25),
+                                  ("Center optical flow vector grid", "FgOpticalCenterGrid", 1),
+                                  ("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", 2)):
             draw(changes={label: value})
             assert f"{key}={value}" in last()
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
             state["settings"][key] = value
             receive(state)
+        # The depth-assisted variant keeps the same optical flow controls.
+        state["settings"].update(FgCenterMethod=5, FgPeripheralMethod=5)
+        receive(state)
+        draw()
+        assert g["values"]["Center optical flow preset"] == 0
+        assert g["values"]["Periphery optical flow resolution"] == 25
         del state["settings"]["FgCenterMethod"]
         receive(state)
         draw()

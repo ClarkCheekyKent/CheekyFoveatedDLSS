@@ -29,12 +29,14 @@ float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(ma
  if(Options.x>.5){OutColor.GetDimensions(w,h);if(id.x<w&&id.y<h){
   float2 uv=Rect.xy+(float2(id.xy)+.5)/float2(w,h)*Rect.zw;
   OutColor[id.xy]=encodeColor(samplePacked(Color,uv,AtlasCrop,AtlasSpans,AtlasTexel));}}
- if(Options.z<.5)return;
- OutMotion.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
+ if(Options.y<.5&&Options.z<.5)return;
+ // Depth and motion share one grid; either may be absent (depth-only optical flow).
+ if(Options.z>.5)OutMotion.GetDimensions(w,h);else OutDepth.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;
  float2 uv=Rect.xy+(float2(id.xy)+.5)/float2(w,h)*Rect.zw;
- uint mw,mh;Motion.GetDimensions(mw,mh);
  if(Options.y>.5){uint dw,dh;Depth.GetDimensions(dw,dh);uint2 d=min(uint2(uv*Dimensions.xy+GuideOffset.xy),uint2(dw,dh)-1);
   OutDepth[id.xy]=Depth.Load(int3(d,0));}
+ if(Options.z<.5)return;
+ uint mw,mh;Motion.GetDimensions(mw,mh);
  uint2 m=min(uint2(uv*Dimensions.zw+GuideOffset.zw),uint2(mw,mh)-1);
  float2 mv=Motion.Load(int3(m,0));
  bool good=all(isfinite(mv))&&all(abs(mv)<65504.0);
@@ -153,17 +155,20 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  ID3D12Resource* color,const CheekyFgEye& g,const FocusRect& r,unsigned w,unsigned h,
  D3D12_RESOURCE_STATES color_state,GpuTimings* timings,float crop_motion_dx,float crop_motion_dy){
  if(eye>1||pass>1||!color||!w||!h||!r.w||!r.h||!initialize(dev))return false;
- const bool need_color=pass==0||g.peripheral_method==3;
- const bool need_motion=need_color||g.peripheral_method!=0;
- const bool need_depth=need_color||g.peripheral_method==2;
+ const unsigned method=pass?g.peripheral_method:g.center_method;
+ // Only NGX (DLSS) reads the prepared color; the shader methods and optical
+ // flow sample the original images. Matches guide_grid's depth/motion choice.
+ const bool need_color=pass==0?method==0:method==3;
+ const bool need_motion=pass==0?method<=2:(method>=1&&method<=3);
+ const bool need_depth=pass==0?(method==0||method==2||method==5):(method==2||method==3||method==5);
  const bool prepared=g.prepared_guides!=0;
  const bool adjust_motion=pass==0&&(crop_motion_dx!=0.f||crop_motion_dy!=0.f);
  auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;
- if((pass?g.peripheral_method:g.center_method)==4){s.depth.Reset();s.motion.Reset();return true;}
+ if(method==cheeky_fg_optical_flow){s.depth.Reset();s.motion.Reset();return true;}
  if(s.borrowed_guides!=prepared){s.depth.Reset();s.motion.Reset();}
  s.borrowed_guides=prepared;
  if(!need_color)s.color.Reset();if(!need_depth)s.depth.Reset();if(!need_motion)s.motion.Reset();
- if(!need_color&&!need_motion){
+ if(!need_color&&!need_motion&&!need_depth){
   if(timings)for(unsigned phase=0;phase<4;++phase)timings->preparation_stamp(list,eye,pass,phase);
   return true;
  }
@@ -190,7 +195,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
   };
   if(!active(need_depth?g.depth:nullptr,g.depth_base_x,g.depth_base_y,g.depth_width,g.depth_height,dw,dh)||
      !active(need_motion?g.motion:nullptr,g.motion_base_x,g.motion_base_y,g.motion_width,g.motion_height,mw,mh))return false;
-  const unsigned sw=need_depth?std::min(dw,mw):mw,sh=need_depth?std::min(dh,mh):mh;
+  const unsigned sw=need_depth?(need_motion?std::min(dw,mw):dw):mw,sh=need_depth?(need_motion?std::min(dh,mh):dh):mh;
   gw=std::clamp(unsigned(std::round(double(sw)*r.w/cd.Width*std::min(1.,double(w)/r.w))),1u,w);
   gh=std::clamp(unsigned(std::round(double(sh)*r.h/cd.Height*std::min(1.,double(h)/r.h))),1u,h);
  }
@@ -272,11 +277,16 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  auto& prior_depth=region?previous_center_depth[eye]:previous_depth[eye];
  auto& valid_history=region?center_history[eye]:history[eye];
  auto& scratch=region?center_output[eye]:peripheral_output[eye];
- if(!s.output_width||!s.output_height||!previous||!current||(method>2&&method!=4))return false;
- if(method==4){
+ if(!s.output_width||!s.output_height||!previous||!current||(method>2&&!cheeky_fg_optical(method)))return false;
+ if(cheeky_fg_optical(method)){
   auto c=optical_constants[eye][pass];
   c.flags[1]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
-  if(!optical[eye][pass].render(list,previous,current,c,interpolation_fraction,color_format,color_state,
+  auto* depth=method==cheeky_fg_optical_depth?s.depth.Get():nullptr;
+  if(method==cheeky_fg_optical_depth&&!depth)return false;
+  // Prepared depth covers this pass's output region in eye coordinates.
+  c.flags[2]=depth?1.f:0.f;c.flags[3]=float(g.depth_inverted);std::copy_n(c.output_rect,4,c.depth_rect);
+  if(camera.valid)optical::pose_mapping(c,camera.previous_pose,camera.previous_fov,camera.pose,camera.view_fov,interpolation_fraction);
+  if(!optical[eye][pass].render(list,previous,current,depth,c,interpolation_fraction,color_format,color_state,
        previous->GetDesc().Format,current->GetDesc().Format,scratch))return false;
   // Optical periphery uses the ordinary composition/packing path. The worker
   // never requests a partial packed destination for this method.

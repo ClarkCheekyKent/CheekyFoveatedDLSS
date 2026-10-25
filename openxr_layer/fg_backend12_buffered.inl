@@ -440,8 +440,9 @@ struct BufferedBackend12 final : FrameBackend {
                 }
                 for(unsigned eye=0;eye<2&&job->guides_valid;++eye) {
                     auto g=guides.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
-                    if(!g.depth||!g.motion){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
-                    job->source_depth=unsigned(g.depth->GetDesc().Format);job->source_motion=unsigned(g.motion->GetDesc().Format);
+                    // Prepared guides omit textures that neither region's method reads.
+                    if(!g.prepared_guides&&(!g.depth||!g.motion)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
+                    job->source_depth=g.depth?unsigned(g.depth->GetDesc().Format):0;job->source_motion=g.motion?unsigned(g.motion->GetDesc().Format):0;
                     const auto& layout=job->color[eye]->layout;
                     if(g.width!=(layout.width?layout.width:d.Width)||g.height!=(layout.height?layout.height:d.Height)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
                     if(layout.packed()){
@@ -634,7 +635,7 @@ struct BufferedBackend12 final : FrameBackend {
                 if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;}
                 if(camera_pair_valid&&pair.generated_count==1&&job->direct_output_mode&&!blocked_direct){
                     const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
-                        return (g.peripheral_method<=2||g.peripheral_method==4)&&(g.focus_width<.999f||g.focus_height<.999f);});
+                        return (g.peripheral_method<=2||cheeky_fg_optical(g.peripheral_method))&&(g.focus_width<.999f||g.focus_height<.999f);});
                     if(supported){
                         direct_job=std::make_shared<DirectRequest>();direct_job->epoch=job->epoch;direct_job->native_id=previous->id;
                         direct_job->previous=previous->color;direct_job->format=owner.worker.focus.color_format;direct_job->width=owner.worker.width;direct_job->height=owner.worker.height;

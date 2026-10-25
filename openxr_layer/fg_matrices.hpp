@@ -66,6 +66,8 @@ struct Camera {
     Matrix view_to_clip{},clip_to_view{},clip_to_prev{},prev_to_clip{};
     float pos[3]{},right[3]{},up[3]{},forward[3]{};
     float fov{},aspect{};
+    // Raw views for pose-only (rotation) reprojection.
+    XrPosef pose{},previous_pose{};XrFovf view_fov{},previous_fov{};
     bool valid{};
 };
 inline Camera camera(const XrCompositionLayerProjectionView& current,
@@ -84,7 +86,8 @@ inline Camera camera(const XrCompositionLayerProjectionView& current,
     if(!finite_matrix(p)||!finite_matrix(cam)||!inverse(cam,view)||!inverse(p,out.clip_to_view)){
         return out;
     }
-    out.view_to_clip=p;
+    out.view_to_clip=p;out.pose=out.previous_pose=current.pose;out.view_fov=out.previous_fov=current.fov;
+    if(previous){out.previous_pose=previous->pose;out.previous_fov=previous->fov;}
     if(previous){
         auto previous_cam=world_from_view(previous->pose);
         auto previous_projection=projection(previous->fov,.05f,10000.f,inverted);

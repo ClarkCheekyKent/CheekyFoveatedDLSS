@@ -44,9 +44,12 @@ inline GuideGrid guide_grid(const CheekyFgEye& g,unsigned dw,unsigned dh,unsigne
     if(pass==1&&!focused)return r;
     const unsigned scale=pass?g.peripheral_percent:g.resolution_percent;
     r.color_width=std::max(32u,(r.w*scale+50u)/100u);r.color_height=std::max(32u,(r.h*scale+50u)/100u);
-    r.depth=pass==0?g.center_method!=4:(g.peripheral_method==2||g.peripheral_method==3);
-    r.motion=pass==0?g.center_method!=4:(g.peripheral_method>=1&&g.peripheral_method<=3);
-    const unsigned sw=r.depth?std::min(dw,mw):mw,sh=r.depth?std::min(dh,mh):mh;
+    // Only what the region's method reads: simple warping uses no depth, and
+    // the optical flow methods estimate their own motion.
+    const unsigned method=pass?g.peripheral_method:g.center_method;
+    r.depth=pass==0?(method==0||method==2||method==5):(method==2||method==3||method==5);
+    r.motion=pass==0?method<=2:(method>=1&&method<=3);
+    const unsigned sw=r.depth?(r.motion?std::min(dw,mw):dw):mw,sh=r.depth?(r.motion?std::min(dh,mh):dh):mh;
     r.width=std::clamp(unsigned(std::round(double(sw)*r.w/g.width*std::min(1.,double(r.color_width)/r.w))),1u,r.color_width);
     r.height=std::clamp(unsigned(std::round(double(sh)*r.h/g.height*std::min(1.,double(r.color_height)/r.h))),1u,r.color_height);
     return r;

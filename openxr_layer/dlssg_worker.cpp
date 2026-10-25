@@ -211,7 +211,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(frame_index==1)for(unsigned eye=0;eye<2;++eye){
         const auto& g=guides.eyes[eye];const bool focused=g.focus_width<.999f||g.focus_height<.999f;
         for(unsigned pass=0;pass<2;++pass){
-            if((pass?g.peripheral_method:g.center_method)!=4||(pass&&!focused))continue;
+            if(!cheeky_fg_optical(pass?g.peripheral_method:g.center_method)||(pass&&!focused))continue;
             const unsigned rw=pass||!focused?width:std::clamp(unsigned(std::round(width*g.focus_width)),1u,width);
             const unsigned rh=pass||!focused?height:std::clamp(unsigned(std::round(height*g.focus_height)),1u,height);
             const unsigned rx=pass||!focused?0:unsigned(std::clamp((width-rw)*.5f+g.focus_x*width,0.f,float(width-rw)));
@@ -220,6 +220,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             const unsigned scale=pass?g.peripheral_percent:g.resolution_percent;
             auto c=optical::constants(g,pass,rect,previous_layouts[eye],color_layouts[eye],
                 std::max(32u,(rw*scale+50)/100),std::max(32u,(rh*scale+50)/100));
+            optical::pose_mapping(c,cameras[eye].previous_pose,cameras[eye].previous_fov,cameras[eye].pose,cameras[eye].view_fov,fraction);
             focus.optical_constants[eye][pass]=c;
             if(!optical_timing_started){
                 if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
@@ -314,7 +315,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         // It must be resampled before publication, so it cannot write directly
         // into the atlas/XR destination that represents the current origin.
         const bool recenter_output=center_pass&&(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f);
-        if(!recenter_output&&direct&&copies&&!(final_xr&&g.peripheral_method==4)&&((*copies)[eye].layout.packed()||final_xr)&&!(final_xr?f.xr_direct_rejected:f.direct_rejected)){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
+        if(!recenter_output&&direct&&copies&&!(final_xr&&cheeky_fg_optical(g.peripheral_method))&&((*copies)[eye].layout.packed()||final_xr)&&!(final_xr?f.xr_direct_rejected:f.direct_rejected)){const auto& destination=(*copies)[eye];const auto d=destination.texture->GetDesc();
             const auto& layout=destination.layout;
             f.offset_x=final_xr?rect.x:0;f.offset_y=final_xr?rect.y:layout.packed()&&!center_pass?layout.center_height:0;
             f.direct=writable_color(d.Format,desc.Format)&&(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)&&
@@ -470,9 +471,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(!prepare_first||phase==0) {
                 gpu_timings.stamp(commands,query);
                 const bool image_only=cheeky_fg_image_only(g.center_method,g.peripheral_method,g.focus_width<.999f||g.focus_height<.999f);
-                if((!image_only&&(!g.depth||!g.motion))||g.width!=width||g.height!=height){report("FG guide/output dimensions disagree",unsigned(E_INVALIDARG));failed=true;good=false;break;}
+                // Prepared guides omit textures their methods do not read;
+                // prepare_inputs validates those per pass.
+                const bool raw_guides=!image_only&&!g.prepared_guides;
+                if((raw_guides&&(!g.depth||!g.motion))||g.width!=width||g.height!=height){report("FG guide/output dimensions disagree",unsigned(E_INVALIDARG));failed=true;good=false;break;}
                 source_depth_format=g.depth?unsigned(g.depth->GetDesc().Format):0;source_motion_format=g.motion?unsigned(g.motion->GetDesc().Format):0;
-                if(!image_only&&
+                if(raw_guides&&
                    (depth_srv_format(DXGI_FORMAT(source_depth_format))==DXGI_FORMAT_UNKNOWN||motion_srv_format(DXGI_FORMAT(source_motion_format))==DXGI_FORMAT_UNKNOWN)){
                     sprintf_s(diagnostic,"FG guide conversion unsupported: depth=%u motion=%u; displaying native frames",source_depth_format,source_motion_format);
                     if(trace)trace(diagnostic);failed=true;good=false;break;
@@ -567,7 +571,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                     good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
                     base=peripheral_features[eye].target;
                 }else {
-                    custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed()&&g.peripheral_method!=4;
+                    custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed()&&!cheeky_fg_optical(g.peripheral_method);
                     auto* target=custom_context_direct?(*copies)[eye].texture:nullptr;
                     good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                         target,custom_context_direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON,

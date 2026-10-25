@@ -272,12 +272,15 @@ void update_settings(const Settings& settings) noexcept {
     auto fg_percent=[](std::uint32_t n) {return n==25||n==50||n==75||n==100?n:100u;};
     fg_settings.resolution_percent=fg_percent(fg_settings.resolution_percent);
     fg_settings.peripheral_percent=fg_percent(fg_settings.peripheral_percent);
-    fg_settings.peripheral_method=std::min(fg_settings.peripheral_method,4u);
+    fg_settings.peripheral_method=std::min(fg_settings.peripheral_method,5u);
     if(!cheeky_fg_center_valid(fg_settings.center_method))fg_settings.center_method=0;
     fg_settings.optical.center_preset=std::min(fg_settings.optical.center_preset,2u);
     fg_settings.optical.peripheral_preset=std::min(fg_settings.optical.peripheral_preset,2u);
     fg_settings.optical.center_percent=fg_percent(fg_settings.optical.center_percent);
     fg_settings.optical.peripheral_percent=fg_percent(fg_settings.optical.peripheral_percent);
+    auto fg_grid=[](std::uint32_t n) {return n==1||n==2||n==4?n:4u;};
+    fg_settings.optical.center_grid=fg_grid(fg_settings.optical.center_grid);
+    fg_settings.optical.peripheral_grid=fg_grid(fg_settings.optical.peripheral_grid);
     d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(
