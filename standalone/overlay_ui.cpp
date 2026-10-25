@@ -963,11 +963,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
         if (s.pacing_clock != 0)
             ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
-        if (s.pacing_clock == 2) {
-            ImGui::Checkbox("Lock vsync phase to GPU finish", &s.phase_lock_to_gpu_finish);
-            if (s.phase_lock_to_gpu_finish)
-                ImGui::TextWrapped("Aims the vsync lock at the moment the game's frame finishes on the GPU instead of when the game starts it, so a frame that takes longer on the GPU still finishes just before the headset slot its first generated frame uses.");
-        }
         ImGui::Checkbox("Present from a dedicated GPU queue (D3D12)", &s.dedicated_present_queue);
         if (s.dedicated_present_queue)
             ImGui::TextWrapped("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.");
@@ -978,6 +973,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if (s.limit_gpu_ahead)
             ImGui::TextWrapped("With a Follow pacing clock and release Never: the game waits whenever its previous frame has not yet been captured on the GPU, so the GPU cannot fall a frame behind and add latency.");
         if (s.limit_gpu_ahead) {
+            ImGui::Checkbox("Also wait for frame generation on the GPU", &s.hold_for_generation);
+            if (s.hold_for_generation)
+                ImGui::TextWrapped("Also waits until the generated frames queued after the game's previous frame have finished on the GPU, so the next game frame cannot push frame generation behind it and add latency.");
             ImGui::Checkbox("Adaptive GPU lead", &s.adaptive_gpu_lead);
             if (s.adaptive_gpu_lead)
                 ImGui::TextWrapped("Lets the game start its next frame slightly before the GPU finishes the previous one, by a lead that tunes itself so the GPU stays busy without a frame queuing up.");

@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgAdaptiveGpuLead", "FgPhaseLockToGpuFinish", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgAdaptiveGpuLead", "FgHoldForGeneration", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -710,12 +710,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
                     end
                 end
-                if draft.FgPhaseLockToGpuFinish ~= nil and draft.FgPacingClock == 2 then
-                    check("Lock vsync phase to GPU finish", "FgPhaseLockToGpuFinish")
-                    if draft.FgPhaseLockToGpuFinish then
-                        text("Aims the vsync lock at the moment the game's frame finishes on the GPU instead of when the game starts it, so a frame that takes longer on the GPU still finishes just before the headset slot its first generated frame uses.")
-                    end
-                end
                 if draft.FgDedicatedPresentQueue ~= nil then
                     check("Present from a dedicated GPU queue (D3D12)", "FgDedicatedPresentQueue")
                     if draft.FgDedicatedPresentQueue then
@@ -732,6 +726,12 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     check("Keep the GPU from falling behind (Never + Follow)", "FgLimitGpuAhead")
                     if draft.FgLimitGpuAhead then
                         text("With a Follow pacing clock and release Never: the game waits whenever its previous frame has not yet been captured on the GPU, so the GPU cannot fall a frame behind and add latency.")
+                    end
+                end
+                if draft.FgHoldForGeneration ~= nil and draft.FgLimitGpuAhead then
+                    check("Also wait for frame generation on the GPU", "FgHoldForGeneration")
+                    if draft.FgHoldForGeneration then
+                        text("Also waits until the generated frames queued after the game's previous frame have finished on the GPU, so the next game frame cannot push frame generation behind it and add latency.")
                     end
                 end
                 if draft.FgAdaptiveGpuLead ~= nil and draft.FgLimitGpuAhead then
