@@ -83,6 +83,11 @@
     <ClInclude Include="src\dlss_nr_contract.hpp" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="CheekyFakeGazeProvider.vcxproj">
+      <Project>{514AE60D-49DA-46DE-8541-4A8F45833214}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
     <ProjectReference Include="CheekyFakeRealVR.vcxproj">
       <Project>{514AE60D-49DA-46DE-8541-4A8F45833213}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>

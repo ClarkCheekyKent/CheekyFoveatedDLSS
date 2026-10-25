@@ -101,6 +101,8 @@ if ($LASTEXITCODE -ne 0) { throw "LibOVR D3D11/D3D12 source transfer tests faile
 if ($LASTEXITCODE -ne 0) { throw "Incomplete corner calibration escalation test failed." }
 & $testExecutable --rr-contract
 if ($LASTEXITCODE -ne 0) { throw "RR contract tests failed." }
+& $testExecutable --gaze-provider
+if ($LASTEXITCODE -ne 0) { throw "Gaze provider tests failed." }
 & $testExecutable
 if ($LASTEXITCODE -ne 0) {
     throw "Tests failed with exit code $LASTEXITCODE."
