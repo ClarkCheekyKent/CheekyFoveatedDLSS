@@ -169,8 +169,8 @@ foreach ($hostKind in @('standalone','optiscaler')) {
     }
 }
 $bootstrapTest = Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapTests.exe"
-foreach ($mode in @('proxy','version','asi','missing','chain','broken-chain','loop-chain','device-chain')) {
-    $proxyInput = if ($mode -eq 'version') { 'version-loader\version.dll' } else { 'standalone-loader\dxgi.dll' }
+foreach ($mode in @('proxy','version','version-local-dxgi','asi','missing','chain','broken-chain','loop-chain','device-chain')) {
+    $proxyInput = if ($mode -like 'version*') { 'version-loader\version.dll' } else { 'standalone-loader\dxgi.dll' }
     & $bootstrapTest $mode (Join-Path $projectRoot "bin\$Configuration\$proxyInput") (Join-Path $projectRoot "bin\$Configuration\CheekyFoveatedDLSS.asi") (Join-Path $projectRoot "bin\$Configuration\CheekyBootstrapFakeHost.dll")
     if ($LASTEXITCODE -ne 0) { throw "Bootstrap tests failed: $mode" }
 }
