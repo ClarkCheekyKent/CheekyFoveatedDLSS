@@ -70,7 +70,7 @@ void Worker::reset_features() noexcept {
 void Worker::reset() noexcept {
     std::lock_guard lock(ngx_mutex);wait_idle();reset_features();
     latency.reset();gpu_timings.reset();completion_wait={};submitted_at={};
-    if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();second_allocator.Reset();list.Reset();second_list.Reset();fence.Reset();
+    if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();second_allocator.Reset();optical_allocator.Reset();list.Reset();second_list.Reset();optical_list.Reset();fence.Reset();
     allocate=nullptr;destroy=nullptr;create=nullptr;evaluate=nullptr;release=nullptr;
     configured=false;serial=prepared_serial=0;width=height=0;init=nullptr;capabilities=nullptr;
 }
@@ -223,10 +223,14 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             optical::pose_mapping(c,cameras[eye].previous_pose,cameras[eye].previous_fov,cameras[eye].pose,cameras[eye].view_fov,fraction);
             focus.optical_constants[eye][pass]=c;
             if(!optical_timing_started){
-                if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return false;
-                latency.begin(list.Get());gpu_timings.begin(list.Get());
-                if(FAILED(list->Close()))return false;ID3D12CommandList* start[]{list.Get()};queue->ExecuteCommandLists(1,start);
-                if(FAILED(queue->Signal(fence.Get(),++serial))||!wait_idle())return false;
+                // A dedicated list, retired by the previous frame's completion
+                // wait, so the main allocator is free without a CPU drain.
+                if(!optical_allocator&&(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&optical_allocator)))||
+                   FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,optical_allocator.Get(),nullptr,IID_PPV_ARGS(&optical_list)))||
+                   FAILED(optical_list->Close())))return false;
+                if(!wait_fence(serial)||FAILED(optical_allocator->Reset())||FAILED(optical_list->Reset(optical_allocator.Get(),nullptr)))return false;
+                latency.begin(optical_list.Get());gpu_timings.begin(optical_list.Get());
+                if(FAILED(optical_list->Close()))return false;ID3D12CommandList* start[]{optical_list.Get()};queue->ExecuteCommandLists(1,start);
                 optical_timing_started=true;
             }
             auto& session=focus.optical[eye][pass];

@@ -733,7 +733,7 @@ const char* fg_state_name(CheekyFgState value) noexcept {
     case CheekyFgState::off: return "Off";
     case CheekyFgState::waiting_for_stereo: return "Waiting for a running D3D12 OpenXR stereo session";
     case CheekyFgState::starting: return "Starting at the next frame";
-    case CheekyFgState::waiting_for_history: return "Waiting for frame history";
+    case CheekyFgState::waiting_for_history: return "Waiting for the previous real frame (interpolation needs a consecutive pair)";
     case CheekyFgState::waiting_for_guides: return "Waiting for stereo NGX depth and motion vectors";
     case CheekyFgState::queue_mismatch: return "NGX and OpenXR command queues do not match";
     case CheekyFgState::ngx_unavailable: return "NVIDIA NGX frame generation unavailable";

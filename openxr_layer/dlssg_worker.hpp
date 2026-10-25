@@ -33,8 +33,8 @@ struct Worker {
     using Release=decltype(&NVSDK_NGX_D3D12_ReleaseFeature);
     Allocate allocate{};Destroy destroy{};Create create{};Evaluate evaluate{};Release release{};
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> allocator,second_allocator;
-    ComPtr<ID3D12GraphicsCommandList> list,second_list;
+    ComPtr<ID3D12CommandAllocator> allocator,second_allocator,optical_allocator;
+    ComPtr<ID3D12GraphicsCommandList> list,second_list,optical_list;
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;

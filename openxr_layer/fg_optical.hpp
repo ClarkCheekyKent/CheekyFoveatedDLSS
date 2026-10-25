@@ -241,9 +241,11 @@ struct Session12 : Error {
     }
     bool prepare(ID3D12Device* dev,ID3D12CommandQueue* q,ID3D12Resource* old,ID3D12Resource* now,unsigned quality,OpticalConstants c,bool reset_history,
         D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format){
+        // Only this session's previous submission must retire before its
+        // allocator is reused. The flow engine waits on the queue-side fence
+        // below, which follows every earlier render that sampled our vectors,
+        // so the CPU never waits for unrelated (game) work on a shared queue.
         if(!initialize(dev,q,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0]))||!wait())return false;
-        // A previous render on the consumer queue may still sample our vectors.
-        if(FAILED(queue->Signal(fence.Get(),++serial))||!wait())return fail("consumer fence");
         if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return fail("command reset");
         barrier(list.Get(),old,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);if(now!=old)barrier(list.Get(),now,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(unsigned i=0;i<2;++i)barrier(list.Get(),textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
