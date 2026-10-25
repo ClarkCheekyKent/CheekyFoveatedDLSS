@@ -106,6 +106,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // flight (pending, generating, history, presenting). More of both lets the
     // game keep rendering while slower frame generation catches up.
     static constexpr unsigned max_credits=4;
+    // Captured real frames waiting for generation. Kept in order: interpolation
+    // needs consecutive real frames, so a burst is worked off instead of skipped.
+    static constexpr std::size_t max_pending=3;
     std::array<std::shared_ptr<Native>,5> slots;
     void release_idle_slots() noexcept {
         // Hold mx. Only the slot itself owns these completed jobs; pending and
@@ -687,7 +690,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
                 latest_native=std::move(native);
                 if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),5u);
-                if(inference_slot){pending.push_back(job);while(pending.size()>2){pending.front()->clear_guides();pending.pop_front();++skipped;}}
+                if(inference_slot){pending.push_back(job);while(pending.size()>max_pending){pending.front()->clear_guides();pending.pop_front();++skipped;}}
                 ++frames;held_valid=true;changed.notify_all();
             }
         }
@@ -716,14 +719,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         try {for(;;) {
             std::shared_ptr<Native> job;
             {std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||!pending.empty();});if(stopping)break;
-             job=pending.back();inflight_id=job->id;
+             job=pending.front();pending.pop_front();inflight_id=job->id;
              inflight_release_point=job->guides_valid?job->policy.release_point:0u;inflight_prepared=false;
              if(job->guides_valid){
                  if(active_release_point!=job->policy.release_point)cadence_window={};
                  active_release_point=job->policy.release_point;
              }changed.notify_all();
-             skipped+=pending.size()-1;
-             for(auto& dropped:pending)if(dropped!=job)dropped->clear_guides();pending.clear();}
+             }
             if(measured_diagnostics!=unsigned(job->latency_diagnostics)){
                 measured_diagnostics=unsigned(job->latency_diagnostics);logged_samples=0;
                 std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
@@ -824,7 +826,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                             static_cast<unsigned long long>(status.serial));
                         trace(publication);
                     }
-                    ready.push_back(std::move(pair));while(ready.size()>2)ready.pop_front();
+                    ready.push_back(std::move(pair));while(ready.size()>max_pending)ready.pop_front();
                 }
                 if(success)completed_pair_id=job->id;
                 // Once real interpolation is available, briefly stop the
@@ -982,8 +984,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void wake_producer() {std::lock_guard lock(mx);wake_producer_locked();}
     std::deque<Pair>::iterator newest_ready_pair(double position) {
         auto selected=ready.end();
+        // The next pair in order, not the newest: a backlog is shown, not skipped,
+        // so every real frame keeps its generated frames.
         for(auto it=ready.begin();it!=ready.end();++it)
-            if(capture_completed(it->ready)&&double(it->native_id)>=position)selected=it;
+            if(capture_completed(it->ready)&&double(it->native_id)>=position){selected=it;break;}
         return selected;
     }
     bool render(Pair& pair,const std::array<Image,2>& images,
