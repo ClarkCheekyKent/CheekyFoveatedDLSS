@@ -117,6 +117,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // GPU wait on the game's queue would stall the game behind generation.
     std::atomic<bool> gpu_waited_present{};
     std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
+    std::uint64_t upload_capture_ticket{}; // Presenter thread only; producer fence value the next upload waits on.
     bool gpu_waited_uploads() const noexcept {return runtime_queue&&gpu_waited_present.load(std::memory_order_relaxed);}
     unsigned max_credits() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?4u:2u;}
     std::size_t slot_count() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?5u:3u;}
@@ -1084,8 +1085,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // Streaming DX12 phases each own a stereo immutable-output fence.
         // Native pairs retain their original producer dependency.
         const bool gpu_waited=generated&&pair.progress&&gpu_waited_uploads();
-        if(!gpu_waited&&!capture_completed(pair.ready))return false;
-        upload_dependency.reset();
+        upload_dependency.reset();upload_capture_ticket=0;
+        // Content selected before its capture finished: the upload waits for
+        // the capture on the GPU rather than failing the submission.
+        if(!gpu_waited&&!capture_completed(pair.ready)){
+            if(!gpu_waited_uploads()||pair.direct_xr)return false;
+            upload_capture_ticket=pair.ready;
+        }
         if(generated&&pair.progress){std::lock_guard lock(mx);
             if(!phase_presentable(pair,pair.generated_index))return false;
             const auto& phase=pair.progress->phases[pair.generated_index];
@@ -1098,7 +1104,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(latency_diagnostics.load()!=0)collect_native_submission_probes();
         auto views=original_views;auto layers=pair.layers;
         const bool published=backend->publish(pair,images,views,layers,generated);
-        upload_dependency.reset();
+        upload_dependency.reset();upload_capture_ticket=0;
         if(!published)return false;
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=pair.space;
         projection.layerFlags=layers.scene_flags;projection.viewCount=2;projection.views=views.data();

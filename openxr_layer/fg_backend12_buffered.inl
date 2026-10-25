@@ -295,7 +295,8 @@ inline bool BufferedPresenter::upload_batch(const std::vector<std::pair<Chain*,I
             }
             // A generated phase handed over before it finished: the copy waits
             // for it on the GPU (uploads run on the layer-owned runtime queue).
-            if(good&&upload_dependency&&!upload_dependency->gpu_wait(uploads.queue.Get())){good=false;c->list->Close();burst.abandon();}
+            if(good&&((upload_dependency&&!upload_dependency->gpu_wait(uploads.queue.Get()))||
+                (upload_capture_ticket&&FAILED(uploads.queue->Wait(producer.fence.Get(),upload_capture_ticket))))){good=false;c->list->Close();burst.abandon();}
             else if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
                 if(good){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
                 else burst.abandon();}
