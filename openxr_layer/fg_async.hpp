@@ -62,6 +62,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
     TimingClock::time_point last_native_present{},runtime_wake{};
     std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{},backlog_holds{};
+    bool backlog_detected{}; // Hold mx. Set by the presenter, consumed by the pacing clock.
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
     // Hold mx. Smoothed interval between runtime xrWaitFrame wakes. Some
     // runtimes report a display period that does not match how often they
@@ -463,7 +464,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=0;
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=0;backlog_detected=false;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -999,12 +1000,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     native_clock_ms=native_ms;
                     const auto period=std::chrono::duration_cast<TimingClock::duration>(
                         std::chrono::duration<double,std::milli>(native_ms));
-                    // Follow modes: a full ready or inference queue means the
-                    // next game frame would only push out a queued one and add
-                    // a whole frame of latency. Skip this credit instead so
-                    // the backlog drains back to the low-latency depth.
-                    const bool backlog=mode!=0u&&pacing_active&&(ready.size()>=max_pending()||pending.size()>=max_pending());
-                    if(backlog)++backlog_holds;
+                    // Follow modes: a standing backlog (a pair already queued
+                    // behind the one being shown, or a full queue) holds every
+                    // frame a whole frame longer. Skip this credit so the
+                    // queued frame fills the gap and the backlog drains.
+                    const bool backlog=mode!=0u&&pacing_active&&
+                        (backlog_detected||ready.size()>=max_pending()||pending.size()>=max_pending());
+                    backlog_detected=false;
+                    // A banked credit would let the game run ahead regardless.
+                    if(backlog){++backlog_holds;if(credits>0)--credits;}
                     if(!raw&&!backlog) {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                             mark_credit_deferred();
@@ -1232,6 +1236,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {
                         active=std::move(*selected);ready.erase(ready.begin(),std::next(selected));have_active=true;
+                        // Another whole pair already waiting behind the one just
+                        // taken is a standing backlog: a frame of added latency
+                        // that equal in/out rates never drain on their own.
+                        if(!ready.empty())backlog_detected=true;
                         fg_active=active.interpolated;
                         if(active.interpolated&&double(active.native_id)<=last_position&&
                             double(active.current_id)>last_position)generated_phase=true;
