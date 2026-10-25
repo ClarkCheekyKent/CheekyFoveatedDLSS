@@ -63,6 +63,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     TimingClock::time_point last_native_present{},runtime_wake{};
     std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{},backlog_holds{},gpu_behind_holds{};
     bool backlog_detected{}; // Hold mx. Set by the presenter, consumed by the pacing clock.
+    bool gpu_behind_credit{}; // Hold mx. A tick's credit held until the previous capture finishes on the GPU.
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
     // Hold mx. Smoothed interval between runtime xrWaitFrame wakes. Some
     // runtimes report a display period that does not match how often they
@@ -465,7 +466,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=0;backlog_detected=false;
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=0;backlog_detected=gpu_behind_credit=false;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -985,6 +986,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     release_deferred_credit();
                     changed.notify_all(); // Existing wait/begin credits may also be gated.
                 }
+                // A tick held for the GPU is granted the moment the previous
+                // capture finishes, not a whole tick later: waiting for the
+                // next tick quantizes the game to multiples of the tick.
+                if(gpu_behind_credit&&(!latest_native||capture_completed(latest_native->ready))) {
+                    gpu_behind_credit=false;
+                    if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1);changed.notify_all();}
+                }
                 if(now>=next) {
                     clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
                     const double display_ms=mode!=0u?follow_display_ms():
@@ -1016,12 +1024,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     const bool gpu_behind=limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&
                         latest_native&&!capture_completed(latest_native->ready);
                     const bool backlog=mode!=0u&&pacing_active&&
-                        (backlog_detected||gpu_behind||ready.size()>=max_pending()||pending.size()>=max_pending());
-                    if(mode!=0u&&pacing_active&&gpu_behind)++gpu_behind_holds;
+                        (backlog_detected||ready.size()>=max_pending()||pending.size()>=max_pending());
+                    const bool hold_for_gpu=!backlog&&mode!=0u&&pacing_active&&gpu_behind;
                     backlog_detected=false;
                     // A banked credit would let the game run ahead regardless.
                     if(backlog){++backlog_holds;if(credits>0)--credits;}
-                    if(!raw&&!backlog) {
+                    if(hold_for_gpu){++gpu_behind_holds;if(credits>0)--credits;gpu_behind_credit=true;}
+                    if(!raw&&!backlog&&!hold_for_gpu) {
                         if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
                             mark_credit_deferred();
                         }else if(credit_deferred)release_deferred_credit();
@@ -1030,8 +1039,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     }
                     next+=period;if(next<=now)next=now+period;
                 }
-                const auto wake=release_delay_until!=TimingClock::time_point{}?
+                auto wake=release_delay_until!=TimingClock::time_point{}?
                     std::min(next,release_delay_until):next;
+                // GPU completion does not notify; poll only while a tick is held for it.
+                if(gpu_behind_credit)wake=std::min(wake,TimingClock::now()+std::chrono::microseconds(500));
                 changed.wait_until(lock,wake);
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
