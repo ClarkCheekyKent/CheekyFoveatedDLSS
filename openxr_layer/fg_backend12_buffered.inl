@@ -293,7 +293,10 @@ inline bool BufferedPresenter::upload_batch(const std::vector<std::pair<Chain*,I
                 burst.record(device.Get(),c->list.Get(),item.chain->images[item.index].texture,xr_image_state(),
                     "openxr",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
             }
-            if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
+            // A generated phase handed over before it finished: the copy waits
+            // for it on the GPU (uploads run on the layer-owned runtime queue).
+            if(good&&upload_dependency&&!upload_dependency->gpu_wait(uploads.queue.Get())){good=false;c->list->Close();burst.abandon();}
+            else if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
                 if(good){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
                 else burst.abandon();}
             else {c->list->Close();burst.abandon();}

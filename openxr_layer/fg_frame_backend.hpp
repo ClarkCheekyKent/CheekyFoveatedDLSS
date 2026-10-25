@@ -30,6 +30,10 @@ struct FrameGuides {virtual ~FrameGuides()=default;};
 struct FrameCompletion {
     virtual ~FrameCompletion()=default;
     virtual bool ready() const noexcept=0; // Poll only; never wait or call OpenXR.
+    // Queue a GPU-side wait for this completion on `queue` (the backend's
+    // native queue type). False when the backend cannot wait on the GPU.
+    virtual bool gpu_wait(void* /*queue*/) const noexcept {return false;}
+    virtual bool gpu_waitable() const noexcept {return false;}
 };
 
 enum class CaptureOutcome { captured, unavailable, busy };

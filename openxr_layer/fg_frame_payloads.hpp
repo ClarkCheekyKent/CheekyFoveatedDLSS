@@ -35,6 +35,10 @@ struct FrameCompletion12 final : FrameCompletion {
     std::uint64_t value{};
     FrameCompletion12(ID3D12Fence* f,std::uint64_t v):fence(f),value(v){}
     bool ready() const noexcept override {return fence&&fence->GetCompletedValue()>=value;}
+    bool gpu_waitable() const noexcept override {return fence!=nullptr;}
+    bool gpu_wait(void* queue) const noexcept override {
+        return fence&&queue&&SUCCEEDED(static_cast<ID3D12CommandQueue*>(queue)->Wait(fence.Get(),value));
+    }
 };
 
 // Native D3D11: per-eye snapshots from Backend11 (interpolation also samples

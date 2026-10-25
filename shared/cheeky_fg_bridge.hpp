@@ -237,6 +237,7 @@ struct CheekyFgPacingOptions {
     std::uint32_t native11_release_point{3}; // Shared release setting: 0 FG submission ... 3 generated frame submission, 4 submission + 4 ms.
     std::uint32_t extra_frame_slots{}; // 1: 4 banked credits and 5 capture slots (more VRAM). Absent in older layers.
     std::uint32_t dedicated_present_queue{}; // 1: give the OpenXR runtime the layer's own D3D12 queue at session creation.
+    std::uint32_t gpu_waited_present{}; // 1: hand generated frames to the runtime once queued; the upload waits on the GPU, not the presenter's CPU.
 };
 using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
 // Independent export: D3D12 quad-view composition in xrEndFrame.

@@ -111,6 +111,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // let the game keep rendering while slower frame generation catches up, at
     // the cost of two more full stereo color copies of VRAM.
     std::atomic<bool> extra_frame_slots{};
+    // Generated phases are handed to the runtime once their GPU work is
+    // queued; the upload queue waits on the phase fence instead of the
+    // presenter thread polling it. Only with a layer-owned runtime queue: a
+    // GPU wait on the game's queue would stall the game behind generation.
+    std::atomic<bool> gpu_waited_present{};
+    std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
+    bool gpu_waited_uploads() const noexcept {return runtime_queue&&gpu_waited_present.load(std::memory_order_relaxed);}
     unsigned max_credits() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?4u:2u;}
     std::size_t slot_count() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?5u:3u;}
     // Captured real frames waiting for generation. Kept in order: interpolation
@@ -551,6 +558,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const auto mode=std::min(pacing.clock_mode,2u);
             const bool extra=pacing.extra_frame_slots!=0;
             if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
+            const bool gpu_waited=pacing.gpu_waited_present!=0;
+            if(gpu_waited_present.exchange(gpu_waited)!=gpu_waited&&trace)
+                trace(gpu_waited?(runtime_queue?"FG GPU-waited present=ON":"FG GPU-waited present requested; inactive without the dedicated present queue"):"FG GPU-waited present=OFF");
             if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
                 mode==1u?"FG pacing clock=presented native rate":"FG pacing clock=independent display clock");
             const auto point=std::min(pacing.native11_release_point,7u);
@@ -761,6 +771,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(pair.progress->failed||index>=pair.generated_count)return false;
         const auto& p=pair.progress->phases[index];
         return p.images[0]&&p.images[1]&&p.completion&&p.completion->ready();
+    }
+    // Hold mx. Whether the presenter may submit this phase now: finished, or
+    // queued with a fence the upload can wait on.
+    bool phase_presentable(const Pair& pair,unsigned index) const {
+        if(!gpu_waited_uploads())return phase_ready(pair,index);
+        if(!pair.progress)return true;
+        if(pair.progress->failed||index>=pair.generated_count)return false;
+        const auto& p=pair.progress->phases[index];
+        return p.images[0]&&p.images[1]&&p.completion&&(p.completion->ready()||p.completion->gpu_waitable());
     }
 
     void generation_loop() noexcept {
@@ -1051,8 +1070,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         auto selected=ready.end();
         // The next pair in order, not the newest: a backlog is shown, not skipped,
         // so every real frame keeps its generated frames.
-        for(auto it=ready.begin();it!=ready.end();++it)
-            if(capture_completed(it->ready)&&(!it->progress||phase_ready(*it,0))&&double(it->native_id)>=position){selected=it;break;}
+        for(auto it=ready.begin();it!=ready.end();++it){
+            // A streamed pair's phase fence follows its capture on the GPU.
+            const bool presentable=it->progress&&gpu_waited_uploads()?phase_presentable(*it,0):
+                capture_completed(it->ready)&&(!it->progress||phase_ready(*it,0));
+            if(presentable&&double(it->native_id)>=position){selected=it;break;}
+        }
         return selected;
     }
     bool render(Pair& pair,const std::array<Image,2>& images,
@@ -1060,17 +1083,23 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 XrResult& result,bool& closed) {
         // Streaming DX12 phases each own a stereo immutable-output fence.
         // Native pairs retain their original producer dependency.
-        if(!capture_completed(pair.ready))return false;
+        const bool gpu_waited=generated&&pair.progress&&gpu_waited_uploads();
+        if(!gpu_waited&&!capture_completed(pair.ready))return false;
+        upload_dependency.reset();
         if(generated&&pair.progress){std::lock_guard lock(mx);
-            if(!phase_ready(pair,pair.generated_index))return false;
-            pair.submitted_at=pair.progress->phases[pair.generated_index].submitted_at;
+            if(!phase_presentable(pair,pair.generated_index))return false;
+            const auto& phase=pair.progress->phases[pair.generated_index];
+            if(gpu_waited&&!phase.completion->ready())upload_dependency=phase.completion;
+            pair.submitted_at=phase.submitted_at;
             pair.completed_at=TimingClock::now();}
         burst_native=pair.native_id;burst_current=pair.current_id;burst_generated=generated;
         burst_presentation=ticks;
         burst.begin_submission();
         if(latency_diagnostics.load()!=0)collect_native_submission_probes();
         auto views=original_views;auto layers=pair.layers;
-        if(!backend->publish(pair,images,views,layers,generated))return false;
+        const bool published=backend->publish(pair,images,views,layers,generated);
+        upload_dependency.reset();
+        if(!published)return false;
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=pair.space;
         projection.layerFlags=layers.scene_flags;projection.viewCount=2;projection.views=views.data();
         auto headers=layers.replace_scene(projection);XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=time;
@@ -1104,7 +1133,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // Hold mx. A pair whose native image was already displayed can still
         // contribute its interpolation; do not submit that native image twice.
         if(have_active&&active.progress&&active.progress->failed)return true; // Retire failed partial interval below.
-        if(have_active&&generated_phase)return phase_ready(active,active.generated_index);
+        if(have_active&&generated_phase)return phase_presentable(active,active.generated_index);
         if(have_active&&double(active.native_id)>position)return true;
         const auto selected=newest_ready_pair(position);
         if(selected!=ready.end()&&(double(selected->native_id)>position||
@@ -1124,7 +1153,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
-            const bool producer_pending=(have_active&&generated_phase&&active.progress&&!phase_ready(active,active.generated_index))||
+            const bool producer_pending=(have_active&&generated_phase&&active.progress&&!phase_presentable(active,active.generated_index))||
                 (!fg_active&&latest_native&&!capture_completed(latest_native->ready))||
                 std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !capture_completed(pair.ready)||(pair.progress&&!phase_ready(pair,0));});
             if(producer_pending)changed.wait_for(lock,std::chrono::milliseconds(1));

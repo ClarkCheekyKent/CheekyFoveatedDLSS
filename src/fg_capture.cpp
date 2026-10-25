@@ -600,7 +600,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     // generated frame is submitted), like the D3D12 path.
     out->native11_release_point=fg.release_point<=7u?fg.release_point:3u;
     if(out->size>=offsetof(CheekyFgPacingOptions,dedicated_present_queue))out->extra_frame_slots=fg.extra_frame_slots?1u:0u;
-    if(out->size>=sizeof(*out))out->dedicated_present_queue=fg.dedicated_present_queue?1u:0u;
+    if(out->size>=offsetof(CheekyFgPacingOptions,gpu_waited_present))out->dedicated_present_queue=fg.dedicated_present_queue?1u:0u;
+    if(out->size>=sizeof(*out))out->gpu_waited_present=fg.gpu_waited_present?1u:0u;
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetNative11OptionsV1(CheekyFgNative11Options* out) noexcept {

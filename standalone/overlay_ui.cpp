@@ -966,6 +966,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::Checkbox("Present from a dedicated GPU queue (D3D12)", &s.dedicated_present_queue);
         if (s.dedicated_present_queue)
             ImGui::TextWrapped("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.");
+        ImGui::Checkbox("Present without waiting on the GPU (D3D12)", &s.gpu_waited_present);
+        if (s.gpu_waited_present)
+            ImGui::TextWrapped("Generated frames go to the headset as soon as their GPU work is queued; the upload waits on the GPU instead of the presenter thread, so headset slots are not missed. Needs the dedicated GPU queue.");
         ImGui::Checkbox("Extra frame slots (more VRAM)", &s.extra_frame_slots);
         if (s.extra_frame_slots)
             ImGui::TextWrapped("Lets the game render up to 4 frames ahead while frame generation catches up. Uses two more full stereo frame copies of VRAM.");
