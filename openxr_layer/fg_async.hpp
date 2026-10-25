@@ -127,6 +127,50 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // soon as it rises, which is a frame starting to queue on the GPU.
     double gpu_lead_ms{},capture_complete_ms{},capture_floor_ms{};
     std::uint64_t stamped_capture_ticket{};
+    // Clock 2 option: lock the vsync phase to when the game's frame finishes
+    // on the GPU instead of when it starts. Ticks aim phase_target_offset_ms
+    // ahead of the runtime wake grid, steered so the capture completion plus
+    // generation time and a margin lands just before a headset slot. Hold mx.
+    std::atomic<bool> phase_lock_to_gpu_finish{};
+    double phase_target_offset_ms{},finish_phase_error_ms{},finish_capture_ms{},finish_jitter_ms{};
+    std::uint64_t finish_capture_ticket{},phase_offset_moves{};
+    bool phase_offset_tracking{};
+    bool finish_phase_active() const noexcept {
+        return pacing_clock_mode.load(std::memory_order_relaxed)==2u&&phase_lock_to_gpu_finish.load(std::memory_order_relaxed)&&pacing_active;
+    }
+    void reset_finish_phase() noexcept {
+        phase_target_offset_ms=finish_phase_error_ms=finish_capture_ms=finish_jitter_ms=0;finish_capture_ticket=0;phase_offset_tracking=false;
+    }
+    // Hold mx. One sample per completed capture, taken when the pacing loop
+    // first sees its fence. Completion phase is measured against the wake
+    // grid directly, so it already contains the game's CPU time before handoff.
+    void observe_finish_phase(TimingClock::time_point now) {
+        const double v=telemetry.xr_period_ms;
+        finish_capture_ticket=latest_native->ready;
+        if(latest_native->native_captured!=TimingClock::time_point{}&&latest_native->native_captured<=now){
+            const double d=std::chrono::duration<double,std::milli>(now-latest_native->native_captured).count();
+            finish_jitter_ms=finish_capture_ms>0?finish_jitter_ms*.9+std::abs(d-finish_capture_ms)*.1:0;
+            finish_capture_ms=finish_capture_ms>0?finish_capture_ms*.9+d*.1:d;
+        }
+        // Generated frames need their GPU time after the capture, then 1 ms
+        // plus the capture's own jitter of margin before the slot.
+        const double generation=telemetry.gpu_valid?std::clamp(telemetry.total_ms,0.,v*.75):0.;
+        const double margin=1.+std::min(finish_jitter_ms,2.);
+        const auto wrap=[v](double x){x=std::fmod(x,v);if(x<0)x+=v;return x>v/2?x-v:x;};
+        // Positive: the generated frame would be ready just after a slot.
+        const double error=wrap(std::chrono::duration<double,std::milli>(now-runtime_wake).count()+generation+margin);
+        finish_phase_error_ms=wrap(finish_phase_error_ms+wrap(error-finish_phase_error_ms)*.2);
+        // Hysteresis: start moving beyond 0.75 ms, stop inside 0.25 ms.
+        if(!phase_offset_tracking&&std::abs(finish_phase_error_ms)>.75)phase_offset_tracking=true;
+        else if(phase_offset_tracking&&std::abs(finish_phase_error_ms)<.25)phase_offset_tracking=false;
+        if(!phase_offset_tracking)return;
+        // Bounded step. The offset is a phase, so it wraps within one display
+        // period (always under one game frame). The step is taken out of the
+        // filtered error so the next samples do not ask for it again.
+        const double step=std::clamp(finish_phase_error_ms*.5,-.5,.5);
+        phase_target_offset_ms=std::fmod(phase_target_offset_ms+step+v,v);
+        finish_phase_error_ms-=step;++phase_offset_moves;
+    }
     bool adaptive_lead_active() const noexcept {
         return limit_gpu_ahead.load(std::memory_order_relaxed)&&adaptive_gpu_lead.load(std::memory_order_relaxed)&&active_release_point==5u;
     }
@@ -485,7 +529,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
         presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;backlog_detected=gpu_behind_credit=false;gpu_lead_ms=capture_complete_ms=capture_floor_ms=0;stamped_capture_ticket=0;
+        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;backlog_detected=gpu_behind_credit=false;gpu_lead_ms=capture_complete_ms=capture_floor_ms=0;stamped_capture_ticket=0;reset_finish_phase();phase_offset_moves=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -583,6 +627,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
             const bool lead=pacing.adaptive_gpu_lead!=0;
             if(adaptive_gpu_lead.exchange(lead)!=lead&&trace)trace(lead?"FG adaptive GPU lead=ON":"FG adaptive GPU lead=OFF");
+            const bool finish=pacing.phase_lock_to_gpu_finish!=0;
+            if(phase_lock_to_gpu_finish.exchange(finish)!=finish&&trace)trace(finish?"FG vsync phase lock target=GPU finish":"FG vsync phase lock target=frame start");
             const bool gpu_ahead=pacing.limit_gpu_ahead!=0;
             if(limit_gpu_ahead.exchange(gpu_ahead)!=gpu_ahead&&trace)trace(gpu_ahead?"FG limit GPU ahead=ON":"FG limit GPU ahead=OFF");
             const bool gpu_waited=pacing.gpu_waited_present!=0;
@@ -1005,7 +1051,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     // Wakes land on the real vsync grid even when the presenter
                     // skips slots, so the phase uses the reported period.
                     seen_wakes=runtime_wakes;const double v=telemetry.xr_period_ms;
-                    double error=std::fmod(std::chrono::duration<double,std::milli>(next-runtime_wake).count(),v);
+                    // GPU-finish target: ticks aim the steered offset ahead of the grid.
+                    if(!finish_phase_active()&&(phase_target_offset_ms!=0||finish_capture_ticket))reset_finish_phase();
+                    double error=std::fmod(std::chrono::duration<double,std::milli>(next-runtime_wake).count()+phase_target_offset_ms,v);
                     if(error<0)error+=v;if(error>v/2)error-=v;
                     if(std::abs(error)>.05){next-=std::chrono::duration_cast<TimingClock::duration>(
                         std::chrono::duration<double,std::milli>(error*.25));++phase_corrections;}
@@ -1035,6 +1083,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     if(d>capture_floor_ms+2.)gpu_lead_ms=std::max(0.,gpu_lead_ms-1.);
                     else gpu_lead_ms=std::min(std::max(0.,max_lead),gpu_lead_ms+.25);
                 }
+                if(finish_phase_active()&&runtime_wakes&&telemetry.xr_period_ms>0&&latest_native&&
+                   latest_native->ready!=finish_capture_ticket&&capture_completed(latest_native->ready))observe_finish_phase(now);
                 if(gpu_behind_credit&&!gpu_behind_now(now)) {
                     gpu_behind_credit=false;
                     if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1);changed.notify_all();}
@@ -1087,7 +1137,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 auto wake=release_delay_until!=TimingClock::time_point{}?
                     std::min(next,release_delay_until):next;
                 // GPU completion does not notify; poll only while a tick is held for it.
-                if(gpu_behind_credit||(adaptive_lead_active()&&latest_native&&latest_native->ready!=stamped_capture_ticket))
+                if(gpu_behind_credit||(adaptive_lead_active()&&latest_native&&latest_native->ready!=stamped_capture_ticket)||
+                   (finish_phase_active()&&latest_native&&latest_native->ready!=finish_capture_ticket))
                     wake=std::min(wake,TimingClock::now()+std::chrono::microseconds(500));
                 changed.wait_until(lock,wake);
             }
@@ -1440,7 +1491,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 }
             }
             measure_presenter_memory();
-            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[512]{},native_latency_log[512]{};
+            char age_log[512]{},stage_log[512]{},cadence_log[512]{},gpu_age_log[512]{},pacing_log[768]{},native_latency_log[512]{};
             {std::lock_guard lock(mx);
                 if(is_generated&&submitted){++generated_count;last_generated_submit_tick=GetTickCount64();}
                 if(submitted&&!is_generated&&!raw_frame){++distinct_native;
@@ -1471,11 +1522,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                         generation_stages[3].mean(),generation_stages[0].mean()+generation_stages[1].mean()+generation_stages[2].mean()+generation_stages[3].mean(),
                         static_cast<unsigned long long>(deferred_credits),static_cast<unsigned long long>(released_deferred_credits),unsigned(credit_deferred));
                     const auto time=pacing_timeline();
-                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu gpu_lead_ms=%.2f capture_complete_ms=%.2f capture_floor_ms=%.2f",
+                    sprintf_s(pacing_log,"FG CPU pacing timeline: clock_late=%.3f deferred_credit=%.3f credit_wait=%.3f begin_gate=%.3f presenter_content=%.3f native_end=%.3f generated_end=%.3f GPU_submit_to_complete=%.3f; deferred=%llu releases=%llu backlog_holds=%llu gpu_behind_holds=%llu gpu_behind_waits=%llu gpu_lead_ms=%.2f capture_complete_ms=%.2f capture_floor_ms=%.2f phase_target_offset_ms=%.2f finish_phase_error_ms=%.2f finish_capture_ms=%.2f finish_jitter_ms=%.2f phase_offset_moves=%llu",
                         time.clock_late_ms,time.credit_deferred_ms,time.game_wait_credit_ms,time.game_begin_gate_ms,
                         time.presenter_content_ms,time.native_xr_end_ms,time.generated_xr_end_ms,
                         time.fg_submit_to_complete_ms,time.deferred_events,time.deferred_releases,
-                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits),gpu_lead_ms,capture_complete_ms,capture_floor_ms);
+                        static_cast<unsigned long long>(backlog_holds),static_cast<unsigned long long>(gpu_behind_holds),static_cast<unsigned long long>(gpu_behind_waits),gpu_lead_ms,capture_complete_ms,capture_floor_ms,
+                        phase_target_offset_ms,finish_phase_error_ms,finish_capture_ms,finish_jitter_ms,static_cast<unsigned long long>(phase_offset_moves));
                     const auto native_latency=native_submission_latency();
                     sprintf_s(native_latency_log,"FG NATIVE submit latency (GPU final stereo capture end to xrEndFrame ENTER): enabled=%u samples=%llu pending=%llu missing=%llu signed_ms=%.3f last=%.3f hold_after_ready=%.3f early_before_ready=%.3f CPU_capture_to_submit=%.3f; NO FG-off baseline",
                         native_latency.enabled,static_cast<unsigned long long>(native_latency.gpu_samples),

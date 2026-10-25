@@ -240,6 +240,7 @@ struct CheekyFgPacingOptions {
     std::uint32_t gpu_waited_present{}; // 1: hand generated frames to the runtime once queued; the upload waits on the GPU, not the presenter's CPU.
     std::uint32_t limit_gpu_ahead{}; // 1: Follow clock + release Never hold the game while its previous frame is not yet captured on the GPU.
     std::uint32_t adaptive_gpu_lead{}; // 1: with limit_gpu_ahead, release the game a self-tuned lead before that capture is predicted to finish.
+    std::uint32_t phase_lock_to_gpu_finish{}; // 1: clock mode 2 aims the vsync lock at the game's GPU capture completion, not its frame start.
 };
 using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
 // Independent export: D3D12 quad-view composition in xrEndFrame.

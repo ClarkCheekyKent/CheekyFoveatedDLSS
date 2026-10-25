@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgAdaptiveGpuLead", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgAdaptiveGpuLead", "FgPhaseLockToGpuFinish", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -708,6 +708,12 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         [0]="Independent display clock", [1]="Follow presented frames", [2]="Follow presented frames + vsync lock"})
                     if draft.FgPacingClock ~= 0 then
                         text("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.")
+                    end
+                end
+                if draft.FgPhaseLockToGpuFinish ~= nil and draft.FgPacingClock == 2 then
+                    check("Lock vsync phase to GPU finish", "FgPhaseLockToGpuFinish")
+                    if draft.FgPhaseLockToGpuFinish then
+                        text("Aims the vsync lock at the moment the game's frame finishes on the GPU instead of when the game starts it, so a frame that takes longer on the GPU still finishes just before the headset slot its first generated frame uses.")
                     end
                 end
                 if draft.FgDedicatedPresentQueue ~= nil then
