@@ -30,6 +30,9 @@ struct FrameGuides {virtual ~FrameGuides()=default;};
 struct FrameCompletion {
     virtual ~FrameCompletion()=default;
     virtual bool ready() const noexcept=0; // Poll only; never wait or call OpenXR.
+    // True only after this phase's output commands and fence signal have been
+    // submitted on this exact queue. Later work on it needs no CPU-ready poll.
+    virtual bool ordered_on(const void* /*queue*/) const noexcept {return false;}
 };
 
 enum class CaptureOutcome { captured, unavailable, busy };

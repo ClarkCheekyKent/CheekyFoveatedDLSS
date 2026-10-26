@@ -980,6 +980,7 @@ void fg_copy_validation_test(bool include_buffered=true) {
 }
 #include "fg_hardware_probe.hpp"
 #include "fg_hardening_validation.hpp"
+#include "fg_shared_queue_validation.hpp"
 #include "fg_auto_validation.hpp"
 void frame_space_lifetime_test() {
     reset();const auto session=h<XrSession>(9100);
@@ -1110,6 +1111,7 @@ void diagnostic_lifetime_test() {
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--fg-shared-submission") {fg_shared_queue_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-profile") {fg_optical_profile();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto") {fg_auto_validation();return 0;}

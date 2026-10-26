@@ -32,9 +32,13 @@ inline FrameGuides12* guides12(const BufferedNative& frame) noexcept {return dyn
 
 struct FrameCompletion12 final : FrameCompletion {
     ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D12CommandQueue> submitted_queue;
     std::uint64_t value{};
-    FrameCompletion12(ID3D12Fence* f,std::uint64_t v):fence(f),value(v){}
+    FrameCompletion12(ID3D12Fence* f,std::uint64_t v,ID3D12CommandQueue* q=nullptr):fence(f),submitted_queue(q),value(v){}
     bool ready() const noexcept override {return fence&&fence->GetCompletedValue()>=value;}
+    bool ordered_on(const void* queue) const noexcept override {
+        return fence&&value&&queue&&submitted_queue.Get()==queue;
+    }
 };
 
 // Native D3D11: per-eye snapshots from Backend11 (interpolation also samples

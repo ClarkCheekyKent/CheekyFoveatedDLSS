@@ -272,8 +272,9 @@ inline bool BufferedPresenter::upload_batch(const std::vector<std::pair<Chain*,I
                 burst.record(device.Get(),c->list.Get(),item.chain->images[item.index].texture,xr_image_state(),
                     "openxr",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
             }
-            // Selection polls the phase fence before recording these uploads.
-            // Do not put an unfinished FG dependency onto the game queue.
+            // Shared-queue phases were submitted before their announcement;
+            // these uploads follow their output copies through queue order.
+            // Separate HIGH phases must already be GPU-ready at selection.
             if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
                 if(good){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
                 else burst.abandon();}
@@ -685,8 +686,8 @@ struct BufferedBackend12 final : FrameBackend {
                     // Each generated phase hands over its immutable stereo output
                     // before retirement. Eligible multi-frame intervals queue
                     // every index before the final CPU completion wait.
-                    // The presenter receives each fence early and polls that
-                    // phase, rather than waiting for the entire batch.
+                    // Shared-queue uploads can follow these submitted commands
+                    // immediately. Separate queues retain the readiness check.
                     auto announce=[&]() noexcept {
                         publish_state();
                         if(pair.direct_xr){
@@ -707,7 +708,7 @@ struct BufferedBackend12 final : FrameBackend {
                             owner.direct_stats.last_path=owner.worker.features[0].direct&&owner.worker.features[1].direct?1u:2u;
                             direct_job->complete=true;owner.changed.notify_all();
                         }else owner.announce_generated_phase(previous,job,pair,
-                            std::make_shared<FrameCompletion12>(owner.worker.fence.Get(),owner.worker.serial));
+                            std::make_shared<FrameCompletion12>(owner.worker.fence.Get(),owner.worker.serial,owner.worker.queue.Get()));
                         announced=true;
                     };
                     success=owner.worker.generate(guides,input,prior,cameras,result,&copies,last?+[](void* context) noexcept {
