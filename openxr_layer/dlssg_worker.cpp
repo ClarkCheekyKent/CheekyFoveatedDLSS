@@ -3,6 +3,7 @@
 #include "fg_color_format.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <cstdio>
 #include <initializer_list>
@@ -49,8 +50,8 @@ bool buffer(ID3D12Device* device,std::uint64_t bytes,D3D12_HEAP_TYPE type,
     return SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&out)));
 }
 }
-bool Worker::wait_idle() noexcept {
-    return wait_fence(serial);
+bool Worker::wait_idle(const char* site) noexcept {
+    return wait_fence(serial,site);
 }
 bool Worker::wait_fence(std::uint64_t value,const char* site) noexcept {
     if(!device||!fence||!value)return true;
@@ -62,6 +63,7 @@ bool Worker::wait_fence(std::uint64_t value,const char* site) noexcept {
         else Sleep(1);
     }
     const double waited=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    (std::strcmp(site,"generation complete")==0?worker_wait_complete_ms:worker_wait_before_ms)+=waited;
     if(waited>5.&&trace&&(++long_cpu_waits<=30||long_cpu_waits%50==0)){char message[160]{};
         sprintf_s(message,"FG worker CPU wait: site=%s waited_ms=%.1f count=%llu",site,waited,static_cast<unsigned long long>(long_cpu_waits));trace(message);}
     return SUCCEEDED(device->GetDeviceRemovedReason());
@@ -200,7 +202,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     const bool batched=!cheeky_fg_needs_ngx(guides)&&guides.release_point!=1u;
     const bool continuing=batched&&frame_index>1;
     if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||!cheeky_fg_center_valid(guides.eyes[0].center_method)||!cheeky_fg_center_valid(guides.eyes[1].center_method)||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
-    if(!continuing&&!wait_idle())return false;
+    if(!continuing&&!wait_idle("previous generation"))return false;
     // Optical preparation and split interpolation prefixes can already be in
     // flight when a later recording/allocation fails. Retire all engines before
     // the caller releases their input and publication leases on that path.
@@ -738,7 +740,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(!wait_fence(prepared_serial,"prepared guides"))return false;
         if(on_prepared)on_prepared(submitted_context);
     }
-    const bool complete=wait_idle();const auto observed_cpu=LatencyProbe::cpu_now();
+    // Includes the capture this generation waits for on the GPU (the game's frame).
+    const bool complete=wait_idle("generation complete");const auto observed_cpu=LatencyProbe::cpu_now();
     completion_wait.add(elapsed_ms(wait_begin));if(!complete)return false;
     latency.collect(queue.Get(),observed_cpu);
     retire_failure.active=false;

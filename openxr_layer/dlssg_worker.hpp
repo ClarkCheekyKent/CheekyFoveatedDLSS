@@ -78,7 +78,7 @@ struct Worker {
     bool probe(ID3D12Device*,const wchar_t* model_directory=nullptr) noexcept;
     void report(const char* stage,std::uint32_t code) noexcept;
     ~Worker(){reset();}
-    bool wait_idle() noexcept;
+    bool wait_idle(const char* site="idle") noexcept;
     bool wait_fence(std::uint64_t value,const char* site="idle") noexcept;
     std::uint64_t long_cpu_waits{}; // CPU fence waits over 5 ms, logged with their call site.
     void reset() noexcept;

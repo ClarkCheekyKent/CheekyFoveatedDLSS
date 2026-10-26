@@ -25,7 +25,6 @@ struct SystemLoadSample {
     double gpu_encode{};                                // Video encode engine (Virtual Desktop streaming).
     char gpu_engine[16]{};                              // Engine type of the busiest render/compute engine.
     double collect_ms{},collect_max_ms{};               // Last and worst PDH collection time.
-    double gpu_probe_ms{-1};                            // One-shot GPU engine collection time; -1 before it ran.
 };
 
 class SystemLoadSampler {
@@ -69,34 +68,20 @@ private:
         PDH_HQUERY query{};PDH_HCOUNTER cores{},engines{};
         if(PdhOpenQueryW(nullptr,0,&query)==ERROR_SUCCESS){
             if(PdhAddEnglishCounterW(query,L"\\Processor(*)\\% Processor Time",0,&cores)!=ERROR_SUCCESS)cores=nullptr;
-            // Test build: the GPU engine counter is not sampled. Collecting it
-            // makes the kernel gather per-process statistics for every GPU
-            // engine, which is suspected of a once-a-second game hitch. Its
-            // cost is measured once below instead.
+            if(PdhAddEnglishCounterW(query,L"\\GPU Engine(*)\\Utilization Percentage",0,&engines)!=ERROR_SUCCESS)engines=nullptr;
             PdhCollectQueryData(query);
         }
         FILETIME idle0{},kernel0{},user0{},created{},exited{},pkernel0{},puser0{};
         GetSystemTimes(&idle0,&kernel0,&user0);GetProcessTimes(GetCurrentProcess(),&created,&exited,&pkernel0,&puser0);
         wchar_t pid_tag[32]{};swprintf_s(pid_tag,L"pid_%lu_",GetCurrentProcessId());
         std::vector<unsigned char> storage;std::uint64_t samples{};
-        double collect_max{},gpu_probe=-1;
+        double collect_max{};
         const auto ms_since=[](LARGE_INTEGER start){LARGE_INTEGER now{},freq{};QueryPerformanceCounter(&now);QueryPerformanceFrequency(&freq);
             return 1000.*double(now.QuadPart-start.QuadPart)/double(freq.QuadPart);};
         while(!stop_requested){
             for(unsigned i=0;i<10&&!stop_requested;++i)Sleep(100);
             if(stop_requested)break;
-            if(gpu_probe<0){
-                // One-shot: what one GPU engine collection costs on this system.
-                PDH_HQUERY probe{};PDH_HCOUNTER counter{};
-                if(PdhOpenQueryW(nullptr,0,&probe)==ERROR_SUCCESS){
-                    if(PdhAddEnglishCounterW(probe,L"\\GPU Engine(*)\\Utilization Percentage",0,&counter)==ERROR_SUCCESS){
-                        PdhCollectQueryData(probe);Sleep(100);
-                        LARGE_INTEGER start{};QueryPerformanceCounter(&start);PdhCollectQueryData(probe);gpu_probe=ms_since(start);
-                    }else gpu_probe=0;
-                    PdhCloseQuery(probe);
-                }else gpu_probe=0;
-            }
-            SystemLoadSample next;next.tick=GetTickCount64();next.samples=++samples;next.gpu_probe_ms=gpu_probe;
+            SystemLoadSample next;next.tick=GetTickCount64();next.samples=++samples;
             FILETIME idle{},kernel{},user{},pkernel{},puser{};
             if(GetSystemTimes(&idle,&kernel,&user)&&GetProcessTimes(GetCurrentProcess(),&created,&exited,&pkernel,&puser)){
                 const auto busy_total=(file_time(kernel)-file_time(kernel0))+(file_time(user)-file_time(user0)); // Kernel time includes idle.

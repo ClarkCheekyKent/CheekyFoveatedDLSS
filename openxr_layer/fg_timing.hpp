@@ -47,6 +47,9 @@ struct CadenceWindow {
     }
 };
 using TimingClock=std::chrono::steady_clock;
+// Late-frame trace: the generation thread's CPU fence waits during one
+// generate call, before its work starts and for its completion.
+inline thread_local double worker_wait_before_ms{},worker_wait_complete_ms{};
 inline double elapsed_ms(TimingClock::time_point since) noexcept {
     return std::chrono::duration<double,std::milli>(TimingClock::now()-since).count();
 }

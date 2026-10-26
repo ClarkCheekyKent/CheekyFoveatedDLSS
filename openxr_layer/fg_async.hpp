@@ -249,6 +249,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     struct FrameTrace {
         std::uint64_t id{};
         TimingClock::time_point wait_enter,wait_exit,begin_enter,begin_exit,end_enter,handed_off,worker_start,worker_end;
+        double wait_before_ms{-1},wait_complete_ms{-1}; // Worker CPU fence waits inside generation.
     };
     std::array<FrameTrace,8> frame_traces;
     TimingClock::time_point game_wait_enter,game_wait_exit,game_begin_enter,game_begin_exit; // Game thread's current frame.
@@ -264,11 +265,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(!t){sprintf_s(out,size,"#%llu n/a",static_cast<unsigned long long>(id));return;}
         // credit=xrWaitFrame wait, gate=xrBeginFrame gate, game=go-ahead to
         // xrEndFrame, capture=xrEndFrame to hand-over, queue=hand-over to
-        // worker, worker=worker start to generation submitted.
-        sprintf_s(out,size,"#%llu interval=%.1f credit=%.1f gate=%.1f game=%.1f capture=%.1f queue=%.1f worker=%.1f",
+        // worker, worker=worker start to generation done; of it, wait_prev=CPU
+        // wait for the previous generation, wait_done=CPU wait for this one
+        // (including the capture it waits for on the GPU).
+        sprintf_s(out,size,"#%llu interval=%.1f credit=%.1f gate=%.1f game=%.1f capture=%.1f queue=%.1f worker=%.1f wait_prev=%.1f wait_done=%.1f",
             static_cast<unsigned long long>(id),p?span_ms(p->end_enter,t->end_enter):-1.,span_ms(t->wait_enter,t->wait_exit),
             span_ms(t->begin_enter,t->begin_exit),span_ms(t->wait_exit,t->end_enter),span_ms(t->end_enter,t->handed_off),
-            span_ms(t->handed_off,t->worker_start),span_ms(t->worker_start,t->worker_end));
+            span_ms(t->handed_off,t->worker_start),span_ms(t->worker_start,t->worker_end),t->wait_before_ms,t->wait_complete_ms);
     }
     TimingClock::time_point inflight_started{}; // Hold mx. When the worker took inflight_id.
     std::uint64_t stalled_natives{}; // Hold mx. Native frames shown because generation stalled.
@@ -920,8 +923,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 }
             }
             const auto generate_started=TimingClock::now();const auto rebuilds_before=optical::rebuilds.load();
+            worker_wait_before_ms=worker_wait_complete_ms=0;
             const auto generation=backend->generate(previous,job,pair,reset_history,logged_samples,direct_job);
-            {std::lock_guard lock(mx);auto& t=frame_trace(job->id);t.worker_start=pair.worker_started_at;t.worker_end=TimingClock::now();}
+            {std::lock_guard lock(mx);auto& t=frame_trace(job->id);t.worker_start=pair.worker_started_at;t.worker_end=TimingClock::now();
+                t.wait_before_ms=worker_wait_before_ms;t.wait_complete_ms=worker_wait_complete_ms;}
             if(const auto generate_ms=elapsed_ms(generate_started);generate_ms>100.&&trace){char message[192]{};
                 sprintf_s(message,"FG worker stall: native=%llu generate_ms=%.1f optical_flow_session_rebuilds=%llu",
                     static_cast<unsigned long long>(job->id),generate_ms,static_cast<unsigned long long>(optical::rebuilds.load()-rebuilds_before));trace(message);}
