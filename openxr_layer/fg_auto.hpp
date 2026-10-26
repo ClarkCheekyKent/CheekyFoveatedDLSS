@@ -26,7 +26,11 @@ struct AutoMultiplier {
         else if(selected>maximum){selected=maximum;++switches;reason=5;overload_since=headroom_since=-1;overload_samples=0;}
         else if(!valid)reason=1;
     }
-    bool observe(double now,const ApplicationTiming& sample,double generated_ms,double display_ms) {
+    // presenter_ms: measured runtime cost per submission (xrWaitFrame through
+    // xrEndFrame). A runtime that accepts fewer frames than its reported
+    // refresh (e.g. 90 submissions/s at 120 Hz) caps output; a higher
+    // multiplier there only lowers the native rate.
+    bool observe(double now,const ApplicationTiming& sample,double generated_ms,double display_ms,double presenter_ms=0) {
         if(!enabled||!sample.sequence||sample.sequence==sequence||!std::isfinite(now)||
            (sample.recorded_ms>0&&(now<sample.recorded_ms||now-sample.recorded_ms>500))||
            !std::isfinite(sample.cpu_ms)||!std::isfinite(sample.gpu_ms)||sample.cpu_ms<0||sample.gpu_ms<=0||
@@ -40,7 +44,8 @@ struct AutoMultiplier {
         const auto work=std::max(cpu_ms,gpu_ms);
         render_ms=valid?render_ms*.65+work*.35:work;
         fg_ms=valid?fg_ms*.75+generated_ms*.25:generated_ms;valid=true;
-        const auto utilization=[&](unsigned n){return (render_ms+(n-1)*fg_ms)/(display_ms*n);};
+        const auto slot_ms=std::isfinite(presenter_ms)&&presenter_ms<250?std::max(display_ms,presenter_ms):display_ms;
+        const auto utilization=[&](unsigned n){return (render_ms+(n-1)*fg_ms)/(slot_ms*n);};
         const auto current=utilization(selected);
         if(current>1.0&&selected<maximum){
             headroom_since=-1;
