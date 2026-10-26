@@ -2,6 +2,7 @@
 #include "fg_ngx_capture.hpp"
 #include "fg_color_format.hpp"
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <cstdio>
 #include <initializer_list>
@@ -51,13 +52,18 @@ bool buffer(ID3D12Device* device,std::uint64_t bytes,D3D12_HEAP_TYPE type,
 bool Worker::wait_idle() noexcept {
     return wait_fence(serial);
 }
-bool Worker::wait_fence(std::uint64_t value) noexcept {
+bool Worker::wait_fence(std::uint64_t value,const char* site) noexcept {
     if(!device||!fence||!value)return true;
+    if(fence->GetCompletedValue()>=value)return SUCCEEDED(device->GetDeviceRemovedReason());
+    const auto started=std::chrono::steady_clock::now();
     while(fence->GetCompletedValue()<value) {
         if(FAILED(device->GetDeviceRemovedReason()))return false;
         if(event&&SUCCEEDED(fence->SetEventOnCompletion(value,event)))WaitForSingleObject(event,100);
         else Sleep(1);
     }
+    const double waited=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+    if(waited>5.&&trace&&(++long_cpu_waits<=30||long_cpu_waits%50==0)){char message[160]{};
+        sprintf_s(message,"FG worker CPU wait: site=%s waited_ms=%.1f count=%llu",site,waited,static_cast<unsigned long long>(long_cpu_waits));trace(message);}
     return SUCCEEDED(device->GetDeviceRemovedReason());
 }
 void Worker::reset_features() noexcept {
@@ -258,7 +264,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(!optical_allocator&&(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&optical_allocator)))||
                    FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,optical_allocator.Get(),nullptr,IID_PPV_ARGS(&optical_list)))||
                    FAILED(optical_list->Close())))return false;
-                if(!wait_fence(serial)||FAILED(optical_allocator->Reset())||FAILED(optical_list->Reset(optical_allocator.Get(),nullptr)))return false;
+                if(!wait_fence(serial,"optical list reuse (previous generation on GPU)")||FAILED(optical_allocator->Reset())||FAILED(optical_list->Reset(optical_allocator.Get(),nullptr)))return false;
                 latency.begin(optical_list.Get());phase_timing.begin(optical_list.Get());
                 batch_timings.begin(device.Get(),optical_list.Get(),frame_count,optical_regions);
                 if(FAILED(optical_list->Close()))return false;ID3D12CommandList* start[]{optical_list.Get()};queue->ExecuteCommandLists(1,start);
@@ -729,7 +735,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(batched&&!last_output){retire_failure.active=false;direct_publication=direct;temporal_evaluation_completed=true;return true;}
     const auto wait_begin=TimingClock::now();
     if(two_lists) {
-        if(!wait_fence(prepared_serial))return false;
+        if(!wait_fence(prepared_serial,"prepared guides"))return false;
         if(on_prepared)on_prepared(submitted_context);
     }
     const bool complete=wait_idle();const auto observed_cpu=LatencyProbe::cpu_now();

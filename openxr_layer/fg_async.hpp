@@ -243,6 +243,33 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t granted_credits{},consumed_credits{},capped_credits{}; // Pacing diagnostics: clock grants, game uses, grants lost at the 2-credit cap.
     std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{};
     std::uint64_t last_credit_tick{},completed_pair_id{},inflight_id{};
+    // Late-frame trace. Per native frame, CPU (QPC) timestamps from the game
+    // thread, the hand-over and the worker; printed only when the runtime
+    // skips a headset slot. Hold mx.
+    struct FrameTrace {
+        std::uint64_t id{};
+        TimingClock::time_point wait_enter,wait_exit,begin_enter,begin_exit,end_enter,handed_off,worker_start,worker_end;
+    };
+    std::array<FrameTrace,8> frame_traces;
+    TimingClock::time_point game_wait_enter,game_wait_exit,game_begin_enter,game_begin_exit; // Game thread's current frame.
+    std::uint64_t late_frames{};
+    double last_content_wait_ms{}; // Presenter's wait for the content it is about to submit.
+    FrameTrace& frame_trace(std::uint64_t id) noexcept {auto& t=frame_traces[id%frame_traces.size()];if(t.id!=id){t={};t.id=id;}return t;}
+    const FrameTrace* find_trace(std::uint64_t id) const noexcept {const auto& t=frame_traces[id%frame_traces.size()];return id&&t.id==id?&t:nullptr;}
+    static double span_ms(TimingClock::time_point a,TimingClock::time_point b) noexcept {
+        return a==TimingClock::time_point{}||b==TimingClock::time_point{}||b<a?-1.:std::chrono::duration<double,std::milli>(b-a).count();
+    }
+    void describe_trace(char* out,std::size_t size,std::uint64_t id) const noexcept {
+        const auto* t=find_trace(id);const auto* p=find_trace(id-1);
+        if(!t){sprintf_s(out,size,"#%llu n/a",static_cast<unsigned long long>(id));return;}
+        // credit=xrWaitFrame wait, gate=xrBeginFrame gate, game=go-ahead to
+        // xrEndFrame, capture=xrEndFrame to hand-over, queue=hand-over to
+        // worker, worker=worker start to generation submitted.
+        sprintf_s(out,size,"#%llu interval=%.1f credit=%.1f gate=%.1f game=%.1f capture=%.1f queue=%.1f worker=%.1f",
+            static_cast<unsigned long long>(id),p?span_ms(p->end_enter,t->end_enter):-1.,span_ms(t->wait_enter,t->wait_exit),
+            span_ms(t->begin_enter,t->begin_exit),span_ms(t->wait_exit,t->end_enter),span_ms(t->end_enter,t->handed_off),
+            span_ms(t->handed_off,t->worker_start),span_ms(t->worker_start,t->worker_end));
+    }
     TimingClock::time_point inflight_started{}; // Hold mx. When the worker took inflight_id.
     std::uint64_t stalled_natives{}; // Hold mx. Native frames shown because generation stalled.
     // Hold mx. Generation has run for over 100 ms (e.g. a driver session
@@ -617,7 +644,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             changed.wait_for(lock,std::chrono::microseconds(500));
         }
         --app_waiters;
-        pacing_wait.add(elapsed_ms(wait_begin));
+        pacing_wait.add(elapsed_ms(wait_begin));game_wait_enter=wait_begin;game_wait_exit=TimingClock::now();
         // Interrupted by a retirement or reset on another thread: let the stop
         // finish so the layer can retry against the current presenter.
         if(stopping&&!XR_FAILED(terminal))changed.wait(lock,[&]{return !stop_in_progress||XR_FAILED(terminal);});
@@ -655,7 +682,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // the previous end_frame enqueues its FG job. Gate begin_frame too.
         const auto gate_started=TimingClock::now();
         changed.wait(lock,[&]{return stopping||!release_gate_active();});
-        begin_gate_wait.add(elapsed_ms(gate_started));
+        begin_gate_wait.add(elapsed_ms(gate_started));game_begin_enter=gate_started;game_begin_exit=TimingClock::now();
         if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();lock.unlock();capture_lock.lock();
         {std::lock_guard state_lock(mx);if(stopping)return XR_ERROR_SESSION_NOT_RUNNING;}
@@ -700,10 +727,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         const auto* external=quad_pair_for_call;
         if(bypass)return xr.end_frame(session,end);
         if(!end)return XR_ERROR_VALIDATION_FAILURE;
-        ProducerElapsed elapsed{*this};
+        ProducerElapsed elapsed{*this};const auto end_entered=TimingClock::now();
         std::uint64_t id{};bool use_raw{};
         {std::lock_guard lock(mx);if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
-            if(!started||begun==ended)return XR_ERROR_CALL_ORDER_INVALID;++native_count;id=++next_id;use_raw=degraded;}
+            if(!started||begun==ended)return XR_ERROR_CALL_ORDER_INVALID;++native_count;id=++next_id;use_raw=degraded;
+            auto& t=frame_trace(id);t.wait_enter=game_wait_enter;t.wait_exit=game_wait_exit;
+            t.begin_enter=game_begin_enter;t.begin_exit=game_begin_exit;t.end_enter=end_entered;}
         const auto fg_runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
         const auto hookless_complete=fg_runtime&&!external?reinterpret_cast<CheekyFgCompleteHooklessFrameFn>(
             GetProcAddress(fg_runtime,"CheekyFG_CompleteHooklessFrameV1")):nullptr;
@@ -751,7 +780,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             if(!good){capture_lock.unlock();result=passthrough(end,"incomplete native color capture / changed swapchain layout");}
             else {
                 job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
-                std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();
+                std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();frame_trace(id).handed_off=job->handed_off_at;
                 // Keep the debug overlay on native submissions too. Native
                 // snapshots are immutable once published; use the last proven
                 // FG region (one native frame behind for dynamic gaze).
@@ -892,6 +921,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             }
             const auto generate_started=TimingClock::now();const auto rebuilds_before=optical::rebuilds.load();
             const auto generation=backend->generate(previous,job,pair,reset_history,logged_samples,direct_job);
+            {std::lock_guard lock(mx);auto& t=frame_trace(job->id);t.worker_start=pair.worker_started_at;t.worker_end=TimingClock::now();}
             if(const auto generate_ms=elapsed_ms(generate_started);generate_ms>100.&&trace){char message[192]{};
                 sprintf_s(message,"FG worker stall: native=%llu generate_ms=%.1f optical_flow_session_rebuilds=%llu",
                     static_cast<unsigned long long>(job->id),generate_ms,static_cast<unsigned long long>(optical::rebuilds.load()-rebuilds_before));trace(message);}
@@ -1252,6 +1282,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             else changed.wait(lock);
         }
         if(waited_for_content)presenter_content_wait.add(elapsed_ms(started_wait));
+        last_content_wait_ms=waited_for_content?elapsed_ms(started_wait):0.;
         return !stopping;
     }
     void presentation_loop() noexcept {
@@ -1266,6 +1297,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             }
         } complete_borrowed_frame{*this};
         Pair active;bool have_active{},generated_phase{};double last_position{};
+        XrTime late_last_display{}; // Late-frame trace: previous runtime frame's display time.
         try {for(;;) {
             // Runtime frame ownership cannot transfer midway through the old
             // native frame. BeginFrame may discard an unfinished frame rather
@@ -1383,6 +1415,23 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 wake_producer();
                 result=runtime_end_frame(&empty);
             }
+            // The runtime skipped a headset slot: print the late frame's
+            // timeline next to its neighbours (rate-limited).
+            if(trace&&!raw_frame&&frame.predictedDisplayPeriod>0&&late_last_display&&
+               frame.predictedDisplayTime-late_last_display>frame.predictedDisplayPeriod*3/2) {
+                std::lock_guard lock(mx);
+                if(++late_frames<=30||late_frames%20==0) {
+                    const auto late_id=trace_current_id?trace_current_id:trace_native_id;
+                    char prev[256]{},late[256]{},next[256]{},message[1024]{};
+                    describe_trace(prev,sizeof(prev),late_id-1);describe_trace(late,sizeof(late),late_id);describe_trace(next,sizeof(next),late_id+1);
+                    const double step=double(frame.predictedDisplayTime-late_last_display)/1e6,period=double(frame.predictedDisplayPeriod)/1e6;
+                    sprintf_s(message,"FG LATE FRAME: count=%llu skipped_slots=%.0f display_step_ms=%.1f shown=%s presenter_wait_ms=%.1f | prev %s | late %s | next %s",
+                        static_cast<unsigned long long>(late_frames),step/period-1.,step,is_generated?"GEN":submitted?"NATIVE":"EMPTY",
+                        last_content_wait_ms,prev,late,next);
+                    trace(message);
+                }
+            }
+            late_last_display=frame.predictedDisplayTime;
             // Capture each runtime frame, including empty submissions, so
             // silent skips cannot masquerade as a clean N/G/N cadence.
             // Use the existing FG Latency Diagnostics switch to avoid any

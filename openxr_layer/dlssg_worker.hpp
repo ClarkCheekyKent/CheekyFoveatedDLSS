@@ -79,7 +79,8 @@ struct Worker {
     void report(const char* stage,std::uint32_t code) noexcept;
     ~Worker(){reset();}
     bool wait_idle() noexcept;
-    bool wait_fence(std::uint64_t value) noexcept;
+    bool wait_fence(std::uint64_t value,const char* site="idle") noexcept;
+    std::uint64_t long_cpu_waits{}; // CPU fence waits over 5 ms, logged with their call site.
     void reset() noexcept;
     bool initialize(ID3D12Device*,ID3D12CommandQueue*,unsigned,unsigned,DXGI_FORMAT,bool require_ngx=true) noexcept;
     static bool record_output_copies(ID3D12GraphicsCommandList*,const std::array<ID3D12Resource*,2>&,
