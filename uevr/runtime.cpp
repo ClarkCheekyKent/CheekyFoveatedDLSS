@@ -743,9 +743,10 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
             const auto load=system_load().latest();
             if(load.valid){
                 CheekyFgCadence fg_rates;fg_cadence(fg_rates);
-                trace_event("SYSTEM load cpu_total=%.0f%% cpu_busiest_core=%.0f%% cpu_game=%.0f%% gpu=%.0f%% (%s) gpu_game=%.0f%% gpu_encode=%.0f%% gpu_valid=%u vram_used_mb=%llu vram_budget_mb=%llu game_fps=%.1f native_fps=%.1f generated_fps=%.1f cadence_valid=%u",
+                trace_event("SYSTEM load cpu_total=%.0f%% cpu_busiest_core=%.0f%% cpu_game=%.0f%% gpu=%.0f%% (%s) gpu_game=%.0f%% gpu_encode=%.0f%% gpu_valid=%u vram_used_mb=%llu vram_budget_mb=%llu game_fps=%.1f native_fps=%.1f generated_fps=%.1f cadence_valid=%u pdh_collect_ms=%.2f pdh_collect_max_ms=%.2f gpu_engine_probe_ms=%.2f",
                     load.cpu_total,load.cpu_busiest_core,load.cpu_process,load.gpu_busy,load.gpu_engine,load.gpu_game,load.gpu_encode,unsigned(load.gpu_valid),
-                    s.memory.local.usage>>20,s.memory.local.budget>>20,fg_rates.game_fps,fg_rates.native_fps,fg_rates.generated_fps,fg_rates.valid);
+                    s.memory.local.usage>>20,s.memory.local.budget>>20,fg_rates.game_fps,fg_rates.native_fps,fg_rates.generated_fps,fg_rates.valid,
+                    load.collect_ms,load.collect_max_ms,load.gpu_probe_ms);
             }
         }
         constexpr std::uint64_t memory_log_change=64ull<<20;

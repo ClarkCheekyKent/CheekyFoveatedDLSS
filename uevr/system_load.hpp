@@ -24,6 +24,8 @@ struct SystemLoadSample {
     double gpu_busy{},gpu_game{};                       // Percent of the busiest render/compute engine on the game's adapter.
     double gpu_encode{};                                // Video encode engine (Virtual Desktop streaming).
     char gpu_engine[16]{};                              // Engine type of the busiest render/compute engine.
+    double collect_ms{},collect_max_ms{};               // Last and worst PDH collection time.
+    double gpu_probe_ms{-1};                            // One-shot GPU engine collection time; -1 before it ran.
 };
 
 class SystemLoadSampler {
@@ -67,17 +69,34 @@ private:
         PDH_HQUERY query{};PDH_HCOUNTER cores{},engines{};
         if(PdhOpenQueryW(nullptr,0,&query)==ERROR_SUCCESS){
             if(PdhAddEnglishCounterW(query,L"\\Processor(*)\\% Processor Time",0,&cores)!=ERROR_SUCCESS)cores=nullptr;
-            if(PdhAddEnglishCounterW(query,L"\\GPU Engine(*)\\Utilization Percentage",0,&engines)!=ERROR_SUCCESS)engines=nullptr;
+            // Test build: the GPU engine counter is not sampled. Collecting it
+            // makes the kernel gather per-process statistics for every GPU
+            // engine, which is suspected of a once-a-second game hitch. Its
+            // cost is measured once below instead.
             PdhCollectQueryData(query);
         }
         FILETIME idle0{},kernel0{},user0{},created{},exited{},pkernel0{},puser0{};
         GetSystemTimes(&idle0,&kernel0,&user0);GetProcessTimes(GetCurrentProcess(),&created,&exited,&pkernel0,&puser0);
         wchar_t pid_tag[32]{};swprintf_s(pid_tag,L"pid_%lu_",GetCurrentProcessId());
         std::vector<unsigned char> storage;std::uint64_t samples{};
+        double collect_max{},gpu_probe=-1;
+        const auto ms_since=[](LARGE_INTEGER start){LARGE_INTEGER now{},freq{};QueryPerformanceCounter(&now);QueryPerformanceFrequency(&freq);
+            return 1000.*double(now.QuadPart-start.QuadPart)/double(freq.QuadPart);};
         while(!stop_requested){
             for(unsigned i=0;i<10&&!stop_requested;++i)Sleep(100);
             if(stop_requested)break;
-            SystemLoadSample next;next.tick=GetTickCount64();next.samples=++samples;
+            if(gpu_probe<0){
+                // One-shot: what one GPU engine collection costs on this system.
+                PDH_HQUERY probe{};PDH_HCOUNTER counter{};
+                if(PdhOpenQueryW(nullptr,0,&probe)==ERROR_SUCCESS){
+                    if(PdhAddEnglishCounterW(probe,L"\\GPU Engine(*)\\Utilization Percentage",0,&counter)==ERROR_SUCCESS){
+                        PdhCollectQueryData(probe);Sleep(100);
+                        LARGE_INTEGER start{};QueryPerformanceCounter(&start);PdhCollectQueryData(probe);gpu_probe=ms_since(start);
+                    }else gpu_probe=0;
+                    PdhCloseQuery(probe);
+                }else gpu_probe=0;
+            }
+            SystemLoadSample next;next.tick=GetTickCount64();next.samples=++samples;next.gpu_probe_ms=gpu_probe;
             FILETIME idle{},kernel{},user{},pkernel{},puser{};
             if(GetSystemTimes(&idle,&kernel,&user)&&GetProcessTimes(GetCurrentProcess(),&created,&exited,&pkernel,&puser)){
                 const auto busy_total=(file_time(kernel)-file_time(kernel0))+(file_time(user)-file_time(user0)); // Kernel time includes idle.
@@ -91,7 +110,10 @@ private:
                 }
                 idle0=idle;kernel0=kernel;user0=user;pkernel0=pkernel;puser0=puser;
             }
-            if(query&&PdhCollectQueryData(query)==ERROR_SUCCESS){
+            LARGE_INTEGER collect_start{};QueryPerformanceCounter(&collect_start);
+            const bool collected=query&&PdhCollectQueryData(query)==ERROR_SUCCESS;
+            next.collect_ms=ms_since(collect_start);collect_max=(std::max)(collect_max,next.collect_ms);next.collect_max_ms=collect_max;
+            if(collected){
                 PDH_FMT_COUNTERVALUE_ITEM_W* items{};DWORD count{};
                 if(cores&&formatted(cores,storage,items,count))
                     for(DWORD i=0;i<count;++i)if(items[i].FmtValue.CStatus==ERROR_SUCCESS&&!std::wcsstr(items[i].szName,L"_Total"))
