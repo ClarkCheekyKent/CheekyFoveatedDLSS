@@ -61,8 +61,8 @@ struct Settings {
         bool limit_gpu_ahead{false}; // Release Never: wait while the previous frame is not yet captured on the GPU.
         bool carry_missed_ticks{false}; // Retained for old settings; no timer credits are accumulated.
         bool pacing_headroom{false}; // Retained for old settings; adaptive pacing is retired.
-        bool extra_frame_slots{false}; // 5 capture slots instead of 3; costs two more stereo color copies of VRAM.
-        bool force_reflex_off{false}; // Per-game override, independent of FG enable.
+        bool extra_frame_slots{true}; // 5 capture slots instead of 3; costs two more stereo color copies of VRAM.
+        bool force_reflex_off{true}; // Per-game override, independent of FG enable.
     } fg;
     bool enabled{true};
     bool d3d12_lower_hook{true}; // Applied at interception startup; changes require a restart.
