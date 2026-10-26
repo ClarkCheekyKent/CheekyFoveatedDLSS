@@ -55,8 +55,6 @@ struct Presenter {
     // The queue the OpenXR runtime was given at session creation, when that is
     // a layer-owned queue rather than the game's. Headset uploads and anything
     // ordered before an image release belong on it.
-    ComPtr<ID3D12CommandQueue> runtime_queue;
-    ID3D12CommandQueue* release_queue() const noexcept {return runtime_queue?runtime_queue.Get():queue.Get();}
     std::shared_ptr<D3D11Bridge> interop11;
     bool quad_input{}; // Separate raw quad color planes plus explicitly supplied guide atlases.
     virtual std::recursive_mutex* dispatch_mutex11() const noexcept {

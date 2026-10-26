@@ -158,19 +158,11 @@ void fg_repeat_upload_validation(ID3D12Device* device) {
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Repeat queue");
     cheeky::fg::BufferedPresenter p;check(p.setup(h<XrSession>(3),Runtime::functions(),device,queue.Get()),"Repeat presenter");
-    // HIGH priority is a property of the GPU command queue, not the CPU
-    // generation thread. On supported devices, only FG uses the new queue;
-    // all captures and runtime-visible uploads remain on the original queue.
-    check(p.generation_queue.Get()!=nullptr,"FG GPU queue selected");
+    // Start shared. A separate HIGH queue is allocated only for an optical job.
+    check(p.generation_queue.Get()==queue.Get()&&!p.fg_high_queue&&!p.generation_high_priority,
+        "FG starts shared without allocating an unused HIGH queue");
     check(p.producer.queue.Get()==queue.Get()&&p.uploads.queue.Get()==queue.Get(),
         "Capture and OpenXR uploads retain the game GPU queue");
-    if(p.generation_high_priority) {
-        const auto desc=p.generation_queue->GetDesc();
-        check(p.generation_queue.Get()!=queue.Get()&&desc.Type==D3D12_COMMAND_LIST_TYPE_DIRECT&&
-            desc.Priority==D3D12_COMMAND_QUEUE_PRIORITY_HIGH&&desc.NodeMask==queue->GetDesc().NodeMask,
-            "FG executes on a separate HIGH-priority direct queue on the same GPU node");
-    } else check(p.generation_queue.Get()==(p.fg_normal_queue?p.fg_normal_queue.Get():queue.Get()),
-        "Unsupported HIGH priority uses separate NORMAL before the shared fallback");
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> commands;
     check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))&&
         SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&commands))),"Repeat commands");
@@ -899,7 +891,8 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                 "After generated submission must hold past GPU completion until generated xrEndFrame returns");
             check(XR_SUCCEEDED(p.begin_frame(&begin)),"Resume game after generated submission");
             Runtime::guides.release_point=0;submit_native();
-            // Execute real NGX on each selected queue. In particular, a shared
+            // DLSS-only NGX always uses the game queue, including legacy saved
+            // NORMAL/HIGH requests. In particular, the shared
             // queue must not wait on a future producer signal or strand either
             // GPU-preparation or generated-submission release policies.
             for(unsigned mode:{2u,0u,1u})for(unsigned point:{0u,1u,3u}) {
@@ -911,10 +904,10 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
                 }
                 {std::unique_lock lock(p.mx);
                     check(p.changed.wait_for(lock,std::chrono::seconds(3),[&]{return p.inflight_id==0&&p.pending.empty();}),"Live GPU queue switch retirement");
-                    auto* requested=mode==2u?queue.Get():mode==0u?p.fg_normal_queue.Get():p.fg_high_queue.Get();
+                    auto* requested=queue.Get();
                     check(requested&&p.generation_queue.Get()==requested&&p.worker.queue.Get()==requested,
-                        "Requested shared/NORMAL/HIGH queue actually executes NGX");
-                    check(p.reported_queue_mode==mode&&p.telemetry.shared_gpu_queue==(mode==2u?1u:0u)&&
+                        "DLSS-only NGX stays on the shared queue for every saved queue value");
+                    check(p.reported_queue_mode==2u&&p.telemetry.shared_gpu_queue==1u&&
                         p.producer.queue.Get()==queue.Get()&&p.uploads.queue.Get()==queue.Get(),"Queue diagnostics and capture/upload ownership match actual execution");
                     const auto exp=p.experiments();
                     check(exp.latency_valid&&exp.latency_samples>0&&exp.gpu_ready_samples>0,

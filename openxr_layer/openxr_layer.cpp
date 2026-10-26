@@ -239,15 +239,6 @@ struct SessionState {
     unsigned graphics_api{};
     void* graphics_device{};
     void* graphics_queue{};
-    // Optional layer-owned D3D12 queue given to the runtime instead of the
-    // game's. Every release of an image the game queue wrote is ordered on it.
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> runtime_queue;
-    Microsoft::WRL::ComPtr<ID3D12Fence> runtime_order_fence;
-    std::uint64_t runtime_order_value{};
-    // The opposite direction: runtime work on an image (acquire/wait) before
-    // the game's queue writes it again.
-    Microsoft::WRL::ComPtr<ID3D12Fence> game_order_fence;
-    std::uint64_t game_order_value{};
     XrSession session{XR_NULL_HANDLE};
     XrInstance instance{XR_NULL_HANDLE};
     XrSystemId system_id{XR_NULL_SYSTEM_ID};
@@ -1067,51 +1058,6 @@ void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
 // (the runtime, the FG presenter or the quad compositor). Without a presenter
 // the menu layer follows the app's layers here; a presenter instead takes the
 // published layer into each runtime frame it submits.
-// The runtime synchronizes released images on its binding queue. When that is
-// the layer's own queue, make it wait for everything already submitted to the
-// game's queue (the image's writes) before the release is forwarded.
-void order_runtime_queue_after_game(SessionState& state) noexcept {
-    if (!state.runtime_queue || !state.runtime_order_fence || !state.graphics_queue) return;
-    auto* game = static_cast<ID3D12CommandQueue*>(state.graphics_queue);
-    const auto value = ++state.runtime_order_value;
-    if (SUCCEEDED(game->Signal(state.runtime_order_fence.Get(), value)))
-        static_cast<void>(state.runtime_queue->Wait(state.runtime_order_fence.Get(), value));
-}
-// Read once per session creation; the binding queue cannot change afterwards.
-// After xrWaitSwapchainImage: the runtime may have queued its own access to the
-// image on its binding queue; the game's queue must not write it before that.
-void order_game_after_runtime_queue(SessionState& state) noexcept {
-    if (!state.runtime_queue || !state.game_order_fence || !state.graphics_queue) return;
-    const auto value = ++state.game_order_value;
-    if (SUCCEEDED(state.runtime_queue->Signal(state.game_order_fence.Get(), value)))
-        static_cast<void>(static_cast<ID3D12CommandQueue*>(state.graphics_queue)->Wait(state.game_order_fence.Get(), value));
-}
-bool dedicated_present_queue_requested(const char*& source) noexcept {
-    const auto runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
-    const auto query = runtime ? reinterpret_cast<CheekyFgPacingOptionsFn>(
-        GetProcAddress(runtime, "CheekyFG_GetPacingOptionsV1")) : nullptr;
-    CheekyFgPacingOptions options;
-    if (query) {
-        source = "runtime module";
-        return query(&options) && options.dedicated_present_queue != 0;
-    }
-    // UEVR creates its OpenXR session before it loads Cheeky's runtime. Read the
-    // same setting from the UEVR profile's Cheeky configuration instead:
-    // %APPDATA%\UnrealVRMod\<executable name>\CheekyFoveatedDLSS.ini.
-    wchar_t appdata[MAX_PATH]{};
-    wchar_t executable[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH) &&
-        GetModuleFileNameW(nullptr, executable, MAX_PATH)) {
-        const auto ini = std::filesystem::path(appdata) / L"UnrealVRMod" /
-            std::filesystem::path(executable).stem() / L"CheekyFoveatedDLSS.ini";
-        if (std::filesystem::exists(ini)) {
-            source = "UEVR profile settings";
-            return GetPrivateProfileIntW(L"CheekyFoveatedDLSS", L"FgDedicatedPresentQueue", 0, ini.c_str()) != 0;
-        }
-    }
-    source = runtime ? "runtime module without pacing export" : "runtime not loaded and no UEVR profile settings";
-    return false;
-}
 template <class EndFrame>
 XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
     SessionState& state, const bool presenter, EndFrame&& end) {
@@ -1227,7 +1173,6 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
         release_source(); return end(info);
     }
-    order_game_after_runtime_queue(state);
     // Runtime availability does not imply our previous queue submission has
     // completed yet. A busy allocator is backpressure, not a permanent copy
     // failure: never poison the headset menu until it is reopened for this.
@@ -1331,7 +1276,6 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         }
     }
     release_source();
-    if (copied) order_runtime_queue_after_game(state);
     const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     if (XR_FAILED(dispatch.release_swapchain_image(menu.swapchain, &release_info)) || !copied) {
         if (!copied && state.graphics_api == 12) {
@@ -2589,50 +2533,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     if (instance_state->dispatch.create_session == nullptr) {
         return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
-    // Optional: give the runtime a layer-owned queue so its image
-    // synchronization never waits behind the game's queued rendering. Only
-    // when the D3D12 binding directly follows the create info, so the chain
-    // can be rebuilt without copying structures the layer does not know.
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> runtime_queue;
-    Microsoft::WRL::ComPtr<ID3D12Fence> runtime_order_fence,game_order_fence;
-    XrSessionCreateInfo swapped_info{};
-    XrGraphicsBindingD3D12KHR swapped_binding{};
-    const XrSessionCreateInfo* create_info = info;
-    const bool d3d12_first = info && info->next &&
-        static_cast<const XrBaseInStructure*>(info->next)->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
-    if (!d3d12_first) log_startup("Dedicated present queue: not applicable (no leading D3D12 binding)\n");
-    const char* settings_source = "not checked";
-    const bool dedicated_requested = d3d12_first && dedicated_present_queue_requested(settings_source);
-    if (d3d12_first) log_startup("Dedicated present queue: requested=%u (from %s)\n", unsigned(dedicated_requested), settings_source);
-    if (dedicated_requested) {
-        const auto* binding = static_cast<const XrGraphicsBindingD3D12KHR*>(info->next);
-        D3D12_COMMAND_QUEUE_DESC desc{};
-        desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        desc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-        if (binding->device && binding->queue &&
-            SUCCEEDED(binding->device->CreateCommandQueue(&desc, IID_PPV_ARGS(&runtime_queue))) &&
-            SUCCEEDED(binding->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&runtime_order_fence))) &&
-            SUCCEEDED(binding->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&game_order_fence)))) {
-            static_cast<void>(runtime_queue->SetName(L"Cheeky OpenXR runtime queue"));
-            swapped_binding = *binding;
-            swapped_binding.queue = runtime_queue.Get();
-            swapped_info = *info;
-            swapped_info.next = &swapped_binding;
-            create_info = &swapped_info;
-        } else {
-            runtime_queue.Reset();
-            runtime_order_fence.Reset();
-            game_order_fence.Reset();
-            log_startup("Dedicated present queue: creation failed; runtime keeps the game's queue\n");
-        }
-    }
-    const auto result = instance_state->dispatch.create_session(
-        instance, create_info, session
-    );
+    const auto result = instance_state->dispatch.create_session(instance, info, session);
     if (XR_FAILED(result)) return result;
-    if (runtime_queue) log_startup("Dedicated present queue: runtime queue=%p game queue=%p session=%p\n",
-        static_cast<void*>(runtime_queue.Get()),
-        static_cast<void*>(static_cast<const XrGraphicsBindingD3D12KHR*>(info->next)->queue), *session);
 
     SessionState session_state{};
     session_state.session = *session;
@@ -2666,9 +2568,6 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSession(
     }
     // graphics_queue stays the game's queue: captures and the layer's own
     // game-ordered work keep using it.
-    session_state.runtime_queue = runtime_queue;
-    session_state.runtime_order_fence = runtime_order_fence;
-    session_state.game_order_fence = game_order_fence;
     session_state.generation = next_session_generation.fetch_add(
         1U, std::memory_order_relaxed
     );
@@ -2837,7 +2736,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrBeginSession(
             quad=std::make_shared<cheeky::quad_capture::Compositor>();
             quad->session=session;
             if(owner.graphics_api==11)quad->device11=static_cast<ID3D11Device*>(owner.graphics_device);
-            else {quad->device=static_cast<ID3D12Device*>(owner.graphics_device);quad->queue=static_cast<ID3D12CommandQueue*>(owner.graphics_queue);quad->runtime_queue=owner.runtime_queue;}
+            else {quad->device=static_cast<ID3D12Device*>(owner.graphics_device);quad->queue=static_cast<ID3D12CommandQueue*>(owner.graphics_queue);}
             const auto& d=instance->dispatch;
             quad->create=d.create_swapchain;quad->destroy=d.destroy_swapchain;quad->enumerate_images=d.enumerate_swapchain_images;
             quad->acquire=d.acquire_swapchain_image;quad->wait=d.wait_swapchain_image;quad->release=d.release_swapchain_image;
@@ -3706,10 +3605,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrWaitSwapchainImage(
         if (it != swapchains.end()) for (auto& image : it->second.acquired_images) {
             if (!image.second) { image.second = true; break; }
         }
-        if (it != swapchains.end()) {
-            const auto owner = sessions.find(it->second.session);
-            if (owner != sessions.end()) order_game_after_runtime_queue(owner->second);
-        }
+
     }
     return result;
 }
@@ -3788,11 +3684,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
         fg_presenter->capture11(swapchain,acquired_index,fg_source11,fg_width,fg_height,fg_array,fg_format);
         fg_source11->Release();
     }
-    {
-        std::lock_guard lock(state_mutex);
-        const auto owner = sessions.find(session);
-        if (owner != sessions.end()) order_runtime_queue_after_game(owner->second);
-    }
+
     const auto submit=[&]{return next(swapchain,release_info);};
     const auto result = fg_presenter?fg_presenter->runtime_dispatch(submit):submit();
     {
@@ -3873,7 +3765,6 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
         candidate->trace=[](const char* message) noexcept {log_startup("%s\n",message);};
         auto* device12=owner.graphics_api==12?static_cast<ID3D12Device*>(owner.graphics_device):nullptr;
         auto* queue12=owner.graphics_api==12?static_cast<ID3D12CommandQueue*>(owner.graphics_queue):nullptr;
-        if(owner.graphics_api==12)candidate->runtime_queue=owner.runtime_queue;
         if(owner.graphics_api==11) {
             auto bridge=std::make_shared<cheeky::fg::D3D11Bridge>();
             bridge->dispatch_mutex=&cheeky::quad_capture::d3d11_dispatch_mutex;

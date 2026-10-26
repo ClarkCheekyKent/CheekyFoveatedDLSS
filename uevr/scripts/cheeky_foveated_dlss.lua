@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgDedicatedPresentQueue", "FgGpuWaitedPresent", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -709,18 +709,6 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         [100]="100 Hz", [120]="120 Hz", [144]="144 Hz", [165]="165 Hz", [180]="180 Hz", [200]="200 Hz", [240]="240 Hz", [360]="360 Hz"})
                     text("Used for game prediction and FPS targets; rendering proceeds when release conditions and buffer capacity allow it. Automatic uses a headset refresh query or the fastest runtime period observed this session. Set your headset's Hz explicitly if Automatic starts too low.")
                 end
-                if draft.FgDedicatedPresentQueue ~= nil then
-                    check("Present from a dedicated GPU queue (D3D12)", "FgDedicatedPresentQueue")
-                    if draft.FgDedicatedPresentQueue then
-                        text("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.")
-                    end
-                end
-                if draft.FgGpuWaitedPresent ~= nil then
-                    check("Present without waiting on the GPU (D3D12)", "FgGpuWaitedPresent")
-                    if draft.FgGpuWaitedPresent then
-                        text("Generated frames go to the headset as soon as their GPU work is queued; the upload waits on the GPU instead of the presenter thread, so headset slots are not missed. Needs the dedicated GPU queue.")
-                    end
-                end
                 if draft.FgLimitGpuAhead ~= nil then
                     check("Keep the GPU from falling behind (release Never)", "FgLimitGpuAhead")
                     if draft.FgLimitGpuAhead then
@@ -736,8 +724,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if native_shader11 then
                     text("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.")
                 elseif draft.FgQueuePriority ~= nil then
-                    combo("FG GPU queue", "FgQueuePriority", {
-                        [0]="Separate NORMAL queue", [1]="Separate HIGH queue", [2]="Shared game queue"})
+                    local flow_queue = draft.FgCenterMethod == 4 or draft.FgCenterMethod == 5 or
+                        (draft.FgFoveated and (draft.FgPeripheralMethod == 4 or draft.FgPeripheralMethod == 5))
+                    if flow_queue then
+                        combo("FG GPU queue", "FgQueuePriority", {[2]="Shared game queue", [1]="Separate HIGH queue"})
+                    else
+                        imgui.begin_disabled(true)
+                        imgui.combo("FG GPU queue", 2, {[2]="Shared game queue"})
+                        imgui.end_disabled()
+                        text("Separate HIGH is available only with NVIDIA Optical Flow selected for the center or active periphery. Other methods use the shared queue.")
+                    end
                 end
                 if draft.FgReleasePoint ~= nil then
                     combo("Release game rendering", "FgReleasePoint", {
@@ -745,9 +741,9 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     if draft.FgReleasePoint == 5 then
                         text("The next render starts when buffer capacity allows it. Generation and presentation may still be in flight.")
                     elseif draft.FgReleasePoint == 6 or draft.FgReleasePoint == 7 then
-                        text("The next render starts after xrEndFrame returns for the selected generated frame. With GPU-waited presentation, generation may still be executing. At 2x there is one generated frame.")
+                        text("The next render starts after xrEndFrame returns for the selected generated frame. At 2x there is one generated frame.")
                     elseif draft.FgReleasePoint == 3 then
-                        text("The next render starts after xrEndFrame returns for the last generated frame. With GPU-waited presentation, generation may still be executing.")
+                        text("The next render starts after xrEndFrame returns for the last generated frame.")
                     elseif draft.FgReleasePoint ~= 3 then
                         text("Experimental overlap: capture order alone cannot prove frame identity. Use After all generated frames submitted for serialized matching.")
                     end

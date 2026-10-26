@@ -43,7 +43,7 @@ struct CheekyFgPair {
     std::uint64_t capture_token{}; // Required input: token observed at color release.
     IUnknown* lease{}; // Retain until the consumer GPU has finished reading guides.
     std::uint64_t render_frame{}; // Producer frame serial (quad views); 0 for pairs matched at xrEndFrame.
-    std::uint32_t fg_queue_priority{1}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
+    std::uint32_t fg_queue_priority{2}; // 1 separate HIGH (optical flow only); 2 shared game queue. Legacy 0 maps to shared.
     std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
 };
 inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
@@ -239,8 +239,8 @@ struct CheekyFgPacingOptions {
     std::uint32_t clock_mode{}; // Retired; current layers use demand-driven production for all values.
     std::uint32_t native11_release_point{3}; // Shared release setting: 0 FG submission ... 3 generated frame submission, 4 submission + 4 ms.
     std::uint32_t extra_frame_slots{}; // 1: 5 capture slots instead of 3 (more VRAM). Absent in older layers.
-    std::uint32_t dedicated_present_queue{}; // 1: give the OpenXR runtime the layer's own D3D12 queue at session creation.
-    std::uint32_t gpu_waited_present{}; // 1: hand generated frames to the runtime once queued; the upload waits on the GPU, not the presenter's CPU.
+    std::uint32_t dedicated_present_queue{}; // Retired; reserved ABI slot, always zero.
+    std::uint32_t gpu_waited_present{}; // Retired; reserved ABI slot, always zero.
     std::uint32_t limit_gpu_ahead{}; // 1: release Never holds while the previous frame is not yet captured on the GPU.
     std::uint32_t carry_missed_ticks{}; // Retired; production does not bank timer ticks.
     std::uint32_t pacing_headroom{}; // Retired; no adaptive production clock.

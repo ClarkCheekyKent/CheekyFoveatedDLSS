@@ -969,12 +969,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             ImGui::EndCombo();
         }
         ImGui::TextWrapped("Used for game prediction and FPS targets; rendering proceeds when release conditions and buffer capacity allow it. Automatic uses a headset refresh query or the fastest runtime period observed this session. Set your headset's Hz explicitly if Automatic starts too low.");
-        ImGui::Checkbox("Present from a dedicated GPU queue (D3D12)", &s.dedicated_present_queue);
-        if (s.dedicated_present_queue)
-            ImGui::TextWrapped("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.");
-        ImGui::Checkbox("Present without waiting on the GPU (D3D12)", &s.gpu_waited_present);
-        if (s.gpu_waited_present)
-            ImGui::TextWrapped("Generated frames go to the headset as soon as their GPU work is queued; the upload waits on the GPU instead of the presenter thread, so headset slots are not missed. Needs the dedicated GPU queue.");
         ImGui::Checkbox("Keep the GPU from falling behind (release Never)", &s.limit_gpu_ahead);
         if (s.limit_gpu_ahead)
             ImGui::TextWrapped("With release Never: the game waits while its previous frame has not yet been captured on the GPU, preventing a GPU backlog.");
@@ -983,7 +977,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             ImGui::TextWrapped("Keeps two additional stereo capture slots available while frame generation is in flight. Uses more VRAM.");
         if(native_shader11())ImGui::TextWrapped("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.");
         else{
-        combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
+        const bool flow_queue=cheeky_fg_uses_flow(s.center_method,s.peripheral_method,s.foveated||quad);
+        int queue_choice=flow_queue&&s.queue_priority==1u?1:0;
+        ImGui::BeginDisabled(!flow_queue);
+        if(ImGui::Combo("FG GPU queue",&queue_choice,quad?"Layer bridge queue\0Separate HIGH queue\0":"Shared game queue\0Separate HIGH queue\0"))
+            s.queue_priority=queue_choice==1?1u:2u;
+        ImGui::EndDisabled();
+        if(!flow_queue)ImGui::TextWrapped("Separate HIGH is available only with NVIDIA Optical Flow selected for the center or active periphery. Other methods use the shared queue.");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         }
         combo("Release game rendering", s.release_point,
@@ -991,9 +991,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if (s.release_point == 5)
             ImGui::TextWrapped("The next render starts when buffer capacity allows it. Generation and presentation may still be in flight.");
         else if (s.release_point == 6 || s.release_point == 7)
-            ImGui::TextWrapped("The next render starts after xrEndFrame returns for the selected generated frame. With GPU-waited presentation, generation may still be executing. At 2x there is one generated frame.");
+            ImGui::TextWrapped("The next render starts after xrEndFrame returns for the selected generated frame. At 2x there is one generated frame.");
         else if (s.release_point == 3)
-            ImGui::TextWrapped("The next render starts after xrEndFrame returns for the last generated frame. With GPU-waited presentation, generation may still be executing.");
+            ImGui::TextWrapped("The next render starts after xrEndFrame returns for the last generated frame.");
         else if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After all generated frames submitted for serialized matching.");
         if(native_shader11()){

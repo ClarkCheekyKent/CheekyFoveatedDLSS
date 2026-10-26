@@ -30,44 +30,16 @@ inline bool BufferedPresenter::accept_guide_queue(const CheekyFgPair& guides,Fra
 inline bool BufferedPresenter::setup(XrSession s,const XrFns& f,ID3D12Device* dev,ID3D12CommandQueue* q) noexcept {
     if(!Presenter::setup(s,f,dev,q))return false;
 
-    // Create the FG queue on the very same D3D12 device/node as the game.
-    // The OpenXR runtime continues to own/use the queue supplied in the
-    // graphics binding. Only NGX evaluation and its final publication copy
-    // are submitted to this dedicated queue. A GPU-side wait in
-    // generation_loop() orders it after the native snapshot/guide work.
-    //
-    // If HIGH priority is unavailable, retain the proven same-queue path;
-    // never make the whole VR presenter fail because of a priority hint.
-    const auto game_desc=q->GetDesc();
-    D3D12_COMMAND_QUEUE_DESC fg_desc{};
-    fg_desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
-    fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
-    fg_desc.Flags=D3D12_COMMAND_QUEUE_FLAG_NONE;
-    fg_desc.NodeMask=game_desc.NodeMask;
-    const HRESULT high_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_high_queue));
-    fg_desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    const HRESULT normal_result=dev->CreateCommandQueue(&fg_desc,IID_PPV_ARGS(&fg_normal_queue));
-    // The default remains HIGH; the shared game queue is an explicit A/B
-    // choice alongside separate NORMAL. Missing priorities fall back here.
-    generation_queue=fg_high_queue.Get() ? fg_high_queue.Get() : fg_normal_queue.Get() ? fg_normal_queue.Get() : q;
-    generation_high_priority=fg_high_queue.Get()!=nullptr&&generation_queue.Get()==fg_high_queue.Get();
-    reported_queue_mode=generation_queue.Get()==q?2u:generation_high_priority?1u:0u;
+    // All methods start on the game queue. Only an optical-flow job explicitly
+    // selecting HIGH may allocate/use the separate inference queue below.
+    generation_queue=q;generation_high_priority=false;reported_queue_mode=2;
     last_fg_priority_requested=UINT32_MAX;
     guide_sync_fence.Reset();guide_sync_serial=0;guide_sync_reported=false;
     // Failure merely disables split-queue FG; the native OpenXR path
     // remains usable, and matching queues need no additional fence.
     dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&guide_sync_fence));
-    if(trace) {
-        char message[240]{};
-        sprintf_s(message,"DLSS-FG queue A/B: HIGH=%s(0x%08lx), separate NORMAL=%s(0x%08lx); active=%s; capture remains game queue",
-            fg_high_queue?"available":"FAILED",static_cast<unsigned long>(high_result),
-            fg_normal_queue?"available":"FAILED",static_cast<unsigned long>(normal_result),
-            generation_high_priority?"HIGH":fg_normal_queue?"NORMAL":"shared fallback");
-        trace(message);
-    }
-    // Captures follow the game's rendering on its queue. Uploads target images
-    // the runtime synchronizes on its own binding queue.
-    return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,runtime_queue?runtime_queue.Get():q);
+    // Capture and XR uploads use the original game/binding queue.
+    return producer.initialize(dev,q)&&output.initialize(dev,q)&&uploads.initialize(dev,q);
 }
 
 inline void BufferedPresenter::measure_worker_memory() {
@@ -300,11 +272,9 @@ inline bool BufferedPresenter::upload_batch(const std::vector<std::pair<Chain*,I
                 burst.record(device.Get(),c->list.Get(),item.chain->images[item.index].texture,xr_image_state(),
                     "openxr",eye,item.index,burst_native,burst_current,burst_generated,burst_presentation);
             }
-            // A generated phase handed over before it finished: the copy waits
-            // for it on the GPU (uploads run on the layer-owned runtime queue).
-            if(good&&((upload_dependency&&!upload_dependency->gpu_wait(uploads.queue.Get()))||
-                (upload_capture_ticket&&FAILED(uploads.queue->Wait(producer.fence.Get(),upload_capture_ticket))))){good=false;c->list->Close();burst.abandon();}
-            else if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
+            // Selection polls the phase fence before recording these uploads.
+            // Do not put an unfinished FG dependency onto the game queue.
+            if(good){std::uint64_t ticket{};good=uploads.execute(*c,ticket);
                 if(good){burst.commit(uploads.fence.Get(),ticket);if(burst.strict)burst.wait_upload(uploads.fence.Get(),ticket);}
                 else burst.abandon();}
             else {c->list->Close();burst.abandon();}
@@ -572,9 +542,19 @@ struct BufferedBackend12 final : FrameBackend {
             // only on the single generation worker after the previous fence
             // has retired; recreating NGX handles prevents cross-queue history
             // hazards and makes the A/B measurements independent.
-            const unsigned requested_priority=job->policy.queue_priority<=2u?job->policy.queue_priority:1u;
-            ID3D12CommandQueue* requested=requested_priority==2u?owner.queue.Get():requested_priority==0u?owner.fg_normal_queue.Get():owner.fg_high_queue.Get();
-            ID3D12CommandQueue* selected=requested ? requested : (owner.fg_high_queue.Get()?owner.fg_high_queue.Get():owner.fg_normal_queue.Get()?owner.fg_normal_queue.Get():owner.queue.Get());
+            const bool uses_flow=std::any_of(std::begin(job_guides->pair.eyes),std::end(job_guides->pair.eyes),[](const auto& g){
+                return cheeky_fg_uses_flow(g.center_method,g.peripheral_method,g.focus_width<.999f||g.focus_height<.999f);
+            });
+            const unsigned requested_priority=job->policy.queue_priority==1u&&uses_flow?1u:2u;
+            if(requested_priority==1u&&!owner.fg_high_attempted){
+                owner.fg_high_attempted=true;
+                auto desc=owner.queue->GetDesc();desc.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+                desc.Priority=D3D12_COMMAND_QUEUE_PRIORITY_HIGH;desc.Flags=D3D12_COMMAND_QUEUE_FLAG_NONE;
+                const auto hr=owner.device->CreateCommandQueue(&desc,IID_PPV_ARGS(&owner.fg_high_queue));
+                if(FAILED(hr)&&owner.trace)owner.trace("Optical-flow HIGH queue unavailable; using game queue");
+            }
+            ID3D12CommandQueue* requested=requested_priority==1u?owner.fg_high_queue.Get():owner.queue.Get();
+            ID3D12CommandQueue* selected=requested?requested:owner.queue.Get();
             if(selected!=owner.generation_queue.Get()) {
                 owner.worker.wait_idle();owner.worker.reset();owner.generation_queue=selected;
                 owner.generation_high_priority=owner.fg_high_queue.Get()!=nullptr&&selected==owner.fg_high_queue.Get();
@@ -583,10 +563,9 @@ struct BufferedBackend12 final : FrameBackend {
                     owner.generation_stages={};owner.capture_to_completion={};owner.completion_to_native={};owner.completion_to_generated={};
                     owner.frame_ages={};owner.age_samples={};owner.pacing_wait={};owner.producer_cpu={};}
                 if(owner.trace)owner.trace(owner.generation_high_priority?"DLSS-FG queue mode=HIGH (Lua; NGX histories reset)":
-                    selected==owner.fg_normal_queue.Get()?"DLSS-FG queue mode=separate NORMAL (Lua; NGX histories reset)":
                     "DLSS-FG queue mode=shared game queue (Lua; NGX histories reset)");
             }
-            {std::lock_guard lock(owner.mx);owner.reported_queue_mode=selected==owner.queue.Get()?2u:owner.generation_high_priority?1u:0u;}
+            {std::lock_guard lock(owner.mx);owner.reported_queue_mode=selected==owner.queue.Get()?2u:1u;}
             if(owner.last_fg_priority_requested!=requested_priority) {
                 owner.last_fg_priority_requested=requested_priority;
                 if(owner.trace) {
@@ -594,8 +573,8 @@ struct BufferedBackend12 final : FrameBackend {
                     sprintf_s(msg,"DLSS-FG queue request=%s selected=%s fallback=%u",
                         owner.queue_mode_name(requested_priority),
                         owner.generation_queue.Get()==owner.fg_high_queue.Get()&&owner.fg_high_queue.Get()?"HIGH":
-                        owner.generation_queue.Get()==owner.fg_normal_queue.Get()&&owner.fg_normal_queue.Get()?"separate NORMAL":"game queue",
-                        selected!=requested?1u:0u);
+                        "game queue",
+                        requested_priority==1u&&selected==owner.queue.Get()?1u:0u);
                     owner.trace(msg);
                 }
             }
@@ -610,7 +589,7 @@ struct BufferedBackend12 final : FrameBackend {
                     owner.generation_queue->Wait(job_guides->sync_fence.Get(),job_guides->sync_value) : S_OK;
                 if(FAILED(guides_ready)){owner.worker.failed=true;owner.worker.report("FG guide cross-queue GPU wait",unsigned(guides_ready));
                     throw std::runtime_error("FG guide cross-queue GPU wait failed");}
-                const bool queued_ngx=owner.gpu_waited_uploads()&&!pair.direct_xr&&Worker::can_batch_ngx(job_guides->pair);
+                const bool queued_ngx=!pair.direct_xr&&Worker::can_batch_ngx(job_guides->pair);
                 const bool continuing=pair.generated_index>0&&
                     (!cheeky_fg_needs_ngx(job_guides->pair)||queued_ngx);
                 // The first phase already submitted this capture dependency.
@@ -706,9 +685,8 @@ struct BufferedBackend12 final : FrameBackend {
                     // Each generated phase hands over its immutable stereo output
                     // before retirement. Eligible multi-frame intervals queue
                     // every index before the final CPU completion wait.
-                    // A presenter without GPU waits still receives each fence
-                    // early and polls that phase, rather than the whole batch.
-                    const bool stream_output=pair.direct_xr||!cheeky_fg_needs_ngx(guides)||owner.gpu_waited_uploads();
+                    // The presenter receives each fence early and polls that
+                    // phase, rather than waiting for the entire batch.
                     auto announce=[&]() noexcept {
                         publish_state();
                         if(pair.direct_xr){
@@ -736,9 +714,9 @@ struct BufferedBackend12 final : FrameBackend {
                         static_cast<BufferedPresenter*>(context)->inference_submitted();
                     }:nullptr,&owner,last?+[](void* context) noexcept {
                         static_cast<BufferedPresenter*>(context)->inference_prepared();
-                    }:nullptr,pair.generated_count,pair.generated_index+1,stream_output?+[](void* context) noexcept {
+                    }:nullptr,pair.generated_count,pair.generated_index+1,+[](void* context) noexcept {
                         (*static_cast<decltype(announce)*>(context))();
-                    }:nullptr,&announce);attempted=!owner.worker.failed&&owner.worker.temporal_evaluation_completed;
+                    },&announce);attempted=!owner.worker.failed&&owner.worker.temporal_evaluation_completed;
                     // Once announced, images/fence/format are immutable to the
                     // presenter; do not rewrite shared metadata after its wake.
                     if(!announced)publish_state();

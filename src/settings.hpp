@@ -51,15 +51,13 @@ struct Settings {
         std::uint32_t peripheral_method{1};
         CheekyFgOpticalSettings optical;
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
-        std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
+        std::uint32_t queue_priority{2}; // 1 separate HIGH (optical flow only); 2 shared game queue. Legacy 0 maps to shared.
         std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held, 6 first generated XR submission, 7 second generated XR submission.
         std::uint32_t pacing_clock{}; // Retained for old settings; current layers use demand-driven production.
         std::uint32_t target_refresh_hz{}; // 0 automatic; manual headset refresh override, 30..360 Hz.
         std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.
         std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.
         bool native11_skip_identity_crop{false}; // Native D3D11: reuse a whole-image eye capture instead of copying it again.
-        bool dedicated_present_queue{false}; // D3D12: the OpenXR runtime syncs on a layer-owned queue instead of the game's; applies at session creation.
-        bool gpu_waited_present{false}; // D3D12 + dedicated present queue: generated frames go to the runtime once queued; the upload waits on the GPU.
         bool limit_gpu_ahead{false}; // Release Never: wait while the previous frame is not yet captured on the GPU.
         bool carry_missed_ticks{false}; // Retained for old settings; no timer credits are accumulated.
         bool pacing_headroom{false}; // Retained for old settings; adaptive pacing is retired.

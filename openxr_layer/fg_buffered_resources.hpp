@@ -33,11 +33,11 @@ struct BufferedResources12 {
     CheekyFgDirectOutputFn direct_output_query{};
 
     Transport producer,output,uploads;
-    // Default: dedicated HIGH-priority inference queue. Lua can also select a
-    // separate NORMAL queue or share the application's original queue. The
-    // OpenXR binding, guide capture and uploads always retain the original queue.
+    // Shared game queue by default. Optical-flow jobs may select a separate
+    // HIGH queue, allocated on demand. Capture and presentation stay on game.
     ComPtr<ID3D12CommandQueue> generation_queue;
-    ComPtr<ID3D12CommandQueue> fg_high_queue,fg_normal_queue;
+    ComPtr<ID3D12CommandQueue> fg_high_queue;
+    bool fg_high_attempted{};
     // Single monotonically increasing fence shared across hook-free frames.
     // It bridges a verified NGX execution queue to the OpenXR/FG queues
     // without depending on UEVR's private renderer/vtable layout.

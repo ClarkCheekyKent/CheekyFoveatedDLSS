@@ -803,8 +803,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     submitted_at=TimingClock::now();latency.submitted(fence.Get(),serial);
     // The output, all final transitions, GPU suppression fallback and stereo
-    // completion fence are now queued. The presenter can enqueue its GPU wait
-    // while this worker still retires NGX resources/history on the CPU.
+    // completion fence are now queued. The presenter can track this phase's
+    // readiness while this worker retires NGX resources/history on the CPU.
     if(early_output)on_output_submitted(output_context);
     // Notify only after commands AND their completion fence are queued. The
     // presenter may release the next native render without waiting for FG to

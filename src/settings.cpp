@@ -275,6 +275,7 @@ void update_settings(const Settings& settings) noexcept {
     fg_settings.resolution_percent=fg_percent(fg_settings.resolution_percent);
     fg_settings.peripheral_percent=fg_percent(fg_settings.peripheral_percent);
     fg_settings.peripheral_method=std::min(fg_settings.peripheral_method,5u);
+    fg_settings.queue_priority=fg_settings.queue_priority==1u?1u:2u;
     if(!cheeky_fg_center_valid(fg_settings.center_method))fg_settings.center_method=0;
     fg_settings.optical.center_preset=std::min(fg_settings.optical.center_preset,2u);
     fg_settings.optical.peripheral_preset=std::min(fg_settings.optical.peripheral_preset,2u);

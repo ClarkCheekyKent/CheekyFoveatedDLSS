@@ -21,7 +21,7 @@ using Image=std::shared_ptr<TransportImage>;
 // whatever source supplied the guides; pacing reads only these values.
 struct FramePolicy {
     std::uint32_t release_point{};  // 0 submission, 1 preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
-    std::uint32_t queue_priority{1}; // 0 separate NORMAL, 1 separate HIGH, 2 shared game queue.
+    std::uint32_t queue_priority{2}; // 1 separate HIGH (optical flow only); 2 shared game queue.
     bool optical_flow{}; // Flow is shared by all phases: use its amortized generation cost for Auto.
 };
 // Backend-owned per-frame guide state (textures, leases, GPU dependencies).
@@ -30,10 +30,6 @@ struct FrameGuides {virtual ~FrameGuides()=default;};
 struct FrameCompletion {
     virtual ~FrameCompletion()=default;
     virtual bool ready() const noexcept=0; // Poll only; never wait or call OpenXR.
-    // Queue a GPU-side wait for this completion on `queue` (the backend's
-    // native queue type). False when the backend cannot wait on the GPU.
-    virtual bool gpu_wait(void* /*queue*/) const noexcept {return false;}
-    virtual bool gpu_waitable() const noexcept {return false;}
 };
 
 enum class CaptureOutcome { captured, unavailable, busy };

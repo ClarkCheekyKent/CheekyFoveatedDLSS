@@ -61,11 +61,12 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     // Retired options now fixed by the runtime; older files and menus may still send them.
     for (const auto retired : {"FgHooklessMode3", "FgBackbufferFrameId", "FgDepthBits", "FgMotionBits", "FgSubmitRepeats", "FgGuideCaptureMode",
             "FgCompactStorage", "FgColorCaptureMode", "FgUploadMode", "FgDirectPeripheralShading", "FgDiagnosticMode",
-            "D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "HookRescanOnModuleChange"})
+            "D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "HookRescanOnModuleChange",
+            "FgDedicatedPresentQueue", "FgGpuWaitedPresent"})
         if (key == retired) return true;
     if (key == "FgQueuePriority") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
-        s.fg.queue_priority=mode; return true;
+        s.fg.queue_priority=mode==1u?1u:2u; return true;
     }
     if (key == "FgLatencyDiagnostics" || key == "FgDirectXrOutput") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 1U) return false;

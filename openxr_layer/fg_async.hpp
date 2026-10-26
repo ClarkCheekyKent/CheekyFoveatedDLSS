@@ -36,10 +36,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool burst_generated{};
 
     unsigned last_fg_priority_requested{UINT32_MAX};
-    unsigned reported_queue_mode{1}; // Published under mx for presentation diagnostics.
+    unsigned reported_queue_mode{2}; // Published under mx for presentation diagnostics.
     bool generation_high_priority{};
     static const char* queue_mode_name(unsigned mode) noexcept {
-        return mode==2u?"shared-game":mode==0u?"separate-NORMAL":"separate-HIGH";
+        return mode==1u?"separate-HIGH":"shared-game";
     }
     std::atomic<unsigned> latency_diagnostics{1};
     // Legacy diagnostic callers may still set a mode. Production follows
@@ -103,18 +103,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // let the game keep rendering while slower frame generation catches up, at
     // the cost of two more full stereo color copies of VRAM.
     std::atomic<bool> extra_frame_slots{};
-    // Generated phases are handed to the runtime once their GPU work is
-    // queued; the upload queue waits on the phase fence instead of the
-    // presenter thread polling it. Only with a layer-owned runtime queue: a
-    // GPU wait on the game's queue would stall the game behind generation.
-    std::atomic<bool> gpu_waited_present{};
     std::atomic<bool> limit_gpu_ahead{}; // Release Never: optional hold while the GPU is a frame behind.
     std::uint64_t carried_ticks{},clock_ticks{};
     // Hold mx. The previous frame is still on the GPU.
     bool gpu_behind_now() const {return latest_native&&!capture_completed(latest_native->ready);}
-    std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
-    std::uint64_t upload_capture_ticket{}; // Presenter thread only; producer fence value the next upload waits on.
-    bool gpu_waited_uploads() const noexcept {return runtime_queue&&gpu_waited_present.load(std::memory_order_relaxed);}
     std::size_t slot_count() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?5u:3u;}
     // Captured real frames waiting for generation. Kept in order: interpolation
     // needs consecutive real frames, so a burst is worked off instead of skipped.
@@ -614,9 +606,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (5 capture slots)":"FG extra frame slots=OFF (3 capture slots)");
             const bool gpu_ahead=pacing.limit_gpu_ahead!=0;
             if(limit_gpu_ahead.exchange(gpu_ahead)!=gpu_ahead&&trace)trace(gpu_ahead?"FG limit GPU ahead=ON":"FG limit GPU ahead=OFF");
-            const bool gpu_waited=pacing.gpu_waited_present!=0;
-            if(gpu_waited_present.exchange(gpu_waited)!=gpu_waited&&trace)
-                trace(gpu_waited?(runtime_queue?"FG GPU-waited present=ON":"FG GPU-waited present requested; inactive without the dedicated present queue"):"FG GPU-waited present=OFF");
             {std::lock_guard lock(mx);
                 const auto before=display_clock.display_ns();
                 display_clock.set_override(pacing.target_refresh_hz);
@@ -852,15 +841,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(pair.progress->failed||index>=pair.generated_count)return false;
         const auto& p=pair.progress->phases[index];
         return p.images[0]&&p.images[1]&&p.completion&&p.completion->ready();
-    }
-    // Hold mx. Whether the presenter may submit this phase now: finished, or
-    // queued with a fence the upload can wait on.
-    bool phase_presentable(const Pair& pair,unsigned index) const {
-        if(!gpu_waited_uploads())return phase_ready(pair,index);
-        if(!pair.progress)return true;
-        if(pair.progress->failed||index>=pair.generated_count)return false;
-        const auto& p=pair.progress->phases[index];
-        return p.images[0]&&p.images[1]&&p.completion&&(p.completion->ready()||p.completion->gpu_waitable());
     }
 
     void generation_loop() noexcept {
@@ -1127,8 +1107,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // so every real frame keeps its generated frames.
         for(auto it=ready.begin();it!=ready.end();++it){
             // A streamed pair's phase fence follows its capture on the GPU.
-            const bool presentable=it->progress&&gpu_waited_uploads()?phase_presentable(*it,0):
-                capture_completed(it->ready)&&(!it->progress||phase_ready(*it,0));
+            const bool presentable=capture_completed(it->ready)&&phase_ready(*it,0);
             if(presentable&&double(it->native_id)>=position){selected=it;break;}
         }
         return selected;
@@ -1138,18 +1117,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 XrResult& result,bool& closed) {
         // Streaming DX12 phases each own a stereo immutable-output fence.
         // Native pairs retain their original producer dependency.
-        const bool gpu_waited=generated&&pair.progress&&gpu_waited_uploads();
-        upload_dependency.reset();upload_capture_ticket=0;
-        // Content selected before its capture finished: the upload waits for
-        // the capture on the GPU rather than failing the submission.
-        if(!gpu_waited&&!capture_completed(pair.ready)){
-            if(!gpu_waited_uploads()||pair.direct_xr)return false;
-            upload_capture_ticket=pair.ready;
-        }
+        if(!capture_completed(pair.ready))return false;
         if(generated&&pair.progress){std::lock_guard lock(mx);
-            if(!phase_presentable(pair,pair.generated_index))return false;
+            if(!phase_ready(pair,pair.generated_index))return false;
             const auto& phase=pair.progress->phases[pair.generated_index];
-            if(gpu_waited&&!phase.completion->ready())upload_dependency=phase.completion;
             pair.submitted_at=phase.submitted_at;
             pair.completed_at=TimingClock::now();}
         burst_native=pair.native_id;burst_current=pair.current_id;burst_generated=generated;
@@ -1158,7 +1129,6 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(latency_diagnostics.load()!=0)collect_native_submission_probes();
         auto views=original_views;auto layers=pair.layers;
         const bool published=backend->publish(pair,images,views,layers,generated);
-        upload_dependency.reset();upload_capture_ticket=0;
         if(!published)return false;
         XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=pair.space;
         projection.layerFlags=layers.scene_flags;projection.viewCount=2;projection.views=views.data();
@@ -1194,7 +1164,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // contribute its interpolation; do not submit that native image twice.
         if(have_active&&active.progress&&active.progress->failed)return true; // Retire failed partial interval below.
         if(stalled_native(position))return true;
-        if(have_active&&generated_phase)return phase_presentable(active,active.generated_index);
+        if(have_active&&generated_phase)return phase_ready(active,active.generated_index);
         if(have_active&&double(active.native_id)>position)return true;
         const auto selected=newest_ready_pair(position);
         if(selected!=ready.end()&&(double(selected->native_id)>position||
@@ -1220,7 +1190,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
-            const bool producer_pending=(have_active&&generated_phase&&active.progress&&!phase_presentable(active,active.generated_index))||
+            const bool producer_pending=(have_active&&generated_phase&&active.progress&&!phase_ready(active,active.generated_index))||
                 (!fg_active&&latest_native&&!capture_completed(latest_native->ready))||
                 std::any_of(ready.begin(),ready.end(),[&](const auto& pair){return !capture_completed(pair.ready)||(pair.progress&&!phase_ready(pair,0));});
             // A running generation may stall; recheck so a newer native frame can be shown.

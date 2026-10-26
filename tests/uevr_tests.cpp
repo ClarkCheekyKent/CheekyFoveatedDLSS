@@ -121,13 +121,14 @@ void settings_tests(const std::filesystem::path& root) {
         require(set_named_setting(fg,"FgReleasePoint","3"),"Select generated submission for persistence");
         for(const auto key:{"FgHooklessMode3","FgBackbufferFrameId","FgDepthBits","FgMotionBits","FgSubmitRepeats","FgGuideCaptureMode","FgCompactStorage",
                 "FgColorCaptureMode","FgUploadMode","FgDirectPeripheralShading","FgDiagnosticMode",
-                "D3D11D3D12SharedGuides","D3D11D3D12SingleBuffer","HookRescanOnModuleChange"})
+                "D3D11D3D12SharedGuides","D3D11D3D12SingleBuffer","HookRescanOnModuleChange",
+                "FgDedicatedPresentQueue","FgGpuWaitedPresent"})
             require(set_named_setting(fg,key,"0")&&set_named_setting(fg,key,"invalid")&&
                 setting_groups_json().find(std::string("\"")+key+"\"")==std::string::npos,"Retired FG options are accepted from older menus but not persisted");
-        require(fg.fg.queue_priority==2&&set_named_setting(fg,"FgQueuePriority","0")&&
+        require(fg.fg.queue_priority==2&&set_named_setting(fg,"FgQueuePriority","0")&&fg.fg.queue_priority==2&&
             set_named_setting(fg,"FgQueuePriority","1")&&set_named_setting(fg,"FgQueuePriority","2")&&
             !set_named_setting(fg,"FgQueuePriority","3")&&!set_named_setting(fg,"FgQueuePriority","-1")&&fg.fg.queue_priority==2,
-            "Shared game queue is the default; separate GPU queues remain selectable");
+            "Shared is default, legacy NORMAL maps to shared, and optical HIGH remains selectable");
         require(fg.fg.latency_diagnostics==0,"Latency timeline defaults off");
         require(fg.fg.direct_xr_output==0,"Direct XR experiment defaults off");
         for(const auto key:{"FgLatencyDiagnostics","FgDirectXrOutput"})

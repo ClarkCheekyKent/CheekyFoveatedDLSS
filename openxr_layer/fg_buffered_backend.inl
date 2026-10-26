@@ -53,7 +53,7 @@ inline void BufferedPresenter::reset() noexcept {
     // dedicated queue. A temporal reset only stops the workers; it keeps
     // the queue available for the next interpolation session.
     stop();destroy_chains();Presenter::reset();
-    generation_queue.Reset();fg_high_queue.Reset();fg_normal_queue.Reset();generation_high_priority=false;
+    generation_queue.Reset();fg_high_queue.Reset();fg_high_attempted=false;generation_high_priority=false;
     last_fg_priority_requested=UINT32_MAX;
 }
 
