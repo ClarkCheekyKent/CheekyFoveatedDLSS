@@ -3,6 +3,7 @@
 #include "fg_buffered_resources.hpp"
 #include "fg_burst_capture.hpp"
 #include "fg_native_submission_math.hpp"
+#include "fg_display_clock.hpp"
 #include "../src/fg_source_lifecycle.hpp"
 #include <condition_variable>
 #include <thread>
@@ -29,7 +30,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool capture_completed(std::uint64_t ready) const {return backend->ready(ready);}
     std::condition_variable_any changed;
     std::mutex capture_mutex;
-    std::thread presentation_thread,generation_thread,pacing_thread;
+    std::thread presentation_thread,generation_thread,release_thread;
     FgBurstCapture burst;
     std::uint64_t burst_native{},burst_current{},burst_presentation{};
     bool burst_generated{};
@@ -41,11 +42,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         return mode==2u?"shared-game":mode==0u?"separate-NORMAL":"separate-HIGH";
     }
     std::atomic<unsigned> latency_diagnostics{1};
-    // Native credit clock (FG pacing clock setting). 0 keeps the independent
-    // display clock. 1 slows it toward the rate native frames actually reach
-    // the runtime, so a late presenter is not fed frames it will drop. 2 does
-    // that and also phase-locks clock ticks to the runtime xrWaitFrame wakes.
+    // Legacy diagnostic callers may still set a mode. Production follows
+    // actual release conditions and buffer capacity, with no timer gate.
     std::atomic<unsigned> pacing_clock_mode{};
+    StableDisplayClock display_clock; // Hold mx.
     std::atomic<unsigned> multiplier{2};
     std::atomic<bool> automatic_multiplier{};
     AutoMultiplier auto_multiplier; // Hold mx; decisions latch on a complete native interval.
@@ -60,21 +60,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     }
     std::atomic<bool> native11_skip_identity_crop{}; // Runtime option; native D3D11 eye crops.
     double presented_native_ms{}; // Hold mx. Smoothed interval between distinct native submissions.
-    TimingClock::time_point last_native_present{},runtime_wake{};
-    std::uint64_t runtime_wakes{},adapted_ticks{},phase_corrections{},backlog_holds{},gpu_behind_holds{},gpu_behind_waits{};
-    bool backlog_detected{}; // Hold mx. Set by the presenter, consumed by the pacing clock.
-    bool gpu_behind_credit{}; // Hold mx. A tick's credit held until the previous capture finishes on the GPU.
+    TimingClock::time_point last_native_present{};
+    std::uint64_t backlog_holds{},gpu_behind_holds{},gpu_behind_waits{};
     double native_clock_ms{}; // Hold mx. Credit period the pacing clock last used.
-    // Hold mx. Smoothed interval between runtime xrWaitFrame wakes. Some
-    // runtimes report a display period that does not match how often they
-    // actually take frames (e.g. 8.33 ms while running at 72 Hz).
-    double measured_wake_ms{};
-    // Hold mx. Follow modes slow the clock only while game frames are being
-    // dropped. Without drops the presented rate is the game's own rate, and
-    // following it would cap the game below the display rate.
-    std::uint64_t follow_game_mark{},follow_shown_mark{};
-    TimingClock::time_point follow_window_start{};
-    bool follow_dropping{};
     // Native D3D11 frames carry no release policy (point 0: release the game
     // at FG submission). Nonzero applies that release point to them instead.
     std::atomic<bool> direct11_requested{};
@@ -84,6 +72,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     CheekyFgStaticEyeCropsV1 static_eye_crops; // Diagnostic only; NEVER used to pack a later native frame.
     // Protected by capture_mutex, like the captured images and their stamps.
     std::unordered_map<XrSwapchain,std::uint64_t> capture_crop_tokens;
+    std::uint64_t color_stamp_frame{},color_stamp_token{}; // Hold capture_mutex; one anchor across this native frame's eye releases.
+    CheekyFgCompleteHooklessFrameV2Fn hookless_complete_v2{}; // Optional test/runtime callback; otherwise resolve the additive export.
     std::uint64_t compact_current_lookups{},compact_current_misses{};
     std::uint64_t pose_sample_count{};
     CompactLayout eye_color_layout(unsigned eye,unsigned width,unsigned height,
@@ -108,7 +98,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unordered_map<XrSwapchain,TimingClock::time_point> capture_times;
     std::unordered_map<XrSwapchain,ColorReady> capture_ready;
     bool capture_overflow{};
-    // Render credits the clock may bank, and capture slots for real frames in
+    // Availability notifications and capture slots for real frames in
     // flight (pending, generating, history, presenting). The opt-in extra slots
     // let the game keep rendering while slower frame generation catches up, at
     // the cost of two more full stereo color copies of VRAM.
@@ -118,25 +108,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // presenter thread polling it. Only with a layer-owned runtime queue: a
     // GPU wait on the game's queue would stall the game behind generation.
     std::atomic<bool> gpu_waited_present{};
-    std::atomic<bool> limit_gpu_ahead{}; // Follow clock + release Never: hold while the GPU is a frame behind.
-    // Follow clocks run at exactly the target rate, so a tick merged into a
-    // deferred or held go-ahead is never made up. With carry_missed_ticks one
-    // such tick is owed and handed over with the next go-ahead. Hold mx.
-    std::atomic<bool> carry_missed_ticks{};
-    bool owed_tick{};
+    std::atomic<bool> limit_gpu_ahead{}; // Release Never: optional hold while the GPU is a frame behind.
     std::uint64_t carried_ticks{},clock_ticks{};
-    void owe_tick() noexcept {if(carry_missed_ticks.load(std::memory_order_relaxed))owed_tick=true;}
-    unsigned take_owed() noexcept {if(!owed_tick)return 0;owed_tick=false;++carried_ticks;return 1;}
-    // Plain Follow clock: pace the game 2.5% above the target rate; the
-    // backlog skip drops the surplus. Not with the vsync lock, which pins
-    // ticks to the headset's slots.
-    std::atomic<bool> pacing_headroom{};
     // Hold mx. The previous frame is still on the GPU.
     bool gpu_behind_now() const {return latest_native&&!capture_completed(latest_native->ready);}
     std::shared_ptr<FrameCompletion> upload_dependency; // Presenter thread only; consumed by the next upload.
     std::uint64_t upload_capture_ticket{}; // Presenter thread only; producer fence value the next upload waits on.
     bool gpu_waited_uploads() const noexcept {return runtime_queue&&gpu_waited_present.load(std::memory_order_relaxed);}
-    unsigned max_credits() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?4u:2u;}
     std::size_t slot_count() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?5u:3u;}
     // Captured real frames waiting for generation. Kept in order: interpolation
     // needs consecutive real frames, so a burst is worked off instead of skipped.
@@ -214,7 +192,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t deferred_credits{},released_deferred_credits{},submitted_native_id{};
     bool credit_deferred{};
     unsigned inflight_release_point{},last_release_point{},active_release_point{};
-    bool inflight_prepared{},release_policy_known{},clock_pacing_active{};
+    bool inflight_prepared{},release_policy_known{};
     bool inflight_generated_gate_released{};
     TimingAverage producer_cpu,pacing_wait;
     TimingAverage clock_late,credit_deferral,begin_gate_wait,presenter_content_wait;
@@ -377,8 +355,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         CheekyFgCadence result;result.supported=1;std::array<double,4> rates{};
         result.valid=cadence_window.rates(rates);result.game_fps=rates[0];result.native_fps=rates[1];result.generated_fps=rates[2];
         result.unique_fps=rates[1]+rates[2];result.submission_fps=rates[3];
-        result.refresh_hz=telemetry.xr_period_ms>0?1000./telemetry.xr_period_ms:0;
-        result.application_period_ms=telemetry.xr_period_ms*(pacing_active?active_multiplier:1);
+        result.refresh_hz=display_clock.display_ms()>0?1000./display_clock.display_ms():0;
+        result.application_period_ms=display_clock.display_ms()*(pacing_active?active_multiplier:1);
         result.native_target_fps=result.application_period_ms>0?1000./result.application_period_ms:0;
         result.app_image_wait_ms=app_image_wait.mean();result.present_image_wait_ms=present_image_wait.mean();
         result.begin_ms=runtime_begin.mean();result.end_ms=runtime_end.mean();result.present_cpu_ms=present_cpu.mean();
@@ -511,11 +489,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         {std::lock_guard lock(mx);stopping=true;stop_in_progress=true;changed.notify_all();}
         if(presentation_thread.joinable())presentation_thread.join();
         if(generation_thread.joinable())generation_thread.join();
-        if(pacing_thread.joinable())pacing_thread.join();
+        if(release_thread.joinable())release_thread.join();
         std::lock_guard capture_lock(capture_mutex);
         backend->retire();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
-        captured.clear();backend->discard_captures(true);capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
+        captured.clear();backend->discard_captures(true);capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();color_stamp_frame=color_stamp_token=0;capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
         if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         raw=nullptr;raw_done=true;passthrough_events=history_reset_events=0;
         waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
@@ -535,11 +513,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         direct_blocked_target=0;
         awaiting_generated_submission=generated_gate_releases=generated_gate_skips=0;
         memory_state={};next_capture_memory=next_worker_memory=next_presenter_memory=0;
-        inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=clock_pacing_active=false;
+        inflight_release_point=last_release_point=active_release_point=0;inflight_prepared=release_policy_known=false;
         distinct_native=runtime_submissions=0;
         auto_multiplier={};active_multiplier=2;
-        presented_native_ms=native_clock_ms=measured_wake_ms=0;last_native_present=runtime_wake={};
-        follow_game_mark=follow_shown_mark=0;follow_window_start={};follow_dropping=false;runtime_wakes=adapted_ticks=phase_corrections=backlog_holds=gpu_behind_holds=gpu_behind_waits=0;owed_tick=false;carried_ticks=clock_ticks=0;backlog_detected=gpu_behind_credit=false;
+        presented_native_ms=native_clock_ms=0;last_native_present={};display_clock={};
+        backlog_holds=gpu_behind_holds=gpu_behind_waits=0;carried_ticks=clock_ticks=0;
         presentation_trace_last_time=0;presentation_trace_last_position=-1.;
         presentation_trace_events=presentation_trace_anomalies=0;
         stop_in_progress=false;changed.notify_all();
@@ -563,8 +541,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(started)return true;
         stopping=false;terminal=XR_SUCCESS;raw_done=false;
         try {
-            started=true;clock_pacing_active=true;
-            pacing_thread=std::thread([this]{pacing_loop();});
+            started=true;
+            release_thread=std::thread([this]{release_loop();});
             generation_thread=std::thread([this]{generation_loop();});
             presentation_thread=std::thread([this]{presentation_loop();});
         } catch(...) {stopping=true;changed.notify_all();return false;}
@@ -632,20 +610,18 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             multiplier=std::clamp(automatic_options.multiplier,2u,4u);automatic_multiplier=automatic_options.automatic!=0;
         }
         if(pacing_query&&pacing_query(&pacing)){
-            const auto mode=std::min(pacing.clock_mode,2u);
             const bool extra=pacing.extra_frame_slots!=0;
-            if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (4 credits, 5 capture slots)":"FG extra frame slots=OFF (2 credits, 3 capture slots)");
+            if(extra_frame_slots.exchange(extra)!=extra&&trace)trace(extra?"FG extra frame slots=ON (5 capture slots)":"FG extra frame slots=OFF (3 capture slots)");
             const bool gpu_ahead=pacing.limit_gpu_ahead!=0;
             if(limit_gpu_ahead.exchange(gpu_ahead)!=gpu_ahead&&trace)trace(gpu_ahead?"FG limit GPU ahead=ON":"FG limit GPU ahead=OFF");
-            const bool carry=pacing.carry_missed_ticks!=0;
-            if(carry_missed_ticks.exchange(carry)!=carry&&trace)trace(carry?"FG carry missed go-aheads=ON":"FG carry missed go-aheads=OFF");
-            const bool headroom=pacing.pacing_headroom!=0;
-            if(pacing_headroom.exchange(headroom)!=headroom&&trace)trace(headroom?"FG pacing headroom=ON (plain Follow clock +2.5%)":"FG pacing headroom=OFF");
             const bool gpu_waited=pacing.gpu_waited_present!=0;
             if(gpu_waited_present.exchange(gpu_waited)!=gpu_waited&&trace)
                 trace(gpu_waited?(runtime_queue?"FG GPU-waited present=ON":"FG GPU-waited present requested; inactive without the dedicated present queue"):"FG GPU-waited present=OFF");
-            if(pacing_clock_mode.exchange(mode)!=mode&&trace)trace(mode==2u?"FG pacing clock=presented rate + runtime phase lock":
-                mode==1u?"FG pacing clock=presented native rate":"FG pacing clock=independent display clock");
+            {std::lock_guard lock(mx);
+                const auto before=display_clock.display_ns();
+                display_clock.set_override(pacing.target_refresh_hz);
+                if(before!=display_clock.display_ns())changed.notify_all();
+            }
             const auto point=std::min(pacing.native11_release_point,7u);
             if(native11_release_point.exchange(point)!=point&&trace){char message[96]{};
                 sprintf_s(message,"FG native D3D11 release point=%u (3 = after generated frame submission)",point);trace(message);}
@@ -654,17 +630,26 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(!start())return XR_ERROR_RUNTIME_FAILURE;
         const auto wait_begin=TimingClock::now();
         ++app_waiters;
-        // A credit banked earlier must not start a frame while the GPU is
-        // still on the previous one: check the GPU-behind gate where the
-        // credit is spent, not only where it is granted. GPU completion does
-        // not notify, so poll while it blocks.
-        const auto gpu_gate=[&]{return pacing_clock_mode.load(std::memory_order_relaxed)!=0u&&pacing_active&&
+        // Optional GPU backlog protection is an actual resource dependency,
+        // independent of the nominal display target.
+        const auto gpu_gate=[&]{return pacing_active&&
             limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now();};
-        for(bool counted=false;;) {
-            changed.wait(lock,[&]{return stopping||XR_FAILED(terminal)||(credits&&waited==begun&&!raw&&!release_gate_active());});
-            if(stopping||XR_FAILED(terminal)||!gpu_gate())break;
-            if(!counted){++gpu_behind_waits;counted=true;}
-            changed.wait_for(lock,std::chrono::microseconds(500));
+        for(bool counted=false,capacity_counted=false;;) {
+            if(stopping||XR_FAILED(terminal))break;
+            const bool ordered=waited==begun&&!raw&&predicted.predictedDisplayPeriod>0;
+            const bool gated=release_gate_active();
+            const bool capacity=degraded||producer_has_capacity();
+            const bool queued=pending.size()>=max_pending()||ready.size()>=max_pending();
+            if(ordered&&!gated&&capacity&&!gpu_gate()){
+                release_deferred_credit();++granted_credits;break;
+            }
+            if(ordered&&gated)mark_credit_deferred();
+            if(ordered&&!capacity&&!capacity_counted){++capped_credits;capacity_counted=true;}
+            if(ordered&&gpu_gate()&&!counted){++gpu_behind_waits;counted=true;}
+            // Fence/lease retirement may not notify the CPU. Queue consumption
+            // and release gates do notify; they need no periodic polling.
+            if(ordered&&!gated&&((!capacity&&!queued)||gpu_gate()))changed.wait_for(lock,std::chrono::microseconds(500));
+            else changed.wait(lock);
         }
         --app_waiters;
         pacing_wait.add(elapsed_ms(wait_begin));game_wait_enter=wait_begin;game_wait_exit=TimingClock::now();
@@ -672,14 +657,14 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // finish so the layer can retry against the current presenter.
         if(stopping&&!XR_FAILED(terminal))changed.wait(lock,[&]{return !stop_in_progress||XR_FAILED(terminal);});
         if(stopping||XR_FAILED(terminal))return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
-        --credits;++consumed_credits;++waited;
+        credits=0;++consumed_credits;++waited;
         const auto next=frame->next;*frame=predicted;frame->next=next;
         // Predict a native frame at least two display intervals ahead; keep one display
         // time consistent across all engine stages and strictly increasing.
-        const auto period=std::max<XrDuration>(1,predicted.predictedDisplayPeriod);
+        const auto period=std::max<XrDuration>(1,display_clock.display_ns());
         const auto factor=pacing_active?active_multiplier:1u;
         frame->predictedDisplayTime=std::max(predicted.predictedDisplayTime+period*std::max(2u,factor),app_display_time+period*factor);
-        if(pacing_active&&period<=INT64_MAX/factor)frame->predictedDisplayPeriod=period*factor;
+        if(period<=INT64_MAX/factor)frame->predictedDisplayPeriod=period*factor;
         app_display_time=frame->predictedDisplayTime;return XR_SUCCESS;
     }
     XrResult begin_frame(const XrFrameBeginInfo* info) noexcept override {
@@ -904,7 +889,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     {std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;}
                     if(release_policy_known)backend->reset_statistics(true);
                     last_release_point=point;
-                    if(trace)trace(point==5u?"FG native release=never held (display clock only; FG fits around the game)":
+                    if(trace)trace(point==5u?"FG native release=buffer capacity only (no FG release gate)":
                         point==3u?"FG native release=after generated frame OpenXR submission (Lua; histories retained)":
                         point==6u?"FG native release=after first generated frame OpenXR submission (Lua; histories retained)":
                         point==7u?"FG native release=after second generated frame OpenXR submission (Lua; histories retained)":
@@ -935,7 +920,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     if(job->guides_valid&&previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&telemetry.gpu_valid){
                         const double now=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
                         const auto generated_ms=(job->policy.optical_flow?telemetry.total_ms:telemetry.total_last_ms)+publication_cost.publication_last_ms+publication_cost.upload_last_ms;
-                        if(auto_multiplier.observe(now,sample,generated_ms,telemetry.xr_period_ms)&&trace){char message[180]{};
+                        if(auto_multiplier.observe(now,sample,generated_ms,display_clock.display_ms())&&trace){char message[180]{};
                             sprintf_s(message,"FG Auto selected=%ux max=%ux render_ms=%.3f generated_ms=%.3f reason=%u (histories retained)",
                                 auto_multiplier.selected,maximum,auto_multiplier.render_ms,auto_multiplier.fg_ms,auto_multiplier.reason);trace(message);}
                     }
@@ -1042,122 +1027,51 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // TODO(perf): render generated frames straight into the acquired image.
 
     void wake_producer_locked() {
-        if(clock_pacing_active){changed.notify_all();return;}
-        // Early late-selection wake and ordinary submission share one credit.
-        if(last_credit_tick==ticks)return;
-        last_credit_tick=ticks;
-        if(!stopping&&!raw&&(!pacing_active||(ticks%active_multiplier)==0)) {
-            if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
-                // Default: hold until FG submission. The opt-in completion
-                // policy holds through both eyes' ordinary completion fence.
-                // Coalesce pacing ticks while either policy blocks production.
-                mark_credit_deferred();
-            }else credits=std::min(max_credits(),credits+(ticks==1?2u:1u));
+        // An availability notification, not a timer credit. wait_frame may
+        // proceed as soon as its dependencies clear even without this call.
+        if(!stopping&&!raw){
+            if(release_gate_active()||(pacing_active&&unsubmitted_native()))mark_credit_deferred();
+            else credits=1;
         }
         changed.notify_all();
     }
-    void pacing_loop() noexcept {
-        SetThreadDescription(GetCurrentThread(),L"Cheeky native pacing");
+    bool producer_has_capacity() const {
+        // Hold mx. Backpressure depends on actual owned work, never elapsed
+        // runtime intervals. Resource reuse remains fence-protected.
+        if(pending.size()>=max_pending()||ready.size()>=max_pending())return false;
+        for(std::size_t i=0;i<slot_count();++i)
+            if(!slots[i]||(slots[i].use_count()==1&&capture_completed(slots[i]->ready)))return true;
+        return false;
+    }
+    void release_loop() noexcept {
+        SetThreadDescription(GetCurrentThread(),L"Cheeky FG release watchdog");
         try {
             std::unique_lock lock(mx);
-            // The first game credit needs a real runtime prediction. Do not
-            // let the independent clock expose an uninitialized frame state.
-            changed.wait(lock,[&]{return stopping||telemetry.xr_period_ms>0;});
-            auto next=TimingClock::now();
-            std::uint64_t seen_wakes=runtime_wakes;
+            std::int64_t previous_target{};
             while(!stopping) {
-                const auto mode=pacing_clock_mode.load(std::memory_order_relaxed);
-                if(mode==2u&&runtime_wakes!=seen_wakes&&telemetry.xr_period_ms>0) {
-                    // Pull the next tick toward the runtime's wake grid (either
-                    // parity). Gain 1/4 converges in a few frames and tracks a
-                    // runtime period that differs from its reported value.
-                    // Wakes land on the real vsync grid even when the presenter
-                    // skips slots, so the phase uses the reported period.
-                    seen_wakes=runtime_wakes;const double v=telemetry.xr_period_ms;
-                    double error=std::fmod(std::chrono::duration<double,std::milli>(next-runtime_wake).count(),v);
-                    if(error<0)error+=v;if(error>v/2)error-=v;
-                    if(std::abs(error)>.05){next-=std::chrono::duration_cast<TimingClock::duration>(
-                        std::chrono::duration<double,std::milli>(error*.25));++phase_corrections;}
-                }
                 const auto now=TimingClock::now();
-                // A deferred native credit may become available between
-                // display clock ticks. Wake exactly at the soft-release
-                // deadline instead of adding a whole XR tick of latency.
+                const auto native_ns=display_clock.native_ns(pacing_active?active_multiplier:1u);
+                native_clock_ms=double(native_ns)/1e6; // Diagnostic target, not a production timer.
+                if(native_ns&&native_ns!=previous_target){
+                    previous_target=native_ns;
+                    if(trace){char message[180]{};sprintf_s(message,
+                        "FG demand-driven production: refresh_hz=%.3f source=%s multiplier=%u native_target_ms=%.3f",
+                        1000./display_clock.display_ms(),display_clock.source(),pacing_active?active_multiplier:1u,double(native_ns)/1e6);trace(message);}
+                }
+                // This thread only maintains explicit release deadlines and
+                // the stall watchdog. It never schedules normal game frames.
                 if(release_delay_until!=TimingClock::time_point{}&&now>=release_delay_until) {
                     release_delay_until={};
                     release_deferred_credit();
-                    changed.notify_all(); // Existing wait/begin credits may also be gated.
+                    changed.notify_all();
                 }
-                // A tick held for the GPU is granted the moment the previous
-                // capture finishes, not a whole tick later: waiting for the
-                // next tick quantizes the game to multiples of the tick.
                 release_gate_watchdog(now);
-                if(gpu_behind_credit&&!gpu_behind_now()) {
-                    gpu_behind_credit=false;
-                    if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1+take_owed());changed.notify_all();}
-                }
-                if(now>=next) {
-                    clock_late.add(std::chrono::duration<double,std::milli>(now-next).count());
-                    const double display_ms=mode!=0u?follow_display_ms():
-                        telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
-                    double native_ms=std::max(1.,display_ms*(pacing_active?double(active_multiplier):1.));
-                    if(mode==1u&&pacing_active&&pacing_headroom.load(std::memory_order_relaxed))native_ms/=1.025;
-                    ++clock_ticks;
-                    if(follow_window_start==TimingClock::time_point{}||now-follow_window_start>=std::chrono::milliseconds(500)) {
-                        // More than 5% of rendered frames never reached the runtime.
-                        const auto rendered=native_count-std::min(native_count,follow_game_mark);
-                        const auto shown=distinct_native-std::min(distinct_native,follow_shown_mark);
-                        follow_dropping=follow_window_start!=TimingClock::time_point{}&&rendered>shown+std::max<std::uint64_t>(1,rendered/20);
-                        follow_game_mark=native_count;follow_shown_mark=distinct_native;follow_window_start=now;
-                    }
-                    // Stay 8% faster than the measured presentation rate so
-                    // the clock keeps probing upward and returns to the
-                    // display rate as soon as the presenter catches up.
-                    if(mode!=0u&&pacing_active&&follow_dropping&&presented_native_ms*.92>native_ms){
-                        native_ms=std::min(presented_native_ms*.92,display_ms*active_multiplier*2.);++adapted_ticks;}
-                    native_clock_ms=native_ms;
-                    const auto period=std::chrono::duration_cast<TimingClock::duration>(
-                        std::chrono::duration<double,std::milli>(native_ms));
-                    // Follow modes: a standing backlog (a pair already queued
-                    // behind the one being shown, or a full queue) holds every
-                    // frame a whole frame longer. Skip this credit so the
-                    // queued frame fills the gap and the backlog drains.
-                    // With release Never nothing else stops the game's CPU from
-                    // running ahead of its GPU: a previous frame still not
-                    // captured on the GPU at the next tick means a GPU-side
-                    // backlog that delays every generated frame behind it.
-                    const bool gpu_behind=limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now();
-                    const bool backlog=mode!=0u&&pacing_active&&
-                        (backlog_detected||ready.size()>=max_pending()||pending.size()>=max_pending());
-                    const bool hold_for_gpu=!backlog&&mode!=0u&&pacing_active&&gpu_behind;
-                    backlog_detected=false;
-                    // A banked credit would let the game run ahead regardless.
-                    if(backlog){++backlog_holds;if(credits>0)--credits;}
-                    if(hold_for_gpu){++gpu_behind_holds;if(credits>0||gpu_behind_credit)owe_tick();if(credits>0)--credits;gpu_behind_credit=true;}
-                    if(!raw&&!backlog&&!hold_for_gpu) {
-                        if(release_gate_active()||(pacing_active&&unsubmitted_native())) {
-                            if(credit_deferred)owe_tick();
-                            mark_credit_deferred();
-                        }else if(credit_deferred){owe_tick();release_deferred_credit();}
-                        else{++granted_credits;if(credits>=max_credits())++capped_credits;credits=std::min(max_credits(),credits+1);}
-                        changed.notify_all();
-                    }
-                    next+=period;if(next<=now)next=now+period;
-                }
+                const auto watchdog_wake=now+std::chrono::milliseconds(50);
                 auto wake=release_delay_until!=TimingClock::time_point{}?
-                    std::min(next,release_delay_until):next;
-                // GPU completion does not notify; poll only while a tick is held for it.
-                if(gpu_behind_credit)wake=std::min(wake,TimingClock::now()+std::chrono::microseconds(500));
+                    std::min(watchdog_wake,release_delay_until):watchdog_wake;
                 changed.wait_until(lock,wake);
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
-    }
-    // Hold mx. Follow modes pace to how often the runtime actually takes
-    // frames, never faster than its reported period. 3% headroom keeps the
-    // clock probing upward when the presenter speeds up again.
-    double follow_display_ms() const noexcept {
-        const double reported=telemetry.xr_period_ms>0?telemetry.xr_period_ms:1000./120.;
-        return std::max(reported,measured_wake_ms*.97);
     }
     // Release point 5 never holds the game: its jobs neither gate nor defer credits.
     bool unsubmitted_native() const noexcept {
@@ -1182,13 +1096,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             std::any_of(pending.begin(),pending.end(),[](const auto& job){return job->guides_valid&&(job->policy.release_point==3u||job->policy.release_point==6u||job->policy.release_point==7u);});
     }
     void mark_credit_deferred() noexcept {
-        // Hold mx. A missed clock tick is coalesced; measure the actual held duration.
+        // Hold mx. Measure a blocked release condition; repeated notifications
+        // share one pending wake rather than banking extra renders.
         if(!credit_deferred){++deferred_credits;credit_deferred=true;credit_deferred_since=TimingClock::now();}
     }
     void release_deferred_credit() noexcept {
-        // Hold mx. Coalesce missed ticks rather than bursting queued renders.
+        // Hold mx. Wake the blocked render immediately when its actual
+        // release condition clears. There is no bank of missed timer ticks.
         if(credit_deferred&&!stopping&&!raw&&!unsubmitted_native()&&!release_gate_active()) {
-            credits=std::min(max_credits(),credits+1+take_owed());credit_deferred=false;++released_deferred_credits;
+            credits=std::max(credits,1u);credit_deferred=false;++released_deferred_credits;
             if(credit_deferred_since!=TimingClock::time_point{})credit_deferral.add(elapsed_ms(credit_deferred_since));
             credit_deferred_since={};changed.notify_all();
         }
@@ -1197,9 +1113,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         std::lock_guard lock(mx);submitted_native_id=std::max(submitted_native_id,inflight_id);
         if(inflight_release_point==4u) {
             release_delay_until=TimingClock::now()+std::chrono::milliseconds(4);
-            changed.notify_all(); // Wake the pacing clock to install the deadline.
+            changed.notify_all(); // Install the explicit soft-release deadline.
         }
-        release_deferred_credit();
+        release_deferred_credit();changed.notify_all();
     }
     void inference_prepared() noexcept {
         std::lock_guard lock(mx);inflight_prepared=true;release_deferred_credit();changed.notify_all();
@@ -1329,6 +1245,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         } complete_borrowed_frame{*this};
         Pair active;bool have_active{},generated_phase{};double last_position{};
         XrTime late_last_display{}; // Late-frame trace: previous runtime frame's display time.
+        TimingClock::time_point next_refresh_query{};
         try {for(;;) {
             // Runtime frame ownership cannot transfer midway through the old
             // native frame. BeginFrame may discard an unfinished frame rather
@@ -1346,6 +1263,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=runtime_dispatch([&]{return xr.begin_frame(session,&begin);});
             {std::lock_guard lock(mx);runtime_begin.add(elapsed_ms(present_start));}
             if(XR_FAILED(result)){runtime_failure("runtime xrBeginFrame",result);break;}
+            double refresh_hz{};
+            if(xr.get_refresh_rate&&present_start>=next_refresh_query){
+                next_refresh_query=present_start+std::chrono::seconds(1);
+                float hz{};
+                if(XR_SUCCEEDED(runtime_dispatch([&]{return xr.get_refresh_rate(session,&hz);})))refresh_hz=hz;
+            }
             const XrFrameEndInfo* raw_frame{};bool stop_now{};
             {std::lock_guard lock(mx);raw_frame=raw;stop_now=stopping;
                 if(have_active&&active.progress&&active.progress->failed){have_active=false;generated_phase=false;fg_active=false;active={};}
@@ -1355,15 +1278,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     note_direct_failure_locked(CheekyFgDirectReason::cancelled,0,direct_request.get());
                     direct_request->decided=true;direct_request.reset();++direct_stats.fallbacks;direct_stats.last_path=3;changed.notify_all();}
                 predicted=frame;telemetry.xr_period_ms=double(frame.predictedDisplayPeriod)/1000000.;
-                {const auto wake_now=TimingClock::now();
-                    if(runtime_wakes&&telemetry.xr_period_ms>0){
-                        const double interval=std::chrono::duration<double,std::milli>(wake_now-runtime_wake).count();
-                        // Ignore stalls (loading, menus) so they do not drag the average.
-                        if(interval>0&&interval<telemetry.xr_period_ms*4.)
-                            measured_wake_ms=measured_wake_ms>0?measured_wake_ms*.95+interval*.05:interval;
-                    }
-                    runtime_wake=wake_now;}
-                ++runtime_wakes;
+                display_clock.observe_period(frame.predictedDisplayPeriod);
+                display_clock.observe_refresh(refresh_hz);
                 xr_wait.add(waited_ms);telemetry.xr_wait_ms=xr_wait.mean();++ticks;changed.notify_all();
             }
             Pair direct_pair;
@@ -1382,10 +1298,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {
                         active=std::move(*selected);ready.erase(ready.begin(),std::next(selected));have_active=true;
-                        // Another whole pair already waiting behind the one just
-                        // taken is a standing backlog: a frame of added latency
-                        // that equal in/out rates never drain on their own.
-                        if(!ready.empty())backlog_detected=true;
+                        changed.notify_all(); // A queued interval no longer consumes production capacity.
                         fg_active=active.interpolated;
                         if(active.interpolated&&double(active.native_id)<=last_position&&
                             double(active.current_id)>last_position)generated_phase=true;
@@ -1551,10 +1464,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     cadence_window.add(now_ms,{native_count,distinct_native,generated_count,runtime_submissions});}
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
                     const auto c=cadence();
-                    sprintf_s(cadence_log,"FG experiment cadence: release=%s queue=%s clock=%s clock_ms=%.3f valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f; game_end_ms=%.3f last=%.3f capture_cpu_ms=%.3f credit_wait_last=%.3f credits granted=%llu consumed=%llu capped=%llu",
+                    sprintf_s(cadence_log,"FG experiment cadence: release=%s queue=%s production=%s target_native_ms=%.3f valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f; game_end_ms=%.3f last=%.3f capture_cpu_ms=%.3f render_wait_last=%.3f permits granted=%llu consumed=%llu capacity_waits=%llu",
                         active_release_point==5u?"never":active_release_point==3u?"generated-submission":active_release_point==6u?"first-generated-submission":active_release_point==7u?"second-generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
                         queue_mode_name(reported_queue_mode),
-                        pacing_clock_mode==2u?"presented+phase":pacing_clock_mode==1u?"presented":"independent",native_clock_ms,c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.submission_fps,
+                        "demand",display_clock.display_ms()*(pacing_active?active_multiplier:1u),c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.submission_fps,
                         xr_wait.mean(),runtime_end.mean(),present_cpu.mean(),app_calls[1].mean(),app_calls[1].last,producer_cpu.mean(),pacing_wait.last,
                         static_cast<unsigned long long>(granted_credits),static_cast<unsigned long long>(consumed_credits),static_cast<unsigned long long>(capped_credits));
                     sprintf_s(age_log,"FG source-age CPU ms: generated_samples=%llu latest_capture_to_complete=%.3f complete_to_generated_submit=%.3f newest_input_age=%.3f complete_to_native_submit=%.3f",

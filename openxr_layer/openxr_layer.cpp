@@ -69,6 +69,7 @@ template <typename T>
 
 struct Dispatch {
     PFN_xrConvertTimeToWin32PerformanceCounterKHR time_to_qpc{};
+    PFN_xrGetDisplayRefreshRateFB get_refresh_rate{};
     PFN_xrGetInstanceProcAddr get_instance_proc_addr{};
     PFN_xrDestroyInstance destroy_instance{};
     PFN_xrGetInstanceProperties get_instance_properties{};
@@ -123,6 +124,7 @@ void populate_dispatch(
 ) noexcept {
     dispatch.get_instance_proc_addr = gipa;
     dispatch.time_to_qpc=load_function<PFN_xrConvertTimeToWin32PerformanceCounterKHR>(gipa,instance,"xrConvertTimeToWin32PerformanceCounterKHR");
+    dispatch.get_refresh_rate=load_function<PFN_xrGetDisplayRefreshRateFB>(gipa,instance,"xrGetDisplayRefreshRateFB");
 #define CHEEKY_LOAD(field, name) \
     dispatch.field = load_function<PFN_xr##name>(gipa, instance, "xr" #name)
     CHEEKY_LOAD(destroy_instance, DestroyInstance);
@@ -2275,13 +2277,17 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
         log_startup("Cyberpunk compatibility: unconfirmed optional cylinder skipped; quad menu retained\n");
     }
     bool inject_cylinder = !cylinder_enabled && cylinder_availability != ExtensionAvailability::absent;
-    bool time_enabled{};
-    for(std::uint32_t i=0;i<info->enabledExtensionCount;++i)
+    bool time_enabled{},refresh_enabled{};
+    for(std::uint32_t i=0;i<info->enabledExtensionCount;++i){
         time_enabled|=std::strcmp(info->enabledExtensionNames[i],XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME)==0;
+        refresh_enabled|=std::strcmp(info->enabledExtensionNames[i],XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)==0;
+    }
     // Optional telemetry only. Never speculate or add a failed instance retry
     // for clock conversion; an unsupported runtime still gets submit timings.
     const bool inject_time=!time_enabled&&extension_availability(next_gipa,
         XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME)==ExtensionAvailability::present;
+    const bool inject_refresh=!refresh_enabled&&extension_availability(next_gipa,
+        XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)==ExtensionAvailability::present;
     if (cylinder_enabled) log_startup("probe extension=%s availability=application_requested\n", XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
     if (cylinder_availability == ExtensionAvailability::unknown) {
         log_startup("cylinder extension probe unanswered; trying extension at instance creation\n");
@@ -2315,6 +2321,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
         if (inject_extension) extensions.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
         if (inject_cylinder) extensions.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
         if(inject_time)extensions.push_back(XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
+        if(inject_refresh)extensions.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
         extensions.insert(extensions.end(),promoted_extensions.begin(),promoted_extensions.end());
         XrInstanceCreateInfo forwarded_info = *info;
         forwarded_info.applicationInfo.apiVersion = downstream_api;
@@ -2368,6 +2375,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateApiLayerInstance(
     state.cylinder_enabled = cylinder_enabled || inject_cylinder;
     populate_dispatch(state.dispatch, *instance, next_gipa);
     if(!time_enabled&&!inject_time)state.dispatch.time_to_qpc=nullptr;
+    if(!refresh_enabled&&!inject_refresh)state.dispatch.get_refresh_rate=nullptr;
     log_startup("FG display clock conversion=%s\n",state.dispatch.time_to_qpc?"available (predicted target only)":"unavailable; GPU-ready submission metric retained");
     if (state.dispatch.get_instance_properties != nullptr) {
         XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
@@ -3832,6 +3840,7 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
             owner.session,owner.graphics_device,owner.graphics_queue);
         cheeky::fg::XrFns fn{};
         fn.time_instance=owner.instance;fn.time_to_qpc=d.time_to_qpc;fn.locate_space=d.locate_space;fn.retain_space=retain_frame_space;
+        fn.get_refresh_rate=d.get_refresh_rate;
         fn.create=d.create_swapchain;fn.destroy=d.destroy_swapchain;
         fn.enumerate=d.enumerate_swapchain_images;fn.acquire=d.acquire_swapchain_image;
         fn.wait_image=d.wait_swapchain_image;fn.release=d.release_swapchain_image;

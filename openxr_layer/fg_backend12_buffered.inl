@@ -166,10 +166,14 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
     const auto captured_cpu=latency_diagnostics?LatencyProbe::cpu_now():0;
     AddElapsed elapsed{capture_cpu_accumulator};
     auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
-    const auto stamp_fn=guide_stamp?guide_stamp:runtime?reinterpret_cast<CheekyFgCaptureStampFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureStamp")):nullptr;
-    CheekyFgCaptureStamp stamp;if(stamp_fn)stamp_fn(original,&stamp);
-    // The legacy test callback has no production fallback: real generation
-    // requires the RHI frame identity returned with the color stamp.
+    const auto stamp_fn=guide_stamp?guide_stamp:runtime&&!quad_input?reinterpret_cast<CheekyFgCaptureStampFn>(GetProcAddress(runtime,"CheekyFG_GetCaptureStamp")):nullptr;
+    std::uint64_t profile_frame{};{std::lock_guard lock(mx);profile_frame=next_id+1;}
+    if(color_stamp_frame!=profile_frame){color_stamp_frame=profile_frame;color_stamp_token=0;}
+    CheekyFgCaptureStamp stamp;stamp.token=color_stamp_token;
+    if(stamp_fn&&!stamp_fn(original,&stamp))stamp={};
+    if(stamp.token&&!stamp.render_frame&&!color_stamp_token)color_stamp_token=stamp.token;
+    // The legacy test callback has no production fallback. Production keeps
+    // either a tagged RHI identity or the hook-free color-bound guide token.
     if(guide_token&&!stamp_fn){stamp.token=guide_token(original);stamp.render_frame=stamp.token/2;}
     const auto token=stamp.token;
     // Look up the *current* unconsumed, submitted guide pair at color
@@ -195,7 +199,6 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
         }
     }
     const auto format=capture_format(original->GetDesc().Format,declared);if(format==DXGI_FORMAT_UNKNOWN)return false;
-    std::uint64_t profile_frame{};{std::lock_guard lock(mx);profile_frame=next_id+1;}
     auto* c=producer.begin(profile_frame);if(!c){capture_overflow=true;return false;}
     const auto ready_stamp=captured_cpu?producer.mark_color_ready(*c,captured_cpu):ColorReady{};
     const auto desc=original->GetDesc();captured_descs[sc]=desc;
@@ -402,10 +405,22 @@ struct BufferedBackend12 final : FrameBackend {
         });
         if(good) {
             if(external){expected_token=external->capture_token;expected_frame=external->render_frame;tokens_match=expected_token!=0;}
-            if(inference_slot&&hookless_complete){
+            const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+            const auto complete_v2=external?nullptr:owner.hookless_complete_v2?owner.hookless_complete_v2:
+                runtime?reinterpret_cast<CheekyFgCompleteHooklessFrameV2Fn>(GetProcAddress(runtime,"CheekyFG_CompleteHooklessFrameV2")):nullptr;
+            if(inference_slot&&(hookless_complete||complete_v2)){
                 // Both final stereo colors are now captured. Stereo guides are claimed at the final OpenXR handoff, independent
                 // of the native-frame release policy.
-                const auto completed=hookless_complete(1);
+                // A first eye may have been copied before the second guide
+                // existed. Only zero/unavailable stamps may adopt the native
+                // capture's anchor; two disagreeing nonzero stamps still fail.
+                if(complete_v2&&!expected_frame&&owner.color_stamp_frame==job->id&&owner.color_stamp_token){
+                    expected_token=owner.color_stamp_token;tokens_match=true;
+                    for(unsigned eye=0;eye<2;++eye){const auto sc=projection->views[eye].subImage.swapchain;
+                        const auto t=owner.capture_tokens[sc],f=owner.capture_frames[sc];
+                        tokens_match&=!f&&(!t||t==expected_token);}
+                }
+                const auto completed=complete_v2?complete_v2(tokens_match?1u:0u,expected_token):hookless_complete(1);
                 if(completed){expected_token=completed;expected_frame=0;tokens_match=true;}
                 else if(!expected_frame){expected_token=0;tokens_match=false;}
             }
@@ -427,7 +442,6 @@ struct BufferedBackend12 final : FrameBackend {
                     break;
                 }
             }
-            auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
             auto acquire=owner.guide_acquire?owner.guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
             auto release=owner.guide_release?owner.guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
             CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
@@ -488,7 +502,10 @@ struct BufferedBackend12 final : FrameBackend {
                     job->source_configuration=guides.eyes[0].configuration;job->render_frame=expected_frame;
                 }
                 if(!external)release(&guides);
-            }else if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
+            }else {
+                if(complete_v2&&expected_token)complete_v2(0,expected_token);
+                if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
+            }
             if(color_only&&inference_slot){
                 auto payload=std::make_shared<FrameGuides12>();
                 for(unsigned eye=0;eye<2;++eye){auto g=color_options.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();

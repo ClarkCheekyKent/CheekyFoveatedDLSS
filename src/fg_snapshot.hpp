@@ -142,15 +142,58 @@ public:
     cheeky::gpu::Summary capture_gpu() const {return gpu_cost.summary();}
     struct Match {
         std::uint64_t latest{},consumed{},failed{};
-        unsigned eligible{},pending{},foreign{},cancelled{};
+        unsigned eligible{},pending{},foreign{},cancelled{},future{};
         const char* reason{"No guides for this frame"};
     };
     Match last_match;
+private:
+    std::shared_ptr<Shot> evaluation(std::uint64_t id) const {
+        for(const auto& s:shots)if(s->meta.evaluation==id)return s;
+        return {};
+    }
+    bool valid_pair(const Shot& a,const Shot& b) const {
+        return a.submitted&&b.submitted&&!a.foreign&&!b.foreign&&!a.cancelled&&!b.cancelled&&
+            a.meta.width==b.meta.width&&a.meta.height==b.meta.height&&
+            a.meta.configuration==b.meta.configuration&&compatible_eyes(a,b);
+    }
+public:
+    // Pin the pair at the color-copy boundary, before a later recording can
+    // recycle its slots or change the globally newest evaluation. A caller
+    // continuing the same native stereo capture supplies its earlier token.
+    // This changes ownership/metadata only: no GPU submission, copy or wait.
+    std::uint64_t capture_token(std::uint64_t expected=0) {
+        if(expected){
+            for(const auto& l:latched)if(l.token==expected&&expected>consumed&&
+                valid_pair(*l.a,*l.b))return expected;
+            return 0; // Never interpret an unrecognized token as a newer pair.
+        }
+        const auto endpoint=consumed+2;
+        if(endpoint<consumed||endpoint>ordinal||(failed_record>consumed&&failed_record<=endpoint))return 0;
+        auto a=evaluation(endpoint-1),b=evaluation(endpoint);
+        if(!a||!b||!valid_pair(*a,*b))return 0;
+        // Without an existing color anchor, multiple submitted pairs are
+        // ambiguous. Future CPU recordings are harmless; do not guess among
+        // multiple already submitted native frames.
+        for(const auto& s:shots)if(s->meta.evaluation>endpoint&&s->submitted&&!s->cancelled)return 0;
+        for(const auto& l:latched)if(l.token==endpoint)return endpoint;
+        if(latched.size()>=12)return 0; // Preserve live anchors; never evict one to make room.
+        latched.push_back({endpoint,std::move(a),std::move(b)});return endpoint;
+    }
     // Peek only the UNCONSUMED capture interval (no latch/consume). A first
     // eye may be released before the second eye has been evaluated. Predict
     // the completed pair token as ordinal+1; xrEndFrame MUST verify the
     // actual token and the final crop geometry.
     bool peek_current_crops(CheekyFgCaptureCropsV2& out,std::uint64_t expected_configuration) const noexcept {
+        // A pinned color pair remains authoritative even when the game has
+        // recorded or submitted the next stereo frame before the second eye
+        // release. Legacy unanchored/first-eye peeks keep their strict rules.
+        if(out.token)for(const auto& l:latched)if(l.token==out.token&&l.token>consumed){
+            if(!valid_pair(*l.a,*l.b)||l.a->identity.eye>=2||l.b->identity.eye>=2||
+                l.a->meta.configuration!=expected_configuration)return false;
+            out.width=l.a->meta.width;out.height=l.a->meta.height;out.valid_mask=3;
+            for(const auto* s:{l.a.get(),l.b.get()})out.eye[s->identity.eye]={s->meta.focus_width,s->meta.focus_height,s->meta.focus_x,s->meta.focus_y};
+            return true;
+        }
         if(failed_record>consumed)return false;
         const auto token=cheeky::fg::pending_stereo_crop_token(ordinal,consumed,true);
         if(!token)return false;
@@ -382,49 +425,54 @@ public:
             failed_record=std::max(failed_record,s->meta.evaluation);
         }
     }
-    std::uint64_t token() {
+    std::uint64_t token(std::uint64_t expected=0) {
         retire();
-        // Exactly two consecutive, submitted guide recordings since the last
-        // consumed interval. Never silently take the newest two from a
-        // 1/3/4-eye interval or across a failed recording.
+        // Validate the color-bound pair, not every recording the CPU has
+        // produced since the last XR handoff. Later recordings retain their
+        // own lifetime and are not evidence that this pair is incomplete.
+        const auto matched=capture_token(expected);
+        const auto endpoint=matched?matched:expected?expected:consumed+2;
         last_match={};last_match.consumed=consumed;last_match.failed=failed_record;
         for(const auto& s:shots)if(s->meta.evaluation>consumed){
+            if(s->meta.evaluation>endpoint){++last_match.future;continue;}
             if(s->cancelled)++last_match.cancelled;
             else if(s->foreign)++last_match.foreign;
             else if(!s->submitted)++last_match.pending;
             else {++last_match.eligible;last_match.latest=std::max(last_match.latest,s->meta.evaluation);}
         }
-        if(ordinal<consumed||ordinal-consumed!=2||failed_record>consumed||
-            last_match.eligible!=2||last_match.pending||last_match.foreign||last_match.cancelled||
-            last_match.latest!=ordinal){
-            last_match.reason=failed_record>consumed?"Guide capture failed":
+        if(!matched){
+            last_match.reason=failed_record>consumed&&failed_record<=endpoint?"Guide capture failed":
                 last_match.pending?"Guides await submission":
                 last_match.foreign?"Guide queue mismatch":
                 last_match.cancelled?"Guide commands cancelled":
-                "Color interval has not exactly two fresh eyes";
+                expected?"Color-bound guide pair is unavailable":"Color interval has no unique submitted stereo pair";
             return 0;
         }
-        const auto latest=last_match.latest;
-        if(latest<=consumed){last_match.reason="Guide pair was already consumed";return 0;}
-        if(latest<=failed_record){last_match.reason="Guide capture failed before this pair";return 0;}
         last_match.reason="Matched";
-        for(auto& latch:latched)if(latch.token==latest)return latest;
-        std::shared_ptr<Shot> a,b;
-        for(auto& s:shots)if(s->submitted&&!s->foreign&&!s->cancelled){if(s->meta.evaluation==latest-1)a=s;if(s->meta.evaluation==latest)b=s;}
-        if(!a||!b){last_match.reason="Guide pair is interrupted";return 0;}
-        if(!compatible_eyes(*a,*b)){last_match.reason="Guide eye mapping changed or stereo identities are ambiguous";return 0;}
         // Group timestamps only after this exact stereo pair has been matched.
-        a->profile_frame=b->profile_frame=(1ull<<63)|latest;
-        // Pin guides at COLOR release, not later at EndFrame. A future DLSS
-        // recording must not recycle either snapshot while color awaits submit.
-        if(latched.size()>=4)latched.erase(latched.begin());
-        latched.push_back({latest,a,b});return latest;
+        for(auto& l:latched)if(l.token==matched)l.a->profile_frame=l.b->profile_frame=(1ull<<63)|matched;
+        return matched;
     }
-    void discard_interval() {
+    void discard_interval(std::uint64_t expected=0) {
         // A partial/ambiguous color handoff consumes the interval without
         // generating FG. Start fresh with the next native stereo pair rather
         // than permanently starving on an extra or failed evaluation.
-        consumed=ordinal;
+        // A pinned frame may be skipped without consuming the next frame.
+        // With no anchor, retire only a complete submitted prefix; preserve
+        // a later pending pair. Partial/unknown intervals remain fail-closed.
+        std::uint64_t endpoint{};
+        if(expected)for(const auto& l:latched)if(l.token==expected&&expected>consumed)endpoint=expected;
+        if(expected&&!endpoint){history_valid=false;return;} // A stale/unknown color must not discard a newer frame.
+        if(!endpoint){
+            endpoint=consumed;
+            while(endpoint<ordinal){
+                const auto s=evaluation(endpoint+1);
+                if(s&&!s->submitted&&!s->cancelled)break;
+                ++endpoint;
+            }
+            if((endpoint-consumed)%2)endpoint=ordinal;
+        }
+        consumed=endpoint;
         history_valid=false;
         std::erase_if(latched,[&](const Latch& l){return l.token<=consumed;});
     }

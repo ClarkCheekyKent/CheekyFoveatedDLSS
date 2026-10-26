@@ -39,6 +39,7 @@ struct XrFns {
     PFN_xrEndFrame end_frame{};
     PFN_xrLocateSpace locate_space{};
     RetainFrameSpace retain_space{};
+    PFN_xrGetDisplayRefreshRateFB get_refresh_rate{};
 };
 struct ColorCopy {
     XrSwapchain source{XR_NULL_HANDLE};

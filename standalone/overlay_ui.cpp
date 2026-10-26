@@ -960,43 +960,40 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     if (ImGui::TreeNode("Advanced settings")) {
         ImGui::Checkbox("Force NVIDIA Reflex off", &s.force_reflex_off);
         if(s.force_reflex_off)ImGui::TextWrapped("Disables NVIDIA Reflex sleep and its frame limiter. Applies even when frame generation is off.");
-        combo("FG pacing clock", s.pacing_clock, "Independent display clock\0Follow presented frames\0Follow presented frames + vsync lock\0");
-        if (s.pacing_clock != 0)
-            ImGui::TextWrapped("Experimental: the game is slowed to the rate frames actually reach the headset, so it does not render frames that would be dropped.");
-        if (s.pacing_clock != 0) {
-            ImGui::Checkbox("Carry missed go-aheads", &s.carry_missed_ticks);
-            if (s.carry_missed_ticks)
-                ImGui::TextWrapped("The Follow clock runs at exactly the target rate, so a go-ahead that gets merged into one still waiting (for the generated frame, or for the GPU) is lost for good, and the game ends up just under the target. This hands at most one such go-ahead over as soon as the game may start again.");
-            if (s.pacing_clock == 1) {
-                ImGui::Checkbox("Pace the game slightly above the headset rate", &s.pacing_headroom);
-                if (s.pacing_headroom)
-                    ImGui::TextWrapped("Paces the game 2.5% above multiplier x headset rate so occasional lost go-aheads do not drop it below the target; surplus frames are skipped by the backlog drain.");
-            } else
-                ImGui::TextWrapped("Pacing headroom: Not available with the vsync lock: the lock pins every go-ahead to a headset slot, which cancels any headroom. Use Carry missed go-aheads there.");
+        char refresh_label[32]{};if(s.target_refresh_hz)sprintf_s(refresh_label,"%u Hz",s.target_refresh_hz);else strcpy_s(refresh_label,"Automatic");
+        if(ImGui::BeginCombo("Headset target refresh",refresh_label)){
+            for(unsigned hz:{0u,60u,72u,75u,80u,90u,100u,120u,144u,165u,180u,200u,240u,360u}){
+                char label[32]{};if(hz)sprintf_s(label,"%u Hz",hz);else strcpy_s(label,"Automatic");
+                if(ImGui::Selectable(label,s.target_refresh_hz==hz))s.target_refresh_hz=hz;
+            }
+            ImGui::EndCombo();
         }
+        ImGui::TextWrapped("Used for game prediction and FPS targets; rendering proceeds when release conditions and buffer capacity allow it. Automatic uses a headset refresh query or the fastest runtime period observed this session. Set your headset's Hz explicitly if Automatic starts too low.");
         ImGui::Checkbox("Present from a dedicated GPU queue (D3D12)", &s.dedicated_present_queue);
         if (s.dedicated_present_queue)
             ImGui::TextWrapped("The headset runtime synchronizes on Cheeky's own queue, so frame uploads never wait behind the game's rendering. Takes effect when the VR session next starts.");
         ImGui::Checkbox("Present without waiting on the GPU (D3D12)", &s.gpu_waited_present);
         if (s.gpu_waited_present)
             ImGui::TextWrapped("Generated frames go to the headset as soon as their GPU work is queued; the upload waits on the GPU instead of the presenter thread, so headset slots are not missed. Needs the dedicated GPU queue.");
-        ImGui::Checkbox("Keep the GPU from falling behind (Never + Follow)", &s.limit_gpu_ahead);
+        ImGui::Checkbox("Keep the GPU from falling behind (release Never)", &s.limit_gpu_ahead);
         if (s.limit_gpu_ahead)
-            ImGui::TextWrapped("With a Follow pacing clock and release Never: the game waits whenever its previous frame has not yet been captured on the GPU, so the GPU cannot fall a frame behind and add latency.");
+            ImGui::TextWrapped("With release Never: the game waits while its previous frame has not yet been captured on the GPU, preventing a GPU backlog.");
         ImGui::Checkbox("Extra frame slots (more VRAM)", &s.extra_frame_slots);
         if (s.extra_frame_slots)
-            ImGui::TextWrapped("Lets the game render up to 4 frames ahead while frame generation catches up. Uses two more full stereo frame copies of VRAM.");
+            ImGui::TextWrapped("Keeps two additional stereo capture slots available while frame generation is in flight. Uses more VRAM.");
         if(native_shader11())ImGui::TextWrapped("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.");
         else{
         combo("FG GPU queue", s.queue_priority, quad?"Separate NORMAL queue\0Separate HIGH queue\0Layer bridge queue\0":"Separate NORMAL queue\0Separate HIGH queue\0Shared game queue\0");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         }
         combo("Release game rendering", s.release_point,
-            "After FG submission\0After GPU preparation\0After FG completion\0After all generated frames submitted\0" "4 ms after FG submission\0" "Never (display clock only)\0" "After first generated frame submission\0" "After second generated frame submission\0");
+            "After FG submission\0After GPU preparation\0After FG completion\0After all generated frames submitted\0" "4 ms after FG submission\0" "Never (buffer capacity only)\0" "After first generated frame submission\0" "After second generated frame submission\0");
         if (s.release_point == 5)
-            ImGui::TextWrapped("Experimental: the game is paced only by the headset clock and never waits for frame generation. Generated frames may arrive later; best when the GPU is the limit.");
+            ImGui::TextWrapped("The next render starts when buffer capacity allows it. Generation and presentation may still be in flight.");
         else if (s.release_point == 6 || s.release_point == 7)
-            ImGui::TextWrapped("The game starts its next frame once that generated frame is handed to the headset, instead of waiting for all of them. At 2x the second is the only one.");
+            ImGui::TextWrapped("The next render starts after xrEndFrame returns for the selected generated frame. With GPU-waited presentation, generation may still be executing. At 2x there is one generated frame.");
+        else if (s.release_point == 3)
+            ImGui::TextWrapped("The next render starts after xrEndFrame returns for the last generated frame. With GPU-waited presentation, generation may still be executing.");
         else if (s.release_point != 3)
             ImGui::TextWrapped("Experimental overlap: capture order alone cannot prove frame identity. Use After all generated frames submitted for serialized matching.");
         if(native_shader11()){

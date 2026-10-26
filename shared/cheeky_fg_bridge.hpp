@@ -63,13 +63,16 @@ using CheekyFgReleaseFn=void(__cdecl*)(CheekyFgPair*);
 using CheekyFgCaptureTokenFn=std::uint64_t(__cdecl*)(ID3D12Resource*);
 struct CheekyFgCaptureStamp {
     std::uint32_t abi{1},size{sizeof(CheekyFgCaptureStamp)};
-    std::uint64_t token{},render_frame{};
+    std::uint64_t token{},render_frame{}; // token may request the earlier anchor of this native stereo capture.
 };
 using CheekyFgCaptureStampFn=bool(__cdecl*)(ID3D12Resource*,CheekyFgCaptureStamp*);
-// Once per native xrEndFrame, AFTER both eye releases. True claims one
-// complete stereo pair; false retires an unused/failed frame. This is the
-// only way a captured guide pair is matched to the frame's color.
+// Once per native xrEndFrame, AFTER both eye releases. True validates the
+// complete stereo pair; false retires an unused/failed frame. Capturing a
+// color stamp pins its guides without consuming them before this handoff.
 using CheekyFgCompleteHooklessFrameFn=std::uint64_t(__cdecl*)(std::uint32_t use_for_fg);
+// Additive hook-free completion: claim the pair pinned at color capture,
+// ignoring later CPU recordings. Zero retains conservative unanchored matching.
+using CheekyFgCompleteHooklessFrameV2Fn=std::uint64_t(__cdecl*)(std::uint32_t use_for_fg,std::uint64_t color_token);
 struct CheekyFgCaptureHealth {
     std::uint32_t abi{2},size{sizeof(CheekyFgCaptureHealth)};
     std::uint64_t captured_guides{},latest_evaluation{},consumed_evaluation{};
@@ -233,14 +236,15 @@ using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
 // Separate export so the transport layout keeps its exact-size check.
 struct CheekyFgPacingOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgPacingOptions)};
-    std::uint32_t clock_mode{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
+    std::uint32_t clock_mode{}; // Retired; current layers use demand-driven production for all values.
     std::uint32_t native11_release_point{3}; // Shared release setting: 0 FG submission ... 3 generated frame submission, 4 submission + 4 ms.
-    std::uint32_t extra_frame_slots{}; // 1: 4 banked credits and 5 capture slots (more VRAM). Absent in older layers.
+    std::uint32_t extra_frame_slots{}; // 1: 5 capture slots instead of 3 (more VRAM). Absent in older layers.
     std::uint32_t dedicated_present_queue{}; // 1: give the OpenXR runtime the layer's own D3D12 queue at session creation.
     std::uint32_t gpu_waited_present{}; // 1: hand generated frames to the runtime once queued; the upload waits on the GPU, not the presenter's CPU.
-    std::uint32_t limit_gpu_ahead{}; // 1: Follow clock + release Never hold the game while its previous frame is not yet captured on the GPU.
-    std::uint32_t carry_missed_ticks{}; // 1: Follow clocks hand over a go-ahead merged into a deferred or held one later.
-    std::uint32_t pacing_headroom{}; // 1: plain Follow clock paces the game 2.5% above the target rate.
+    std::uint32_t limit_gpu_ahead{}; // 1: release Never holds while the previous frame is not yet captured on the GPU.
+    std::uint32_t carry_missed_ticks{}; // Retired; production does not bank timer ticks.
+    std::uint32_t pacing_headroom{}; // Retired; no adaptive production clock.
+    std::uint32_t target_refresh_hz{}; // 0 automatic; 30..360 overrides the headset target, independent of delayed runtime frames.
 };
 using CheekyFgPacingOptionsFn=bool(__cdecl*)(CheekyFgPacingOptions*);
 // Independent export: D3D12 quad-view composition in xrEndFrame.

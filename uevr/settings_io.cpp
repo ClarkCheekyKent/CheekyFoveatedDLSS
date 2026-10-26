@@ -48,6 +48,10 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     if(key=="QuadSavedSourceCount"){unsigned count{};if(!parse(value,count)||count>8)return false;s.quad_saved_source_count=count;return true;}
     if(key.size()==13&&key.starts_with("QuadView")&&key.ends_with("Role")&&key[8]>='1'&&key[8]<='8'){
         unsigned role{};if(!parse(value,role)||role>4)return false;s.quad_saved_roles[key[8]-'1']=role;return true;}
+    if (key == "FgTargetRefreshHz") {
+        std::uint32_t hz{};if(!parse(value,hz)||(hz!=0&&(hz<30||hz>360)))return false;
+        s.fg.target_refresh_hz=hz;return true;
+    }
     if (key == "FgPacingClock") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;
         s.fg.pacing_clock=mode; return true;

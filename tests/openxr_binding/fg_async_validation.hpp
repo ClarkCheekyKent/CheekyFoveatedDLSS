@@ -456,6 +456,7 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
     }
     {
         P held;held.started=true;held.credits=2;held.pacing_active=true;held.ticks=2;
+        held.predicted.predictedDisplayPeriod=8333333;held.display_clock.observe_refresh(120);
         auto job=std::make_shared<P::Native>();job->id=5;job->guides_valid=true;job->policy.release_point=2;
         held.pending.push_back(job);held.wake_producer();
         check(held.release_gate_active()&&held.credits==2&&held.credit_deferred,
@@ -534,28 +535,37 @@ void fg_presentation_timing_validation(ID3D12Device* device) {
         check(soft.credits==1&&!soft.credit_deferred,"Soft release must issue the deferred game credit once");
     }
     {
-        P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=100.;
+        P clock;clock.pacing_active=true;clock.telemetry.xr_period_ms=100.;
         clock.inflight_id=12;clock.inflight_release_point=4;clock.submitted_native_id=12;
         clock.credit_deferred=true;
         clock.release_delay_until=cheeky::fg::TimingClock::now()+std::chrono::milliseconds(4);
-        std::thread pacer([&]{clock.pacing_loop();});
+        std::thread pacer([&]{clock.release_loop();});
         bool delivered{};{std::unique_lock lock(clock.mx);delivered=clock.changed.wait_for(lock,std::chrono::milliseconds(100),[&]{return clock.credits>0;});
             clock.stopping=true;clock.changed.notify_all();}
         pacer.join();
         check(delivered&&clock.released_deferred_credits==1&&clock.ticks==0,
-            "Soft release deadline wakes the native clock without waiting for a full XR interval");
+            "Soft release deadline wakes the game without waiting for an XR interval");
     }
     {
-        P clock;clock.clock_pacing_active=true;clock.pacing_active=true;clock.telemetry.xr_period_ms=8.333333;
-        std::thread pacer([&]{clock.pacing_loop();});
-        bool delivered{};{std::unique_lock lock(clock.mx);delivered=clock.changed.wait_for(lock,seconds(1),[&]{return clock.credits>0;});
-            clock.stopping=true;clock.changed.notify_all();}
-        pacer.join();check(delivered&&clock.ticks==0,"Native clock must deliver credits without any XR submissions");
+        P demand;demand.started=true;demand.pacing_active=true;demand.active_multiplier=3;
+        demand.display_clock.observe_refresh(90);demand.predicted.predictedDisplayTime=1000000000;
+        demand.predicted.predictedDisplayPeriod=44444444; // Delayed runtime report: 22.5 Hz.
+        XrFrameState frame{XR_TYPE_FRAME_STATE};const auto begin=Clock::now();
+        for(unsigned i=0;i<3;++i){
+            check(XR_SUCCEEDED(demand.wait_frame(nullptr,&frame))&&frame.predictedDisplayPeriod==33333333,
+                "Eligible game frames proceed without a timer, retaining the 30 FPS prediction period through a runtime stall");
+            demand.begun=demand.ended=demand.waited;
+        }
+        check(Clock::now()-begin<milliseconds(50)&&demand.ticks==0,
+            "Production needs neither XR ticks nor a nominal 33ms timer when release conditions and capacity allow it");
+        demand.ready.resize(demand.max_pending());check(!demand.producer_has_capacity(),
+            "An actual full publication queue applies production backpressure");
+        demand.ready.clear();check(demand.producer_has_capacity(),"Draining queued work immediately restores production capacity");
     }
     std::cout<<"PASS native/generated capture ages; ready-pair selection cannot rewind; source age decomposes into completion and residence\n";
     std::cout<<"PASS FG submission backpressure: next render waits for older FG enqueue, not GPU completion; retirement/fallback releases, no duplicate credits or shutdown wake\n";
     std::cout<<"PASS FG completion gate: pending/in-flight holds, submit and pacing paths, existing/pipelined credits, retirement, fallback and shutdown\n";
-    std::cout<<"PASS FG preparation milestone and independent native clock without XR submissions\n";
+    std::cout<<"PASS FG preparation milestone, explicit soft deadline, stable prediction and demand-driven production without timer waits\n";
 }
 
 void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,unsigned method=2,bool prepared_capture=false) {

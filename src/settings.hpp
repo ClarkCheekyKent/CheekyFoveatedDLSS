@@ -53,16 +53,17 @@ struct Settings {
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
         std::uint32_t queue_priority{2}; // 0 separate NORMAL; 1 separate HIGH; 2 shared game queue.
         std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held, 6 first generated XR submission, 7 second generated XR submission.
-        std::uint32_t pacing_clock{}; // 0 independent display clock; 1 presented native rate; 2 rate + runtime phase lock.
+        std::uint32_t pacing_clock{}; // Retained for old settings; current layers use demand-driven production.
+        std::uint32_t target_refresh_hz{}; // 0 automatic; manual headset refresh override, 30..360 Hz.
         std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.
         std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.
         bool native11_skip_identity_crop{false}; // Native D3D11: reuse a whole-image eye capture instead of copying it again.
         bool dedicated_present_queue{false}; // D3D12: the OpenXR runtime syncs on a layer-owned queue instead of the game's; applies at session creation.
         bool gpu_waited_present{false}; // D3D12 + dedicated present queue: generated frames go to the runtime once queued; the upload waits on the GPU.
-        bool limit_gpu_ahead{false}; // Follow clock + release Never: the game waits while its previous frame is not yet captured on the GPU.
-        bool carry_missed_ticks{false}; // Follow clocks: a go-ahead merged into a deferred or held one is handed over later, not lost.
-        bool pacing_headroom{false}; // Plain Follow clock: pace the game 2.5% above the target rate; the backlog skip drops the surplus.
-        bool extra_frame_slots{false}; // 4 banked render credits and 5 capture slots instead of 2/3; costs two more stereo color copies of VRAM.
+        bool limit_gpu_ahead{false}; // Release Never: wait while the previous frame is not yet captured on the GPU.
+        bool carry_missed_ticks{false}; // Retained for old settings; no timer credits are accumulated.
+        bool pacing_headroom{false}; // Retained for old settings; adaptive pacing is retired.
+        bool extra_frame_slots{false}; // 5 capture slots instead of 3; costs two more stereo color copies of VRAM.
         bool force_reflex_off{false}; // Per-game override, independent of FG enable.
     } fg;
     bool enabled{true};

@@ -495,30 +495,35 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureHealth(CheekyFg
     out->eligible=match.eligible;out->pending=match.pending;out->foreign=match.foreign;out->cancelled=match.cancelled;
     strcpy_s(out->match_reason,match.reason);return true;
 }
-// Each eye may release its OpenXR image independently. The stereo pair is
-// associated only at the single xrEndFrame after both releases.
+// Each eye may release independently. Pin the submitted guide pair at color
+// capture; the single xrEndFrame later validates and consumes this exact pair.
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetCaptureStamp(ID3D12Resource*,CheekyFgCaptureStamp* out) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!out||out->abi!=1||out->size!=sizeof(*out)||!enabled())return false;
-    out->token=out->render_frame=0;return true;
+    std::lock_guard lock(mutex);
+    out->token=snapshots().capture_token(out->token);out->render_frame=0;return true;
 }
-extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHooklessFrameV1(
-    std::uint32_t use_for_fg) noexcept {
+extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHooklessFrameV2(
+    std::uint32_t use_for_fg,std::uint64_t color_token) noexcept {
     using namespace cheeky::foveated_dlss;
     if(!enabled())return 0;
     std::lock_guard lock(mutex);
     auto& guides=snapshots();
-    const auto token=use_for_fg?guides.token():0;
-    if(!token)guides.discard_interval();
+    const auto token=use_for_fg?guides.token(color_token):0;
+    if(!token)guides.discard_interval(color_token);
     last_color_match=guides.last_match;
     if(!use_for_fg)last_color_match.reason="Native frame skipped at xrEndFrame";
     else if(token)last_color_match.reason="Matched at xrEndFrame";
     static ULONGLONG next_trace{};const auto now=GetTickCount64();
     if(now>=next_trace){next_trace=now+2000;const auto& m=last_color_match;
-        trace_event("FG end-frame match token=%llu eligible=%u pending=%u foreign=%u cancelled=%u latest_eval=%llu consumed=%llu failed=%llu reason=%s",
-            token,m.eligible,m.pending,m.foreign,m.cancelled,m.latest,m.consumed,m.failed,m.reason);
+        trace_event("FG end-frame match token=%llu color_token=%llu eligible=%u pending=%u future=%u foreign=%u cancelled=%u latest_eval=%llu consumed=%llu failed=%llu reason=%s",
+            token,color_token,m.eligible,m.pending,m.future,m.foreign,m.cancelled,m.latest,m.consumed,m.failed,m.reason);
     }
     return token;
+}
+extern "C" __declspec(dllexport) std::uint64_t __cdecl CheekyFG_CompleteHooklessFrameV1(
+    std::uint32_t use_for_fg) noexcept {
+    return CheekyFG_CompleteHooklessFrameV2(use_for_fg,0);
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgControl* out) noexcept {
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
@@ -595,7 +600,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     // Layers built before extra_frame_slots pass the shorter structure.
     if(!out||out->abi!=1||out->size<offsetof(CheekyFgPacingOptions,extra_frame_slots))return false;
     const auto& fg=cheeky::foveated_dlss::current_settings().fg;
-    out->clock_mode=fg.pacing_clock<=2u?fg.pacing_clock:0u;
+    out->clock_mode=0; // Legacy follow/phase-lock settings no longer change the target clock.
     // Native D3D11 follows the shared release setting (default: after the
     // generated frame is submitted), like the D3D12 path.
     out->native11_release_point=fg.release_point<=7u?fg.release_point:3u;
@@ -603,8 +608,9 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(Cheeky
     if(out->size>=offsetof(CheekyFgPacingOptions,gpu_waited_present))out->dedicated_present_queue=fg.dedicated_present_queue?1u:0u;
     if(out->size>=offsetof(CheekyFgPacingOptions,limit_gpu_ahead))out->gpu_waited_present=fg.gpu_waited_present?1u:0u;
     if(out->size>=offsetof(CheekyFgPacingOptions,carry_missed_ticks))out->limit_gpu_ahead=fg.limit_gpu_ahead?1u:0u;
-    if(out->size>=offsetof(CheekyFgPacingOptions,pacing_headroom))out->carry_missed_ticks=fg.carry_missed_ticks?1u:0u;
-    if(out->size>=sizeof(*out))out->pacing_headroom=fg.pacing_headroom?1u:0u;
+    if(out->size>=offsetof(CheekyFgPacingOptions,pacing_headroom))out->carry_missed_ticks=0;
+    if(out->size>=offsetof(CheekyFgPacingOptions,target_refresh_hz))out->pacing_headroom=0;
+    if(out->size>=sizeof(*out))out->target_refresh_hz=fg.target_refresh_hz;
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetNative11OptionsV1(CheekyFgNative11Options* out) noexcept {
