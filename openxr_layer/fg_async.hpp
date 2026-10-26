@@ -254,6 +254,26 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::array<FrameTrace,8> frame_traces;
     TimingClock::time_point game_wait_enter,game_wait_exit,game_begin_enter,game_begin_exit; // Game thread's current frame.
     std::uint64_t late_frames{};
+    // Hold mx. Release-gate watchdog: when the gate has held the game for
+    // 500 ms straight, something it waits for will never happen (e.g. a
+    // generated frame lost in a pipeline reset); release it.
+    TimingClock::time_point gate_held_since{};
+    std::uint64_t gate_timeouts{};
+    void release_gate_watchdog(TimingClock::time_point now) {
+        if(!release_gate_active()){gate_held_since={};return;}
+        if(gate_held_since==TimingClock::time_point{}){gate_held_since=now;return;}
+        if(now-gate_held_since<std::chrono::milliseconds(500))return;
+        ++gate_timeouts;
+        if(trace){char message[256]{};
+            sprintf_s(message,"FG release gate watchdog: game held %.0f ms; awaiting_generated=%llu inflight=%llu pending=%zu submitted_native=%llu; releasing (count=%llu)",
+                std::chrono::duration<double,std::milli>(now-gate_held_since).count(),static_cast<unsigned long long>(awaiting_generated_submission),
+                static_cast<unsigned long long>(inflight_id),pending.size(),static_cast<unsigned long long>(submitted_native_id),static_cast<unsigned long long>(gate_timeouts));
+            trace(message);}
+        if(awaiting_generated_submission)finish_generated_gate(awaiting_generated_submission,false);
+        if(inflight_id){inflight_generated_gate_released=true;inflight_prepared=true;submitted_native_id=std::max(submitted_native_id,inflight_id);}
+        for(const auto& job:pending)submitted_native_id=std::max(submitted_native_id,job->id);
+        release_delay_until={};release_deferred_credit();gate_held_since={};changed.notify_all();
+    }
     double last_content_wait_ms{}; // Presenter's wait for the content it is about to submit.
     FrameTrace& frame_trace(std::uint64_t id) noexcept {auto& t=frame_traces[id%frame_traces.size()];if(t.id!=id){t={};t.id=id;}return t;}
     const FrameTrace* find_trace(std::uint64_t id) const noexcept {const auto& t=frame_traces[id%frame_traces.size()];return id&&t.id==id?&t:nullptr;}
@@ -504,7 +524,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
         reset_gpu_metrics();extra_gpu={};batch_telemetry={};inflight_progress.reset();
         frame_ages={};age_samples={};
-        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=0;
+        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=0;gate_held_since={};
         capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
         gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
@@ -1066,6 +1086,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 // A tick held for the GPU is granted the moment the previous
                 // capture finishes, not a whole tick later: waiting for the
                 // next tick quantizes the game to multiples of the tick.
+                release_gate_watchdog(now);
                 if(gpu_behind_credit&&!gpu_behind_now()) {
                     gpu_behind_credit=false;
                     if(!raw){++granted_credits;credits=std::min(max_credits(),credits+1+take_owed());changed.notify_all();}
