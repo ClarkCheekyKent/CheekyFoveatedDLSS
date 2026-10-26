@@ -1234,6 +1234,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // first tick never waits for content.
         while(!stopping&&!raw&&ticks&&!(direct_request&&!direct_request->decided)&&!fresh_content(active,have_active,generated_phase,position)) {
             waited_for_content=true;
+            // A generated-submission gate for an interval the presenter has
+            // already passed (a stall showed its native frame) can never be
+            // met; holding it would leave the game and this wait stuck.
+            if(awaiting_generated_submission&&double(awaiting_generated_submission)<=position){
+                if(trace)trace("FG generated gate cancelled: presenter already showed that native frame");
+                finish_generated_gate(awaiting_generated_submission,false);continue;}
             // FG completion and new captures notify changed. Poll only an
             // outstanding producer fence (native-only startup/fallback), not
             // a quiet mailbox: idle fresh-only mode must not spin at 1 kHz.
