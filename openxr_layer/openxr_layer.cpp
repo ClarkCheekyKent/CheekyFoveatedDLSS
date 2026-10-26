@@ -23,6 +23,7 @@
 #include "fg_restart_policy.hpp"
 #include "quad_capture.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
+#include "../standalone/menu_backend.hpp"
 #include "menu_geometry.hpp"
 #include "../src/realvr_runtime.hpp"
 #include "../src/d3d12_native.hpp"
@@ -219,12 +220,16 @@ struct SessionState {
         std::uint32_t convert_rtv_stride{};
         std::uint64_t fence_value{};
         std::uint32_t width{}, height{}, format{}, target_format{};
+        float display_width{}, display_height{};
         bool anchored{};
         bool cylinder{};
         unsigned strips{1};
         XrPosef pose{};
         XrExtent2Df size{};
     } menu, cached_menu; // Updates never acquire the currently published chain.
+    Menu cursor_menu; // Static pixels; only the quad pose changes per headset tick.
+    Microsoft::WRL::ComPtr<ID3D12Resource> cursor_upload;
+    bool cursor_ready{}, cursor_failed{}, cursor_controller_drag{};
     struct LocatedProjection {
         XrTime time{};
         XrSpace space{XR_NULL_HANDLE};
@@ -674,7 +679,15 @@ struct PublishedMenu {
     bool cylinder{};
     XrCompositionLayerCylinderKHR cylinder_layer{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
     std::vector<XrCompositionLayerQuad> strips;
+    XrPosef panel_pose{};
+    XrExtent2Df panel_size{};
+    std::uint32_t panel_width{}, panel_strips{1};
+    float display_width{}, display_height{};
+    XrSwapchain cursor_swapchain{XR_NULL_HANDLE};
+    XrCompositionLayerQuad cursor_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    bool cursor_visible{}, cursor_controller_drag{};
 };
+void update_presenter_menu_cursor(XrSession, const XrFrameEndInfo*, PublishedMenu&);
 std::mutex published_menu_mutex;
 // Shared while a presenter submits; exclusive before a menu swapchain is destroyed.
 std::shared_mutex published_menu_lifetime;
@@ -703,6 +716,7 @@ XRAPI_ATTR XrResult XRAPI_CALL presenter_end_frame_with_menu(
         if (found == published_menus.end() || !found->second.next) return XR_ERROR_HANDLE_INVALID;
         menu = found->second;
     }
+    if (info && menu.swapchain) update_presenter_menu_cursor(session, info, menu);
     const auto count = menu.cylinder ? 1U : static_cast<std::uint32_t>(menu.strips.size());
     if (!info || menu.swapchain == XR_NULL_HANDLE || !count || (info->layerCount && !info->layers) ||
         info->layerCount + count > menu.max_layers) return menu.next(session, info);
@@ -710,6 +724,8 @@ XRAPI_ATTR XrResult XRAPI_CALL presenter_end_frame_with_menu(
     if (info->layerCount) layers.assign(info->layers, info->layers + info->layerCount);
     if (menu.cylinder) layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu.cylinder_layer));
     else for (const auto& strip : menu.strips) layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&strip));
+    if (menu.cursor_visible && menu.cursor_swapchain && layers.size() < menu.max_layers)
+        layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&menu.cursor_layer));
     auto forwarded = *info;
     forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
     forwarded.layers = layers.data();
@@ -721,8 +737,26 @@ void destroy_menu(SessionState::Menu& menu, const Dispatch& dispatch) noexcept {
         // Wait out a presenter submission that may still reference this swapchain.
         std::unique_lock lifetime(published_menu_lifetime);
         std::lock_guard lock(published_menu_mutex);
-        for (auto& published : published_menus)
+        for (auto& published : published_menus) {
             if (published.second.swapchain == menu.swapchain) published.second.swapchain = XR_NULL_HANDLE;
+            if (published.second.cursor_swapchain == menu.swapchain) {
+                published.second.cursor_swapchain = XR_NULL_HANDLE; published.second.cursor_visible = false;
+            }
+        }
+    }
+    // Resize/session teardown only: allocators and static cursor uploads must
+    // outlive their last queued copy. Ordinary menu refresh never waits here.
+    if (menu.fence && menu.fence_value && menu.fence->GetCompletedValue() < menu.fence_value) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        if (!menu.images12.empty() && menu.images12[0].texture)
+            menu.images12[0].texture->GetDevice(IID_PPV_ARGS(&device));
+        const auto event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        while(menu.fence->GetCompletedValue()<menu.fence_value) {
+            if(device&&FAILED(device->GetDeviceRemovedReason()))break;
+            if(event&&SUCCEEDED(menu.fence->SetEventOnCompletion(menu.fence_value,event)))WaitForSingleObject(event,100);
+            else Sleep(1);
+        }
+        if(event)CloseHandle(event);
     }
     if (menu.swapchain != XR_NULL_HANDLE && dispatch.destroy_swapchain)
         static_cast<void>(dispatch.destroy_swapchain(menu.swapchain));
@@ -975,16 +1009,18 @@ bool sample_host_menu_hand(SessionState& session, const InstanceState& instance,
     return valid_pose;
 }
 
-void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
-    const XrTime time, const CheekyOpenXRMenuFrame& frame, CheekyOpenXRMenuPointer pointer_sink = nullptr) {
+struct MenuPointerSample {float u{},v{};bool down{},active{};};
+MenuPointerSample send_menu_pointer(SessionState& session, const Dispatch& dispatch,
+    const XrTime time, const CheekyOpenXRMenuFrame& frame, CheekyOpenXRMenuPointer pointer_sink = nullptr,
+    const SessionState::Menu* displayed = nullptr) {
     const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
     const auto send = pointer_sink ? pointer_sink : host ? reinterpret_cast<CheekyOpenXRMenuPointer>(
         GetProcAddress(host, "CheekyOpenXRMenuSetPointer")) : nullptr;
-    if (!send || !dispatch.locate_space || !dispatch.get_action_state_boolean) return;
+    if (!send || !dispatch.locate_space || !dispatch.get_action_state_boolean || frame.display_width <= 0 || frame.display_height <= 0) return {};
     const auto instance = instances.find(session.instance);
     if (instance == instances.end() || instance->second.menu_click_action == XR_NULL_HANDLE ||
-        !session.action_attached) { send(0, 0, false, false); return; }
-    const auto& menu = session.menu;
+        !session.action_attached) { send(0, 0, false, false); return {}; }
+    const auto& menu = displayed ? *displayed : session.menu;
     const auto& orientation = menu.pose.orientation;
     const XrQuaternionf inverse{-orientation.x, -orientation.y, -orientation.z, orientation.w};
     struct Pointer { bool hit{}, down{}; float x{}, y{}; };
@@ -1038,8 +1074,10 @@ void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
         for (const int hand : {1, 0}) if (pointers[hand].hit && pointers[hand].down) { selected = hand; break; }
         if (selected < 0) for (const int hand : {1, 0}) if (pointers[hand].hit) { selected = hand; break; }
     }
+    MenuPointerSample sample;
     if (selected >= 0) {
         const auto& p = pointers[selected];
+        sample = {p.x / frame.display_width, p.y / frame.display_height, p.down, true};
         send(p.x, p.y, p.down, true);
         session.menu_pointer_hand = p.down ? selected : -1;
     } else { session.menu_pointer_hand = -1; send(0, 0, false, false); }
@@ -1055,6 +1093,7 @@ void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
             unsigned(pointers[1].hit), pointers[1].x, pointers[1].y, host_fallback[0], host_fallback[1]);
         report_menu_diagnostic(diagnostic);
     }
+    return sample;
 }
 
 // Copies the open F8 menu into its swapchain, then hands the frame to `end`
@@ -1088,6 +1127,8 @@ XrResult release_menu_image(SessionState::Menu& menu, const Dispatch& dispatch) 
     if (XR_SUCCEEDED(result)) menu.acquired = menu.waited = false;
     return result;
 }
+
+#include "menu_cursor.inl"
 
 template <class EndFrame>
 XrResult submit_menu_layers(const XrFrameEndInfo* info, SessionState& state,
@@ -1136,6 +1177,14 @@ XrResult submit_menu_layers(const XrFrameEndInfo* info, SessionState& state,
             layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
         }
     }
+    PublishedMenu live;
+    live.swapchain=menu.swapchain;live.max_layers=state.max_layers;live.cylinder=menu.cylinder;live.strips=strips;
+    set_menu_cursor_geometry(live,menu);
+    {
+        std::lock_guard lock(state_mutex);
+        const auto instance=instances.find(state.instance);
+        if(instance!=instances.end())update_menu_cursor_locked(state,instance->second.dispatch,info,live);
+    }
     if (presenter) {
         {
             std::lock_guard lock(published_menu_mutex);
@@ -1145,12 +1194,17 @@ XrResult submit_menu_layers(const XrFrameEndInfo* info, SessionState& state,
             published.cylinder = menu.cylinder;
             published.cylinder_layer = cylinder;
             published.strips = strips;
+            set_menu_cursor_geometry(published, menu);
+            published.cursor_swapchain=live.cursor_swapchain;published.cursor_layer=live.cursor_layer;
+            published.cursor_visible=live.cursor_visible;published.cursor_controller_drag=live.cursor_controller_drag;
         }
         const auto result = end(info);
         report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
         return result;
     }
     unpublish_menu(state.session);
+    if(live.cursor_visible&&layers.size()<state.max_layers)
+        layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&live.cursor_layer));
     auto forwarded = *info;
     forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
     forwarded.layers = layers.data();
@@ -1260,6 +1314,7 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         release_source(); return end(info);
     }
     auto& menu = state.menu;
+    menu.display_width = frame.display_width; menu.display_height = frame.display_height;
     const auto available_layers = state.max_layers > info->layerCount ? state.max_layers - info->layerCount : 0U;
     if (!available_layers) { release_source(); return end(info); }
     menu.cylinder = state.menu_cylinder_enabled;
@@ -1267,7 +1322,7 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
     if (menu.fence_value == 0 && state.graphics_api == 12)
         report_menu_diagnostic(menu.cylinder ? "OpenXR menu policy: native cylinder, sampled texture" :
             "OpenXR menu policy: single full-image quad, sampled texture");
-    send_menu_pointer(state, dispatch, info->displayTime, frame);
+    // Pointer sampling follows presentation, independently of background refresh.
     const auto available = poll_menu_image(menu, dispatch);
     if (available == XR_TIMEOUT_EXPIRED) { release_source(); return keep_previous(); }
     if (available != XR_SUCCESS) {
@@ -2497,6 +2552,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
             if (session_it->second.instance == instance) {
                 destroy_menu(session_it->second.menu, dispatch);
                 destroy_menu(session_it->second.cached_menu, dispatch);
+                destroy_menu(session_it->second.cursor_menu, dispatch);
                 session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
                 if(session_it->second.fg)retired_presenters.push_back(std::move(session_it->second.fg));
                 session_it = sessions.erase(session_it);
@@ -2673,6 +2729,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         dispatch = instance_it->second.dispatch;
         destroy_menu(session_it->second.menu, dispatch);
         destroy_menu(session_it->second.cached_menu, dispatch);
+        destroy_menu(session_it->second.cursor_menu, dispatch);
         gaze_space = session_it->second.gaze_space;
         calibration_local_space = session_it->second.calibration_local_space;
         menu_aim_spaces = session_it->second.menu_aim_spaces;

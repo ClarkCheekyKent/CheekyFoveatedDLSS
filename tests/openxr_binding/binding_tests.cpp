@@ -1029,6 +1029,7 @@ void fg_copy_validation_test(bool include_buffered=true) {
 #include "fg_hardware_probe.hpp"
 #include "fg_hardening_validation.hpp"
 #include "fg_shared_queue_validation.hpp"
+#include "menu_cursor_validation.hpp"
 #include "fg_auto_validation.hpp"
 void frame_space_lifetime_test() {
     reset();const auto session=h<XrSession>(9100);
@@ -1159,6 +1160,10 @@ void diagnostic_lifetime_test() {
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--menu-live-cursor") {
+            for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB})menu_cursor_validation(format);
+            custom_binding_menu_test();return 0;
+        }
         if(argc>1&&std::string(argv[1])=="--menu-nonblocking") {menu_nonblocking_test();presenter_menu_layer_test();menu_policy_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shared-submission") {fg_shared_queue_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-latest-interval") {fg_latest_interval_validation();return 0;}

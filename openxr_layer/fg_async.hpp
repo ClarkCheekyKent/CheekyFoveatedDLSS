@@ -1112,6 +1112,16 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     }
     void wake_producer() {std::lock_guard lock(mx);wake_producer_locked();}
     std::deque<Pair>::iterator newest_ready_pair(double position) {
+        // Hold mx. A native fallback can be displayed before its queued record
+        // is consumed. Retire records with no remaining forward content before
+        // FIFO selection, or that duplicate can hide newer intervals forever
+        // while the full queue blocks the game from producing another frame.
+        const auto retired=std::erase_if(ready,[&](const Pair& pair){
+            return double(pair.native_id)<position ||
+                (double(pair.native_id)==position&&
+                 (!pair.interpolated||double(pair.current_id)<=position));
+        });
+        if(retired)changed.notify_all(); // Stale records no longer own queue capacity.
         auto selected=ready.end();
         // Presentation-gated policies retain every interval. Overlap policies
         // choose the latest usable interval at a cycle boundary, so completed

@@ -26,6 +26,7 @@ set_target_properties(CheekyOpenXRBindingTests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 add_test(NAME OpenXRHostBindings COMMAND CheekyOpenXRBindingTests)
 add_test(NAME OpenXRMenuNonblocking COMMAND CheekyOpenXRBindingTests --menu-nonblocking)
+add_test(NAME OpenXRMenuLiveCursor COMMAND CheekyOpenXRBindingTests --menu-live-cursor)
 add_test(NAME OpenXRQuadD3D11 COMMAND CheekyOpenXRBindingTests --quad-d3d11)
 add_test(NAME OpenXRQuadRoles COMMAND CheekyOpenXRBindingTests --quad-roles)
 add_test(NAME OpenXRQuadD3D12 COMMAND CheekyOpenXRBindingTests --quad-capture)

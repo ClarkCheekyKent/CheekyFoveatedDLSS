@@ -30,6 +30,15 @@ using CheekyOpenXRMenuTrySubmit12 = std::int32_t(__cdecl*)(void*, void*, void*, 
 using CheekyOpenXRMenuReport = void(__cdecl*)(std::uint32_t);
 using CheekyOpenXRMenuDiagnosticFn = void(__cdecl*)(const char*);
 
+struct CheekyOpenXRMenuCursorInput {
+    std::uint32_t size{sizeof(CheekyOpenXRMenuCursorInput)};
+    float u{}, v{}; // Normalized desktop pointer, independent of menu refresh.
+    std::uint32_t valid{}, controllers{1}, down{};
+    std::uint64_t desktop_activity{};
+};
+using CheekyOpenXRMenuCursorInputFn = bool(__cdecl*)(CheekyOpenXRMenuCursorInput*);
+using CheekyOpenXRMenuCursorLayerFn = void(__cdecl*)(bool);
+
 enum CheekyOpenXRMenuStatus : std::uint32_t {
     cheeky_xr_menu_submitted,
     cheeky_xr_menu_graphics_mismatch,

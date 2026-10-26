@@ -31,13 +31,32 @@ void fg_latest_interval_validation() {
     completion->done=true;auto eye=newest.progress->phases[0].images[1];newest.progress->phases[0].images[1].reset();
     check(presenter.newest_ready_pair(0.)->current_id==3,"Latest selection still requires a complete stereo publication");
     newest.progress->phases[0].images[1]=eye;
+    auto active=presenter.ready.front();active.generated_index=1;
     check(presenter.newest_ready_pair(2.5)->current_id==4&&presenter.newest_ready_pair(3.5)==presenter.ready.end(),
         "Latest selection cannot rewind the displayed source timeline");
-    auto active=presenter.ready.front();active.generated_index=1;
     auto active_completion=std::static_pointer_cast<Completion>(active.progress->phases[1].completion);active_completion->done=false;
     check(!presenter.fresh_content(active,true,true,1.25),"A newer interval cannot interrupt an active generated-frame sequence");
     active_completion->done=true;
     check(presenter.fresh_content(active,true,true,1.25),"The active sequence resumes when its own next phase is usable");
+    for(unsigned release:{0u,1u,2u,3u,4u,5u,6u,7u}){
+        BufferedPresenter queued;queued.active_release_point=release;queued.extra_frame_slots=true;queued.ticks=1;
+        BufferedPair fallback;fallback.native_id=fallback.current_id=415;
+        queued.ready.push_back(fallback);
+        for(std::uint64_t id:{415u,416u}){
+            auto interval=active;interval.native_id=id;interval.current_id=id+1;interval.generated_index=0;
+            queued.ready.push_back(std::move(interval));
+        }
+        check(!queued.producer_has_capacity(),"Reproduce BeamNG's full ready queue after native fallback");
+        check(queued.fresh_content(fallback,true,false,415.),
+            "Already displayed fallback cannot hide newer content or leave the presenter asleep");
+        check(queued.ready.size()==2&&queued.producer_has_capacity(),
+            "Retiring the duplicate immediately restores game production capacity");
+        const bool ordered=release==3u||release==6u||release==7u;
+        check(queued.newest_ready_pair(415.)->current_id==(ordered?416u:417u),
+            "Retain the first unshown interpolation for FIFO and newest interval for overlap");
+        check(queued.newest_ready_pair(418.)==queued.ready.end()&&queued.ready.empty()&&queued.producer_has_capacity(),
+            "An entirely stale queue is retired even when there is no newer selectable interval");
+    }
     std::cout<<"PASS latest-interval selection for overlap; presentation gates and active sequences preserved\n";
 }
 

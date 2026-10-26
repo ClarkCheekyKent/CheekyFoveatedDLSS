@@ -5,6 +5,7 @@
 #include "version.h"
 #include "openvr_menu.hpp"
 #include "menu_backend.hpp"
+#include "menu_cursor_draw.hpp"
 #include "../shared/openxr_menu_bridge.hpp"
 #include "../shared/openxr_menu_shared11.hpp"
 void report_openxr_menu_diagnostic(const char* message) noexcept {
@@ -113,6 +114,8 @@ struct Renderer : OverlayUiState {
     ComPtr<ID3D11RenderTargetView> headset_rtv11;
     cheeky::xr_menu::SharedTexture11 xr_shared11;
     ComPtr<ID3D12Resource> headset_texture12;
+    MenuHeadsetDrawData headset_draw_data;
+    ImDrawData* headset_draw{};
     vr::IVROverlay* vr_overlay{};
     bool xr_menu_owner{};
     vr::IVRSystem* vr_system{};
@@ -143,6 +146,10 @@ struct State {
     ULONGLONG xr_last_request{};
     std::mutex xr_inputs_mutex; // Never held across rendering or GPU submission.
     MenuPointerQueue xr_inputs;
+    std::atomic<ULONGLONG> live_cursor_tick{}, desktop_activity{};
+    std::atomic<HWND> cursor_window{};
+    std::atomic<bool> cursor_open{}, cursor_controllers{true}, cursor_raw{};
+    std::atomic<float> cursor_u{}, cursor_v{};
     void clear_xr_inputs() { std::lock_guard lock(xr_inputs_mutex); xr_inputs = {}; }
     void push_xr_input(MenuPointer event) { std::lock_guard lock(xr_inputs_mutex); xr_inputs.push(event); }
     bool pop_xr_input(MenuPointer& event) {
@@ -585,7 +592,7 @@ void render11(Renderer& r) {
         r.context11->ClearRenderTargetView(r.headset_rtv11.Get(), clear);
         view = r.headset_rtv11.Get();
         r.context11->OMSetRenderTargets(1, &view, nullptr);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        ImGui_ImplDX11_RenderDrawData(r.headset_draw ? r.headset_draw : ImGui::GetDrawData());
         r.context11->OMSetRenderTargets(0, nullptr, nullptr);
         // Publish on the mirror render thread; the OpenXR thread must never
         // issue work through the game's immediate context.
@@ -628,7 +635,7 @@ void render12(Renderer& r) {
         const float clear[]{0, 0, 0, 0};
         r.command_list->ClearRenderTargetView(headset_target, clear, 0, nullptr);
         r.command_list->OMSetRenderTargets(1, &headset_target, FALSE, nullptr);
-        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), r.command_list.Get());
+        ImGui_ImplDX12_RenderDrawData(r.headset_draw ? r.headset_draw : ImGui::GetDrawData(), r.command_list.Get());
         std::swap(headset.Transition.StateBefore, headset.Transition.StateAfter);
         r.command_list->ResourceBarrier(1, &headset);
     }
@@ -703,6 +710,10 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         r.input->enabled = true;
         poll_overlay_hotkey(*r.input);
         const bool menu_open = r.input->open.load();
+        global.cursor_open = menu_open; global.cursor_window = r.input->window;
+        global.cursor_controllers = r.input->headset_pointer.load();
+        global.cursor_raw = r.input->raw_pointer_mode.load();
+        global.desktop_activity = r.input->desktop_pointer_tick.load();
         if (menu_open != r.menu_was_open) {
             r.menu_was_open = menu_open;
             set_status(menu_open ? "Menu opened" : "Menu closed");
@@ -718,6 +729,10 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         if (r.dx12) ImGui_ImplDX12_NewFrame(); else ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         apply_desktop_pointer(*r.input, desktop_events_begin);
+        if (ImGui::GetIO().DisplaySize.x > 0 && ImGui::GetIO().DisplaySize.y > 0) {
+            global.cursor_u = r.input->raw_x / ImGui::GetIO().DisplaySize.x;
+            global.cursor_v = r.input->raw_y / ImGui::GetIO().DisplaySize.y;
+        }
         set_overlay_framebuffer_scale(r.framebuffer_width, r.framebuffer_height);
         const bool headset_ready = prepare_headset(r);
         poll_headset_input(r, headset_ready, desktop_events_begin);
@@ -754,7 +769,14 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         draw_overlay_ui(r,runtime,*r.input,r.dx12?"D3D12":"D3D11",status.load(),open);
         // Only the close button writes the atomic; concurrent menu-key input is preserved.
         if(!open){r.input->open=false;restore_cursor(*r.input,true);}
+        const auto cursor_tick = global.live_cursor_tick.load();
+        const bool separate_cursor = r.xr_menu_owner && cursor_tick && GetTickCount64() - cursor_tick < 250;
+        if (separate_cursor) {
+            ImGui::GetIO().MouseDrawCursor = false;
+            draw_desktop_menu_cursor();
+        }
         ImGui::Render();
+        r.headset_draw = r.headset_draw_data.prepare(ImGui::GetDrawData(), separate_cursor);
         if (now - r.input_log_tick >= 1000) {
             r.input_log_tick = now;
             const auto& io = ImGui::GetIO();
@@ -919,6 +941,30 @@ extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuSetPointer(
     float x, float y, bool down, bool active) noexcept {
     auto& global = cheeky::standalone::state();
     global.push_xr_input({x, y, down, active});
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuGetCursorInput(
+    CheekyOpenXRMenuCursorInput* input) noexcept {
+    if (!input || input->size != sizeof(*input)) return false;
+    auto& global = cheeky::standalone::state();
+    *input = {}; input->controllers = global.cursor_controllers.load();
+    input->desktop_activity = global.desktop_activity.load();
+    const auto window = global.cursor_window.load();
+    if (!global.cursor_open.load() || !window) return false;
+    input->u = global.cursor_u.load(); input->v = global.cursor_v.load();
+    if (!global.cursor_raw.load()) {
+        POINT point{}; RECT client{};
+        if (!GetCursorPos(&point) || !ScreenToClient(window, &point) || !GetClientRect(window, &client) ||
+            client.right <= 0 || client.bottom <= 0) return true;
+        input->u = float(point.x) / client.right; input->v = float(point.y) / client.bottom;
+    }
+    input->valid = foreground(window) && input->u >= 0 && input->u <= 1 && input->v >= 0 && input->v <= 1;
+    input->down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    return true;
+}
+
+extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuCursorLayerActive(bool active) noexcept {
+    cheeky::standalone::state().live_cursor_tick.store(active ? GetTickCount64() : 0);
 }
 
 extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuReportStatus(
