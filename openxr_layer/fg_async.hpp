@@ -838,8 +838,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         return result;
     }
 
-    // Called only by the DX12 generation thread, after both immutable eye
-    // outputs AND their worker fence have been submitted. No CPU GPU wait.
+    // Called by the generation thread as soon as both eye outputs are safe
+    // for ordered publication: a submitted DX12 fence or D3D11 context order.
     void announce_generated_phase(const std::shared_ptr<Native>& previous,const std::shared_ptr<Native>& job,
                                   Pair& pair,std::shared_ptr<FrameCompletion> completion) {
         std::lock_guard lock(mx);
@@ -970,7 +970,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(success&&!pair.direct_xr)for(unsigned eye=0;eye<2;++eye)last_fg_borders[eye]=pair.generated[eye]->fg_border;
                 if(pair.progress){pair.progress->complete=true;pair.progress->failed|=!success||job->epoch!=epoch||degraded;
                     if(pair.progress->failed){std::erase_if(ready,[&](const auto& p){return p.progress==pair.progress;});finish_generated_gate(job->id,false);}}
-                if(success&&!pair.progress&&(active_release_point==3u||active_release_point==6u||active_release_point==7u)&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
+                if(success&&!pair.progress&&!(pair.direct_xr&&direct_job&&direct_job->queued)&&
+                    (active_release_point==3u||active_release_point==6u||active_release_point==7u)&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
                 const auto status=backend->generation_status();
                 CheekyFgPerformance gpu_performance;backend->snapshot(gpu_performance,extra_gpu,experiment_state);
@@ -985,8 +986,12 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 }
                 release_deferred_credit();
                 if(job->epoch!=epoch||degraded){previous.reset();reset_history=true;continue;}
-                if(pair.direct_xr){direct_job->success=success;if(success){++direct_stats.frames;direct_job->result=std::move(pair);}
-                    else{++direct_stats.fallbacks;direct_stats.last_path=3;note_direct_failure_locked(CheekyFgDirectReason::generation);}}
+                if(pair.direct_xr){
+                    // An early direct handoff is immutable and may already
+                    // have been moved by the presenter while NGX retired.
+                    if(!direct_job->queued){direct_job->success=success;if(success){++direct_stats.frames;direct_job->result=std::move(pair);}
+                        else{++direct_stats.fallbacks;direct_stats.last_path=3;note_direct_failure_locked(CheekyFgDirectReason::generation);}}
+                }
                 else{
                     if(trace&&job->latency_diagnostics){
                         char publication[420]{};

@@ -126,6 +126,7 @@ void bind(FocusPipeline& p,ID3D12Device* dev,ID3D12GraphicsCommandList* list,uns
 DXGI_FORMAT depth_srv_format(DXGI_FORMAT f) noexcept {return guide_depth_format(f);}
 DXGI_FORMAT motion_srv_format(DXGI_FORMAT f) noexcept {return guide_motion_format(f);}
 void FocusPipeline::reset() noexcept {
+ for(auto& eye:borrowed_optical)for(auto& session:eye)session=nullptr;
  for(auto& eye:optical)for(auto& session:eye)session.reset();
  root.Reset();prepare.Reset();peripheral.Reset();center_shader.Reset();compose.Reset();pack.Reset();recenter.Reset();descriptors.Reset();stride=0;
  for(auto& eye:inputs)for(auto& input:eye)input={};
@@ -286,8 +287,8 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
   // Prepared depth covers this pass's output region in eye coordinates.
   c.flags[2]=depth?1.f:0.f;c.flags[3]=float(g.depth_inverted);std::copy_n(c.output_rect,4,c.depth_rect);
   if(camera.valid)optical::pose_mapping(c,camera.previous_pose,camera.previous_fov,camera.pose,camera.view_fov,interpolation_fraction);
-  optical[eye][pass].descriptor_set=descriptor_set;
-  if(!optical[eye][pass].render(list,previous,current,depth,c,interpolation_fraction,color_format,color_state,
+  auto& session=optical_session(eye,pass);session.descriptor_set=descriptor_set;
+  if(!session.render(list,previous,current,depth,c,interpolation_fraction,color_format,color_state,
        previous->GetDesc().Format,current->GetDesc().Format,scratch))return false;
   // Optical periphery uses the ordinary composition/packing path. The worker
   // never requests a partial packed destination for this method.

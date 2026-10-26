@@ -70,15 +70,30 @@ bool Worker::wait_fence(std::uint64_t value,const char* site) noexcept {
 }
 void Worker::reset_features() noexcept {
     temporal_evaluation_completed=false;
+    // Borrowed temporal handles belong to the first phase. Retire the whole
+    // interval before destroying any phase's descriptors or parameters.
+    for(auto& phase:ngx_phases){
+        for(auto* array:{&phase.features,&phase.peripheral_features})for(auto& f:*array){
+            if(f.handle&&!f.borrowed_handle&&release)release(f.handle);
+            if(f.params&&destroy)destroy(f.params);f={};
+        }
+        phase.focus.reset();
+    }
     for(auto* array:{&features,&peripheral_features})for(auto& f:*array){
         if(f.handle&&release)release(f.handle);if(f.params&&destroy)destroy(f.params);f={};
     }
-    focus.reset();configuration=0;center_width=center_height=peripheral_width=peripheral_height=0;
+    focus.reset();ngx_fallback.reset();configuration=0;center_width=center_height=peripheral_width=peripheral_height=0;
+}
+bool Worker::can_batch_ngx(const CheekyFgPair& guides) noexcept {
+    // Mixed optical regions borrow phase 1's sessions and immutable flow
+    // fields; NGX parameter/preparation storage remains private per phase.
+    return cheeky_fg_needs_ngx(guides);
 }
 void Worker::reset() noexcept {
     std::lock_guard lock(ngx_mutex);wait_idle();reset_features();
     latency.reset();gpu_timings.reset();for(auto& t:phase_timings)t.reset();batch_timings.reset();completion_wait={};submitted_at={};
     if(event)CloseHandle(event);event=nullptr;device.Reset();queue.Reset();allocator.Reset();second_allocator.Reset();optical_allocator.Reset();list.Reset();second_list.Reset();optical_list.Reset();for(auto& a:batch_allocators)a.Reset();for(auto& l:batch_lists)l.Reset();fence.Reset();
+    for(auto& a:batch_second_allocators)a.Reset();for(auto& l:batch_second_lists)l.Reset();
     for(auto& a:optical_consumer_allocators)a.Reset();for(auto& l:optical_consumer_lists)l.Reset();
     for(auto& eye:optical_pending)for(auto& pending:eye)pending=false;
     allocate=nullptr;destroy=nullptr;create=nullptr;evaluate=nullptr;release=nullptr;
@@ -185,7 +200,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     const std::array<ID3D12Resource*,2>& previous,const std::array<Camera,2>& cameras,
     std::array<ID3D12Resource*,2>& outputs,std::array<OutputCopy,2>* copies,
     void(*on_submitted)(void*) noexcept,void* submitted_context,void(*on_prepared)(void*) noexcept,
-    unsigned frame_count,unsigned frame_index) noexcept {
+    unsigned frame_count,unsigned frame_index,void(*on_output_submitted)(void*) noexcept,void* output_context) noexcept {
     submitted_at={};prepared_serial=0;temporal_evaluation_completed=false;
     std::lock_guard lock(ngx_mutex);
     if(frame_count<1||frame_count>3||frame_index<1||frame_index>frame_count)return false;
@@ -195,11 +210,16 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     const float fraction=float(frame_index)/float(frame_count+1);
     const bool last_output=frame_index==frame_count;
-    // Shader and optical flow intervals submit each generated frame without a
-    // CPU round trip; the queue keeps them ordered. The last frame's wait
-    // retires the whole interval; completed stereo outputs can be published earlier.
-    // NGX keeps one evaluation in flight, as its multi-frame contract expects.
-    const bool batched=!cheeky_fg_needs_ngx(guides)&&guides.release_point!=1u;
+    // Every method may publish its queued stereo output. NGX additionally
+    // resolves its suppression flag on the GPU before the ready fence.
+    const bool early_output=on_output_submitted&&copies&&
+        (*copies)[0].texture&&(*copies)[1].texture;
+    // Queue all indices in order without a GPU-to-CPU round trip. NGX uses
+    // private phase bindings below while retaining the same temporal handles.
+    // CPU suppression callers retain their old path. Preparation-gated jobs
+    // queue every phase before observing their preparation/completion fences.
+    const bool batch_ngx=early_output&&can_batch_ngx(guides);
+    const bool batched=!cheeky_fg_needs_ngx(guides)||batch_ngx;
     const bool continuing=batched&&frame_index>1;
     if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||!cheeky_fg_center_valid(guides.eyes[0].center_method)||!cheeky_fg_center_valid(guides.eyes[1].center_method)||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!continuing&&!wait_idle("previous generation"))return false;
@@ -230,19 +250,53 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             trace(message);
         }
     }
+    auto& phase_focus=batch_ngx&&continuing?ngx_phases[frame_index-2].focus:this->focus;
+    auto& phase_features=batch_ngx&&continuing?ngx_phases[frame_index-2].features:this->features;
+    auto& phase_peripheral_features=batch_ngx&&continuing?ngx_phases[frame_index-2].peripheral_features:this->peripheral_features;
+    if(batch_ngx&&continuing){
+        auto borrow=[&](Feature& phase,const Feature& temporal){
+            if(phase.handle!=temporal.handle||phase.width!=temporal.width||phase.height!=temporal.height){
+                if(phase.params&&destroy)destroy(phase.params);phase={};
+            }
+            phase.handle=temporal.handle;phase.borrowed_handle=true;
+            phase.width=temporal.width;phase.height=temporal.height;
+            phase.direct_rejected|=temporal.direct_rejected;phase.xr_direct_rejected|=temporal.xr_direct_rejected;
+            phase.evaluated_crop=temporal.evaluated_crop;phase.evaluated_crop_valid=temporal.evaluated_crop_valid;
+            phase.evaluated_frame=temporal.evaluated_frame;
+        };
+        for(unsigned eye=0;eye<2;++eye){
+            borrow(phase_features[eye],this->features[eye]);borrow(phase_peripheral_features[eye],this->peripheral_features[eye]);
+            // Previous-native depth is immutable until the LAST index saves
+            // the new history, after all earlier queue consumers have run.
+            phase_focus.previous_depth[eye]=this->focus.previous_depth[eye];
+            phase_focus.previous_center_depth[eye]=this->focus.previous_center_depth[eye];
+            phase_focus.history[eye]=this->focus.history[eye];phase_focus.center_history[eye]=this->focus.center_history[eye];
+            for(unsigned pass=0;pass<2;++pass){
+                phase_focus.borrowed_optical[eye][pass]=&this->focus.optical_session(eye,pass);
+                phase_focus.optical_constants[eye][pass]=this->focus.optical_constants[eye][pass];
+            }
+        }
+        phase_focus.color_format=this->focus.color_format;
+    }
     // Each generated phase owns separate query storage until the final fence.
     // The legacy HUD aggregates their completed samples, rather than overwriting
     // phase 1's optical-flow interval with the last interpolation phase.
     auto& phase_timing=phase_timings[frame_index-1];
-    focus.color_layouts=color_layouts;focus.previous_layouts=previous_layouts;
-    focus.interpolation_fraction=fraction;focus.descriptor_set=batched?frame_index-1:0;
+    if(batch_ngx&&frame_index==1&&phase_timing.samples==0&&trace){char message[192]{};
+        sprintf_s(message,"DLSS-FG queued stereo phases: count=%u; private phase bindings, ordered shared temporal handles, CPU completion wait only after final phase",frame_count);
+        trace(message);
+    }
+    phase_focus.color_layouts=color_layouts;phase_focus.previous_layouts=previous_layouts;
+    phase_focus.interpolation_fraction=fraction;phase_focus.descriptor_set=batched?frame_index-1:0;
     bool optical_timing_started=false;
     unsigned optical_regions{};
     for(const auto& g:guides.eyes){
         optical_regions+=cheeky_fg_optical(g.center_method)?1u:0u;
         if(g.focus_width<.999f||g.focus_height<.999f)optical_regions+=cheeky_fg_optical(g.peripheral_method)?1u:0u;
     }
-    const bool defer_optical=batched;
+    // The two-list preparation milestone has its own conservative flow order;
+    // do not split its second list into deferred optical-consumer lists.
+    const bool defer_optical=batched&&guides.release_point!=1u;
     if(frame_index==1)for(auto& eye:optical_pending)for(auto& pending:eye)pending=false;
     // NVOFA submits work outside this command list. Prepare once per native
     // pair, then reuse the same forward/backward fields at all 2x/3x/4x phases.
@@ -259,7 +313,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             auto c=optical::constants(g,pass,rect,previous_layouts[eye],color_layouts[eye],
                 std::max(32u,(rw*scale+50)/100),std::max(32u,(rh*scale+50)/100));
             optical::pose_mapping(c,cameras[eye].previous_pose,cameras[eye].previous_fov,cameras[eye].pose,cameras[eye].view_fov,fraction);
-            focus.optical_constants[eye][pass]=c;
+            phase_focus.optical_constants[eye][pass]=c;
             if(!optical_timing_started){
                 // A dedicated list, retired by the previous frame's completion
                 // wait, so the main allocator is free without a CPU drain.
@@ -273,7 +327,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 retire_failure.active=true;
                 optical_timing_started=true;
             }
-            auto& session=focus.optical[eye][pass];
+            auto& session=phase_focus.optical_session(eye,pass);
             if(!session.prepare(device.Get(),queue.Get(),previous[eye],colors[eye],pass?g.optical.peripheral_preset:g.optical.center_preset,
                 c,g.reset!=0,input_color_state,previous[eye]->GetDesc().Format,colors[eye]->GetDesc().Format,defer_optical)){
                 strcpy_s(diagnostic,session.diagnostic);failed=true;return false;
@@ -288,6 +342,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     auto& phase_allocator=continuing?batch_allocators[frame_index-2]:allocator;
     auto& phase_list=continuing?batch_lists[frame_index-2]:list;
+    auto& phase_second_allocator=continuing?batch_second_allocators[frame_index-2]:second_allocator;
+    auto& phase_second_list=continuing?batch_second_lists[frame_index-2]:second_list;
     if(FAILED(phase_allocator->Reset())||FAILED(phase_list->Reset(phase_allocator.Get(),nullptr)))return false;
     // Release point 1 records both eyes' preparation on list A and NGX and
     // composition on list B, with a GPU milestone between them.
@@ -295,22 +351,22 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // Lazily allocate the second list. Both allocators are reused only after
     // the previous frame's final fence retires.
     if(two_lists) {
-        if(!second_allocator && FAILED(device->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&second_allocator)))) {
+        if(!phase_second_allocator && FAILED(device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&phase_second_allocator)))) {
             if(trace)trace("FG preparation gate: cannot allocate second command allocator");
-            list->Close();return false;
+            phase_list->Close();return false;
         }
-        if(!second_list) {
+        if(!phase_second_list) {
             if(FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    second_allocator.Get(),nullptr,IID_PPV_ARGS(&second_list)))) {
+                    phase_second_allocator.Get(),nullptr,IID_PPV_ARGS(&phase_second_list)))) {
                 if(trace)trace("FG preparation gate: cannot create second command list");
-                list->Close();return false;
+                phase_list->Close();return false;
             }
-            if(FAILED(second_list->Close())) {list->Close();return false;}
+            if(FAILED(phase_second_list->Close())) {phase_list->Close();return false;}
         }
-        if(FAILED(second_allocator->Reset())||FAILED(second_list->Reset(second_allocator.Get(),nullptr))) {
+        if(FAILED(phase_second_allocator->Reset())||FAILED(phase_second_list->Reset(phase_second_allocator.Get(),nullptr))) {
             if(trace)trace("FG preparation gate: cannot reset second command list");
-            list->Close();return false;
+            phase_list->Close();return false;
         }
     }
     // The lambdas and timestamp recording follow the active command list.
@@ -323,7 +379,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(FAILED(commands->Close()))return false;
         ID3D12CommandList* prefix[]{commands};queue->ExecuteCommandLists(1,prefix);
         retire_failure.active=true;
-        if(!focus.optical[eye][pass].consume()){failed=true;return false;}
+        if(!phase_focus.optical_session(eye,pass).consume()){failed=true;return false;}
         optical_pending[eye][pass]=false;
         auto& a=optical_consumer_allocators[optical_consumer_count];auto& l=optical_consumer_lists[optical_consumer_count++];
         if(!a&&(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&a)))||
@@ -347,18 +403,18 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         const bool composition=g.focus_width<.999f||g.focus_height<.999f||
             scaled(width,g.resolution_percent)!=width||scaled(height,g.resolution_percent)!=height;
         direct=(composition||(*copies)[eye].layout.packed())&&d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&d.Width==((*copies)[eye].layout.packed()?(*copies)[eye].layout.stored_width():width)&&d.Height==((*copies)[eye].layout.packed()?(*copies)[eye].layout.stored_height():height)&&
-            d.DepthOrArraySize==1&&d.MipLevels==1&&d.SampleDesc.Count==1&&writable_color(d.Format,focus.color_format)&&
+            d.DepthOrArraySize==1&&d.MipLevels==1&&d.SampleDesc.Count==1&&writable_color(d.Format,phase_focus.color_format)&&
             (d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)&&(!(*copies)[eye].final_xr||(d.Flags&D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET));
         for(unsigned source=0;source<2&&direct;++source)
             direct=(*copies)[eye].texture!=colors[source]&&(*copies)[eye].texture!=previous[source]&&
                 (*copies)[eye].texture!=guides.eyes[source].depth&&(*copies)[eye].texture!=guides.eyes[source].motion;
     }
-    if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed()||(*copies)[0].final_xr||(*copies)[1].final_xr)){list->Close();if(two_lists)second_list->Close();return false;}
+    if(copies&&!direct&&((*copies)[0].layout.packed()||(*copies)[1].layout.packed()||(*copies)[0].final_xr||(*copies)[1].final_xr)){phase_list->Close();if(two_lists)phase_second_list->Close();return false;}
     // wait_idle above retired every earlier use of these private scratch images.
     // Not while earlier frames of this interval may still sample them.
     if(direct&&direct_periphery&&!continuing)for(unsigned eye=0;eye<2;++eye)
         if(((*copies)[eye].layout.packed()||(*copies)[eye].final_xr)&&guides.eyes[eye].peripheral_method<=2){
-            focus.peripheral_output[eye].Reset();if((*copies)[eye].final_xr)focus.full[eye].Reset();}
+            phase_focus.peripheral_output[eye].Reset();if((*copies)[eye].final_xr)phase_focus.full[eye].Reset();}
     std::array<bool,2> moving_crop_reset{};
     std::array<FocusRect,2> previous_center_crops{};
     std::array<float,2> motion_crop_dx{},motion_crop_dy{};
@@ -367,6 +423,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         const auto desc=input.color->GetDesc();const auto tw=unsigned(desc.Width),th=desc.Height;
         const auto guide_desc=input.depth->GetDesc();const auto gw=unsigned(guide_desc.Width),gh=guide_desc.Height;
         if(f.width!=tw||f.height!=th) {
+            if(f.borrowed_handle){report("NGX indexed phase changed dimensions",unsigned(E_INVALIDARG));failed=true;return false;}
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
             if(trace) {
                 char message[384]{};
@@ -402,9 +459,11 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         bool created=false;auto* p=f.params;
         p->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount,frame_count);
         p->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex,frame_index);
+        // A later index owns a separate parameter object, so populate the
+        // complete binding even when it borrows an existing temporal handle.
+        p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);p->Set("Width",tw);p->Set("Height",th);
+        p->Set("DLSSG.BackbufferFormat",unsigned(desc.Format));p->Set("DLSSG.InternalWidth",gw);p->Set("DLSSG.InternalHeight",gh);p->Set("DLSSG.DynamicResolution",1u);
         if(!f.handle) {
-            p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);p->Set("Width",tw);p->Set("Height",th);
-            p->Set("DLSSG.BackbufferFormat",unsigned(desc.Format));p->Set("DLSSG.InternalWidth",gw);p->Set("DLSSG.InternalHeight",gh);p->Set("DLSSG.DynamicResolution",1u);
             const auto result=create(commands,NVSDK_NGX_Feature_FrameGeneration,p,&f.handle);report("NGX FG CreateFeature",result);
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
             if(trace) {
@@ -486,7 +545,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(center_pass)phase_timing.ngx_stamp(commands,eye,1);
         if(ngx_burst.active){
             const unsigned pass=center_pass?0u:1u;
-            const auto& inputs=focus.inputs[eye][pass];
+            const auto& inputs=phase_focus.inputs[eye][pass];
             ngx_burst.record(device.Get(),commands,inputs.color.Get(),D3D12_RESOURCE_STATE_COMMON,"input_color",eye,pass);
             ngx_burst.record(device.Get(),commands,inputs.depth.Get(),D3D12_RESOURCE_STATE_COMMON,"input_depth",eye,pass);
             ngx_burst.record(device.Get(),commands,inputs.motion.Get(),D3D12_RESOURCE_STATE_COMMON,"input_motion",eye,pass);
@@ -500,7 +559,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             D3D12_RESOURCE_BARRIER uav{};uav.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;uav.UAV.pResource=f.target;commands->ResourceBarrier(1,&uav);
             barrier(commands,f.target,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);(*copies)[f.eye].state=D3D12_RESOURCE_STATE_COMMON;
             uav.UAV.pResource=f.disable.Get();commands->ResourceBarrier(1,&uav);
-            if(!f.output&&!texture(device.Get(),focus.inputs[f.eye][center_pass?0:1].color.Get(),f.width,f.height,
+            if(!f.output&&!texture(device.Get(),phase_focus.inputs[f.eye][center_pass?0:1].color.Get(),f.width,f.height,
                     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,f.output)){failed=true;return false;}
             f.direct=false;f.target=f.output.Get();f.params->Set("DLSSG.OutputInterpolated",f.target);
             f.params->Set("DLSSG.OutputInterpolatedSubrectBaseY",0u);f.params->Set("DLSSG.OutputInterpolatedSubrectBaseX",0u);
@@ -560,7 +619,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                     ++focused;
                 }
                 center_rects[eye]=rect;foveated[eye]=rect.active;peripheral_method=g.peripheral_method;
-                const auto& last=features[eye];
+                const auto& last=phase_features[eye];
                 // An evaluation that skipped NGX cannot provide a previous crop.
                 // A non-overlapping jump has no useful temporal pixels to reuse.
                 const bool compatible=last.evaluated_crop_valid&&last.evaluated_crop.active==rect.active&&
@@ -581,16 +640,16 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 peripheral_width=rect.active?scaled(width,g.peripheral_percent):0;
                 peripheral_height=rect.active?scaled(height,g.peripheral_percent):0;
                 auto* detail=phase_timing.record_preparation?&phase_timing:nullptr;
-                if(!focus.prepare_inputs(device.Get(),commands,eye,0,colors[eye],g,rect,center_width,center_height,input_color_state,detail,motion_crop_dx[eye],motion_crop_dy[eye])) {
+                if(!phase_focus.prepare_inputs(device.Get(),commands,eye,0,colors[eye],g,rect,center_width,center_height,input_color_state,detail,motion_crop_dx[eye],motion_crop_dy[eye])) {
                     report("FG center guide conversion",unsigned(E_FAIL));failed=true;good=false;break;
                 }
-                if(rect.active&&!focus.prepare_inputs(device.Get(),commands,eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,input_color_state,detail)) {
+                if(rect.active&&!phase_focus.prepare_inputs(device.Get(),commands,eye,1,colors[eye],g,full_rect,peripheral_width,peripheral_height,input_color_state,detail)) {
                     report("FG periphery guide conversion",unsigned(E_FAIL));failed=true;good=false;break;
                 }
                 if(!rect.active)for(unsigned part=0;part<4;++part)phase_timing.preparation_stamp(commands,eye,1,part);
                 // Feature creation can record GPU commands. With the preparation
                 // gate, configure both feature instances before either evaluates.
-                if(prepare_first&&g.center_method==0&&!configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)) {
+                if(prepare_first&&g.center_method==0&&!configure_pass(phase_features[eye],phase_focus.inputs[eye][0],camera,g,rect,eye)) {
                     good=false;break;
                 }
                 phase_timing.stamp(commands,query+1);
@@ -601,15 +660,15 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(cheeky_fg_optical(g.center_method)&&!consume_optical(eye,0)){good=false;break;}
                 phase_timing.stamp(commands,query+2);
                 if(g.center_method) {
-                    const auto& last=features[eye];
-                    focus.center_history[eye]=focus.center_history[eye]&&!g.reset&&last.evaluated_crop_valid&&
+                    const auto& last=phase_features[eye];
+                    phase_focus.center_history[eye]=phase_focus.center_history[eye]&&!g.reset&&last.evaluated_crop_valid&&
                         last.evaluated_crop.x==rect.x&&last.evaluated_crop.y==rect.y&&last.evaluated_crop.w==rect.w&&last.evaluated_crop.h==rect.h;
-                    good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
+                    good=phase_focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                         nullptr,D3D12_RESOURCE_STATE_COMMON,nullptr,nullptr,&rect);
                     for(unsigned mark=0;mark<4;++mark)phase_timing.ngx_stamp(commands,eye,mark);
                 } else {
-                    good=prepare_first?dispatch_pass(features[eye],eye,true):
-                        (configure_pass(features[eye],focus.inputs[eye][0],camera,g,rect,eye)&&dispatch_pass(features[eye],eye,true));
+                    good=prepare_first?dispatch_pass(phase_features[eye],eye,true):
+                        (configure_pass(phase_features[eye],phase_focus.inputs[eye][0],camera,g,rect,eye)&&dispatch_pass(phase_features[eye],eye,true));
                 }
                 phase_timing.stamp(commands,query+3);
                 if(!good)break;
@@ -617,54 +676,54 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             if(prepare_first&&phase==1)continue;
             if(rect.active&&cheeky_fg_optical(g.peripheral_method)&&!consume_optical(eye,1)){good=false;break;}
             phase_timing.stamp(commands,query+4);
-            auto* center=g.center_method?focus.center_output[eye].Get():features[eye].target;
+            auto* center=g.center_method?phase_focus.center_output[eye].Get():phase_features[eye].target;
             if(motion_crop_dx[eye]!=0.f||motion_crop_dy[eye]!=0.f){
                 // For a static full-eye point P and crop origins A -> B, NGX
                 // interpolates (P-A)/size -> (P-B)/size. Its output at t belongs
                 // at lerp(A,B,t). Sampling at uv+(1-t)*(B-A)/size re-expresses that
                 // image in B without changing the real scene's interpolation.
-                if(!focus.recenter_frame(device.Get(),commands,eye,center,(1-fraction)*motion_crop_dx[eye],(1-fraction)*motion_crop_dy[eye])){
+                if(!phase_focus.recenter_frame(device.Get(),commands,eye,center,(1-fraction)*motion_crop_dx[eye],(1-fraction)*motion_crop_dy[eye])){
                     report("FG moving-crop output recenter",unsigned(E_FAIL));failed=true;good=false;break;
                 }
-                center=focus.inputs[eye][0].recentered_color.Get();
+                center=phase_focus.inputs[eye][0].recentered_color.Get();
             }
             auto* base=center;
             bool custom_context_direct=false;
             const bool final_xr=direct&&(*copies)[eye].final_xr;
             if(final_xr){
-                FocusPipeline::FinalOutput final{center,rect,width,height,features[eye].direct,
-                    focus.color_format==DXGI_FORMAT_R8G8B8A8_UNORM&&srgb_color(format)};
-                good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
+                FocusPipeline::FinalOutput final{center,rect,width,height,phase_features[eye].direct,
+                    phase_focus.color_format==DXGI_FORMAT_R8G8B8A8_UNORM&&srgb_color(format)};
+                good=phase_focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                     (*copies)[eye].texture,(*copies)[eye].state,nullptr,&final);
                 (*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;outputs[eye]=(*copies)[eye].texture;
             }else if(rect.active) {
                 if(g.peripheral_method==3) {
-                    good=evaluate_pass(peripheral_features[eye],focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
-                    base=peripheral_features[eye].target;
+                    good=evaluate_pass(phase_peripheral_features[eye],phase_focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
+                    base=phase_peripheral_features[eye].target;
                 }else {
                     custom_context_direct=direct&&direct_periphery&&(*copies)[eye].layout.packed()&&!cheeky_fg_optical(g.peripheral_method);
                     auto* target=custom_context_direct?(*copies)[eye].texture:nullptr;
-                    good=focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
+                    good=phase_focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                         target,custom_context_direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON,
                         custom_context_direct?&(*copies)[eye].layout:nullptr);
-                    base=custom_context_direct?target:focus.peripheral_output[eye].Get();
+                    base=custom_context_direct?target:phase_focus.peripheral_output[eye].Get();
                     if(good&&custom_context_direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
                 }
             }
             if(final_xr){}else if(good&&copies&&(*copies)[eye].layout.packed()) {
-                const bool center_direct=features[eye].direct;
-                const bool context_direct=custom_context_direct||(g.peripheral_method==3&&peripheral_features[eye].direct);
-                good=focus.pack_frame(device.Get(),commands,eye,center,base,(*copies)[eye].texture,(*copies)[eye].state,
+                const bool center_direct=phase_features[eye].direct;
+                const bool context_direct=custom_context_direct||(g.peripheral_method==3&&phase_peripheral_features[eye].direct);
+                good=phase_focus.pack_frame(device.Get(),commands,eye,center,base,(*copies)[eye].texture,(*copies)[eye].state,
                     (*copies)[eye].layout,center_direct,context_direct);
                 outputs[eye]=(*copies)[eye].texture;(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
             }else if(good&&(rect.active||center_output_width[eye]!=width||center_output_height[eye]!=height)) {
-                good=focus.compose_frame(device.Get(),commands,eye,center,base,rect,width,height,
+                good=phase_focus.compose_frame(device.Get(),commands,eye,center,base,rect,width,height,
                     direct?(*copies)[eye].texture:nullptr,direct?(*copies)[eye].state:D3D12_RESOURCE_STATE_COMMON);
-                outputs[eye]=direct?(*copies)[eye].texture:focus.full[eye].Get();
+                outputs[eye]=direct?(*copies)[eye].texture:phase_focus.full[eye].Get();
                 if(direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_GENERIC_READ;
             } else outputs[eye]=base;
-            if(good&&last_output&&rect.active&&g.peripheral_method==2)good=focus.save_depth(device.Get(),commands,eye);
-            if(good&&last_output&&g.center_method==2)good=focus.save_depth(device.Get(),commands,eye,0);
+            if(good&&last_output&&rect.active&&g.peripheral_method==2)good=phase_focus.save_depth(device.Get(),commands,eye);
+            if(good&&last_output&&g.center_method==2)good=phase_focus.save_depth(device.Get(),commands,eye,0);
             if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
             phase_timing.stamp(commands,query+5);
         }
@@ -673,7 +732,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             // Record B before submitting either list to avoid a CPU-created
             // gap between preparation and inference.
             if(FAILED(commands->Close())) {good=false;break;}
-            commands=second_list.Get();cut_to_second_list=true;
+            commands=phase_second_list.Get();cut_to_second_list=true;
         }
     }
     if(good&&direct)for(auto& copy:*copies){
@@ -688,6 +747,20 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     if(good&&copies&&!direct&&!record_output_copies(commands,outputs,*copies)) {
         report("FG immutable output copy",unsigned(E_INVALIDARG));failed=true;good=false;
     }
+    if(good&&early_output&&cheeky_fg_needs_ngx(guides)){
+        std::array<ID3D12Resource*,4> disabled{};
+        for(unsigned eye=0;eye<2;++eye){
+            if(guides.eyes[eye].center_method==0)disabled[eye*2]=phase_features[eye].disable.Get();
+            if(foveated[eye]&&guides.eyes[eye].peripheral_method==3)disabled[eye*2+1]=phase_peripheral_features[eye].disable.Get();
+        }
+        // Either eye/pass suppresses the entire stereo result. Both outputs
+        // then contain native color instead of exposing invalid interpolation.
+        for(unsigned eye=0;eye<2&&good;++eye)if(!ngx_fallback.record(device.Get(),commands,frame_index-1,eye,
+            colors[eye],input_color_state,color_layouts[eye],(*copies)[eye].texture,(*copies)[eye].layout,disabled,
+            (*copies)[eye].final_xr?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_GENERIC_READ,phase_focus.color_format)){
+            report("FG queued DLSS native fallback",unsigned(E_FAIL));failed=true;good=false;
+        }
+    }
     if(good){phase_timing.stamp(commands,15);phase_timing.resolve(commands);if(!batched||last_output)latency.end(commands);
         if(last_output)batch_timings.end(commands);}
     // A split optical prefix is already submitted. Its retirement guard keeps
@@ -699,14 +772,14 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         // A failure before the cut leaves list B recording. Close it too
         // before reusing its allocator on the next frame. Neither list has
         // been submitted, so nothing may still reference captured inputs.
-        if(two_lists && !cut_to_second_list && second_list)second_list->Close();
+        if(two_lists && !cut_to_second_list && phase_second_list)phase_second_list->Close();
         return false;
     }
     if(two_lists && cut_to_second_list) {
         // Two actual ExecuteCommandLists calls on the SAME HIGH-priority queue,
         // strictly ordered, no CPU fence wait and no inter-list GPU signal.
-        ID3D12CommandList* first[]{list.Get()};
-        ID3D12CommandList* second[]{second_list.Get()};
+        ID3D12CommandList* first[]{phase_list.Get()};
+        ID3D12CommandList* second[]{phase_second_list.Get()};
         retire_failure.active=true;
         queue->ExecuteCommandLists(1,first);
         prepared_serial=++serial;
@@ -724,11 +797,15 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // recording EvaluateFeature (e.g. during final composition), in which case
     // the command list is discarded and these crops must not be published.
     for(unsigned eye=0;last_output&&eye<2;++eye){
-        auto& done=features[eye];
+        auto& done=this->features[eye];
         done.evaluated_crop=center_rects[eye];done.evaluated_crop_valid=true;
         done.evaluated_frame=guides.render_frame;
     }
     submitted_at=TimingClock::now();latency.submitted(fence.Get(),serial);
+    // The output, all final transitions, GPU suppression fallback and stereo
+    // completion fence are now queued. The presenter can enqueue its GPU wait
+    // while this worker still retires NGX resources/history on the CPU.
+    if(early_output)on_output_submitted(output_context);
     // Notify only after commands AND their completion fence are queued. The
     // presenter may release the next native render without waiting for FG to
     // finish, but must not let it overtake a still-unsubmitted FG job.
@@ -752,6 +829,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // Non-batched NGX calls also retain independent phase queries; only the
     // last call closes the native-pair span.
     if(last_output)batch_timings.collect(this->gpu_timings.frequency,phase_timings);
+    if(batch_ngx&&last_output&&continuing)for(unsigned eye=0;eye<2;++eye){
+        // Carry only completed temporal state into the next native interval;
+        // phase-private preparation/output bindings stay with their allocators.
+        this->focus.previous_depth[eye]=phase_focus.previous_depth[eye];
+        this->focus.previous_center_depth[eye]=phase_focus.previous_center_depth[eye];
+    }
     // Existing timestamp data only: distinguish consistently expensive work
     // from occasional long elapsed intervals without changing the GPU schedule.
     if(trace&&phase_timing.valid&&(phase_timing.samples%120)==0) {
@@ -840,7 +923,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 static_cast<unsigned long long>(phase_timing.preparation_samples),phase_timing.sampled_preparation.mean(),
                 phase_timing.sampled_preparation.percentile(50),phase_timing.sampled_preparation.percentile(95),phase_timing.preparation_gaps.mean());trace(message);
             for(unsigned pass=0;pass<4;++pass) {
-                const auto& part=phase_timing.preparation_parts[pass];const auto& input=focus.inputs[pass/2][pass%2];
+                const auto& part=phase_timing.preparation_parts[pass];const auto& input=phase_focus.inputs[pass/2][pass%2];
                 const auto guide=input.motion?input.motion->GetDesc():D3D12_RESOURCE_DESC{};
                 sprintf_s(message,"FG preparation stage GPU ms: eye=%s pass=%s color=%ux%u guides=%llux%u; before/dispatch/after avg=%.3f/%.3f/%.3f last=%.3f/%.3f/%.3f p95=%.3f/%.3f/%.3f",
                     pass<2?"left":"right",pass%2?"periphery":"center",input.color?input.output_width:0,input.color?input.output_height:0,
@@ -851,15 +934,17 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     bool enabled=true;
     for(unsigned eye=0;eye<2;++eye){
-        if(last_output){focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
-            focus.center_history[eye]=guides.eyes[eye].center_method==2;}
-        for(auto* f:{&features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==3?&peripheral_features[eye]:nullptr}) {
+        if(last_output){this->focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
+            this->focus.center_history[eye]=guides.eyes[eye].center_method==2;}
+        for(auto* f:{&phase_features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==3?&phase_peripheral_features[eye]:nullptr}) {
             if(!f)continue;
             if(!f->handle)continue;void* data{};if(FAILED(f->readback->Map(0,nullptr,&data))||!data)return false;
             enabled&=*static_cast<const unsigned char*>(data)==0;const D3D12_RANGE written{0,0};f->readback->Unmap(0,&written);
         }
     }
     temporal_evaluation_completed=true;
-    return enabled;
+    // An early published suppressed phase already contains safe native color.
+    // Legacy callers retain the original CPU suppression/warm-up behavior.
+    return enabled||early_output;
 }
 }

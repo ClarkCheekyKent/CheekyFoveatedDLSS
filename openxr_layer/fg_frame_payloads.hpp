@@ -43,6 +43,11 @@ struct FrameCompletion12 final : FrameCompletion {
 
 // Native D3D11: per-eye snapshots from Backend11 (interpolation also samples
 // the previous interval's depth, so these outlive generation).
+// The shared immediate context orders generation and publication; this means
+// safe to enqueue the consumer, not that the GPU has completed the image.
+struct FrameCompletion11 final : FrameCompletion {
+    bool ready() const noexcept override {return true;}
+};
 struct FrameGuides11 final : FrameGuides {
     std::array<std::shared_ptr<Backend11::Guides>,2> eyes;
 };
@@ -53,7 +58,7 @@ struct BufferedDirectRequest {
     std::array<Image,2> previous;
     std::array<Worker::OutputCopy,2> targets;
     DXGI_FORMAT format{};unsigned width{},height{};
-    bool decided{},allowed{},complete{},success{};
+    bool decided{},allowed{},complete{},success{},queued{};
     unsigned deferred_ticks{};
     ComPtr<ID3D12Fence> fence;std::uint64_t serial{};
     BufferedPair result;

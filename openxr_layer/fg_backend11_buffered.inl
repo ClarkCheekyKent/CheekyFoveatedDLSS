@@ -174,10 +174,20 @@ struct BufferedBackend11 final : FrameBackend {
                 pair.generated_count=std::clamp(job->multiplier,2u,4u)-1;
                 success=true;
                 for(unsigned index=0;index<pair.generated_count&&success;++index){
+                    pair.generated_index=index;
                     auto& output=index?pair.extra_generated[index-1]:pair.generated;
                     success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,output,
                         owner.direct11_requested.load(),float(index+1)/float(pair.generated_count+1));
+                    if(success){
+                        pair.submitted_at=TimingClock::now();
+                        // announce_generated_phase reads pair.generated. Swap
+                        // only the private local record while publishing G2/G3.
+                        if(index)pair.generated.swap(pair.extra_generated[index-1]);
+                        owner.announce_generated_phase(previous,job,pair,std::make_shared<FrameCompletion11>());
+                        if(index)pair.generated.swap(pair.extra_generated[index-1]);
+                    }
                 }
+                pair.generated_index=0;
                 owner.inference_submitted(); // Releases the native credit gate, as the NGX worker callback does.
                 if(!success){attempted=false;
                     if(!cheeky_fg_uses_flow(now[0]->source.meta.center_method,now[0]->source.meta.peripheral_method,true))

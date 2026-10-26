@@ -72,8 +72,8 @@ inline bool BufferedPresenter::service_direct_output(double position,Pair& resul
         std::unique_lock lock(mx);
         good&=!stopping&&!raw&&!degraded&&epoch==request->epoch;
         request->allowed=good;request->decided=true;direct_request.reset();changed.notify_all();
-        // Even shutdown must let a granted GPU dispatch retire before releasing
-        // its XR images. The worker's scope guard completes every exit path.
+        // Wait for the worker to publish its final queued fence/result. The
+        // binding queue waits for GPU completion below, including on shutdown.
         if(good)changed.wait(lock,[&]{return request->complete;});
         if(good){direct_wait.add(elapsed_ms(start));direct_stats.wait_ms=direct_wait.mean();direct_stats.last_wait_ms=direct_wait.last;}
         else{++direct_stats.fallbacks;++direct_stats.unsupported;direct_stats.last_path=3;

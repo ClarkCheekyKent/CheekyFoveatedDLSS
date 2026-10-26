@@ -77,25 +77,29 @@ inline void BufferedPresenter::measure_worker_memory() {
     output.trim_unused(now);
     CheekyFgMemory value;fg_memory::Collector collect(device.Get());
     value.categories[fg_memory::generated]=output.memory(collect);
-    for(const auto& eye:worker.focus.inputs)for(const auto& input:eye){
-        collect.add(value.categories[fg_memory::prepared_color],input.color.Get());
-        collect.add(value.categories[fg_memory::prepared_color],input.recentered_color.Get());
-        collect.add(value.categories[fg_memory::prepared_motion],input.corrected_motion.Get());
-        // Prepared captures are owned/countable by the producer snapshot
-        // pool. These references are borrowed, not a second allocation.
-        if(!input.borrowed_guides){collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());
-            collect.add(value.categories[fg_memory::prepared_motion],input.motion.Get());}
+    for(const auto* pipeline:{&worker.focus,&worker.ngx_phases[0].focus,&worker.ngx_phases[1].focus}){
+        for(const auto& eye:pipeline->inputs)for(const auto& input:eye){
+            collect.add(value.categories[fg_memory::prepared_color],input.color.Get());
+            collect.add(value.categories[fg_memory::prepared_color],input.recentered_color.Get());
+            collect.add(value.categories[fg_memory::prepared_motion],input.corrected_motion.Get());
+            // Prepared captures are owned/countable by the producer snapshot
+            // pool. These references are borrowed, not a second allocation.
+            if(!input.borrowed_guides){collect.add(value.categories[fg_memory::prepared_depth],input.depth.Get());
+                collect.add(value.categories[fg_memory::prepared_motion],input.motion.Get());}
+        }
+        for(unsigned eye=0;eye<2;++eye){
+            collect.add(value.categories[fg_memory::periphery],pipeline->peripheral_output[eye].Get());
+            collect.add(value.categories[fg_memory::periphery],pipeline->previous_depth[eye].Get());
+            collect.add(value.categories[fg_memory::prepared_color],pipeline->center_output[eye].Get());
+            collect.add(value.categories[fg_memory::prepared_depth],pipeline->previous_center_depth[eye].Get());
+            collect.add(value.categories[fg_memory::composition],pipeline->full[eye].Get());
+        }
     }
-    for(const auto* features:{&worker.features,&worker.peripheral_features})for(const auto& f:*features){
+    for(const auto* features:{&worker.features,&worker.peripheral_features,
+        &worker.ngx_phases[0].features,&worker.ngx_phases[0].peripheral_features,
+        &worker.ngx_phases[1].features,&worker.ngx_phases[1].peripheral_features})for(const auto& f:*features){
         collect.add(value.categories[fg_memory::ngx_outputs],f.output.Get());
         collect.add(value.categories[fg_memory::ngx_outputs],f.disable.Get());
-    }
-    for(unsigned eye=0;eye<2;++eye){
-        collect.add(value.categories[fg_memory::periphery],worker.focus.peripheral_output[eye].Get());
-        collect.add(value.categories[fg_memory::periphery],worker.focus.previous_depth[eye].Get());
-        collect.add(value.categories[fg_memory::prepared_color],worker.focus.center_output[eye].Get());
-        collect.add(value.categories[fg_memory::prepared_depth],worker.focus.previous_center_depth[eye].Get());
-        collect.add(value.categories[fg_memory::composition],worker.focus.full[eye].Get());
     }
     std::lock_guard lock(mx);
     for(auto category:{fg_memory::generated,fg_memory::prepared_color,fg_memory::prepared_depth,
@@ -525,9 +529,6 @@ struct BufferedBackend12 final : FrameBackend {
             pair.generated_index=index;
             if(index)pair.generated.swap(pair.extra_generated[index-1]);
             const auto result=generate_one(previous,job,pair,reset_history,logged_samples,direct_job);
-            const auto* payload=guides12(*job);
-            if(result.success&&result.attempted&&!pair.direct_xr&&payload&&!cheeky_fg_needs_ngx(payload->pair)&&job->policy.release_point!=1u)
-                owner.announce_generated_phase(previous,job,pair,std::make_shared<FrameCompletion12>(owner.worker.fence.Get(),owner.worker.serial));
             if(index)pair.generated.swap(pair.extra_generated[index-1]);
             total.success&=result.success;total.attempted&=result.attempted;total.history_reset|=result.history_reset;
             if(!result.attempted)break;
@@ -592,7 +593,9 @@ struct BufferedBackend12 final : FrameBackend {
                     owner.generation_queue->Wait(job_guides->sync_fence.Get(),job_guides->sync_value) : S_OK;
                 if(FAILED(guides_ready)){owner.worker.failed=true;owner.worker.report("FG guide cross-queue GPU wait",unsigned(guides_ready));
                     throw std::runtime_error("FG guide cross-queue GPU wait failed");}
-                const bool continuing=pair.generated_index>0&&!cheeky_fg_needs_ngx(job_guides->pair)&&job->policy.release_point!=1u;
+                const bool queued_ngx=owner.gpu_waited_uploads()&&!pair.direct_xr&&Worker::can_batch_ngx(job_guides->pair);
+                const bool continuing=pair.generated_index>0&&
+                    (!cheeky_fg_needs_ngx(job_guides->pair)||queued_ngx);
                 // The first phase already submitted this capture dependency.
                 // Preserve its calibrated latency bracket across the batch.
                 const auto ready_result=continuing?S_OK:owner.worker.latency.enqueue_wait(owner.device.Get(),owner.generation_queue.Get(),owner.producer.fence.Get(),job->ready,job->latency_diagnostics);
@@ -674,18 +677,55 @@ struct BufferedBackend12 final : FrameBackend {
                 }
                 if(available&&camera_pair_valid) {
                     const bool last=pair.generated_index+1==pair.generated_count;
+                    bool announced=false;
+                    auto publish_state=[&] {
+                        pair.submitted_at=owner.worker.submitted_at;
+                        for(unsigned eye=0;eye<2;++eye){
+                            pair.generated[eye]->state=copies[eye].state;
+                            pair.generated[eye]->presentation_format=srgb_color(d.Format)&&publication.Format==DXGI_FORMAT_R8G8B8A8_UNORM?
+                                DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:publication.Format;
+                        }
+                    };
+                    // Each generated phase hands over its immutable stereo output
+                    // before retirement. Eligible multi-frame intervals queue
+                    // every index before the final CPU completion wait.
+                    // A presenter without GPU waits still receives each fence
+                    // early and polls that phase, rather than the whole batch.
+                    const bool stream_output=pair.direct_xr||!cheeky_fg_needs_ngx(guides)||owner.gpu_waited_uploads();
+                    auto announce=[&]() noexcept {
+                        publish_state();
+                        if(pair.direct_xr){
+                            std::lock_guard lock(owner.mx);
+                            direct_job->fence=owner.worker.fence;direct_job->serial=owner.worker.serial;
+                            direct_job->queued=true;direct_job->success=!owner.stopping&&!owner.degraded&&job->epoch==owner.epoch;
+                            if(direct_job->success){
+                                auto published=pair;published.interpolated=true;
+                                published.native_id=previous->id;published.native=previous->color;
+                                published.native_color_ready=previous->color_ready;published.native_final_ready=previous->final_color_ready;
+                                published.native_captured=previous->captured_at;published.native_views=previous->views;
+                                published.generated_views=BufferedPresenter::midpoint(previous->views,job->views,published.fraction());
+                                direct_job->result=std::move(published);++owner.direct_stats.frames;
+                                if(owner.active_release_point==3u||owner.active_release_point==6u||owner.active_release_point==7u)
+                                    owner.awaiting_generated_submission=job->id;
+                            }
+                            for(const auto& f:owner.worker.features)if(f.direct)++owner.direct_stats.ngx_direct_eyes;else ++owner.direct_stats.ngx_scratch_eyes;
+                            owner.direct_stats.last_path=owner.worker.features[0].direct&&owner.worker.features[1].direct?1u:2u;
+                            direct_job->complete=true;owner.changed.notify_all();
+                        }else owner.announce_generated_phase(previous,job,pair,
+                            std::make_shared<FrameCompletion12>(owner.worker.fence.Get(),owner.worker.serial));
+                        announced=true;
+                    };
                     success=owner.worker.generate(guides,input,prior,cameras,result,&copies,last?+[](void* context) noexcept {
                         static_cast<BufferedPresenter*>(context)->inference_submitted();
                     }:nullptr,&owner,last?+[](void* context) noexcept {
                         static_cast<BufferedPresenter*>(context)->inference_prepared();
-                    }:nullptr,pair.generated_count,pair.generated_index+1);attempted=!owner.worker.failed&&owner.worker.temporal_evaluation_completed;
-                    pair.submitted_at=owner.worker.submitted_at;
-                    for(unsigned eye=0;eye<2;++eye) {
-                        pair.generated[eye]->state=copies[eye].state;
-                        pair.generated[eye]->presentation_format=srgb_color(d.Format)&&publication.Format==DXGI_FORMAT_R8G8B8A8_UNORM?
-                            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:publication.Format;
-                    }
-                    if(pair.direct_xr){std::lock_guard lock(owner.mx);
+                    }:nullptr,pair.generated_count,pair.generated_index+1,stream_output?+[](void* context) noexcept {
+                        (*static_cast<decltype(announce)*>(context))();
+                    }:nullptr,&announce);attempted=!owner.worker.failed&&owner.worker.temporal_evaluation_completed;
+                    // Once announced, images/fence/format are immutable to the
+                    // presenter; do not rewrite shared metadata after its wake.
+                    if(!announced)publish_state();
+                    if(pair.direct_xr&&!announced){std::lock_guard lock(owner.mx);
                         direct_job->fence=owner.worker.fence;direct_job->serial=owner.worker.serial;
                         for(const auto& f:owner.worker.features)if(f.direct)++owner.direct_stats.ngx_direct_eyes;else ++owner.direct_stats.ngx_scratch_eyes;
                         owner.direct_stats.last_path=owner.worker.features[0].direct&&owner.worker.features[1].direct?1u:2u;}

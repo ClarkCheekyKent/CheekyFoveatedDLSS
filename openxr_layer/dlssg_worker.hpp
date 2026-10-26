@@ -4,6 +4,7 @@
 #include "fg_focus.hpp"
 #include "fg_timing.hpp"
 #include "fg_latency.hpp"
+#include "fg_ngx_fallback.hpp"
 #include <Windows.h>
 #include <d3d12.h>
 #include "../third_party/ngx-sdk/include/nvsdk_ngx.h"
@@ -20,7 +21,7 @@ struct Worker {
         Matrix view_to_clip,clip_to_camera,clip_to_prev,prev_clip_to_clip,lens;
         FocusRect evaluated_crop{}; // Coordinates of the most recent submitted NGX evaluation.
         std::uint64_t evaluated_frame{};
-        bool evaluated_crop_valid{};
+        bool evaluated_crop_valid{},borrowed_handle{};
     };
     struct OutputCopy {ID3D12Resource* texture{};D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};CompactLayout layout;bool final_xr{};};
     using Init=decltype(&NVSDK_NGX_D3D12_Init_with_ProjectID);
@@ -35,9 +36,12 @@ struct Worker {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12CommandAllocator> allocator,second_allocator,optical_allocator;
     ComPtr<ID3D12GraphicsCommandList> list,second_list,optical_list;
-    // Lists for the 2nd/3rd generated frame of a batched (non-NGX) interval.
+    // Lists for the 2nd/3rd generated frame of a queued interval.
     std::array<ComPtr<ID3D12CommandAllocator>,2> batch_allocators;
     std::array<ComPtr<ID3D12GraphicsCommandList>,2> batch_lists;
+    // Preparation-gated phases each retain their own second command list too.
+    std::array<ComPtr<ID3D12CommandAllocator>,2> batch_second_allocators;
+    std::array<ComPtr<ID3D12GraphicsCommandList>,2> batch_second_lists;
     // A first phase may split at each of four independent optical consumers.
     // Every allocator remains leased until the native-pair completion fence.
     std::array<ComPtr<ID3D12CommandAllocator>,4> optical_consumer_allocators;
@@ -46,6 +50,14 @@ struct Worker {
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;
+    struct NgxPhase {
+        // Each index uses the SAME temporal NGX handles, with private parameter
+        // storage, matrices, preparation descriptors, outputs and disable flags.
+        std::array<Feature,2> features{},peripheral_features{};
+        FocusPipeline focus;
+    };
+    std::array<NgxPhase,2> ngx_phases;
+    NgxFallback ngx_fallback;
     std::array<CompactLayout,2> color_layouts,previous_layouts;
     D3D12_RESOURCE_STATES input_color_state{D3D12_RESOURCE_STATE_COMMON};
     bool temporal_evaluation_completed{}; // Last generate() finished processing both eyes, even if output was suppressed.
@@ -85,6 +97,7 @@ struct Worker {
     bool initialize(ID3D12Device*,ID3D12CommandQueue*,unsigned,unsigned,DXGI_FORMAT,bool require_ngx=true) noexcept;
     static bool record_output_copies(ID3D12GraphicsCommandList*,const std::array<ID3D12Resource*,2>&,
                                     const std::array<OutputCopy,2>&) noexcept;
+    static bool can_batch_ngx(const CheekyFgPair&) noexcept;
     // One indexed output of a real-frame interval. Histories advance on its last output.
     bool generate(const CheekyFgPair&,const std::array<ID3D12Resource*,2>& color,
                   const std::array<ID3D12Resource*,2>& previous,
@@ -93,6 +106,7 @@ struct Worker {
                   std::array<OutputCopy,2>* copies=nullptr,
                   void(*on_submitted)(void*) noexcept=nullptr,void* submitted_context=nullptr,
                   void(*on_prepared)(void*) noexcept=nullptr,
-                  unsigned frame_count=1,unsigned frame_index=1) noexcept;
+                  unsigned frame_count=1,unsigned frame_index=1,
+                  void(*on_output_submitted)(void*) noexcept=nullptr,void* output_context=nullptr) noexcept;
 };
 }

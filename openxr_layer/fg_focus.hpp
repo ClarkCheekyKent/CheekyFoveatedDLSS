@@ -19,6 +19,12 @@ struct FocusInput {
 };
 struct FocusPipeline {
     optical::Session12 optical[2][2];
+    // Later NGX phases borrow the first phase's native-pair flow fields.
+    // The owning worker retains these sessions through the final batch fence.
+    optical::Session12* borrowed_optical[2][2]{};
+    optical::Session12& optical_session(unsigned eye,unsigned pass) noexcept {
+        return borrowed_optical[eye][pass]?*borrowed_optical[eye][pass]:optical[eye][pass];
+    }
     OpticalConstants optical_constants[2][2];
     float interpolation_fraction{.5f};
     struct FinalOutput {ID3D12Resource* center{};FocusRect region;unsigned width{},height{};bool center_direct{},linear_sdr{};};

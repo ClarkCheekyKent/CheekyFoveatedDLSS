@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <thread>
 #include <variant>
 #include <unordered_set>
 
@@ -69,6 +71,7 @@ inline Microsoft::WRL::ComPtr<ID3D12Resource> flag_upload;
 inline unsigned calls{},fail_at{},created{};
 inline std::vector<unsigned> reset_flags;
 inline std::vector<std::pair<unsigned,unsigned>> frame_indices;
+inline bool suppress_second_only{};
 NVSDK_NGX_Result NVSDK_CONV allocate(NVSDK_NGX_Parameter** out){*out=new Parameters;return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV destroy(NVSDK_NGX_Parameter* p){delete static_cast<Parameters*>(p);return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature,NVSDK_NGX_Parameter*,NVSDK_NGX_Handle** out){
@@ -83,7 +86,7 @@ NVSDK_NGX_Result NVSDK_CONV evaluate(ID3D12GraphicsCommandList* list,const NVSDK
     if(++calls==fail_at)return NVSDK_NGX_Result_FAIL_InvalidParameter;
     ID3D12Resource* disable{};check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.OutputDisableInterpolation",&disable))&&disable,"Fixture receives disable-output buffer");
     cheeky::fg::color_transition(list,disable,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(disable,0,flag_upload.Get(),0,4);
+    list->CopyBufferRegion(disable,0,flag_upload.Get(),suppress_second_only&&(calls%2)?4:0,4);
     cheeky::fg::color_transition(list,disable,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     return NVSDK_NGX_Result_Success;
 }
@@ -93,7 +96,7 @@ NVSDK_NGX_Result NVSDK_CONV evaluate(ID3D12GraphicsCommandList* list,const NVSDK
 // the NGX backend is replaced, so failed and suppressed evaluations are deterministic.
 void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     using namespace cheeky::fg;using namespace fg_completion_fixture;using Microsoft::WRL::ComPtr;
-    calls=fail_at=created=0;reset_flags.clear();
+    calls=fail_at=created=0;suppress_second_only=false;reset_flags.clear();
     Worker worker;worker.probe_attempted=true;worker.capability_ready=true;worker.probed_device=device;
     check(worker.initialize(device,queue,64,64,DXGI_FORMAT_R8G8B8A8_UNORM),"Initialize completion fixture without NVIDIA inference");
     worker.allocate=allocate;worker.destroy=destroy;worker.create=create;worker.release=release;worker.evaluate=evaluate;
@@ -104,7 +107,7 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     };
     flag_upload=buffer(D3D12_HEAP_TYPE_UPLOAD,8);
     auto flag=[&](unsigned value){void* data{};check(SUCCEEDED(flag_upload->Map(0,nullptr,&data)),"Map completion flag");
-        std::memcpy(data,&value,4);flag_upload->Unmap(0,nullptr);};flag(1);
+        std::memset(data,0,8);std::memcpy(data,&value,4);flag_upload->Unmap(0,nullptr);};flag(1);
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
     check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))&&
         SUCCEEDED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))),"Completion fixture initialization commands");
@@ -173,6 +176,132 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
                 "Crop history advances once per real frame after the last output");
         }
     }
+    // Hold the real worker queue on a CPU-controlled fence. A DLSS phase must
+    // hand over its immutable stereo outputs before the GPU can execute them.
+    // Suppress only one eye: the queued GPU fallback must protect BOTH eyes.
+    {
+        std::array<Worker::OutputCopy,2> copies;
+        std::array<ComPtr<ID3D12Resource>,2> publication;
+        auto desc=color->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+        for(unsigned eye=0;eye<2;++eye){
+            check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,
+                IID_PPV_ARGS(&publication[eye]))),"Early NGX publication texture");
+            copies[eye].texture=publication[eye].Get();copies[eye].layout.width=copies[eye].layout.height=64;
+        }
+        ComPtr<ID3D12CommandQueue> consumer;D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+        check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&consumer))),"Early NGX consumer queue");
+        ComPtr<ID3D12Fence> gate,consumed;
+        check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)))&&
+            SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&consumed))),"Early NGX handoff fences");
+        flag(1);suppress_second_only=true;
+        check(SUCCEEDED(queue->Wait(gate.Get(),1)),"Block NGX GPU work until early handoff");
+        HANDLE handed_over=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        check(handed_over!=nullptr,"Early handoff watchdog event");std::atomic<bool> handoff_timed_out{};
+        std::jthread handoff_watchdog([&]{if(WaitForSingleObject(handed_over,5000)!=WAIT_OBJECT_0){
+            handoff_timed_out=true;gate->Signal(1);}});
+        unsigned handoffs{};
+        auto handoff=[&]() noexcept {
+            ++handoffs;
+            check(worker.fence->GetCompletedValue()<worker.serial&&worker.submitted_at!=TimingClock::time_point{},
+                "DLSS stereo handoff occurs after submission but before GPU completion");
+            for(const auto& copy:copies)check(copy.state==D3D12_RESOURCE_STATE_GENERIC_READ,"Handoff publishes final resource states");
+            check(SUCCEEDED(consumer->Wait(worker.fence.Get(),worker.serial))&&SUCCEEDED(consumer->Signal(consumed.Get(),1)),
+                "Consumer queues a GPU dependency without CPU completion");
+            check(consumed->GetCompletedValue()==0,"Consumer cannot overtake the incomplete stereo output");
+            SetEvent(handed_over);
+            check(SUCCEEDED(gate->Signal(1)),"Release the fixture GPU after checking the handoff");
+        };
+        ++guides.render_frame;
+        check(worker.generate(guides,colors,colors,cameras,output,&copies,nullptr,nullptr,nullptr,1,1,
+            +[](void* context) noexcept {(*static_cast<decltype(handoff)*>(context))();},&handoff)&&handoffs==1,
+            "Queued DLSS phase succeeds with a GPU native fallback for suppressed interpolation");
+        handoff_watchdog.join();CloseHandle(handed_over);
+        check(!handoff_timed_out,"DLSS publication did not wait for GPU completion");
+        worker.wait_idle();suppress_second_only=false;flag(0);
+        event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        check(event&&SUCCEEDED(consumed->SetEventOnCompletion(1,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0,
+            "Consumer retires only after the stereo ready fence");CloseHandle(event);
+        check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Queued fallback readback commands");
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 bytes{};
+        device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&bytes);
+        std::array<ComPtr<ID3D12Resource>,2> readbacks;
+        for(unsigned eye=0;eye<2;++eye){
+            readbacks[eye]=buffer(D3D12_HEAP_TYPE_READBACK,bytes);
+            color_transition(list.Get(),publication[eye].Get(),D3D12_RESOURCE_STATE_GENERIC_READ,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=publication[eye].Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=readbacks[eye].Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
+            list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        }
+        check(SUCCEEDED(list->Close()),"Close queued fallback readback");ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
+        check(SUCCEEDED(queue->Signal(consumed.Get(),2)),"Queued fallback readback fence");
+        event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        check(event&&SUCCEEDED(consumed->SetEventOnCompletion(2,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0,
+            "Retire queued fallback readback");CloseHandle(event);
+        for(const auto& readback:readbacks){void* data{};check(SUCCEEDED(readback->Map(0,nullptr,&data)),"Map native fallback pixels");
+            const auto* pixel=static_cast<const unsigned char*>(data)+footprint.Offset+32*footprint.Footprint.RowPitch+32*4;
+            check(pixel[0]==255&&pixel[1]==0&&pixel[2]==0,"One suppressed eye selects actual native pixels for both eyes");
+            readback->Unmap(0,nullptr);
+        }
+    }
+    // Keep the GPU blocked until the LAST index has been queued. Any CPU
+    // completion wait between indices would deadlock before that callback.
+    for(unsigned method:{0u,1u,2u})for(unsigned release:{0u,1u})for(unsigned count:{2u,3u}){
+        for(auto& g:guides.eyes)g.center_method=method;
+        guides.release_point=release;
+        std::array<std::array<ComPtr<ID3D12Resource>,2>,3> images;
+        std::array<std::array<Worker::OutputCopy,2>,3> copies;
+        auto desc=color->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+        for(unsigned phase=0;phase<count;++phase)for(unsigned eye=0;eye<2;++eye){
+            check(SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,
+                IID_PPV_ARGS(&images[phase][eye]))),"Queued multi-frame publication texture");
+            copies[phase][eye].texture=images[phase][eye].Get();copies[phase][eye].layout.width=copies[phase][eye].layout.height=64;
+        }
+        ComPtr<ID3D12Fence> gate;
+        check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&gate)))&&SUCCEEDED(queue->Wait(gate.Get(),1)),
+            "Block multi-frame GPU work until all indices are submitted");
+        HANDLE all_queued=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+        check(all_queued!=nullptr,"Queued NGX watchdog event");std::atomic<bool> queue_timed_out{};
+        std::jthread queue_watchdog([&]{if(WaitForSingleObject(all_queued,5000)!=WAIT_OBJECT_0){
+            queue_timed_out=true;gate->Signal(1);}});
+        const auto created_before=created;
+        const auto submitted_before=worker.serial;
+        const auto handles=std::array{worker.features[0].handle,worker.features[1].handle};
+        unsigned handoffs{};frame_indices.clear();++guides.render_frame;
+        const auto previous_frame=worker.features[0].evaluated_frame;
+        for(unsigned index=1;index<=count;++index){
+            auto handoff=[&]() noexcept {
+                ++handoffs;
+                check(worker.fence->GetCompletedValue()<=submitted_before&&worker.serial==submitted_before+index*(release?2u:1u),
+                    "Every generated phase queues its stereo fence while earlier GPU work is still blocked");
+                if(index==count){SetEvent(all_queued);check(SUCCEEDED(gate->Signal(1)),"Release GPU only after the last indexed submission");}
+            };
+            check(worker.generate(guides,colors,colors,cameras,output,&copies[index-1],nullptr,nullptr,nullptr,count,index,
+                +[](void* context) noexcept {(*static_cast<decltype(handoff)*>(context))();},&handoff),
+                "Queue consecutive indices without an intervening GPU-to-CPU completion wait");
+            check(worker.features[0].evaluated_frame==(index==count?guides.render_frame:previous_frame),
+                "Queued NGX advances temporal crop history once at the final index");
+            if(index<count)check(worker.fence->GetCompletedValue()<=submitted_before,
+                "An early index returns to the CPU while the GPU remains blocked");
+        }
+        queue_watchdog.join();CloseHandle(all_queued);
+        check(!queue_timed_out,"Every index queues without waiting for earlier GPU execution");
+        check(handoffs==count&&created==created_before&&frame_indices.size()==(method?0u:2*count),
+            "Every phase publishes once without creating additional temporal handles");
+        if(!method)for(unsigned phase=0;phase<count;++phase)for(unsigned eye=0;eye<2;++eye){
+            check(frame_indices[phase*2+eye]==std::pair{count,phase+1},"Queued NGX preserves multi-frame index ordering");
+            if(phase){const auto& binding=worker.ngx_phases[phase-1].features[eye];
+                check(binding.borrowed_handle&&binding.handle==handles[eye]&&binding.params!=worker.features[eye].params&&
+                    binding.disable.Get()!=worker.features[eye].disable.Get()&&
+                    worker.ngx_phases[phase-1].focus.inputs[eye][0].color.Get()!=worker.focus.inputs[eye][0].color.Get(),
+                    "Queued indices share temporal history with independent parameters, suppression and prepared inputs");
+            }
+        }
+        check(worker.batch_timings.snapshot().generated_count==count&&worker.batch_timings.snapshot().valid,
+            "Final indexed fence retires all phase timing queries");
+    }
+    guides.release_point=0;
     worker.reset();check(!worker.temporal_evaluation_completed,"Worker reset clears completion state");flag_upload.Reset();
     worker.probe_attempted=true;worker.capability_ready=false;worker.failed=true;
     check(worker.initialize(device,queue,64,64,DXGI_FORMAT_R8G8B8A8_UNORM,false),"Shader-only D3D12 FG bypasses unavailable NGX capability");
