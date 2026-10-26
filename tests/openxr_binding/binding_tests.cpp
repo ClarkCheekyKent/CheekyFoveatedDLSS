@@ -353,6 +353,54 @@ void presenter_menu_layer_test() {
     presenter_end_frame_with_menu(session, &end);
     check(presenter_menu_layers == 0, "presenter submitted a destroyed menu swapchain");
 }
+
+unsigned menu_poll_acquires{}, menu_poll_waits{}, menu_poll_releases{};
+bool menu_poll_ready{};
+void menu_nonblocking_test() {
+    menu_poll_acquires=menu_poll_waits=menu_poll_releases=0;menu_poll_ready=false;
+    SessionState state;state.session=h<XrSession>(8800);state.max_layers=16;
+    state.menu.swapchain=h<XrSwapchain>(8801);
+    state.cached_menu.swapchain=h<XrSwapchain>(8802);
+    state.cached_menu.width=800;state.cached_menu.height=600;state.cached_menu.size={1,1};
+    Dispatch dispatch;
+    dispatch.acquire_swapchain_image=[](XrSwapchain sc,const XrSwapchainImageAcquireInfo*,std::uint32_t* index)->XrResult {
+        check(sc==h<XrSwapchain>(8801),"An update must not acquire the displayed menu's swapchain");
+        ++menu_poll_acquires;*index=2;return XR_SUCCESS;
+    };
+    dispatch.wait_swapchain_image=[](XrSwapchain,const XrSwapchainImageWaitInfo* info)->XrResult {
+        check(info->timeout==0,"Menu image availability must be polled without blocking");
+        ++menu_poll_waits;return menu_poll_ready?XR_SUCCESS:XR_TIMEOUT_EXPIRED;
+    };
+    dispatch.release_swapchain_image=[](XrSwapchain,const XrSwapchainImageReleaseInfo*)->XrResult {
+        check(menu_poll_ready,"An image whose wait timed out must not be released");
+        ++menu_poll_releases;return XR_SUCCESS;
+    };
+    check(poll_menu_image(state.menu,dispatch)==XR_TIMEOUT_EXPIRED&&state.menu.acquired&&!state.menu.waited,
+        "A timeout retains the acquired update image");
+    check(release_menu_image(state.menu,dispatch)==XR_ERROR_CALL_ORDER_INVALID&&!menu_poll_releases,
+        "No image release is forwarded before a successful wait");
+    check(poll_menu_image(state.menu,dispatch)==XR_TIMEOUT_EXPIRED&&menu_poll_acquires==1&&menu_poll_waits==2,
+        "Repeated timeouts poll the same acquisition instead of acquiring again");
+    XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};bool forwarded{};
+    submit_menu_layers(&end,state,false,state.cached_menu,[&](const XrFrameEndInfo* frame){
+        check(frame->layerCount==1,"A pending update must retain the previous menu layer");
+        const auto* quad=reinterpret_cast<const XrCompositionLayerQuad*>(frame->layers[0]);
+        check(quad->subImage.swapchain==state.cached_menu.swapchain,"Only the released cached menu is submitted");
+        forwarded=true;return XR_SUCCESS;
+    });
+    check(forwarded,"Game frame proceeds while menu availability is pending");
+    menu_poll_ready=true;
+    check(poll_menu_image(state.menu,dispatch)==XR_SUCCESS&&state.menu.waited&&menu_poll_acquires==1,
+        "An available image completes the existing pending acquisition");
+    check(poll_menu_image(state.menu,dispatch)==XR_SUCCESS&&menu_poll_waits==3,
+        "A waited image retained for a busy renderer must not be waited twice");
+    check(release_menu_image(state.menu,dispatch)==XR_SUCCESS&&!state.menu.acquired&&!state.menu.waited&&menu_poll_releases==1,
+        "Successful release resets the pending update state");
+    check(poll_menu_image(state.menu,dispatch)==XR_SUCCESS&&menu_poll_acquires==2,
+        "A fresh acquisition is allowed only after the previous release");
+    release_menu_image(state.menu,dispatch);
+    std::cout<<"PASS non-blocking menu polling, cached publication and acquire/wait/release ordering\n";
+}
 void custom_binding_menu_test() {
     reset();
     auto& inst = instances.at(instance);
@@ -1111,7 +1159,9 @@ void diagnostic_lifetime_test() {
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
+        if(argc>1&&std::string(argv[1])=="--menu-nonblocking") {menu_nonblocking_test();presenter_menu_layer_test();menu_policy_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-shared-submission") {fg_shared_queue_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-latest-interval") {fg_latest_interval_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-profile") {fg_optical_profile();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto") {fg_auto_validation();return 0;}

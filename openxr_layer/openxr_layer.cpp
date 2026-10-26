@@ -194,6 +194,8 @@ struct SessionState {
     bool diagnostic_menu_visible{};
     struct Menu {
         XrSwapchain swapchain{XR_NULL_HANDLE};
+        std::uint32_t acquired_index{};
+        bool acquired{},waited{};
         std::vector<XrSwapchainImageD3D11KHR> images11;
         std::vector<XrSwapchainImageD3D12KHR> images12;
         Microsoft::WRL::ComPtr<ID3D11DeviceContext> convert_context11;
@@ -222,7 +224,7 @@ struct SessionState {
         unsigned strips{1};
         XrPosef pose{};
         XrExtent2Df size{};
-    } menu;
+    } menu, cached_menu; // Updates never acquire the currently published chain.
     struct LocatedProjection {
         XrTime time{};
         XrSpace space{XR_NULL_HANDLE};
@@ -890,7 +892,8 @@ bool initialize_menu(SessionState& session, const Dispatch& dispatch,
         }
     } else { destroy_menu(menu, dispatch); return false; }
 
-    return anchor_menu(session, dispatch, frame, time);
+    report_menu_diagnostic("OpenXR menu: non-blocking refresh; previous released menu retained while update is pending");
+    return menu.anchored || anchor_menu(session, dispatch, frame, time);
 }
 
 // User SteamVR bindings can omit actions added by a layer. Read the host's
@@ -1058,6 +1061,104 @@ void send_menu_pointer(SessionState& session, const Dispatch& dispatch,
 // (the runtime, the FG presenter or the quad compositor). Without a presenter
 // the menu layer follows the app's layers here; a presenter instead takes the
 // published layer into each runtime frame it submits.
+// A timeout leaves the image acquired. Poll that same image on the next menu
+// update; never acquire another one or release an image whose wait timed out.
+XrResult poll_menu_image(SessionState::Menu& menu, const Dispatch& dispatch) {
+    if (!dispatch.acquire_swapchain_image || !dispatch.wait_swapchain_image || !dispatch.release_swapchain_image)
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!menu.acquired) {
+        const XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        const auto result = dispatch.acquire_swapchain_image(menu.swapchain, &acquire, &menu.acquired_index);
+        if (XR_FAILED(result)) return result;
+        menu.acquired = true; menu.waited = false;
+    }
+    if (!menu.waited) {
+        const XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, 0};
+        const auto result = dispatch.wait_swapchain_image(menu.swapchain, &wait);
+        if (result != XR_SUCCESS && result != XR_SESSION_LOSS_PENDING) return result;
+        menu.waited = true;
+    }
+    return XR_SUCCESS;
+}
+
+XrResult release_menu_image(SessionState::Menu& menu, const Dispatch& dispatch) {
+    if (!menu.acquired || !menu.waited) return XR_ERROR_CALL_ORDER_INVALID;
+    const XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    const auto result = dispatch.release_swapchain_image(menu.swapchain, &release);
+    if (XR_SUCCEEDED(result)) menu.acquired = menu.waited = false;
+    return result;
+}
+
+template <class EndFrame>
+XrResult submit_menu_layers(const XrFrameEndInfo* info, SessionState& state,
+    const bool presenter, const SessionState::Menu& menu, EndFrame&& end) {
+    const auto count = menu.cylinder ? 1u : menu.strips;
+    if (!menu.swapchain || !count || info->layerCount + count > state.max_layers) return end(info);
+    std::vector<const XrCompositionLayerBaseHeader*> layers;
+    if (info->layerCount && info->layers) layers.assign(info->layers, info->layers + info->layerCount);
+    XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
+    std::vector<XrCompositionLayerQuad> strips(menu.cylinder ? 0U : menu.strips);
+    if (menu.cylinder) {
+        cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        cylinder.space = state.calibration_local_space;
+        cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        cylinder.subImage.swapchain = menu.swapchain;
+        cylinder.subImage.imageRect.extent = {static_cast<std::int32_t>(menu.width), static_cast<std::int32_t>(menu.height)};
+        cylinder.pose = menu.pose;
+        const auto offset = rotate_menu_vector(menu.pose.orientation, {0, 0, cheeky::xr_menu::radius});
+        cylinder.pose.position.x += offset.x;
+        cylinder.pose.position.z += offset.z;
+        cylinder.radius = cheeky::xr_menu::radius;
+        cylinder.centralAngle = menu.size.width / cylinder.radius;
+        cylinder.aspectRatio = menu.size.width / menu.size.height;
+        layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinder));
+    } else {
+        // Runtimes without cylinders receive a single flat full-image panel.
+        // Geometry and pointer hit-testing both use the same one-strip policy.
+        for (unsigned i{}; i < menu.strips; ++i) {
+            const auto geometry = cheeky::xr_menu::strip(menu.size.width, menu.width, i, menu.strips);
+            auto& quad = strips[i];
+            quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quad.space = state.calibration_local_space;
+            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage.swapchain = menu.swapchain;
+            quad.subImage.imageRect.offset.x = static_cast<std::int32_t>(geometry.left);
+            quad.subImage.imageRect.extent = {static_cast<std::int32_t>(geometry.right - geometry.left), static_cast<std::int32_t>(menu.height)};
+            quad.pose = menu.pose;
+            const auto offset = rotate_menu_vector(menu.pose.orientation, geometry.center);
+            quad.pose.position.x += offset.x;
+            quad.pose.position.z += offset.z;
+            const float sn = std::sin(-geometry.angle * .5F), cs = std::cos(-geometry.angle * .5F);
+            quad.pose.orientation.y = menu.pose.orientation.y * cs + menu.pose.orientation.w * sn;
+            quad.pose.orientation.w = menu.pose.orientation.w * cs - menu.pose.orientation.y * sn;
+            quad.size = {geometry.width, menu.size.height};
+            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
+        }
+    }
+    if (presenter) {
+        {
+            std::lock_guard lock(published_menu_mutex);
+            auto& published = published_menus[state.session];
+            published.swapchain = menu.swapchain;
+            published.max_layers = state.max_layers;
+            published.cylinder = menu.cylinder;
+            published.cylinder_layer = cylinder;
+            published.strips = strips;
+        }
+        const auto result = end(info);
+        report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
+        return result;
+    }
+    unpublish_menu(state.session);
+    auto forwarded = *info;
+    forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
+    forwarded.layers = layers.data();
+    const auto result = end(&forwarded);
+    report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
+    return result;
+}
+
 template <class EndFrame>
 XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
     SessionState& state, const bool presenter, EndFrame&& end) {
@@ -1066,14 +1167,22 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         (state.view_configuration != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO && !state.quad_capture) ||
         (state.graphics_api != 11 && state.graphics_api != 12))
         return end(info);
+    const auto keep_previous = [&] {
+        return state.cached_menu.swapchain ? submit_menu_layers(info, state, presenter, state.cached_menu, end) : end(info);
+    };
     const auto host = GetModuleHandleW(L"CheekyFoveatedDLSSHost.dll");
     const auto acquire = host ? reinterpret_cast<CheekyOpenXRMenuAcquire>(
         GetProcAddress(host, "CheekyOpenXRMenuAcquireFrame")) : nullptr;
     if (!acquire) return end(info);
+    const auto try_acquire = reinterpret_cast<CheekyOpenXRMenuTryAcquire>(
+        GetProcAddress(host, "CheekyOpenXRMenuTryAcquireFrame"));
     CheekyOpenXRMenuFrame frame{};
-    if (!acquire(&frame)) {
+    const auto acquired = try_acquire ? try_acquire(&frame) : acquire(&frame) ? S_OK : S_FALSE;
+    if (acquired == E_PENDING) return keep_previous();
+    if (acquired != S_OK) {
         { std::lock_guard lock(state_mutex); state.diagnostic_menu_visible = false; }
         state.menu.anchored = false; // Reopening places the panel in front of the current head pose.
+        state.cached_menu.anchored = false;
         state.menu_pointer_hand = -1;
         state.menu_submission_disabled = false;
         unpublish_menu(state.session);
@@ -1159,30 +1268,21 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
         report_menu_diagnostic(menu.cylinder ? "OpenXR menu policy: native cylinder, sampled texture" :
             "OpenXR menu policy: single full-image quad, sampled texture");
     send_menu_pointer(state, dispatch, info->displayTime, frame);
-    std::uint32_t index{};
-    const XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (!dispatch.acquire_swapchain_image || !dispatch.wait_swapchain_image || !dispatch.release_swapchain_image ||
-        XR_FAILED(dispatch.acquire_swapchain_image(menu.swapchain, &acquire_info, &index))) {
+    const auto available = poll_menu_image(menu, dispatch);
+    if (available == XR_TIMEOUT_EXPIRED) { release_source(); return keep_previous(); }
+    if (available != XR_SUCCESS) {
         report_menu_status(cheeky_xr_menu_image_failed);
-        release_source(); return end(info);
+        release_source(); return keep_previous();
     }
-    const XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, nullptr, XR_INFINITE_DURATION};
-    if (XR_FAILED(dispatch.wait_swapchain_image(menu.swapchain, &wait_info))) {
-        report_menu_status(cheeky_xr_menu_image_failed);
-        const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
-        release_source(); return end(info);
-    }
+    const auto index = menu.acquired_index;
     // Runtime availability does not imply our previous queue submission has
     // completed yet. A busy allocator is backpressure, not a permanent copy
     // failure: never poison the headset menu until it is reopened for this.
     if (state.graphics_api == 12 && index < menu.fence_values.size() && menu.fence &&
         menu.fence->GetCompletedValue() != UINT64_MAX &&
         menu.fence->GetCompletedValue() < menu.fence_values[index]) {
-        const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        static_cast<void>(dispatch.release_swapchain_image(menu.swapchain, &release_info));
         release_source();
-        return end(info);
+        return keep_previous();
     }
     bool copied{};
     const char* copy_failure_stage = "image, allocator or fence not ready";
@@ -1266,88 +1366,38 @@ XrResult submit_menu_frame(const XrFrameEndInfo* info, const Dispatch& dispatch,
             list->ResourceBarrier(1, &barrier);
             copy_failure_stage = "command list close failed";
             if (SUCCEEDED(list->Close())) {
-                const auto value = ++menu.fence_value;
+                const auto value = menu.fence_value + 1;
                 const auto submit = reinterpret_cast<CheekyOpenXRMenuSubmit12>(
                     GetProcAddress(host, "CheekyOpenXRMenuSubmit12"));
+                const auto try_submit = reinterpret_cast<CheekyOpenXRMenuTrySubmit12>(
+                    GetProcAddress(host, "CheekyOpenXRMenuTrySubmit12"));
                 copy_failure_stage = submit ? "queue submission failed" : "host submission entry unavailable";
-                copied = submit && submit(frame.queue, state.graphics_queue, list, menu.fence.Get(), value);
-                if (copied) menu.fence_values[index] = value;
+                if (try_submit) {
+                    const auto result = try_submit(frame.queue, state.graphics_queue, list, menu.fence.Get(), value);
+                    if (result == E_PENDING || result == S_FALSE) { release_source(); return keep_previous(); }
+                    copied = result == S_OK;
+                } else copied = submit && submit(frame.queue, state.graphics_queue, list, menu.fence.Get(), value);
+                if (copied) menu.fence_values[index] = menu.fence_value = value;
             }
         }
     }
     release_source();
-    const XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    if (XR_FAILED(dispatch.release_swapchain_image(menu.swapchain, &release_info)) || !copied) {
+    const auto released = release_menu_image(menu, dispatch);
+    if (XR_FAILED(released) || !copied) {
         if (!copied && state.graphics_api == 12) {
             report_menu_diagnostic(copy_failure_stage);
             state.menu_submission_disabled = true;
         }
         report_menu_status(copied ? cheeky_xr_menu_image_failed : cheeky_xr_menu_copy_failed);
-        return end(info);
+        return keep_previous();
     }
-    std::vector<const XrCompositionLayerBaseHeader*> layers;
-    if (info->layerCount && info->layers) layers.assign(info->layers, info->layers + info->layerCount);
-    XrCompositionLayerCylinderKHR cylinder{XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR};
-    std::vector<XrCompositionLayerQuad> strips(menu.cylinder ? 0U : menu.strips);
-    if (menu.cylinder) {
-        cylinder.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-        cylinder.space = state.calibration_local_space;
-        cylinder.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-        cylinder.subImage.swapchain = menu.swapchain;
-        cylinder.subImage.imageRect.extent = {static_cast<std::int32_t>(menu.width), static_cast<std::int32_t>(menu.height)};
-        cylinder.pose = menu.pose;
-        const auto offset = rotate_menu_vector(menu.pose.orientation, {0, 0, cheeky::xr_menu::radius});
-        cylinder.pose.position.x += offset.x;
-        cylinder.pose.position.z += offset.z;
-        cylinder.radius = cheeky::xr_menu::radius;
-        cylinder.centralAngle = menu.size.width / cylinder.radius;
-        cylinder.aspectRatio = menu.size.width / menu.size.height;
-        layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinder));
-    } else {
-        // Runtimes without cylinders receive a single flat full-image panel.
-        // Geometry and pointer hit-testing both use the same one-strip policy.
-        for (unsigned i{}; i < menu.strips; ++i) {
-            const auto geometry = cheeky::xr_menu::strip(menu.size.width, menu.width, i, menu.strips);
-            auto& quad = strips[i];
-            quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
-            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            quad.space = state.calibration_local_space;
-            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage.swapchain = menu.swapchain;
-            quad.subImage.imageRect.offset.x = static_cast<std::int32_t>(geometry.left);
-            quad.subImage.imageRect.extent = {static_cast<std::int32_t>(geometry.right - geometry.left), static_cast<std::int32_t>(menu.height)};
-            quad.pose = menu.pose;
-            const auto offset = rotate_menu_vector(menu.pose.orientation, geometry.center);
-            quad.pose.position.x += offset.x;
-            quad.pose.position.z += offset.z;
-            const float sn = std::sin(-geometry.angle * .5F), cs = std::cos(-geometry.angle * .5F);
-            quad.pose.orientation.y = menu.pose.orientation.y * cs + menu.pose.orientation.w * sn;
-            quad.pose.orientation.w = menu.pose.orientation.w * cs - menu.pose.orientation.y * sn;
-            quad.size = {geometry.width, menu.size.height};
-            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad));
-        }
-    }
-    if (presenter) {
-        {
-            std::lock_guard lock(published_menu_mutex);
-            auto& published = published_menus[state.session];
-            published.swapchain = menu.swapchain;
-            published.max_layers = state.max_layers;
-            published.cylinder = menu.cylinder;
-            published.cylinder_layer = cylinder;
-            published.strips = strips;
-        }
-        const auto result = end(info);
-        report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
-        return result;
-    }
-    unpublish_menu(state.session);
-    auto forwarded = *info;
-    forwarded.layerCount = static_cast<std::uint32_t>(layers.size());
-    forwarded.layers = layers.data();
-    const auto result = end(&forwarded);
-    report_menu_status(XR_SUCCEEDED(result) ? cheeky_xr_menu_submitted : cheeky_xr_menu_end_frame_rejected);
-    return result;
+    // Preserve the released/displayed chain while the other one is acquired
+    // and polled next frame. Its descriptors and GPU contexts travel with it.
+    std::swap(state.menu, state.cached_menu);
+    state.menu.pose = state.cached_menu.pose;
+    state.menu.size = state.cached_menu.size;
+    state.menu.anchored = state.cached_menu.anchored;
+    return submit_menu_layers(info, state, presenter, state.cached_menu, end);
 }
 
 struct SnapshotSlot {
@@ -2446,6 +2496,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroyInstance(
         for (auto session_it = sessions.begin(); session_it != sessions.end();) {
             if (session_it->second.instance == instance) {
                 destroy_menu(session_it->second.menu, dispatch);
+                destroy_menu(session_it->second.cached_menu, dispatch);
                 session_it->second.calibration.destroy(cheeky::openxr_calibration::bridge());
                 if(session_it->second.fg)retired_presenters.push_back(std::move(session_it->second.fg));
                 session_it = sessions.erase(session_it);
@@ -2621,6 +2672,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrDestroySession(
         if (instance_it == instances.end()) return XR_ERROR_HANDLE_INVALID;
         dispatch = instance_it->second.dispatch;
         destroy_menu(session_it->second.menu, dispatch);
+        destroy_menu(session_it->second.cached_menu, dispatch);
         gaze_space = session_it->second.gaze_space;
         calibration_local_space = session_it->second.calibration_local_space;
         menu_aim_spaces = session_it->second.menu_aim_spaces;

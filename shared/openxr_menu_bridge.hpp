@@ -17,6 +17,8 @@ struct CheekyOpenXRMenuFrame {
 };
 
 using CheekyOpenXRMenuAcquire = bool(__cdecl*)(CheekyOpenXRMenuFrame*);
+// Additive non-blocking exports: 0 ready, 1 closed/no update, E_PENDING busy.
+using CheekyOpenXRMenuTryAcquire = std::int32_t(__cdecl*)(CheekyOpenXRMenuFrame*);
 // On success returns an AddRef'd D3D11 texture and a keyed mutex held at key 1.
 // The consumer releases key 0 after copying, then releases both COM references.
 using CheekyOpenXRMenuShared11 = std::int32_t(__cdecl*)(void*, void*, void**, void**);
@@ -24,6 +26,7 @@ using CheekyOpenXRMenuPointer = void(__cdecl*)(float, float, bool, bool);
 using CheekyOpenXRMenuCopy11 = bool(__cdecl*)(void*, void*);
 using CheekyOpenXRMenuExecute11 = bool(__cdecl*)(void*, void*);
 using CheekyOpenXRMenuSubmit12 = bool(__cdecl*)(void*, void*, void*, void*, std::uint64_t);
+using CheekyOpenXRMenuTrySubmit12 = std::int32_t(__cdecl*)(void*, void*, void*, void*, std::uint64_t);
 using CheekyOpenXRMenuReport = void(__cdecl*)(std::uint32_t);
 using CheekyOpenXRMenuDiagnosticFn = void(__cdecl*)(const char*);
 

@@ -1,5 +1,46 @@
 #pragma once
 
+void fg_latest_interval_validation() {
+    using namespace cheeky::fg;
+    struct Completion final : FrameCompletion {bool done{true};bool ready() const noexcept override{return done;}};
+    BufferedPresenter presenter;
+    for(std::uint64_t id:{1u,2u,3u}){
+        BufferedPair pair;pair.native_id=id;pair.current_id=id+1;pair.interpolated=true;pair.generated_count=2;
+        pair.progress=std::make_shared<BufferedPair::Progress>();
+        for(auto& phase:pair.progress->phases){
+            for(auto& image:phase.images)image=std::make_shared<TransportImage>();
+            phase.completion=std::make_shared<Completion>();
+        }
+        presenter.ready.push_back(std::move(pair));
+    }
+    for(unsigned release:{0u,1u,2u,4u,5u}){
+        presenter.active_release_point=release;
+        check(presenter.newest_ready_pair(0.)->current_id==4,
+            "Overlap release policies select the newest usable queued interval");
+    }
+    for(unsigned release:{3u,6u,7u}){
+        presenter.active_release_point=release;
+        check(presenter.newest_ready_pair(0.)->current_id==2,
+            "Presentation-gated policies retain their ordered interval submissions");
+    }
+    presenter.active_release_point=2;
+    auto& newest=presenter.ready.back();
+    auto completion=std::static_pointer_cast<Completion>(newest.progress->phases[0].completion);
+    completion->done=false;
+    check(presenter.newest_ready_pair(0.)->current_id==3,"An unusable newest interval does not hide an older usable one");
+    completion->done=true;auto eye=newest.progress->phases[0].images[1];newest.progress->phases[0].images[1].reset();
+    check(presenter.newest_ready_pair(0.)->current_id==3,"Latest selection still requires a complete stereo publication");
+    newest.progress->phases[0].images[1]=eye;
+    check(presenter.newest_ready_pair(2.5)->current_id==4&&presenter.newest_ready_pair(3.5)==presenter.ready.end(),
+        "Latest selection cannot rewind the displayed source timeline");
+    auto active=presenter.ready.front();active.generated_index=1;
+    auto active_completion=std::static_pointer_cast<Completion>(active.progress->phases[1].completion);active_completion->done=false;
+    check(!presenter.fresh_content(active,true,true,1.25),"A newer interval cannot interrupt an active generated-frame sequence");
+    active_completion->done=true;
+    check(presenter.fresh_content(active,true,true,1.25),"The active sequence resumes when its own next phase is usable");
+    std::cout<<"PASS latest-interval selection for overlap; presentation gates and active sequences preserved\n";
+}
+
 // Hold the software GPU before a simulated generation output. The production
 // presenter must queue its XR uploads and release the game before GPU readiness.
 void fg_shared_queue_validation() {

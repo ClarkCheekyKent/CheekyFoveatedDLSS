@@ -211,7 +211,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool native_frame_pending{}; // Hold mx; the pre-activation frame still owns runtime Begin/End.
     unsigned credits{},app_waiters{};
     std::uint64_t granted_credits{},consumed_credits{},capped_credits{}; // Pacing diagnostics: clock grants, game uses, grants lost at the 2-credit cap.
-    std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{};
+    std::uint64_t next_id{},waited{},begun{},ended{},ticks{},skipped{},epoch{},transition_until{},superseded_intervals{};
     std::uint64_t last_credit_tick{},completed_pair_id{},inflight_id{};
     // Late-frame trace. Per native frame, CPU (QPC) timestamps from the game
     // thread, the hand-over and the worker; printed only when the runtime
@@ -494,7 +494,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
         reset_gpu_metrics();extra_gpu={};batch_telemetry={};inflight_progress.reset();
         frame_ages={};age_samples={};
-        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=0;gate_held_since={};
+        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=superseded_intervals=0;gate_held_since={};
         capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
         gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
@@ -1113,13 +1113,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void wake_producer() {std::lock_guard lock(mx);wake_producer_locked();}
     std::deque<Pair>::iterator newest_ready_pair(double position) {
         auto selected=ready.end();
-        // The next pair in order, not the newest: a backlog is shown, not skipped,
-        // so every real frame keeps its generated frames.
+        // Presentation-gated policies retain every interval. Overlap policies
+        // choose the latest usable interval at a cycle boundary, so completed
+        // outputs cannot build a FIFO of increasingly old pictures.
+        const bool preserve_intervals=active_release_point==3u||active_release_point==6u||active_release_point==7u;
         for(auto it=ready.begin();it!=ready.end();++it){
             // A submitted phase covers its capture dependencies too. Shared
             // queue order permits upload before either fence finishes.
             const bool presentable=it->progress?phase_presentable(*it,0):capture_completed(it->ready);
-            if(presentable&&double(it->native_id)>=position){selected=it;break;}
+            if(presentable&&double(it->native_id)>=position){selected=it;if(preserve_intervals)break;}
         }
         return selected;
     }
@@ -1284,6 +1286,17 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 else if(!generated_phase&&!raw_frame&&!stop_now&&!degraded) {
                     auto selected=newest_ready_pair(last_position);
                     if(selected!=ready.end()) {
+                        const auto superseded=std::distance(ready.begin(),selected);
+                        if(superseded){
+                            superseded_intervals+=std::uint64_t(superseded);
+                            if(trace&&(superseded_intervals<=3||superseded_intervals%60==0)){char message[192]{};
+                                sprintf_s(message,"FG presenter: superseded %llu older queued intervals; selected native=%llu current=%llu total=%llu",
+                                    static_cast<unsigned long long>(superseded),static_cast<unsigned long long>(selected->native_id),
+                                    static_cast<unsigned long long>(selected->current_id),static_cast<unsigned long long>(superseded_intervals));trace(message);}
+                        }
+                        // Discard only presentation records. Generation history
+                        // and in-flight input/output/upload leases remain owned
+                        // by their workers and fence-protected transports.
                         active=std::move(*selected);ready.erase(ready.begin(),std::next(selected));have_active=true;
                         changed.notify_all(); // A queued interval no longer consumes production capacity.
                         fg_active=active.interpolated;

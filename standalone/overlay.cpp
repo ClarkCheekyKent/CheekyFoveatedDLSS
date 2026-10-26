@@ -141,7 +141,16 @@ struct State {
     std::mutex mutex;
     std::unique_ptr<Renderer> renderer;
     ULONGLONG xr_last_request{};
+    std::mutex xr_inputs_mutex; // Never held across rendering or GPU submission.
     MenuPointerQueue xr_inputs;
+    void clear_xr_inputs() { std::lock_guard lock(xr_inputs_mutex); xr_inputs = {}; }
+    void push_xr_input(MenuPointer event) { std::lock_guard lock(xr_inputs_mutex); xr_inputs.push(event); }
+    bool pop_xr_input(MenuPointer& event) {
+        std::lock_guard lock(xr_inputs_mutex);
+        if (!xr_inputs.count) return false;
+        event = xr_inputs.pop(); return true;
+    }
+    unsigned xr_input_count() { std::lock_guard lock(xr_inputs_mutex); return xr_inputs.count; }
 };
 State& state() { static auto* value = new State; return *value; }
 
@@ -703,7 +712,7 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         if (r.attachment != runtime.attachment) { r.attachment = runtime.attachment; r.next_snapshot = 0; }
         const int desktop_events_begin = ImGui::GetCurrentContext()->InputEventsQueue.Size;
         process_overlay_input(*r.input, r.vr_buttons | unsigned(r.xr_pointer_down));
-        if (!r.input->open) { release_headset_input(r); r.xr_pointer_down = false; r.xr_pointer_active = false; global.xr_inputs = {}; hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
+        if (!r.input->open) { release_headset_input(r); r.xr_pointer_down = false; r.xr_pointer_active = false; global.clear_xr_inputs(); hide_headset(r); ImGui::GetIO().ClearInputKeys(); ImGui::GetIO().ClearInputMouse(); return; }
         release_cursor(*r.input);
         ImGui::GetIO().MouseDrawCursor = true;
         if (r.dx12) ImGui_ImplDX12_NewFrame(); else ImGui_ImplDX11_NewFrame();
@@ -714,12 +723,12 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
         poll_headset_input(r, headset_ready, desktop_events_begin);
         if (!r.input->headset_pointer) {
             // Desktop-only menu input: drop OpenXR controller/hand pointer samples.
-            global.xr_inputs = {};
+            global.clear_xr_inputs();
             if (r.xr_pointer_down) ImGui::GetIO().AddMouseButtonEvent(0, false);
             r.xr_pointer_down = r.xr_pointer_active = false;
         }
-        if (global.xr_inputs.count) {
-            const auto pointer = global.xr_inputs.pop();
+        MenuPointer pointer;
+        if (global.pop_xr_input(pointer)) {
             const bool active = headset_ready && controller_pointer_owns(pointer.active,
                 r.xr_pointer_down, pointer.down && !r.xr_pointer_down,
                 GetTickCount64(), r.input->desktop_pointer_tick.load(), r.input->desktop_button_down.load());
@@ -754,7 +763,7 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
                 "Menu input v5: foreground=%d xr=%d down=%d mouse=%.0f,%.0f display=%.0f,%.0f hovered=%u active=%u queued=%u raw=%d",
                 foreground(r.input->window), r.xr_pointer_active, io.MouseDown[0], io.MousePos.x, io.MousePos.y,
                 io.DisplaySize.x, io.DisplaySize.y, ImGui::GetCurrentContext()->HoveredId,
-                ImGui::GetCurrentContext()->ActiveId, global.xr_inputs.count, r.input->raw_pointer_mode.load());
+                ImGui::GetCurrentContext()->ActiveId, global.xr_input_count(), r.input->raw_pointer_mode.load());
             report_openxr_menu_diagnostic(diagnostic);
         }
         if (r.dx12) render12(r); else render11(r);
@@ -766,11 +775,10 @@ void overlay_present(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue, const
     } catch (...) { set_status("Overlay exception contained; rendering skipped"); }
 }
 
-extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuAcquireFrame(
-    CheekyOpenXRMenuFrame* frame) noexcept {
+// Caller holds the renderer mutex. A busy try-acquire preserves the old menu.
+static bool openxr_menu_frame_locked(CheekyOpenXRMenuFrame* frame) noexcept {
     if (!frame || frame->size != sizeof(CheekyOpenXRMenuFrame)) return false;
     auto& global = cheeky::standalone::state();
-    std::lock_guard lock(global.mutex);
     global.xr_last_request = GetTickCount64();
     auto* r = global.renderer.get();
     if (!r || !r->input || !r->input->open || r->poisoned) return false;
@@ -789,6 +797,22 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuAcquireFrame(
     frame->queue = r->dx12 ? static_cast<void*>(r->queue.Get()) : nullptr;
     frame->texture = texture;
     return true;
+}
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuAcquireFrame(
+    CheekyOpenXRMenuFrame* frame) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    return openxr_menu_frame_locked(frame);
+}
+
+extern "C" __declspec(dllexport) std::int32_t __cdecl CheekyOpenXRMenuTryAcquireFrame(
+    CheekyOpenXRMenuFrame* frame) noexcept {
+    if (!frame || frame->size != sizeof(*frame)) return E_INVALIDARG;
+    auto& global = cheeky::standalone::state();
+    std::unique_lock lock(global.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return E_PENDING;
+    return openxr_menu_frame_locked(frame) ? S_OK : S_FALSE;
 }
 
 extern "C" __declspec(dllexport) std::int32_t __cdecl CheekyOpenXRMenuAcquireShared11(
@@ -840,11 +864,10 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuExecute11(
     return true;
 }
 
-extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuSubmit12(
+static bool submit_openxr_menu12_locked(
     void* host_queue, void* xr_queue, void* command_list, void* fence,
     std::uint64_t fence_value) noexcept {
     auto& global = cheeky::standalone::state();
-    std::lock_guard lock(global.mutex);
     auto* r = global.renderer.get();
     if (!r || !r->dx12 || r->queue.Get() != host_queue || !xr_queue || !command_list || !fence) return false;
     auto* destination_queue = static_cast<ID3D12CommandQueue*>(xr_queue);
@@ -871,11 +894,31 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuSubmit12(
     return true;
 }
 
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXRMenuSubmit12(
+    void* host_queue, void* xr_queue, void* command_list, void* fence, std::uint64_t fence_value) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::lock_guard lock(global.mutex);
+    return submit_openxr_menu12_locked(host_queue, xr_queue, command_list, fence, fence_value);
+}
+
+extern "C" __declspec(dllexport) std::int32_t __cdecl CheekyOpenXRMenuTrySubmit12(
+    void* host_queue, void* xr_queue, void* command_list, void* fence, std::uint64_t fence_value) noexcept {
+    auto& global = cheeky::standalone::state();
+    std::unique_lock lock(global.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return E_PENDING;
+    auto* r = global.renderer.get();
+    if (!r || !r->dx12 || !r->fence) return E_FAIL;
+    // The mutex keeps the source stable until the copy/return bridge is queued.
+    // Same-queue copies are already ordered. Skip an unfinished render on a
+    // different queue rather than introduce a new GPU wait for optional UI.
+    if (xr_queue != r->queue.Get() && r->fence->GetCompletedValue() < r->fence_value) return S_FALSE;
+    return submit_openxr_menu12_locked(host_queue, xr_queue, command_list, fence, fence_value) ? S_OK : E_FAIL;
+}
+
 extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuSetPointer(
     float x, float y, bool down, bool active) noexcept {
     auto& global = cheeky::standalone::state();
-    std::lock_guard lock(global.mutex);
-    global.xr_inputs.push({x, y, down, active});
+    global.push_xr_input({x, y, down, active});
 }
 
 extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuReportStatus(
