@@ -71,7 +71,7 @@ inline Microsoft::WRL::ComPtr<ID3D12Resource> flag_upload;
 inline unsigned calls{},fail_at{},created{};
 inline std::vector<unsigned> reset_flags;
 inline std::vector<std::pair<unsigned,unsigned>> frame_indices;
-inline bool suppress_second_only{};
+inline bool suppress_second_only{},write_first_index_only{};
 NVSDK_NGX_Result NVSDK_CONV allocate(NVSDK_NGX_Parameter** out){*out=new Parameters;return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV destroy(NVSDK_NGX_Parameter* p){delete static_cast<Parameters*>(p);return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature,NVSDK_NGX_Parameter*,NVSDK_NGX_Handle** out){
@@ -84,6 +84,8 @@ NVSDK_NGX_Result NVSDK_CONV evaluate(ID3D12GraphicsCommandList* list,const NVSDK
     frame_indices.emplace_back(count,index);
     unsigned reset{};check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.Reset",&reset)),"Fixture receives actual NGX reset policy");reset_flags.push_back(reset);
     if(++calls==fail_at)return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    // Real DLSS can leave the decision untouched after the first MFG index.
+    if(write_first_index_only&&index>1)return NVSDK_NGX_Result_Success;
     ID3D12Resource* disable{};check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.OutputDisableInterpolation",&disable))&&disable,"Fixture receives disable-output buffer");
     cheeky::fg::color_transition(list,disable,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(disable,0,flag_upload.Get(),suppress_second_only&&(calls%2)?4:0,4);
@@ -96,7 +98,7 @@ NVSDK_NGX_Result NVSDK_CONV evaluate(ID3D12GraphicsCommandList* list,const NVSDK
 // the NGX backend is replaced, so failed and suppressed evaluations are deterministic.
 void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     using namespace cheeky::fg;using namespace fg_completion_fixture;using Microsoft::WRL::ComPtr;
-    calls=fail_at=created=0;suppress_second_only=false;reset_flags.clear();
+    calls=fail_at=created=0;suppress_second_only=write_first_index_only=false;reset_flags.clear();
     Worker worker;worker.probe_attempted=true;worker.capability_ready=true;worker.probed_device=device;
     check(worker.initialize(device,queue,64,64,DXGI_FORMAT_R8G8B8A8_UNORM),"Initialize completion fixture without NVIDIA inference");
     worker.allocate=allocate;worker.destroy=destroy;worker.create=create;worker.release=release;worker.evaluate=evaluate;
@@ -247,6 +249,7 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     // Keep the GPU blocked until the LAST index has been queued. Any CPU
     // completion wait between indices would deadlock before that callback.
     for(unsigned method:{0u,1u,2u})for(unsigned release:{0u,1u})for(unsigned count:{2u,3u}){
+        write_first_index_only=method==0;
         for(auto& g:guides.eyes)g.center_method=method;
         guides.release_point=release;
         std::array<std::array<ComPtr<ID3D12Resource>,2>,3> images;
@@ -293,14 +296,19 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
             check(frame_indices[phase*2+eye]==std::pair{count,phase+1},"Queued NGX preserves multi-frame index ordering");
             if(phase){const auto& binding=worker.ngx_phases[phase-1].features[eye];
                 check(binding.borrowed_handle&&binding.handle==handles[eye]&&binding.params!=worker.features[eye].params&&
-                    binding.disable.Get()!=worker.features[eye].disable.Get()&&
+                    binding.disable.Get()==worker.features[eye].disable.Get()&&
                     worker.ngx_phases[phase-1].focus.inputs[eye][0].color.Get()!=worker.focus.inputs[eye][0].color.Get(),
-                    "Queued indices share temporal history with independent parameters, suppression and prepared inputs");
+                    "Queued indices share native-pair history and suppression with independent parameters and prepared inputs");
             }
+            auto& binding=phase?worker.ngx_phases[phase-1].features[eye]:worker.features[eye];void* decision{};
+            check(SUCCEEDED(binding.readback->Map(0,nullptr,&decision)),"Read indexed suppression decision");
+            const auto suppressed=*static_cast<const unsigned char*>(decision);binding.readback->Unmap(0,nullptr);
+            check(suppressed==0,"Every generated index inherits the first index's fresh suppression decision");
         }
         check(worker.batch_timings.snapshot().generated_count==count&&worker.batch_timings.snapshot().valid,
             "Final indexed fence retires all phase timing queries");
     }
+    write_first_index_only=false;
     guides.release_point=0;
     worker.reset();check(!worker.temporal_evaluation_completed,"Worker reset clears completion state");flag_upload.Reset();
     worker.probe_attempted=true;worker.capability_ready=false;worker.failed=true;

@@ -235,7 +235,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         }}
     } retire_failure{*this};
     ngx_burst.trace=trace;
-    ngx_burst.start(guides.render_frame,guides.capture_token);
+    ngx_burst.start(guides.render_frame,guides.capture_token,frame_count,frame_index);
     if(configuration!=guides.eyes[0].configuration) {
         const bool previously_failed=failed;
         reset_features();configuration=guides.eyes[0].configuration;initialize_timings();completion_wait={};
@@ -259,6 +259,12 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(phase.params&&destroy)destroy(phase.params);phase={};
             }
             phase.handle=temporal.handle;phase.borrowed_handle=true;
+            // DLSS writes this native-pair decision at the first index. Later
+            // indices can leave it untouched (verified on the real runtime).
+            // Share the flag through the interval: a phase-private buffer can
+            // retain warm-up's 1 forever and incorrectly suppress G2/G3.
+            // All evaluations, fallback reads and transitions use one queue.
+            phase.disable=temporal.disable;
             phase.width=temporal.width;phase.height=temporal.height;
             phase.direct_rejected|=temporal.direct_rejected;phase.xr_direct_rejected|=temporal.xr_direct_rejected;
             phase.evaluated_crop=temporal.evaluated_crop;phase.evaluated_crop_valid=temporal.evaluated_crop_valid;
@@ -546,6 +552,10 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(ngx_burst.active){
             const unsigned pass=center_pass?0u:1u;
             const auto& inputs=phase_focus.inputs[eye][pass];
+            if(trace){unsigned reset{};f.params->Get("DLSSG.Reset",&reset);char message[480]{};
+                sprintf_s(message,"FG NGX CAPTURE binding: frame=%llu token=%llu phase=%u/%u eye=%u pass=%u reset=%u handle=%p params=%p color=%p depth=%p motion=%p output=%p",
+                    static_cast<unsigned long long>(guides.render_frame),static_cast<unsigned long long>(guides.capture_token),
+                    frame_index,frame_count,eye,pass,reset,f.handle,f.params,inputs.color.Get(),inputs.depth.Get(),inputs.motion.Get(),f.target);trace(message);}
             ngx_burst.record(device.Get(),commands,inputs.color.Get(),D3D12_RESOURCE_STATE_COMMON,"input_color",eye,pass);
             ngx_burst.record(device.Get(),commands,inputs.depth.Get(),D3D12_RESOURCE_STATE_COMMON,"input_depth",eye,pass);
             ngx_burst.record(device.Get(),commands,inputs.motion.Get(),D3D12_RESOURCE_STATE_COMMON,"input_motion",eye,pass);
@@ -577,6 +587,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->CopyBufferRegion(f.readback.Get(),0,f.disable.Get(),0,4);
         barrier(commands,f.disable.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+        if(ngx_burst.active)ngx_burst.record(device.Get(),commands,f.disable.Get(),D3D12_RESOURCE_STATE_COMMON,
+            "disable_interpolation",eye,center_pass?0u:1u);
         if(center_pass)phase_timing.ngx_stamp(commands,eye,3);
         return true;
     };
@@ -761,6 +773,10 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             report("FG queued DLSS native fallback",unsigned(E_FAIL));failed=true;good=false;
         }
     }
+    if(good&&ngx_burst.active&&copies)for(unsigned eye=0;eye<2;++eye)
+        ngx_burst.record(device.Get(),commands,(*copies)[eye].texture,
+            (*copies)[eye].final_xr?D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_GENERIC_READ,
+            "published_stereo",eye,0);
     if(good){phase_timing.stamp(commands,15);phase_timing.resolve(commands);if(!batched||last_output)latency.end(commands);
         if(last_output)batch_timings.end(commands);}
     // A split optical prefix is already submitted. Its retirement guard keeps

@@ -52,7 +52,8 @@ struct Worker {
     FocusPipeline focus;
     struct NgxPhase {
         // Each index uses the SAME temporal NGX handles, with private parameter
-        // storage, matrices, preparation descriptors, outputs and disable flags.
+        // storage, matrices, preparation descriptors and output images.
+        // The suppression flag belongs to the native pair and is shared.
         std::array<Feature,2> features{},peripheral_features{};
         FocusPipeline focus;
     };
