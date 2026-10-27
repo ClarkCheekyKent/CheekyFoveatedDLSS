@@ -237,6 +237,17 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     // generated frame lost in a pipeline reset); release it.
     TimingClock::time_point gate_held_since{};
     std::uint64_t gate_timeouts{};
+    // Hold mx. Native IDs increase across jobs; only work already present at
+    // a timeout is exempt. Keep its GPU fences and resource leases unchanged.
+    std::uint64_t release_gate_timeout_id{};
+    bool fg_release_required(std::uint64_t id,unsigned point) const noexcept {
+        return id>release_gate_timeout_id&&waits_for_fg(point);
+    }
+    void arm_generated_gate(std::uint64_t id) noexcept {
+        // A late publication must not restore a gate the watchdog cancelled.
+        if(id>release_gate_timeout_id&&(active_release_point==3u||active_release_point==6u||active_release_point==7u))
+            awaiting_generated_submission=id;
+    }
     void release_gate_watchdog(TimingClock::time_point now) {
         if(!release_gate_active()){gate_held_since={};return;}
         if(gate_held_since==TimingClock::time_point{}){gate_held_since=now;return;}
@@ -247,9 +258,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 std::chrono::duration<double,std::milli>(now-gate_held_since).count(),static_cast<unsigned long long>(awaiting_generated_submission),
                 static_cast<unsigned long long>(inflight_id),pending.size(),static_cast<unsigned long long>(submitted_native_id),static_cast<unsigned long long>(gate_timeouts));
             trace(message);}
+        release_gate_timeout_id=std::max({release_gate_timeout_id,inflight_id,awaiting_generated_submission});
+        for(const auto& job:pending)release_gate_timeout_id=std::max(release_gate_timeout_id,job->id);
         if(awaiting_generated_submission)finish_generated_gate(awaiting_generated_submission,false);
-        if(inflight_id){inflight_generated_gate_released=true;inflight_prepared=true;submitted_native_id=std::max(submitted_native_id,inflight_id);}
-        for(const auto& job:pending)submitted_native_id=std::max(submitted_native_id,job->id);
         release_delay_until={};release_deferred_credit();gate_held_since={};changed.notify_all();
     }
     double last_content_wait_ms{}; // Presenter's wait for the content it is about to submit.
@@ -502,7 +513,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
         reset_gpu_metrics();extra_gpu={};batch_telemetry={};inflight_progress.reset();
         frame_ages={};age_samples={};
-        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=superseded_intervals=0;gate_held_since={};
+        last_credit_tick=completed_pair_id=inflight_id=0;inflight_started={};stalled_natives=superseded_intervals=0;gate_held_since={};release_gate_timeout_id=0;
         capture_to_completion={};completion_to_native={};completion_to_generated={};
         generation_stages={};deferred_credits=released_deferred_credits=submitted_native_id=0;credit_deferred=false;
         gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;
@@ -684,7 +695,13 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // A pipelined xrWaitFrame may already have consumed a credit before
         // the previous end_frame enqueues its FG job. Gate begin_frame too.
         const auto gate_started=TimingClock::now();
-        changed.wait(lock,[&]{return stopping||!release_gate_active();});
+        while(!stopping){
+            const bool fg_gate=release_gate_active();
+            if(!fg_gate&&!capture_release_gate())break;
+            // Capture fence retirement has no CPU notification. FG gates do.
+            if(fg_gate)changed.wait(lock);
+            else changed.wait_for(lock,std::chrono::microseconds(500));
+        }
         begin_gate_wait.add(elapsed_ms(gate_started));game_begin_enter=gate_started;game_begin_exit=TimingClock::now();
         if(stopping)return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         ++begun;changed.notify_all();lock.unlock();capture_lock.lock();
@@ -836,7 +853,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             published.native_captured=previous->captured_at;published.native_views=previous->views;
             published.generated_views=midpoint(previous->views,job->views,published.fraction());
             ready.push_back(std::move(published));while(ready.size()>max_pending())ready.pop_front();
-            if(active_release_point==3u||active_release_point==6u||active_release_point==7u)awaiting_generated_submission=job->id;
+            arm_generated_gate(job->id);
             if(!fg_active)transition_until=ticks+8;
         }
         changed.notify_all();
@@ -953,7 +970,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(pair.progress){pair.progress->complete=true;pair.progress->failed|=!success||job->epoch!=epoch||degraded;
                     if(pair.progress->failed){std::erase_if(ready,[&](const auto& p){return p.progress==pair.progress;});finish_generated_gate(job->id,false);}}
                 if(success&&!pair.progress&&!(pair.direct_xr&&direct_job&&direct_job->queued)&&
-                    (active_release_point==3u||active_release_point==6u||active_release_point==7u)&&job->epoch==epoch&&!degraded)awaiting_generated_submission=job->id;
+                    job->epoch==epoch&&!degraded)arm_generated_gate(job->id);
                 inflight_id=0;inflight_release_point=0;inflight_prepared=false;
                 const auto status=backend->generation_status();
                 CheekyFgPerformance gpu_performance;backend->snapshot(gpu_performance,extra_gpu,experiment_state);
@@ -1071,27 +1088,29 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
     // Modes 5 and 8 have no FG dependency. Mode 8's capture fence is checked
-    // separately in wait_frame so FG worker notifications are not required.
+    // separately at WaitFrame/BeginFrame so FG notifications are not required.
     bool unsubmitted_native() const noexcept {
-        return (inflight_id>submitted_native_id&&waits_for_fg(inflight_release_point))||
-            (!pending.empty()&&pending.back()->id>submitted_native_id&&waits_for_fg(pending.back()->policy.release_point));
+        return (inflight_id>submitted_native_id&&fg_release_required(inflight_id,inflight_release_point))||
+            (!pending.empty()&&pending.back()->id>submitted_native_id&&fg_release_required(pending.back()->id,pending.back()->policy.release_point));
     }
     bool release_gate_active() const noexcept {
         // Hold mx. Inspect pending jobs as well as the worker's latched policy
         // so pre-existing credits cannot let a render race worker pickup.
         if(stopping||raw||degraded)return false;
-        if(awaiting_generated_submission)return true;
+        if(awaiting_generated_submission>release_gate_timeout_id)return true;
         if(release_delay_until!=TimingClock::time_point{}&&TimingClock::now()<release_delay_until)return true;
-        if(inflight_id&&waits_for_fg(inflight_release_point)&&(inflight_id>submitted_native_id||inflight_release_point==2u||
+        if(fg_release_required(inflight_id,inflight_release_point)&&(inflight_id>submitted_native_id||inflight_release_point==2u||
             (!inflight_generated_gate_released&&(inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
             (inflight_release_point==1u&&!inflight_prepared)))return true;
         return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
-            return job->guides_valid&&waits_for_fg(job->policy.release_point)&&(job->policy.release_point!=0||job->id>submitted_native_id);
+            return job->guides_valid&&fg_release_required(job->id,job->policy.release_point)&&(job->policy.release_point!=0||job->id>submitted_native_id);
         });
     }
     bool generated_submission_pending() const noexcept {
-        return awaiting_generated_submission||(inflight_id&&!inflight_generated_gate_released&&(inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
-            std::any_of(pending.begin(),pending.end(),[](const auto& job){return job->guides_valid&&(job->policy.release_point==3u||job->policy.release_point==6u||job->policy.release_point==7u);});
+        return awaiting_generated_submission>release_gate_timeout_id||(fg_release_required(inflight_id,inflight_release_point)&&!inflight_generated_gate_released&&
+            (inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
+            std::any_of(pending.begin(),pending.end(),[&](const auto& job){return job->guides_valid&&fg_release_required(job->id,job->policy.release_point)&&
+                (job->policy.release_point==3u||job->policy.release_point==6u||job->policy.release_point==7u);});
     }
     void mark_credit_deferred() noexcept {
         // Hold mx. Measure a blocked release condition; repeated notifications
@@ -1109,7 +1128,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     }
     void inference_submitted() noexcept {
         std::lock_guard lock(mx);submitted_native_id=std::max(submitted_native_id,inflight_id);
-        if(inflight_release_point==4u) {
+        if(inflight_release_point==4u&&inflight_id>release_gate_timeout_id) {
             release_delay_until=TimingClock::now()+std::chrono::milliseconds(4);
             changed.notify_all(); // Install the explicit soft-release deadline.
         }

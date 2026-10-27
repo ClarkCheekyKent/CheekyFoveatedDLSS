@@ -93,6 +93,10 @@ if ($LASTEXITCODE -ne 0) { throw "FG OpenXR image state and software GPU copy re
 if ($LASTEXITCODE -ne 0) { throw "Native D3D11 shader frame generation regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-auto
 if ($LASTEXITCODE -ne 0) { throw "Automatic frame-generation controller regressions failed." }
+foreach ($releaseCase in @('--fg-capture-release', '--fg-release-watchdog')) {
+    & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") $releaseCase
+    if ($LASTEXITCODE -ne 0) { throw "Frame-generation release gate regression failed: $releaseCase" }
+}
 & $testExecutable --calibration-search
 if ($LASTEXITCODE -ne 0) { throw "Calibration locator scale and ambiguity regressions failed." }
 & $testExecutable --libovr-policy

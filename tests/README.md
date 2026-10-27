@@ -42,6 +42,15 @@ These changes are not a confirmed fix for either ACC failure.
 worker with unavailable NGX capability and null NGX callbacks. This complements
 the existing DLSS-G failure/recovery fixtures; live headset testing remains needed.
 
+# FG release gates
+
+`CheekyOpenXRBindingTests --fg-capture-release` checks capture-fence gating at
+both WaitFrame and pipelined BeginFrame, including fence retirement without an
+FG callback and interruption on stop. `--fg-release-watchdog` checks the 500 ms
+deadline across all FG release policies, pending-worker pickup, late callbacks,
+preserved guide ownership and normal gating of subsequent frames. Both run
+without a headset; the capture checks use WARP.
+
 # FG camera and evaluation hardening
 
 `CheekyOpenXRBindingTests --fg-hardening` checks non-finite/singular camera

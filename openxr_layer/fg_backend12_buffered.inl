@@ -701,8 +701,7 @@ struct BufferedBackend12 final : FrameBackend {
                                 published.native_captured=previous->captured_at;published.native_views=previous->views;
                                 published.generated_views=BufferedPresenter::midpoint(previous->views,job->views,published.fraction());
                                 direct_job->result=std::move(published);++owner.direct_stats.frames;
-                                if(owner.active_release_point==3u||owner.active_release_point==6u||owner.active_release_point==7u)
-                                    owner.awaiting_generated_submission=job->id;
+                                owner.arm_generated_gate(job->id);
                             }
                             for(const auto& f:owner.worker.features)if(f.direct)++owner.direct_stats.ngx_direct_eyes;else ++owner.direct_stats.ngx_scratch_eyes;
                             owner.direct_stats.last_path=owner.worker.features[0].direct&&owner.worker.features[1].direct?1u:2u;
