@@ -228,7 +228,7 @@ inline Summary run(Gpu& gpu,const Config& c,unsigned mode,unsigned release,std::
     auto source=[&](unsigned eye){CheekyFgShaderSource11V1 s;s.eye=eye;s.session_generation=7;s.mapping_revision=3;s.generation=1;
         s.context=gpu.context.Get();s.depth=depth.Get();s.motion=motion.Get();auto& g=s.meta;g.feature=200+eye;
         g.width=g.height=g.depth_width=g.depth_height=g.motion_width=g.motion_height=size;g.configuration=55;
-        g.focus_width=g.focus_height=.5f;g.center_method=2;g.peripheral_method=0;g.resolution_percent=g.peripheral_percent=100;g.reset=0;return s;};
+        g.focus_width=g.focus_height=.5f;g.center_method=2;g.peripheral_method=cheeky_fg_previous;g.resolution_percent=g.peripheral_percent=100;g.reset=0;return s;};
 
     // Game GPU time per native frame, measured with timestamp queries that are
     // read back asynchronously so the game never waits for its own GPU work.

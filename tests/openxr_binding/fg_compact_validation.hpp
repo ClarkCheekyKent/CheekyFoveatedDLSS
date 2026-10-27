@@ -56,7 +56,7 @@ void fg_compact_validation(ID3D12Device* device) {
     auto generated=transport.image(gd,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);generated->layout=layout;
     // Use the atlas's two regions as independent read-only views through the
     // production preparation path, retaining native center density and context.
-    CheekyFgEye g;g.width=g.height=128;g.peripheral_method=0;
+    CheekyFgEye g;g.width=g.height=128;g.peripheral_method=cheeky_fg_previous;
     // Test publication packing from known, uniformly colored region textures.
     auto make_color=[&](unsigned size,const float* color){
         auto d=gd;d.Width=d.Height=size;auto image=transport.image(d,D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);

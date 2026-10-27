@@ -4167,6 +4167,16 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetBatchTimingsV1(CheekyF
     *out=CheekyFgBatchTimingsV1{};
     std::lock_guard lock(state_mutex);
     for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
+        std::lock_guard fg_lock(owner.fg->mx);const auto timing=owner.fg->batch_timing();
+        *out=static_cast<const CheekyFgBatchTimingsV1&>(timing);out->abi=1;out->size=sizeof(*out);
+        if(timing.optical_separated&&timing.generated_count){out->phase_ms[0]+=timing.optical_ms;out->phase_last_ms[0]+=timing.optical_last_ms;}
+        return true;}
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetBatchTimingsV2(CheekyFgBatchTimingsV2* out) noexcept {
+    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
+    *out=CheekyFgBatchTimingsV2{};std::lock_guard lock(state_mutex);
+    for(const auto& [handle,owner]:sessions){if(!owner.fg)continue;
         std::lock_guard fg_lock(owner.fg->mx);*out=owner.fg->batch_timing();return true;}
     return true;
 }

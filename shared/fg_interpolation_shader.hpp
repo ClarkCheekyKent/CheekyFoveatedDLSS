@@ -21,9 +21,41 @@ float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(ma
 bool inside(float2 p){return all(isfinite(p))&&all(p>=0)&&all(p<=1);}
 float2 guideUV(float2 uv){return GuideOffset.w>.5?(uv-Rect.xy)/Rect.zw:uv;}
 bool motionAt(float2 uv,out float2 mv){uv=guideUV(uv);uint w,h;Motion.GetDimensions(w,h);if(GuideOffset.w>.5&&!inside(uv)){mv=0;return false;}mv=Motion.Load(int3(min(uint2(saturate(uv)*float2(w,h)),uint2(w,h)-1),0));if(GuideOffset.w>.5)mv*=Rect.zw;return all(isfinite(mv))&&all(abs(mv)<=2);}
+float depthAt(Texture2D<float> image,float2 uv){
+ uint w,h;image.GetDimensions(w,h);return image.Load(int3(min(uint2(saturate(guideUV(uv))*float2(w,h)),uint2(w,h)-1),0));
+}
+// Game vectors provide one direction. Confidence is derived from trajectory
+// convergence and depth agreement, not fabricated optical matching costs.
+float trajectory(float2 uv,float2 seed,float2 pixels,out float2 cuv,out float2 puv){
+ cuv=seed;puv=uv;float2 mv=0;
+ [unroll]for(uint i=0;i<4;++i){if(!inside(cuv)||!motionAt(cuv,mv))return 0;cuv=uv-(1-Options.y)*mv;}
+ if(!inside(cuv)||!motionAt(cuv,mv))return 0;puv=cuv+mv;
+ if(!inside(puv)||(GuideOffset.w>.5&&!inside(guideUV(puv))))return 0;
+ float residual=length((cuv+(1-Options.y)*mv-uv)*pixels);
+ float z=depthAt(Depth,cuv),old=depthAt(PreviousDepth,puv);
+ float4 clip=mul(ClipToPrevious,float4(cuv.x*2-1,1-cuv.y*2,z,1));
+ if(!isfinite(z)||!isfinite(old)||!all(isfinite(clip))||clip.w<=1e-6)return 0;
+ float error=abs(old-clip.z/clip.w);
+ return saturate(1-residual/2)*saturate(1-error/.02);
+}
+float4 confidenceInterpolation(float2 uv,uint w,uint h){
+ float2 cuv,puv;float best=trajectory(uv,uv,float2(w,h),cuv,puv);
+ [branch]if(best<.5){
+  uint mw,mh;Motion.GetDimensions(mw,mh);float2 stepUV=1/float2(mw,mh);if(GuideOffset.w>.5)stepUV*=Rect.zw;
+  [loop]for(int y=-1;y<=1;++y)[loop]for(int x=-1;x<=1;++x){
+   float2 c,p;float score=trajectory(uv,uv+float2(x,y)*stepUV,float2(w,h),c,p);
+   if(score>best){best=score;cuv=c;puv=p;}
+  }
+ }
+ float4 fallback=samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel);
+ if(best<=0)return encodeColor(fallback);
+ float4 a=samplePacked(Previous,puv,PriorCrop,PriorSpans,AtlasTexel),b=samplePacked(Current,cuv,AtlasCrop,AtlasSpans,AtlasTexel);
+ return encodeColor(lerp(fallback,lerp(a,b,Options.y),best));
+}
 float4 interpolateAt(float2 uv,uint w,uint h,float method){
  if(Options.z<.5)return encodeColor(samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel));
- if(method<.5)return encodeColor(samplePacked(Previous,uv,PriorCrop,PriorSpans,AtlasTexel));
+ if(method>9.5)return encodeColor(samplePacked(Previous,uv,PriorCrop,PriorSpans,AtlasTexel));
+ if(method>2.5)return confidenceInterpolation(uv,w,h);
  float2 cuv=uv,mv=0;bool valid=true;
  [unroll]for(uint i=0;i<4;++i){if(!inside(cuv)||!motionAt(cuv,mv)){valid=false;break;}cuv=uv-(1-Options.y)*mv;}
  valid=valid&&inside(cuv)&&motionAt(cuv,mv);float2 puv=cuv+mv;
@@ -55,8 +87,8 @@ float4 regionsAt(uint2 pixel){
  float4 c=0,b=0;
  if(fade>0){float2 grid=max(float2(1,1),round(Rect.zw*float2(w,h)*Dimensions.z));
   float2 q=Rect.xy+(floor(saturate((uv-Rect.xy)/Rect.zw)*grid)+.5)/grid*Rect.zw;
-  c=MotionAdjust.z>3.5?OpticalCenter.SampleLevel(LinearClamp,saturate((q-Rect.xy)/Rect.zw),0):interpolateAt(q,w,h,MotionAdjust.z);}
- if(fade<1)b=Options.x>3.5?OpticalPeriphery.SampleLevel(LinearClamp,uv,0):peripheralAt(uv,w,h);
+  c=(MotionAdjust.z>3.5&&MotionAdjust.z<9.5)?OpticalCenter.SampleLevel(LinearClamp,saturate((q-Rect.xy)/Rect.zw),0):interpolateAt(q,w,h,MotionAdjust.z);}
+ if(fade<1)b=(Options.x>3.5&&Options.x<9.5)?OpticalPeriphery.SampleLevel(LinearClamp,uv,0):peripheralAt(uv,w,h);
  float4 result=fade>=1?c:fade<=0?b:lerp(b,c,fade);
  if(GuideOffset.z>.5&&MotionAdjust.w>.5){float2 edge=abs(min(uv-Rect.xy,Rect.xy+Rect.zw-uv))*float2(w,h);
   if(all(uv>=Rect.xy-2/float2(w,h))&&all(uv<=Rect.xy+Rect.zw+2/float2(w,h))&&min(edge.x,edge.y)<2)result=float4(0,.25,1,1);}

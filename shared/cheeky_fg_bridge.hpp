@@ -7,7 +7,7 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473E; // Optical flow vector grids; install runtime and layer together.
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x4346473F; // Aligned FG methods and independent depth guidance; install runtime and layer together.
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -28,7 +28,7 @@ struct CheekyFgEye {
     std::uint32_t show_foveation_border{}; // Blue border on FG generated output only (not history).
     std::uint32_t resolution_percent{100},peripheral_percent{50};
     std::uint32_t peripheral_method{2};
-    std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
+    std::uint32_t center_method{}; // Combined method ID; see fg_methods.hpp.
     CheekyFgOpticalSettings optical;
     std::uint64_t configuration{};
     std::uint32_t prepared_guides{}; // Guides are prepared FG grids rather than raw snapshots.
@@ -48,7 +48,7 @@ struct CheekyFgPair {
 };
 inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
     for(const auto& g:pair.eyes)
-        if(g.center_method==0||((g.focus_width<.999f||g.focus_height<.999f)&&g.peripheral_method==3))return true;
+        if(g.center_method==0||((g.focus_width<.999f||g.focus_height<.999f)&&g.peripheral_method==0))return true;
     return false;
 }
 // eyes[] is in physical OpenXR order. Evaluation ordinals retain capture order,
@@ -168,6 +168,14 @@ struct CheekyFgBatchTimingsV1 {
     double phase_ms[3]{},phase_last_ms[3]{};
 };
 using CheekyFgBatchTimingsFn=bool(__cdecl*)(CheekyFgBatchTimingsV1*);
+// V1 retains its inclusive first phase. V2 reports preparation/exposed optical
+// dependency waits separately, without serializing otherwise overlapping work.
+struct CheekyFgBatchTimingsV2 : CheekyFgBatchTimingsV1 {
+    std::uint32_t optical_separated{1};
+    double optical_ms{},optical_last_ms{};
+    CheekyFgBatchTimingsV2(){abi=2;size=sizeof(CheekyFgBatchTimingsV2);}
+};
+using CheekyFgBatchTimingsV2Fn=bool(__cdecl*)(CheekyFgBatchTimingsV2*);
 
 // Separate optional export: v15's performance structure remains unchanged.
 struct CheekyFgCadence {

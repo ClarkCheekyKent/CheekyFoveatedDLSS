@@ -1170,7 +1170,8 @@ int main(int argc,char** argv) {
         if(argc>1&&std::string(argv[1])=="--fg-latest-interval") {fg_latest_interval_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-capture-release") {fg_capture_release_validation();fg_pipelined_capture_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-release-watchdog") {fg_release_watchdog_validation();return 0;}
-        if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-methods") {fg_cross_api_parity();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation(argc>2&&std::string(argv[2])=="quick");return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-profile") {fg_optical_profile();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto") {fg_auto_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto-live11") {

@@ -38,7 +38,7 @@ inline std::vector<std::uint32_t> read11(ID3D11Device* device,ID3D11DeviceContex
     std::vector<std::uint32_t> out(edge*edge);for(unsigned y=0;y<edge;++y)memcpy(out.data()+y*edge,static_cast<const char*>(data.pData)+y*data.RowPitch,edge*4);context->Unmap(staging.Get(),0);return out;
 }
 }
-inline void fg_optical_validation(){
+inline void fg_optical_validation(bool quick=false){
     using namespace cheeky::fg;using namespace optical_fixture;
     // Real OFA execution is required. This entry point deliberately fails on
     // unsupported hardware; the ordinary WARP suites keep testing fallback.
@@ -56,13 +56,13 @@ inline void fg_optical_validation(){
     {D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=edge;d.MipLevels=d.ArraySize=1;d.SampleDesc.Count=1;d.Format=DXGI_FORMAT_R32_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
      D3D11_SUBRESOURCE_DATA data{depth.data(),edge*4,0};check(SUCCEEDED(device11->CreateTexture2D(&d,&data,&depth11))&&SUCCEEDED(device11->CreateShaderResourceView(depth11.Get(),nullptr,&depth_view)),"Optical depth texture");}
     auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));for(auto& v:views)v.subImage.imageRect.extent={edge,edge};
-    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_depth})for(unsigned quality=0;quality<3;++quality){
+    for(unsigned method:{cheeky_fg_optical_simple,cheeky_fg_optical_bidirectional,cheeky_fg_optical_flow})for(bool depth_guidance:{false,true})for(unsigned quality=0;quality<(!quick&&method==6?3u:1u);++quality){
         Backend11 backend;check(backend.initialize(device11.Get(),7,nullptr),backend.diagnostic);
         std::array<Image,2> previous,current;
         std::array<std::shared_ptr<Backend11::Guides>,2> guides;
         for(unsigned eye=0;eye<2;++eye){previous[eye]=backend.copy(a.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);current[eye]=backend.copy(b.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
-            guides[eye]=std::make_shared<Backend11::Guides>();auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.center_method=g.peripheral_method=method;
-            if(method==cheeky_fg_optical_depth)guides[eye]->depth_srv=depth_view;
+            guides[eye]=std::make_shared<Backend11::Guides>();auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.center_method=g.peripheral_method=method+(depth_guidance?3u:0u);
+            if(depth_guidance)guides[eye]->depth_srv=depth_view;
             g.focus_width=.55f;g.focus_height=.45f;g.resolution_percent=100;g.peripheral_percent=75;
             g.optical.center_preset=quality;g.optical.peripheral_preset=2-quality;g.optical.center_percent=100;g.optical.peripheral_percent=50;g.optical.center_grid=1u<<quality;g.optical.peripheral_grid=4u>>quality;}
         for(unsigned multiplier=2;multiplier<=4;++multiplier)for(unsigned phase=1;phase<multiplier;++phase){
@@ -108,11 +108,11 @@ inline void fg_optical_validation(){
     fg_parity::D3D12 gpu(adapter.Get());
     auto old12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4,edge),now12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4,edge);
     auto depth12=gpu.texture(DXGI_FORMAT_R32_FLOAT,depth.data(),4,edge),motion12=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,motion.data(),8,edge);gpu.execute();
-    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_depth})for(unsigned quality=0;quality<3;++quality){
+    for(unsigned method:{cheeky_fg_optical_simple,cheeky_fg_optical_bidirectional,cheeky_fg_optical_flow})for(bool depth_guidance:{false,true})for(unsigned quality=0;quality<(!quick&&method==6?3u:1u);++quality){
         Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),edge,edge,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
         CheekyFgPair pair;pair.producer_queue=gpu.queue.Get();
-        for(auto& g:pair.eyes){g.width=g.height=edge;g.center_method=g.peripheral_method=method;g.focus_width=.55f;g.focus_height=.45f;
-            if(method==cheeky_fg_optical_depth){g.depth=depth12.Get();g.motion=motion12.Get();g.depth_width=g.depth_height=g.motion_width=g.motion_height=edge;g.motion_scale_x=g.motion_scale_y=1;}
+        for(auto& g:pair.eyes){g.width=g.height=edge;g.center_method=g.peripheral_method=method+(depth_guidance?3u:0u);g.focus_width=.55f;g.focus_height=.45f;
+            if(depth_guidance){g.depth=depth12.Get();g.motion=motion12.Get();g.depth_width=g.depth_height=g.motion_width=g.motion_height=edge;g.motion_scale_x=g.motion_scale_y=1;}
             g.optical.center_preset=quality;g.optical.peripheral_preset=2-quality;g.optical.center_percent=100;g.optical.peripheral_percent=50;g.optical.center_grid=1u<<quality;g.optical.peripheral_grid=4u>>quality;g.peripheral_percent=75;g.configuration=method*4+quality+1;}
         std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye],false);
         std::array<ID3D12Resource*,2> previous{old12.Get(),old12.Get()},current{now12.Get(),now12.Get()},output;
@@ -121,7 +121,13 @@ inline void fg_optical_validation(){
             validate(gpu.read(output[0]),float(phase)/multiplier,"D3D12");
             if(phase==multiplier-1){const auto batch=worker.batch_timings.snapshot();
                 check(batch.valid&&batch.generated_count==multiplier-1&&batch.optical_regions==4,
-                    "Optical batch timings retain all generated phases and four deferred regional dependencies");}
+                    "Optical batch timings retain all generated phases and four deferred regional dependencies");
+                check(batch.optical_separated&&batch.optical_ms>0&&batch.optical_last_ms>0,
+                    "Optical preparation/exposed waits have their own completed GPU interval");
+                double accounted=batch.optical_last_ms;
+                for(unsigned index=0;index<batch.generated_count;++index){check(batch.phase_last_ms[index]>0,"Every generated phase has reconstruction time");accounted+=batch.phase_last_ms[index];}
+                check(accounted<=batch.batch_last_ms+.02,
+                    "Optical preparation and generated phases partition the batch without double counting");}
         }
     }
     {
@@ -178,7 +184,7 @@ inline void fg_optical_profile(){
     Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),size,size,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
     auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));for(auto& v:views)v.subImage.imageRect.extent={int(size),int(size)};
     CheekyFgPair pair;pair.producer_queue=gpu.queue.Get();
-    for(auto& g:pair.eyes){g.width=g.height=size;g.center_method=g.peripheral_method=4;g.focus_width=.55f;g.focus_height=.45f;
+    for(auto& g:pair.eyes){g.width=g.height=size;g.center_method=g.peripheral_method=cheeky_fg_optical_flow;g.focus_width=.55f;g.focus_height=.45f;
         g.optical.center_preset=setting[0];g.optical.peripheral_preset=2;g.optical.center_percent=setting[1];g.optical.peripheral_percent=25;g.peripheral_percent=25;g.configuration=1;}
     std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye],false);
     std::array<ID3D12Resource*,2> previous{old12.Get(),old12.Get()},current{now12.Get(),now12.Get()},output;

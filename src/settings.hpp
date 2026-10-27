@@ -47,7 +47,7 @@ struct Settings {
         bool match_sr_region{true}; // Copy SR size and effective per-eye placement when enabled.
         bool show_border{false}; // Blue FG debug outline, drawn after FG into OpenXR output.
         std::uint32_t resolution_percent{100},peripheral_percent{50};
-        std::uint32_t center_method{}; // 0 DLSS, 1 simple motion warp, 2 bidirectional interpolation.
+        std::uint32_t center_method{}; // Combined method ID; see fg_methods.hpp.
         std::uint32_t peripheral_method{1};
         CheekyFgOpticalSettings optical;
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.

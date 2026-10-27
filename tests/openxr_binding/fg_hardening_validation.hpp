@@ -315,7 +315,7 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(worker.initialize(device,queue,64,64,DXGI_FORMAT_R8G8B8A8_UNORM,false),"Shader-only D3D12 FG bypasses unavailable NGX capability");
     worker.create=nullptr;worker.evaluate=nullptr;worker.allocate=nullptr;
     for(unsigned method:{1u,2u})for(bool focused:{false,true}){
-        for(auto& g:guides.eyes){g.center_method=method;g.peripheral_method=0;g.focus_width=g.focus_height=focused?.5f:1.f;++g.configuration;}
+        for(auto& g:guides.eyes){g.center_method=method;g.peripheral_method=cheeky_fg_previous;g.focus_width=g.focus_height=focused?.5f:1.f;++g.configuration;}
         check(!cheeky_fg_needs_ngx(guides),"Shader regions need no NGX initialization");
         check(generate(cameras)&&generate(cameras)&&worker.temporal_evaluation_completed,"Production worker interpolates both shader center methods without any NGX callbacks");
         check(!worker.features[0].handle&&!worker.features[1].handle,"Shader center creates no DLSS-G feature");
@@ -421,7 +421,7 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         Runtime::waits=Runtime::begins=Runtime::ends=Runtime::generated=0;
         Runtime::paused=Runtime::reject_private=Runtime::block_generated_end=false;Runtime::upload_serial=nullptr;
         Runtime::guides=guides;Runtime::guides.release_point=3;Runtime::guides.fg_queue_priority=2;
-        for(auto& g:Runtime::guides.eyes){g.center_method=2;g.peripheral_method=0;g.focus_width=g.focus_height=1;g.reset=0;}
+        for(auto& g:Runtime::guides.eyes){g.center_method=2;g.peripheral_method=cheeky_fg_previous;g.focus_width=g.focus_height=1;g.reset=0;}
         check(SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr)),"Auto native source state");
         color_transition(list.Get(),color.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_RENDER_TARGET);
         check(SUCCEEDED(list->Close()),"Auto source state close");ID3D12CommandList* source_lists[]{list.Get()};queue->ExecuteCommandLists(1,source_lists);

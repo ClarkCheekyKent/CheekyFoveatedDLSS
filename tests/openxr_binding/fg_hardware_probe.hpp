@@ -178,7 +178,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(timing.center.last>0&&timing.total.last>=timing.center.last&&
         timing.foveated_eyes==(foveated?2u:0u),"GPU timing must distinguish foveated and full-frame generation");
     if(foveated)check(timing.periphery.last>0,"Foveated composition must have a real GPU timestamp interval");
-    check(bool(worker.peripheral_features[0].handle)==(foveated&&method==3),"DLSS periphery must run its own NGX feature; custom modes must not");
+    check(bool(worker.peripheral_features[0].handle)==(foveated&&method==0),"DLSS periphery must run its own NGX feature; custom modes must not");
     check(worker.center_width==std::max(32u,(unsigned(std::round(width*(foveated?.55f:1.f)))*scale+50u)/100u),"FG scale must change actual inference dimensions");
     const auto& center_input=worker.focus.inputs[0][0];
     if(prepared_capture)check(center_input.borrowed_guides&&center_input.depth.Get()==guides.eyes[0].depth&&
@@ -187,11 +187,11 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(center_input.depth->GetDesc().Width==guide_width&&center_input.motion->GetDesc().Width==guide_width,
         "NGX must accept cropped source-resolution guides independently of output color");
     if(foveated){const auto& input=worker.focus.inputs[0][1];
-        if(compact&&method<=2&&!periphery_baseline)check(!worker.focus.peripheral_output[0]&&!worker.focus.peripheral_output[1],
+        if(compact&&(method==10||cheeky_fg_dlss_vectors(method))&&!periphery_baseline)check(!worker.focus.peripheral_output[0]&&!worker.focus.peripheral_output[1],
             "Custom compact output must eliminate both private periphery textures");
-        check(bool(input.color)==(method==3)&&bool(input.depth)==(method>=2)&&bool(input.motion)==(method!=0),
+        check(bool(input.color)==(method==0)&&bool(input.depth)==(method==0||cheeky_fg_depth(method))&&bool(input.motion)==(method==0||cheeky_fg_dlss_vectors(method)),
             "Only resources used by the periphery algorithm may be prepared");
-        check(bool(worker.focus.previous_depth[0])==(method==2),"Only bidirectional warp may copy depth history");}
+        check(bool(worker.focus.previous_depth[0])==(cheeky_fg_depth_history(method)),"Only depth-guided warp may copy depth history");}
     std::cout << "Actual inputs: center=" << worker.center_width << 'x' << worker.center_height
         << " periphery=" << worker.peripheral_width << 'x' << worker.peripheral_height
         << " method=" << method << " source-depth=" << worker.source_depth_format << " source-motion=" << worker.source_motion_format << '\n';

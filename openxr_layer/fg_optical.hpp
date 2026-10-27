@@ -62,7 +62,8 @@ inline OpticalConstants constants(const CheekyFgEye& g,unsigned pass,const float
     c.sizes[1]=float(std::max(64u,(unsigned(std::ceil(g.height*c.flow_rect[3]*percent*.01f))+3u)&~3u));
     c.sizes[2]=float(outw);c.sizes[3]=float(outh);
     layout.constants(c.crop,c.spans,c.texel);float unused[4];old_layout.constants(c.old_crop,c.old_spans,unused);
-    c.texel[0]=float(grid==1||grid==2?grid:4u);c.texel[1]=0;return c;
+    c.texel[0]=float(grid==1||grid==2?grid:4u);c.texel[1]=0;
+    c.texel[3]=float(cheeky_fg_interpolation(pass?g.peripheral_method:g.center_method));return c;
 }
 // Head-rotation reprojection between the previous, current and submitted
 // in-between cameras. The in-between pose matches the presenter's midpoint().

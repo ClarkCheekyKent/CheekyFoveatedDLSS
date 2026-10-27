@@ -329,6 +329,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 if(!wait_fence(serial,"optical list reuse (previous generation on GPU)")||FAILED(optical_allocator->Reset())||FAILED(optical_list->Reset(optical_allocator.Get(),nullptr)))return false;
                 latency.begin(optical_list.Get());phase_timing.begin(optical_list.Get());
                 batch_timings.begin(device.Get(),optical_list.Get(),frame_count,optical_regions);
+                batch_timings.optical_prefix.begin(device.Get(),optical_list.Get());
                 if(FAILED(optical_list->Close()))return false;ID3D12CommandList* start[]{optical_list.Get()};queue->ExecuteCommandLists(1,start);
                 retire_failure.active=true;
                 optical_timing_started=true;
@@ -382,6 +383,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     auto consume_optical=[&](unsigned eye,unsigned pass)->bool {
         if(!optical_pending[eye][pass])return true;
         if(optical_consumer_count>=optical_consumer_lists.size())return false;
+        auto& wait_timing=batch_timings.optical_waits[batch_timings.optical_wait_count++];
+        wait_timing.begin(device.Get(),commands);
         if(FAILED(commands->Close()))return false;
         ID3D12CommandList* prefix[]{commands};queue->ExecuteCommandLists(1,prefix);
         retire_failure.active=true;
@@ -391,8 +394,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(!a&&(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&a)))||
             FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,a.Get(),nullptr,IID_PPV_ARGS(&l)))||FAILED(l->Close()))){a.Reset();l.Reset();return false;}
         if(FAILED(a->Reset())||FAILED(l->Reset(a.Get(),nullptr)))return false;
-        commands=l.Get();return true;
+        commands=l.Get();wait_timing.end(commands);return true;
     };
+    if(optical_timing_started)batch_timings.optical_prefix.end(commands);
     bool cut_to_second_list=false;
     if(!optical_timing_started){if(!continuing)latency.begin(commands);phase_timing.begin(commands);}
     if(frame_index==1&&!optical_timing_started)batch_timings.begin(device.Get(),commands,frame_count,optical_regions);
@@ -419,7 +423,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     // wait_idle above retired every earlier use of these private scratch images.
     // Not while earlier frames of this interval may still sample them.
     if(direct&&direct_periphery&&!continuing)for(unsigned eye=0;eye<2;++eye)
-        if(((*copies)[eye].layout.packed()||(*copies)[eye].final_xr)&&guides.eyes[eye].peripheral_method<=2){
+        if(((*copies)[eye].layout.packed()||(*copies)[eye].final_xr)&&(guides.eyes[eye].peripheral_method==cheeky_fg_previous||cheeky_fg_dlss_vectors(guides.eyes[eye].peripheral_method))){
             phase_focus.peripheral_output[eye].Reset();if((*copies)[eye].final_xr)phase_focus.full[eye].Reset();}
     std::array<bool,2> moving_crop_reset{};
     std::array<FocusRect,2> previous_center_crops{};
@@ -709,7 +713,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                     (*copies)[eye].texture,(*copies)[eye].state,nullptr,&final);
                 (*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;outputs[eye]=(*copies)[eye].texture;
             }else if(rect.active) {
-                if(g.peripheral_method==3) {
+                if(g.peripheral_method==0) {
                     good=evaluate_pass(phase_peripheral_features[eye],phase_focus.inputs[eye][1],camera,g,FocusRect{0,0,width,height,0,false},eye);
                     base=phase_peripheral_features[eye].target;
                 }else {
@@ -724,7 +728,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             }
             if(final_xr){}else if(good&&copies&&(*copies)[eye].layout.packed()) {
                 const bool center_direct=phase_features[eye].direct;
-                const bool context_direct=custom_context_direct||(g.peripheral_method==3&&phase_peripheral_features[eye].direct);
+                const bool context_direct=custom_context_direct||(g.peripheral_method==0&&phase_peripheral_features[eye].direct);
                 good=phase_focus.pack_frame(device.Get(),commands,eye,center,base,(*copies)[eye].texture,(*copies)[eye].state,
                     (*copies)[eye].layout,center_direct,context_direct);
                 outputs[eye]=(*copies)[eye].texture;(*copies)[eye].state=D3D12_RESOURCE_STATE_COMMON;
@@ -734,8 +738,8 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 outputs[eye]=direct?(*copies)[eye].texture:phase_focus.full[eye].Get();
                 if(direct)(*copies)[eye].state=D3D12_RESOURCE_STATE_GENERIC_READ;
             } else outputs[eye]=base;
-            if(good&&last_output&&rect.active&&g.peripheral_method==2)good=phase_focus.save_depth(device.Get(),commands,eye);
-            if(good&&last_output&&g.center_method==2)good=phase_focus.save_depth(device.Get(),commands,eye,0);
+            if(good&&last_output&&rect.active&&cheeky_fg_depth_history(g.peripheral_method))good=phase_focus.save_depth(device.Get(),commands,eye);
+            if(good&&last_output&&cheeky_fg_depth_history(g.center_method))good=phase_focus.save_depth(device.Get(),commands,eye,0);
             if(!good&&!failed){report("FG periphery/composition allocation",unsigned(E_FAIL));failed=true;}
             phase_timing.stamp(commands,query+5);
         }
@@ -763,7 +767,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         std::array<ID3D12Resource*,4> disabled{};
         for(unsigned eye=0;eye<2;++eye){
             if(guides.eyes[eye].center_method==0)disabled[eye*2]=phase_features[eye].disable.Get();
-            if(foveated[eye]&&guides.eyes[eye].peripheral_method==3)disabled[eye*2+1]=phase_peripheral_features[eye].disable.Get();
+            if(foveated[eye]&&guides.eyes[eye].peripheral_method==0)disabled[eye*2+1]=phase_peripheral_features[eye].disable.Get();
         }
         // Either eye/pass suppresses the entire stereo result. Both outputs
         // then contain native color instead of exposing invalid interpolation.
@@ -840,8 +844,10 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     retire_failure.active=false;
     direct_publication=direct;
     const unsigned collect_count=batched?frame_count:1u;
+    if((batched&&last_output)||(!batched&&frame_index==1))batch_timings.collect_optical(this->gpu_timings.frequency);
     for(unsigned i=0;i<collect_count;++i){auto& t=batched?phase_timings[i]:phase_timing;
-        t.collect(focused,copies&&!direct);this->gpu_timings.append_latest(t);}
+        if(batch_timings.optical_valid)t.collect(focused,copies&&!direct,(batched?i==0:frame_index==1)?batch_timings.optical_current:0);
+        this->gpu_timings.append_latest(t);}
     // Non-batched NGX calls also retain independent phase queries; only the
     // last call closes the native-pair span.
     if(last_output)batch_timings.collect(this->gpu_timings.frequency,phase_timings);
@@ -950,9 +956,9 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     }
     bool enabled=true;
     for(unsigned eye=0;eye<2;++eye){
-        if(last_output){this->focus.history[eye]=foveated[eye]&&guides.eyes[eye].peripheral_method==2;
-            this->focus.center_history[eye]=guides.eyes[eye].center_method==2;}
-        for(auto* f:{&phase_features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==3?&phase_peripheral_features[eye]:nullptr}) {
+        if(last_output){this->focus.history[eye]=foveated[eye]&&cheeky_fg_depth_history(guides.eyes[eye].peripheral_method);
+            this->focus.center_history[eye]=cheeky_fg_depth_history(guides.eyes[eye].center_method);}
+        for(auto* f:{&phase_features[eye],foveated[eye]&&guides.eyes[eye].peripheral_method==0?&phase_peripheral_features[eye]:nullptr}) {
             if(!f)continue;
             if(!f->handle)continue;void* data{};if(FAILED(f->readback->Map(0,nullptr,&data))||!data)return false;
             enabled&=*static_cast<const unsigned char*>(data)==0;const D3D12_RANGE written{0,0};f->readback->Unmap(0,&written);

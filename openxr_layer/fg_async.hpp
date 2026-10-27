@@ -135,9 +135,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unordered_map<XrSwapchain,Chain> auxiliary_chains;
     Chain scene_chains[2]; // Native and generated presentations share each eye's destination.
     CheekyFgPerformance telemetry;
-    CheekyFgBatchTimingsV1 batch_telemetry;
+    CheekyFgBatchTimingsV2 batch_telemetry;
     std::weak_ptr<Pair::Progress> inflight_progress;
-    CheekyFgBatchTimingsV1 batch_timing() const noexcept override {return batch_telemetry;}
+    CheekyFgBatchTimingsV2 batch_timing() const noexcept override {return batch_telemetry;}
     CheekyFgOverhead extra_gpu;
     // Unique native, generated interpolation time, newest FG input.
     std::array<TimingAverage,3> frame_ages;
@@ -933,7 +933,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(job->automatic_multiplier){
                     if(job->guides_valid&&previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&telemetry.gpu_valid){
                         const double now=std::chrono::duration<double,std::milli>(TimingClock::now().time_since_epoch()).count();
-                        const auto generated_ms=(job->policy.optical_flow?telemetry.total_ms:telemetry.total_last_ms)+publication_cost.publication_last_ms+publication_cost.upload_last_ms;
+                        const auto optical_cost=job->policy.optical_flow&&batch_telemetry.valid&&batch_telemetry.optical_separated&&batch_telemetry.generated_count?
+                            batch_telemetry.optical_ms/batch_telemetry.generated_count:0.;
+                        const auto generated_ms=(job->policy.optical_flow?telemetry.total_ms:telemetry.total_last_ms)+optical_cost+publication_cost.publication_last_ms+publication_cost.upload_last_ms;
                         if(auto_multiplier.observe(now,sample,generated_ms,display_clock.display_ms(),xr_wait.mean()+present_cpu.mean())&&trace){char message[180]{};
                             sprintf_s(message,"FG Auto selected=%ux max=%ux render_ms=%.3f generated_ms=%.3f reason=%u (histories retained)",
                                 auto_multiplier.selected,maximum,auto_multiplier.render_ms,auto_multiplier.fg_ms,auto_multiplier.reason);trace(message);}

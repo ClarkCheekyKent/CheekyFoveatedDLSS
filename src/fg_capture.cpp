@@ -316,7 +316,7 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
     m.reset=ui(p,"Reset");m.resolution_percent=settings.fg.resolution_percent;m.peripheral_percent=settings.fg.peripheral_percent;
     m.center_method=settings.fg.center_method;
     m.optical=settings.fg.optical;
-    m.peripheral_method=settings.fg.peripheral_method==3?2u:settings.fg.peripheral_method;
+    m.peripheral_method=settings.fg.peripheral_method==0?2u:settings.fg.peripheral_method;
     m.focus_feather=settings.fg.feather;m.show_foveation_border=settings.fg.show_border;m.configuration=configuration(settings);
     source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;
     observe(&source);
@@ -777,10 +777,14 @@ bool fg_performance(CheekyFgPerformance& out) noexcept {
     const auto query=layer?reinterpret_cast<CheekyFgPerformanceFn>(GetProcAddress(layer,"CheekyFG_GetPerformance")):nullptr;
     return query&&query(&out);
 }
-bool fg_batch_timings(CheekyFgBatchTimingsV1& out) noexcept {
+bool fg_batch_timings(CheekyFgBatchTimingsV2& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");
-    const auto query=layer?reinterpret_cast<CheekyFgBatchTimingsFn>(GetProcAddress(layer,"CheekyFG_GetBatchTimingsV1")):nullptr;
-    return query&&query(&out);
+    const auto query=layer?reinterpret_cast<CheekyFgBatchTimingsV2Fn>(GetProcAddress(layer,"CheekyFG_GetBatchTimingsV2")):nullptr;
+    if(query)return query(&out);
+    const auto legacy=layer?reinterpret_cast<CheekyFgBatchTimingsFn>(GetProcAddress(layer,"CheekyFG_GetBatchTimingsV1")):nullptr;
+    CheekyFgBatchTimingsV1 prior;if(!legacy||!legacy(&prior))return false;
+    static_cast<CheekyFgBatchTimingsV1&>(out)=prior;out.abi=2;out.size=sizeof(out);out.optical_separated=0;
+    out.optical_ms=out.optical_last_ms=0;return true;
 }
 bool fg_cadence(CheekyFgCadence& out) noexcept {
     const auto layer=GetModuleHandleW(L"CheekyOpenXRLayer.dll");

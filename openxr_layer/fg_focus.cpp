@@ -159,13 +159,13 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  const unsigned method=pass?g.peripheral_method:g.center_method;
  // Only NGX (DLSS) reads the prepared color; the shader methods and optical
  // flow sample the original images. Matches guide_grid's depth/motion choice.
- const bool need_color=pass==0?method==0:method==3;
- const bool need_motion=pass==0?method<=2:(method>=1&&method<=3);
- const bool need_depth=pass==0?(method==0||method==2||method==5):(method==2||method==3||method==5);
+ const bool need_color=method==0;
+ const bool need_motion=cheeky_fg_dlss_vectors(method)||(method==0);
+ const bool need_depth=cheeky_fg_depth(method)||(method==0);
  const bool prepared=g.prepared_guides!=0;
  const bool adjust_motion=pass==0&&(crop_motion_dx!=0.f||crop_motion_dy!=0.f);
  auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;
- if(method==cheeky_fg_optical_flow){s.depth.Reset();s.motion.Reset();return true;}
+ if(cheeky_fg_optical(method)&&!cheeky_fg_depth(method)){s.depth.Reset();s.motion.Reset();return true;}
  if(s.borrowed_guides!=prepared){s.depth.Reset();s.motion.Reset();}
  s.borrowed_guides=prepared;
  if(!need_color)s.color.Reset();if(!need_depth)s.depth.Reset();if(!need_motion)s.motion.Reset();
@@ -278,12 +278,12 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  auto& prior_depth=region?previous_center_depth[eye]:previous_depth[eye];
  auto& valid_history=region?center_history[eye]:history[eye];
  auto& scratch=region?center_output[eye]:peripheral_output[eye];
- if(!s.output_width||!s.output_height||!previous||!current||(method>2&&!cheeky_fg_optical(method)))return false;
+ if(!s.output_width||!s.output_height||!previous||!current||(method!=cheeky_fg_previous&&!cheeky_fg_shader(method)))return false;
  if(cheeky_fg_optical(method)){
   auto c=optical_constants[eye][pass];
   c.flags[1]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
-  auto* depth=method==cheeky_fg_optical_depth?s.depth.Get():nullptr;
-  if(method==cheeky_fg_optical_depth&&!depth)return false;
+  auto* depth=cheeky_fg_depth(method)?s.depth.Get():nullptr;
+  if(cheeky_fg_depth(method)&&!depth)return false;
   // Prepared depth covers this pass's output region in eye coordinates.
   c.flags[2]=depth?1.f:0.f;c.flags[3]=float(g.depth_inverted);std::copy_n(c.output_rect,4,c.depth_rect);
   if(camera.valid)optical::pose_mapping(c,camera.previous_pose,camera.previous_fov,camera.pose,camera.view_fov,interpolation_fraction);
@@ -298,7 +298,7 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
   }
   return destination==nullptr;
  }
- const bool need_motion=method!=0,need_depth=method==2;
+ const bool need_motion=cheeky_fg_dlss_vectors(method),need_depth=cheeky_fg_depth_history(method);
  if((need_motion&&!s.motion)||(need_depth&&!s.depth))return false;
  if(destination){
   const auto d=destination->GetDesc();

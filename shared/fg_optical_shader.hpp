@@ -62,6 +62,38 @@ float4 flow(Texture2D<int2> field,Texture2D<uint> cost,float2 p,bool guided=fals
  v/=sum;c/=sum;
  return float4(v/(32*Sizes.xy),1/(1+c/32),0);
 }
+// Fast reconstruction does not read the matching-cost surfaces. Native fields
+// remain in their own grid; changing interpolator never repeats estimation.
+float2 vectorAt(Texture2D<int2> field,float2 p,bool guided=false){
+ uint w,h;field.GetDimensions(w,h);
+ float2 pos=p*Sizes.xy/Texel.x-.5;int2 i=int2(floor(pos));float2 a=frac(pos);int2 hi=int2(w,h)-1;
+ int2 q[4]={clamp(i,0,hi),clamp(i+int2(1,0),0,hi),clamp(i+int2(0,1),0,hi),clamp(i+1,0,hi)};
+ float k[4]={(1-a.x)*(1-a.y),a.x*(1-a.y),(1-a.x)*a.y,a.x*a.y};
+ if(guided&&Flags.z>.5){float n=nearness(p);
+  [unroll]for(uint j=0;j<4;++j){float e=(nearness((float2(q[j])+.5)*Texel.x/Sizes.xy)-n)/(.03*n);k[j]*=1/(1+e*e);}}
+ float2 v=0;float sum=1e-6;
+ [unroll]for(uint j=0;j<4;++j){v+=k[j]*float2(field.Load(int3(q[j],0)));sum+=k[j];}
+ return v/(sum*32*Sizes.xy);
+}
+float4 fastInterpolation(float2 uv,float2 q,float t){
+ float2 a=q,b=q;
+ [unroll]for(uint i=0;i<4;++i){
+  b=q-(1-t)*vectorAt(Backward,b,true);
+  if(Texel.w>.5)a=q-t*vectorAt(Forward,a);
+ }
+ // Simple warping uses the same current->previous trajectory as DLSS Vectors.
+ if(Texel.w<.5)a=b+vectorAt(Backward,b,true);
+ float2 source=oldUV(FlowRect.xy+a*FlowRect.zw);
+ float wa=within(a)&&within(source)?1-t:0,wb=within(b)?t:0;
+ if(Texel.w<.5){wa=within(a)&&within(source)?1:0;wb=0;}
+ if(Flags.z>.5&&wa>0&&wb>0){
+  float na=nearness(a+vectorAt(Forward,a)),nb=nearness(b);
+  float rel=(na-nb)/max(na,nb);wa*=rel<-.03?0:1;wb*=rel>.03?0:1;
+ }
+ float4 c=wa+wb>1e-6?(packed(Old,source,OldCrop,OldSpans)*wa+packed(Now,FlowRect.xy+b*FlowRect.zw,Crop,Spans)*wb)/(wa+wb):packed(Now,uv,Crop,Spans);
+ if(Flags.y>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));
+ return c;
+}
 float3 inputColor(float3 c){float y=dot(max(c,0),float3(.2126,.7152,.0722));return (y/(1+y)).xxx;}
 [numthreads(8,8,1)]void Prepare(uint3 id:SV_DispatchThreadID){
  if(any(id.xy>=uint2(Sizes.xy)))return;
@@ -85,6 +117,7 @@ float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
  float2 uv=OutputRect.xy+(float2(id.xy)+.5)/Sizes.zw*OutputRect.zw;
  if(Texel.y>.5)uv=rotateView(uv,MidToNow,MidTangents,NowTangents);
  float2 q=(uv-FlowRect.xy)/FlowRect.zw;float t=Flags.x;
+ [branch]if(Texel.w<1.5){Result[id.xy]=fastInterpolation(uv,q,t);return;}
  float2 a=q,b=q;float4 f=0,r=0;
  [unroll]for(uint k=0;k<5;++k){f=flow(Forward,ForwardCost,a);a=q-t*f.xy;r=flow(Backward,BackwardCost,b,true);b=q-(1-t)*r.xy;}
  f=flow(Forward,ForwardCost,a);r=flow(Backward,BackwardCost,b,true);
@@ -140,8 +173,8 @@ float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
 )HLSL";
 struct OpticalConstants {
     float flow_rect[4]{0,0,1,1},output_rect[4]{0,0,1,1},sizes[4]{},flags[4]{};
-    // texel.x: vector grid; texel.y: pose compensation. packed() derives its own texel.xy.
-    float crop[4]{},spans[4]{},texel[4]{4,0,0,0},old_crop[4]{},old_spans[4]{},depth_rect[4]{0,0,1,1};
+    // texel: vector grid, pose compensation, packed feather, interpolation mode.
+    float crop[4]{},spans[4]{},texel[4]{4,0,0,2},old_crop[4]{},old_spans[4]{},depth_rect[4]{0,0,1,1};
     float now_to_old[4]{0,0,0,1},old_tangents[4]{},now_tangents[4]{},mid_to_now[4]{0,0,0,1},mid_tangents[4]{};
 };
 }

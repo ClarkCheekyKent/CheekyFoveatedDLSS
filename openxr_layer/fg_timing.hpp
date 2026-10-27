@@ -165,7 +165,7 @@ struct GpuTimings {
     }
     // Caller has already completed the ordinary generation fence wait. Reading
     // telemetry must not add another wait, flush or command-list submission.
-    bool collect(unsigned focused_eyes,bool copied_output=true) noexcept {
+    bool collect(unsigned focused_eyes,bool copied_output=true,double optical_ms=0) noexcept {
         valid=preparation_valid=false;if(!supported())return false;
         const unsigned count=record_preparation?query_count:always_query_count;
         void* mapped{};D3D12_RANGE range{0,count*sizeof(std::uint64_t)};
@@ -191,7 +191,8 @@ struct GpuTimings {
                 ngx_sub[eye][part]=double(ticks[base+part+1]-ticks[base+part])*1000.0/double(frequency);
             }
         }
-        preparation.add(prep);center.add(ngx);periphery.add(edge);total.add(whole);
+        if(!std::isfinite(optical_ms)||optical_ms<0||whole-optical_ms+0.001<prep+ngx+edge)return false;
+        preparation.add(prep);center.add(ngx);periphery.add(edge);total.add(std::max(0.,whole-optical_ms));
         for(unsigned eye=0;eye<2;++eye)
             for(unsigned part=0;part<3;++part) {
                 ngx_parts[eye][part].add(ngx_sub[eye][part]);
@@ -238,27 +239,40 @@ struct GpuTimings {
 
 struct BatchGpuTimings {
     cheeky::gpu::Span span;
-    TimingAverage batch;
+    cheeky::gpu::Span optical_prefix;
+    std::array<cheeky::gpu::Span,4> optical_waits;
+    TimingAverage batch,optical;
+    double optical_current{};
+    unsigned optical_wait_count{};
+    bool optical_valid{true};
     std::array<TimingAverage,3> phases;
     unsigned count{},optical_regions{};
     std::uint64_t samples{};
     bool valid{};
-    void reset() noexcept {span={};batch={};phases={};count=optical_regions=0;samples=0;valid=false;}
+    void reset() noexcept {span={};optical_prefix={};optical_waits={};batch={};optical={};phases={};count=optical_regions=0;samples=0;valid=false;optical_current=0;optical_wait_count=0;optical_valid=true;}
     void begin(ID3D12Device* device,ID3D12GraphicsCommandList* commands,unsigned n,unsigned regions) {
-        if(count!=n||optical_regions!=regions){batch={};phases={};samples=0;}
+        if(count!=n||optical_regions!=regions){batch={};optical={};phases={};samples=0;}
+        optical_current=0;optical_wait_count=0;optical_valid=true;
         count=n;optical_regions=regions;valid=false;span.begin(device,commands);
+    }
+    void collect_optical(std::uint64_t frequency) {
+        optical_current=0;optical_valid=true;if(!optical_regions)return;
+        optical_valid=optical_prefix.collect(frequency,optical_current);
+        for(unsigned i=0;i<optical_wait_count;++i){double ms{};
+            if(!optical_waits[i].collect(frequency,ms))optical_valid=false;else optical_current+=ms;}
     }
     void end(ID3D12GraphicsCommandList* commands) {span.end(commands);}
     void collect(std::uint64_t frequency,const std::array<GpuTimings,3>& timing) {
         double ms{};valid=false;
-        if(!span.collect(frequency,ms)||!count||count>3)return;
+        if(!span.collect(frequency,ms)||!count||count>3||!optical_valid)return;
         for(unsigned i=0;i<count;++i)if(!timing[i].valid)return;
-        batch.add(ms);for(unsigned i=0;i<count;++i)phases[i].add(timing[i].total.last+timing[i].publication.last);
+        batch.add(ms);optical.add(optical_current);for(unsigned i=0;i<count;++i)phases[i].add(timing[i].total.last+timing[i].publication.last);
         ++samples;valid=true;
     }
-    CheekyFgBatchTimingsV1 snapshot() const noexcept {
-        CheekyFgBatchTimingsV1 out;out.supported=1;out.valid=valid;out.generated_count=count;
+    CheekyFgBatchTimingsV2 snapshot() const noexcept {
+        CheekyFgBatchTimingsV2 out;out.supported=1;out.valid=valid;out.generated_count=count;
         out.optical_regions=optical_regions;out.samples=samples;out.batch_ms=batch.mean();out.batch_last_ms=batch.last;
+        out.optical_ms=optical.mean();out.optical_last_ms=optical.last;
         for(unsigned i=0;i<count&&i<3;++i){out.phase_ms[i]=phases[i].mean();out.phase_last_ms[i]=phases[i].last;}
         return out;
     }

@@ -883,7 +883,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     // Game-composited quad views submit stereo, so they keep the stereo FG controls.
     const bool outer_guides=flag(member(snapshot,"quad_views"),"fg_outer_guides");
     const bool quad=flag(member(snapshot,"quad_views"),"active")&&!outer_guides;
-    if(quad&&settings.fg.peripheral_method==3)settings.fg.peripheral_method=2;
+    if(quad&&settings.fg.peripheral_method==0)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
     const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
     const auto fg = member(snapshot, "fg");
@@ -918,15 +918,19 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     }
 
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
-    unsigned center_choice=cheeky_fg_optical(s.center_method)?s.center_method-1:s.center_method;
-    combo("FG center method", center_choice,
-        "DLSS\0Simple motion-vector warping\0Bidirectional interpolation\0NVIDIA Optical Flow\0NVIDIA Optical Flow + DLSS depth\0");
-    s.center_method=center_choice>=3?center_choice+1:center_choice;
-    if(cheeky_fg_optical(s.center_method)){
-        combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
-        fg_percent("Center optical flow resolution",s.optical.center_percent);
-        optical_grid("Center optical flow vector grid",s.optical.center_grid);
-    }
+    const auto method_combo=[](const char* label,unsigned& method,bool periphery,bool quad_view){
+        constexpr const char* names[]{"DLSS Frame Generation",
+            "DLSS Vectors - Simple Warping", "DLSS Vectors - Bidirectional Interpolation",
+            "DLSS Vectors - Confidence-Guided Interpolation", "Optical Flow - Simple Warping",
+            "Optical Flow - Bidirectional Interpolation", "Optical Flow - Confidence-Guided Interpolation",
+            "Optical Flow + DLSS Depth - Simple Warping", "Optical Flow + DLSS Depth - Bidirectional Interpolation",
+            "Optical Flow + DLSS Depth - Confidence-Guided Interpolation", "Previous frame"};
+        const unsigned first=periphery&&quad_view?1u:0u,count=periphery?11u:10u;
+        int selected=int(method)-int(first);
+        if(ImGui::Combo(label,&selected,names+first,int(count-first)))method=unsigned(selected)+first;
+        test_control(label);
+    };
+    method_combo("FG center method",s.center_method,false,quad);
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
     ImGui::Checkbox("Foveated frame generation", &s.foveated);
@@ -945,19 +949,20 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         }
         }
         fg_percent("FG periphery scale", s.peripheral_percent);
-        unsigned periphery_choice=quad&&cheeky_fg_optical(s.peripheral_method)?s.peripheral_method-1:s.peripheral_method;
-        combo("FG periphery method", periphery_choice,
-            quad?"Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0NVIDIA Optical Flow\0NVIDIA Optical Flow + DLSS depth\0":
-                "Previous frame\0Simple motion-vector warping\0Bidirectional interpolation\0DLSS\0NVIDIA Optical Flow\0NVIDIA Optical Flow + DLSS depth\0");
-        s.peripheral_method=quad&&periphery_choice>=3?periphery_choice+1:periphery_choice;
-        if(cheeky_fg_optical(s.peripheral_method)){
+        method_combo("FG periphery method",s.peripheral_method,true,quad);
+        ImGui::Checkbox("Show blue FG region border", &s.show_border);
+    }
+    if (ImGui::TreeNode("Advanced settings")) {
+        if(cheeky_fg_optical(s.center_method)){
+            combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
+            fg_percent("Center optical flow resolution",s.optical.center_percent);
+            optical_grid("Center optical flow vector grid",s.optical.center_grid);
+        }
+        if((s.foveated||quad)&&cheeky_fg_optical(s.peripheral_method)){
             combo("Periphery optical flow preset",s.optical.peripheral_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
             fg_percent("Periphery optical flow resolution",s.optical.peripheral_percent);
             optical_grid("Periphery optical flow vector grid",s.optical.peripheral_grid);
         }
-        ImGui::Checkbox("Show blue FG region border", &s.show_border);
-    }
-    if (ImGui::TreeNode("Advanced settings")) {
         ImGui::Checkbox("Force NVIDIA Reflex off", &s.force_reflex_off);
         if(s.force_reflex_off)ImGui::TextWrapped("Disables NVIDIA Reflex sleep and its frame limiter. Applies even when frame generation is off.");
         char refresh_label[32]{};if(s.target_refresh_hz)sprintf_s(refresh_label,"%u Hz",s.target_refresh_hz);else strcpy_s(refresh_label,"Automatic");
@@ -1113,6 +1118,27 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
                 }
             }
             ImGui::EndTable();
+        }
+        const auto batch=member(fg,"batch_timing");
+        if(flag(batch,"supported")&&flag(batch,"valid")&&ImGui::BeginTable("fg_batch_timings",2,ImGuiTableFlags_SizingStretchProp|ImGuiTableFlags_RowBg)){
+            const auto row=[](const char* label,double mean,double last){
+                ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::TextWrapped("%s",label);
+                ImGui::TableNextColumn();ImGui::Text("%.3f / %.3f",mean,last);
+            };
+            row("Whole batch incl. output copies (per real frame)",number(batch,"batch_ms"),number(batch,"batch_last_ms"));
+            const bool separated=flag(batch,"optical_separated"),flow=number(batch,"optical_regions")>0;
+            if(separated&&flow)row("Optical flow preparation + exposed waits (per real frame)",number(batch,"optical_ms"),number(batch,"optical_last_ms"));
+            auto phases=member(batch,"phases");
+            for(unsigned i=0;i<3;++i){const auto start=phases.find('{'),end=phases.find('}',start);
+                if(start==phases.npos||end==phases.npos)break;
+                const auto phase=phases.substr(start,end-start+1);char label[96]{};
+                const auto index=unsigned(number(phase,"index"));
+                sprintf_s(label,"Generated stereo frame %u%s",index,index==1&&flow&&!separated?" (includes optical flow)":"");
+                row(label,number(phase,"ms"),number(phase,"last_ms"));phases.remove_prefix(end+1);
+            }
+            ImGui::EndTable();
+            ImGui::TextWrapped("Batch and generated-frame times cover both eyes, including composition and output copies. Capture, XR uploads and pacing are excluded.");
+            if(separated&&flow)ImGui::TextWrapped("Generated-frame times exclude optical flow preparation and exposed waits. Optical engine work overlapping interpolation is not counted twice.");
         }
         ImGui::TextWrapped(native_shader11()?"Shader time covers both eyes. Copy times are per copy. Runtime work is excluded.":
             "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.");

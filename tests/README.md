@@ -676,3 +676,24 @@ with two source proofs but only one submitted eye. It checks that Auto reaches
 full crop search and can then acquire a complete pair, while incomplete pairs
 never publish a mapping and manually selected corners never escalate. This
 changes failure accounting only; it does not defer or combine eye captures.
+
+# Combined FG methods and optical timing
+
+Center and periphery share menu IDs: 0 DLSS Frame Generation, 1-3 DLSS Vectors
+(simple warping, bidirectional, confidence-guided), 4-6 Optical Flow (the same
+three reconstruction choices), 7-9 Optical Flow + DLSS Depth (the same three choices), and 10 Previous frame
+(periphery only). Old method IDs are not migrated.
+
+`CheekyOpenXRBindingTests --fg-methods` compares generated D3D11/D3D12 pixels
+for all DLSS-vector reconstruction choices, foveation and interpolation phases.
+`--fg-optical quick` checks all optical reconstruction/depth combinations on
+NVIDIA hardware, including 2x/3x/4x phases, translation, occlusions, head rotation,
+and the separate optical preparation/exposed-wait GPU scope. The full optical
+case also sweeps presets and vector grids. No headset is needed.
+
+`python tests/uevr_menu_tests.py --fg-center` checks menu selection/IDs in LuaJIT
+and Lua 5.4. The full menu test additionally checks independent optical timing
+rows and fallback labels for older layers. The V2 timing export removes optical
+preparation/exposed waits from generated frame 1; V1 remains inclusive. GPU work
+that overlaps optical estimation is not counted twice, and profiling adds no
+GPU waits or submissions.

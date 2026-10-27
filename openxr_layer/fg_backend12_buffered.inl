@@ -648,7 +648,7 @@ struct BufferedBackend12 final : FrameBackend {
                 if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;}
                 if(camera_pair_valid&&pair.generated_count==1&&job->direct_output_mode&&!blocked_direct){
                     const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
-                        return (g.peripheral_method<=2||cheeky_fg_optical(g.peripheral_method))&&(g.focus_width<.999f||g.focus_height<.999f);});
+                        return (g.peripheral_method==cheeky_fg_previous||cheeky_fg_shader(g.peripheral_method))&&(g.focus_width<.999f||g.focus_height<.999f);});
                     if(supported){
                         direct_job=std::make_shared<DirectRequest>();direct_job->epoch=job->epoch;direct_job->native_id=previous->id;
                         direct_job->previous=previous->color;direct_job->format=owner.worker.focus.color_format;direct_job->width=owner.worker.width;direct_job->height=owner.worker.height;

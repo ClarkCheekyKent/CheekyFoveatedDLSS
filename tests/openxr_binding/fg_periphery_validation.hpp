@@ -122,7 +122,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     cheeky::fg::Camera camera{};camera.clip_to_prev=cheeky::fg::identity();
     cheeky::fg::Transport publication;check(publication.initialize(device,queue),"Direct composition publication pool");
     for(unsigned method=0;method<3;++method) {
-        begin();guides.peripheral_method=method;
+        begin();guides.peripheral_method=method==0?cheeky_fg_previous:method;
         // Supply no depth in simple warp and no guides at all in previous mode.
         guides.depth=method==2?depth.Get():nullptr;guides.motion=method?motion.Get():nullptr;
         check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Prepare only inputs used by the periphery mode");
@@ -217,7 +217,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         for(unsigned y=0;y<64;++y)memcpy(pixels.data()+y*64*4,static_cast<unsigned char*>(data)+fp.Offset+y*fp.Footprint.RowPitch,64*8);
         readback->Unmap(0,nullptr);return pixels;};
     for(unsigned method=0;method<3;++method)for(float feather:{0.f,.04f,.16f}){
-        layout.feather=feather;guides.peripheral_method=method;guides.depth=depth.Get();guides.motion=motion.Get();begin();
+        layout.feather=feather;guides.peripheral_method=method==0?cheeky_fg_previous:method;guides.depth=depth.Get();guides.motion=motion.Get();begin();
         check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Compact periphery preparation");
         check(pipeline.generate_periphery(device,list.Get(),0,previous.Get(),current.Get(),guides,camera),"Complete context reference");
         auto* compact_center=pipeline.inputs[0][0].color.Get();
@@ -236,7 +236,7 @@ void fg_periphery_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     }
     std::cout<<"PASS direct compact periphery: all three custom modes, asymmetric crop, three feather widths, exact center/context copies, XR reconstruction matches every reference pixel with NaN-poisoned interior\n";
     auto final_image=make_output(64,64,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS|D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    for(unsigned method=0;method<3;++method){guides.peripheral_method=method;begin();
+    for(unsigned method=0;method<3;++method){guides.peripheral_method=method==0?cheeky_fg_previous:method;begin();
         check(pipeline.prepare_inputs(device,list.Get(),0,1,current.Get(),guides,full,32,32),"Final-image periphery preparation");
         auto* small_center=pipeline.inputs[0][0].color.Get();
         cheeky::fg::FocusPipeline::FinalOutput final{small_center,{13,9,32,32,.04f,true},64,64,false,false};

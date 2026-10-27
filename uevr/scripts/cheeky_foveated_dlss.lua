@@ -159,6 +159,26 @@ local function combo(label, key, values, order)
     if changed then draft[key], dirty[key], ready_edits[key] = value, value, value end
 end
 local function text(s) imgui.text(tostring(s)) end
+local function fg_optical(method)
+    return method ~= nil and method >= 4 and method <= 9
+end
+local function fg_method_combo(label, key, periphery)
+    local values = {
+        [0] = "DLSS Frame Generation",
+        [1] = "DLSS Vectors - Simple Warping",
+        [2] = "DLSS Vectors - Bidirectional Interpolation",
+        [3] = "DLSS Vectors - Confidence-Guided Interpolation",
+        [4] = "Optical Flow - Simple Warping",
+        [5] = "Optical Flow - Bidirectional Interpolation",
+        [6] = "Optical Flow - Confidence-Guided Interpolation",
+        [7] = "Optical Flow + DLSS Depth - Simple Warping",
+        [8] = "Optical Flow + DLSS Depth - Bidirectional Interpolation",
+        [9] = "Optical Flow + DLSS Depth - Confidence-Guided Interpolation"
+    }
+    local order = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+    if periphery then values[10] = "Previous frame"; order[#order + 1] = 10 end
+    combo(label, key, values, order)
+end
 local function donate_button()
     -- Do not remove this donation button or change its original destination when
     -- this project is forked or integrated into another project.
@@ -660,19 +680,14 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
             end
             local dx11 = status.renderer == 0
-            local native_shader11 = dx11 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) ~= 3)
+            local native_shader11 = dx11 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) ~= 0)
             local percent = {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"}
             section("Foveation")
             if draft.FgCenterMethod ~= nil then
-                combo("FG center method", "FgCenterMethod", {[0]="DLSS", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [4]="NVIDIA Optical Flow", [5]="NVIDIA Optical Flow + DLSS depth"})
+                fg_method_combo("FG center method", "FgCenterMethod", false)
             end
             local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
             local optical_grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
-            if draft.FgCenterMethod == 4 or draft.FgCenterMethod == 5 then
-                if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
-                if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
-                if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
-            end
             if draft.FgResolutionPercent ~= nil then combo("FG scale", "FgResolutionPercent", percent) end
             check("Foveated frame generation", "FgFoveated")
             if draft.FgFoveated then
@@ -688,16 +703,21 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgPeripheralPercent ~= nil then
                     combo("FG periphery scale", "FgPeripheralPercent", percent)
-                    combo("FG periphery method", "FgPeripheralMethod", {[0]="Previous frame", [1]="Simple motion-vector warping", [2]="Bidirectional interpolation", [3]="DLSS", [4]="NVIDIA Optical Flow", [5]="NVIDIA Optical Flow + DLSS depth"})
-                    if draft.FgPeripheralMethod == 4 or draft.FgPeripheralMethod == 5 then
-                        if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
-                        if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
-                        if draft.FgOpticalPeripheralGrid ~= nil then combo("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", optical_grids) end
-                    end
+                    fg_method_combo("FG periphery method", "FgPeripheralMethod", true)
                 end
                 if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end
             end
             if imgui.tree_node("Advanced settings") then
+                if fg_optical(draft.FgCenterMethod) then
+                    if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
+                    if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
+                    if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
+                end
+                if draft.FgFoveated and fg_optical(draft.FgPeripheralMethod) then
+                    if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
+                    if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
+                    if draft.FgOpticalPeripheralGrid ~= nil then combo("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", optical_grids) end
+                end
                 if draft.FgForceReflexOff ~= nil then
                     check("Force NVIDIA Reflex off", "FgForceReflexOff")
                     if draft.FgForceReflexOff then
@@ -733,8 +753,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if native_shader11 then
                     text("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.")
                 elseif draft.FgQueuePriority ~= nil then
-                    local flow_queue = draft.FgCenterMethod == 4 or draft.FgCenterMethod == 5 or
-                        (draft.FgFoveated and (draft.FgPeripheralMethod == 4 or draft.FgPeripheralMethod == 5))
+                    local flow_queue = fg_optical(draft.FgCenterMethod) or
+                        (draft.FgFoveated and fg_optical(draft.FgPeripheralMethod))
                     if flow_queue then
                         combo("FG GPU queue", "FgQueuePriority", {[2]="Shared game queue", [1]="Separate HIGH queue"})
                     else
@@ -865,13 +885,19 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     local batch = fg.batch_timing
                     if batch and batch.supported and batch.valid then
                         local batch_rows = {{"Whole batch incl. output copies (per real frame)", gpu_ms(batch.batch_ms, batch.batch_last_ms)}}
+                        if batch.optical_separated and (batch.optical_regions or 0) > 0 then
+                            batch_rows[#batch_rows+1] = {"Optical flow preparation + exposed waits (per real frame)", gpu_ms(batch.optical_ms, batch.optical_last_ms)}
+                        end
                         for _, phase in ipairs(batch.phases or {}) do
                             local label = "Generated stereo frame " .. tostring(phase.index or "?")
-                            if phase.index == 1 and (batch.optical_regions or 0) > 0 then label = label .. " (includes optical flow)" end
+                            if phase.index == 1 and (batch.optical_regions or 0) > 0 and not batch.optical_separated then label = label .. " (includes optical flow)" end
                             batch_rows[#batch_rows+1] = {label, gpu_ms(phase.ms, phase.last_ms)}
                         end
                         rows("fg_batch_timings", batch_rows)
                         text("Batch and generated-frame times cover both eyes, including composition and output copies. Capture, XR uploads and pacing are excluded.")
+                        if batch.optical_separated and (batch.optical_regions or 0) > 0 then
+                            text("Generated-frame times exclude optical flow preparation and exposed waits. Optical engine work overlapping interpolation is not counted twice.")
+                        end
                     end
                     text(native_shader11 and "Shader time covers both eyes. Copy times are per copy. Runtime work is excluded." or
                         "Stage samples use different frame cadences and can overlap. Their sum is not total frame time; compositor work is excluded.")

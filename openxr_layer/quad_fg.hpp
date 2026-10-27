@@ -247,7 +247,7 @@ public:
             g.jitter_x=g.jitter_y=g.jitter_correction_x=g.jitter_correction_y=0;g.motion_jittered=0;g.prepared_guides=0;
             g.focus_width=insets[eye][2];g.focus_height=insets[eye][3];g.focus_x=insets[eye][0]+g.focus_width*.5f-.5f;g.focus_y=insets[eye][1]+g.focus_height*.5f-.5f;
             g.focus_feather=2.f/std::min(widths[eye],heights[eye]);
-            if(g.peripheral_method==3)g.peripheral_method=2;g.peripheral_depth=g.peripheral_motion=nullptr;
+            if(g.peripheral_method==0)g.peripheral_method=2;g.peripheral_depth=g.peripheral_motion=nullptr;
             g.reset=reset||selected[eye]->metadata.meta.reset||selected[eye+2]->metadata.meta.reset;g.configuration=configuration;
         }}
         diagnostics.assembly_stage=3;if(!execute()||!bridge.from11())return {};

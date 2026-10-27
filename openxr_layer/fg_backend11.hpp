@@ -200,9 +200,9 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         // Snapshot only what the selected methods read: simple warping needs no
         // depth, and the optical flow methods estimate their own motion.
         const bool focused=g.focus_width<.999f||g.focus_height<.999f;
-        const unsigned center=g.center_method,periphery=focused?g.peripheral_method:0u;
-        const bool need_depth=center==2||center==5||periphery==2||periphery==5;
-        const bool need_motion=center==1||center==2||periphery==1||periphery==2;
+        const unsigned center=g.center_method,periphery=focused?g.peripheral_method:cheeky_fg_previous;
+        const bool need_depth=cheeky_fg_depth(center)||cheeky_fg_depth(periphery);
+        const bool need_motion=cheeky_fg_dlss_vectors(center)||cheeky_fg_dlss_vectors(periphery);
         if(!need_depth&&!need_motion)return false;
         if((need_depth&&df==DXGI_FORMAT_UNKNOWN)||(need_motion&&mf==DXGI_FORMAT_UNKNOWN))return false;
         const bool same=old&&old->source.meta.feature==g.feature&&old->source.generation==input.generation&&
@@ -356,8 +356,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
                     std::max(32u,unsigned(std::round(d.Height*rect[3]*scale*.01f))));
                 const auto quality=pass?g.optical.peripheral_preset:g.optical.center_preset;
                 // The guide snapshot is already normalized to full-eye coordinates.
-                auto* depth=method==cheeky_fg_optical_depth?now.depth_srv.Get():nullptr;
-                if(method==cheeky_fg_optical_depth&&!depth){strcpy_s(diagnostic,"NVIDIA Optical Flow + depth: waiting for depth guides");return false;}
+                auto* depth=cheeky_fg_depth(method)?now.depth_srv.Get():nullptr;
+                if(cheeky_fg_depth(method)&&!depth){strcpy_s(diagnostic,"NVIDIA Optical Flow + depth: waiting for depth guides");return false;}
                 params.flags[2]=depth?1.f:0.f;params.flags[3]=float(g.depth_inverted);
                 optical::pose_mapping(params,previous_views[eye].pose,previous_views[eye].fov,current_views[eye].pose,current_views[eye].fov,fraction);
                 if(!submit_shader([&](ID3D11DeviceContext* context){

@@ -17,7 +17,7 @@ struct CheekyFgShaderSource11V1 {
 };
 using CheekyFgShaderObserve11Fn=bool(__cdecl*)(const CheekyFgShaderSource11V1*);
 inline bool cheeky_fg_shader_only(unsigned center,unsigned periphery,bool foveated) noexcept {
-    return (center==1||center==2||cheeky_fg_optical(center))&&(!foveated||periphery<=2||cheeky_fg_optical(periphery));
+    return cheeky_fg_shader(center)&&(!foveated||periphery==cheeky_fg_previous||cheeky_fg_shader(periphery));
 }
 // Color-only metadata comes from settings, rather than a captured NGX evaluation.
 struct CheekyFgColorOptionsV1 {

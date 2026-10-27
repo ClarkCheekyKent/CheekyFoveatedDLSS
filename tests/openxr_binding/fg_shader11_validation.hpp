@@ -80,7 +80,7 @@ inline CheekyFgShaderSource11V1 source(unsigned eye,unsigned method,ID3D11Textur
     CheekyFgShaderSource11V1 s;s.eye=eye;s.session_generation=7;s.mapping_revision=3;s.generation=1;
     s.context=context.Get();s.depth=depth;s.motion=motion;auto& g=s.meta;g.feature=200+eye;
     g.width=g.height=g.depth_width=g.depth_height=g.motion_width=g.motion_height=64;g.configuration=55;
-    g.focus_width=g.focus_height=.5f;g.center_method=method;g.peripheral_method=0;g.resolution_percent=g.peripheral_percent=100;return s;
+    g.focus_width=g.focus_height=.5f;g.center_method=method;g.peripheral_method=cheeky_fg_previous;g.resolution_percent=g.peripheral_percent=100;return s;
 }
 inline std::array<XrCompositionLayerProjectionView,2> eye_views(XrSwapchain left,XrSwapchain right){
     std::array<XrCompositionLayerProjectionView,2> views;

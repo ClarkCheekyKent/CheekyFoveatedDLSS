@@ -207,7 +207,7 @@ def run(engine):
     receive(state)
     draw()
     if "--fg-center" in sys.argv:
-        for method in (1, 2, 4, 5, 0):
+        for method in range(10):
             draw(changes={"FG center method": method})
             assert f"FgCenterMethod={method}" in last()
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
@@ -223,9 +223,9 @@ def run(engine):
         assert g["values"]["FG center method"] == 2
         assert g["values"]["FG periphery method"] == 1
         assert g["values"]["FG GPU queue"] is None
-        assert g["values"]["Release game rendering"] == state["settings"]["FgReleasePoint"]
+        assert g["values"]["Release game rendering"] == [5,0,4,8,1,2,6,7,3].index(state["settings"]["FgReleasePoint"])
         assert not any("Native D3D11: shader FG" in text for text in g.drawn.values())
-        state["settings"]["FgPeripheralMethod"] = 3
+        state["settings"]["FgPeripheralMethod"] = 0
         receive(state)
         draw()
         assert g["values"]["FG GPU queue"] is not None
@@ -247,7 +247,7 @@ def run(engine):
             state["settings"][key] = value
             receive(state)
         # The depth-assisted variant keeps the same optical flow controls.
-        state["settings"].update(FgCenterMethod=5, FgPeripheralMethod=5)
+        state["settings"].update(FgCenterMethod=9, FgPeripheralMethod=9)
         receive(state)
         draw()
         assert g["values"]["Center optical flow preset"] == 0
@@ -259,12 +259,12 @@ def run(engine):
         print("PASS FG center menu:", engine)
         return
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
-    assert g["values"]["Release game rendering"] == 3
+    assert g["values"]["Release game rendering"] == 8
     for retired in ("Submit repeat frames", "FG color capture", "FG OpenXR uploads", "FG guide capture",
                     "FG frame storage", "Direct periphery shading", "FG diagnostic mode", "FG periphery depth"):
         assert g["values"][retired] is None, "Fixed FG option must not be drawn: " + retired
     assert g.tree_parents["Advanced settings"] == "DLSS-FG (experimental)"
-    assert g.tree_parents["Advanced settings"] is not None and g["values"]["FG pacing clock"] is not None
+    assert g.tree_parents["Advanced settings"] is not None and g["values"]["FG pacing clock"] is None
     assert "FG resource memory breakdown##fg" not in g.trees, "GPU memory belongs to Performance, not the FG menu"
     state["gpu_memory"] = {"supported":True,"scope":"process","adapter":"Test GPU","dedicated_capacity_bytes":12288*1048576,
         "local":{"valid":True,"usage_bytes":9000*1048576,"budget_bytes":8192*1048576,"headroom_bytes":0,
@@ -312,7 +312,10 @@ def run(engine):
     receive(state)
     draw()
     assert g.combos["FG GPU queue"][2] == "Shared game queue"
-    for option in (2, 0, 1):
+    state["settings"]["FgCenterMethod"] = 4
+    receive(state)
+    draw()
+    for option in (2, 1):
         draw(changes={"FG GPU queue": option})
         assert "FgQueuePriority=" + str(option) in last()
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
@@ -321,13 +324,13 @@ def run(engine):
         draw()
         assert g["values"]["FG GPU queue"] == option
     for point in (1, 2, 3, 4, 5, 0):
-        draw(changes={"Release game rendering": point})
+        draw(changes={"Release game rendering": [5,0,4,8,1,2,6,7,3].index(point)})
         assert "FgReleasePoint=" + str(point) in last()
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
         state["settings"]["FgReleasePoint"] = point
         receive(state)
         draw()
-        assert g["values"]["Release game rendering"] == point
+        assert g["values"]["Release game rendering"] == [5,0,4,8,1,2,6,7,3].index(point)
     assert any("Generating frames" in t for t in g.drawn.values())
     for label, key in (("FG latency diagnostics","FgLatencyDiagnostics"),):
         for option in (1,0):
@@ -393,6 +396,14 @@ def run(engine):
                   "Generated stereo frame 2", "Generated stereo frame 3", "7.200 / 7.000", "5.000 / 4.800"):
         assert label in list(g.drawn.values()), "Missing distinct batch/phase scope: " + label
     assert len(g.sent) == count, "Reading batch timings must not change settings"
+    state["fg"]["batch_timing"].update(optical_separated=True, optical_ms=4.0, optical_last_ms=3.8)
+    state["fg"]["batch_timing"]["phases"][0].update(ms=1.0, last_ms=1.0)
+    receive(state)
+    draw()
+    for label in ("Optical flow preparation + exposed waits (per real frame)", "4.000 / 3.800", "Generated stereo frame 1"):
+        assert label in list(g.drawn.values()), "Missing separate optical reconstruction timing: " + label
+    assert "Generated stereo frame 1 (includes optical flow)" not in list(g.drawn.values())
+    assert len(g.sent) == count, "Reading separate optical timings must not change settings"
     state["fg"]["batch_timing"]["valid"] = False
     receive(state)
     draw()
@@ -457,7 +468,7 @@ def run(engine):
     for label,key,value in (("FG scale","FgResolutionPercent",50),
                             ("FG periphery scale","FgPeripheralPercent",25),
                             ("FG center method","FgCenterMethod",2),
-                            ("FG periphery method","FgPeripheralMethod",3)):
+                            ("FG periphery method","FgPeripheralMethod",0)):
         draw(changes={label:value})
         assert f"{key}={value}" in last(), "FG control must send its actual setting: " + label
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
