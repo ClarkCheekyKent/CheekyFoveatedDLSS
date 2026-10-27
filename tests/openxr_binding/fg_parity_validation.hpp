@@ -98,7 +98,8 @@ struct D3D12 {
 
 // D3D12 shader-FG stages as the buffered backend uses them for one eye.
 inline std::vector<std::uint32_t> generate12(D3D12& gpu,cheeky::fg::FocusPipeline& pipeline,unsigned eye,
-    const std::array<Frame,2>& frames,unsigned center,unsigned periphery,bool foveated,float fraction=.5f){
+    const std::array<Frame,2>& frames,unsigned center,unsigned periphery,bool foveated,float fraction=.5f,
+    const cheeky::fg::Camera* supplied_camera=nullptr){
     using namespace cheeky::fg;
     pipeline.interpolation_fraction=fraction;
     std::array<ComPtr<ID3D12Resource>,2> color,depth,motion;
@@ -115,7 +116,7 @@ inline std::vector<std::uint32_t> generate12(D3D12& gpu,cheeky::fg::FocusPipelin
     prepare(0);check(pipeline.save_depth(gpu.device.Get(),gpu.list.Get(),eye,0)&&pipeline.save_depth(gpu.device.Get(),gpu.list.Get(),eye,1),"Parity D3D12 depth history");
     gpu.execute();pipeline.history[eye]=pipeline.center_history[eye]=true;
     prepare(1);
-    Camera camera{};camera.clip_to_prev=identity();
+    Camera camera{};camera.clip_to_prev=identity();if(supplied_camera)camera=*supplied_camera;
     if(foveated)check(pipeline.generate_periphery(gpu.device.Get(),gpu.list.Get(),eye,color[0].Get(),color[1].Get(),g,camera,
         D3D12_RESOURCE_STATE_COMMON,nullptr,D3D12_RESOURCE_STATE_COMMON,nullptr,nullptr,&region),"Parity D3D12 center dispatch");
     check(pipeline.generate_periphery(gpu.device.Get(),gpu.list.Get(),eye,color[0].Get(),color[1].Get(),g,camera),"Parity D3D12 periphery dispatch");
@@ -124,7 +125,9 @@ inline std::vector<std::uint32_t> generate12(D3D12& gpu,cheeky::fg::FocusPipelin
     gpu.execute();return gpu.read(pipeline.full[eye].Get());
 }
 
-inline std::array<std::vector<std::uint32_t>,2> generate11(const std::array<std::array<Frame,2>,2>& scene,unsigned center,unsigned periphery,bool foveated,float fraction=.5f){
+inline std::array<std::vector<std::uint32_t>,2> generate11(const std::array<std::array<Frame,2>,2>& scene,unsigned center,unsigned periphery,bool foveated,float fraction=.5f,
+    const std::array<XrCompositionLayerProjectionView,2>* previous_views=nullptr,
+    const std::array<XrCompositionLayerProjectionView,2>* current_views=nullptr){
     using namespace shader11_fixture;using namespace cheeky::fg;
     Backend11 b;check(b.initialize(device.Get(),7,nullptr),b.diagnostic);
     auto upload=[&](DXGI_FORMAT format,const void* data,unsigned texel){D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=size;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;
@@ -142,7 +145,7 @@ inline std::array<std::vector<std::uint32_t>,2> generate11(const std::array<std:
             check(colors[f][eye]&&b.observe(s),"Parity D3D11 capture");}
         check(b.take_guides(guides[f]),"Parity D3D11 guide interval");}
     check(!guides[1][0]->source.meta.reset,"Parity D3D11 keeps history");
-    std::array<Image,2> generated;check(b.generate(colors[0],colors[1],guides[0],guides[1],views,views,generated,false,fraction),"Parity D3D11 interpolation");
+    std::array<Image,2> generated;check(b.generate(colors[0],colors[1],guides[0],guides[1],previous_views?*previous_views:views,current_views?*current_views:views,generated,false,fraction),"Parity D3D11 interpolation");
     std::array<std::vector<std::uint32_t>,2> out;
     for(unsigned eye=0;eye<2;++eye){auto* t=generated[eye]->texture11.Get();D3D11_TEXTURE2D_DESC d{};t->GetDesc(&d);
         d.Usage=D3D11_USAGE_STAGING;d.CPUAccessFlags=D3D11_CPU_ACCESS_READ;d.BindFlags=d.MiscFlags=0;

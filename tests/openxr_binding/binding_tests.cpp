@@ -1154,6 +1154,7 @@ void diagnostic_lifetime_test() {
 #include "quad_role_mapping_validation.hpp"
 #include "fg_shader11_validation.hpp"
 #include "fg_parity_validation.hpp"
+#include "fg_confidence_validation.hpp"
 #include "fg_optical_validation.hpp"
 #include "fg_shader11_ngx_probe.hpp"
 #include "fg_shader11_nvapi_probe.hpp"
@@ -1170,6 +1171,7 @@ int main(int argc,char** argv) {
         if(argc>1&&std::string(argv[1])=="--fg-latest-interval") {fg_latest_interval_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-capture-release") {fg_capture_release_validation();fg_pipelined_capture_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-release-watchdog") {fg_release_watchdog_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-confidence-motion") {fg_confidence_motion_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-methods") {fg_cross_api_parity();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-cache") {fg_optical_cache_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation(argc>2&&std::string(argv[2])=="quick");return 0;}

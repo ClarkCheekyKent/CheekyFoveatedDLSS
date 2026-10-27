@@ -679,6 +679,14 @@ changes failure accounting only; it does not defer or combine eye captures.
 
 # Combined FG methods and optical timing
 
+`CheekyOpenXRBindingTests --fg-confidence-motion` checks confidence-guided
+camera-motion reconstruction on D3D11 and D3D12 WARP. A translating edge with
+partial/rejected previous-depth confidence must appear only at its interpolated
+position. A textured plane rendered under yaw and pitch must follow the known
+intermediate camera. Regular/Fast confidence modes and bidirectional (as a
+control) are checked using matched motion vectors and camera poses. This does
+not validate the vectors, depth or pose synchronization captured from MSFS.
+
 Center and periphery share menu IDs: 0 DLSS Frame Generation; 1-4 DLSS Vectors
 (simple, bidirectional, confidence-guided, fast confidence-guided); 5-8 Optical
 Flow; 9-12 Optical Flow + DLSS Depth; and 13 Previous frame (periphery only).

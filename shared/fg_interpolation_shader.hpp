@@ -26,12 +26,16 @@ float depthAt(Texture2D<float> image,float2 uv){
 }
 // Game vectors provide one direction. Confidence is derived from trajectory
 // convergence and depth agreement, not fabricated optical matching costs.
-float trajectory(float2 uv,float2 seed,float2 pixels,out float2 cuv,out float2 puv,bool fast){
- cuv=seed;puv=uv;float2 mv=0;
+float trajectory(float2 uv,float2 seed,float2 pixels,out float2 cuv,out float2 puv,out bool currentValid,bool fast){
+ cuv=seed;puv=uv;currentValid=false;float2 mv=0;
  [unroll]for(uint i=0;i<4;++i){if(fast&&i>=2)break;if(!inside(cuv)||!motionAt(cuv,mv))return 0;cuv=uv-(1-Options.y)*mv;}
  if(!inside(cuv)||!motionAt(cuv,mv))return 0;puv=cuv+mv;
- if(!inside(puv)||(GuideOffset.w>.5&&!inside(guideUV(puv))))return 0;
  float residual=length((cuv+(1-Options.y)*mv-uv)*pixels);
+ if(!isfinite(residual)||residual>=2)return 0;
+ // A converged current-frame trajectory is still usable when previous depth
+ // rejects the correspondence or the previous endpoint is outside its crop.
+ currentValid=true;
+ if(!inside(puv)||(GuideOffset.w>.5&&!inside(guideUV(puv))))return 0;
  float z=depthAt(Depth,cuv),old=depthAt(PreviousDepth,puv);
  float4 clip=mul(ClipToPrevious,float4(cuv.x*2-1,1-cuv.y*2,z,1));
  if(!isfinite(z)||!isfinite(old)||!all(isfinite(clip))||clip.w<=1e-6)return 0;
@@ -39,18 +43,21 @@ float trajectory(float2 uv,float2 seed,float2 pixels,out float2 cuv,out float2 p
  return saturate(1-residual/2)*saturate(1-error/.02);
 }
 float4 confidenceInterpolation(float2 uv,uint w,uint h,bool fast){
- float2 cuv,puv;float best=trajectory(uv,uv,float2(w,h),cuv,puv,fast);
+ float2 cuv,puv;bool currentValid;float best=trajectory(uv,uv,float2(w,h),cuv,puv,currentValid,fast);
  [branch]if(!fast&&best<.5){
   uint mw,mh;Motion.GetDimensions(mw,mh);float2 stepUV=1/float2(mw,mh);if(GuideOffset.w>.5)stepUV*=Rect.zw;
   [loop]for(int y=-1;y<=1;++y)[loop]for(int x=-1;x<=1;++x){
-   float2 c,p;float score=trajectory(uv,uv+float2(x,y)*stepUV,float2(w,h),c,p,fast);
-   if(score>best){best=score;cuv=c;puv=p;}
+   float2 c,p;bool candidateValid;float score=trajectory(uv,uv+float2(x,y)*stepUV,float2(w,h),c,p,candidateValid,fast);
+   if(score>best||(!currentValid&&candidateValid)){best=score;cuv=c;puv=p;currentValid=candidateValid;}
   }
  }
- float4 fallback=samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel);
- if(best<=0)return encodeColor(fallback);
- float4 a=samplePacked(Previous,puv,PriorCrop,PriorSpans,AtlasTexel),b=samplePacked(Current,cuv,AtlasCrop,AtlasSpans,AtlasTexel);
- return encodeColor(lerp(fallback,lerp(a,b,Options.y),best));
+ float4 now=samplePacked(Current,currentValid?cuv:uv,AtlasCrop,AtlasSpans,AtlasTexel);
+ if(best<=0)return encodeColor(now);
+ // Confidence controls the previous endpoint's contribution. Both colors
+ // must be warped to the requested phase: crossfading with Current(uv)
+ // creates a second scene position whenever the camera or an object moves.
+ float4 old=samplePacked(Previous,puv,PriorCrop,PriorSpans,AtlasTexel);
+ return encodeColor(lerp(now,old,(1-Options.y)*best));
 }
 float4 interpolateAt(float2 uv,uint w,uint h,float method){
  if(Options.z<.5)return encodeColor(samplePacked(Current,uv,AtlasCrop,AtlasSpans,AtlasTexel));
