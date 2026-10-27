@@ -276,6 +276,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             // the new history, after all earlier queue consumers have run.
             phase_focus.previous_depth[eye]=this->focus.previous_depth[eye];
             phase_focus.previous_center_depth[eye]=this->focus.previous_center_depth[eye];
+            phase_focus.previous_center_depth_rect[eye]=this->focus.previous_center_depth_rect[eye];
             phase_focus.history[eye]=this->focus.history[eye];phase_focus.center_history[eye]=this->focus.center_history[eye];
             for(unsigned pass=0;pass<2;++pass){
                 phase_focus.borrowed_optical[eye][pass]=&this->focus.optical_session(eye,pass);
@@ -688,8 +689,11 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
                 phase_timing.stamp(commands,query+2);
                 if(g.center_method) {
                     const auto& last=phase_features[eye];
+                    // Gaze movement changes the depth crop's origin. Preserve
+                    // history and sample it with its saved rectangle; newly
+                    // uncovered pixels fall back to the warped current frame.
                     phase_focus.center_history[eye]=phase_focus.center_history[eye]&&!g.reset&&last.evaluated_crop_valid&&
-                        last.evaluated_crop.x==rect.x&&last.evaluated_crop.y==rect.y&&last.evaluated_crop.w==rect.w&&last.evaluated_crop.h==rect.h;
+                        last.evaluated_crop.w==rect.w&&last.evaluated_crop.h==rect.h;
                     good=phase_focus.generate_periphery(device.Get(),commands,eye,previous[eye],colors[eye],g,camera,input_color_state,
                         nullptr,D3D12_RESOURCE_STATE_COMMON,nullptr,nullptr,&rect);
                     for(unsigned mark=0;mark<4;++mark)phase_timing.ngx_stamp(commands,eye,mark);
@@ -867,6 +871,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         // phase-private preparation/output bindings stay with their allocators.
         this->focus.previous_depth[eye]=phase_focus.previous_depth[eye];
         this->focus.previous_center_depth[eye]=phase_focus.previous_center_depth[eye];
+        this->focus.previous_center_depth_rect[eye]=phase_focus.previous_center_depth_rect[eye];
     }
     // Existing timestamp data only: distinguish consistently expensive work
     // from occasional long elapsed intervals without changing the GPU schedule.

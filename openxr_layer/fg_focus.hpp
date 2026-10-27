@@ -14,6 +14,7 @@ DXGI_FORMAT depth_srv_format(DXGI_FORMAT) noexcept;
 DXGI_FORMAT motion_srv_format(DXGI_FORMAT) noexcept;
 struct FocusInput {
     ComPtr<ID3D12Resource> color,depth,motion,corrected_motion,recentered_color;
+    FocusRect depth_rect;
     unsigned output_width{},output_height{};
     bool borrowed_guides{};
 };
@@ -38,6 +39,7 @@ struct FocusPipeline {
     ComPtr<ID3D12Resource> peripheral_output[2],full[2],previous_depth[2];
     bool history[2]{};
     ComPtr<ID3D12Resource> center_output[2],previous_center_depth[2];
+    FocusRect previous_center_depth_rect[2];
     bool center_history[2]{};
     std::array<CompactLayout,2> color_layouts,previous_layouts;
     bool initialize(ID3D12Device*);

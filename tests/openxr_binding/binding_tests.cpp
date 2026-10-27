@@ -1171,6 +1171,7 @@ int main(int argc,char** argv) {
         if(argc>1&&std::string(argv[1])=="--fg-latest-interval") {fg_latest_interval_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-capture-release") {fg_capture_release_validation();fg_pipelined_capture_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-release-watchdog") {fg_release_watchdog_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-gaze-motion") {fg_gaze_motion_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-confidence-motion") {fg_confidence_motion_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-methods") {fg_cross_api_parity();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-cache") {fg_optical_cache_validation();return 0;}

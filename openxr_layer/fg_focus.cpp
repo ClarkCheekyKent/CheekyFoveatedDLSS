@@ -130,7 +130,7 @@ void FocusPipeline::reset() noexcept {
  for(auto& eye:optical)for(auto& session:eye)session.reset();
  root.Reset();prepare.Reset();peripheral.Reset();center_shader.Reset();compose.Reset();pack.Reset();recenter.Reset();descriptors.Reset();stride=0;
  for(auto& eye:inputs)for(auto& input:eye)input={};
- for(unsigned i=0;i<2;++i){peripheral_output[i].Reset();full[i].Reset();previous_depth[i].Reset();history[i]=false;center_output[i].Reset();previous_center_depth[i].Reset();center_history[i]=false;}
+ for(unsigned i=0;i<2;++i){peripheral_output[i].Reset();full[i].Reset();previous_depth[i].Reset();history[i]=false;center_output[i].Reset();previous_center_depth[i].Reset();previous_center_depth_rect[i]={};center_history[i]=false;}
 }
 bool FocusPipeline::initialize(ID3D12Device* dev){
  if(root&&prepare&&center_shader&&peripheral&&compose&&pack&&recenter&&descriptors)return true;
@@ -164,7 +164,7 @@ bool FocusPipeline::prepare_inputs(ID3D12Device* dev,ID3D12GraphicsCommandList* 
  const bool need_depth=cheeky_fg_depth(method)||(method==0);
  const bool prepared=g.prepared_guides!=0;
  const bool adjust_motion=pass==0&&(crop_motion_dx!=0.f||crop_motion_dy!=0.f);
- auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;
+ auto& s=inputs[eye][pass];s.output_width=w;s.output_height=h;s.depth_rect=r;
  if(cheeky_fg_optical(method)&&!cheeky_fg_depth(method)){s.depth.Reset();s.motion.Reset();return true;}
  if(s.borrowed_guides!=prepared){s.depth.Reset();s.motion.Reset();}
  s.borrowed_guides=prepared;
@@ -313,7 +313,9 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  if(need_depth&&(!prior_depth||prior_depth->GetDesc().Width!=s.depth->GetDesc().Width||
      prior_depth->GetDesc().Height!=s.depth->GetDesc().Height))valid_history=false;
  Constants c{};color_layouts[eye].constants(c.atlas_crop,c.atlas_spans,c.atlas_texel);float unused[4];previous_layouts[eye].constants(c.prior_crop,c.prior_spans,unused);c.options[0]=float(method);c.options[1]=interpolation_fraction;
- c.options[2]=(!need_depth||valid_history)&&!g.reset?1.f:0.f;c.previous=camera.clip_to_prev;
+ // 2 keeps motion warping active without trusting previous depth. Gaze/crop
+ // changes must not replace the generated center with an unwarped endpoint.
+ c.options[2]=g.reset?0.f:need_depth&&!valid_history?2.f:1.f;c.previous=camera.clip_to_prev;
  c.options[3]=srgb_color(current->GetDesc().Format)&&color_format==DXGI_FORMAT_R8G8B8A8_UNORM?1.f:0.f;
  auto* mv=need_motion?s.motion.Get():nullptr;auto* depth=need_depth?s.depth.Get():nullptr;
  auto* old=need_depth?(valid_history?prior_depth.Get():depth):nullptr;
@@ -327,6 +329,12 @@ bool FocusPipeline::generate_periphery(ID3D12Device* dev,ID3D12GraphicsCommandLi
  }else if(region){
   c.rect[0]=float(region->x)/g.width;c.rect[1]=float(region->y)/g.height;
   c.rect[2]=float(region->w)/g.width;c.rect[3]=float(region->h)/g.height;c.offset[3]=1.f;
+  // CenterMain does not use JitterCorrection's packing flags. Carry the old
+  // depth crop here without enlarging the 60-DWORD root constant block.
+  const auto& saved_rect=previous_center_depth_rect[eye];
+  const auto& before=valid_history&&saved_rect.w&&saved_rect.h?saved_rect:*region;
+  c.jitter[0]=float(before.x)/g.width;c.jitter[1]=float(before.y)/g.height;
+  c.jitter[2]=float(before.w)/g.width;c.jitter[3]=float(before.h)/g.height;
  }else if(destination){
   c.dimensions[3]=float(layout->center_height);
   c.rect[0]=float(layout->x)/layout->width;c.rect[1]=float(layout->y)/layout->height;
@@ -423,6 +431,7 @@ bool FocusPipeline::save_depth(ID3D12Device* dev,ID3D12GraphicsCommandList* list
  transition(list,source,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_SOURCE);
  transition(list,saved.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
  list->CopyResource(saved.Get(),source);
+ if(pass==0)previous_center_depth_rect[eye]=inputs[eye][pass].depth_rect;
  transition(list,saved.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COMMON);
  transition(list,source,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);return true;
 }

@@ -87,3 +87,62 @@ inline void fg_confidence_motion_validation(){
     device.Reset();context.Reset();
     std::cout<<"PASS confidence motion: partial/zero depth confidence, no doubled edge, yaw+pitch, regular/fast/bidirectional, D3D11/D3D12\n";
 }
+
+// Exercise the production worker, including the crop-history gate that a
+// direct shader fixture bypasses. Current and previous colors differ so a
+// false history rejection cannot pass by showing only a sharp current frame.
+inline void fg_gaze_motion_validation(){
+    using namespace cheeky::fg;using namespace fg_parity;
+    D3D12 gpu;
+    std::vector<std::uint32_t> a(size*size),b(size*size),jump(size*size);
+    std::vector<float> old_depth(size*size),next_depth(size*size),jump_depth(size*size);
+    std::vector<float> still(size*size*2),moving(size*size*2),jump_motion(size*size*2);
+    for(unsigned y=0;y<size;++y)for(unsigned x=0;x<size;++x){const auto i=y*size+x;
+        a[i]=rgba(x>=16&&x<24?255:0,0,0);b[i]=rgba(0,0,x>=32&&x<40?255:0);
+        jump[i]=rgba(0,0,x>=48&&x<56?255:0);
+        old_depth[i]=.15f+.005f*x+.003f*y;
+        next_depth[i]=.15f+.005f*(int(x)-16)+.003f*y;
+        jump_depth[i]=.15f+.005f*(int(x)-8)+.003f*y;
+        moving[i*2]=-16;jump_motion[i*2]=-8;
+    }
+    auto old_color=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,a.data(),4),now_color=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,b.data(),4),jump_color=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,jump.data(),4);
+    auto z0=gpu.texture(DXGI_FORMAT_R32_FLOAT,old_depth.data(),4),z1=gpu.texture(DXGI_FORMAT_R32_FLOAT,next_depth.data(),4),z2=gpu.texture(DXGI_FORMAT_R32_FLOAT,jump_depth.data(),4);
+    auto m0=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,still.data(),8),m1=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,moving.data(),8),m2=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,jump_motion.data(),8);gpu.execute();
+    auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));std::array<Camera,2> cameras;
+    for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye]);
+    for(unsigned method:{cheeky_fg_dlss_vectors_bidirectional,cheeky_fg_dlss_vectors_confidence,cheeky_fg_dlss_vectors_fast})for(unsigned scenario=0;scenario<3;++scenario){
+        Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),size,size,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
+        CheekyFgPair guides;guides.producer_queue=gpu.queue.Get();
+        for(unsigned eye=0;eye<2;++eye){auto& g=guides.eyes[eye];g.width=g.height=g.depth_width=g.depth_height=g.motion_width=g.motion_height=size;
+            g.center_method=method;g.peripheral_method=cheeky_fg_previous;g.focus_width=g.focus_height=.5f;
+            const unsigned x=scenario?0:eye?4:8,y=eye?20:16;
+            g.focus_x=(float(x)-16)/size;g.focus_y=(float(y)-16)/size;
+            g.resolution_percent=g.peripheral_percent=100;g.depth=z0.Get();g.motion=m0.Get();g.reset=1;g.configuration=1;
+        }
+        std::array<ID3D12Resource*,2> before{old_color.Get(),old_color.Get()},warm=before,out;
+        check(worker.generate(guides,warm,before,cameras,out),worker.diagnostic);
+        const auto saved0=worker.focus.previous_center_depth_rect[0],saved1=worker.focus.previous_center_depth_rect[1];
+        for(unsigned eye=0;eye<2;++eye){auto& g=guides.eyes[eye];
+            const unsigned x=scenario?32:eye?16:20,y=eye?12:8;
+            g.focus_x=(float(x)-16)/size;g.focus_y=(float(y)-16)/size;
+            g.depth=scenario?z2.Get():z1.Get();g.motion=scenario?m2.Get():m1.Get();g.reset=0;
+            if(scenario==2)worker.focus.center_history[eye]=false;
+        }
+        std::array<ID3D12Resource*,2> current{scenario?jump_color.Get():now_color.Get(),scenario?jump_color.Get():now_color.Get()};
+        for(unsigned phase=1;phase<=2;++phase){const float t=float(phase)/3;
+            check(worker.generate(guides,current,before,cameras,out,nullptr,nullptr,nullptr,nullptr,2,phase),worker.diagnostic);
+            for(unsigned eye=0;eye<2;++eye){const auto pixels=gpu.read(out[eye]);
+                const unsigned x=scenario?unsigned(std::round(48-8*(1-t)+3)):unsigned(std::round(16+16*t+3));
+                const auto pixel=pixels[24*size+x];const int red=int(pixel&255),blue=int((pixel>>16)&255);
+                const int expected_red=scenario?0:int(std::round(255*(1-t))),expected_blue=scenario?255:int(std::round(255*t));
+                if(std::abs(red-expected_red)>2||std::abs(blue-expected_blue)>2)
+                    std::cout<<"Gaze method="<<method<<" scenario="<<scenario<<" phase="<<phase<<" eye="<<eye<<" red/blue="<<red<<'/'<<blue<<" expected="<<expected_red<<'/'<<expected_blue<<'\n';
+                check(std::abs(red-expected_red)<=2&&std::abs(blue-expected_blue)<=2,
+                    "Moving gaze must preserve correctly mapped history; uncovered or unavailable history must use phase-warped current color");
+            }
+            if(phase==1)check(worker.focus.previous_center_depth_rect[0].x==saved0.x&&worker.focus.previous_center_depth_rect[1].y==saved1.y,
+                "Every generated phase keeps the previous native depth crop immutable");
+        }
+    }
+    std::cout<<"PASS moving-gaze worker: bidirectional/regular/fast, both eyes/axes, old crop depth mapping, uncovered and missing history, both 3x phases\n";
+}

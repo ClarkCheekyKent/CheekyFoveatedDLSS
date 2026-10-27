@@ -20,9 +20,16 @@ float4 samplePacked(Texture2D<float4> image,float2 uv,float4 crop,float4 spans,f
 float4 encodeColor(float4 c){if(Options.w>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));return c;}
 bool inside(float2 p){return all(isfinite(p))&&all(p>=0)&&all(p<=1);}
 float2 guideUV(float2 uv){return GuideOffset.w>.5?(uv-Rect.xy)/Rect.zw:uv;}
+// Cropped previous depth belongs to its own gaze rectangle, not today's one.
+// Native D3D11 and periphery depth are full-eye and keep identity coordinates.
+float2 previousGuideUV(float2 uv){return GuideOffset.w>.5?(uv-JitterCorrection.xy)/JitterCorrection.zw:uv;}
 bool motionAt(float2 uv,out float2 mv){uv=guideUV(uv);uint w,h;Motion.GetDimensions(w,h);if(GuideOffset.w>.5&&!inside(uv)){mv=0;return false;}mv=Motion.Load(int3(min(uint2(saturate(uv)*float2(w,h)),uint2(w,h)-1),0));if(GuideOffset.w>.5)mv*=Rect.zw;return all(isfinite(mv))&&all(abs(mv)<=2);}
 float depthAt(Texture2D<float> image,float2 uv){
  uint w,h;image.GetDimensions(w,h);return image.Load(int3(min(uint2(saturate(guideUV(uv))*float2(w,h)),uint2(w,h)-1),0));
+}
+float previousDepthAt(float2 uv){
+ uint w,h;PreviousDepth.GetDimensions(w,h);
+ return PreviousDepth.Load(int3(min(uint2(saturate(previousGuideUV(uv))*float2(w,h)),uint2(w,h)-1),0));
 }
 // Game vectors provide one direction. Confidence is derived from trajectory
 // convergence and depth agreement, not fabricated optical matching costs.
@@ -35,8 +42,8 @@ float trajectory(float2 uv,float2 seed,float2 pixels,out float2 cuv,out float2 p
  // A converged current-frame trajectory is still usable when previous depth
  // rejects the correspondence or the previous endpoint is outside its crop.
  currentValid=true;
- if(!inside(puv)||(GuideOffset.w>.5&&!inside(guideUV(puv))))return 0;
- float z=depthAt(Depth,cuv),old=depthAt(PreviousDepth,puv);
+ if(Options.z>1.5||!inside(puv)||!inside(previousGuideUV(puv)))return 0;
+ float z=depthAt(Depth,cuv),old=previousDepthAt(puv);
  float4 clip=mul(ClipToPrevious,float4(cuv.x*2-1,1-cuv.y*2,z,1));
  if(!isfinite(z)||!isfinite(old)||!all(isfinite(clip))||clip.w<=1e-6)return 0;
  float error=abs(old-clip.z/clip.w);
@@ -71,10 +78,11 @@ float4 interpolateAt(float2 uv,uint w,uint h,float method){
  if(valid){float4 b=0;if(method>=1.5)b=samplePacked(Current,cuv,AtlasCrop,AtlasSpans,AtlasTexel);
   if(inside(puv)){float4 a=samplePacked(Previous,puv,PriorCrop,PriorSpans,AtlasTexel);
    if(method<1.5)result=a;
+   else if(Options.z>1.5)result=b;
    else{uint dw,dh;Depth.GetDimensions(dw,dh);float z=Depth.Load(int3(min(uint2(saturate(guideUV(cuv))*float2(dw,dh)),uint2(dw,dh)-1),0));
     float4 clip=mul(ClipToPrevious,float4(cuv.x*2-1,1-cuv.y*2,z,1));
-    PreviousDepth.GetDimensions(dw,dh);float old=PreviousDepth.Load(int3(min(uint2(saturate(guideUV(puv))*float2(dw,dh)),uint2(dw,dh)-1),0));
-    bool agrees=(GuideOffset.w<.5||inside(guideUV(puv)))&&all(isfinite(clip))&&clip.w>0.000001&&isfinite(old)&&abs(old-clip.z/clip.w)<=.02;
+    float old=previousDepthAt(puv);
+    bool agrees=inside(previousGuideUV(puv))&&all(isfinite(clip))&&clip.w>0.000001&&isfinite(old)&&abs(old-clip.z/clip.w)<=.02;
     result=agrees?lerp(a,b,Options.y):b;}
   }else if(method>=1.5)result=b;
  }

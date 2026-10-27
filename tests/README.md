@@ -687,6 +687,13 @@ intermediate camera. Regular/Fast confidence modes and bidirectional (as a
 control) are checked using matched motion vectors and camera poses. This does
 not validate the vectors, depth or pose synchronization captured from MSFS.
 
+`CheekyOpenXRBindingTests --fg-gaze-motion` exercises the production worker on
+D3D12 WARP with moving center crops in both eyes and both axes. It checks saved
+depth-crop coordinates, warped-current fallback for uncovered or missing depth
+history, and both generated phases of 3x for bidirectional and regular/Fast
+confidence-guided methods. Live eye-tracked headset behavior still needs an
+in-game check.
+
 Center and periphery share menu IDs: 0 DLSS Frame Generation; 1-4 DLSS Vectors
 (simple, bidirectional, confidence-guided, fast confidence-guided); 5-8 Optical
 Flow; 9-12 Optical Flow + DLSS Depth; and 13 Previous frame (periphery only).
