@@ -986,9 +986,21 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if(!flow_queue)ImGui::TextWrapped("Separate HIGH is available only with NVIDIA Optical Flow selected for the center or active periphery. Other methods use the shared queue.");
         if(quad)ImGui::TextWrapped("DX11 quad input uses the layer's private DX12 bridge. Layer bridge queue shares its capture queue; separate queues isolate FG processing.");
         }
-        combo("Release game rendering", s.release_point,
-            "After FG submission\0After GPU preparation\0After FG completion\0After all generated frames submitted\0" "4 ms after FG submission\0" "Never (buffer capacity only)\0" "After first generated frame submission\0" "After second generated frame submission\0");
-        if (s.release_point == 5)
+        // Display pipeline stages without renumbering persisted release IDs.
+        // CPU submission can precede GPU capture completion. Keep its timed
+        // variant adjacent; its deadline can overlap the GPU milestones.
+        constexpr unsigned release_order[]{5,0,4,8,1,2,6,7,3};
+        int release_choice=8;
+        for(int i=0;i<int(std::size(release_order));++i)if(release_order[i]==s.release_point)release_choice=i;
+        combo("Release game rendering", release_choice,
+            "Never (buffer capacity only)\0After FG submission\0"
+            "4 ms after FG submission\0After color capture completes\0After GPU preparation\0After FG completion\0"
+            "After first generated frame submission\0After second generated frame submission\0After all generated frames submitted\0");
+        s.release_point=release_order[release_choice];
+        if (s.release_point == 8)
+            ImGui::TextWrapped(native_shader11()?"Native D3D11 orders capture on its immediate context; this mode uses buffer capacity only.":
+                "The next render starts after the GPU completes both-eye color capture and buffer capacity is available. Optical flow, frame generation and presentation may still be in flight.");
+        else if (s.release_point == 5)
             ImGui::TextWrapped("The next render starts when buffer capacity allows it. Generation and presentation may still be in flight.");
         else if (s.release_point == 6 || s.release_point == 7)
             ImGui::TextWrapped("The next render starts after xrEndFrame returns for the selected generated frame. At 2x there is one generated frame.");

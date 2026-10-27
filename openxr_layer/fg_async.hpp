@@ -107,6 +107,14 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t carried_ticks{},clock_ticks{};
     // Hold mx. The previous frame is still on the GPU.
     bool gpu_behind_now() const {return latest_native&&!capture_completed(latest_native->ready);}
+    bool capture_release_gate() const {
+        // Hold mx. Mode 8 depends only on the stereo capture fence, including
+        // startup before FG is active. Mode 5 retains its optional backlog gate.
+        const bool capture_only=active_release_point==8u||native11_release_point.load()==8u;
+        return !stopping&&!raw&&!degraded&&(capture_only||
+            (pacing_active&&active_release_point==5u&&limit_gpu_ahead.load()))&&gpu_behind_now();
+    }
+    static bool waits_for_fg(unsigned point) noexcept {return point!=5u&&point!=8u;}
     std::size_t slot_count() const noexcept {return extra_frame_slots.load(std::memory_order_relaxed)?5u:3u;}
     // Captured real frames waiting for generation. Kept in order: interpolation
     // needs consecutive real frames, so a burst is worked off instead of skipped.
@@ -611,7 +619,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 display_clock.set_override(pacing.target_refresh_hz);
                 if(before!=display_clock.display_ns())changed.notify_all();
             }
-            const auto point=std::min(pacing.native11_release_point,7u);
+            const auto point=std::min(pacing.native11_release_point,8u);
             if(native11_release_point.exchange(point)!=point&&trace){char message[96]{};
                 sprintf_s(message,"FG native D3D11 release point=%u (3 = after generated frame submission)",point);trace(message);}
         }
@@ -619,10 +627,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(!start())return XR_ERROR_RUNTIME_FAILURE;
         const auto wait_begin=TimingClock::now();
         ++app_waiters;
-        // Optional GPU backlog protection is an actual resource dependency,
-        // independent of the nominal display target.
-        const auto gpu_gate=[&]{return pacing_active&&
-            limit_gpu_ahead.load(std::memory_order_relaxed)&&active_release_point==5u&&gpu_behind_now();};
+        // Capture completion is independent of FG preparation/submission.
+        const auto gpu_gate=[&]{return capture_release_gate();};
         for(bool counted=false,capacity_counted=false;;) {
             if(stopping||XR_FAILED(terminal))break;
             const bool ordered=waited==begun&&!raw&&predicted.predictedDisplayPeriod>0;
@@ -789,7 +795,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 native.native=native.current=job->color;native.native_views=native.current_views=job->views;
                 native.layers=job->layers;native.auxiliary=job->auxiliary;native.space=job->space;native.blend=job->blend;
                 latest_native=std::move(native);
-                if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),7u);
+                if(native11&&job->guides_valid&&!job->policy.release_point)job->policy.release_point=std::min(native11_release_point.load(),8u);
                 if(inference_slot){pending.push_back(job);while(pending.size()>max_pending()){pending.front()->clear_guides();pending.pop_front();++skipped;}}
                 ++frames;held_valid=true;changed.notify_all();
             }
@@ -879,7 +885,8 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     {std::lock_guard lock(mx);gpu_ready_ages={};gpu_ready_samples=predicted_samples=prediction_late=0;}
                     if(release_policy_known)backend->reset_statistics(true);
                     last_release_point=point;
-                    if(trace)trace(point==5u?"FG native release=buffer capacity only (no FG release gate)":
+                    if(trace)trace(point==8u?"FG native release=after stereo color capture GPU completion (no FG release gate)":
+                        point==5u?"FG native release=buffer capacity only (no FG release gate)":
                         point==3u?"FG native release=after generated frame OpenXR submission (Lua; histories retained)":
                         point==6u?"FG native release=after first generated frame OpenXR submission (Lua; histories retained)":
                         point==7u?"FG native release=after second generated frame OpenXR submission (Lua; histories retained)":
@@ -1063,10 +1070,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             }
         }catch(...) {std::lock_guard lock(mx);terminal=XR_ERROR_RUNTIME_FAILURE;stopping=true;changed.notify_all();}
     }
-    // Release point 5 never holds the game: its jobs neither gate nor defer credits.
+    // Modes 5 and 8 have no FG dependency. Mode 8's capture fence is checked
+    // separately in wait_frame so FG worker notifications are not required.
     bool unsubmitted_native() const noexcept {
-        return (inflight_id>submitted_native_id&&inflight_release_point!=5u)||
-            (!pending.empty()&&pending.back()->id>submitted_native_id&&pending.back()->policy.release_point!=5u);
+        return (inflight_id>submitted_native_id&&waits_for_fg(inflight_release_point))||
+            (!pending.empty()&&pending.back()->id>submitted_native_id&&waits_for_fg(pending.back()->policy.release_point));
     }
     bool release_gate_active() const noexcept {
         // Hold mx. Inspect pending jobs as well as the worker's latched policy
@@ -1074,11 +1082,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(stopping||raw||degraded)return false;
         if(awaiting_generated_submission)return true;
         if(release_delay_until!=TimingClock::time_point{}&&TimingClock::now()<release_delay_until)return true;
-        if(inflight_id&&inflight_release_point!=5u&&(inflight_id>submitted_native_id||inflight_release_point==2u||
+        if(inflight_id&&waits_for_fg(inflight_release_point)&&(inflight_id>submitted_native_id||inflight_release_point==2u||
             (!inflight_generated_gate_released&&(inflight_release_point==3u||inflight_release_point==6u||inflight_release_point==7u))||
             (inflight_release_point==1u&&!inflight_prepared)))return true;
         return std::any_of(pending.begin(),pending.end(),[&](const auto& job){
-            return job->guides_valid&&job->policy.release_point!=5u&&(job->policy.release_point!=0||job->id>submitted_native_id);
+            return job->guides_valid&&waits_for_fg(job->policy.release_point)&&(job->policy.release_point!=0||job->id>submitted_native_id);
         });
     }
     bool generated_submission_pending() const noexcept {
@@ -1475,7 +1483,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 if(trace&&is_generated&&submitted&&(generated_count%120)==0) {
                     const auto c=cadence();
                     sprintf_s(cadence_log,"FG experiment cadence: release=%s queue=%s production=%s target_native_ms=%.3f valid=%u game=%.3f native=%.3f generated=%.3f unique=%.3f submissions=%.3f; xr_wait_ms=%.3f xr_end_ms=%.3f present_ms=%.3f; game_end_ms=%.3f last=%.3f capture_cpu_ms=%.3f render_wait_last=%.3f permits granted=%llu consumed=%llu capacity_waits=%llu",
-                        active_release_point==5u?"never":active_release_point==3u?"generated-submission":active_release_point==6u?"first-generated-submission":active_release_point==7u?"second-generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
+                        active_release_point==8u?"capture-complete":active_release_point==5u?"never":active_release_point==3u?"generated-submission":active_release_point==6u?"first-generated-submission":active_release_point==7u?"second-generated-submission":active_release_point==2u?"completion":active_release_point==1u?"preparation":active_release_point==4u?"submit+4ms":"submission",
                         queue_mode_name(reported_queue_mode),
                         "demand",display_clock.display_ms()*(pacing_active?active_multiplier:1u),c.valid,c.game_fps,c.native_fps,c.generated_fps,c.unique_fps,c.submission_fps,
                         xr_wait.mean(),runtime_end.mean(),present_cpu.mean(),app_calls[1].mean(),app_calls[1].last,producer_cpu.mean(),pacing_wait.last,

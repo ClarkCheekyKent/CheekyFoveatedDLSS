@@ -38,7 +38,7 @@ void fg_latest_interval_validation() {
     check(!presenter.fresh_content(active,true,true,1.25),"A newer interval cannot interrupt an active generated-frame sequence");
     active_completion->done=true;
     check(presenter.fresh_content(active,true,true,1.25),"The active sequence resumes when its own next phase is usable");
-    for(unsigned release:{0u,1u,2u,3u,4u,5u,6u,7u}){
+    for(unsigned release:{0u,1u,2u,3u,4u,5u,6u,7u,8u}){
         BufferedPresenter queued;queued.active_release_point=release;queued.extra_frame_slots=true;queued.ticks=1;
         BufferedPair fallback;fallback.native_id=fallback.current_id=415;
         queued.ready.push_back(fallback);
@@ -58,6 +58,48 @@ void fg_latest_interval_validation() {
             "An entirely stale queue is retired even when there is no newer selectable interval");
     }
     std::cout<<"PASS latest-interval selection for overlap; presentation gates and active sequences preserved\n";
+}
+
+void fg_capture_release_validation() {
+    using namespace cheeky::fg;using Microsoft::WRL::ComPtr;
+    ComPtr<IDXGIFactory4> factory;ComPtr<IDXGIAdapter> warp;ComPtr<ID3D12Device> device;
+    check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))&&SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)))&&
+        SUCCEEDED(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"Capture gate software device");
+    BufferedPresenter presenter;presenter.started=true;
+    check(SUCCEEDED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&presenter.producer.fence))),"Capture gate fence");
+    presenter.active_release_point=8;presenter.native11_release_point=8;
+    presenter.predicted.predictedDisplayPeriod=10000000;
+    presenter.latest_native=BufferedPair{};presenter.latest_native->ready=1;
+    auto queued=std::make_shared<BufferedNative>();queued->id=2;queued->guides_valid=true;queued->policy.release_point=8;
+    presenter.pending.push_back(queued);presenter.inflight_id=1;presenter.inflight_release_point=8;
+    check(presenter.capture_release_gate()&&!presenter.release_gate_active()&&!presenter.unsubmitted_native(),
+        "Capture-only release holds for capture during startup, without an FG submission gate");
+    std::atomic<bool> returned{};XrResult result{};XrFrameState frame{XR_TYPE_FRAME_STATE};
+    std::thread waiter([&]{result=presenter.wait_frame(nullptr,&frame);returned=true;});
+    bool waiting{};
+    for(unsigned i=0;i<1000&&!waiting;++i){
+        {std::lock_guard lock(presenter.mx);waiting=presenter.app_waiters!=0;}
+        if(!waiting)Sleep(1);
+    }
+    const bool held=waiting&&!returned;
+    // GPU fence retirement does not notify the presenter condition variable.
+    // The capture gate must observe it without any FG completion callback.
+    presenter.producer.fence->Signal(1);
+    for(unsigned i=0;i<1000&&!returned;++i)Sleep(1);
+    const bool released=returned;
+    if(!released){std::lock_guard lock(presenter.mx);presenter.stopping=true;presenter.changed.notify_all();}
+    waiter.join();
+    check(held&&released&&XR_SUCCEEDED(result)&&presenter.pending.size()==1&&presenter.inflight_id==1&&
+        presenter.submitted_native_id==0&&!presenter.capture_release_gate(),
+        "Completed color capture releases the game while FG is still queued and unsubmitted");
+    presenter.producer.fence->Signal(0);presenter.active_release_point=presenter.native11_release_point=5;
+    check(!presenter.capture_release_gate(),"Never remains ungated with its optional backlog protection off");
+    presenter.pacing_active=true;presenter.limit_gpu_ahead=true;
+    check(presenter.capture_release_gate(),"Never retains its existing optional capture backlog protection");
+    presenter.active_release_point=presenter.native11_release_point=3;
+    check(!presenter.capture_release_gate(),"Generated-submission release does not acquire the new capture gate");
+    presenter.pending.clear();presenter.inflight_id=0;presenter.latest_native.reset();presenter.started=false;
+    std::cout<<"PASS color-capture release: waits for capture, resumes before FG submission, preserves existing modes\n";
 }
 
 // Hold the software GPU before a simulated generation output. The production

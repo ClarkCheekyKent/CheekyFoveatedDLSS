@@ -44,7 +44,7 @@ struct CheekyFgPair {
     IUnknown* lease{}; // Retain until the consumer GPU has finished reading guides.
     std::uint64_t render_frame{}; // Producer frame serial (quad views); 0 for pairs matched at xrEndFrame.
     std::uint32_t fg_queue_priority{2}; // 1 separate HIGH (optical flow only); 2 shared game queue. Legacy 0 maps to shared.
-    std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms.
+    std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms, 5 capacity, 6/7 generated XR, 8 capture GPU completion.
 };
 inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
     for(const auto& g:pair.eyes)
@@ -237,7 +237,7 @@ using CheekyFgTransportOptionsFn=bool(__cdecl*)(CheekyFgTransportOptions*);
 struct CheekyFgPacingOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgPacingOptions)};
     std::uint32_t clock_mode{}; // Retired; current layers use demand-driven production for all values.
-    std::uint32_t native11_release_point{3}; // Shared release setting: 0 FG submission ... 3 generated frame submission, 4 submission + 4 ms.
+    std::uint32_t native11_release_point{3}; // Shared release setting, including 8: color capture GPU completion (D3D12).
     std::uint32_t extra_frame_slots{}; // 1: 5 capture slots instead of 3 (more VRAM). Absent in older layers.
     std::uint32_t dedicated_present_queue{}; // Retired; reserved ABI slot, always zero.
     std::uint32_t gpu_waited_present{}; // Retired; reserved ABI slot, always zero.

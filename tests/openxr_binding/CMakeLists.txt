@@ -36,6 +36,7 @@ add_test(NAME OpenXRFGCropRecenter COMMAND CheekyOpenXRBindingTests --fg-crop-gp
 add_test(NAME OpenXRFGHardening COMMAND CheekyOpenXRBindingTests --fg-hardening)
 add_test(NAME OpenXRFGSharedSubmission COMMAND CheekyOpenXRBindingTests --fg-shared-submission)
 add_test(NAME OpenXRFGLatestInterval COMMAND CheekyOpenXRBindingTests --fg-latest-interval)
+add_test(NAME OpenXRFGCaptureRelease COMMAND CheekyOpenXRBindingTests --fg-capture-release)
 add_test(NAME OpenXRFGAutoController COMMAND CheekyOpenXRBindingTests --fg-auto)
 
 add_test(NAME OpenXRFGNativeShader11 COMMAND CheekyOpenXRBindingTests --fg-shader11)

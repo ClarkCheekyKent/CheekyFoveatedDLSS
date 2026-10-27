@@ -79,7 +79,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
         s.fg.release_point = hold ? 2U : 0U; return true;
     }
     if (key == "FgReleasePoint") {
-        std::uint32_t point{}; if (!parse(value, point) || point > 7U) return false;
+        std::uint32_t point{}; if (!parse(value, point) || point > 8U) return false;
         s.fg.release_point = point; return true;
     }
 #define CHEEKY_SETTING(name, field) if (key == name) return parse(value, s.field);

@@ -144,9 +144,18 @@ local function slider(label, key, minimum, maximum, integer)
         ready_edits[key], slider_edits[key] = draft[key], nil
     end
 end
-local function combo(label, key, values)
-    -- UEVR's Lua combo preserves table keys: use the actual settings enum values.
-    local changed, value = imgui.combo(label, draft[key], values)
+local function combo(label, key, values, order)
+    -- Preserve settings IDs; an explicit order maps display positions to IDs.
+    local selected, displayed = draft[key], values
+    if order then
+        displayed = {}
+        for index, id in ipairs(order) do
+            displayed[index - 1] = values[id]
+            if id == draft[key] then selected = index - 1 end
+        end
+    end
+    local changed, value = imgui.combo(label, selected, displayed)
+    if changed and order then value = order[value + 1] end
     if changed then draft[key], dirty[key], ready_edits[key] = value, value, value end
 end
 local function text(s) imgui.text(tostring(s)) end
@@ -737,8 +746,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgReleasePoint ~= nil then
                     combo("Release game rendering", "FgReleasePoint", {
-                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After all generated frames submitted", [4]="4 ms after FG submission", [5]="Never (buffer capacity only)", [6]="After first generated frame submission", [7]="After second generated frame submission"})
-                    if draft.FgReleasePoint == 5 then
+                        [0]="After FG submission", [1]="After GPU preparation", [2]="After FG completion", [3]="After all generated frames submitted", [4]="4 ms after FG submission", [5]="Never (buffer capacity only)", [6]="After first generated frame submission", [7]="After second generated frame submission", [8]="After color capture completes"}, {5,0,4,8,1,2,6,7,3})
+                    if draft.FgReleasePoint == 8 then
+                        text(native_shader11 and "Native D3D11 orders capture on its immediate context; this mode uses buffer capacity only." or "The next render starts after the GPU completes both-eye color capture and buffer capacity is available. Optical flow, frame generation and presentation may still be in flight.")
+                    elseif draft.FgReleasePoint == 5 then
                         text("The next render starts when buffer capacity allows it. Generation and presentation may still be in flight.")
                     elseif draft.FgReleasePoint == 6 or draft.FgReleasePoint == 7 then
                         text("The next render starts after xrEndFrame returns for the selected generated frame. At 2x there is one generated frame.")

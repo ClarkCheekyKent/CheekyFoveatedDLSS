@@ -52,7 +52,7 @@ struct Settings {
         CheekyFgOpticalSettings optical;
         float width{0.55F}, height{0.45F}, x{}, y{}, feather{0.04F}; // Same defaults as SR.
         std::uint32_t queue_priority{2}; // 1 separate HIGH (optical flow only); 2 shared game queue. Legacy 0 maps to shared.
-        std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held, 6 first generated XR submission, 7 second generated XR submission.
+        std::uint32_t release_point{3}; // 0 FG submission, 1 preparation, 2 completion, 3 generated XR submission, 4 4ms post-submit, 5 never held, 6 first generated XR submission, 7 second generated XR submission, 8 color capture GPU completion.
         std::uint32_t pacing_clock{}; // Retained for old settings; current layers use demand-driven production.
         std::uint32_t target_refresh_hz{}; // 0 automatic; manual headset refresh override, 30..360 Hz.
         std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.
