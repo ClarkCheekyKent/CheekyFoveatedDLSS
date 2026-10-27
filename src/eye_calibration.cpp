@@ -1365,7 +1365,7 @@ bool eye_calibration_enabled() noexcept {
 }
 EyeCalibrationStats eye_calibration_stats() noexcept {
     auto& s = state();
-    std::lock_guard lock(s.mutex);
+    std::unique_lock lock(s.mutex);
     auto result = s.stats;
     result.enabled = enabled;
     result.in_flight =
@@ -1383,6 +1383,10 @@ EyeCalibrationStats eye_calibration_stats() noexcept {
     result.runtime_active = s.last_frame_ms && GetTickCount64() - s.last_frame_ms <= 1000;
     result.openvr_active = result.runtime_active && s.backend == EyeCalibrationBackend::openvr;
     result.unsupported_submission = s.unsupported_submission;
+    // Assignment lookup can call back into the OpenXR layer. EndFrame holds
+    // its state lock while entering calibration, so never keep the calibration
+    // lock across that lookup. Everything below uses this local snapshot.
+    lock.unlock();
     result.correction_active = result.enabled && stereo_eye_assignment(result.left_view).calibrated &&
                                stereo_eye_assignment(result.right_view).calibrated;
     result.vertical_flip = result.correction_active && stereo_eye_assignment(result.left_view).vertical_flip;
