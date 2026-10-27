@@ -921,16 +921,24 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const auto method_combo=[](const char* label,unsigned& method,bool periphery,bool quad_view){
         constexpr const char* names[]{"DLSS Frame Generation",
             "DLSS Vectors - Simple Warping", "DLSS Vectors - Bidirectional Interpolation",
-            "DLSS Vectors - Confidence-Guided Interpolation", "Optical Flow - Simple Warping",
-            "Optical Flow - Bidirectional Interpolation", "Optical Flow - Confidence-Guided Interpolation",
+            "DLSS Vectors - Confidence-Guided Interpolation", "DLSS Vectors - Confidence-Guided Interpolation (Fast)",
+            "Optical Flow - Simple Warping", "Optical Flow - Bidirectional Interpolation",
+            "Optical Flow - Confidence-Guided Interpolation", "Optical Flow - Confidence-Guided Interpolation (Fast)",
             "Optical Flow + DLSS Depth - Simple Warping", "Optical Flow + DLSS Depth - Bidirectional Interpolation",
-            "Optical Flow + DLSS Depth - Confidence-Guided Interpolation", "Previous frame"};
-        const unsigned first=periphery&&quad_view?1u:0u,count=periphery?11u:10u;
+            "Optical Flow + DLSS Depth - Confidence-Guided Interpolation", "Optical Flow + DLSS Depth - Confidence-Guided Interpolation (Fast)",
+            "Previous frame"};
+        const unsigned first=periphery&&quad_view?1u:0u,count=periphery?14u:13u;
         int selected=int(method)-int(first);
         if(ImGui::Combo(label,&selected,names+first,int(count-first)))method=unsigned(selected)+first;
         test_control(label);
     };
     method_combo("FG center method",s.center_method,false,quad);
+    if(cheeky_fg_cacheable(s.center_method))ImGui::Checkbox("Cache optical vector/confidence data (center)",&s.optical.center_cache);
+    if(cheeky_fg_optical(s.center_method)){
+        combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
+        fg_percent("Center optical flow resolution",s.optical.center_percent);
+        optical_grid("Center optical flow vector grid",s.optical.center_grid);
+    }
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
     ImGui::Checkbox("Foveated frame generation", &s.foveated);
@@ -950,19 +958,15 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         }
         fg_percent("FG periphery scale", s.peripheral_percent);
         method_combo("FG periphery method",s.peripheral_method,true,quad);
-        ImGui::Checkbox("Show blue FG region border", &s.show_border);
-    }
-    if (ImGui::TreeNode("Advanced settings")) {
-        if(cheeky_fg_optical(s.center_method)){
-            combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
-            fg_percent("Center optical flow resolution",s.optical.center_percent);
-            optical_grid("Center optical flow vector grid",s.optical.center_grid);
-        }
-        if((s.foveated||quad)&&cheeky_fg_optical(s.peripheral_method)){
+        if(cheeky_fg_cacheable(s.peripheral_method))ImGui::Checkbox("Cache optical vector/confidence data (periphery)",&s.optical.peripheral_cache);
+        if(cheeky_fg_optical(s.peripheral_method)){
             combo("Periphery optical flow preset",s.optical.peripheral_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
             fg_percent("Periphery optical flow resolution",s.optical.peripheral_percent);
             optical_grid("Periphery optical flow vector grid",s.optical.peripheral_grid);
         }
+        ImGui::Checkbox("Show blue FG region border", &s.show_border);
+    }
+    if (ImGui::TreeNode("Advanced settings")) {
         ImGui::Checkbox("Force NVIDIA Reflex off", &s.force_reflex_off);
         if(s.force_reflex_off)ImGui::TextWrapped("Disables NVIDIA Reflex sleep and its frame limiter. Applies even when frame generation is off.");
         char refresh_label[32]{};if(s.target_refresh_hz)sprintf_s(refresh_label,"%u Hz",s.target_refresh_hz);else strcpy_s(refresh_label,"Automatic");

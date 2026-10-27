@@ -161,7 +161,7 @@ inline void fg_cross_api_parity(){
     check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context)),"Parity D3D11 device");
     D3D12 gpu;const auto scene=scenes();unsigned cases{};
     struct Case {unsigned center,periphery;bool foveated;};
-    for(float fraction:{.25f,1.f/3,.5f,2.f/3,.75f})for(const auto c:{Case{1,10,false},Case{2,10,false},Case{1,10,true},Case{2,1,true},Case{2,2,true},Case{1,2,true},Case{3,10,false},Case{3,1,true},Case{1,3,true},Case{3,3,true}}){
+    for(float fraction:{.25f,1.f/3,.5f,2.f/3,.75f})for(const auto c:{Case{1,13,false},Case{2,13,false},Case{1,13,true},Case{2,1,true},Case{2,2,true},Case{1,2,true},Case{3,13,false},Case{3,1,true},Case{1,3,true},Case{3,3,true}}){
         cheeky::fg::FocusPipeline pipeline;pipeline.color_format=DXGI_FORMAT_R8G8B8A8_UNORM;
         check(pipeline.initialize(gpu.device.Get()),"Parity D3D12 focus pipeline");
         const auto native=generate11(scene,c.center,c.periphery,c.foveated,fraction);unsigned total_changed{};

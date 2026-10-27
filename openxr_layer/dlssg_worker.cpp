@@ -394,9 +394,20 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         if(!a&&(FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&a)))||
             FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,a.Get(),nullptr,IID_PPV_ARGS(&l)))||FAILED(l->Close()))){a.Reset();l.Reset();return false;}
         if(FAILED(a->Reset())||FAILED(l->Reset(a.Get(),nullptr)))return false;
-        commands=l.Get();wait_timing.end(commands);return true;
+        commands=l.Get();
+        if(!phase_focus.optical_session(eye,pass).prepare_vectors(commands,phase_focus.optical_constants[eye][pass]))return false;
+        wait_timing.end(commands);return true;
     };
-    if(optical_timing_started)batch_timings.optical_prefix.end(commands);
+    if(optical_timing_started){
+        // With the preparation gate all flow waits are already on the queue.
+        // Cache packing belongs to optical preparation, not generated frame 1.
+        if(!defer_optical)for(unsigned eye=0;eye<2;++eye)for(unsigned pass=0;pass<2;++pass){
+            const auto& g=guides.eyes[eye];
+            if(!cheeky_fg_optical(pass?g.peripheral_method:g.center_method)||(pass&&g.focus_width>=.999f&&g.focus_height>=.999f))continue;
+            if(!phase_focus.optical_session(eye,pass).prepare_vectors(commands,phase_focus.optical_constants[eye][pass]))return false;
+        }
+        batch_timings.optical_prefix.end(commands);
+    }
     bool cut_to_second_list=false;
     if(!optical_timing_started){if(!continuing)latency.begin(commands);phase_timing.begin(commands);}
     if(frame_index==1&&!optical_timing_started)batch_timings.begin(device.Get(),commands,frame_count,optical_regions);

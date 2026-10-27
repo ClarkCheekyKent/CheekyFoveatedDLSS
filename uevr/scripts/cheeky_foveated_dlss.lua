@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterCache", "FgOpticalPeripheralCache", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -145,22 +145,23 @@ local function slider(label, key, minimum, maximum, integer)
     end
 end
 local function combo(label, key, values, order)
-    -- Preserve settings IDs; an explicit order maps display positions to IDs.
+    -- UEVR enumerates Lua keys: use a contiguous 1-based display array so
+    -- index zero cannot move the first entry into the table's hash portion.
     local selected, displayed = draft[key], values
     if order then
         displayed = {}
         for index, id in ipairs(order) do
-            displayed[index - 1] = values[id]
-            if id == draft[key] then selected = index - 1 end
+            displayed[index] = values[id]
+            if id == draft[key] then selected = index end
         end
     end
     local changed, value = imgui.combo(label, selected, displayed)
-    if changed and order then value = order[value + 1] end
+    if changed and order then value = order[value] end
     if changed then draft[key], dirty[key], ready_edits[key] = value, value, value end
 end
 local function text(s) imgui.text(tostring(s)) end
 local function fg_optical(method)
-    return method ~= nil and method >= 4 and method <= 9
+    return method ~= nil and method >= 5 and method <= 12
 end
 local function fg_method_combo(label, key, periphery)
     local values = {
@@ -168,16 +169,24 @@ local function fg_method_combo(label, key, periphery)
         [1] = "DLSS Vectors - Simple Warping",
         [2] = "DLSS Vectors - Bidirectional Interpolation",
         [3] = "DLSS Vectors - Confidence-Guided Interpolation",
-        [4] = "Optical Flow - Simple Warping",
-        [5] = "Optical Flow - Bidirectional Interpolation",
-        [6] = "Optical Flow - Confidence-Guided Interpolation",
-        [7] = "Optical Flow + DLSS Depth - Simple Warping",
-        [8] = "Optical Flow + DLSS Depth - Bidirectional Interpolation",
-        [9] = "Optical Flow + DLSS Depth - Confidence-Guided Interpolation"
+        [4] = "DLSS Vectors - Confidence-Guided Interpolation (Fast)",
+        [5] = "Optical Flow - Simple Warping",
+        [6] = "Optical Flow - Bidirectional Interpolation",
+        [7] = "Optical Flow - Confidence-Guided Interpolation",
+        [8] = "Optical Flow - Confidence-Guided Interpolation (Fast)",
+        [9] = "Optical Flow + DLSS Depth - Simple Warping",
+        [10] = "Optical Flow + DLSS Depth - Bidirectional Interpolation",
+        [11] = "Optical Flow + DLSS Depth - Confidence-Guided Interpolation",
+        [12] = "Optical Flow + DLSS Depth - Confidence-Guided Interpolation (Fast)"
     }
-    local order = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
-    if periphery then values[10] = "Previous frame"; order[#order + 1] = 10 end
+    local order = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+    if periphery then values[13] = "Previous frame"; order[#order + 1] = 13 end
     combo(label, key, values, order)
+end
+local function fg_cache_check(label, method, key)
+    if (method == 7 or method == 8 or method == 11 or method == 12) and draft[key] ~= nil then
+        check(label, key)
+    end
 end
 local function donate_button()
     -- Do not remove this donation button or change its original destination when
@@ -685,9 +694,15 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             section("Foveation")
             if draft.FgCenterMethod ~= nil then
                 fg_method_combo("FG center method", "FgCenterMethod", false)
+                fg_cache_check("Cache optical vector/confidence data (center)", draft.FgCenterMethod, "FgOpticalCenterCache")
             end
             local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
             local optical_grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
+            if fg_optical(draft.FgCenterMethod) then
+                if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
+                if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
+                if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
+            end
             if draft.FgResolutionPercent ~= nil then combo("FG scale", "FgResolutionPercent", percent) end
             check("Foveated frame generation", "FgFoveated")
             if draft.FgFoveated then
@@ -704,20 +719,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgPeripheralPercent ~= nil then
                     combo("FG periphery scale", "FgPeripheralPercent", percent)
                     fg_method_combo("FG periphery method", "FgPeripheralMethod", true)
+                    fg_cache_check("Cache optical vector/confidence data (periphery)", draft.FgPeripheralMethod, "FgOpticalPeripheralCache")
+                    if fg_optical(draft.FgPeripheralMethod) then
+                        if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
+                        if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
+                        if draft.FgOpticalPeripheralGrid ~= nil then combo("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", optical_grids) end
+                    end
                 end
                 if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end
             end
             if imgui.tree_node("Advanced settings") then
-                if fg_optical(draft.FgCenterMethod) then
-                    if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
-                    if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
-                    if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
-                end
-                if draft.FgFoveated and fg_optical(draft.FgPeripheralMethod) then
-                    if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
-                    if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
-                    if draft.FgOpticalPeripheralGrid ~= nil then combo("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", optical_grids) end
-                end
                 if draft.FgForceReflexOff ~= nil then
                     check("Force NVIDIA Reflex off", "FgForceReflexOff")
                     if draft.FgForceReflexOff then

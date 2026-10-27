@@ -88,7 +88,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{s.multiplier,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
-        s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,
+        s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,unsigned(s.optical.center_cache),unsigned(s.optical.peripheral_cache),
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;

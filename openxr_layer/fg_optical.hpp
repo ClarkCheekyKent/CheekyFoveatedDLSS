@@ -63,7 +63,9 @@ inline OpticalConstants constants(const CheekyFgEye& g,unsigned pass,const float
     c.sizes[2]=float(outw);c.sizes[3]=float(outh);
     layout.constants(c.crop,c.spans,c.texel);float unused[4];old_layout.constants(c.old_crop,c.old_spans,unused);
     c.texel[0]=float(grid==1||grid==2?grid:4u);c.texel[1]=0;
-    c.texel[3]=float(cheeky_fg_interpolation(pass?g.peripheral_method:g.center_method));return c;
+    const auto method=pass?g.peripheral_method:g.center_method;
+    c.texel[3]=float(cheeky_fg_interpolation(method));
+    if(cheeky_fg_cacheable(method)&&(pass?g.optical.peripheral_cache:g.optical.center_cache))c.texel[3]+=4;return c;
 }
 // Head-rotation reprojection between the previous, current and submitted
 // in-between cameras. The in-between pose matches the presenter's midpoint().
@@ -101,12 +103,13 @@ struct Error {
 // The owning backend serializes every call. The driver DLL stays resident.
 struct Session11 : Error {
     NV_OF_D3D11_API_FUNCTION_LIST api{};NvOFHandle handle{};
-    ComPtr<ID3D11Device> device;ComPtr<ID3D11ComputeShader> prepare_shader,interpolate_shader;
+    ComPtr<ID3D11Device> device;ComPtr<ID3D11ComputeShader> prepare_shader,interpolate_shader,cache_shader;
     ComPtr<ID3D11SamplerState> sampler;
-    std::array<ComPtr<ID3D11Texture2D>,6> textures;
-    std::array<ComPtr<ID3D11ShaderResourceView>,6> views;
+    std::array<ComPtr<ID3D11Texture2D>,8> textures;
+    std::array<ComPtr<ID3D11ShaderResourceView>,8> views;
     std::array<NvOFGPUBufferHandle,6> buffers{};
-    ComPtr<ID3D11UnorderedAccessView> input_uavs[2];
+    ComPtr<ID3D11UnorderedAccessView> input_uavs[2],cache_uavs[2];
+    bool cache_ready{};unsigned cache_builds{};
     unsigned width{},height{},preset{},grid{4};std::uint64_t old_id{},new_id{};
     float crop[4]{};bool history{},initialized{};
     // Rebuilding a session (driver init, registrations, shader compiles)
@@ -124,7 +127,8 @@ struct Session11 : Error {
     void reset(){
         for(auto& b:buffers)if(b){api.nvOFUnregisterResourceD3D11(b);b=nullptr;}
         if(handle){api.nvOFDestroy(handle);handle=nullptr;}
-        for(auto& t:textures)t.Reset();for(auto& v:views)v.Reset();for(auto& v:input_uavs)v.Reset();
+        for(auto& t:textures)t.Reset();for(auto& v:views)v.Reset();for(auto& v:input_uavs)v.Reset();for(auto& v:cache_uavs)v.Reset();
+        cache_shader.Reset();cache_ready=false;cache_builds=0;
         device.Reset();prepare_shader.Reset();interpolate_shader.Reset();sampler.Reset();old_id=new_id=0;history=false;initialized=false;
     }
     bool initialize(ID3D11Device* dev,ID3D11DeviceContext* context,unsigned w,unsigned h,unsigned quality,unsigned cells){
@@ -158,7 +162,7 @@ struct Session11 : Error {
         ComPtr<ID3D11Buffer> cb;if(FAILED(device->CreateBuffer(&d,&data,&cb)))return fail("constants");
         auto* b=cb.Get();auto* s=sampler.Get();ctx->CSSetConstantBuffers(0,1,&b);ctx->CSSetSamplers(0,1,&s);return true;
     }
-    static void unbind(ID3D11DeviceContext* ctx){ID3D11ShaderResourceView* srv[7]{};ID3D11UnorderedAccessView* uav[2]{};ctx->CSSetShaderResources(0,7,srv);ctx->CSSetUnorderedAccessViews(0,2,uav,nullptr);}
+    static void unbind(ID3D11DeviceContext* ctx){ID3D11ShaderResourceView* srv[9]{};ID3D11UnorderedAccessView* uav[2]{};ctx->CSSetShaderResources(0,9,srv);ctx->CSSetUnorderedAccessViews(0,2,uav,nullptr);}
     // depth is the captured R32 depth snapshot when c.flags[2] enables it.
     bool render(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* old,ID3D11ShaderResourceView* now,ID3D11ShaderResourceView* depth,
         std::uint64_t previous_id,std::uint64_t current_id,unsigned quality,OpticalConstants c,float fraction,bool reset_history,
@@ -167,6 +171,7 @@ struct Session11 : Error {
         if(!initialize(dev,ctx,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0])))return false;
         c.sizes[0]=float(width);c.sizes[1]=float(height);
         if(old_id!=previous_id||new_id!=current_id){
+            cache_ready=false;
             if(!bind(ctx,c))return false;
             ID3D11ShaderResourceView* srvs[]{old,now};ID3D11UnorderedAccessView* uavs[]{input_uavs[0].Get(),input_uavs[1].Get()};
             ctx->CSSetShader(prepare_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,2,srvs);ctx->CSSetUnorderedAccessViews(0,2,uavs,nullptr);
@@ -179,13 +184,28 @@ struct Session11 : Error {
             auto status=api.nvOFExecute(handle,&in,&out);if(status)return fail("flow execution",status);
             old_id=previous_id;new_id=current_id;std::copy_n(c.flow_rect,4,crop);history=true;
         }
+        if(c.texel[3]>3.5&&!cache_ready){
+            if(!cache_shader){ComPtr<ID3DBlob> code;
+                if(!compile("CacheVectors","cs_5_0",code)||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&cache_shader)))return fail("vector cache shader");}
+            for(unsigned i=0;i<2;++i)if(!textures[6+i]){
+                D3D11_TEXTURE2D_DESC d{};d.Width=(width+grid-1)/grid;d.Height=(height+grid-1)/grid;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;
+                d.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
+                if(FAILED(dev->CreateTexture2D(&d,nullptr,&textures[6+i]))||FAILED(dev->CreateShaderResourceView(textures[6+i].Get(),nullptr,&views[6+i]))||
+                   FAILED(dev->CreateUnorderedAccessView(textures[6+i].Get(),nullptr,&cache_uavs[i])))return fail("vector cache allocation");
+            }
+            if(!bind(ctx,c))return false;
+            ID3D11ShaderResourceView* fields[]{views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get()};
+            ID3D11UnorderedAccessView* targets[]{cache_uavs[0].Get(),cache_uavs[1].Get()};
+            ctx->CSSetShader(cache_shader.Get(),nullptr,0);ctx->CSSetShaderResources(2,4,fields);ctx->CSSetUnorderedAccessViews(0,2,targets,nullptr);
+            ctx->Dispatch(((width+grid-1)/grid+7)/8,((height+grid-1)/grid+7)/8,1);unbind(ctx);cache_ready=true;++cache_builds;
+        }
         D3D11_TEXTURE2D_DESC d{};d.Width=unsigned(c.sizes[2]);d.Height=unsigned(c.sizes[3]);d.ArraySize=d.MipLevels=1;d.SampleDesc.Count=1;
         d.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
         ComPtr<ID3D11UnorderedAccessView> target;
         if(FAILED(dev->CreateTexture2D(&d,nullptr,&output))||FAILED(dev->CreateShaderResourceView(output.Get(),nullptr,&output_view))||FAILED(dev->CreateUnorderedAccessView(output.Get(),nullptr,&target)))return fail("generated image");
         c.flags[0]=fraction;if(!bind(ctx,c))return false;
-        ID3D11ShaderResourceView* srvs[]{old,now,views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get(),depth};auto* uav=target.Get();
-        ctx->CSSetShader(interpolate_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,7,srvs);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
+        ID3D11ShaderResourceView* srvs[]{old,now,views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get(),depth,views[6].Get(),views[7].Get()};auto* uav=target.Get();
+        ctx->CSSetShader(interpolate_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,9,srvs);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
         ctx->Dispatch((d.Width+7)/8,(d.Height+7)/8,1);unbind(ctx);
         strcpy_s(diagnostic,"NVIDIA Optical Flow: generating");return true;
     }
@@ -195,10 +215,11 @@ struct Session12 : Error {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;std::uint64_t serial{};HANDLE event{};
-    ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> prepare_shader,interpolate_shader;
+    ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> prepare_shader,interpolate_shader,cache_shader;
     ComPtr<ID3D12DescriptorHeap> heap;unsigned stride{};
-    std::array<ComPtr<ID3D12Resource>,6> textures;std::array<NvOFGPUBufferHandle,6> buffers{};
+    std::array<ComPtr<ID3D12Resource>,8> textures;std::array<NvOFGPUBufferHandle,6> buffers{};
     unsigned width{},height{},preset{},grid{4};float crop[4]{};bool history{},initialized{};
+    bool cache_ready{};unsigned cache_builds{};
     unsigned descriptor_set{}; // Generated frame within the interval; renders may be in flight together.
     // Rebuilding a session (driver init, registrations, shader compiles)
     // stalls generation for seconds. The current session samples any flow
@@ -220,7 +241,7 @@ struct Session12 : Error {
         // The driver faults when a registered texture outlives nvOFDestroy.
         for(auto& t:textures)t.Reset();
         if(handle){api.nvOFDestroy(handle);handle=nullptr;}
-        device.Reset();queue.Reset();allocator.Reset();list.Reset();fence.Reset();root.Reset();heap.Reset();prepare_shader.Reset();interpolate_shader.Reset();
+        device.Reset();queue.Reset();allocator.Reset();list.Reset();fence.Reset();root.Reset();heap.Reset();prepare_shader.Reset();interpolate_shader.Reset();cache_shader.Reset();cache_ready=false;cache_builds=0;
         if(event)CloseHandle(event);event=nullptr;serial=0;history=false;initialized=false;
     }
     static void barrier(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
@@ -251,22 +272,22 @@ struct Session12 : Error {
             NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 r{};r.resource=textures[i].Get();r.hOFGpuBuffer=&buffers[i];r.inputFencePoint={fence.Get(),serial};r.outputFencePoint={fence.Get(),++serial};
             status=api.nvOFRegisterResourceD3D12(handle,&r);if(status){--serial;return fail("buffer registration",status);}if(!wait())return fail("registration fence");
         }
-        D3D12_DESCRIPTOR_RANGE ranges[]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,7,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,2,0,0,7}};
+        D3D12_DESCRIPTOR_RANGE ranges[]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,9,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,2,0,0,9}};
         D3D12_ROOT_PARAMETER rp[2]{};rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;rp[0].DescriptorTable={2,ranges};rp[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;rp[1].Constants={0,0,sizeof(OpticalConstants)/4};
         D3D12_STATIC_SAMPLER_DESC s{};s.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;s.AddressU=s.AddressV=s.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;s.MaxLOD=D3D12_FLOAT32_MAX;
         D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=2;rs.pParameters=rp;rs.NumStaticSamplers=1;rs.pStaticSamplers=&s;
         ComPtr<ID3DBlob> blob,error;if(FAILED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error))||FAILED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))))return fail("root signature");
         for(unsigned i=0;i<2;++i){ComPtr<ID3DBlob> code;if(!compile(i?"Interpolate":"Prepare","cs_5_1",code))return fail("shader compilation");D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};if(FAILED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(i?&interpolate_shader:&prepare_shader))))return fail("compute pipeline");}
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=9*4;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=11*5;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))))return fail("descriptor heap");stride=dev->GetDescriptorHandleIncrementSize(hd.Type);initialized=true;return true;
     }
-    // Each bind uses 9 descriptors: 7 SRVs, then 2 UAVs.
-    void bind(ID3D12GraphicsCommandList* commands,unsigned base,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* output,OpticalConstants c,bool preparing,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ID3D12Resource* depth=nullptr){
+    // Eleven descriptors per set: nine SRVs and two UAVs. Set four owns cache preparation.
+    void bind(ID3D12GraphicsCommandList* commands,unsigned base,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* output,OpticalConstants c,bool preparing,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ID3D12Resource* depth=nullptr,bool caching=false){
         auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=base*stride;
-        ID3D12Resource* resources[]{old,now,textures[2].Get(),textures[3].Get(),textures[4].Get(),textures[5].Get(),depth};
-        for(unsigned i=0;i<7;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=i==0?old_format:i==1?now_format:i<4?DXGI_FORMAT_R16G16_SINT:i<6?DXGI_FORMAT_R8_UINT:DXGI_FORMAT_R32_FLOAT;v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;device->CreateShaderResourceView(resources[i],&v,cpu);cpu.ptr+=stride;}
-        for(unsigned i=0;i<2;++i){auto* r=preparing?textures[i].Get():i==0?output:nullptr;D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=r?r->GetDesc().Format:DXGI_FORMAT_R8G8B8A8_UNORM;v.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(r,nullptr,&v,cpu);cpu.ptr+=stride;}
-        auto* h=heap.Get();commands->SetDescriptorHeaps(1,&h);commands->SetComputeRootSignature(root.Get());commands->SetPipelineState(preparing?prepare_shader.Get():interpolate_shader.Get());auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=base*stride;commands->SetComputeRootDescriptorTable(0,gpu);commands->SetComputeRoot32BitConstants(1,sizeof(c)/4,&c,0);
+        ID3D12Resource* resources[]{old,now,textures[2].Get(),textures[3].Get(),textures[4].Get(),textures[5].Get(),depth,(caching||preparing)?nullptr:textures[6].Get(),(caching||preparing)?nullptr:textures[7].Get()};
+        for(unsigned i=0;i<9;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=i==0?old_format:i==1?now_format:i<4?DXGI_FORMAT_R16G16_SINT:i<6?DXGI_FORMAT_R8_UINT:i==6?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R32G32B32A32_FLOAT;v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;device->CreateShaderResourceView(resources[i],&v,cpu);cpu.ptr+=stride;}
+        for(unsigned i=0;i<2;++i){auto* r=caching?textures[6+i].Get():preparing?textures[i].Get():i==0?output:nullptr;D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=r?r->GetDesc().Format:DXGI_FORMAT_R8G8B8A8_UNORM;v.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(r,nullptr,&v,cpu);cpu.ptr+=stride;}
+        auto* h=heap.Get();commands->SetDescriptorHeaps(1,&h);commands->SetComputeRootSignature(root.Get());commands->SetPipelineState(caching?cache_shader.Get():preparing?prepare_shader.Get():interpolate_shader.Get());auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=base*stride;commands->SetComputeRootDescriptorTable(0,gpu);commands->SetComputeRoot32BitConstants(1,sizeof(c)/4,&c,0);
     }
     bool prepare(ID3D12Device* dev,ID3D12CommandQueue* q,ID3D12Resource* old,ID3D12Resource* now,unsigned quality,OpticalConstants c,bool reset_history,
         D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format,bool defer_completion=false){
@@ -275,7 +296,7 @@ struct Session12 : Error {
         // below, which follows every earlier render that sampled our vectors,
         // so the CPU never waits for unrelated (game) work on a shared queue.
         if(!initialize(dev,q,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0]))||!wait())return false;
-        c.sizes[0]=float(width);c.sizes[1]=float(height);
+        c.sizes[0]=float(width);c.sizes[1]=float(height);cache_ready=false;
         if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return fail("command reset");
         barrier(list.Get(),old,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);if(now!=old)barrier(list.Get(),now,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(unsigned i=0;i<2;++i)barrier(list.Get(),textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -292,22 +313,41 @@ struct Session12 : Error {
         if(!defer_completion&&!consume())return false;
         std::copy_n(c.flow_rect,4,crop);history=true;strcpy_s(diagnostic,"NVIDIA Optical Flow: generating");return true;
     }
+    // Queue after consume(), once per native pair. Later interpolation phases
+    // reuse the same packed fields without estimation, filtering passes or CPU waits.
+    bool prepare_vectors(ID3D12GraphicsCommandList* commands,OpticalConstants c){
+        if(c.texel[3]<3.5||cache_ready)return true;
+        if(!cache_shader){ComPtr<ID3DBlob> code;if(!compile("CacheVectors","cs_5_1",code))return fail("vector cache shader");
+            D3D12_COMPUTE_PIPELINE_STATE_DESC p{};p.pRootSignature=root.Get();p.CS={code->GetBufferPointer(),code->GetBufferSize()};
+            if(FAILED(device->CreateComputePipelineState(&p,IID_PPV_ARGS(&cache_shader))))return fail("vector cache pipeline");}
+        for(unsigned i=6;i<8;++i)if(!textures[i]&&!texture((width+grid-1)/grid,(height+grid-1)/grid,DXGI_FORMAT_R32G32B32A32_FLOAT,true,textures[i]))return fail("vector cache allocation");
+        c.sizes[0]=float(width);c.sizes[1]=float(height);
+        for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        for(unsigned i=6;i<8;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        bind(commands,44,nullptr,nullptr,nullptr,c,false,DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM,nullptr,true);
+        commands->Dispatch(((width+grid-1)/grid+7)/8,((height+grid-1)/grid+7)/8,1);
+        for(unsigned i=6;i<8;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        cache_ready=true;++cache_builds;return true;
+    }
     // GPU-side dependency only. The caller first submits earlier independent
     // work, then consumes this result immediately before recording its reader.
     bool consume(){return SUCCEEDED(queue->Wait(fence.Get(),serial))||fail("optical flow dependency");}
     // depth (R32_FLOAT, COMMON state) is read when c.flags[2] enables it.
     bool render(ID3D12GraphicsCommandList* commands,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* depth,OpticalConstants c,float fraction,DXGI_FORMAT format,
         D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ComPtr<ID3D12Resource>& output){
-        if(!handle)return false;
+        if(!handle||!prepare_vectors(commands,c))return false;
         c.sizes[0]=float(width);c.sizes[1]=float(height);
         if(!output||output->GetDesc().Width!=unsigned(c.sizes[2])||output->GetDesc().Height!=unsigned(c.sizes[3])||output->GetDesc().Format!=format){output.Reset();if(!texture(unsigned(c.sizes[2]),unsigned(c.sizes[3]),format,true,output))return fail("generated image");}
         barrier(commands,old,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);if(now!=old)barrier(commands,now,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         barrier(commands,output.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         barrier(commands,depth,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        c.flags[0]=fraction;bind(commands,9*(1+descriptor_set),old,now,output.Get(),c,false,old_format,now_format,depth);commands->Dispatch((unsigned(c.sizes[2])+7)/8,(unsigned(c.sizes[3])+7)/8,1);
+        if(c.texel[3]>3.5)for(unsigned i=6;i<8;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        c.flags[0]=fraction;bind(commands,11*(1+descriptor_set),old,now,output.Get(),c,false,old_format,now_format,depth);commands->Dispatch((unsigned(c.sizes[2])+7)/8,(unsigned(c.sizes[3])+7)/8,1);
         barrier(commands,output.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         barrier(commands,depth,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        if(c.texel[3]>3.5)for(unsigned i=6;i<8;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         barrier(commands,old,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,color_state);if(now!=old)barrier(commands,now,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,color_state);return true;
     }

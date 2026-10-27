@@ -207,29 +207,40 @@ def run(engine):
     receive(state)
     draw()
     if "--fg-center" in sys.argv:
-        for method in range(10):
-            draw(changes={"FG center method": method})
+        state["settings"].update(FgOpticalCenterCache=False, FgOpticalPeripheralCache=False)
+        receive(state)
+        for method in range(13):
+            draw(changes={"FG center method": method + 1})
             assert f"FgCenterMethod={method}" in last()
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
             state["settings"]["FgCenterMethod"] = method
             receive(state)
             draw()
-            assert g["values"]["FG center method"] == method
+            assert g["values"]["FG center method"] == method + 1
+            menu = g.combos["FG center method"]
+            assert menu[1] == "DLSS Frame Generation" and menu[0] is None
+            keys = list(lua.eval("function(t) local r={} for k in pairs(t) do r[#r+1]=k end return r end")(menu).values())
+            assert keys == list(range(1,14)), "UEVR must enumerate DLSS first, using a contiguous display array"
+            visible = g["values"]["Cache optical vector/confidence data (center)"] is not None
+            assert visible == (method in (7,8,11,12))
+            if method >= 5:
+                assert g.tree_parents["Advanced settings"] is not None
+                assert g["values"]["Center optical flow resolution"] is not None
         state["renderer"] = 0
         state["settings"]["FgCenterMethod"] = 2
         state["settings"]["FgPeripheralMethod"] = 1
         receive(state)
         draw()
-        assert g["values"]["FG center method"] == 2
-        assert g["values"]["FG periphery method"] == 1
+        assert g["values"]["FG center method"] == 3
+        assert g["values"]["FG periphery method"] == 2
         assert g["values"]["FG GPU queue"] is None
-        assert g["values"]["Release game rendering"] == [5,0,4,8,1,2,6,7,3].index(state["settings"]["FgReleasePoint"])
+        assert g["values"]["Release game rendering"] == 1 + [5,0,4,8,1,2,6,7,3].index(state["settings"]["FgReleasePoint"])
         assert not any("Native D3D11: shader FG" in text for text in g.drawn.values())
         state["settings"]["FgPeripheralMethod"] = 0
         receive(state)
         draw()
         assert g["values"]["FG GPU queue"] is not None
-        state["settings"].update(FgCenterMethod=4, FgPeripheralMethod=4, FgOpticalCenterPreset=1,
+        state["settings"].update(FgCenterMethod=5, FgPeripheralMethod=5, FgOpticalCenterPreset=1,
                                  FgOpticalPeripheralPreset=2, FgOpticalCenterPercent=100, FgOpticalPeripheralPercent=50,
                                  FgOpticalCenterGrid=4, FgOpticalPeripheralGrid=4)
         receive(state)
@@ -246,8 +257,23 @@ def run(engine):
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
             state["settings"][key] = value
             receive(state)
+        # Optical tuning remains visible with Advanced settings collapsed.
+        g.closed_trees["Advanced settings"] = True
+        receive(state)
+        draw()
+        assert g["values"]["Center optical flow preset"] is not None
+        assert g["values"]["Periphery optical flow resolution"] is not None
+        assert g["values"]["Center optical flow vector grid"] is not None
+        g.closed_trees["Advanced settings"] = None
+        state["settings"].update(FgCenterMethod=8, FgPeripheralMethod=12)
+        receive(state)
+        draw(changes={"Cache optical vector/confidence data (center)": True})
+        assert "FgOpticalCenterCache=true" in last()
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"]["FgOpticalCenterCache"] = True
+        receive(state)
         # The depth-assisted variant keeps the same optical flow controls.
-        state["settings"].update(FgCenterMethod=9, FgPeripheralMethod=9)
+        state["settings"].update(FgCenterMethod=11, FgPeripheralMethod=11)
         receive(state)
         draw()
         assert g["values"]["Center optical flow preset"] == 0
@@ -259,7 +285,7 @@ def run(engine):
         print("PASS FG center menu:", engine)
         return
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
-    assert g["values"]["Release game rendering"] == 8
+    assert g["values"]["Release game rendering"] == 9
     for retired in ("Submit repeat frames", "FG color capture", "FG OpenXR uploads", "FG guide capture",
                     "FG frame storage", "Direct periphery shading", "FG diagnostic mode", "FG periphery depth"):
         assert g["values"][retired] is None, "Fixed FG option must not be drawn: " + retired
@@ -312,7 +338,7 @@ def run(engine):
     receive(state)
     draw()
     assert g.combos["FG GPU queue"][2] == "Shared game queue"
-    state["settings"]["FgCenterMethod"] = 4
+    state["settings"]["FgCenterMethod"] = 5
     receive(state)
     draw()
     for option in (2, 1):
@@ -324,13 +350,13 @@ def run(engine):
         draw()
         assert g["values"]["FG GPU queue"] == option
     for point in (1, 2, 3, 4, 5, 0):
-        draw(changes={"Release game rendering": [5,0,4,8,1,2,6,7,3].index(point)})
+        draw(changes={"Release game rendering": 1 + [5,0,4,8,1,2,6,7,3].index(point)})
         assert "FgReleasePoint=" + str(point) in last()
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
         state["settings"]["FgReleasePoint"] = point
         receive(state)
         draw()
-        assert g["values"]["Release game rendering"] == [5,0,4,8,1,2,6,7,3].index(point)
+        assert g["values"]["Release game rendering"] == 1 + [5,0,4,8,1,2,6,7,3].index(point)
     assert any("Generating frames" in t for t in g.drawn.values())
     for label, key in (("FG latency diagnostics","FgLatencyDiagnostics"),):
         for option in (1,0):
@@ -469,7 +495,7 @@ def run(engine):
                             ("FG periphery scale","FgPeripheralPercent",25),
                             ("FG center method","FgCenterMethod",2),
                             ("FG periphery method","FgPeripheralMethod",0)):
-        draw(changes={label:value})
+        draw(changes={label:value + 1 if label in ("FG center method", "FG periphery method") else value})
         assert f"{key}={value}" in last(), "FG control must send its actual setting: " + label
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
         state["settings"][key] = value

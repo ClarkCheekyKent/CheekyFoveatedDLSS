@@ -679,10 +679,21 @@ changes failure accounting only; it does not defer or combine eye captures.
 
 # Combined FG methods and optical timing
 
-Center and periphery share menu IDs: 0 DLSS Frame Generation, 1-3 DLSS Vectors
-(simple warping, bidirectional, confidence-guided), 4-6 Optical Flow (the same
-three reconstruction choices), 7-9 Optical Flow + DLSS Depth (the same three choices), and 10 Previous frame
-(periphery only). Old method IDs are not migrated.
+Center and periphery share menu IDs: 0 DLSS Frame Generation; 1-4 DLSS Vectors
+(simple, bidirectional, confidence-guided, fast confidence-guided); 5-8 Optical
+Flow; 9-12 Optical Flow + DLSS Depth; and 13 Previous frame (periphery only).
+Old method IDs are not migrated. Optical preset, resolution and vector block
+size remain next to the selected method, outside Advanced. The cache checkbox
+is shown only for optical confidence-guided methods (7/8/11/12), defaults off,
+and independently configures center/periphery. Fast uses two trajectory
+iterations and omits the neighboring-trajectory repair search.
+
+`--fg-optical-cache` is the focused NVIDIA test: it compares cache on/off pixels
+for quality/fast and depth on/off, checks one cache build per native pair across
+three generated phases, and checks the preparation gate timing. Caching packs
+vectors with their original cost into float surfaces; unguided reads use hardware
+bilinear filtering and depth-guided reads keep their original per-sample weights.
+It does not cache phase-dependent trajectories or visibility decisions.
 
 `CheekyOpenXRBindingTests --fg-methods` compares generated D3D11/D3D12 pixels
 for all DLSS-vector reconstruction choices, foveation and interpolation phases.

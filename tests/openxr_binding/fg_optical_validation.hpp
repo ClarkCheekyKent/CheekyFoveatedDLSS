@@ -56,12 +56,12 @@ inline void fg_optical_validation(bool quick=false){
     {D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=edge;d.MipLevels=d.ArraySize=1;d.SampleDesc.Count=1;d.Format=DXGI_FORMAT_R32_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
      D3D11_SUBRESOURCE_DATA data{depth.data(),edge*4,0};check(SUCCEEDED(device11->CreateTexture2D(&d,&data,&depth11))&&SUCCEEDED(device11->CreateShaderResourceView(depth11.Get(),nullptr,&depth_view)),"Optical depth texture");}
     auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));for(auto& v:views)v.subImage.imageRect.extent={edge,edge};
-    for(unsigned method:{cheeky_fg_optical_simple,cheeky_fg_optical_bidirectional,cheeky_fg_optical_flow})for(bool depth_guidance:{false,true})for(unsigned quality=0;quality<(!quick&&method==6?3u:1u);++quality){
+    for(unsigned method:{cheeky_fg_optical_simple,cheeky_fg_optical_bidirectional,cheeky_fg_optical_flow})for(bool depth_guidance:{false,true})for(unsigned quality=0;quality<(!quick&&method==cheeky_fg_optical_flow?3u:1u);++quality){
         Backend11 backend;check(backend.initialize(device11.Get(),7,nullptr),backend.diagnostic);
         std::array<Image,2> previous,current;
         std::array<std::shared_ptr<Backend11::Guides>,2> guides;
         for(unsigned eye=0;eye<2;++eye){previous[eye]=backend.copy(a.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);current[eye]=backend.copy(b.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
-            guides[eye]=std::make_shared<Backend11::Guides>();auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.center_method=g.peripheral_method=method+(depth_guidance?3u:0u);
+            guides[eye]=std::make_shared<Backend11::Guides>();auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.center_method=g.peripheral_method=method+(depth_guidance?4u:0u);
             if(depth_guidance)guides[eye]->depth_srv=depth_view;
             g.focus_width=.55f;g.focus_height=.45f;g.resolution_percent=100;g.peripheral_percent=75;
             g.optical.center_preset=quality;g.optical.peripheral_preset=2-quality;g.optical.center_percent=100;g.optical.peripheral_percent=50;g.optical.center_grid=1u<<quality;g.optical.peripheral_grid=4u>>quality;}
@@ -108,10 +108,10 @@ inline void fg_optical_validation(bool quick=false){
     fg_parity::D3D12 gpu(adapter.Get());
     auto old12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4,edge),now12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4,edge);
     auto depth12=gpu.texture(DXGI_FORMAT_R32_FLOAT,depth.data(),4,edge),motion12=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,motion.data(),8,edge);gpu.execute();
-    for(unsigned method:{cheeky_fg_optical_simple,cheeky_fg_optical_bidirectional,cheeky_fg_optical_flow})for(bool depth_guidance:{false,true})for(unsigned quality=0;quality<(!quick&&method==6?3u:1u);++quality){
+    for(unsigned method:{cheeky_fg_optical_simple,cheeky_fg_optical_bidirectional,cheeky_fg_optical_flow})for(bool depth_guidance:{false,true})for(unsigned quality=0;quality<(!quick&&method==cheeky_fg_optical_flow?3u:1u);++quality){
         Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),edge,edge,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
         CheekyFgPair pair;pair.producer_queue=gpu.queue.Get();
-        for(auto& g:pair.eyes){g.width=g.height=edge;g.center_method=g.peripheral_method=method+(depth_guidance?3u:0u);g.focus_width=.55f;g.focus_height=.45f;
+        for(auto& g:pair.eyes){g.width=g.height=edge;g.center_method=g.peripheral_method=method+(depth_guidance?4u:0u);g.focus_width=.55f;g.focus_height=.45f;
             if(depth_guidance){g.depth=depth12.Get();g.motion=motion12.Get();g.depth_width=g.depth_height=g.motion_width=g.motion_height=edge;g.motion_scale_x=g.motion_scale_y=1;}
             g.optical.center_preset=quality;g.optical.peripheral_preset=2-quality;g.optical.center_percent=100;g.optical.peripheral_percent=50;g.optical.center_grid=1u<<quality;g.optical.peripheral_grid=4u>>quality;g.peripheral_percent=75;g.configuration=method*4+quality+1;}
         std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye],false);
@@ -219,4 +219,74 @@ inline void fg_optical_size_stability(){
     bool kept=true;for(unsigned i=0;i<100;++i)kept=session.keep_size(2000,1800);
     check(!kept,"A lasting flow size change must rebuild the optical flow session");
     std::cout<<"PASS optical flow session size stability (edge, far jump, transient full eye)\n";
+}
+
+// Focused coverage for the optional pair cache and fast reconstruction. Reuse
+// sessions so this does not sweep presets, grids or unrelated presenter paths.
+inline void fg_optical_cache_validation(){
+    using namespace cheeky::fg;using namespace optical_fixture;
+    ComPtr<ID3D11Device> device11;ComPtr<ID3D11DeviceContext> context;
+    check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device11,nullptr,&context)),"Cache hardware device");
+    auto upload11=[&](DXGI_FORMAT format,const void* pixels,unsigned stride){
+        D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=edge;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;d.Format=format;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA initial{pixels,edge*stride};ComPtr<ID3D11Texture2D> t;
+        check(SUCCEEDED(device11->CreateTexture2D(&d,&initial,&t)),"Cache source texture");return t;
+    };
+    auto near_equal=[](const auto& a,const auto& b){
+        check(a.size()==b.size(),"Cached output dimensions");unsigned peak{};double error{};
+        for(size_t i=0;i<a.size();++i)for(unsigned channel=0;channel<3;++channel){
+            const auto delta=unsigned(std::abs(int((a[i]>>(channel*8))&255)-int((b[i]>>(channel*8))&255)));
+            peak=std::max(peak,delta);error+=delta;
+        }
+        error/=a.size()*3;check(error<.1&&peak<=2,"Caching must preserve reconstruction within output quantization");
+    };
+    const auto old=frame(0),now=frame(12);std::vector<float> depth(edge*edge,.5f),motion(edge*edge*2);
+    auto a=upload11(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4),b=upload11(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4),z=upload11(DXGI_FORMAT_R32_FLOAT,depth.data(),4);
+    ComPtr<ID3D11ShaderResourceView> depth_view;check(SUCCEEDED(device11->CreateShaderResourceView(z.Get(),nullptr,&depth_view)),"Cache depth view");
+    auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));for(auto& v:views)v.subImage.imageRect.extent={edge,edge};
+    Backend11 native;check(native.initialize(device11.Get(),7,nullptr),native.diagnostic);
+    std::array<Image,2> previous,current;std::array<std::shared_ptr<Backend11::Guides>,2> guides;
+    for(unsigned eye=0;eye<2;++eye){previous[eye]=native.copy(a.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);current[eye]=native.copy(b.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+        guides[eye]=std::make_shared<Backend11::Guides>();guides[eye]->depth_srv=depth_view;
+        auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.focus_width=g.focus_height=1;g.peripheral_method=cheeky_fg_previous;g.optical.center_grid=4;
+    }
+    constexpr float fractions[]{.25f,.5f,.75f};
+    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth}){
+        std::array<std::vector<std::uint32_t>,3> reference;
+        for(bool cached:{false,true})for(unsigned phase=0;phase<3;++phase){
+            for(auto& guide:guides){guide->source.meta.center_method=method;guide->source.meta.optical.center_cache=cached;}
+            std::array<Image,2> out;check(native.generate(previous,current,guides,guides,views,views,out,false,fractions[phase]),native.diagnostic);
+            const auto pixels=read11(device11.Get(),context.Get(),out[0]->texture11.Get());
+            if(cached)near_equal(reference[phase],pixels);else{reference[phase]=pixels;validate(pixels,fractions[phase],"D3D11 cache/fast");}
+        }
+        for(unsigned eye=0;eye<2;++eye)check(native.optical[eye][0].cache_builds==1,"D3D11 packs vectors once for the native pair, across phases and interpolators");
+    }
+    ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;check(SUCCEEDED(device11.As(&dxgi))&&SUCCEEDED(dxgi->GetAdapter(&adapter)),"Cache adapter");
+    fg_parity::D3D12 gpu(adapter.Get());
+    auto old12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4,edge),now12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4,edge);
+    auto depth12=gpu.texture(DXGI_FORMAT_R32_FLOAT,depth.data(),4,edge),motion12=gpu.texture(DXGI_FORMAT_R32G32_FLOAT,motion.data(),8,edge);gpu.execute();
+    Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),edge,edge,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
+    CheekyFgPair pair;pair.producer_queue=gpu.queue.Get();
+    for(auto& g:pair.eyes){g.width=g.height=edge;g.focus_width=g.focus_height=1;g.peripheral_method=cheeky_fg_previous;
+        g.depth=depth12.Get();g.motion=motion12.Get();g.depth_width=g.depth_height=g.motion_width=g.motion_height=edge;}
+    std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye],false);
+    std::array<ID3D12Resource*,2> prior{old12.Get(),old12.Get()},later{now12.Get(),now12.Get()},out;
+    unsigned expected_builds{};
+    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth}){
+        std::array<std::vector<std::uint32_t>,3> reference;
+        for(bool cached:{false,true}){
+            if(cached)++expected_builds;
+            for(auto& g:pair.eyes){g.center_method=method;g.optical.center_cache=cached;}
+            for(unsigned phase=1;phase<=3;++phase){
+                check(worker.generate(pair,later,prior,cameras,out,nullptr,nullptr,nullptr,nullptr,3,phase),worker.diagnostic);
+                const auto pixels=gpu.read(out[0]);if(cached)near_equal(reference[phase-1],pixels);else{reference[phase-1]=pixels;validate(pixels,fractions[phase-1],"D3D12 cache/fast");}
+                for(unsigned eye=0;eye<2;++eye)check(worker.focus.optical[eye][0].cache_builds==expected_builds,"D3D12 packs vectors once per pair, never per generated phase");
+            }
+            const auto batch=worker.batch_timings.snapshot();check(batch.valid&&batch.optical_separated&&batch.optical_ms>0,"Cache preparation is in the separate optical timing scope");
+        }
+    }
+    pair.release_point=1;for(auto& g:pair.eyes){g.center_method=cheeky_fg_optical_fast_depth;g.optical.center_cache=true;}
+    for(unsigned phase=1;phase<=2;++phase)check(worker.generate(pair,later,prior,cameras,out,nullptr,nullptr,nullptr,nullptr,2,phase),worker.diagnostic);
+    check(worker.batch_timings.snapshot().valid,"Preparation-gated caching retains valid separated timings");
+    std::cout<<"PASS focused optical cache/fast: D3D11/D3D12, depth on/off, cache pixel parity, per-pair reuse and preparation-gate timing\n";
 }

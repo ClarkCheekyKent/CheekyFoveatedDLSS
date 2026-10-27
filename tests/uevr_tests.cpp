@@ -135,29 +135,32 @@ void settings_tests(const std::filesystem::path& root) {
             require(!set_named_setting(fg,key,"2")&&!set_named_setting(fg,key,"-1")&&set_named_setting(fg,key,"1"),"Transport dropdown bounds validate");
         require(fg.fg.center_method==0&&set_named_setting(fg,"FgCenterMethod","1")&&set_named_setting(fg,"FgCenterMethod","2")&&
             set_named_setting(fg,"FgCenterMethod","3")&&!set_named_setting(fg,"FgCenterMethod","-1"),"Center FG defaults to DLSS and validates shader methods");
-        require(set_named_setting(fg,"FgCenterMethod","4")&&set_named_setting(fg,"FgPeripheralMethod","4")&&
+        require(set_named_setting(fg,"FgCenterMethod","5")&&set_named_setting(fg,"FgPeripheralMethod","5")&&
             set_named_setting(fg,"FgOpticalCenterPreset","0")&&set_named_setting(fg,"FgOpticalPeripheralPreset","2")&&
             set_named_setting(fg,"FgOpticalCenterPercent","75")&&set_named_setting(fg,"FgOpticalPeripheralPercent","25")&&
             !set_named_setting(fg,"FgOpticalCenterPercent","0")&&!set_named_setting(fg,"FgOpticalPeripheralPreset","3"),
             "Independent optical flow controls accept valid presets/scales and reject malformed settings");
-        for(unsigned method=1;method<=9;++method){
+        for(unsigned method=1;method<=12;++method){
             require(set_named_setting(fg,"FgCenterMethod",std::to_string(method))&&set_named_setting(fg,"FgPeripheralMethod",std::to_string(method)),
                 "Combined method IDs follow the menu order");
             require(cheeky_fg_shader_only(method,method,true),"Combined methods use the shader backend");
         }
-        require(!set_named_setting(fg,"FgCenterMethod","10")&&!set_named_setting(fg,"FgPeripheralMethod","11"),"Unknown combined methods are rejected");
-        require(set_named_setting(fg,"FgCenterMethod","4"),"Restore Optical Flow Simple Warping for the settings round trip");
+        require(!set_named_setting(fg,"FgCenterMethod","13")&&!set_named_setting(fg,"FgPeripheralMethod","14"),"Unknown combined methods are rejected");
+        require(set_named_setting(fg,"FgCenterMethod","5"),"Restore Optical Flow Simple Warping for the settings round trip");
+        require(!fg.fg.optical.center_cache&&!fg.fg.optical.peripheral_cache&&
+            set_named_setting(fg,"FgOpticalCenterCache","true")&&set_named_setting(fg,"FgOpticalPeripheralCache","false"),
+            "Optical vector caches default off and are independently configurable");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","0"),"FG quality and periphery controls parse");
         require(write_settings_file(path,fg,error),"Save FG settings");
         Settings restored;
         require(read_settings_file(path,restored,error)&&restored.fg.optical.center_preset==0&&restored.fg.optical.peripheral_preset==2&&
-            restored.fg.optical.center_percent==75&&restored.fg.optical.peripheral_percent==25&&restored.fg.center_method==4,
+            restored.fg.optical.center_cache&&!restored.fg.optical.peripheral_cache&&restored.fg.optical.center_percent==75&&restored.fg.optical.peripheral_percent==25&&restored.fg.center_method==5,
             "Optical flow center method and independent controls survive profile round trip");
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.center_method==4&&restored.fg.peripheral_method==0&&
+            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.center_method==5&&restored.fg.peripheral_method==0&&
             restored.fg.release_point==3&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1,
             "FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");

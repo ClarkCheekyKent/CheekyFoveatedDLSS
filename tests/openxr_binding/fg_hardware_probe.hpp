@@ -187,7 +187,7 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     check(center_input.depth->GetDesc().Width==guide_width&&center_input.motion->GetDesc().Width==guide_width,
         "NGX must accept cropped source-resolution guides independently of output color");
     if(foveated){const auto& input=worker.focus.inputs[0][1];
-        if(compact&&(method==10||cheeky_fg_dlss_vectors(method))&&!periphery_baseline)check(!worker.focus.peripheral_output[0]&&!worker.focus.peripheral_output[1],
+        if(compact&&(method==cheeky_fg_previous||cheeky_fg_dlss_vectors(method))&&!periphery_baseline)check(!worker.focus.peripheral_output[0]&&!worker.focus.peripheral_output[1],
             "Custom compact output must eliminate both private periphery textures");
         check(bool(input.color)==(method==0)&&bool(input.depth)==(method==0||cheeky_fg_depth(method))&&bool(input.motion)==(method==0||cheeky_fg_dlss_vectors(method)),
             "Only resources used by the periphery algorithm may be prepared");

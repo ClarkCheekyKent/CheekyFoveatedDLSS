@@ -47,7 +47,7 @@ void fg_prepared_validation(ID3D12Device* device) {
         for(unsigned y=0;y<d.Height;++y)std::memcpy(out.data()+SIZE_T(y)*d.Width*pixel_bytes,static_cast<char*>(data)+y*fp.Footprint.RowPitch,SIZE_T(d.Width)*pixel_bytes);
         result->Unmap(0,nullptr);return out;
     };
-    for(unsigned method:{10u,1u,2u,0u,3u,9u}){
+    for(unsigned method:{13u,1u,2u,0u,3u,4u,11u}){
         upload(depth.Get(),false);upload(motion.Get(),true);
         CheekyFgEye g;g.depth=depth.Get();g.motion=motion.Get();g.width=640;g.height=512;
         g.depth_base_x=7;g.depth_base_y=5;g.depth_width=256;g.depth_height=192;
