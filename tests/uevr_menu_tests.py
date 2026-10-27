@@ -171,7 +171,7 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["Use lower DLSS hook (DX12)"] is True
-    assert "DLSS-FG (experimental)" in g.trees
+    assert "Frame Gen (Experimental)" in g.trees
     assert g["values"]["Enable Frame Generation"] is False
     state["settings"]["FgMultiplier"] = 2
     receive(state)
@@ -209,18 +209,25 @@ def run(engine):
     if "--fg-center" in sys.argv:
         state["settings"].update(FgOpticalCenterCache=False, FgOpticalPeripheralCache=False)
         receive(state)
+        keys_of = lua.eval("function(t) local r={} for k in pairs(t) do r[#r+1]=k end return r end")
         for method in range(13):
-            draw(changes={"FG center method": method + 1})
-            assert f"FgCenterMethod={method}" in last()
-            state["request"] = state["applied_request"] = int(last().splitlines()[1])
+            kind, interpolation = (1, None) if method == 0 else ((method - 1) // 4 + 2, (method - 1) % 4 + 1)
+            changes = {"FG center type": kind}
+            if interpolation: changes["FG center method"] = interpolation
+            draw(changes=changes)
+            if method != state["settings"]["FgCenterMethod"]:
+                assert f"FgCenterMethod={method}" in last()
+                state["request"] = state["applied_request"] = int(last().splitlines()[1])
             state["settings"]["FgCenterMethod"] = method
             receive(state)
             draw()
-            assert g["values"]["FG center method"] == method + 1
-            menu = g.combos["FG center method"]
-            assert menu[1] == "DLSS Frame Generation" and menu[0] is None
-            keys = list(lua.eval("function(t) local r={} for k in pairs(t) do r[#r+1]=k end return r end")(menu).values())
-            assert keys == list(range(1,14)), "UEVR must enumerate DLSS first, using a contiguous display array"
+            assert g["values"]["FG center type"] == kind
+            assert g["values"]["FG center method"] == interpolation
+            menu = g.combos["FG center type"]
+            assert menu[1] == "DLSS-G" and menu[4] == "Optiflow + Depth" and menu[0] is None
+            assert list(keys_of(menu).values()) == [1, 2, 3, 4], "UEVR must enumerate DLSS-G first, using a contiguous display array"
+            if interpolation:
+                assert list(keys_of(g.combos["FG center method"]).values()) == [1, 2, 3, 4]
             visible = g["values"]["Cache optical vector/confidence data (center)"] is not None
             assert visible == (method in (7,8,11,12))
             if method >= 5:
@@ -231,8 +238,9 @@ def run(engine):
         state["settings"]["FgPeripheralMethod"] = 1
         receive(state)
         draw()
-        assert g["values"]["FG center method"] == 3
-        assert g["values"]["FG periphery method"] == 2
+        assert g["values"]["FG center type"] == 2 and g["values"]["FG center method"] == 2
+        assert g["values"]["FG periphery type"] == 2 and g["values"]["FG periphery method"] == 1
+        assert g.combos["FG periphery type"][5] == "Previous frame"
         assert g["values"]["FG GPU queue"] is None
         assert g["values"]["Release game rendering"] == 1 + [5,0,4,8,1,2,6,7,3].index(state["settings"]["FgReleasePoint"])
         assert not any("Native D3D11: shader FG" in text for text in g.drawn.values())
@@ -281,7 +289,7 @@ def run(engine):
         del state["settings"]["FgCenterMethod"]
         receive(state)
         draw()
-        assert g["values"]["FG center method"] is None
+        assert g["values"]["FG center type"] is None and g["values"]["FG center method"] is None
         print("PASS FG center menu:", engine)
         return
     assert g["values"]["FG region width"] == state["settings"]["FgWidth"]
@@ -289,7 +297,7 @@ def run(engine):
     for retired in ("Submit repeat frames", "FG color capture", "FG OpenXR uploads", "FG guide capture",
                     "FG frame storage", "Direct periphery shading", "FG diagnostic mode", "FG periphery depth"):
         assert g["values"][retired] is None, "Fixed FG option must not be drawn: " + retired
-    assert g.tree_parents["Advanced settings"] == "DLSS-FG (experimental)"
+    assert g.tree_parents["Advanced settings"] == "Frame Gen (Experimental)"
     assert g.tree_parents["Advanced settings"] is not None and g["values"]["FG pacing clock"] is None
     assert "FG resource memory breakdown##fg" not in g.trees, "GPU memory belongs to Performance, not the FG menu"
     state["gpu_memory"] = {"supported":True,"scope":"process","adapter":"Test GPU","dedicated_capacity_bytes":12288*1048576,
@@ -491,11 +499,12 @@ def run(engine):
     assert "2.750 / 2.500" not in list(g.drawn.values()), "Do not show stale/invalid GPU samples as current"
     performance["gpu_valid"] = True
     assert g.slider_ranges["FG transition width"][1] == 0
-    for label,key,value in (("FG scale","FgResolutionPercent",50),
-                            ("FG periphery scale","FgPeripheralPercent",25),
-                            ("FG center method","FgCenterMethod",2),
-                            ("FG periphery method","FgPeripheralMethod",0)):
-        draw(changes={label:value + 1 if label in ("FG center method", "FG periphery method") else value})
+    # Type and method indices are 1-based: DLSS Vectors + Bidirectional is ID 2; DLSS-G is ID 0.
+    for label,key,value,edit in (("FG scale","FgResolutionPercent",50,{"FG scale":50}),
+                                 ("FG periphery scale","FgPeripheralPercent",25,{"FG periphery scale":25}),
+                                 ("FG center type","FgCenterMethod",2,{"FG center type":2,"FG center method":2}),
+                                 ("FG periphery type","FgPeripheralMethod",0,{"FG periphery type":1})):
+        draw(changes=edit)
         assert f"{key}={value}" in last(), "FG control must send its actual setting: " + label
         state["request"] = state["applied_request"] = int(last().splitlines()[1])
         state["settings"][key] = value

@@ -918,21 +918,30 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     }
 
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
-    const auto method_combo=[](const char* label,unsigned& method,bool periphery,bool quad_view){
-        constexpr const char* names[]{"DLSS Frame Generation",
-            "DLSS Vectors - Simple Warping", "DLSS Vectors - Bidirectional Interpolation",
-            "DLSS Vectors - Confidence-Guided Interpolation", "DLSS Vectors - Confidence-Guided Interpolation (Fast)",
-            "Optical Flow - Simple Warping", "Optical Flow - Bidirectional Interpolation",
-            "Optical Flow - Confidence-Guided Interpolation", "Optical Flow - Confidence-Guided Interpolation (Fast)",
-            "Optical Flow + DLSS Depth - Simple Warping", "Optical Flow + DLSS Depth - Bidirectional Interpolation",
-            "Optical Flow + DLSS Depth - Confidence-Guided Interpolation", "Optical Flow + DLSS Depth - Confidence-Guided Interpolation (Fast)",
-            "Previous frame"};
-        const unsigned first=periphery&&quad_view?1u:0u,count=periphery?14u:13u;
-        int selected=int(method)-int(first);
-        if(ImGui::Combo(label,&selected,names+first,int(count-first)))method=unsigned(selected)+first;
+    // Type and method share one saved ID: 0 DLSS-G, 1-4 DLSS vectors,
+    // 5-8 optical flow, 9-12 optical flow + depth, 13 previous frame.
+    const auto method_combo=[](const char* prefix,unsigned& method,bool periphery,bool quad_view){
+        constexpr const char* types[]{"DLSS-G","DLSS Vectors","Optiflow","Optiflow + Depth","Previous frame"};
+        constexpr const char* methods[]{"Simple Warping","Bidirectional Interpolation",
+            "Confidence-Guided Interpolation","Confidence-Guided Interpolation (Fast)"};
+        const auto type_of=[](unsigned m){return m==0?0:m==cheeky_fg_previous?4:int((m-1)/4)+1;};
+        const int first=periphery&&quad_view?1:0,count=periphery?5:4;
+        const int interpolation=cheeky_fg_shader(method)?int((method-1)%4):2;
+        char label[64]{};
+        sprintf_s(label,"%s type",prefix);
+        int selected=type_of(method)-first;
+        if(ImGui::Combo(label,&selected,types+first,count-first)&&selected+first!=type_of(method)){
+            const int type=selected+first;
+            method=type==0?0u:type==4?cheeky_fg_previous:unsigned((type-1)*4+interpolation+1);
+        }
+        test_control(label);
+        if(!cheeky_fg_shader(method))return;
+        sprintf_s(label,"%s method",prefix);
+        int index=int((method-1)%4);
+        if(ImGui::Combo(label,&index,methods,4))method=method-(method-1)%4+unsigned(index);
         test_control(label);
     };
-    method_combo("FG center method",s.center_method,false,quad);
+    method_combo("FG center",s.center_method,false,quad);
     if(cheeky_fg_cacheable(s.center_method))ImGui::Checkbox("Cache optical vector/confidence data (center)",&s.optical.center_cache);
     if(cheeky_fg_optical(s.center_method)){
         combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
@@ -957,7 +966,7 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         }
         }
         fg_percent("FG periphery scale", s.peripheral_percent);
-        method_combo("FG periphery method",s.peripheral_method,true,quad);
+        method_combo("FG periphery",s.peripheral_method,true,quad);
         if(cheeky_fg_cacheable(s.peripheral_method))ImGui::Checkbox("Cache optical vector/confidence data (periphery)",&s.optical.peripheral_cache);
         if(cheeky_fg_optical(s.peripheral_method)){
             combo("Periphery optical flow preset",s.optical.peripheral_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
@@ -1350,7 +1359,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     draw_sr_performance(r.snapshot, r.draft);
                 end_tab();
             }
-            if (begin_tab("DLSS-FG")) {
+            if (begin_tab("Frame Gen (Experimental)")) {
                 draw_fg(r.draft, r.snapshot, std::string_view(renderer)=="D3D11");
                 if (ImGui::Button("Reset FG defaults")) command(r, runtime, "defaults_fg");
                 end_tab();

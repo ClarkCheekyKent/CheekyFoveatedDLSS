@@ -139,7 +139,7 @@ void test_ui_diagnostics() {
     auto text = render("Stereo / Gaze");
     auto* bar = context->TabBars.GetByIndex(0);
     require(std::strcmp(ImGui::TabBarGetTabName(bar, &bar->Tabs[0]), "General") == 0, "General should be the first tab");
-    require(bar->Tabs.Size == 6, "Standalone tabs include DLSS-FG");
+    require(bar->Tabs.Size == 6, "Standalone tabs include Frame Gen");
     require(text.find("no active OpenXR layer") != text.npos, "Missing gaze adapter warning");
     text = render("Stereo / Gaze", false);
     require(text.find("Quad view assignment") == text.npos && text.find("Quad assignment mode") == text.npos &&
@@ -154,19 +154,19 @@ void test_ui_diagnostics() {
     require(text.find("manual fallback placement") != text.npos, "Missing stereo fallback warning");
     state.draft.fg.enabled = true;
     state.snapshot = R"({"fg":{"layer_present":false}})";
-    render("DLSS-FG"); text = render("DLSS-FG");
+    render("Frame Gen (Experimental)"); text = render("Frame Gen (Experimental)");
     require(text.find("Enable Frame Generation") != text.npos &&
         text.find("Automatic FG multiplier") != text.npos &&
         text.find("OpenXR layer not loaded") != text.npos, "FG enable and missing presenter diagnostics");
     state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":false}})";
-    require(render("DLSS-FG").find("Waiting for a running D3D11 or D3D12 OpenXR stereo session") != text.npos,
+    require(render("Frame Gen (Experimental)").find("Waiting for a running D3D11 or D3D12 OpenXR stereo session") != text.npos,
         "FG does not report an incompatible session as generating");
     state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":true,
         "state":"Generating frames","generated_frames":17,"cadence":{"valid":true,"unique_fps":90,"submission_fps":120},
         "performance":{"supported":true,"gpu_valid":true,"total_ms":2.5,"total_last_ms":2.25},
         "overhead":{"supported":true,"guide_samples":4,"guide_ms":0.25,"guide_last_ms":0.25,"capture_samples":4,"capture_ms":0.125,
             "capture_last_ms":0.125,"publication_samples":0,"upload_samples":4,"upload_ms":0.5,"upload_last_ms":0.375}}})";
-    text = render("DLSS-FG");
+    text = render("Frame Gen (Experimental)");
     require(text.find("Generating frames") != text.npos && text.find("Total frames (native / generated / fallback): 0 / 17 / 0") != text.npos &&
         text.find("Unique FPS output: 90.0 FPS") != text.npos && text.find("Generation subtotal") != text.npos &&
         text.find("Repeated / total OpenXR submissions") == text.npos &&
@@ -182,10 +182,10 @@ void test_ui_diagnostics() {
         text.find("Copy FG diagnostic JSON") != text.npos && text.find("{\"layer_present\"") == text.npos,
         "FG diagnostics must use readable groups without dumping raw JSON");
     render_api="D3D11";
-    text=render("DLSS-FG");
+    text=render("Frame Gen (Experimental)");
     require(text.find("FG output destination")==text.npos,"DX11 FG omits the unavailable direct-XR experiment");
     state.draft.fg.center_method=1;state.draft.fg.peripheral_method=1;
-    text=render("DLSS-FG",false);
+    text=render("Frame Gen (Experimental)",false);
     require(text.find("Shader generation (center + periphery)")!=text.npos&&text.find("Color / guide preparation")==text.npos&&
         text.find("Show blue FG region border")!=text.npos,"Native D3D11 labels fused shader timings and leaves the border outside Advanced settings");
     state.draft.fg.center_method=0;

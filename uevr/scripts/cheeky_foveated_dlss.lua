@@ -163,25 +163,28 @@ local function text(s) imgui.text(tostring(s)) end
 local function fg_optical(method)
     return method ~= nil and method >= 5 and method <= 12
 end
-local function fg_method_combo(label, key, periphery)
-    local values = {
-        [0] = "DLSS Frame Generation",
-        [1] = "DLSS Vectors - Simple Warping",
-        [2] = "DLSS Vectors - Bidirectional Interpolation",
-        [3] = "DLSS Vectors - Confidence-Guided Interpolation",
-        [4] = "DLSS Vectors - Confidence-Guided Interpolation (Fast)",
-        [5] = "Optical Flow - Simple Warping",
-        [6] = "Optical Flow - Bidirectional Interpolation",
-        [7] = "Optical Flow - Confidence-Guided Interpolation",
-        [8] = "Optical Flow - Confidence-Guided Interpolation (Fast)",
-        [9] = "Optical Flow + DLSS Depth - Simple Warping",
-        [10] = "Optical Flow + DLSS Depth - Bidirectional Interpolation",
-        [11] = "Optical Flow + DLSS Depth - Confidence-Guided Interpolation",
-        [12] = "Optical Flow + DLSS Depth - Confidence-Guided Interpolation (Fast)"
-    }
-    local order = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
-    if periphery then values[13] = "Previous frame"; order[#order + 1] = 13 end
-    combo(label, key, values, order)
+-- Type and method share one saved ID: 0 DLSS-G, 1-4 DLSS vectors,
+-- 5-8 optical flow, 9-12 optical flow + depth, 13 previous frame.
+local function fg_method_combo(prefix, key, periphery)
+    local method = draft[key]
+    if method == nil then return end
+    local function set(value) draft[key], dirty[key], ready_edits[key] = value, value, value end
+    local types = {"DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"}
+    if periphery then types[5] = "Previous frame" end
+    local shader = method >= 1 and method <= 12
+    local kind = method == 0 and 1 or method == 13 and 5 or math.floor((method - 1) / 4) + 2
+    local interpolation = shader and (method - 1) % 4 + 1 or 3
+    local changed, value = imgui.combo(prefix .. " type", kind, types)
+    if changed and value ~= kind then
+        if value == 1 then set(0) elseif value == 5 then set(13) else set((value - 2) * 4 + interpolation) end
+    end
+    method = draft[key]
+    if method >= 1 and method <= 12 then
+        local methods = {"Simple Warping", "Bidirectional Interpolation",
+            "Confidence-Guided Interpolation", "Confidence-Guided Interpolation (Fast)"}
+        changed, value = imgui.combo(prefix .. " method", (method - 1) % 4 + 1, methods)
+        if changed then set(method - (method - 1) % 4 + value - 1) end
+    end
 end
 local function fg_cache_check(label, method, key)
     if (method == 7 or method == 8 or method == 11 or method == 12) and draft[key] ~= nil then
@@ -652,13 +655,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         imgui.tree_pop()
     end
 
-    if imgui.tree_node("DLSS-FG (experimental)") then
+    if imgui.tree_node("Frame Gen (Experimental)") then
         if draft.FgEnabled == nil then
             text("Install the matching DLSS-FG plugin, runtime and Lua script.")
         elseif not native_fg_mode then
             text("DLSS-FG controls are available only in UEVR Native Stereo.")
         else
-            -- Same content and order as the standalone F8 DLSS-FG tab.
+            -- Same content and order as the standalone F8 Frame Gen tab.
             check("Enable Frame Generation", "FgEnabled")
             if draft.FgMultiplier ~= nil then
                 if draft.FgAutoMultiplier ~= nil then check("Automatic FG multiplier", "FgAutoMultiplier") end
@@ -693,7 +696,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             local percent = {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"}
             section("Foveation")
             if draft.FgCenterMethod ~= nil then
-                fg_method_combo("FG center method", "FgCenterMethod", false)
+                fg_method_combo("FG center", "FgCenterMethod", false)
                 fg_cache_check("Cache optical vector/confidence data (center)", draft.FgCenterMethod, "FgOpticalCenterCache")
             end
             local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
@@ -718,7 +721,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if draft.FgPeripheralPercent ~= nil then
                     combo("FG periphery scale", "FgPeripheralPercent", percent)
-                    fg_method_combo("FG periphery method", "FgPeripheralMethod", true)
+                    fg_method_combo("FG periphery", "FgPeripheralMethod", true)
                     fg_cache_check("Cache optical vector/confidence data (periphery)", draft.FgPeripheralMethod, "FgOpticalPeripheralCache")
                     if fg_optical(draft.FgPeripheralMethod) then
                         if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
