@@ -157,6 +157,8 @@ void test_ui_diagnostics() {
     render("Frame Gen (Experimental)"); text = render("Frame Gen (Experimental)");
     require(text.find("Enable Frame Generation") != text.npos &&
         text.find("Automatic FG multiplier") != text.npos &&
+        text.find("DLSS-G preset") != text.npos &&
+        text.find("Preset C") != text.npos &&
         text.find("OpenXR layer not loaded") != text.npos, "FG enable and missing presenter diagnostics");
     state.snapshot = R"({"fg":{"layer_present":true,"controls_supported":true,"compatible_session":false}})";
     require(render("Frame Gen (Experimental)").find("Waiting for a running D3D11 or D3D12 OpenXR stereo session") != text.npos,

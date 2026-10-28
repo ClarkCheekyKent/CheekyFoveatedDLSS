@@ -91,6 +91,9 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
 void settings_tests(const std::filesystem::path& root) {
     {
         Settings fg;
+        require(fg.fg.dlssg_preset==3,"DLSS-G preset defaults to C");
+        for(const auto preset:{"1","2","3"})require(set_named_setting(fg,"FgDlssgPreset",preset),"DLSS-G preset accepts A/B/C");
+        for(const auto preset:{"0","4","-1","C","1.5"})require(!set_named_setting(fg,"FgDlssgPreset",preset)&&fg.fg.dlssg_preset==3,"Invalid DLSS-G presets preserve the selection");
         require(!fg.fg.automatic_multiplier&&set_named_setting(fg,"FgAutoMultiplier","true")&&fg.fg.automatic_multiplier&&
             !set_named_setting(fg,"FgAutoMultiplier","invalid"),"Auto FG is opt-in and validates boolean values");
         require(fg.fg.multiplier==2&&set_named_setting(fg,"FgMultiplier","3")&&fg.fg.multiplier==3&&
@@ -153,6 +156,7 @@ void settings_tests(const std::filesystem::path& root) {
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","0"),"FG quality and periphery controls parse");
+        require(set_named_setting(fg,"FgDlssgPreset","2"),"Select non-default preset B for persistence coverage");
         require(write_settings_file(path,fg,error),"Save FG settings");
         Settings restored;
         require(read_settings_file(path,restored,error)&&restored.fg.optical.center_preset==0&&restored.fg.optical.peripheral_preset==2&&
@@ -160,16 +164,16 @@ void settings_tests(const std::filesystem::path& root) {
             "Optical flow center method and independent controls survive profile round trip");
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
-            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.center_method==5&&restored.fg.peripheral_method==0&&
+            restored.fg.automatic_multiplier&&restored.fg.multiplier==4&&restored.fg.dlssg_preset==2&&restored.fg.center_method==5&&restored.fg.peripheral_method==0&&
             restored.fg.release_point==3&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1,
             "FG settings survive restart");
-        require(reset_settings_group(restored,"sr") && restored.fg.enabled,"SR reset must preserve FG");
+        require(reset_settings_group(restored,"sr") && restored.fg.enabled&&restored.fg.dlssg_preset==2,"SR reset must preserve FG and its DLSS-G preset");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
-            !restored.fg.automatic_multiplier&&restored.fg.multiplier==2&&restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
+            !restored.fg.automatic_multiplier&&restored.fg.multiplier==2&&restored.fg.dlssg_preset==3&&restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
             "FG reset restores the tested preset and opt-out");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
-        require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3,
+        require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&restored.fg.dlssg_preset==3,
             "Old profiles inherit the tested FG preset and default FG off");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgWaitForCompletion=1\n";}
         require(read_settings_file(path,restored,error)&&restored.fg.release_point==2,"Migrate old completion checkbox with fresh-only default");
@@ -566,6 +570,17 @@ int main(int argc, char** argv) {
                 "Multiplier reaches layer export and retires the old presenter configuration");
             rate.abi=999;require(!rate_fn(&rate),"FG rate export validates ABI");
             command("1\n910\nset\nFgMultiplier=2");
+            const auto preset_fn=reinterpret_cast<CheekyFgDlssgOptionsV1Fn>(GetProcAddress(runtime,"CheekyFG_GetDlssgOptionsV1"));
+            CheekyFgDlssgOptionsV1 preset_options;
+            require(preset_fn&&preset_fn(&preset_options)&&preset_options.preset==3,"DLSS-G export defaults to C");
+            require(control_fn(&control),"Read configuration before preset selection");const auto before_preset=control.configuration;
+            command("1\n920\nset\nFgDlssgPreset=1");
+            require(preset_fn(&preset_options)&&preset_options.preset==1&&control_fn(&control)&&control.configuration!=before_preset,
+                "Preset A reaches the layer and requests a safe presenter rebuild");
+            preset_options.abi=2;require(!preset_fn(&preset_options),"Preset export validates ABI");
+            preset_options={};--preset_options.size;require(!preset_fn(&preset_options)&&!preset_fn(nullptr),"Preset export validates size and pointer");
+            command("1\n921\nset\nFgDlssgPreset=3");
+            require(control_fn(&control)&&control.configuration==before_preset,"Preset C restores the original FG configuration");
             require(control_fn(&control),"Read current fixed multiplier configuration");const auto fixed_configuration=control.configuration;
             const auto automatic_fn=reinterpret_cast<CheekyFgRateOptionsV2Fn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV2"));
             CheekyFgRateOptionsV2 automatic;

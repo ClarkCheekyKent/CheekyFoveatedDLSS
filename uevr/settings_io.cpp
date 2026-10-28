@@ -1,4 +1,5 @@
 #include "settings_io.hpp"
+#include "../shared/fg_dlssg_preset.hpp"
 #include <Windows.h>
 #include <charconv>
 #include <cmath>
@@ -39,6 +40,7 @@ std::string_view trim(std::string_view s) {
 }
 }
 bool set_named_setting(Settings& s, std::string_view key, std::string_view value) {
+    if(key=="FgDlssgPreset") {unsigned n{};if(!parse(value,n)||!cheeky::fg::valid_dlssg_preset(n))return false;s.fg.dlssg_preset=n;return true;}
     if(key=="FgMultiplier") {unsigned n{};if(!parse(value,n)||n<2||n>4)return false;s.fg.multiplier=n;return true;}
     if(key=="FgCenterMethod") {unsigned method{};if(!parse(value,method)||!cheeky_fg_center_valid(method))return false;s.fg.center_method=method;return true;}
     if(key=="FgPeripheralMethod") {unsigned method{};if(!parse(value,method)||!cheeky_fg_periphery_valid(method))return false;s.fg.peripheral_method=method;return true;}

@@ -1,6 +1,7 @@
 #include "dlssg_worker.hpp"
 #include "fg_ngx_capture.hpp"
 #include "fg_color_format.hpp"
+#include "../shared/fg_dlssg_preset.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -223,6 +224,15 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
     const bool continuing=batched&&frame_index>1;
     if(!configured||(cheeky_fg_needs_ngx(guides)&&!ngx_required)||!cheeky_fg_center_valid(guides.eyes[0].center_method)||!cheeky_fg_center_valid(guides.eyes[1].center_method)||guides.producer_queue!=queue.Get()||!colors[0]||!colors[1]||!previous[0]||!previous[1]||!cameras[0].valid||!cameras[1].valid)return false;
     if(!continuing&&!wait_idle("previous generation"))return false;
+    if(frame_index==1&&cheeky_fg_needs_ngx(guides)){
+        const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+        const auto query=dlssg_options_query?dlssg_options_query:runtime?
+            reinterpret_cast<CheekyFgDlssgOptionsV1Fn>(GetProcAddress(runtime,"CheekyFG_GetDlssgOptionsV1")):nullptr;
+        CheekyFgDlssgOptionsV1 options;
+        if(query&&query(&options)&&valid_dlssg_preset(options.preset)&&options.preset!=dlssg_preset){
+            reset_features();dlssg_preset=options.preset;
+        }
+    }
     // Optical preparation and split interpolation prefixes can already be in
     // flight when a later recording/allocation fails. Retire all engines before
     // the caller releases their input and publication leases on that path.
@@ -486,6 +496,7 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
         p->Set("CreationNodeMask",1u);p->Set("VisibilityNodeMask",1u);p->Set("Width",tw);p->Set("Height",th);
         p->Set("DLSSG.BackbufferFormat",unsigned(desc.Format));p->Set("DLSSG.InternalWidth",gw);p->Set("DLSSG.InternalHeight",gh);p->Set("DLSSG.DynamicResolution",1u);
         if(!f.handle) {
+            apply_dlssg_preset(p,dlssg_preset);
             const auto result=create(commands,NVSDK_NGX_Feature_FrameGeneration,p,&f.handle);report("NGX FG CreateFeature",result);
 #ifdef CHEEKY_FG_LIFETIME_DIAGNOSTICS
             if(trace) {

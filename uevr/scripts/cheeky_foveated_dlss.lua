@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterCache", "FgOpticalPeripheralCache", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterCache", "FgOpticalPeripheralCache", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -698,6 +698,12 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             if draft.FgCenterMethod ~= nil then
                 fg_method_combo("FG center", "FgCenterMethod", false)
                 fg_cache_check("Cache optical vector/confidence data (center)", draft.FgCenterMethod, "FgOpticalCenterCache")
+            end
+            if draft.FgDlssgPreset ~= nil and ((draft.FgCenterMethod or 0) == 0 or
+                    (draft.FgFoveated and draft.FgPeripheralMethod == 0)) then
+                combo("DLSS-G preset", "FgDlssgPreset", {[1]="Preset A", [2]="Preset B", [3]="Preset C"})
+                if draft.FgDlssgPreset == 2 then text("Preset B needs separate scene and HUD inputs; without them it behaves like Preset A.") end
+                if draft.FgDlssgPreset == 3 then text("Preset C uses the faster Lite model and requires DLSS-G 310.9.16 or newer.") end
             end
             local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
             local optical_grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}

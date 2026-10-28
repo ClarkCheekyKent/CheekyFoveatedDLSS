@@ -97,6 +97,11 @@ struct CheekyFgRateOptionsV2 {
     std::uint32_t abi{2},size{sizeof(CheekyFgRateOptionsV2)},multiplier{2},automatic{};
 };
 using CheekyFgRateOptionsV2Fn=bool(__cdecl*)(CheekyFgRateOptionsV2*);
+// Optional additive export; existing guide/control structures retain their ABI.
+struct CheekyFgDlssgOptionsV1 {
+    std::uint32_t abi{1},size{sizeof(CheekyFgDlssgOptionsV1)},preset{3};
+};
+using CheekyFgDlssgOptionsV1Fn=bool(__cdecl*)(CheekyFgDlssgOptionsV1*);
 struct CheekyFgAutoStatus {
     std::uint32_t abi{1},size{sizeof(CheekyFgAutoStatus)},supported{},enabled{},valid{};
     std::uint32_t selected{2},presented{2},maximum{4},reason{};

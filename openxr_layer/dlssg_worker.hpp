@@ -65,6 +65,8 @@ struct Worker {
     std::uint64_t crop_diagnostic_frame{};
     bool force_fp16{}; // Explicit A/B probe only; preserve SDR precision by default.
     std::uint64_t configuration{};
+    unsigned dlssg_preset{3}; // Latched for an entire native-pair generation batch.
+    CheekyFgDlssgOptionsV1Fn dlssg_options_query{}; // Optional fixture override.
     unsigned center_width{},center_height{},peripheral_width{},peripheral_height{},peripheral_method{};
     unsigned source_depth_format{},source_motion_format{};
     bool direct_publication{};

@@ -942,6 +942,13 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         test_control(label);
     };
     method_combo("FG center",s.center_method,false,quad);
+    if(s.center_method==0||((s.foveated||quad)&&s.peripheral_method==0)){
+        int preset=int(s.dlssg_preset)-1;
+        if(ImGui::Combo("DLSS-G preset",&preset,"Preset A\0Preset B\0Preset C\0"))s.dlssg_preset=unsigned(preset+1);
+        test_control("FgDlssgPreset");
+        if(s.dlssg_preset==2)ImGui::TextWrapped("Preset B needs separate scene and HUD inputs; without them it behaves like Preset A.");
+        if(s.dlssg_preset==3)ImGui::TextWrapped("Preset C uses the faster Lite model and requires DLSS-G 310.9.16 or newer.");
+    }
     if(cheeky_fg_cacheable(s.center_method))ImGui::Checkbox("Cache optical vector/confidence data (center)",&s.optical.center_cache);
     if(cheeky_fg_optical(s.center_method)){
         combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");

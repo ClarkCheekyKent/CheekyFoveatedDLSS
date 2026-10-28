@@ -87,7 +87,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // both NGX histories every time a release mode was changed live.
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{s.multiplier,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
+    for(const auto n:{s.multiplier,s.dlssg_preset,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
         s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,unsigned(s.optical.center_cache),unsigned(s.optical.peripheral_cache),
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
@@ -595,6 +595,10 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetRateOptionsV2(CheekyFg
     if(!out||out->abi!=2||out->size<sizeof(*out))return false;
     const auto& fg=cheeky::foveated_dlss::current_settings().fg;
     out->multiplier=std::clamp(fg.multiplier,2u,4u);out->automatic=fg.automatic_multiplier;return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetDlssgOptionsV1(CheekyFgDlssgOptionsV1* out) noexcept {
+    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    out->preset=cheeky::foveated_dlss::current_settings().fg.dlssg_preset;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetPacingOptionsV1(CheekyFgPacingOptions* out) noexcept {
     // Layers built before extra_frame_slots pass the shorter structure.

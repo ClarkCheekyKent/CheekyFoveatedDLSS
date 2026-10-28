@@ -180,6 +180,15 @@ def run(engine):
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["FgMultiplier"] = 4
     receive(state)
+    state["settings"]["FgDlssgPreset"] = 3
+    state["settings"]["FgCenterMethod"] = 0
+    receive(state)
+    for preset in (1, 2, 3):
+        draw(changes={"DLSS-G preset": preset})
+        assert f"FgDlssgPreset={preset}" in last()
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"]["FgDlssgPreset"] = preset
+        receive(state)
     state["settings"]["FgAutoMultiplier"] = False
     receive(state)
     draw(changes={"Automatic FG multiplier": True})

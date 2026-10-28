@@ -336,6 +336,14 @@ The FG center method can be **DLSS**, **Simple motion-vector warping**, or
 **Bidirectional interpolation** (`FgCenterMethod=0`, `1`, or `2`). The periphery
 method remains independent. DLSS is the default center method.
 
+**DLSS-G preset** selects **Preset A**, **Preset B**, or **Preset C**
+(`FgDlssgPreset=1`, `2`, or `3`). Preset C is the default, including for old
+profiles and Reset FG defaults. The choice applies to every region using
+DLSS-G; shader methods are unaffected. Changing it safely rebuilds the FG
+presenter. Preset C requests Lite candidate blending and requires DLSS-G
+310.9.16 or newer. Preset B requests UI recomposition, which needs separate
+HUD-less scene and UI inputs; without those inputs it behaves like A.
+
 For D3D11 OpenXR stereo and D3D11 quad views, choosing shader methods for both
 regions selects native D3D11 capture, guide history and final-image rendering.
 This path creates no D3D12 device or bridge and does not query DLSS-G capability.

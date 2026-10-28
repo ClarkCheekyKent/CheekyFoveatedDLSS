@@ -71,10 +71,15 @@ inline Microsoft::WRL::ComPtr<ID3D12Resource> flag_upload;
 inline unsigned calls{},fail_at{},created{};
 inline std::vector<unsigned> reset_flags;
 inline std::vector<std::pair<unsigned,unsigned>> frame_indices;
+inline std::vector<std::pair<unsigned,unsigned>> create_presets;
 inline bool suppress_second_only{},write_first_index_only{};
 NVSDK_NGX_Result NVSDK_CONV allocate(NVSDK_NGX_Parameter** out){*out=new Parameters;return NVSDK_NGX_Result_Success;}
 NVSDK_NGX_Result NVSDK_CONV destroy(NVSDK_NGX_Parameter* p){delete static_cast<Parameters*>(p);return NVSDK_NGX_Result_Success;}
-NVSDK_NGX_Result NVSDK_CONV create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature,NVSDK_NGX_Parameter*,NVSDK_NGX_Handle** out){
+NVSDK_NGX_Result NVSDK_CONV create(ID3D12GraphicsCommandList*,NVSDK_NGX_Feature,NVSDK_NGX_Parameter* p,NVSDK_NGX_Handle** out){
+    unsigned ui{},lite{};
+    check(NVSDK_NGX_SUCCEED(p->Get("DLSSG.UserInterfaceRecompositionEnabled",&ui))&&
+        NVSDK_NGX_SUCCEED(p->Get("DLSSG.LiteCandidateBlendingEnabled",&lite)),"NGX receives the selected preset before feature creation");
+    create_presets.emplace_back(ui,lite);
     *out=reinterpret_cast<NVSDK_NGX_Handle*>(new unsigned(++created));return NVSDK_NGX_Result_Success;
 }
 NVSDK_NGX_Result NVSDK_CONV release(NVSDK_NGX_Handle* h){delete reinterpret_cast<unsigned*>(h);return NVSDK_NGX_Result_Success;}
@@ -142,6 +147,16 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(!generate(cameras)&&worker.temporal_evaluation_completed&&!worker.failed&&created==2&&submissions==2,"Repeated warm-up preserves feature history");
     check(reset_flags.size()==4&&reset_flags[2]==0&&reset_flags[3]==0,"Warm-up is not trapped in repeated history resets");
     flag(0);check(generate(cameras)&&worker.temporal_evaluation_completed&&!worker.failed,"NGX resumes interpolation after warm-up");
+    static unsigned requested_preset=3;
+    worker.dlssg_options_query=[](CheekyFgDlssgOptionsV1* out) noexcept {out->preset=requested_preset;return true;};
+    for(const unsigned preset:{1u,2u,3u}){
+        requested_preset=preset;create_presets.clear();
+        check(generate(cameras),"Live DLSS-G preset change resumes generation");
+        check(create_presets.size()==2&&create_presets[0]==std::pair{preset==2?1u:0u,preset==3?1u:0u}&&
+            create_presets[0]==create_presets[1],"A/B/C recreate both eyes with the matching UI/Lite create-time flags");
+    }
+    create_presets.clear();check(generate(cameras)&&create_presets.empty(),"Unchanged DLSS-G preset preserves temporal features");
+    worker.dlssg_options_query=nullptr;
     const auto serial=worker.serial,accepted_frame=worker.features[0].evaluated_frame;const auto submitted=submissions;
     auto broken=cameras;broken[0].valid=false;const auto calls_before=calls;
     check(!generate(broken)&&!worker.temporal_evaluation_completed&&!worker.failed&&calls==calls_before&&worker.serial==serial,"Input rejection clears stale completion without evaluating or submitting");
@@ -163,6 +178,7 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
     check(generate(cameras)&&worker.temporal_evaluation_completed&&!worker.failed,"Recover after discarded publication");
     worker.reset_features();check(!worker.temporal_evaluation_completed,"Feature reset invalidates completion state");
     check(generate(cameras)&&worker.temporal_evaluation_completed,"Generation resumes after resetting features");
+    worker.dlssg_options_query=[](CheekyFgDlssgOptionsV1* out) noexcept {out->preset=requested_preset;return true;};
     for(unsigned count:{2u,3u}){
         const auto before=calls;worker.max_generated_frames=1;
         check(!worker.generate(guides,colors,colors,cameras,output,nullptr,nullptr,nullptr,nullptr,count,1)&&calls==before&&!worker.failed,
@@ -170,14 +186,17 @@ void fg_completion_validation(ID3D12Device* device,ID3D12CommandQueue* queue) {
         worker.max_generated_frames=3;++guides.render_frame;
         const auto previous_frame=worker.features[0].evaluated_frame;
         for(unsigned index=1;index<=count;++index){
+            requested_preset=index==1?3u:1u;
             frame_indices.clear();
             check(worker.generate(guides,colors,colors,cameras,output,nullptr,nullptr,nullptr,nullptr,count,index),"NGX multi-frame indexed evaluation");
+            check(worker.dlssg_preset==3,"Preset changes are deferred until the next complete native-pair batch");
             check(frame_indices.size()==2&&frame_indices[0]==std::pair{count,index}&&frame_indices[1]==std::pair{count,index},
                 "Each eye receives the same count and successive index");
             check(worker.features[0].evaluated_frame==(index==count?guides.render_frame:previous_frame),
                 "Crop history advances once per real frame after the last output");
         }
     }
+    worker.dlssg_options_query=nullptr;
     // Hold the real worker queue on a CPU-controlled fence. A DLSS phase must
     // hand over its immutable stereo outputs before the GPU can execute them.
     // Suppress only one eye: the queued GPU fallback must protect BOTH eyes.
