@@ -74,6 +74,8 @@ public:
 
 // Returns a private color in the same coordinate space/state as the source.
 // The source is never written. A null result means SR must use original color.
+// Record the SR consumer on frame.command_list before preparing this view again:
+// sequential evaluations within one recording reuse the same scratch texture.
 [[nodiscard]] ID3D12Resource* prepare_dlss_nr_input(
     DlssNrFrame frame, const Settings& settings) noexcept;
 void collect_dlss_nr_input_submissions() noexcept;

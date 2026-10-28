@@ -19,6 +19,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
+#include <memory>
 
 namespace cheeky::foveated_dlss {
 extern int nr_test_evaluations;
@@ -39,6 +41,27 @@ void check(HRESULT hr) {
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
+
+// A resource owns this marker through private data. Its destruction proves the
+// input cache released the texture, without guessing from VRAM accounting.
+class ResourceDeath final : public IUnknown {
+    std::atomic<ULONG> references{1};
+    std::shared_ptr<std::atomic<bool>> destroyed;
+public:
+    explicit ResourceDeath(std::shared_ptr<std::atomic<bool>> state) : destroyed(std::move(state)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (id != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = this; AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto remaining = --references;
+        if (!remaining) { destroyed->store(true); delete this; }
+        return remaining;
+    }
+};
 
 // Interposers may expose a different COM pointer while forwarding object data.
 // Only the object interface is used by the submission bookkeeping.
@@ -83,6 +106,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
     Settings settings{};
     settings.nr_enabled = true;
     settings.nr_processing_order = NrProcessingOrder::before_upscaling;
+    update_settings(settings);
     DlssNrFrame frame{};
     frame.view_id = 501;
     frame.route = route;
@@ -91,7 +115,21 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
     frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     frame.input_width = frame.input_height = 32;
     frame.output_width = frame.output_height = 64;
+    const auto first_destroyed = std::make_shared<std::atomic<bool>>(false);
+    nr_recording_bind_allocator(list.Get(), allocator.Get());
     ObjectAlias submitted(list.Get());
+    std::array<ComPtr<ID3D12GraphicsCommandList>, 3> other_lists;
+    std::array<ComPtr<ID3D12CommandAllocator>, 3> other_allocators;
+    ComPtr<ID3D12GraphicsCommandList> overflow_list;
+    ComPtr<ID3D12CommandAllocator> overflow_allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&overflow_allocator)));
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, overflow_allocator.Get(), nullptr, IID_PPV_ARGS(&overflow_list)));
+    nr_recording_bind_allocator(overflow_list.Get(), overflow_allocator.Get());
+    const auto try_other_recording = [&] {
+        auto separate = frame;
+        separate.command_list = overflow_list.Get();
+        return prepare_dlss_nr_input(separate, settings);
+    };
     for (UINT64 iteration = 1; iteration <= 24; ++iteration) {
         if (iteration != 1) {
             check(allocator->Reset());
@@ -100,13 +138,30 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
             nr_recording_reset(alias ? static_cast<ID3D12Object*>(&submitted) : list.Get(), S_OK);
 #endif
         }
-        require(prepare_dlss_nr_input(frame, settings) != nullptr,
+        nr_recording_bind_allocator(frame.command_list, allocator.Get());
+        auto* scratch = prepare_dlss_nr_input(frame, settings);
+        require(scratch != nullptr,
             "Before NR exhausted its input pool across aliased submissions");
+        for (unsigned call = 0; call < 12; ++call)
+            require(prepare_dlss_nr_input(frame, settings) == scratch,
+                "Sequential calls in one recording allocated another private input");
         if (iteration == 1) {
-            for (unsigned slot = 1; slot < 3; ++slot)
-                require(prepare_dlss_nr_input(frame, settings) != nullptr, "Could not fill NR pool");
-            require(prepare_dlss_nr_input(frame, settings) == nullptr,
-                "NR reused an input whose commands were still being recorded");
+            constexpr GUID death_key{0x906f157a, 0xc6e5, 0x432e, {0xb8,0x60,0x3b,0xc4,0x75,0x41,0x6d,0x37}};
+            ComPtr<IUnknown> death;
+            death.Attach(new ResourceDeath(first_destroyed));
+            check(scratch->SetPrivateDataInterface(death_key, death.Get()));
+            death.Reset();
+            for (unsigned slot = 0; slot < other_lists.size(); ++slot) {
+                check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&other_allocators[slot])));
+                check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, other_allocators[slot].Get(), nullptr, IID_PPV_ARGS(&other_lists[slot])));
+                nr_recording_bind_allocator(other_lists[slot].Get(), other_allocators[slot].Get());
+                auto independent = frame;
+                independent.command_list = other_lists[slot].Get();
+                require(prepare_dlss_nr_input(independent, settings) != nullptr, "Could not fill NR pool with independent recordings");
+                check(other_lists[slot]->Close());
+            }
+            require(try_other_recording() == nullptr,
+                "NR shared private input across independent unsubmitted recordings");
         }
         check(list->Close());
         // No NR accounting at the pre-Execute host notification.
@@ -119,7 +174,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
             const auto waited = WaitForSingleObject(idle, 10000);
             CloseHandle(idle);
             require(waited == WAIT_OBJECT_0, "Idle queue timed out");
-            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+            require(try_other_recording() == nullptr,
                 "NR recycled an input before ExecuteCommandLists");
             check(queue->Wait(gate.Get(), 1));
         }
@@ -130,7 +185,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
 #endif
         collect_dlss_nr_input_submissions();
         if (iteration == 1) {
-            const bool held = prepare_dlss_nr_input(frame, settings) == nullptr;
+            const bool held = try_other_recording() == nullptr;
             check(gate->Signal(1));
             require(held, "NR recycled an input before GPU completion");
         }
@@ -142,7 +197,7 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
         CloseHandle(event);
         require(waited == WAIT_OBJECT_0, "NR recycling test timed out");
         if (iteration == 1) {
-            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+            require(try_other_recording() == nullptr,
                 "GPU completion made an unretired input reusable");
             ComPtr<ID3D12CommandQueue> replay_queue;
             check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&replay_queue)));
@@ -160,11 +215,15 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
 #ifndef CHEEKY_NR_NATIVE_OBSERVER
             nr_recording_reset(&submitted, S_OK);
 #endif
-            require(prepare_dlss_nr_input(frame, settings) == nullptr,
+            require(try_other_recording() == nullptr,
                 "Reset reused private inputs while another queue was pending");
-            release_dlss_nr_inputs(501);
-            require(prepare_dlss_nr_input(frame, settings) == nullptr,
-                "View release bypassed the three-input limit during replay");
+            auto disabled = settings;
+            disabled.nr_enabled = false;
+            update_settings(disabled);
+            collect_dlss_nr_input_submissions();
+            require(!first_destroyed->load(), "Disable destroyed a private input still referenced by replay");
+            require(try_other_recording() == nullptr,
+                "Disabling NR bypassed the four-input limit during pending replay");
             ComPtr<ID3D12Fence> replay_done;
             check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&replay_done)));
             check(gate->Signal(2));
@@ -174,12 +233,17 @@ void run_nr_recycling(ID3D12Device* device, bool alias, DlssNrRoute route) {
             const auto replay_waited = WaitForSingleObject(replay_event, 10000);
             CloseHandle(replay_event);
             require(replay_waited == WAIT_OBJECT_0, "NR input replay queue timed out");
+            for (auto& other : other_lists) other.Reset();
+            collect_dlss_nr_input_submissions();
+            require(first_destroyed->load(), "Disabled NR retained an input after all recordings and queues retired");
+            update_settings(settings);
             require(prepare_dlss_nr_input(frame, settings) != nullptr,
                 "Private input pool did not recover after retirement and all queue completions");
             check(list->Close()); // The next Reset discards this unsubmitted copy.
         }
     }
-    release_dlss_nr_inputs(501);
+    settings.nr_enabled = false;
+    update_settings(settings);
     list.Reset(); // Destruction retires the final completed recording.
     collect_dlss_nr_input_submissions();
     if (messages) {
@@ -271,6 +335,69 @@ Texture texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
     return t;
 }
 
+void run_nr_scratch_pixels(ID3D12Device* device) {
+    ComPtr<ID3D12CommandAllocator> allocator;
+    check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    ComPtr<ID3D12GraphicsCommandList> list;
+    check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    constexpr UINT32 first = 0xff332211U, second = 0xff887766U;
+    auto color = texture(device, list.Get(), 32, 32, 1, 1, first, DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto replacement = texture(device, list.Get(), 32, 32, 1, 1, second, DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto first_readback = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
+    auto second_readback = buffer(device, color.bytes, D3D12_HEAP_TYPE_READBACK);
+    Settings settings{}; settings.nr_enabled = true;
+    settings.nr_processing_order = NrProcessingOrder::before_upscaling;
+    update_settings(settings);
+    DlssNrFrame frame{};
+    frame.view_id = 502; frame.command_list = list.Get(); frame.color = color.resource.Get();
+    frame.color_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    frame.input_width = frame.input_height = frame.output_width = frame.output_height = 32;
+    transition(list.Get(), frame.color, D3D12_RESOURCE_STATE_COPY_DEST, frame.color_state);
+    nr_recording_bind_allocator(list.Get(), allocator.Get());
+    const auto consume = [&](ID3D12Resource* scratch, ID3D12Resource* readback) {
+        transition(list.Get(), scratch, frame.color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource = scratch; from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource = readback; to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint = color.footprints[0];
+        list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+        transition(list.Get(), scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, frame.color_state);
+    };
+    auto* scratch = prepare_dlss_nr_input(frame, settings);
+    require(scratch != nullptr, "First scratch preparation failed");
+    consume(scratch, first_readback.Get());
+    transition(list.Get(), frame.color, frame.color_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    transition(list.Get(), replacement.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyResource(frame.color, replacement.resource.Get());
+    transition(list.Get(), frame.color, D3D12_RESOURCE_STATE_COPY_DEST, frame.color_state);
+    require(prepare_dlss_nr_input(frame, settings) == scratch, "Second call did not reuse same-recording scratch");
+    consume(scratch, second_readback.Get());
+    check(list->Close());
+    ComPtr<ID3D12CommandQueue> queue; D3D12_COMMAND_QUEUE_DESC q{};
+    check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)));
+    ID3D12CommandList* lists[]{list.Get()}; queue->ExecuteCommandLists(1, lists);
+#ifndef CHEEKY_NR_NATIVE_OBSERVER
+    nr_recording_submitted(queue.Get(), list.Get());
+#endif
+    ComPtr<ID3D12Fence> done;
+    check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done)));
+    check(queue->Signal(done.Get(), 1));
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    check(done->SetEventOnCompletion(1, event));
+    const auto waited = WaitForSingleObject(event, 10000); CloseHandle(event);
+    require(waited == WAIT_OBJECT_0, "Scratch consumption test timed out");
+    for (auto pair : {std::pair{first_readback.Get(), first}, std::pair{second_readback.Get(), second}}) {
+        UINT32* pixels{};
+        check(pair.first->Map(0, nullptr, reinterpret_cast<void**>(&pixels)));
+        const bool correct = pixels[0] == pair.second;
+        pair.first->Unmap(0, nullptr);
+        require(correct, "Later scratch overwrite corrupted an earlier consumer");
+    }
+    settings.nr_enabled = false; update_settings(settings);
+    list.Reset(); collect_dlss_nr_input_submissions();
+    std::cout << "NR same-recording scratch: two different inputs consumed in order; one private texture passed\n";
+}
+
 void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
     UINT source_width = 8, UINT source_height = 8, bool direct11 = false, bool checker = false, bool before_nr = false, bool nr_success = true,
@@ -314,6 +441,7 @@ void run_case(ID3D12Device* device, UINT16 slices, UINT16 mips,
         frame.color_base_x = 4U; frame.color_base_y = 2U;
         nr_test_succeeds = nr_success;
         const auto calls = nr_test_evaluations;
+        nr_recording_bind_allocator(list.Get(), allocator.Get());
         auto* processed = prepare_dlss_nr_input(frame, settings);
         require(nr_test_evaluations == calls + 1, "Before NR was not evaluated exactly once");
         require(nr_test_frame.processing_width == 24U && nr_test_frame.processing_height == 20U,
@@ -695,6 +823,7 @@ int run_d3d12_composite_tests() {
             run_nr_recycling(device.Get(), true, route);
             run_nr_recycling(device.Get(), false, route);
         }
+        run_nr_scratch_pixels(device.Get());
         run_case(device.Get(), 1, 1);
         run_case(device.Get(), 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, true, false, true, false, false, true);
         run_case(device.Get(), 2, 5, DXGI_FORMAT_R8G8B8A8_UNORM, 8, 8, false, false, false, true, true);

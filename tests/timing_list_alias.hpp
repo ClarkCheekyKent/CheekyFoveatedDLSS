@@ -25,6 +25,10 @@ struct TimingListAlias {
     static HRESULT STDMETHODCALLTYPE set(TimingListAlias* self, REFGUID key, UINT size, const void* data) { return self->target->SetPrivateData(key, size, data); }
     static HRESULT STDMETHODCALLTYPE set_interface(TimingListAlias* self, REFGUID key, const IUnknown* value) { return self->target->SetPrivateDataInterface(key, value); }
     static HRESULT STDMETHODCALLTYPE device(TimingListAlias* self, REFIID iid, void** out) { return self->target->GetDevice(iid, out); }
+    static HRESULT STDMETHODCALLTYPE close(TimingListAlias* self) { return self->target->Close(); }
+    static HRESULT STDMETHODCALLTYPE reset(TimingListAlias* self, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pipeline) {
+        return self->target->Reset(allocator, pipeline);
+    }
     static void STDMETHODCALLTYPE copy(TimingListAlias* self,ID3D12Resource* to,ID3D12Resource* from){self->target->CopyResource(to,from);}
     static void STDMETHODCALLTYPE copy_region(TimingListAlias* self,const D3D12_TEXTURE_COPY_LOCATION* to,UINT x,UINT y,UINT z,
         const D3D12_TEXTURE_COPY_LOCATION* from,const D3D12_BOX* box){self->target->CopyTextureRegion(to,x,y,z,from,box);}
@@ -43,6 +47,7 @@ struct TimingListAlias {
         methods.fill(reinterpret_cast<void*>(&unexpected));
         methods[0] = reinterpret_cast<void*>(&query); methods[1] = reinterpret_cast<void*>(&addref); methods[2] = reinterpret_cast<void*>(&release);
         methods[3] = reinterpret_cast<void*>(&get_private); methods[4] = reinterpret_cast<void*>(&set); methods[5] = reinterpret_cast<void*>(&set_interface); methods[7] = reinterpret_cast<void*>(&device);
+        methods[9]=reinterpret_cast<void*>(&close); methods[10]=reinterpret_cast<void*>(&reset);
         methods[16]=reinterpret_cast<void*>(&copy_region);methods[17]=reinterpret_cast<void*>(&copy);methods[26]=reinterpret_cast<void*>(&barriers);
         methods[14]=reinterpret_cast<void*>(&dispatch);methods[25]=reinterpret_cast<void*>(&pipeline);methods[28]=reinterpret_cast<void*>(&heaps);
         methods[29]=reinterpret_cast<void*>(&root);methods[31]=reinterpret_cast<void*>(&table);methods[35]=reinterpret_cast<void*>(&constants);

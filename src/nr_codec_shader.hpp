@@ -25,6 +25,9 @@ inline constexpr char nr_codec_shader[] = R"(
 Texture2D<float4> Source0 : register(t0);
 Texture2D<float4> Source1 : register(t1);
 Texture2D<float4> Source2 : register(t2);
+#ifndef __spirv__
+Texture2D<float4> GameExposure : register(t3);
+#endif
 RWTexture2D<float4> Output0 : register(u0);
 RWTexture2D<float4> Output1 : register(u1);
 
@@ -45,7 +48,8 @@ cbuffer CodecConstants : register(b0) {
     float FoveationFeather;
     uint ShowAlignmentBorder;
     uint MaskCount;
-    uint2 MaskPadding;
+    float ExposureWhiteMultiplier;
+    uint ExposurePadding;
     float4 MaskBounds[4];
 };
 
@@ -69,6 +73,20 @@ float FoveationShapeDistance(float2 pixel) {
         length(scaled),
         saturate(FoveationRoundness)
     );
+}
+
+// Match the exposure normalization used by the SR alignment border. The
+// codec must work in the game's exposed space and restore its storage scale.
+float CodecWhite() {
+    float white = PaperWhiteScale;
+#ifndef __spirv__
+    if (ExposureWhiteMultiplier > 0.0) {
+        const float exposure = GameExposure.Load(int3(0, 0, 0)).r;
+        if (isfinite(exposure) && exposure > 0.0)
+            white *= clamp(ExposureWhiteMultiplier / exposure, 0.0001, 1024.0);
+    }
+#endif
+    return max(white, 0.0001);
 }
 
 float Luminance(float3 color) {
@@ -152,17 +170,10 @@ float4 LoadSource2Bilinear(float2 position, uint2 dimensions) {
 }
 
 float3 UpgradeToneMap(float3 original, float3 proxy, float3 neural) {
-    float original_y = Luminance(original);
-    float proxy_y = Luminance(proxy);
-    float neural_y = Luminance(neural);
-    float ratio;
-    if (original_y < proxy_y) {
-        ratio = proxy_y > 0.0 ? original_y / proxy_y : 0.0;
-    } else {
-        float new_y = neural_y + max(0.0, original_y - proxy_y);
-        ratio = neural_y > 0.0 ? new_y / neural_y : 0.0;
-    }
-    return lerp(original, max(neural * ratio, 0.0), TransferStrength);
+    // Apply the model's change to the original HDR color. Scaling the model
+    // output by luminance loses HDR chroma when the SDR proxy clips a channel,
+    // producing a grey patch even when the model returns its input unchanged.
+    return original + (neural - proxy) * TransferStrength;
 }
 
 [numthreads(16, 16, 1)]
@@ -181,7 +192,7 @@ void EncodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
             SourceSize
         );
         const float3 linear_color = max(
-            proxy_source.rgb / max(PaperWhiteScale, 0.0001),
+            proxy_source.rgb / CodecWhite(),
             0.0
         );
         const float3 encoded = HdrMode != 0 ? SrgbEncode(linear_color) : proxy_source.rgb;
@@ -244,15 +255,12 @@ void DecodeMain(uint3 dispatch_id : SV_DispatchThreadID) {
         Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
         return;
     }
-    const float3 original = max(
-        original_sample.rgb / max(PaperWhiteScale, 0.0001),
-        0.0
-    );
+    const float3 original = original_sample.rgb / CodecWhite();
     const float3 proxy = SrgbDecode(proxy_sample.rgb);
     const float3 neural = SrgbDecode(neural_sample.rgb);
     const float3 upgraded = UpgradeToneMap(original, proxy, neural);
-    const float3 decoded = lerp(original, upgraded, ColorStrength) * PaperWhiteScale;
-    const float4 processed = float4(max(decoded, 0.0), original_sample.a);
+    const float3 decoded = lerp(original, upgraded, ColorStrength) * CodecWhite();
+    const float4 processed = float4(decoded, original_sample.a);
     Output0[SourceBase + dispatch_id.xy] = lerp(original_sample, processed, foveation_weight);
 }
 )";

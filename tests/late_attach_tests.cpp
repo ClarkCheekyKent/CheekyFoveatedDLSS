@@ -38,7 +38,7 @@ const NgxHandle* nr_last_handle{};
 void observe_nr_handle(const NgxHandle* handle, const NgxParameters*) { nr_last_handle = handle; }
 float nr_motion_x{};
 unsigned nr_motion_width{};
-ComPtr<ID3D12Resource> nr_motion_resource;
+ComPtr<ID3D12Resource> nr_motion_resource, nr_color_resource;
 MockNgxParameters nr_created;
 void observe_nr_created(const NgxParameters* params) {
     nr_created.values = static_cast<const MockNgxParameters*>(params)->values;
@@ -55,6 +55,7 @@ void observe_nr(const NgxParameters* params) {
     params->Get("DLSSNR.Reset", &nr_reset);
     params->Get("DLSSNR.MVecScaleX", &nr_motion_x);
     params->Get("DLSSNR.MVecSubrectWidth", &nr_motion_width);
+    ID3D12Resource* color{}; params->Get("DLSSNR.Color", &color); nr_color_resource=color;
     ID3D12Resource* mv{}; params->Get("DLSSNR.MVec", &mv); nr_motion_resource=mv;
 }
 struct FrameToken : SlFrameToken {
@@ -602,6 +603,81 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
         require(unchanged, "SDR NR round trip changed paper white, alpha, or working-scale edge sampling");
     }
     command("1\n96\nset\nNrPaperWhiteScale=1\nNrWorkingScale=1\nNrHdrTransferStrength=1"); evaluate(0);
+    // Saturated HDR must keep its original chroma with an identity model.
+    // The old luminance-ratio reconstruction turned (4,2,.75) into grey.
+    check(color_upload->Map(0,nullptr,&mapped), "Map HDR NR color");
+    for (unsigned y = 0; y < color_desc.Height; ++y) {
+        auto* row = reinterpret_cast<DirectX::PackedVector::HALF*>(static_cast<std::byte*>(mapped) + color_fp.Offset + y*color_fp.Footprint.RowPitch);
+        for (unsigned x = 0; x < color_desc.Width; ++x) {
+            row[4*x] = DirectX::PackedVector::XMConvertFloatToHalf(4.F);
+            row[4*x+1] = DirectX::PackedVector::XMConvertFloatToHalf(2.F);
+            row[4*x+2] = DirectX::PackedVector::XMConvertFloatToHalf(.75F);
+            row[4*x+3] = DirectX::PackedVector::XMConvertFloatToHalf(.25F);
+        }
+    }
+    color_upload->Unmap(0,nullptr);
+    transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+    f.list->CopyTextureRegion(&color_dst,0,0,0,&color_src,nullptr);
+    transition_resource(color_dst.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ComPtr<ID3D12Resource> exposure_texture;
+    ID3D12Resource* previous_exposure{};
+    f.params.Get("ExposureTexture", &previous_exposure);
+    if (!f.use_sl) {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+        auto ed=color_desc; ed.Width=ed.Height=1; ed.Format=DXGI_FORMAT_R32_FLOAT;
+        ed.Flags=D3D12_RESOURCE_FLAG_NONE;
+        check(f.device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&ed,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&exposure_texture)), "Create NR exposure");
+        auto exposure_upload=make_buffer(256,D3D12_HEAP_TYPE_UPLOAD);
+        check(exposure_upload->Map(0,nullptr,&mapped), "Map NR exposure");
+        *static_cast<float*>(mapped)=.25F; exposure_upload->Unmap(0,nullptr);
+        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+        src.pResource=exposure_upload.Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint={DXGI_FORMAT_R32_FLOAT,1,1,1,256};
+        dst.pResource=exposure_texture.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        f.list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        transition_resource(dst.pResource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.finish_gpu();
+        f.params.Set("ExposureTexture", exposure_texture.Get());
+        f.params.Set("DLSS.Pre.Exposure", 1.F); f.params.Set("DLSS.Exposure.Scale", 1.F);
+    }
+    f.params.Set("DLSS.Feature.Create.Flags", 3U);
+    for (float white : {.25F, 1.F, 4.F}) {
+        command((std::string("1\n96\nset\nNrPaperWhiteScale=") + std::to_string(white)).c_str()); evaluate(0);
+        require(sr_inputs.size() == 1 && sr_inputs[0].color != f.textures12[0].Get(), "HDR NR did not substitute input");
+        auto readback=make_buffer(256,D3D12_HEAP_TYPE_READBACK);
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource=sr_inputs[0].color; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16B16A16_FLOAT,1,1,1,256};
+        const D3D12_BOX pixel{0,0,0,1,1,1};
+        transition_resource(from.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        f.list->CopyTextureRegion(&to,0,0,0,&from,&pixel);
+        transition_resource(from.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.finish_gpu(); check(readback->Map(0,nullptr,&mapped), "Map HDR NR result");
+        const auto* result = static_cast<const DirectX::PackedVector::HALF*>(mapped);
+        require(DirectX::PackedVector::XMConvertHalfToFloat(result[0]) == 4.F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[1]) == 2.F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[2]) == .75F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[3]) == .25F,
+            "Identity HDR NR lost chroma, highlights or alpha");
+        readback->Unmap(0,nullptr);
+        if (!f.use_sl) {
+            from.pResource=nr_color_resource.Get();
+            transition_resource(from.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+            f.list->CopyTextureRegion(&to,0,0,0,&from,&pixel);
+            transition_resource(from.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            f.finish_gpu(); check(readback->Map(0,nullptr,&mapped), "Map exposed NR proxy");
+            const float linear=std::min(.75F/(white*4.F),1.F);
+            const float expected=linear<=.0031308F ? 12.92F*linear : 1.055F*std::pow(linear,1.F/2.4F)-.055F;
+            require(std::abs(DirectX::PackedVector::XMConvertHalfToFloat(static_cast<const DirectX::PackedVector::HALF*>(mapped)[2])-expected)<.001F,
+                "NR proxy ignored the game's exposure texture");
+            readback->Unmap(0,nullptr);
+        }
+    }
+    f.params.Set("ExposureTexture", previous_exposure);
+    f.params.Set("DLSS.Feature.Create.Flags", 2U);
+    command("1\n96\nset\nNrPaperWhiteScale=1");
     copy_nr_color(false);
     // Exercise the production feature cache through the fake NVIDIA runtime:
     // warm two toggle states, then churn dimensions without growing live features.
@@ -684,11 +760,20 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
     evaluate(0);
     expect_input(false, 0, "Repeated disabled frame reset raw history");
     require(evaluation_order == "S", "Disabled NR still evaluated");
+    require(nr_creates() == nr_releases(), "Disabling NR retained completed NVIDIA features");
+    command("1\n96\nset\nNrEnabled=true");
+    evaluate(0);
+    expect_input(true, 1, "Reenabling NR after cache cleanup did not reset SR input history");
+    require(evaluation_order == "NS" && nr_reset == 1, "Reenabled NR did not recreate/reset its feature");
+    command("1\n96\nset\nNrEnabled=false");
+    evaluate(0);
+    expect_input(false, 1, "Second disable lost the processed-to-raw SR reset");
+    require(nr_creates() == nr_releases(), "Second disable retained completed NVIDIA features");
     proc<void(*)(void(*)(const NgxParameters*))>(f.ngx,"CheekyFakeObserve")(nullptr);
     proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserve")(nullptr);
     proc<void(*)(void(*)(const NgxParameters*))>(nr,"CheekyFakeObserveCreated")(nullptr);
     command("1\n97\nset\nEnabled=true\nNrEnabled=false\nPeripheralDlaa=false\nAutoStereoAlignment=false");
-    nr_motion_resource.Reset();
+    nr_motion_resource.Reset(); nr_color_resource.Reset();
     puts("NR controls, cached creation tuning, jittered vectors, SDR codec/edge sampling and reset isolation passed");
 }
 }

@@ -51,6 +51,7 @@ bool evaluate_dlss_nr(const DlssNrFrame& frame, const Settings&) noexcept {
     nr_test_frame = frame;
     return nr_test_succeeds && frame.color;
 }
+void skip_dlss_nr_history(DlssViewId) noexcept {}
 void note_dlss_nr_skipped(DlssNrRoute, const Settings&, const char*) noexcept {}
 }
 int run_nr_lifetime_tests();
@@ -480,6 +481,7 @@ int run_foreign_list_tests() {
         });
         held.get_future().wait();
         auto foreign_work=std::async(std::launch::async,[&]{
+            check(allocator->Reset());
             check(foreign->Reset(allocator.Get(),nullptr)); check(foreign->Close());
             ID3D12CommandList* lists[]{foreign.Get()}; queue->ExecuteCommandLists(1,lists);
         });
@@ -523,16 +525,112 @@ int run_probe_tests() {
         require(probe.queues==4,"Alternate device factory failures were not cached");
         probe.methods[8]=reinterpret_cast<void*>(&ProbeDevice::queue);
         require(ensure_native_observer(alias.get()) && probe.queues==4,"Alternate factory invalidated the working factory's cache");
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC color_desc{}; color_desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        color_desc.Width=color_desc.Height=32; color_desc.DepthOrArraySize=color_desc.MipLevels=color_desc.SampleDesc.Count=1;
+        color_desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        ComPtr<ID3D12Resource> color;
+        check(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&color_desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&color)));
+        Settings nr_settings{}; nr_settings.nr_enabled=true;
+        nr_settings.nr_processing_order=NrProcessingOrder::before_upscaling;
+        DlssNrFrame nr_frame{}; nr_frame.view_id=509; nr_frame.command_list=list.Get(); nr_frame.color=color.Get();
+        nr_frame.color_state=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        nr_frame.input_width=nr_frame.input_height=nr_frame.output_width=nr_frame.output_height=32;
+        const auto attempts=nr_test_evaluations;
+        require(prepare_dlss_nr_input(nr_frame,nr_settings)==nullptr && nr_test_evaluations==attempts,
+            "Pre-attach list without allocator ownership consumed an input slot");
+        check(list->Close());
+        check(list->Reset(allocator.Get(),nullptr));
+        require(nr_recording_allocator_reset_target(alias.get())!=nullptr,
+            "Pre-attach list did not acquire allocator ownership after observed Reset");
+        require(prepare_dlss_nr_input(nr_frame,nr_settings)!=nullptr,
+            "Pre-attach list did not resume NR after observed Reset bound its allocator");
         check(list->Close());
         std::cout << "PASS observer retry/cache/identity recovery\n"; return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL observer probe: " << e.what() << '\n'; return 1; }
 }
+int run_allocator_tests() {
+    using namespace cheeky::foveated_dlss;
+    try {
+        ComPtr<IDXGIFactory4> factory; check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+        ComPtr<IDXGIAdapter> warp; check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)));
+        ComPtr<ID3D12Device> device; check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)));
+        ComPtr<ID3D12CommandQueue> queue; D3D12_COMMAND_QUEUE_DESC q{};
+        check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)));
+        require(initialize_native_observer(device.Get(),queue.Get()), "Allocator observer initialization failed");
+        ComPtr<ID3D12CommandAllocator> allocator, unrelated, next_allocator;
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)));
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&unrelated)));
+        check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&next_allocator)));
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{}; desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width=desc.Height=32; desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;
+        desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        ComPtr<ID3D12Resource> color;
+        check(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&desc,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&color)));
+        Settings settings{}; settings.nr_enabled=true; settings.nr_processing_order=NrProcessingOrder::before_upscaling;
+        update_settings(settings);
+        DlssNrFrame frame{}; frame.view_id=506; frame.color=color.Get();
+        frame.color_state=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        frame.input_width=frame.input_height=frame.output_width=frame.output_height=32;
+        std::array<ComPtr<ID3D12GraphicsCommandList>,4> lists;
+        std::array<ID3D12CommandList*,4> submitted{};
+        NrLifetime first;
+        for (unsigned i=0;i<lists.size();++i) {
+            check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&lists[i])));
+            frame.command_list=lists[i].Get();
+            require(prepare_dlss_nr_input(frame,settings)!=nullptr,"Could not fill four allocator-backed inputs");
+            if(i==0)require(first.record(lists[i].Get()),"Allocator lifetime tracking failed");
+            check(lists[i]->Close()); submitted[i]=lists[i].Get();
+        }
+        ComPtr<ID3D12Fence> done; check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&done)));
+        queue->ExecuteCommandLists(static_cast<UINT>(submitted.size()),submitted.data());
+        check(queue->Signal(done.Get(),1));
+        HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        check(done->SetEventOnCompletion(1,event));
+        const auto waited=WaitForSingleObject(event,10000); CloseHandle(event);
+        require(waited==WAIT_OBJECT_0,"Allocator test GPU timeout");
+        first.collect();
+        require(!first.empty() && first.status().allocator_unknown==0 && first.status().completed_recordings==1,
+            "Completed recording lost its allocator association or replay protection");
+        ComPtr<ID3D12GraphicsCommandList> overflow;
+        check(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,next_allocator.Get(),nullptr,IID_PPV_ARGS(&overflow)));
+        frame.command_list=overflow.Get();
+        require(prepare_dlss_nr_input(frame,settings)==nullptr,"Pool did not retain four completed replayable inputs");
+        nr_allocator_reset(allocator.Get(),E_FAIL); first.collect();
+        require(!first.empty(),"Failed allocator Reset retired a recording");
+        check(unrelated->Reset()); first.collect();
+        require(!first.empty(),"Unrelated allocator Reset retired another allocator's recording");
+        check(allocator->Reset()); first.collect();
+        require(first.empty(),"Allocator Reset retained completed recording while list objects remained alive");
+        require(prepare_dlss_nr_input(frame,settings)!=nullptr,
+            "Four cached closed list objects still exhausted the input pool after allocator Reset");
+        check(overflow->Close());
+        // Rebinding an existing list to new allocator storage must not inherit
+        // the retired epoch. No additional game list object is required.
+        check(lists[0]->Reset(allocator.Get(),nullptr));
+        require(first.record(lists[0].Get()),"List Reset did not bind a fresh allocator epoch");
+        check(lists[0]->Close());
+        nr_allocator_reset(allocator.Get(),E_FAIL); first.collect();
+        require(!first.empty(),"Failed Reset discarded a fresh unsubmitted epoch");
+        check(allocator->Reset()); first.collect();
+        require(first.empty(),"Allocator Reset did not discard unsubmitted command storage");
+        settings.nr_enabled=false; update_settings(settings);
+        lists={}; overflow.Reset(); collect_dlss_nr_input_submissions();
+        std::cout<<"PASS allocator Reset: four completed cached lists reclaim inputs; failed/unrelated Reset protected; fresh and discarded epochs passed\n";
+        return 0;
+    } catch(const std::exception& e) { std::cerr<<"FAIL allocator retirement: "<<e.what()<<'\n';return 1; }
+}
+
 }
 int main(int argc, char** argv) {
     if (argc==2 && std::strcmp(argv[1],"--copy-metadata")==0) return run_copy_metadata_tests();
     if (argc==2 && std::strcmp(argv[1],"--opaque-vr")==0) return run_legacy_tests();
     if (argc==2 && std::strcmp(argv[1],"--wrapped-reshade")==0) return run_wrapped_tests(false);
     if (argc==2 && std::strcmp(argv[1],"--wrapped-streamline")==0) return run_wrapped_tests(true);
+    if (argc==2 && std::strcmp(argv[1],"--allocator")==0) return run_allocator_tests();
     if (argc==2 && std::strcmp(argv[1],"--probe")==0) return run_probe_tests();
     if (argc==2 && std::strcmp(argv[1],"--foreign-list")==0) return run_foreign_list_tests();
     cheeky::foveated_dlss::Settings settings;
@@ -544,6 +642,8 @@ int main(int argc, char** argv) {
     if (probe) return probe;
     const auto foreign = run_foreign_list_tests();
     if (foreign) return foreign;
+    const auto allocator = run_allocator_tests();
+    if (allocator) return allocator;
     const auto lifetime = run_nr_lifetime_tests();
     return lifetime ? lifetime : run_d3d12_composite_tests();
 }

@@ -2,12 +2,18 @@
 #include "eye_calibration_d3d12.hpp"
 #include "graphics_observer.hpp"
 #include "d3d12_native.hpp"
+#include "runtime.hpp"
 #include <atomic>
 #include <vector>
+#include <mutex>
 #include <wrl/client.h>
 
 namespace cheeky::foveated_dlss {
 using Microsoft::WRL::ComPtr;
+struct NrAllocatorEpoch {
+    std::atomic<bool> retired{};
+    std::atomic<std::uint64_t> nr_recordings{};
+};
 struct NrRecording {
     struct Point {
         ComPtr<ID3D12CommandQueue> queue;
@@ -16,15 +22,55 @@ struct NrRecording {
         bool needs_signal{};
     };
     bool retired{};
+    std::shared_ptr<NrAllocatorEpoch> allocator_epoch;
     std::vector<Point> points;
     std::uint64_t created{}, released{};
 };
 namespace {
 constexpr GUID recording_key{0x24c7a6bb, 0xe7d4, 0x44d2, {0xb9, 0x9d, 0x36, 0xb2, 0x41, 0xc7, 0x8f, 0x71}};
+constexpr GUID allocator_key{0xf7406731, 0xdb57, 0x498b, {0xa2,0x7c,0x62,0x85,0x16,0x3e,0x8f,0x4a}};
+class AllocatorIdentity final : public IUnknown {
+    std::atomic<ULONG> refs{1};
+public:
+    std::mutex mutex;
+    std::shared_ptr<NrAllocatorEpoch> epoch;
+    ~AllocatorIdentity() { if (epoch) epoch->retired.store(true); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = this; AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const auto left = --refs; if (!left) delete this; return left;
+    }
+};
+ComPtr<AllocatorIdentity> allocator_identity(ID3D12CommandAllocator* allocator, bool create) {
+    auto native = native_d3d12_interface(allocator);
+    // Several closed lists may share one allocator. Never replace a live token
+    // when their first metadata bindings arrive on different threads.
+    static std::mutex creation_mutex;
+    std::unique_lock creation_lock(creation_mutex, std::defer_lock);
+    if (create) creation_lock.lock();
+    ComPtr<AllocatorIdentity> result;
+    IUnknown* stored{}; UINT bytes = sizeof(stored);
+    if (native && SUCCEEDED(native->GetPrivateData(allocator_key, &bytes, &stored)) && stored)
+        result.Attach(static_cast<AllocatorIdentity*>(stored));
+    if (!result && native && create) {
+        result.Attach(new AllocatorIdentity);
+        if (FAILED(native->SetPrivateDataInterface(allocator_key, result.Get()))) result.Reset();
+    }
+    return result;
+}
 class RecordingIdentity final : public IUnknown {
     std::atomic<ULONG> refs{1};
 public:
     std::shared_ptr<NrRecording> current;
+    std::shared_ptr<NrAllocatorEpoch> allocator_epoch;
+    std::atomic<bool> tracked{};
+    std::atomic<void*> allocator_reset_target{};
+    void* observed_allocator_reset{};
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
@@ -39,8 +85,10 @@ public:
         if (!left) {
             // No owner callbacks or owner locks here. COM releases during
             // collection can reenter this notification under the execution lock.
-            std::lock_guard execution_lock(calibration12_execution_mutex());
-            if (current) current->retired = true;
+            if (current) {
+                std::lock_guard execution_lock(calibration12_execution_mutex());
+                current->retired = true;
+            }
             delete this;
         }
         return left;
@@ -87,16 +135,26 @@ bool ensure_dlss_nr_recording(ID3D12GraphicsCommandList* list) noexcept {
     if (!list) return false;
     std::lock_guard execution_lock(calibration12_execution_mutex());
     auto tag = identity(list);
-    if (!tag) {
+    if (!tag || !tag->tracked.load() ||
+            tag->observed_allocator_reset != tag->allocator_reset_target.load()) {
         // Probe through this list's device, even if a different device already
         // installed hooks. Unsupported observation/private data means fallback.
         if (!ensure_native_observer(list)) return false;
-        tag.Attach(new RecordingIdentity);
-        if (FAILED(list->SetPrivateDataInterface(recording_key, tag.Get()))) return false;
+        if (!tag) {
+            tag.Attach(new RecordingIdentity);
+            if (FAILED(list->SetPrivateDataInterface(recording_key, tag.Get()))) return false;
+        }
         const auto stored = identity(list);
         if (stored.Get() != tag.Get()) return false;
+        tag->observed_allocator_reset = tag->allocator_reset_target.load();
     }
-    if (!tag->current) tag->current = std::make_shared<NrRecording>();
+    if (tag->allocator_epoch && tag->allocator_epoch->retired.load()) return false;
+    if (!tag->current) {
+        tag->current = std::make_shared<NrRecording>();
+        tag->current->allocator_epoch = tag->allocator_epoch;
+        if (tag->allocator_epoch) ++tag->allocator_epoch->nr_recordings;
+    }
+    tag->tracked.store(true);
     return true;
 }
 bool NrLifetime::record(ID3D12GraphicsCommandList* list) noexcept {
@@ -135,7 +193,8 @@ void nr_recording_submitted(ID3D12CommandQueue* queue, ID3D12Object* list, NrSig
     signal_point(recording, *found, submit_signal ? submit_signal : signal);
 }
 bool nr_recording_tagged(ID3D12Object* list) noexcept {
-    return list && identity(list) != nullptr;
+    const auto tag = list ? identity(list) : ComPtr<RecordingIdentity>{};
+    return tag && tag->tracked.load();
 }
 void nr_recording_reset(ID3D12Object* list, HRESULT result) noexcept {
     if (FAILED(result)) return;
@@ -146,12 +205,53 @@ void nr_recording_reset(ID3D12Object* list, HRESULT result) noexcept {
         tag->current.reset();
     }
 }
+// Binding metadata never retains the allocator or takes the graphics execution
+// mutex. Unrelated OpenXR/driver list Reset/Create calls must remain unblocked.
+void nr_recording_bind_allocator(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator) noexcept {
+    const auto native = native_d3d12_interface(list);
+    if (!native || !allocator) return;
+    auto allocation = allocator_identity(allocator, true);
+    if (!allocation) return;
+    auto tag = identity(native.Get());
+    if (!tag) {
+        tag.Attach(new RecordingIdentity);
+        if (FAILED(native->SetPrivateDataInterface(recording_key, tag.Get()))) return;
+    }
+    std::lock_guard lock(allocation->mutex);
+    if (!allocation->epoch) allocation->epoch = std::make_shared<NrAllocatorEpoch>();
+    tag->allocator_epoch = allocation->epoch;
+    const auto native_allocator = native_d3d12_interface(allocator);
+    tag->allocator_reset_target.store(native_allocator
+        ? (*reinterpret_cast<void***>(native_allocator.Get()))[8] : nullptr);
+}
+void* nr_recording_allocator_reset_target(ID3D12GraphicsCommandList* list) noexcept {
+    const auto tag = identity(list);
+    return tag ? tag->allocator_reset_target.load() : nullptr;
+}
+void nr_allocator_reset(ID3D12CommandAllocator* allocator, HRESULT result) noexcept {
+    if (FAILED(result)) return;
+    auto allocation = allocator_identity(allocator, false);
+    if (!allocation) return;
+    std::lock_guard lock(allocation->mutex);
+    if (allocation->epoch) {
+        allocation->epoch->retired.store(true);
+        if (const auto records = allocation->epoch->nr_recordings.load()) {
+            static std::atomic<std::uint64_t> retirements{};
+            const auto count = ++retirements;
+            if (count <= 4 || count % 300 == 0)
+                trace_event("DLSS-NR allocator storage retired recordings=%llu generations=%llu", records, count);
+        }
+    }
+    allocation->epoch.reset();
+}
 void NrLifetime::collect(NrSignal submit_signal) noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     for (auto it = uses_.begin(); it != uses_.end();) {
         auto& recording = **it;
         collect_recording(recording, submit_signal ? submit_signal : signal);
-        if (recording.retired && recording.points.empty()) {
+        const bool retired = recording.retired ||
+            (recording.allocator_epoch && recording.allocator_epoch->retired.load());
+        if (retired && recording.points.empty()) {
             created_ += recording.created;
             released_ += recording.released;
             it = uses_.erase(it);
@@ -162,6 +262,19 @@ std::uint64_t NrLifetime::fences_created() const noexcept {
     auto total = created_;
     for (const auto& use : uses_) total += use->created;
     return total;
+}
+NrLifetimeStatus NrLifetime::status() const noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    NrLifetimeStatus result{};
+    for (const auto& recording : uses_) {
+        result.pending_queues += recording->points.size();
+        if (!recording->allocator_epoch) ++result.allocator_unknown;
+        if (recording->points.empty()) {
+            if (recording->created) ++result.completed_recordings;
+            else ++result.unsubmitted_recordings;
+        }
+    }
+    return result;
 }
 std::uint64_t NrLifetime::fences_released() const noexcept {
     auto total = released_;

@@ -16,6 +16,7 @@ void require(bool value, const char* message) {
 }
 void check(HRESULT result) { require(SUCCEEDED(result), "D3D12 lifetime fixture failed"); }
 HRESULT STDMETHODCALLTYPE reject_interface(TimingListAlias*, REFGUID, const IUnknown*) { return E_NOINTERFACE; }
+HRESULT STDMETHODCALLTYPE reject_private_data(TimingListAlias*, REFGUID, UINT*, void*) { return E_FAIL; }
 HRESULT fail_signal(ID3D12CommandQueue*, ID3D12Fence*, std::uint64_t) { return E_FAIL; }
 struct Gpu {
     ComPtr<ID3D12Device> device;
@@ -213,6 +214,7 @@ int run_nr_lifetime_tests() {
         check(gpu.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gpu.allocator.Get(),
             nullptr, IID_PPV_ARGS(&unused)));
         TimingListAlias unsupported(unused.Get());
+        unsupported.methods[3] = reinterpret_cast<void*>(&reject_private_data);
         unsupported.methods[5] = reinterpret_cast<void*>(&reject_interface);
         require(!destroyed.record(unsupported.get()), "Unsupported recording identity was accepted");
         require(destroyed.record(unused.Get()), "Unsubmitted destruction recording failed");

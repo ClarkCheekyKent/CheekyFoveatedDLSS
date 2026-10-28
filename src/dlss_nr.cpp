@@ -3,6 +3,8 @@
 #include "eye_calibration_d3d12.hpp"
 #include "dlss_nr.hpp"
 #include "nr_codec_shader.hpp"
+#include "debug_exposure.hpp"
+#include <bit>
 #include "d3d_shaders.hpp"
 #include "nr_parameters.hpp"
 #include "nr_runtime_module.hpp"
@@ -125,6 +127,7 @@ bool verify_model_tuning(NgxParameters* parameters, const Settings& settings,
 
 struct GpuResources {
     bool border_only{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> exposure;
     NrGuidePass guides;
     NrLifetime uses;
     std::uint64_t last_use{};
@@ -184,8 +187,8 @@ DlssNrSnapshot diagnostics;
 // One active feature plus one alternate for full/foveated toggling. Pending
 // recordings count against this budget too; exhausted caches fall back to SR.
 constexpr std::size_t retired_feature_capacity = 1U;
-// Two configurations across three rotating private input textures per eye.
-constexpr std::size_t gpu_resource_cache_capacity = 6U;
+// Two configurations across four rotating private input textures per eye.
+constexpr std::size_t gpu_resource_cache_capacity = 8U;
 
 void release_gpu(GpuResources& gpu) noexcept {
     release(gpu.border_pipeline);
@@ -614,7 +617,7 @@ void evict_retired_features(ViewState& view) noexcept {
 
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap{};
     descriptor_heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptor_heap.NumDescriptors = 8U;
+    descriptor_heap.NumDescriptors = 9U;
     descriptor_heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     result = device->CreateDescriptorHeap(
         &descriptor_heap,
@@ -664,6 +667,15 @@ void evict_retired_features(ViewState& view) noexcept {
     cpu.ptr += gpu.descriptor_size;
     device->CreateUnorderedAccessView(game_output, nullptr, &game_uav, cpu);
 
+    cpu.ptr += gpu.descriptor_size;
+    gpu.exposure = debug_exposure_supported(debug_exposure) ? debug_exposure.texture : nullptr;
+    D3D12_SHADER_RESOURCE_VIEW_DESC exposure_srv{};
+    exposure_srv.Format = gpu.exposure ? gpu.exposure->GetDesc().Format : DXGI_FORMAT_R32_FLOAT;
+    exposure_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    exposure_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    exposure_srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(gpu.exposure.Get(), &exposure_srv, cpu);
+
     if (shared && shared->root_signature && shared->border_pipeline &&
         (gpu.border_only || (shared->encode_pipeline && shared->decode_pipeline))) {
         gpu.root_signature = shared->root_signature; gpu.root_signature->AddRef();
@@ -674,14 +686,17 @@ void evict_retired_features(ViewState& view) noexcept {
         }
         cleanup(); return true;
     }
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
+    D3D12_DESCRIPTOR_RANGE ranges[3]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 3U;
     ranges[0].BaseShaderRegister = 0U;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 2U;
     ranges[1].BaseShaderRegister = 0U;
-    D3D12_ROOT_PARAMETER root_parameters[3]{};
+    ranges[2] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1U, 3U, 0U, 0U};
+    D3D12_ROOT_PARAMETER root_parameters[4]{};
+    root_parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[3].DescriptorTable = {1U, &ranges[2]};
     root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     root_parameters[0].DescriptorTable.NumDescriptorRanges = 1U;
     root_parameters[0].DescriptorTable.pDescriptorRanges = &ranges[0];
@@ -692,7 +707,7 @@ void evict_retired_features(ViewState& view) noexcept {
     root_parameters[2].Constants.ShaderRegister = 0U;
     root_parameters[2].Constants.Num32BitValues = 40U;
     D3D12_ROOT_SIGNATURE_DESC root_desc{};
-    root_desc.NumParameters = 3U;
+    root_desc.NumParameters = 4U;
     root_desc.pParameters = root_parameters;
     result = D3D12SerializeRootSignature(
         &root_desc,
@@ -751,7 +766,9 @@ void evict_retired_features(ViewState& view) noexcept {
     const std::uint32_t working_height,
     const bool border_only = false
 ) noexcept {
+    auto* exposure = debug_exposure_supported(debug_exposure) ? debug_exposure.texture : nullptr;
     for (auto& gpu : view.gpu_resources) {
+        if (gpu.exposure.Get() != exposure) continue;
         if (gpu.border_only == border_only && gpu.game_output == frame.color &&
             (border_only || (gpu.width == region.width && gpu.height == region.height &&
             gpu.working_width == working_width && gpu.working_height == working_height &&
@@ -786,6 +803,14 @@ void evict_retired_features(ViewState& view) noexcept {
         cpu.ptr += gpu.descriptor_size;
         device->CreateUnorderedAccessView(frame.color, nullptr, &uav, cpu);
         frame.color->AddRef(); release(gpu.game_output); gpu.game_output = frame.color;
+        cpu.ptr += gpu.descriptor_size;
+        D3D12_SHADER_RESOURCE_VIEW_DESC exposure_srv{};
+        exposure_srv.Format = exposure ? exposure->GetDesc().Format : DXGI_FORMAT_R32_FLOAT;
+        exposure_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        exposure_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        exposure_srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(exposure, &exposure_srv, cpu);
+        gpu.exposure = exposure;
         if (!border_only) gpu.guides.rebind(device.Get(), frame.motion_vectors, frame.depth);
         ++diagnostics.resource_rebinds;
         if (!gpu.uses.record(frame.command_list)) return nullptr;
@@ -889,6 +914,9 @@ void dispatch_codec(
     frame.command_list->SetComputeRootDescriptorTable(1U, handle);
     const auto width = gpu.border_only ? region.width : gpu.width;
     const auto height = gpu.border_only ? region.height : gpu.height;
+    auto exposure_handle = gpu.descriptors->GetGPUDescriptorHandleForHeapStart();
+    exposure_handle.ptr += 8ULL * gpu.descriptor_size;
+    frame.command_list->SetComputeRootDescriptorTable(3U, exposure_handle);
     CodecConstants constants{
         {width, height},
         {width, height},
@@ -907,6 +935,11 @@ void dispatch_codec(
         settings.nr_alignment_border_enabled ? 1U : 0U,
         region.mask.count, {}, {},
     };
+    constants.padding[0] = std::bit_cast<std::uint32_t>(gpu.exposure
+        ? debug_exposure.pre / debug_exposure.scale : 0.0F);
+    const auto exposure_state = debug_exposure.state;
+    if (gpu.exposure) transition(frame.command_list, gpu.exposure.Get(), exposure_state,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     std::memcpy(constants.mask_bounds, region.mask.bounds, sizeof(constants.mask_bounds));
     frame.command_list->SetComputeRoot32BitConstants(2U, 40U, &constants, 0U);
     const auto dispatch_width = (std::max)(width, gpu.working_width);
@@ -916,6 +949,8 @@ void dispatch_codec(
         (dispatch_height + 15U) / 16U,
         1U
     );
+    if (gpu.exposure) transition(frame.command_list, gpu.exposure.Get(),
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, exposure_state);
 }
 
 // Resolve NR independently of SR: changing NR dimensions must not resize the
@@ -1008,6 +1043,10 @@ bool evaluate_dlss_nr(
         frame.motion_state == static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU) ||
         frame.depth_state == static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFU)) {
         diagnostics.state = DlssNrState::unsupported_resources;
+        diagnostics.skip_reason = !frame.color ? "NR color resource missing"
+            : !frame.depth ? "NR depth resource missing"
+            : !frame.motion_vectors ? "NR motion resource missing"
+            : "NR dimensions, motion metadata or guide states invalid";
         ++diagnostics.failed_calls;
         return false;
     }
@@ -1022,6 +1061,7 @@ bool evaluate_dlss_nr(
     if (!guide_valid(frame.depth, frame.depth_base_x, frame.depth_base_y, frame.depth_width, frame.depth_height) ||
         !guide_valid(frame.motion_vectors, frame.motion_base_x, frame.motion_base_y, frame.motion_width, frame.motion_height)) {
         diagnostics.state = DlssNrState::unsupported_resources;
+        diagnostics.skip_reason = "NR guide subrect out of bounds or texture not shader-readable";
         ++diagnostics.failed_calls;
         return false;
     }
@@ -1480,7 +1520,19 @@ void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const cha
 void collect_dlss_nr_submissions() noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
+    const bool disabled = !current_settings().nr_enabled;
+    if (disabled)
+        for (auto& view : views) view.retired = true;
     collect_retired_views();
+    if (disabled) {
+        diagnostics.state = DlssNrState::disabled;
+        diagnostics.skip_reason = views.empty() ? nullptr : "NR disabled; waiting for recordings to retire";
+        if (views.empty()) {
+            diagnostics.region_width = diagnostics.region_height = 0U;
+            diagnostics.working_width = diagnostics.working_height = 0U;
+            diagnostics.intermediate_vram_bytes = 0U;
+        }
+    }
 }
 void skip_dlss_nr_history(const DlssViewId view_id) noexcept {
     std::lock_guard lock(nr_mutex);

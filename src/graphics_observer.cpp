@@ -21,6 +21,7 @@ std::mutex probe_mutex;
 std::atomic<bool> ready{};
 std::atomic<std::uint64_t> submissions{}, copies{}, resets{}, destroyed{};
 thread_local bool observing{};
+thread_local bool initializing_observer{};
 struct ObservationScope {
     bool outer{!observing};
     ObservationScope() {
@@ -34,6 +35,9 @@ struct ObservationScope {
 using ExecuteFn = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using ResetFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*,
                                             ID3D12PipelineState*);
+using AllocatorResetFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandAllocator*);
+using CreateListFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE,
+    ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
 using CopyFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
 using CopyTextureFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*,
                                                UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*,
@@ -354,9 +358,28 @@ HRESULT reset(ResetFn real_reset, ID3D12GraphicsCommandList* list, ID3D12Command
         }
     }
     if (SUCCEEDED(hr)) {
+        nr_recording_bind_allocator(list, allocator);
         note_d3d12_command_list_reset(list);
         reset_gaze_copies(reinterpret_cast<std::uint64_t>(list));
         ++resets;
+    }
+    return hr;
+}
+HRESULT allocator_reset(AllocatorResetFn real_reset, ID3D12CommandAllocator* allocator) {
+    // No global execution mutex: a foreign allocator may belong to a thread
+    // that the game's forwarding queue is currently waiting for.
+    const auto hr = real_reset(allocator);
+    nr_allocator_reset(allocator, hr);
+    return hr;
+}
+HRESULT create_list(CreateListFn real_create, ID3D12Device* device, UINT node,
+    D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator,
+    ID3D12PipelineState* pipeline, REFIID iid, void** out) {
+    const auto hr = real_create(device, node, type, allocator, pipeline, iid, out);
+    if (SUCCEEDED(hr) && out && *out && !initializing_observer) {
+        ComPtr<ID3D12GraphicsCommandList> list;
+        if (SUCCEEDED(static_cast<IUnknown*>(*out)->QueryInterface(IID_PPV_ARGS(&list))))
+            nr_recording_bind_allocator(list.Get(), allocator);
     }
     return hr;
 }
@@ -436,6 +459,11 @@ bool initialize_native_observer(ID3D12Device* device, ID3D12CommandQueue* queue)
     if (!device || !queue)
         return false;
     std::lock_guard lock(install_mutex);
+    struct ProbeScope {
+        bool previous{initializing_observer};
+        ProbeScope() { initializing_observer = true; }
+        ~ProbeScope() { initializing_observer = previous; }
+    } probe_scope;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
@@ -459,7 +487,9 @@ bool initialize_native_observer(ID3D12Device* device, ID3D12CommandQueue* queue)
         !install_method<ResetFn, &reset>(targets[1]) ||
         !install_method<CopyFn, &copy_resource>(targets[2]) ||
         !install_method<CopyTextureFn, &copy_texture>(targets[3]) ||
-        !install_method<ResolveFn, &resolve>(targets[4])) {
+        !install_method<ResolveFn, &resolve>(targets[4]) ||
+        !install_method<AllocatorResetFn, &allocator_reset>(method(allocator.Get(), 8)) ||
+        !install_method<CreateListFn, &create_list>(method(device, 12))) {
         log_error("Could not install all D3D12 observer methods for this object family");
         return false;
     }
@@ -476,6 +506,7 @@ bool ensure_native_observer(ID3D12GraphicsCommandList* list) noexcept {
     if (!list || FAILED(list->GetDevice(IID_PPV_ARGS(&device))) || !device) return false;
     device = native_d3d12_interface(device.Get());
     if (!device) return false;
+    const auto allocator_reset_target = nr_recording_allocator_reset_target(list);
     std::lock_guard lock(probe_mutex);
     ComPtr<ObserverProbe> probe;
     IUnknown* stored{};
@@ -512,7 +543,19 @@ bool ensure_native_observer(ID3D12GraphicsCommandList* list) noexcept {
     }
     cached->methods = factories;
     cached->used_at = now;
-    if (cached->succeeded) return true;
+    const auto ensure_actual_reset = [&] {
+        std::lock_guard hook_lock(install_mutex);
+        const auto before = method_count;
+        const auto target = method(list, reset_slot);
+        const bool installed = install_method<ResetFn, &reset>(target) &&
+            (!allocator_reset_target || install_method<AllocatorResetFn, &allocator_reset>(allocator_reset_target));
+        if (installed && method_count != before)
+            trace_event("D3D12 observer actual-list Reset ready methods=%zu reset=%p", method_count, target);
+        return installed;
+    };
+    // A device-created probe need not share its Reset implementation with the
+    // game's actual list (different proxy/type/creation flags).
+    if (cached->succeeded) return ensure_actual_reset();
     if (cached->attempted && cached->hooks_ready == ready.load() && now - cached->attempted_at < 1000U)
         return false;
     ComPtr<ID3D12CommandQueue> queue;
@@ -522,7 +565,7 @@ bool ensure_native_observer(ID3D12GraphicsCommandList* list) noexcept {
     cached->succeeded = SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue))) &&
         initialize_native_observer(device.Get(), queue.Get());
     cached->hooks_ready = ready.load();
-    return cached->succeeded;
+    return cached->succeeded && ensure_actual_reset();
 }
 NativeObserverStatus native_observer_status() noexcept {
     return {ready.load(), submissions.load(), copies.load(), resets.load(), destroyed.load()};

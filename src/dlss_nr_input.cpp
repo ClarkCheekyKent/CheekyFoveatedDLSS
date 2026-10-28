@@ -69,6 +69,14 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
             "NR requires compatible Execute/Reset observation and recording identity");
         return nullptr;
     }
+    if (!nr_recording_allocator_reset_target(frame.command_list)) {
+        // A list created before attach has no discoverable allocator getter.
+        // Wait for an observed Reset rather than pin an unretirable pool slot.
+        skip_dlss_nr_history(frame.view_id);
+        note_dlss_nr_skipped(frame.route, settings,
+            "Before NR waiting for observed command-list creation/Reset to identify allocator");
+        return nullptr;
+    }
     auto desc = frame.color->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1U ||
         desc.SampleDesc.Count != 1U || frame.color_base_x > desc.Width ||
@@ -85,6 +93,8 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
         return nullptr;
     }
     ID3D12Resource* private_color{};
+    NrLifetimeStatus holds{};
+    const char* unavailable_reason = "Before NR input pool busy (4 retained recordings); using original color";
     {
         std::lock_guard lock(mutex);
         collect();
@@ -99,10 +109,20 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
                 input.retired = true;
                 continue;
             }
-            if (complete(input)) { selected = &input; break; }
+            // Each caller records Copy -> NR -> SR before the next caller can
+            // overwrite this scratch texture. Reuse within that same recording
+            // is ordered on replay too. Independent recordings still need their
+            // own inputs until Reset/destruction and all queue fences drain.
+            if (complete(input) || (input.uses.size() == 1U &&
+                    input.uses.contains(frame.command_list))) {
+                selected = &input;
+                break;
+            }
         }
-        // Accommodate overlapping frames, not a history of settings choices.
-        if (!selected && count < 3U) {
+        // Allow four retained recordings per eye instead of assuming triple
+        // buffering. Reset and every-queue completion still gate reuse.
+        if (!selected && count < 4U) {
+            unavailable_reason = "Before NR private input allocation failed; using original color";
             ID3D12Device* device{};
             if (SUCCEEDED(frame.command_list->GetDevice(IID_PPV_ARGS(&device)))) {
                 Input created{};
@@ -123,10 +143,20 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
                 device->Release();
             }
         }
+        if (selected) unavailable_reason = "Before NR recording identity unavailable; using original color";
         if (selected && selected->uses.record(frame.command_list)) {
             if (++selected->uses_count % 300 == 0)
                 trace_event("DLSS-NR Before input recycled view=%llu uses=%llu", frame.view_id, selected->uses_count);
             private_color = selected->color;
+        }
+        if (!private_color) {
+            for (const auto& input : inputs) if (input.view == frame.view_id) {
+                const auto status = input.uses.status();
+                holds.pending_queues += status.pending_queues;
+                holds.completed_recordings += status.completed_recordings;
+                holds.unsubmitted_recordings += status.unsubmitted_recordings;
+                holds.allocator_unknown += status.allocator_unknown;
+            }
         }
     }
     frame_device->Release();
@@ -134,9 +164,10 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
         static std::atomic<std::uint64_t> skips{};
         const auto skipped = ++skips;
         if (skipped == 1 || skipped % 300 == 0)
-            trace_event("DLSS-NR Before input unavailable view=%llu skips=%llu", frame.view_id, skipped);
-        frame.color = nullptr;
-        static_cast<void>(evaluate_dlss_nr(frame, settings));
+            trace_event("DLSS-NR Before input unavailable view=%llu skips=%llu pendingQueues=%zu completedAwaitingReset=%zu unsubmitted=%zu allocatorUnknown=%zu",
+                frame.view_id, skipped, holds.pending_queues, holds.completed_recordings, holds.unsubmitted_recordings, holds.allocator_unknown);
+        skip_dlss_nr_history(frame.view_id);
+        note_dlss_nr_skipped(frame.route, settings, unavailable_reason);
         return nullptr;
     }
     transition(frame.command_list, frame.color, frame.color_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -159,6 +190,10 @@ ID3D12Resource* prepare_dlss_nr_input(DlssNrFrame frame, const Settings& setting
 void collect_dlss_nr_input_submissions() noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(mutex);
+    if (!current_settings().nr_enabled)
+        for (auto& input : inputs) input.retired = true;
+    // Preserve the small input history so the first raw SR frame after disable
+    // still resets its processed-input history exactly once.
     collect();
 }
 void release_dlss_nr_inputs(DlssViewId view_id) noexcept {

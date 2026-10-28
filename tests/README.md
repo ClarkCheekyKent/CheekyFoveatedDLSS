@@ -583,6 +583,27 @@ ACC moving-head A/B comparison against 1x is still required.
 
 Run `bin/Release/CheekyTests.exe --nr-processing` to run the NR contracts independently.
 
+`CheekyStandaloneHostTests.exe dx12` checks the production HDR codec with an
+identity NR model: saturated HDR chroma, highlights and alpha must survive,
+and the proxy must use the game's exposure texture. `CheekyNrObserverTests.exe`
+fills all four Before NR inputs with independent recordings, then verifies
+exhaustion, replay protection, pending queues and recycling after Reset.
+Sequential calls in one recording reuse one input; GPU readback verifies that
+each consumer sees its own color before the next overwrite. Disable tests prove
+pending replay keeps inputs alive, completed inputs are destroyed, NVIDIA
+features are released, and reenable recreates/reset histories correctly.
+These fixtures use a fake NR model
+and GPU readback; MSFS 2024 appearance and dropout frequency need an in-game check.
+
+`CheekyNrObserverTests.exe --allocator` reproduces four completed recordings
+whose closed list objects remain cached: successful allocator Reset must retire
+their old command storage and reclaim the four input slots. Failed or unrelated
+allocator Reset must not do so. It also checks fresh and discarded allocator
+generations. The regular observer suite covers initial list creation, Reset
+association, untracked allocator calls without the graphics execution mutex,
+and replay protection. Pre-attach Before NR lists wait for an observed Reset
+before allocating inputs, because D3D12 exposes no allocator getter on a list.
+
 The standard suite tests processing-resolution selection, Working scale, crop
 centers, independent resource origins, render/output-resolution motion fields,
 per-eye history changes, and restoration of NGX parameters and Streamline tags
