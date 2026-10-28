@@ -47,7 +47,8 @@ run performs these steps in order:
 
 1. Sign the seven built binaries with the `binaries` configuration.
 2. Check that every downloaded binary has an Authenticode signature and the same
-   signer. Self-signed certificate trust failures are allowed for this test;
+   signer. Self-signed certificate trust failures are allowed for this test
+   (`NotTrusted`, or the specific untrusted-root message reported as `UnknownError`);
    missing signatures, hash mismatches and other verification errors stop the job.
 3. Build `CheekyOpenXRSetup.exe` with the signed OpenXR layer and its manifest,
    using Inno Setup supplied by the GitHub-hosted Windows image.

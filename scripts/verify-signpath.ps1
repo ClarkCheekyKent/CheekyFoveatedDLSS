@@ -8,6 +8,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
+# Some Windows versions expose CERT_E_UNTRUSTEDROOT as UnknownError. Match
+# only its localized message, rather than allowing arbitrary verification errors.
+$untrustedRootMessage = ([Runtime.InteropServices.Marshal]::GetExceptionForHR(-2146762487).Message -replace '\s+\(0x800B0109\)$', '').Trim()
 if ($PSCmdlet.ParameterSetName -eq 'Binaries') {
     [xml]$configuration = Get-Content -LiteralPath (Join-Path $projectRoot '.github/signpath/binaries.xml') -Raw
     $namespaces = New-Object System.Xml.XmlNamespaceManager($configuration.NameTable)
@@ -23,7 +26,8 @@ foreach ($path in $paths) {
     $signature = Get-AuthenticodeSignature -LiteralPath $path
     # NotTrusted is expected for the self-signed test certificate. Reject missing,
     # broken, unsupported and otherwise unverifiable signatures.
-    if (-not $signature.SignerCertificate -or $signature.Status -notin @('Valid', 'NotTrusted')) {
+    $untrustedRoot = $signature.Status -eq 'UnknownError' -and $signature.StatusMessage.Trim() -eq $untrustedRootMessage
+    if (-not $signature.SignerCertificate -or ($signature.Status -notin @('Valid', 'NotTrusted') -and -not $untrustedRoot)) {
         throw "Signature check failed for ${path}: $($signature.Status) $($signature.StatusMessage)"
     }
     if (-not $ExpectedThumbprint) { $ExpectedThumbprint = $signature.SignerCertificate.Thumbprint }

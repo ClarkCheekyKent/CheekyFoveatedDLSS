@@ -32,12 +32,12 @@ function Assert-Rejected($Action, [string]$Message) {
 Assert-Rejected { & "$projectRoot/scripts/verify-signpath.ps1" -InstallerPath $installer } 'Signature check failed'
 
 # Only the certificate response is mocked; use actual packagers, ZIP IO and hashes.
-$signatureFixture = @{ Status = 'NotTrusted'; InstallerThumbprint = 'TEST-CERT'; InstallerPath = $installer }
+$signatureFixture = @{ Status = 'NotTrusted'; Message = 'Synthetic test result'; InstallerThumbprint = 'TEST-CERT'; InstallerPath = $installer }
 Set-Item Function:Get-AuthenticodeSignature -Value ({
     param([string]$LiteralPath)
     [pscustomobject]@{
         Status = $signatureFixture.Status
-        StatusMessage = 'Synthetic test result'
+        StatusMessage = $signatureFixture.Message
         SignerCertificate = [pscustomobject]@{
             Thumbprint = $(if ($LiteralPath -eq $signatureFixture.InstallerPath) { $signatureFixture.InstallerThumbprint } else { 'TEST-CERT' })
         }
@@ -45,6 +45,11 @@ Set-Item Function:Get-AuthenticodeSignature -Value ({
 }.GetNewClosure())
 $signatureFixture.Status = 'HashMismatch'
 Assert-Rejected { & "$projectRoot/scripts/package-signpath.ps1" -BinaryRoot $binaries -InstallerPath $installer } 'Signature check failed'
+$signatureFixture.Status = 'UnknownError'
+Assert-Rejected { & "$projectRoot/scripts/verify-signpath.ps1" -InstallerPath $installer } 'Signature check failed'
+$signatureFixture.Message = ([Runtime.InteropServices.Marshal]::GetExceptionForHR(-2146762487).Message -replace '\s+\(0x800B0109\)$', '').Trim()
+& "$projectRoot/scripts/verify-signpath.ps1" -InstallerPath $installer
+$signatureFixture.Message = 'Synthetic test result'
 $signatureFixture.Status = 'NotTrusted'
 $signatureFixture.InstallerThumbprint = 'OTHER-CERT'
 Assert-Rejected { & "$projectRoot/scripts/package-signpath.ps1" -BinaryRoot $binaries -InstallerPath $installer } 'Unexpected signing certificate'
