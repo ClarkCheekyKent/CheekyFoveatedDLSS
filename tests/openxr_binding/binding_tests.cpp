@@ -448,6 +448,73 @@ void custom_binding_menu_test() {
     fallback_profile = profile; fallback_tracking = true;
     std::cout << "PASS custom SteamVR binding: host fallback aim, both triggers, release, ray loss, profile cleanup\n";
 }
+void fg_reset_clock_test() {
+    // DCS's menu can produce 180 frames/s while VDXR presents at 120 Hz.
+    // Repeated waits against one runtime prediction must not accumulate a
+    // display interval for every application frame (including at 2x-4x FG).
+    constexpr XrDuration period=8333333;
+    for(const unsigned factor:{1u,2u,3u,4u}) {
+        cheeky::fg::BufferedPresenter presenter;
+        presenter.started=true;presenter.degraded=true;
+        presenter.display_clock.observe_refresh(120);
+        presenter.pacing_active=factor>1;presenter.active_multiplier=factor;
+        XrTime previous{};
+        for(unsigned i=0;i<1800;++i) {
+            presenter.predicted.predictedDisplayTime=1000000000+XrTime(i*2/3)*period;
+            presenter.predicted.predictedDisplayPeriod=period;
+            presenter.begun=presenter.waited;
+            XrFrameState frame{XR_TYPE_FRAME_STATE};
+            check(XR_SUCCEEDED(presenter.wait_frame(nullptr,&frame)),"Fast application wait succeeds");
+            check(frame.predictedDisplayTime>previous,"FG application display time remains monotonic");
+            check(frame.predictedDisplayTime<=presenter.predicted.predictedDisplayTime+
+                period*std::max(2u,factor)+2,"Fast application cannot advance seconds beyond the runtime clock");
+            check(frame.predictedDisplayPeriod==period*factor,"FG retains its requested native prediction period");
+            previous=frame.predictedDisplayTime;
+        }
+    }
+    std::cout<<"PASS FG application prediction stays near the runtime at 180 FPS / 120 Hz, 1x-4x\n";
+}
+
+void fg_reset_native_resume_test() {
+    reset();swapchains.clear();
+    const auto session=h<XrSession>(2);
+    static unsigned waits,begins,ends;
+    static XrResult begin_result,end_result;
+    constexpr XrTime floor=1000+1200*100;
+    for(const unsigned failure:{0u,1u,2u}) {
+        waits=begins=ends=0;
+        begin_result=failure==1?XR_ERROR_RUNTIME_FAILURE:XR_SUCCESS;
+        end_result=failure==2?XR_ERROR_RUNTIME_FAILURE:XR_SUCCESS;
+        auto& d=instances.at(instance).dispatch;
+        d.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* frame) {
+            // A second wait without a matching BeginFrame is the live VDXR hang.
+            if(waits!=begins)return XR_ERROR_CALL_ORDER_INVALID;
+            frame->predictedDisplayTime=1000+100*++waits;
+            frame->predictedDisplayPeriod=100;return XR_SUCCESS;
+        };
+        d.begin_frame=[](XrSession,const XrFrameBeginInfo*) {if(XR_FAILED(begin_result))return begin_result;++begins;return XR_SUCCESS;};
+        d.end_frame=[](XrSession,const XrFrameEndInfo*) {if(XR_FAILED(end_result))return end_result;++ends;return XR_SUCCESS;};
+        SessionState owner{};owner.session=session;owner.instance=instance;owner.running=true;
+        auto retired=std::make_shared<cheeky::fg::BufferedPresenter>();
+        retired->app_display_time=floor;owner.fg=retired;owner.fg_requested=true;
+        sessions.emplace(session,std::move(owner));
+        XrFrameState frame{XR_TYPE_FRAME_STATE};
+        const auto result=cheeky_xrWaitFrame(session,nullptr,&frame);
+        if(!failure) {
+            check(XR_SUCCEEDED(result)&&frame.predictedDisplayTime>floor,
+                "FG reset must consume all stale runtime frames, including more than sixteen");
+            check(waits==1201&&begins==1200&&ends==1200,"Stale waits have paired empty Begin/End frames");
+            check(XR_SUCCEEDED(cheeky_xrBeginFrame(session,nullptr)),"Resumed frame begins");
+            XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;
+            check(XR_SUCCEEDED(cheeky_xrEndFrame(session,&end)),"Resumed frame ends");
+            check(XR_SUCCEEDED(cheeky_xrWaitFrame(session,nullptr,&frame)),"Next native wait remains live");
+        }else check(result==XR_ERROR_RUNTIME_FAILURE&&sessions.at(session).native_waits_pending==0,
+            "Failed native resume Begin/End propagates and clears the pending wait");
+        sessions.clear();
+    }
+    std::cout<<"PASS FG reset native resume beyond sixteen stale frames and Begin/End errors\n";
+}
+
 void fg_native_handoff_test() {
     reset();swapchains.clear();
     const auto session=h<XrSession>(2);
@@ -625,7 +692,8 @@ void fg_toggle_test() {
     static std::atomic<unsigned> waits{},begins{},ends{};
     waits=begins=ends=0;
     d.wait_frame=[](XrSession,const XrFrameWaitInfo*,XrFrameState* state) {
-        Sleep(1);const auto tick=++waits;state->predictedDisplayPeriod=100;state->predictedDisplayTime=1000+100*tick;
+        // Use a real headset period accepted by StableDisplayClock.
+        Sleep(1);const auto tick=++waits;state->predictedDisplayPeriod=10000000;state->predictedDisplayTime=1000000000+10000000*tick;
         state->shouldRender=XR_TRUE;return XR_SUCCESS;
     };
     d.begin_frame=[](XrSession,const XrFrameBeginInfo*) {++begins;return XR_SUCCESS;};
@@ -666,7 +734,7 @@ void fg_toggle_test() {
     first->held_valid=true;first->frames=1;
     XrFrameWaitInfo info{XR_TYPE_FRAME_WAIT_INFO};XrFrameState state{XR_TYPE_FRAME_STATE};
     check(XR_SUCCEEDED(first->wait_frame(&info,&state)) && waits>=1 && begins>=1 &&
-        state.predictedDisplayPeriod==100 && first->fallback_count==0,"Enabling FG without a generated frame must preserve native cadence");
+        state.predictedDisplayPeriod==10000000 && first->fallback_count==0,"Enabling FG without a generated frame must preserve native cadence");
     XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};XrFrameEndInfo empty{XR_TYPE_FRAME_END_INFO};empty.displayTime=state.predictedDisplayTime;
     check(XR_SUCCEEDED(first->begin_frame(&begin))&&XR_SUCCEEDED(first->end_frame(&empty,{},nullptr)),
         "Buffered application frames must close through the presentation owner");
@@ -677,7 +745,7 @@ void fg_toggle_test() {
     check(!CheekyFG_GetStatus(&status),"Reject mismatched FG status ABI");
     CheekyFgPerformance performance;
     check(CheekyFG_GetPerformance(&performance)&&!performance.gpu_valid&&performance.gpu_samples==0&&
-        std::abs(performance.xr_period_ms-.0001)<1e-9,"FG performance must preserve raw headset period before any cadence scaling");
+        std::abs(performance.xr_period_ms-10.)<1e-9,"FG performance must preserve raw headset period before any cadence scaling");
     performance.abi=999;
     check(!CheekyFG_GetPerformance(&performance),"Reject mismatched FG performance ABI");
     CheekyFgBatchTimingsV1 batch_timing;
@@ -730,7 +798,7 @@ void fg_toggle_test() {
     first.reset();retired.reset();
     waits=begins=ends=0;
     check(XR_SUCCEEDED(cheeky_xrWaitFrame(session,&info,&state)) && waits==1 && !begins && !ends &&
-        state.predictedDisplayPeriod==100,"Disabled FG must restore the ordinary application cadence");
+        state.predictedDisplayPeriod==10000000,"Disabled FG must restore the ordinary application cadence");
     update_fg_at_frame_boundary(live,d,true);
     check(live.fg && !live.fg->held_valid && live.fg->frames==0,"Re-enable must start with fresh history");
     live.running=false;
@@ -1201,7 +1269,9 @@ int main(int argc,char** argv) {
         diagnostic_lifetime_test();
         if(argc>1&&std::string(argv[1])=="--fg-lifetime")return 0;
 #endif
-        if(argc>1&&std::string(argv[1])=="--fg-native-handoff") {fg_native_handoff_test();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-reset-clock") {fg_reset_clock_test();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-reset-resume") {fg_reset_native_resume_test();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-native-handoff") {fg_reset_clock_test();fg_reset_native_resume_test();fg_native_handoff_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-lifecycle") {fg_lifecycle_retirement_test();fg_borrowed_frame_shutdown_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-borrowed-shutdown") {fg_borrowed_frame_shutdown_test();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-hardening") {fg_hardening_validation();return 0;}
@@ -1243,7 +1313,7 @@ int main(int argc,char** argv) {
         if(argc>1 && std::string(argv[1])=="--fg-d3d11") {fg_d3d11_validation();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-gpu-validation") {fg_copy_validation_test();return 0;}
         if(argc>1 && std::string(argv[1])=="--fg-crop-gpu-validation") {fg_copy_validation_test(false);return 0;}
-        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); presenter_menu_layer_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); fg_optical_size_stability(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
+        run(); startup_test(); clock_extension_test(); menu_policy_test(); custom_binding_menu_test(); presenter_menu_layer_test(); fg_reset_clock_test(); fg_reset_native_resume_test(); fg_native_handoff_test(); fg_lifecycle_retirement_test(); fg_borrowed_frame_shutdown_test(); fg_toggle_test(); fg_optical_size_stability(); std::cout << "PASS bindings, input, startup and flat sampled-menu policy\n"; return 0;
     }
     catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

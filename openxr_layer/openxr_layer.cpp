@@ -4078,11 +4078,13 @@ XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const in
     // application (DCS calls xrWaitFrame again without xrBeginFrame), and the
     // runtime then blocks that wait until a BeginFrame which never comes.
     // Consume such runtime frames here, empty, until the clock passes it.
+    // Do not return a stale prediction after an arbitrary number of skips:
+    // DCS skips its BeginFrame, then VDXR blocks the next WaitFrame forever.
     for(unsigned skipped=0;XR_SUCCEEDED(result)&&state&&native_time_floor&&state->predictedDisplayTime<=native_time_floor&&
-            downstream_begin&&downstream_end&&skipped<16;++skipped){
-        XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};if(XR_FAILED(downstream_begin(session,&begin)))break;
+            downstream_begin&&downstream_end;++skipped){
+        XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=downstream_begin(session,&begin);if(XR_FAILED(result))break;
         XrFrameEndInfo empty{XR_TYPE_FRAME_END_INFO};empty.displayTime=state->predictedDisplayTime;
-        empty.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;if(XR_FAILED(downstream_end(session,&empty)))break;
+        empty.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;result=downstream_end(session,&empty);if(XR_FAILED(result))break;
         XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};result=downstream(session,info?info:&wait,state);
         log_startup("FG native resume: skipped runtime frame before the last presented time (%u) result=%d time=%lld floor=%lld\n",
             skipped+1,int(result),static_cast<long long>(state->predictedDisplayTime),static_cast<long long>(native_time_floor));

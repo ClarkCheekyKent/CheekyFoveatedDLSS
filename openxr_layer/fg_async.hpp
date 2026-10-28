@@ -665,11 +665,14 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(stopping||XR_FAILED(terminal))return XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         credits=0;++consumed_credits;++waited;
         const auto next=frame->next;*frame=predicted;frame->next=next;
-        // Predict a native frame at least two display intervals ahead; keep one display
-        // time consistent across all engine stages and strictly increasing.
+        // Anchor the lead to the runtime clock, not the application frame count.
+        // DCS menus can run faster than the headset: adding a whole period to
+        // every application frame accumulated seconds of lead and made the
+        // native clock jump backwards when FG was disabled/reset. Repeated
+        // runtime predictions need only a one-nanosecond monotonic tie-break.
         const auto period=std::max<XrDuration>(1,display_clock.display_ns());
         const auto factor=pacing_active?active_multiplier:1u;
-        frame->predictedDisplayTime=std::max(predicted.predictedDisplayTime+period*std::max(2u,factor),app_display_time+period*factor);
+        frame->predictedDisplayTime=std::max(predicted.predictedDisplayTime+period*std::max(2u,factor),app_display_time+1);
         if(period<=INT64_MAX/factor)frame->predictedDisplayPeriod=period*factor;
         app_display_time=frame->predictedDisplayTime;return XR_SUCCESS;
     }
