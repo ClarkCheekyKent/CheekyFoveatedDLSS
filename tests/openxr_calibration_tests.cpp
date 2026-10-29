@@ -1535,7 +1535,9 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
     h.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    d.Width = 128 * 128 * 4;
+    const auto bytes = calibration_pixel_bytes(format);
+    require(bytes != 0, "Calibration fixture requires a supported source pixel format");
+    d.Width = 128 * 128 * bytes;
     d.Height = 1;
     d.DepthOrArraySize = d.MipLevels = 1;
     d.SampleDesc.Count = 1;
@@ -1545,7 +1547,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
                                               nullptr, IID_PPV_ARGS(&black)));
     void* mapped{};
     check(black->Map(0, nullptr, &mapped));
-    memset(mapped, 0, 128 * 128 * 4);
+    memset(mapped, 0, 128 * 128 * bytes);
     black->Unmap(0, nullptr);
     std::uint64_t warm_allocations{};
     auto support = support_images ? request_calibration_images(true) : CalibrationImageRequestPtr{};
@@ -1563,7 +1565,7 @@ void run12(EyeCalibrationBackend backend, bool array, bool hardware = false,
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             src.pResource = black.Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint.Footprint = {format, 128, 128, 1, 512};
+            src.PlacedFootprint.Footprint = {format, 128, 128, 1, 128 * bytes};
             gpu.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             gpu.barrier(r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
@@ -2012,6 +2014,7 @@ int run_stereo_support12_tests() {
 }
 int run_openxr_calibration_format_tests() {
     try {
+        run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R32G32B32A32_TYPELESS);
         for (bool flipped : {false, true})
             run12(EyeCalibrationBackend::openxr, true, false, DXGI_FORMAT_R11G11B10_FLOAT,
                   true, flipped, false, true);

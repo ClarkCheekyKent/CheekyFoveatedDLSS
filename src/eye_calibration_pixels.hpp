@@ -32,6 +32,8 @@ inline unsigned calibration_pixel_bytes(DXGI_FORMAT format) {
         return 4;
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
         return 8;
+    // Calibration color in typeless RGBA32 uses floats (including Unity DLSS output).
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
     case DXGI_FORMAT_R32G32B32A32_FLOAT:
         return 16;
     default:
@@ -57,7 +59,7 @@ inline CalibrationPixel calibration_decode(const unsigned char* p, DXGI_FORMAT f
                 calibration_half(std::uint16_t(((n >> 11) & 0x7ffU) << 4)),
                 calibration_half(std::uint16_t((n >> 22) << 5)), 1};
     }
-    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+    if (format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R32G32B32A32_TYPELESS) {
         CalibrationPixel result;
         std::memcpy(&result, p, sizeof(result));
         return result;
@@ -93,7 +95,7 @@ inline void calibration_encode_pattern(unsigned char* p, DXGI_FORMAT format, uns
         const auto v = std::uint16_t(light ? 0x3c00 : 0);
         const std::uint16_t values[]{v, v, v, 0x3c00};
         std::memcpy(p, values, 8);
-    } else if (format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+    } else if (format == DXGI_FORMAT_R32G32B32A32_FLOAT || format == DXGI_FORMAT_R32G32B32A32_TYPELESS) {
         const float v = light ? 1.F : 0.F;
         const CalibrationPixel value{v, v, v, 1};
         std::memcpy(p, &value, 16);
