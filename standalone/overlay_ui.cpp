@@ -942,14 +942,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         test_control(label);
     };
     method_combo("FG center",s.center_method,false,quad);
-    if(cheeky_fg_uses_flow(s.center_method,s.peripheral_method,s.foveated||quad)){
-        ImGui::Checkbox("RGB optical flow input",&s.optical.rgb_input);
-        ImGui::TextDisabled("Uses color instead of luminance for both optical regions; increases input memory.");
-        if(cheeky_fg_optical(s.center_method)){
-            ImGui::Checkbox("Full-eye optical flow estimation",&s.optical.full_eye);
-            ImGui::TextDisabled("Keeps the center flow window fixed as gaze moves; increases estimation work.");
-        }
-    }
     if(s.center_method==0||((s.foveated||quad)&&s.peripheral_method==0)){
         int preset=int(s.dlssg_preset)-1;
         if(ImGui::Combo("DLSS-G preset",&preset,"Preset A\0Preset B\0Preset C\0"))s.dlssg_preset=unsigned(preset+1);
@@ -957,7 +949,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         if(s.dlssg_preset==2)ImGui::TextWrapped("Preset B needs separate scene and HUD inputs; without them it behaves like Preset A.");
         if(s.dlssg_preset==3)ImGui::TextWrapped("Preset C uses the faster Lite model and requires DLSS-G 310.9.16 or newer.");
     }
-    if(cheeky_fg_cacheable(s.center_method))ImGui::Checkbox("Cache optical vector/confidence data (center)",&s.optical.center_cache);
     if(cheeky_fg_optical(s.center_method)){
         combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
         fg_percent("Center optical flow resolution",s.optical.center_percent);
@@ -984,7 +975,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         }
         fg_percent("FG periphery scale", s.peripheral_percent);
         method_combo("FG periphery",s.peripheral_method,true,quad);
-        if(cheeky_fg_cacheable(s.peripheral_method))ImGui::Checkbox("Cache optical vector/confidence data (periphery)",&s.optical.peripheral_cache);
         if(cheeky_fg_optical(s.peripheral_method)){
             combo("Periphery optical flow preset",s.optical.peripheral_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
             fg_percent("Periphery optical flow resolution",s.optical.peripheral_percent);

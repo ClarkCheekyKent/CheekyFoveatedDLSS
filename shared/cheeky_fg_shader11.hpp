@@ -21,7 +21,7 @@ inline bool cheeky_fg_shader_only(unsigned center,unsigned periphery,bool foveat
 }
 // Color-only metadata comes from settings, rather than a captured NGX evaluation.
 struct CheekyFgColorOptionsV1 {
-    unsigned abi{1},size{sizeof(CheekyFgColorOptionsV1)},enabled{},foveated{};
+    unsigned abi{2},size{sizeof(CheekyFgColorOptionsV1)},enabled{},foveated{};
     CheekyFgEye eyes[2];
     unsigned queue_priority{2},release_point{3};
 };

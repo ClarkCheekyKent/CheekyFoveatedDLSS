@@ -65,7 +65,8 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     for (const auto retired : {"FgHooklessMode3", "FgBackbufferFrameId", "FgDepthBits", "FgMotionBits", "FgSubmitRepeats", "FgGuideCaptureMode",
             "FgCompactStorage", "FgColorCaptureMode", "FgUploadMode", "FgDirectPeripheralShading", "FgDiagnosticMode",
             "D3D11D3D12SharedGuides", "D3D11D3D12SingleBuffer", "HookRescanOnModuleChange",
-            "FgDedicatedPresentQueue", "FgGpuWaitedPresent"})
+            "FgDedicatedPresentQueue", "FgGpuWaitedPresent",
+            "FgOpticalCenterCache", "FgOpticalPeripheralCache", "FgOpticalRgbInput", "FgOpticalFullEye"})
         if (key == retired) return true;
     if (key == "FgQueuePriority") {
         std::uint32_t mode{}; if (!parse(value, mode) || mode > 2U) return false;

@@ -42,8 +42,6 @@ inline bool cheeky_fg_uses_flow(unsigned center,unsigned periphery,bool foveated
 struct CheekyFgOpticalSettings {
     std::uint32_t center_preset{1},peripheral_preset{2}; // 0 slow, 1 medium, 2 fast.
     std::uint32_t center_percent{100},peripheral_percent{50}; // Input dimensions, independent of FG output scale.
-    bool center_cache{},peripheral_cache{}; // Optional pair-invariant optical vector/cost packing.
     std::uint32_t center_grid{4},peripheral_grid{4}; // One vector per grid x grid flow-input pixels: 1, 2 or 4.
-    bool rgb_input{},full_eye{}; // Color estimation inputs; fixed full-eye center window (output stays foveated).
     std::uint32_t center_validation{},peripheral_validation{}; // 0 method default, 1 image agreement, 2 combined.
 };

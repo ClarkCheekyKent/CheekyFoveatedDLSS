@@ -339,12 +339,15 @@ Shader reconstruction offers **Simple Warping**, **Bidirectional Interpolation**
 **Confidence-Guided Interpolation**, and its **Fast** variant. DLSS-G remains
 the default center source.
 
-Optical sources expose these optional controls in the Frame Gen tab:
+Optical estimation always uses 8-bit color inputs for both regions. Bright input
+values are compressed with a shared RGB scale to preserve hue; generated color
+retains its original range. Confidence-guided optical methods automatically cache
+vector/cost data once per native frame pair and reuse it across generated phases.
+The foveated center estimates motion over its cropped region plus a halo.
+There is no extra full-eye estimation override.
 
-- **RGB optical flow input** (`FgOpticalRgbInput`, default off) uses 8-bit color
-  inputs for both optical regions. Bright input values are compressed with a
-  shared RGB scale to preserve hue. Generated color retains the original range.
-  The two estimation inputs use four bytes per pixel instead of one.
+The Frame Gen tab exposes independent validation choices:
+
 - **Center/Periphery optical flow validation** (`FgOpticalCenterValidation` and
   `FgOpticalPeripheralValidation`): **Method default** (`0`) keeps the selected
   interpolator's existing checks; **Image agreement** (`1`) compares the warped
@@ -353,19 +356,14 @@ Optical sources expose these optional controls in the Frame Gen tab:
   existing checks. All optical reconstruction methods support the comparison,
   including depth variants and cached vectors. Head rotation is accounted for
   when valid camera poses are available; otherwise the baseline is unwarped.
-- **Full-eye optical flow estimation** (`FgOpticalFullEye`, default off) fixes
-  the center estimation window to the whole eye. This avoids invalidating temporal
-  hints solely because gaze moved the window. FG output remains foveated. Input
-  resolution is then a percentage of the full eye, increasing work and memory
-  relative to a cropped center.
 
 Optical presets, input resolution and vector grid remain independently selectable
 for both regions. For a controlled quality comparison, try Medium, 50%, 4x4 in
 both regions, then change one option at a time. Image validation can favor a
 camera-aligned blend where estimated motion disagrees with the colors; compare
-moving edges and occlusions in the game as well as generation time. The new
-options retain legacy behavior until enabled and require matching runtime/layer
-binaries.
+moving edges and occlusions in the game as well as generation time. Retired RGB,
+cache and full-eye settings in older profiles are ignored and omitted when saved.
+Update the runtime, menu script and OpenXR layer together.
 
 **DLSS-G preset** selects **Preset A**, **Preset B**, or **Preset C**
 (`FgDlssgPreset=1`, `2`, or `3`). Preset C is the default, including for old

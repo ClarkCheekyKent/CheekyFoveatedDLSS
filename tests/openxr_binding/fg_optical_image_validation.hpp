@@ -86,9 +86,7 @@ inline void fg_optical_image_validation(){
         "Image-only validation replaces matching cost; combined retains the method's confidence");
     // Preparation uses the same hue-preserving HDR mapping for both endpoints.
     for(auto& p:old)p={8,2,.5f,1};context->UpdateSubresource(a.Get(),0,nullptr,old.data(),edge*16,0);
-    c.texel[1]=2;const auto rgb=dispatch(prepare.Get())[edge*32+32];
+    c.texel[1]=0;const auto rgb=dispatch(prepare.Get())[edge*32+32];
     check(std::abs(rgb[0]-8.f/9)<.0001&&std::abs(rgb[1]-2.f/9)<.0001&&std::abs(rgb[2]-.5f/9)<.0001,"RGB input bounds highlights while preserving channel ratios");
-    c.texel[1]=0;const auto luma=dispatch(prepare.Get())[edge*32+32];
-    check(std::abs(luma[0]-luma[1])<.0001&&std::abs(luma[1]-luma[2])<.0001,"Legacy luminance input remains grayscale");
     std::cout<<"PASS optical image validation: "<<cases<<" SDR/HDR, interpolation, depth, cache and phase cases; RGB preprocessing\n";
 }

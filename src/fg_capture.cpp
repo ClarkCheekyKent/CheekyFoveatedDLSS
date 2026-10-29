@@ -88,8 +88,8 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{s.multiplier,s.dlssg_preset,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
-        s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,unsigned(s.optical.center_cache),unsigned(s.optical.peripheral_cache),
-        unsigned(s.optical.rgb_input),unsigned(s.optical.full_eye),s.optical.center_validation,s.optical.peripheral_validation,
+        s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,
+        s.optical.center_validation,s.optical.peripheral_validation,
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;
@@ -640,7 +640,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyFgColorOptionsV1* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if(!out||out->abi!=1||out->size<sizeof(*out))return false;
+    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
     const auto s=current_settings();const auto& f=s.fg;const auto key=configuration(s);
     out->enabled=enabled()&&cheeky_fg_image_only(f.center_method,f.peripheral_method,f.foveated);
     out->foveated=f.foveated;out->queue_priority=f.queue_priority;out->release_point=f.release_point;

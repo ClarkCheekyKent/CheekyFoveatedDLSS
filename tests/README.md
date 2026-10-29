@@ -719,12 +719,13 @@ Center and periphery share menu IDs: 0 DLSS Frame Generation; 1-4 DLSS Vectors
 (simple, bidirectional, confidence-guided, fast confidence-guided); 5-8 Optical
 Flow; 9-12 Optical Flow + DLSS Depth; and 13 Previous frame (periphery only).
 Old method IDs are not migrated. Optical preset, resolution and vector block
-size remain next to the selected method, outside Advanced. The cache checkbox
-is shown only for optical confidence-guided methods (7/8/11/12), defaults off,
-and independently configures center/periphery. Fast uses two trajectory
+size remain next to the selected method, outside Advanced. Optical input is always
+RGB and confidence-guided methods (7/8/11/12) always cache their vector/cost data.
+RGB/cache/full-eye overrides are retired; the foveated center keeps its cropped
+estimation window and halo. Fast uses two trajectory
 iterations and omits the neighboring-trajectory repair search.
 
-`--fg-optical-cache` is the focused NVIDIA test: it compares cache on/off pixels
+`--fg-optical-cache` is the focused NVIDIA test: it checks stable output replay
 for quality/fast and depth on/off, checks one cache build per native pair across
 three generated phases, and checks the preparation gate timing. Caching packs
 vectors with their original cost into float surfaces; unguided reads use hardware
@@ -737,9 +738,9 @@ image-based rejection, SDR/HDR output, exact endpoints, every reconstruction
 method, depth on/off, cache parity and hue-preserving RGB preparation. It also
 compiles the D3D12 shader profile. No NVIDIA GPU is needed for this check.
 `--fg-optical-options` uses real NVIDIA estimation on D3D11/D3D12 with RGB inputs,
-all validation choices, depth/caching and three interpolation phases, then switches
-RGB off/on to verify registered texture recreation. The ordinary binding suite
-checks full-eye window stability and preservation of options during pose mapping.
+all validation choices, automatic caching and three interpolation phases. It checks
+that registered inputs remain RGB. The ordinary binding suite checks cropped
+window stability, unconditional cache policy and preservation of validation during pose mapping.
 These fixtures do not establish in-headset quality or game performance.
 
 `CheekyOpenXRBindingTests --fg-methods` compares generated D3D11/D3D12 pixels

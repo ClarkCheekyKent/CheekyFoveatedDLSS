@@ -239,10 +239,11 @@ def run(engine):
             assert list(keys_of(menu).values()) == [1, 2, 3, 4], "UEVR must enumerate DLSS-G first, using a contiguous display array"
             if interpolation:
                 assert list(keys_of(g.combos["FG center method"]).values()) == [1, 2, 3, 4]
-            visible = g["values"]["Cache optical vector/confidence data (center)"] is not None
-            assert visible == (method in (7,8,11,12))
+            assert g["values"]["Cache optical vector/confidence data (center)"] is None
+            assert g["values"]["Cache optical vector/confidence data (periphery)"] is None
+            assert g["values"]["RGB optical flow input"] is None
             assert (g["values"]["Center optical flow validation"] is not None) == (method >= 5)
-            assert (g["values"]["Full-eye optical flow estimation"] is not None) == (method >= 5)
+            assert g["values"]["Full-eye optical flow estimation"] is None
             if method >= 5:
                 assert g.tree_parents["Advanced settings"] is not None
                 assert g["values"]["Center optical flow resolution"] is not None
@@ -280,13 +281,6 @@ def run(engine):
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
             state["settings"][key] = value
             receive(state)
-        for label, key in (("RGB optical flow input", "FgOpticalRgbInput"),
-                           ("Full-eye optical flow estimation", "FgOpticalFullEye")):
-            draw(changes={label: True})
-            assert f"{key}=true" in last()
-            state["request"] = state["applied_request"] = int(last().splitlines()[1])
-            state["settings"][key] = True
-            receive(state)
         # Optical tuning remains visible with Advanced settings collapsed.
         g.closed_trees["Advanced settings"] = True
         receive(state)
@@ -297,11 +291,8 @@ def run(engine):
         g.closed_trees["Advanced settings"] = None
         state["settings"].update(FgCenterMethod=8, FgPeripheralMethod=12)
         receive(state)
-        draw(changes={"Cache optical vector/confidence data (center)": True})
-        assert "FgOpticalCenterCache=true" in last()
-        state["request"] = state["applied_request"] = int(last().splitlines()[1])
-        state["settings"]["FgOpticalCenterCache"] = True
-        receive(state)
+        draw()
+        assert g["values"]["Cache optical vector/confidence data (center)"] is None
         # The depth-assisted variant keeps the same optical flow controls.
         state["settings"].update(FgCenterMethod=11, FgPeripheralMethod=11)
         receive(state)

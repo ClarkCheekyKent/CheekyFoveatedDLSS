@@ -416,7 +416,7 @@ default evaluation order unless roles are assigned manually.
 
 ## DX12 generated-frame scheduling and timing
 
-The buffered shader/optical path submits luma preparation for the independent
+The buffered shader/optical path submits RGB input preparation for the independent
 eye/region sessions before waiting for flow completion. It splits interpolation
 lists at the consuming region, submitting the preceding work before inserting
 that region's GPU fence wait. Optical flow is prepared once per real-frame pair

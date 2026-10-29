@@ -3,7 +3,7 @@
 namespace cheeky::fg {
 // Both endpoints use the same flow crop. Gaze movement therefore cannot become
 // apparent scene motion. Color is sampled from the original HDR/linear images;
-// only the optical flow input is converted to 8-bit luminance or bounded RGB.
+// only the optical flow input is converted to bounded 8-bit RGB.
 // With pose compensation (Texel.y bit 0), the previous frame is reprojected into the
 // current camera by the head-rotation delta before flow estimation, so flow
 // measures only residual motion (head translation, the scene itself). The
@@ -41,6 +41,7 @@ float2 rotateView(float2 uv,float4 rotation,float4 from,float4 to){
 }
 bool poseCompensated(){return (uint(Texel.y)&1u)!=0;}
 uint validationMode(){return (uint(Texel.y)>>2)&3u;}
+bool cachedVectors(){return Texel.w>=4&&Texel.w<8;}
 float2 oldUV(float2 uv){return poseCompensated()?rotateView(uv,NowToOld,NowTangents,OldTangents):uv;}
 // A shared scale bounds HDR values without clipping bright colored edges or
 // changing their hue. This transform is used only for estimation/validation.
@@ -84,7 +85,7 @@ float4 flow(Texture2D<int2> field,Texture2D<uint> cost,Texture2D<float4> cached,
  uint w,h;field.GetDimensions(w,h);
  // Packing is pair-invariant. Hardware bilinear filtering replaces four
  // vector loads plus four cost loads when depth guidance is not requested.
- if(Texel.w>3.5&&(!guided||Flags.z<.5)){
+ if(cachedVectors()&&(!guided||Flags.z<.5)){
   float4 v=cached.SampleLevel(ClampLinear,p*Sizes.xy/(Texel.x*float2(w,h)),0)/1.000001;
   return float4(v.xy/(32*Sizes.xy),1/(1+v.z/32),0);
  }
@@ -99,7 +100,7 @@ float4 flow(Texture2D<int2> field,Texture2D<uint> cost,Texture2D<float4> cached,
   [unroll]for(uint j=0;j<4;++j){float e=(nearness((float2(q[j])+.5)*Texel.x/Sizes.xy)-n)/(.03*n);k[j]*=1/(1+e*e);}}
  float2 v=0;float c=0,sum=1e-6;
  [unroll]for(uint j=0;j<4;++j){
-  float4 sample=Texel.w>3.5?cached.Load(int3(q[j],0)):float4(float2(field.Load(int3(q[j],0))),float(cost.Load(int3(q[j],0))),0);
+  float4 sample=cachedVectors()?cached.Load(int3(q[j],0)):float4(float2(field.Load(int3(q[j],0))),float(cost.Load(int3(q[j],0))),0);
   v+=k[j]*sample.xy;c+=k[j]*sample.z;sum+=k[j];}
  v/=sum;c/=sum;
  return float4(v/(32*Sizes.xy),1/(1+c/32),0);
@@ -135,10 +136,7 @@ float4 fastInterpolation(float2 uv,float2 q,float t){
  float4 c=wa+wb>1e-6?(packed(Old,source,OldCrop,OldSpans)*wa+packed(Now,FlowRect.xy+b*FlowRect.zw,Crop,Spans)*wb)/(wa+wb):packed(Now,uv,Crop,Spans);
  return encodeOutput(validateImage(uv,a,b,t,c));
 }
-float3 inputColor(float3 c){
- if((uint(Texel.y)&2u)!=0)return boundedRgb(c);
- float y=dot(max(c,0),float3(.2126,.7152,.0722));return (y/(1+y)).xxx;
-}
+float3 inputColor(float3 c){return boundedRgb(c);}
 [numthreads(8,8,1)]void Prepare(uint3 id:SV_DispatchThreadID){
  if(any(id.xy>=uint2(Sizes.xy)))return;
  float2 uv=FlowRect.xy+(float2(id.xy)+.5)/Sizes.xy*FlowRect.zw;
@@ -227,7 +225,7 @@ float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
 )HLSL";
 struct OpticalConstants {
     float flow_rect[4]{0,0,1,1},output_rect[4]{0,0,1,1},sizes[4]{},flags[4]{};
-    // texel: vector grid, option bits (0 pose, 1 RGB, 2-3 validation), packed feather, interpolation mode + 4 when cached.
+    // texel: vector grid, option bits (0 pose, 2-3 validation), packed feather, interpolation mode + 4 when cached.
     float crop[4]{},spans[4]{},texel[4]{4,0,0,2},old_crop[4]{},old_spans[4]{},depth_rect[4]{0,0,1,1};
     float now_to_old[4]{0,0,0,1},old_tangents[4]{},now_tangents[4]{},mid_to_now[4]{0,0,0,1},mid_tangents[4]{};
 };
