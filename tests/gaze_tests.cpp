@@ -2707,6 +2707,27 @@ void test_afw_source_projection_coverage() {
             current.input_width == crops[0].input_width && current.input_height == crops[0].input_height,
             "Temporary source-eye metadata loss never resizes a warmed AFW gaze allocation");
     }
+    // A session whose first frames have no source-eye metadata allocates for
+    // both eyes' unmapped regions. That allocation is replaced once, when the
+    // source eye becomes known, and then kept like any other.
+    bool allocated_unknown{};
+    for (unsigned source : {UINT32_MAX, UINT32_MAX, 0U, 1U, UINT32_MAX, 0U}) {
+        requested.afw_source_eye = source;
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now); sample.publication_qpc = now.QuadPart; ++sample.predicted_display_time;
+        publish_afw_stereo_projection(matrices, 2000, 1600, true);
+        const auto settings = afw_experiment_settings(requested, &projection);
+        CropGeometry current{}; bool reset{};
+        expect(calculate_coordinated_crop(settings, 772, nullptr, 1000, 800, 2000, 1600, 0, 0, current, reset, &sample),
+            "AFW gaze resolves before and after source-eye metadata arrives");
+        if (source == UINT32_MAX && !allocated_unknown) {
+            expect(current.input_width > crops[0].input_width,
+                "Without source-eye metadata the allocation spans both eyes' unmapped regions");
+            continue;
+        }
+        allocated_unknown = true;
+        expect(current.input_width == crops[0].input_width && current.input_height == crops[0].input_height,
+            "A known source eye replaces the both-eye allocation, which then stays fixed");
+    }
     expect(crops[0].input_width == crops[1].input_width && crops[0].input_height == crops[1].input_height,
         "Alternating source eyes retain the same private reconstruction allocation");
     expect(std::abs(static_cast<float>(crops[0].input_base_x) - crops[1].input_base_x - 242.513F) <= 8.F,

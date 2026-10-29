@@ -34,7 +34,7 @@ struct AfwGazeState {
     unsigned pattern{}, mode{}, quantum{};
     float width{}, height{}, margin{};
     std::uint32_t native_source{};
-    bool configured{};
+    bool configured{}, allocated_with_source{};
 };
 
 struct ViewState {
@@ -354,9 +354,14 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
         const auto b = afw_mask_extent(state.afw_mask, &projection, settings.afw_source_eye);
         bounds = {b.left, b.top, b.right, b.bottom};
     }
+    // An allocation chosen without source-eye metadata spans both eyes'
+    // unmapped regions, wider by the lens asymmetry. Replace it once, when
+    // the source eye becomes known.
+    if (afw.allocated_width && !afw.allocated_with_source && source_known) afw.allocated_width = afw.allocated_height = 0;
     if (!afw.allocated_width) {
         // Source-eye metadata can briefly disappear. That changes placement,
         // not the allocation chosen when this gaze session began.
+        afw.allocated_with_source = source_known;
         const auto budget = afw_gaze_budget(settings, projection);
         afw.allocated_width = afw_gaze_size(budget.width, rw, settings.gaze_quantization_pixels);
         afw.allocated_height = afw_gaze_size(budget.height, rh, settings.gaze_quantization_pixels);
