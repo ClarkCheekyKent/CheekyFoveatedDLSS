@@ -65,6 +65,24 @@ DWORD WINAPI start_host(void*) noexcept {
     }
     wcscpy_s(filename + 1, ARRAYSIZE(path) - static_cast<size_t>(filename + 1 - path), suffix);
 
+    // The host imports dxgi.dll, so loading it binds "dxgi.dll" to System32.
+    // Every later LoadLibrary("dxgi.dll") then returns that module, and a
+    // dxgi.dll proxy from another mod beside the game never loads in games
+    // that load DXGI late. If no dxgi.dll is loaded yet and one sits beside the
+    // executable, load it first so the host's import binds to it, as the game
+    // itself would have. A Cheeky or ASI loader named dxgi.dll is already
+    // loaded and is left alone.
+    if (GetModuleHandleW(L"dxgi.dll") == nullptr) {
+        wchar_t local[32768]{};
+        const DWORD local_length = GetModuleFileNameW(nullptr, local, ARRAYSIZE(local));
+        wchar_t* slash = local_length != 0 && local_length < ARRAYSIZE(local) ? wcsrchr(local, L'\\') : nullptr;
+        if (slash != nullptr && static_cast<size_t>(slash + 1 - local) + ARRAYSIZE(L"dxgi.dll") <= ARRAYSIZE(local)) {
+            wcscpy_s(slash + 1, ARRAYSIZE(local) - static_cast<size_t>(slash + 1 - local), L"dxgi.dll");
+            if (GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES)
+                static_cast<void>(LoadLibraryExW(local, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH));
+        }
+    }
+
     // No current-working-directory or PATH search. The runtime and its private
     // dependencies live beneath this loader, including when it is an ASI.
     HMODULE host = LoadLibraryExW(path, nullptr,

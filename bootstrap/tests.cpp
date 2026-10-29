@@ -76,6 +76,54 @@ void check_debug_forward(HMODULE proxy, HMODULE system) {
         require(a == b, "ASM forwarded output differs");
     }
 }
+
+// Another mod's dxgi.dll proxy beside the game must still load when the
+// VERSION loader starts the host before the game loads DXGI. A copy of this
+// executable runs beside the VERSION loader and a stand-in dxgi.dll.
+int local_dxgi_parent(wchar_t** argv) {
+    wchar_t executable[32768]{};
+    require(GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable)) != 0, "test executable path");
+    const auto directory = fs::path(executable).parent_path() /
+        (L"bootstrap-local-dxgi-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    require(!fs::exists(directory), "fixture directory already exists");
+    fs::create_directories(directory / L"CheekyFoveatedDLSS");
+    const auto child = directory / fs::path(executable).filename();
+    fs::copy_file(executable, child);
+    fs::copy_file(argv[2], directory / L"version.dll");
+    fs::copy_file(argv[4], directory / L"CheekyFoveatedDLSS" / L"CheekyFoveatedDLSSHost.dll");
+    fs::copy_file(argv[4], directory / L"dxgi.dll");
+    std::wstring command = L"\"" + child.wstring() + L"\" version-local-dxgi-child";
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    require(CreateProcessW(child.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+        directory.c_str(), &startup, &process) != FALSE, "local dxgi child process");
+    const bool finished = WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0;
+    DWORD exit_code = 1;
+    if (finished) GetExitCodeProcess(process.hProcess, &exit_code);
+    else TerminateProcess(process.hProcess, 1);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    require(finished, "local dxgi child timed out");
+    require(exit_code == 0, "local dxgi child failed");
+    std::puts("PASS VERSION loader keeps a local dxgi.dll proxy ahead of System32");
+    return 0;
+}
+
+int local_dxgi_child() {
+    wchar_t executable[32768]{};
+    require(GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable)) != 0, "test executable path");
+    const auto directory = fs::path(executable).parent_path();
+    require(GetModuleHandleW(L"dxgi.dll") == nullptr, "test executable must not import DXGI");
+    const HMODULE loader = LoadLibraryExW((directory / L"version.dll").c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    require(loader != nullptr, "VERSION loader failed to load");
+    const auto status = reinterpret_cast<StatusFn>(GetProcAddress(loader, "CheekyBootstrap_Status"));
+    require(status != nullptr, "bootstrap status export missing");
+    require(wait_for_start(status) == 2, "VERSION host startup");
+    require(GetModuleHandleW((directory / L"dxgi.dll").c_str()) != nullptr,
+        "dxgi.dll beside the executable was not loaded before the host");
+    return 0;
+}
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -83,7 +131,9 @@ int wmain(int argc, wchar_t** argv) {
     // errors to the assertions instead of opening a blocking Windows dialog.
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     try {
-        require(argc == 5 || argc == 6, "Usage: bootstrap-tests proxy|version|asi|missing|chain|broken-chain|loop-chain <proxy.dll> <plugin.asi> <fake-host.dll> [external-chain.dll]");
+        if (argc == 2 && std::wstring(argv[1]) == L"version-local-dxgi-child") return local_dxgi_child();
+        if (argc == 5 && std::wstring(argv[1]) == L"version-local-dxgi") return local_dxgi_parent(argv);
+        require(argc == 5 || argc == 6, "Usage: bootstrap-tests proxy|version|version-local-dxgi|asi|missing|chain|broken-chain|loop-chain <proxy.dll> <plugin.asi> <fake-host.dll> [external-chain.dll]");
         const bool asi = std::wstring(argv[1]) == L"asi";
         const bool version = std::wstring(argv[1]) == L"version";
         const bool missing = std::wstring(argv[1]) == L"missing";
