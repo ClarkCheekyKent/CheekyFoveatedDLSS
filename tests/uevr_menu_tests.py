@@ -216,7 +216,9 @@ def run(engine):
     receive(state)
     draw()
     if "--fg-center" in sys.argv:
-        state["settings"].update(FgOpticalCenterCache=False, FgOpticalPeripheralCache=False)
+        state["settings"].update(FgOpticalCenterCache=False, FgOpticalPeripheralCache=False,
+                                 FgOpticalRgbInput=False, FgOpticalFullEye=False,
+                                 FgOpticalCenterValidation=0, FgOpticalPeripheralValidation=0)
         receive(state)
         keys_of = lua.eval("function(t) local r={} for k in pairs(t) do r[#r+1]=k end return r end")
         for method in range(13):
@@ -239,6 +241,8 @@ def run(engine):
                 assert list(keys_of(g.combos["FG center method"]).values()) == [1, 2, 3, 4]
             visible = g["values"]["Cache optical vector/confidence data (center)"] is not None
             assert visible == (method in (7,8,11,12))
+            assert (g["values"]["Center optical flow validation"] is not None) == (method >= 5)
+            assert (g["values"]["Full-eye optical flow estimation"] is not None) == (method >= 5)
             if method >= 5:
                 assert g.tree_parents["Advanced settings"] is not None
                 assert g["values"]["Center optical flow resolution"] is not None
@@ -268,11 +272,20 @@ def run(engine):
                                   ("Center optical flow resolution", "FgOpticalCenterPercent", 75),
                                   ("Periphery optical flow resolution", "FgOpticalPeripheralPercent", 25),
                                   ("Center optical flow vector grid", "FgOpticalCenterGrid", 1),
-                                  ("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", 2)):
+                                  ("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", 2),
+                                  ("Center optical flow validation", "FgOpticalCenterValidation", 1),
+                                  ("Periphery optical flow validation", "FgOpticalPeripheralValidation", 2)):
             draw(changes={label: value})
             assert f"{key}={value}" in last()
             state["request"] = state["applied_request"] = int(last().splitlines()[1])
             state["settings"][key] = value
+            receive(state)
+        for label, key in (("RGB optical flow input", "FgOpticalRgbInput"),
+                           ("Full-eye optical flow estimation", "FgOpticalFullEye")):
+            draw(changes={label: True})
+            assert f"{key}=true" in last()
+            state["request"] = state["applied_request"] = int(last().splitlines()[1])
+            state["settings"][key] = True
             receive(state)
         # Optical tuning remains visible with Advanced settings collapsed.
         g.closed_trees["Advanced settings"] = True

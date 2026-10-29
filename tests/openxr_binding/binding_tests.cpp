@@ -1224,6 +1224,7 @@ void diagnostic_lifetime_test() {
 #include "fg_parity_validation.hpp"
 #include "fg_confidence_validation.hpp"
 #include "fg_optical_validation.hpp"
+#include "fg_optical_image_validation.hpp"
 #include "fg_shader11_ngx_probe.hpp"
 #include "fg_shader11_nvapi_probe.hpp"
 #include "fg_pacing_simulation.hpp"
@@ -1243,6 +1244,8 @@ int main(int argc,char** argv) {
         if(argc>1&&std::string(argv[1])=="--fg-confidence-motion") {fg_confidence_motion_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-methods") {fg_cross_api_parity();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-cache") {fg_optical_cache_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-optical-image") {fg_optical_image_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-optical-options") {fg_optical_cache_validation(true);return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical") {fg_optical_validation(argc>2&&std::string(argv[2])=="quick");return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-optical-profile") {fg_optical_profile();return 0;}
         if(argc>1&&std::string(argv[1])=="--fg-auto") {fg_auto_validation();return 0;}

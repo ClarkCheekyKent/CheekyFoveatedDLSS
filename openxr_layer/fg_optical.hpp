@@ -25,12 +25,14 @@ inline bool color_options(CheekyFgColorOptionsV1& options){
 // Sessions rebuilt after their first initialization (each stalls generation).
 inline std::atomic<std::uint64_t> rebuilds{};
 inline HMODULE module(){static HMODULE dll=LoadLibraryExW(L"nvofapi64.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);return dll;}
-inline NV_OF_INIT_PARAMS parameters(unsigned w,unsigned h,unsigned preset,unsigned grid){
+inline NV_OF_INIT_PARAMS parameters(unsigned w,unsigned h,unsigned preset,unsigned grid,bool rgb=false){
     NV_OF_INIT_PARAMS p{};p.width=w;p.height=h;p.outGridSize=NV_OF_OUTPUT_VECTOR_GRID_SIZE(grid);
     p.mode=NV_OF_MODE_OPTICALFLOW;
     p.perfLevel=preset==0?NV_OF_PERF_LEVEL_SLOW:preset==1?NV_OF_PERF_LEVEL_MEDIUM:NV_OF_PERF_LEVEL_FAST;
-    p.enableOutputCost=NV_OF_TRUE;p.predDirection=NV_OF_PRED_DIRECTION_BOTH;p.inputBufferFormat=NV_OF_BUFFER_FORMAT_GRAYSCALE8;return p;
+    p.enableOutputCost=NV_OF_TRUE;p.predDirection=NV_OF_PRED_DIRECTION_BOTH;
+    p.inputBufferFormat=rgb?NV_OF_BUFFER_FORMAT_ABGR8:NV_OF_BUFFER_FORMAT_GRAYSCALE8;return p;
 }
+inline DXGI_FORMAT input_format(bool rgb){return rgb?DXGI_FORMAT_B8G8R8A8_UNORM:DXGI_FORMAT_R8_UNORM;}
 template<class Count,class Formats> bool supports_format(NvOFHandle handle,Count count,Formats formats,NV_OF_BUFFER_USAGE usage,DXGI_FORMAT format){
     unsigned n{};if(count(handle,usage,NV_OF_MODE_OPTICALFLOW,&n)!=NV_OF_SUCCESS||!n)return false;
     std::vector<DXGI_FORMAT> values(n);if(formats(handle,usage,NV_OF_MODE_OPTICALFLOW,values.data())!=NV_OF_SUCCESS)return false;
@@ -53,7 +55,8 @@ inline OpticalConstants constants(const CheekyFgEye& g,unsigned pass,const float
     // Head turns move content tens of pixels per native frame at low rates.
     // At an eye edge the window slides inward instead of shrinking: its size
     // sets the flow session's size, and a new size rebuilds the session.
-    if(pass==0){const float halo_x=std::max(.05f,32.f/std::max(1u,g.width)),halo_y=std::max(.05f,32.f/std::max(1u,g.height));
+    if(g.optical.full_eye){const float full[]{0,0,1,1};std::copy_n(full,4,c.flow_rect);}
+    else if(pass==0){const float halo_x=std::max(.05f,32.f/std::max(1u,g.width)),halo_y=std::max(.05f,32.f/std::max(1u,g.height));
         c.flow_rect[2]=std::min(1.f,rect[2]+2*halo_x);c.flow_rect[3]=std::min(1.f,rect[3]+2*halo_y);
         c.flow_rect[0]=std::clamp(rect[0]-halo_x,0.f,1.f-c.flow_rect[2]);c.flow_rect[1]=std::clamp(rect[1]-halo_y,0.f,1.f-c.flow_rect[3]);}
     const auto percent=pass?g.optical.peripheral_percent:g.optical.center_percent;
@@ -62,7 +65,8 @@ inline OpticalConstants constants(const CheekyFgEye& g,unsigned pass,const float
     c.sizes[1]=float(std::max(64u,(unsigned(std::ceil(g.height*c.flow_rect[3]*percent*.01f))+3u)&~3u));
     c.sizes[2]=float(outw);c.sizes[3]=float(outh);
     layout.constants(c.crop,c.spans,c.texel);float unused[4];old_layout.constants(c.old_crop,c.old_spans,unused);
-    c.texel[0]=float(grid==1||grid==2?grid:4u);c.texel[1]=0;
+    c.texel[0]=float(grid==1||grid==2?grid:4u);
+    c.texel[1]=float((g.optical.rgb_input?2u:0u)+4u*std::min(2u,pass?g.optical.peripheral_validation:g.optical.center_validation));
     const auto method=pass?g.peripheral_method:g.center_method;
     c.texel[3]=float(cheeky_fg_interpolation(method));
     if(cheeky_fg_cacheable(method)&&(pass?g.optical.peripheral_cache:g.optical.center_cache))c.texel[3]+=4;return c;
@@ -71,7 +75,7 @@ inline OpticalConstants constants(const CheekyFgEye& g,unsigned pass,const float
 // in-between cameras. The in-between pose matches the presenter's midpoint().
 inline void pose_mapping(OpticalConstants& c,const XrPosef& previous,const XrFovf& previous_fov,
     const XrPosef& current,const XrFovf& current_fov,float t) noexcept {
-    c.texel[1]=0;
+    const auto options=unsigned(c.texel[1])&~1u;c.texel[1]=float(options);
     if(!finite_pose_orientation(previous)||!finite_pose_orientation(current)||
        !finite_camera_fov(previous_fov)||!finite_camera_fov(current_fov)||!std::isfinite(t))return;
     struct Q{float x,y,z,w;};
@@ -90,7 +94,7 @@ inline void pose_mapping(OpticalConstants& c,const XrPosef& previous,const XrFov
     tangents(previous_fov,c.old_tangents);tangents(current_fov,c.now_tangents);tangents(mid_fov,c.mid_tangents);
     const float a[]{now_to_old.x,now_to_old.y,now_to_old.z,now_to_old.w},b[]{mid_to_now.x,mid_to_now.y,mid_to_now.z,mid_to_now.w};
     for(float v:a)if(!std::isfinite(v))return;for(float v:b)if(!std::isfinite(v))return;
-    std::copy_n(a,4,c.now_to_old);std::copy_n(b,4,c.mid_to_now);c.texel[1]=1;
+    std::copy_n(a,4,c.now_to_old);std::copy_n(b,4,c.mid_to_now);c.texel[1]=float(options|1u);
 }
 inline bool compile(const char* entry,const char* profile,ComPtr<ID3DBlob>& code){
     ComPtr<ID3DBlob> errors;const auto hr=D3DCompile(optical_shader,strlen(optical_shader),nullptr,nullptr,nullptr,entry,profile,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
@@ -110,7 +114,7 @@ struct Session11 : Error {
     std::array<NvOFGPUBufferHandle,6> buffers{};
     ComPtr<ID3D11UnorderedAccessView> input_uavs[2],cache_uavs[2];
     bool cache_ready{};unsigned cache_builds{};
-    unsigned width{},height{},preset{},grid{4};std::uint64_t old_id{},new_id{};
+    unsigned width{},height{},preset{},grid{4};bool rgb_input{};std::uint64_t old_id{},new_id{};
     float crop[4]{};bool history{},initialized{};
     // Rebuilding a session (driver init, registrations, shader compiles)
     // stalls generation for seconds. The current session samples any flow
@@ -131,22 +135,23 @@ struct Session11 : Error {
         cache_shader.Reset();cache_ready=false;cache_builds=0;
         device.Reset();prepare_shader.Reset();interpolate_shader.Reset();sampler.Reset();old_id=new_id=0;history=false;initialized=false;
     }
-    bool initialize(ID3D11Device* dev,ID3D11DeviceContext* context,unsigned w,unsigned h,unsigned quality,unsigned cells){
-        if(initialized&&device.Get()==dev&&preset==quality&&grid==cells&&keep_size(w,h))return true;
+    bool initialize(ID3D11Device* dev,ID3D11DeviceContext* context,unsigned w,unsigned h,unsigned quality,unsigned cells,bool rgb=false){
+        if(initialized&&device.Get()==dev&&preset==quality&&grid==cells&&rgb_input==rgb&&keep_size(w,h))return true;
         if(initialized)++rebuilds;size_mismatch=0;
         reset();auto dll=module();if(!dll)return fail("driver API unavailable",GetLastError());
         using Create=decltype(&NvOFAPICreateInstanceD3D11);auto create=reinterpret_cast<Create>(GetProcAddress(dll,"NvOFAPICreateInstanceD3D11"));
         if(!create)return fail("D3D11 API unavailable");
         auto status=create(NV_OF_API_VERSION,&api);if(status)return fail("D3D11 API version",status);
         status=api.nvCreateOpticalFlowD3D11(dev,context,&handle);if(status)return fail("D3D11 device unsupported",status);
-        device=dev;width=w;height=h;preset=quality;grid=cells;
+        device=dev;width=w;height=h;preset=quality;grid=cells;rgb_input=rgb;
         if(!supported(handle,api.nvOFGetCaps,w,h))return fail("flow dimensions unsupported");
         if(!supports_grid(handle,api.nvOFGetCaps,cells))return fail("vector grid unsupported by this GPU; use 4x4",cells);
-        if(!supports_format(handle,api.nvOFGetSurfaceFormatCountD3D11,api.nvOFGetSurfaceFormatD3D11,NV_OF_BUFFER_USAGE_INPUT,DXGI_FORMAT_R8_UNORM))return fail("8-bit luminance input unsupported");
-        auto params=parameters(w,h,quality,cells);status=api.nvOFInit(handle,&params);if(status)return fail("session initialization",status);
+        const auto format=input_format(rgb);
+        if(!supports_format(handle,api.nvOFGetSurfaceFormatCountD3D11,api.nvOFGetSurfaceFormatD3D11,NV_OF_BUFFER_USAGE_INPUT,format))return fail(rgb?"RGB input unsupported; disable RGB input":"8-bit luminance input unsupported");
+        auto params=parameters(w,h,quality,cells,rgb);status=api.nvOFInit(handle,&params);if(status)return fail("session initialization",status);
         for(unsigned i=0;i<6;++i){
             D3D11_TEXTURE2D_DESC d{};d.Width=i<2?w:(w+cells-1)/cells;d.Height=i<2?h:(h+cells-1)/cells;d.ArraySize=d.MipLevels=1;d.SampleDesc.Count=1;
-            d.Format=i<2?DXGI_FORMAT_R8_UNORM:i<4?DXGI_FORMAT_R16G16_SINT:DXGI_FORMAT_R8_UINT;
+            d.Format=i<2?format:i<4?DXGI_FORMAT_R16G16_SINT:DXGI_FORMAT_R8_UINT;
             d.BindFlags=D3D11_BIND_SHADER_RESOURCE|(i<2?D3D11_BIND_UNORDERED_ACCESS:0);
             if(FAILED(dev->CreateTexture2D(&d,nullptr,&textures[i]))||FAILED(dev->CreateShaderResourceView(textures[i].Get(),nullptr,&views[i])))return fail("buffer allocation");
             if(i<2&&FAILED(dev->CreateUnorderedAccessView(textures[i].Get(),nullptr,&input_uavs[i])))return fail("input view");
@@ -168,7 +173,7 @@ struct Session11 : Error {
         std::uint64_t previous_id,std::uint64_t current_id,unsigned quality,OpticalConstants c,float fraction,bool reset_history,
         ComPtr<ID3D11Texture2D>& output,ComPtr<ID3D11ShaderResourceView>& output_view){
         ID3D11Device* dev{};ctx->GetDevice(&dev);ComPtr<ID3D11Device> owned;owned.Attach(dev);
-        if(!initialize(dev,ctx,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0])))return false;
+        if(!initialize(dev,ctx,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0]),(unsigned(c.texel[1])&2u)!=0))return false;
         c.sizes[0]=float(width);c.sizes[1]=float(height);
         if(old_id!=previous_id||new_id!=current_id){
             cache_ready=false;
@@ -218,7 +223,7 @@ struct Session12 : Error {
     ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> prepare_shader,interpolate_shader,cache_shader;
     ComPtr<ID3D12DescriptorHeap> heap;unsigned stride{};
     std::array<ComPtr<ID3D12Resource>,8> textures;std::array<NvOFGPUBufferHandle,6> buffers{};
-    unsigned width{},height{},preset{},grid{4};float crop[4]{};bool history{},initialized{};
+    unsigned width{},height{},preset{},grid{4};float crop[4]{};bool history{},initialized{},rgb_input{};
     bool cache_ready{};unsigned cache_builds{};
     unsigned descriptor_set{}; // Generated frame within the interval; renders may be in flight together.
     // Rebuilding a session (driver init, registrations, shader compiles)
@@ -251,23 +256,24 @@ struct Session12 : Error {
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;d.MipLevels=d.DepthOrArraySize=1;d.SampleDesc.Count=1;d.Format=format;d.Flags=writable?D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS:D3D12_RESOURCE_FLAG_NONE;
         return SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out)));
     }
-    bool initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsigned h,unsigned quality,unsigned cells){
-        if(initialized&&device.Get()==dev&&queue.Get()==q&&preset==quality&&grid==cells&&keep_size(w,h))return true;
+    bool initialize(ID3D12Device* dev,ID3D12CommandQueue* q,unsigned w,unsigned h,unsigned quality,unsigned cells,bool rgb=false){
+        if(initialized&&device.Get()==dev&&queue.Get()==q&&preset==quality&&grid==cells&&rgb_input==rgb&&keep_size(w,h))return true;
         if(initialized)++rebuilds;size_mismatch=0;
         reset();auto dll=module();if(!dll)return fail("driver API unavailable",GetLastError());
         using Create=decltype(&NvOFAPICreateInstanceD3D12);auto create=reinterpret_cast<Create>(GetProcAddress(dll,"NvOFAPICreateInstanceD3D12"));if(!create)return fail("D3D12 API unavailable");
         auto status=create(NV_OF_API_VERSION,&api);if(status)return fail("D3D12 API version",status);
         status=api.nvCreateOpticalFlowD3D12(dev,&handle);if(status)return fail("D3D12 device unsupported",status);
-        device=dev;queue=q;width=w;height=h;preset=quality;grid=cells;
+        device=dev;queue=q;width=w;height=h;preset=quality;grid=cells;rgb_input=rgb;
         if(!supported(handle,api.nvOFGetCaps,w,h))return fail("flow dimensions unsupported");
         if(!supports_grid(handle,api.nvOFGetCaps,cells))return fail("vector grid unsupported by this GPU; use 4x4",cells);
-        if(!supports_format(handle,api.nvOFGetSurfaceFormatCountD3D12,api.nvOFGetSurfaceFormatD3D12,NV_OF_BUFFER_USAGE_INPUT,DXGI_FORMAT_R8_UNORM))return fail("8-bit luminance input unsupported");
-        auto p=parameters(w,h,quality,cells);status=api.nvOFInit(handle,&p);if(status)return fail("session initialization",status);
+        const auto format=input_format(rgb);
+        if(!supports_format(handle,api.nvOFGetSurfaceFormatCountD3D12,api.nvOFGetSurfaceFormatD3D12,NV_OF_BUFFER_USAGE_INPUT,format))return fail(rgb?"RGB input unsupported; disable RGB input":"8-bit luminance input unsupported");
+        auto p=parameters(w,h,quality,cells,rgb);status=api.nvOFInit(handle,&p);if(status)return fail("session initialization",status);
         event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
         if(!event||FAILED(dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)))||FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||FAILED(dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))))return fail("command resources");
         list->Close();
         for(unsigned i=0;i<6;++i){
-            const auto fmt=i<2?DXGI_FORMAT_R8_UNORM:i<4?DXGI_FORMAT_R16G16_SINT:DXGI_FORMAT_R8_UINT;
+            const auto fmt=i<2?format:i<4?DXGI_FORMAT_R16G16_SINT:DXGI_FORMAT_R8_UINT;
             if(!texture(i<2?w:(w+cells-1)/cells,i<2?h:(h+cells-1)/cells,fmt,i<2,textures[i]))return fail("buffer allocation");
             NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 r{};r.resource=textures[i].Get();r.hOFGpuBuffer=&buffers[i];r.inputFencePoint={fence.Get(),serial};r.outputFencePoint={fence.Get(),++serial};
             status=api.nvOFRegisterResourceD3D12(handle,&r);if(status){--serial;return fail("buffer registration",status);}if(!wait())return fail("registration fence");
@@ -295,7 +301,7 @@ struct Session12 : Error {
         // allocator is reused. The flow engine waits on the queue-side fence
         // below, which follows every earlier render that sampled our vectors,
         // so the CPU never waits for unrelated (game) work on a shared queue.
-        if(!initialize(dev,q,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0]))||!wait())return false;
+        if(!initialize(dev,q,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0]),(unsigned(c.texel[1])&2u)!=0)||!wait())return false;
         c.sizes[0]=float(width);c.sizes[1]=float(height);cache_ready=false;
         if(FAILED(allocator->Reset())||FAILED(list->Reset(allocator.Get(),nullptr)))return fail("command reset");
         barrier(list.Get(),old,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);if(now!=old)barrier(list.Get(),now,color_state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

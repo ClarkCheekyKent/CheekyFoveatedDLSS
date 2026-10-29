@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterCache", "FgOpticalPeripheralCache", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterCache", "FgOpticalPeripheralCache", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgOpticalRgbInput", "FgOpticalFullEye", "FgOpticalCenterValidation", "FgOpticalPeripheralValidation", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -707,10 +707,23 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             end
             local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
             local optical_grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
+            local optical_validation = {[0]="Method default", [1]="Image agreement", [2]="Combined"}
+            if fg_optical(draft.FgCenterMethod) or (draft.FgFoveated and fg_optical(draft.FgPeripheralMethod)) then
+                if draft.FgOpticalRgbInput ~= nil then check("RGB optical flow input", "FgOpticalRgbInput") end
+                text("Uses color instead of luminance for both optical regions; increases input memory.")
+            end
             if fg_optical(draft.FgCenterMethod) then
+                if draft.FgOpticalFullEye ~= nil then
+                    check("Full-eye optical flow estimation", "FgOpticalFullEye")
+                    text("Keeps the center flow window fixed as gaze moves; increases estimation work.")
+                end
                 if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
                 if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
                 if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
+                if draft.FgOpticalCenterValidation ~= nil then
+                    combo("Center optical flow validation", "FgOpticalCenterValidation", optical_validation)
+                    if draft.FgOpticalCenterValidation > 0 then text("Image agreement compares the motion warp with a camera-aligned blend. Combined also retains vector confidence; depth guidance remains active when selected.") end
+                end
             end
             if draft.FgResolutionPercent ~= nil then combo("FG scale", "FgResolutionPercent", percent) end
             check("Foveated frame generation", "FgFoveated")
@@ -733,6 +746,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
                         if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
                         if draft.FgOpticalPeripheralGrid ~= nil then combo("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", optical_grids) end
+                        if draft.FgOpticalPeripheralValidation ~= nil then combo("Periphery optical flow validation", "FgOpticalPeripheralValidation", optical_validation) end
                     end
                 end
                 if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end

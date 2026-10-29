@@ -112,7 +112,7 @@ attempts request both, gaze only, cylinder only, then neither, stopping at the
 first success or any error other than `XR_ERROR_EXTENSION_NOT_PRESENT`.
 Application-requested and confirmed extensions are retained on every attempt.
 Unsupported cylinders retain the existing quad menu fallback. These fixtures
-do not replace an OFXR/headset retest.
+do not replace an in-headset retest.
 Startup history is persisted in `%TEMP%/CheekyOpenXR-<pid>-<process-start>.log`
 and collected as `CheekyOpenXR-startup.log` in support ZIPs. It includes probe
 stages/results, application-requested extensions, retries and final enabled
@@ -730,6 +730,17 @@ three generated phases, and checks the preparation gate timing. Caching packs
 vectors with their original cost into float surfaces; unguided reads use hardware
 bilinear filtering and depth-guided reads keep their original per-sample weights.
 It does not cache phase-dependent trajectories or visibility decisions.
+
+`--fg-optical-image` runs deterministic WARP shader tests using correct translated
+fields and mutually consistent but deliberately incorrect fields. It verifies
+image-based rejection, SDR/HDR output, exact endpoints, every reconstruction
+method, depth on/off, cache parity and hue-preserving RGB preparation. It also
+compiles the D3D12 shader profile. No NVIDIA GPU is needed for this check.
+`--fg-optical-options` uses real NVIDIA estimation on D3D11/D3D12 with RGB inputs,
+all validation choices, depth/caching and three interpolation phases, then switches
+RGB off/on to verify registered texture recreation. The ordinary binding suite
+checks full-eye window stability and preservation of options during pose mapping.
+These fixtures do not establish in-headset quality or game performance.
 
 `CheekyOpenXRBindingTests --fg-methods` compares generated D3D11/D3D12 pixels
 for all DLSS-vector reconstruction choices, foveation and interpolation phases.

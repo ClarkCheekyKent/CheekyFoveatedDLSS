@@ -154,8 +154,9 @@ inline void fg_optical_validation(bool quick=false){
         std::array<Image,2> previous,current;std::array<std::shared_ptr<Backend11::Guides>,2> guides;
         for(unsigned eye=0;eye<2;++eye){previous[eye]=backend.copy(c0.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);current[eye]=backend.copy(c1.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
             guides[eye]=std::make_shared<Backend11::Guides>();auto& g=guides[eye]->source.meta;g.width=g.height=edge;
-            g.center_method=g.peripheral_method=cheeky_fg_optical_flow;g.focus_width=g.focus_height=1;g.resolution_percent=100;g.optical.center_percent=100;}
-        for(const float t:{1.f/3,.5f,2.f/3}){
+            g.center_method=g.peripheral_method=cheeky_fg_optical_flow;g.focus_width=g.focus_height=1;g.resolution_percent=100;g.optical.center_percent=100;g.optical.rgb_input=true;}
+        for(unsigned validation=0;validation<3;++validation)for(const float t:{1.f/3,.5f,2.f/3}){
+            for(auto& guide:guides)guide->source.meta.optical.center_validation=validation;
             std::array<Image,2> output;check(backend.generate(previous,current,guides,guides,prior,later,output,false,t),backend.diagnostic);
             const auto mid=midpoint_pose(prior[0],later[0],t);
             const auto expected=render(mid),actual=read11(device11.Get(),context.Get(),output[0]->texture11.Get());
@@ -218,12 +219,20 @@ inline void fg_optical_size_stability(){
         "A transient full-eye flow request must keep the optical flow session");
     bool kept=true;for(unsigned i=0;i<100;++i)kept=session.keep_size(2000,1800);
     check(!kept,"A lasting flow size change must rebuild the optical flow session");
+    g.optical.full_eye=true;g.optical.rgb_input=true;g.optical.center_validation=2;
+    const auto fixed=optical::constants(g,0,centered,none,none,800,720),moved=optical::constants(g,0,edge_left,none,none,800,720);
+    check(fixed.flow_rect[0]==0&&fixed.flow_rect[1]==0&&fixed.flow_rect[2]==1&&fixed.flow_rect[3]==1&&
+        !memcmp(fixed.flow_rect,moved.flow_rect,sizeof(fixed.flow_rect))&&fixed.sizes[0]==moved.sizes[0]&&fixed.sizes[1]==moved.sizes[1]&&
+        memcmp(fixed.output_rect,moved.output_rect,sizeof(fixed.output_rect)),"Full-eye estimation fixes the input window while output follows gaze");
+    auto mapping=fixed;XrPosef identity{};identity.orientation.w=1;const XrFovf fov{-.7f,.7f,.7f,-.7f};
+    optical::pose_mapping(mapping,identity,fov,identity,fov,.5f);
+    check(unsigned(mapping.texel[1])==11,"Pose mapping preserves RGB and validation option bits");
     std::cout<<"PASS optical flow session size stability (edge, far jump, transient full eye)\n";
 }
 
 // Focused coverage for the optional pair cache and fast reconstruction. Reuse
 // sessions so this does not sweep presets, grids or unrelated presenter paths.
-inline void fg_optical_cache_validation(){
+inline void fg_optical_cache_validation(bool options=false){
     using namespace cheeky::fg;using namespace optical_fixture;
     ComPtr<ID3D11Device> device11;ComPtr<ID3D11DeviceContext> context;
     check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device11,nullptr,&context)),"Cache hardware device");
@@ -249,17 +258,25 @@ inline void fg_optical_cache_validation(){
     for(unsigned eye=0;eye<2;++eye){previous[eye]=native.copy(a.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);current[eye]=native.copy(b.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
         guides[eye]=std::make_shared<Backend11::Guides>();guides[eye]->depth_srv=depth_view;
         auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.focus_width=g.focus_height=1;g.peripheral_method=cheeky_fg_previous;g.optical.center_grid=4;
+        g.optical.rgb_input=options;g.optical.full_eye=options;
     }
     constexpr float fractions[]{.25f,.5f,.75f};
-    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth}){
+    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth})for(unsigned validation=0;validation<(options?3u:1u);++validation){
         std::array<std::vector<std::uint32_t>,3> reference;
         for(bool cached:{false,true})for(unsigned phase=0;phase<3;++phase){
-            for(auto& guide:guides){guide->source.meta.center_method=method;guide->source.meta.optical.center_cache=cached;}
+            for(auto& guide:guides){guide->source.meta.center_method=method;guide->source.meta.optical.center_cache=cached;guide->source.meta.optical.center_validation=validation;}
             std::array<Image,2> out;check(native.generate(previous,current,guides,guides,views,views,out,false,fractions[phase]),native.diagnostic);
             const auto pixels=read11(device11.Get(),context.Get(),out[0]->texture11.Get());
             if(cached)near_equal(reference[phase],pixels);else{reference[phase]=pixels;validate(pixels,fractions[phase],"D3D11 cache/fast");}
         }
         for(unsigned eye=0;eye<2;++eye)check(native.optical[eye][0].cache_builds==1,"D3D11 packs vectors once for the native pair, across phases and interpolators");
+    }
+    if(options)for(bool rgb:{false,true}){
+        for(auto& guide:guides)guide->source.meta.optical.rgb_input=rgb;
+        std::array<Image,2> out;check(native.generate(previous,current,guides,guides,views,views,out,false,.5f),native.diagnostic);
+        validate(read11(device11.Get(),context.Get(),out[0]->texture11.Get()),.5f,"D3D11 RGB format switch");
+        D3D11_TEXTURE2D_DESC desc{};native.optical[0][0].textures[0]->GetDesc(&desc);
+        check(desc.Format==optical::input_format(rgb)&&native.optical[0][0].rgb_input==rgb,"D3D11 RGB changes rebuild registered inputs");
     }
     ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;check(SUCCEEDED(device11.As(&dxgi))&&SUCCEEDED(dxgi->GetAdapter(&adapter)),"Cache adapter");
     fg_parity::D3D12 gpu(adapter.Get());
@@ -268,15 +285,16 @@ inline void fg_optical_cache_validation(){
     Worker worker;check(worker.initialize(gpu.device.Get(),gpu.queue.Get(),edge,edge,DXGI_FORMAT_R8G8B8A8_UNORM,false),worker.diagnostic);
     CheekyFgPair pair;pair.producer_queue=gpu.queue.Get();
     for(auto& g:pair.eyes){g.width=g.height=edge;g.focus_width=g.focus_height=1;g.peripheral_method=cheeky_fg_previous;
+        g.optical.rgb_input=options;g.optical.full_eye=options;
         g.depth=depth12.Get();g.motion=motion12.Get();g.depth_width=g.depth_height=g.motion_width=g.motion_height=edge;}
     std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)cameras[eye]=camera(views[eye],&views[eye],false);
     std::array<ID3D12Resource*,2> prior{old12.Get(),old12.Get()},later{now12.Get(),now12.Get()},out;
     unsigned expected_builds{};
-    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth}){
+    for(unsigned method:{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth})for(unsigned validation=0;validation<(options?3u:1u);++validation){
         std::array<std::vector<std::uint32_t>,3> reference;
         for(bool cached:{false,true}){
             if(cached)++expected_builds;
-            for(auto& g:pair.eyes){g.center_method=method;g.optical.center_cache=cached;}
+            for(auto& g:pair.eyes){g.center_method=method;g.optical.center_cache=cached;g.optical.center_validation=validation;}
             for(unsigned phase=1;phase<=3;++phase){
                 check(worker.generate(pair,later,prior,cameras,out,nullptr,nullptr,nullptr,nullptr,3,phase),worker.diagnostic);
                 const auto pixels=gpu.read(out[0]);if(cached)near_equal(reference[phase-1],pixels);else{reference[phase-1]=pixels;validate(pixels,fractions[phase-1],"D3D12 cache/fast");}
@@ -284,6 +302,13 @@ inline void fg_optical_cache_validation(){
             }
             const auto batch=worker.batch_timings.snapshot();check(batch.valid&&batch.optical_separated&&batch.optical_ms>0,"Cache preparation is in the separate optical timing scope");
         }
+    }
+    if(options)for(bool rgb:{false,true}){
+        for(auto& g:pair.eyes)g.optical.rgb_input=rgb;
+        check(worker.generate(pair,later,prior,cameras,out),worker.diagnostic);
+        validate(gpu.read(out[0]),.5f,"D3D12 RGB format switch");
+        check(worker.focus.optical[0][0].textures[0]->GetDesc().Format==optical::input_format(rgb)&&worker.focus.optical[0][0].rgb_input==rgb,
+            "D3D12 RGB changes rebuild registered inputs");
     }
     pair.release_point=1;for(auto& g:pair.eyes){g.center_method=cheeky_fg_optical_fast_depth;g.optical.center_cache=true;}
     for(unsigned phase=1;phase<=2;++phase)check(worker.generate(pair,later,prior,cameras,out,nullptr,nullptr,nullptr,nullptr,2,phase),worker.diagnostic);

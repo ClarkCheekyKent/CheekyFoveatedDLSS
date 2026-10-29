@@ -3,8 +3,8 @@
 namespace cheeky::fg {
 // Both endpoints use the same flow crop. Gaze movement therefore cannot become
 // apparent scene motion. Color is sampled from the original HDR/linear images;
-// only the optical flow input is converted to 8-bit luminance.
-// With pose compensation (Texel.y), the previous frame is reprojected into the
+// only the optical flow input is converted to 8-bit luminance or bounded RGB.
+// With pose compensation (Texel.y bit 0), the previous frame is reprojected into the
 // current camera by the head-rotation delta before flow estimation, so flow
 // measures only residual motion (head translation, the scene itself). The
 // generated image is interpolated in the current camera and then reprojected
@@ -39,7 +39,40 @@ float2 rotateView(float2 uv,float4 rotation,float4 from,float4 to){
  float2 tangent=ray.xy/-ray.z;
  return float2((tangent.x-to.x)/(to.y-to.x),(tangent.y-to.z)/(to.w-to.z));
 }
-float2 oldUV(float2 uv){return Texel.y>.5?rotateView(uv,NowToOld,NowTangents,OldTangents):uv;}
+bool poseCompensated(){return (uint(Texel.y)&1u)!=0;}
+uint validationMode(){return (uint(Texel.y)>>2)&3u;}
+float2 oldUV(float2 uv){return poseCompensated()?rotateView(uv,NowToOld,NowTangents,OldTangents):uv;}
+// A shared scale bounds HDR values without clipping bright colored edges or
+// changing their hue. This transform is used only for estimation/validation.
+float3 boundedRgb(float3 c){
+ if(!all(isfinite(c)))return 0;
+ c=max(c,0);return c/(1+max(c.r,max(c.g,c.b)));
+}
+float imageError(float3 a,float3 b){
+ float3 d=abs(boundedRgb(a)-boundedRgb(b));
+ return (d.r+d.g+d.b+max(d.r,max(d.g,d.b)))*.25;
+}
+float4 encodeOutput(float4 c){
+ if(Flags.y>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));
+ return c;
+}
+// Compare both explanations in the current camera, before output encoding.
+// Ignore quantization-sized changes and use a relative, smooth penalty: a
+// resampled highlight should not veto an otherwise useful motion estimate.
+float4 validateImage(float2 uv,float2 a,float2 b,float t,float4 warped){
+ [branch]if(validationMode()==0)return warped;
+ float2 stableSource=oldUV(uv),source=oldUV(FlowRect.xy+a*FlowRect.zw);
+ // A clamped offscreen sample is not evidence. Leave single-sided occlusion
+ // reconstruction to the interpolator when either trajectory has no endpoint.
+ if(!within(uv)||!within(stableSource)||!within(a)||!within(b)||!within(source))return warped;
+ float4 stableOld=packed(Old,stableSource,OldCrop,OldSpans),stableNow=packed(Now,uv,Crop,Spans);
+ float4 movingOld=packed(Old,source,OldCrop,OldSpans),movingNow=packed(Now,FlowRect.xy+b*FlowRect.zw,Crop,Spans);
+ float baseline=imageError(stableOld.rgb,stableNow.rgb),motion=imageError(movingOld.rgb,movingNow.rgb);
+ float excess=max(0,motion-baseline-2.0/255.0);
+ float relative=excess/(.02+.5*baseline);
+ float trust=1/(1+relative*relative);
+ return lerp(lerp(stableOld,stableNow,t),warped,trust);
+}
 // Captured depth of the current frame, as nearness (larger is closer). Device
 // depth is ~near/z for both conventions, so a ratio compares view distances.
 float nearness(float2 p){
@@ -100,10 +133,12 @@ float4 fastInterpolation(float2 uv,float2 q,float t){
   float rel=(na-nb)/max(na,nb);wa*=rel<-.03?0:1;wb*=rel>.03?0:1;
  }
  float4 c=wa+wb>1e-6?(packed(Old,source,OldCrop,OldSpans)*wa+packed(Now,FlowRect.xy+b*FlowRect.zw,Crop,Spans)*wb)/(wa+wb):packed(Now,uv,Crop,Spans);
- if(Flags.y>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));
- return c;
+ return encodeOutput(validateImage(uv,a,b,t,c));
 }
-float3 inputColor(float3 c){float y=dot(max(c,0),float3(.2126,.7152,.0722));return (y/(1+y)).xxx;}
+float3 inputColor(float3 c){
+ if((uint(Texel.y)&2u)!=0)return boundedRgb(c);
+ float y=dot(max(c,0),float3(.2126,.7152,.0722));return (y/(1+y)).xxx;
+}
 [numthreads(8,8,1)]void Prepare(uint3 id:SV_DispatchThreadID){
  if(any(id.xy>=uint2(Sizes.xy)))return;
  float2 uv=FlowRect.xy+(float2(id.xy)+.5)/Sizes.xy*FlowRect.zw;
@@ -120,6 +155,9 @@ float3 inputColor(float3 c){float y=dot(max(c,0),float3(.2126,.7152,.0722));retu
 }
 float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
  if(!within(p)||!all(isfinite(v)))return 0;
+ // Image-only validation retains solve/coverage checks without treating the
+ // driver's matching cost or reverse estimate as a motion-confidence score.
+ if(validationMode()==1)return (within(other)?1:.5)*saturate(1-length(residual*Sizes.xy)/3);
  // Content entering or leaving the flow rectangle (head turns, the halo
  // edge) has no counterpart to verify against. Trust its own match at a
  // reduced weight rather than repeating an endpoint.
@@ -131,8 +169,9 @@ float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
 [numthreads(8,8,1)]void Interpolate(uint3 id:SV_DispatchThreadID){
  if(any(id.xy>=uint2(Sizes.zw)))return;
  float2 uv=OutputRect.xy+(float2(id.xy)+.5)/Sizes.zw*OutputRect.zw;
- if(Texel.y>.5)uv=rotateView(uv,MidToNow,MidTangents,NowTangents);
+ if(poseCompensated())uv=rotateView(uv,MidToNow,MidTangents,NowTangents);
  float2 q=(uv-FlowRect.xy)/FlowRect.zw;float t=Flags.x;float mode=fmod(Texel.w,4);
+ if(t<=0||t>=1){Result[id.xy]=encodeOutput(t<=0&&within(oldUV(uv))?packed(Old,oldUV(uv),OldCrop,OldSpans):packed(Now,uv,Crop,Spans));return;}
  [branch]if(mode<1.5){Result[id.xy]=fastInterpolation(uv,q,t);return;}
  float2 a=q,b=q;float4 f=0,r=0;
  [unroll]for(uint k=0;k<5;++k){if(mode>2.5&&k>=2)break;f=flow(Forward,ForwardCost,CachedForward,a);a=q-t*f.xy;r=flow(Backward,BackwardCost,CachedBackward,b,true);b=q-(1-t)*r.xy;}
@@ -183,14 +222,14 @@ float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
  float4 c;
  if(wa+wb>.02)c=(old*wa+now*wb)/(wa+wb);
  else c=t<.5&&within(oldUV(uv))?packed(Old,oldUV(uv),OldCrop,OldSpans):packed(Now,uv,Crop,Spans);
- if(Flags.y>.5)c.rgb=lerp(12.92*c.rgb,1.055*pow(max(c.rgb,0),1.0/2.4)-.055,step(.0031308,c.rgb));
- Result[id.xy]=c;
+ Result[id.xy]=encodeOutput(validateImage(uv,a,b,t,c));
 }
 )HLSL";
 struct OpticalConstants {
     float flow_rect[4]{0,0,1,1},output_rect[4]{0,0,1,1},sizes[4]{},flags[4]{};
-    // texel: vector grid, pose compensation, packed feather, interpolation mode + 4 when cached.
+    // texel: vector grid, option bits (0 pose, 1 RGB, 2-3 validation), packed feather, interpolation mode + 4 when cached.
     float crop[4]{},spans[4]{},texel[4]{4,0,0,2},old_crop[4]{},old_spans[4]{},depth_rect[4]{0,0,1,1};
     float now_to_old[4]{0,0,0,1},old_tangents[4]{},now_tangents[4]{},mid_to_now[4]{0,0,0,1},mid_tangents[4]{};
 };
+static_assert(sizeof(OpticalConstants)%16==0&&sizeof(OpticalConstants)/4+1<=64);
 }

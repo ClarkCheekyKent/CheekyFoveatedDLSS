@@ -43,3 +43,4 @@ add_test(NAME OpenXRFGReleaseWatchdog COMMAND CheekyOpenXRBindingTests --fg-rele
 add_test(NAME OpenXRFGAutoController COMMAND CheekyOpenXRBindingTests --fg-auto)
 
 add_test(NAME OpenXRFGNativeShader11 COMMAND CheekyOpenXRBindingTests --fg-shader11)
+add_test(NAME OpenXRFGOpticalImage COMMAND CheekyOpenXRBindingTests --fg-optical-image)

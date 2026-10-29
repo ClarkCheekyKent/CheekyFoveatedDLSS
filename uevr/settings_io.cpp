@@ -47,6 +47,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     if(key=="FgOpticalCenterPreset"||key=="FgOpticalPeripheralPreset") {unsigned n{};if(!parse(value,n)||n>2)return false;(key=="FgOpticalCenterPreset"?s.fg.optical.center_preset:s.fg.optical.peripheral_preset)=n;return true;}
     if(key=="FgOpticalCenterPercent"||key=="FgOpticalPeripheralPercent") {unsigned n{};if(!parse(value,n)||(n!=25&&n!=50&&n!=75&&n!=100))return false;(key=="FgOpticalCenterPercent"?s.fg.optical.center_percent:s.fg.optical.peripheral_percent)=n;return true;}
     if(key=="FgOpticalCenterGrid"||key=="FgOpticalPeripheralGrid") {unsigned n{};if(!parse(value,n)||(n!=1&&n!=2&&n!=4))return false;(key=="FgOpticalCenterGrid"?s.fg.optical.center_grid:s.fg.optical.peripheral_grid)=n;return true;}
+    if(key=="FgOpticalCenterValidation"||key=="FgOpticalPeripheralValidation") {unsigned n{};if(!parse(value,n)||n>2)return false;(key=="FgOpticalCenterValidation"?s.fg.optical.center_validation:s.fg.optical.peripheral_validation)=n;return true;}
     if(key=="QuadSavedSourceCount"){unsigned count{};if(!parse(value,count)||count>8)return false;s.quad_saved_source_count=count;return true;}
     if(key.size()==13&&key.starts_with("QuadView")&&key.ends_with("Role")&&key[8]>='1'&&key[8]<='8'){
         unsigned role{};if(!parse(value,role)||role>4)return false;s.quad_saved_roles[key[8]-'1']=role;return true;}

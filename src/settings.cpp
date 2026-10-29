@@ -286,6 +286,8 @@ void update_settings(const Settings& settings) noexcept {
     auto fg_grid=[](std::uint32_t n) {return n==1||n==2||n==4?n:4u;};
     fg_settings.optical.center_grid=fg_grid(fg_settings.optical.center_grid);
     fg_settings.optical.peripheral_grid=fg_grid(fg_settings.optical.peripheral_grid);
+    fg_settings.optical.center_validation=std::min(fg_settings.optical.center_validation,2u);
+    fg_settings.optical.peripheral_validation=std::min(fg_settings.optical.peripheral_validation,2u);
     d3d12_lower_hook.store(settings.d3d12_lower_hook, std::memory_order_release);
     enabled.store(settings.enabled, std::memory_order_release);
     d3d11_use_d3d12_transport.store(

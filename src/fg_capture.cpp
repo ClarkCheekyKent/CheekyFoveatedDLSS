@@ -89,6 +89,7 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     std::uint64_t hash=1469598103934665603ull;
     for(const auto n:{s.multiplier,s.dlssg_preset,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
         s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,unsigned(s.optical.center_cache),unsigned(s.optical.peripheral_cache),
+        unsigned(s.optical.rgb_input),unsigned(s.optical.full_eye),s.optical.center_validation,s.optical.peripheral_validation,
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
         hash=(hash^n)*1099511628211ull;

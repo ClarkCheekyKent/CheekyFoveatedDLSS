@@ -332,9 +332,40 @@ color/depth history. It will not increase the count when extra interpolation
 would worsen GPU load. Missing timings retain the current count. The manual
 selection is restored when Auto is turned off.
 
-The FG center method can be **DLSS**, **Simple motion-vector warping**, or
-**Bidirectional interpolation** (`FgCenterMethod=0`, `1`, or `2`). The periphery
-method remains independent. DLSS is the default center method.
+The FG center and periphery select a vector source and reconstruction method
+independently. Sources are **DLSS-G**, **DLSS Vectors**, **Optiflow**, and
+**Optiflow + Depth**; the periphery also offers **Previous frame**.
+Shader reconstruction offers **Simple Warping**, **Bidirectional Interpolation**,
+**Confidence-Guided Interpolation**, and its **Fast** variant. DLSS-G remains
+the default center source.
+
+Optical sources expose these optional controls in the Frame Gen tab:
+
+- **RGB optical flow input** (`FgOpticalRgbInput`, default off) uses 8-bit color
+  inputs for both optical regions. Bright input values are compressed with a
+  shared RGB scale to preserve hue. Generated color retains the original range.
+  The two estimation inputs use four bytes per pixel instead of one.
+- **Center/Periphery optical flow validation** (`FgOpticalCenterValidation` and
+  `FgOpticalPeripheralValidation`): **Method default** (`0`) keeps the selected
+  interpolator's existing checks; **Image agreement** (`1`) compares the warped
+  frames with a camera-aligned blend, replacing cost/forward-backward confidence
+  in confidence-guided methods; **Combined** (`2`) adds that comparison to the
+  existing checks. All optical reconstruction methods support the comparison,
+  including depth variants and cached vectors. Head rotation is accounted for
+  when valid camera poses are available; otherwise the baseline is unwarped.
+- **Full-eye optical flow estimation** (`FgOpticalFullEye`, default off) fixes
+  the center estimation window to the whole eye. This avoids invalidating temporal
+  hints solely because gaze moved the window. FG output remains foveated. Input
+  resolution is then a percentage of the full eye, increasing work and memory
+  relative to a cropped center.
+
+Optical presets, input resolution and vector grid remain independently selectable
+for both regions. For a controlled quality comparison, try Medium, 50%, 4x4 in
+both regions, then change one option at a time. Image validation can favor a
+camera-aligned blend where estimated motion disagrees with the colors; compare
+moving edges and occlusions in the game as well as generation time. The new
+options retain legacy behavior until enabled and require matching runtime/layer
+binaries.
 
 **DLSS-G preset** selects **Preset A**, **Preset B**, or **Preset C**
 (`FgDlssgPreset=1`, `2`, or `3`). Preset C is the default, including for old
@@ -350,7 +381,7 @@ This path creates no D3D12 device or bridge and does not query DLSS-G capability
 Choosing DLSS for either active region retains the D3D12 processing path. The
 separate DX11-to-DX12 SR transport option still applies if explicitly enabled.
 
-These methods need captured game inputs: simple warping uses motion vectors and
+DLSS-vector methods need captured game inputs: simple warping uses motion vectors and
 previous/current color; bidirectional interpolation also uses depth history and
 camera reprojection. The existing NGX-SR guide source remains necessary. Stereo
 uses calibrated per-eye source crops; quad views require all four assigned views.

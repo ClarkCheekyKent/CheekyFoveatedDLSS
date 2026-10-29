@@ -153,6 +153,11 @@ void settings_tests(const std::filesystem::path& root) {
         require(!fg.fg.optical.center_cache&&!fg.fg.optical.peripheral_cache&&
             set_named_setting(fg,"FgOpticalCenterCache","true")&&set_named_setting(fg,"FgOpticalPeripheralCache","false"),
             "Optical vector caches default off and are independently configurable");
+        require(!fg.fg.optical.rgb_input&&!fg.fg.optical.full_eye&&fg.fg.optical.center_validation==0&&fg.fg.optical.peripheral_validation==0&&
+            set_named_setting(fg,"FgOpticalRgbInput","true")&&set_named_setting(fg,"FgOpticalFullEye","true")&&
+            set_named_setting(fg,"FgOpticalCenterValidation","1")&&set_named_setting(fg,"FgOpticalPeripheralValidation","2")&&
+            !set_named_setting(fg,"FgOpticalCenterValidation","3")&&!set_named_setting(fg,"FgOpticalPeripheralValidation","-1")&&
+            !set_named_setting(fg,"FgOpticalRgbInput","2"),"Optical input/validation options preserve defaults and reject invalid values");
         std::string error;const auto path=root/"fg.ini";
         require(set_named_setting(fg,"FgResolutionPercent","75")&&set_named_setting(fg,"FgPeripheralPercent","25")&&
             set_named_setting(fg,"FgPeripheralMethod","0"),"FG quality and periphery controls parse");
@@ -160,7 +165,8 @@ void settings_tests(const std::filesystem::path& root) {
         require(write_settings_file(path,fg,error),"Save FG settings");
         Settings restored;
         require(read_settings_file(path,restored,error)&&restored.fg.optical.center_preset==0&&restored.fg.optical.peripheral_preset==2&&
-            restored.fg.optical.center_cache&&!restored.fg.optical.peripheral_cache&&restored.fg.optical.center_percent==75&&restored.fg.optical.peripheral_percent==25&&restored.fg.center_method==5,
+            restored.fg.optical.center_cache&&!restored.fg.optical.peripheral_cache&&restored.fg.optical.center_percent==75&&restored.fg.optical.peripheral_percent==25&&restored.fg.center_method==5&&
+            restored.fg.optical.rgb_input&&restored.fg.optical.full_eye&&restored.fg.optical.center_validation==1&&restored.fg.optical.peripheral_validation==2,
             "Optical flow center method and independent controls survive profile round trip");
         require(read_settings_file(path,restored,error) && restored.fg.enabled && restored.fg.width==0.37f &&
             restored.fg.y==-0.12f&&restored.fg.resolution_percent==75&&restored.fg.peripheral_percent==25&&
@@ -562,6 +568,18 @@ int main(int argc, char** argv) {
             command("1\n908\nset\nFgReleasePoint=3");
             require(control_fn(&control)&&control.enabled&&control.configuration==before_release_configuration,
                 "Switching release modes preserves an enabled FG pipeline and its temporal configuration");
+            const auto color_fn=reinterpret_cast<CheekyFgColorOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetColorOptionsV1"));
+            command("1\n930\nset\nFgCenterMethod=7\nFgOpticalRgbInput=true\nFgOpticalFullEye=true\nFgOpticalCenterValidation=1\nFgOpticalPeripheralValidation=2");
+            CheekyFgColorOptionsV1 color_options;
+            require(color_fn&&color_fn(&color_options)&&color_options.eyes[0].optical.rgb_input&&
+                color_options.eyes[1].optical.full_eye&&color_options.eyes[0].optical.center_validation==1&&
+                color_options.eyes[1].optical.peripheral_validation==2&&control_fn(&control)&&control.configuration!=before_release_configuration,
+                "Optical options reach both eyes and retire the prior capture configuration");
+            const auto optical_configuration=control.configuration;
+            command("1\n931\nset\nFgOpticalCenterValidation=2");
+            require(control_fn(&control)&&control.configuration!=optical_configuration,"Validation changes invalidate generated-frame history");
+            command("1\n932\nset\nFgCenterMethod=0\nFgOpticalRgbInput=false\nFgOpticalFullEye=false\nFgOpticalCenterValidation=0\nFgOpticalPeripheralValidation=0");
+            require(control_fn(&control)&&control.configuration==before_release_configuration,"Restoring optical defaults restores the original configuration");
             const auto rate_fn=reinterpret_cast<CheekyFgRateOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetRateOptionsV1"));
             CheekyFgRateOptions rate;
             require(rate_fn&&rate_fn(&rate)&&rate.multiplier==2,"Older configurations retain 2x default");

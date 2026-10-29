@@ -7,7 +7,7 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464740; // Fast FG methods and optional optical vector caches; install runtime and layer together.
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464741; // Optical input and validation options; install runtime and layer together.
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};

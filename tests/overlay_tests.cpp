@@ -190,7 +190,15 @@ void test_ui_diagnostics() {
     text=render("Frame Gen (Experimental)",false);
     require(text.find("Shader generation (center + periphery)")!=text.npos&&text.find("Color / guide preparation")==text.npos&&
         text.find("Show blue FG region border")!=text.npos,"Native D3D11 labels fused shader timings and leaves the border outside Advanced settings");
-    state.draft.fg.center_method=0;
+    state.draft.fg.center_method=7;state.draft.fg.peripheral_method=11;
+    text=render("Frame Gen (Experimental)",false);
+    require(text.find("RGB optical flow input")!=text.npos&&text.find("Full-eye optical flow estimation")!=text.npos&&
+        text.find("Center optical flow validation")!=text.npos&&text.find("Periphery optical flow validation")!=text.npos,
+        "Optical options are visible for both regions outside Advanced settings");
+    state.draft.fg.center_method=0;state.draft.fg.peripheral_method=1;
+    text=render("Frame Gen (Experimental)",false);
+    require(text.find("RGB optical flow input")==text.npos&&text.find("Center optical flow validation")==text.npos,
+        "Optical input/validation controls are hidden for other vector sources");
     render_api="D3D12";
     state.draft.fg.enabled = false;
     state.draft.center_mode = FoveationCenterMode::fixed;
