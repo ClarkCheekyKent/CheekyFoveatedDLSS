@@ -187,10 +187,24 @@ struct SubmittedView {
     bool valid{};
 };
 
+// Host input diagnostics run on the application's input thread. Keep them to
+// a short startup window so steady-state frames never wait on log writes.
+constexpr ULONGLONG input_diagnostic_interval_ms = 2000;
+constexpr unsigned input_diagnostic_rounds = 8;
+
+[[nodiscard]] bool input_diagnostic_due(ULONGLONG& tick, unsigned& rounds, ULONGLONG now) noexcept {
+    if (rounds >= input_diagnostic_rounds || (rounds && now - tick < input_diagnostic_interval_ms)) return false;
+    tick = now;
+    ++rounds;
+    return true;
+}
+
 struct SessionState {
     ULONGLONG input_log_tick{};
+    unsigned input_log_rounds{};
     std::array<ULONGLONG, 3> pose_log_ticks{};
-    struct InputSample { XrAction action; XrPath path; XrStructureType type; ULONGLONG tick; };
+    std::array<unsigned, 3> pose_log_rounds{};
+    struct InputSample { XrAction action; XrPath path; XrStructureType type; ULONGLONG tick; unsigned rounds; };
     std::vector<InputSample> input_samples; // bounded, session-owned diagnostic throttle
     bool diagnostic_menu_visible{};
     struct Menu {
@@ -1612,7 +1626,8 @@ void publish_snapshot_locked(const SessionState* const session) noexcept {
 enum class ExtensionAvailability { present, absent, unknown };
 
 void log_startup(const char* format, ...) noexcept {
-    // Startup only; failure to write diagnostics must never affect OpenXR.
+    // Failure to write diagnostics must never affect OpenXR. The file stays open:
+    // reopening per line made every write pay for a fresh scan of the whole log.
     try {
         static std::mutex log_mutex;
         std::lock_guard lock(log_mutex);
@@ -1625,14 +1640,14 @@ void log_startup(const char* format, ...) noexcept {
         _snprintf_s(line, sizeof(line), _TRUNCATE, "tick=%llu thread=%lu %s",
             GetTickCount64(), GetCurrentThreadId(), message);
         OutputDebugStringA(line);
-        const auto path = cheeky::openxr_startup_log_path();
-        if (path.empty()) return;
-        const auto file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        static HANDLE file = [] {
+            const auto path = cheeky::openxr_startup_log_path();
+            return path.empty() ? INVALID_HANDLE_VALUE : CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }();
         if (file == INVALID_HANDLE_VALUE) return;
         DWORD written{};
         WriteFile(file, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
-        CloseHandle(file);
     } catch (...) {}
 }
 
@@ -3097,10 +3112,8 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrSyncActions(
         attached = sessions.at(session).action_attached;
         ++sessions.at(session).input.host_sync_calls;
         auto& tracked = sessions.at(session);
-        const auto now = GetTickCount64();
-        diagnostic_due = now - tracked.input_log_tick >= 2000;
+        diagnostic_due = input_diagnostic_due(tracked.input_log_tick, tracked.input_log_rounds, GetTickCount64());
         if (diagnostic_due) {
-            tracked.input_log_tick = now;
             diagnostic_dispatch = instance->dispatch;
             diagnostic_instance = instance->instance;
             diagnostic_hands = instance->menu_hand_paths;
@@ -3198,9 +3211,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrGetActionStatePose(
         next = instance->dispatch.get_action_state_pose;
         if (info) for (unsigned i = 0; i < 2; ++i)
             if (info->subactionPath == instance->menu_hand_paths[i]) hand = i;
-        const auto now = GetTickCount64();
-        due = now - it->second.pose_log_ticks[hand] >= 2000;
-        if (due) it->second.pose_log_ticks[hand] = now;
+        due = input_diagnostic_due(it->second.pose_log_ticks[hand], it->second.pose_log_rounds[hand], GetTickCount64());
     }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
     const auto result = next(session, info, output);
@@ -3229,8 +3240,8 @@ XrResult diagnostic_input(XrSession session, const XrActionStateGetInfo* info,
                 return s.action == info->action && s.path == info->subactionPath && s.type == type;
             });
             if (sample == samples.end()) {
-                if (samples.size() < 128) { samples.push_back({info->action, info->subactionPath, type, now}); due = true; }
-            } else if (now - sample->tick >= 2000) { sample->tick = now; due = true; }
+                if (samples.size() < 128) { samples.push_back({info->action, info->subactionPath, type, now, 1}); due = true; }
+            } else due = input_diagnostic_due(sample->tick, sample->rounds, now);
         }
     }
     if (!next) return XR_ERROR_FUNCTION_UNSUPPORTED;
