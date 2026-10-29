@@ -47,7 +47,8 @@ $signatureFixture.Status = 'HashMismatch'
 Assert-Rejected { & "$projectRoot/scripts/package-signpath.ps1" -BinaryRoot $binaries -InstallerPath $installer } 'Signature check failed'
 $signatureFixture.Status = 'UnknownError'
 Assert-Rejected { & "$projectRoot/scripts/verify-signpath.ps1" -InstallerPath $installer } 'Signature check failed'
-$signatureFixture.Message = ([Runtime.InteropServices.Marshal]::GetExceptionForHR(-2146762487).Message -replace '\s+\(0x800B0109\)$', '').Trim()
+# Authenticode reports the sentence without the HRESULT suffix or final period.
+$signatureFixture.Message = ([Runtime.InteropServices.Marshal]::GetExceptionForHR(-2146762487).Message -replace '\s*\((Exception from HRESULT: )?0x800B0109\)$', '').Trim().TrimEnd('.')
 & "$projectRoot/scripts/verify-signpath.ps1" -InstallerPath $installer
 $signatureFixture.Message = 'Synthetic test result'
 $signatureFixture.Status = 'NotTrusted'
