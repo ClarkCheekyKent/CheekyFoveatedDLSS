@@ -733,7 +733,8 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
         ModelSetting{"NrSkinStructureStrength", "DLSSNR.SkinStructureStrength", 1.F, 0.75F},
         ModelSetting{"NrAutomaticMask", "DLSSNR.UseAutoMask", 0.F, 1.F},
         ModelSetting{"NrUiCorrection", "DLSSNR.UICorrection", 0.F, 1.F},
-        ModelSetting{"NrPreset", "DLSSNR.Hint.Render.Preset", 0.F, 3.F},
+        ModelSetting{"NrPreset", "DLSSNR.Hint.Render.Preset", 0.F, 1.F},
+        ModelSetting{"NrPreset", "DLSSNR.Hint.Render.Preset", 0.F, 2.F},
         ModelSetting{"NrStyle", "DLSSNR.Style", 0.F, 2.F}}) {
         const auto set_value = [&](float value) {
             const bool boolean = std::string(item.setting) == "NrAutomaticMask" || std::string(item.setting) == "NrUiCorrection";

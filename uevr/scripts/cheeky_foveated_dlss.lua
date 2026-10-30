@@ -998,6 +998,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     check("Show NR alignment border", "NrAlignmentBorder")
                 end
                 section("Neural rendering")
+                combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A (Original)",[2]="Preset B (Faster)"})
+                text("Shared by all model passes. Preset B requires NR 310.9.16 or newer.")
                 if status.settings.NrProcessingOrder ~= nil then
                     combo("Rendering order", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
                 else

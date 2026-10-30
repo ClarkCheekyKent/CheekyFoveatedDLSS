@@ -1671,6 +1671,13 @@ void draw_nr_controls(Settings& settings, bool& changed) {
 
     }
     ImGui::SeparatorText("Neural rendering");
+    int preset = static_cast<int>(settings.nr_preset);
+    if (ImGui::Combo("DLSS-NR preset", &preset, "Default\0Preset A (Original)\0Preset B (Faster)\0")) {
+        settings.nr_preset = static_cast<std::uint32_t>(preset);
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Shared by all model passes. Preset B requires NR 310.9.16 or newer.");
     int order = static_cast<int>(settings.nr_processing_order);
     if (ImGui::Combo("Rendering order", &order, "After upscaling\0Before upscaling\0")) {
         settings.nr_processing_order = nr_processing_order(static_cast<std::uint32_t>(order));

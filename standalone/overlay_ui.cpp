@@ -287,6 +287,9 @@ void draw_nr(Settings& s, bool quad) {
     }
     }
     ImGui::SeparatorText("Neural rendering");
+    combo("DLSS-NR preset", s.nr_preset, "Default\0Preset A (Original)\0Preset B (Faster)\0");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Shared by all model passes. Preset B requires NR 310.9.16 or newer.");
     combo("Rendering order", s.nr_processing_order, "After upscaling\0Before upscaling (experimental)\0");
     slider("Working scale", s.nr_working_scale, .1F, 1.0F);
     combo("DLSS-NR style", s.nr_style, "Standard\0Natural\0Cinematic\0");

@@ -88,7 +88,8 @@ The required NVIDIA and Streamline runtimes are **not distributed with this proj
 Additional notes:
 
 - DLSS-NR is off by default.
-- **Style** selects Standard, Natural or Cinematic. This changes a different model parameter from the old preset hints, which have been removed from the menus along with the unverified UI correction toggle.
+- **DLSS-NR preset**, above **Rendering order**, selects Default, Preset A (Original), or Preset B (Faster) for all model passes. NR 310.9.16 includes both models and defaults to B; NR 310.8 only includes A. Preset B requires NR 310.9.16 or newer. Changing the preset recreates the model features and resets their history.
+- **Style** selects Standard, Natural or Cinematic independently of the model preset.
 - **Intensity** controls the model edit from 0 (none) to 1 (full). Values above 1 from older settings files normalize to 1. **Local tone** and **Local structure** remain 0–2; compare their endpoints in a stationary scene to judge the effect.
 - **Model passes** (1–3, Direct3D 12 and DX12 Transport) runs the model again on its own output inside the same region. Each pass keeps its own temporal history, and the picture is decoded once, so the colour transform and fovea feather are not applied repeatedly. **Pass 2 settings** and **Pass 3 settings** each have a **Same as pass 1** checkbox, on by default. Untick it to give that pass its own style, intensity, local structure and local tone; game-input settings under **Additional settings** always follow pass 1. Each extra pass costs about one more NR evaluation. If a pass cannot start, NR runs the passes that are ready; if one fails during a frame, that frame keeps the game image.
 - **Skin structure** appears when **Automatic mask** is enabled. **Paper white** appears only when NR receives HDR input. These controls do not affect the picture outside those conditions.

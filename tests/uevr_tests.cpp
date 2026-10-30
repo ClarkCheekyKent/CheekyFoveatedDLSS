@@ -215,6 +215,7 @@ void settings_tests(const std::filesystem::path& root) {
         "Parse NR pass settings");
     {
         Settings p; p.nr_intensity = .8F; p.nr_style = 2U; p.nr_local_tone_strength = 1.5F;
+        p.nr_preset = 2U;
         p.nr_extra_passes[0] = {true, 1U, .25F, .5F, 0.F};
         p.nr_extra_passes[1] = {false, 1U, .25F, .5F, 0.F};
         const auto same = nr_pass_settings(p, 1U), own = nr_pass_settings(p, 2U);
@@ -222,6 +223,8 @@ void settings_tests(const std::filesystem::path& root) {
             own.nr_intensity == .25F && own.nr_style == 1U && own.nr_local_structure_strength == .5F &&
             own.nr_local_tone_strength == 0.F && own.nr_skin_structure_strength == p.nr_skin_structure_strength,
             "Later NR passes use pass 1's tuning unless they have their own");
+        require(nr_pass_settings(p, 0U).nr_preset == 2U && same.nr_preset == 2U && own.nr_preset == 2U,
+            "All NR passes must share the selected model preset, including passes with custom tuning");
     }
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
         "Parse AFW manual coverage settings");

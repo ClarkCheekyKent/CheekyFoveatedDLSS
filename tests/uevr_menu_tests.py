@@ -884,7 +884,19 @@ def run(engine):
     assert g["values"]["NR intensity"] is not None
     assert g.slider_ranges["NR intensity"][1] == 0 and g.slider_ranges["NR intensity"][2] == 1
     assert g["values"]["Skin structure"] is None, "Hide skin tuning without automatic masking"
-    assert g["values"]["DLSS-NR preset"] is None and g["values"]["UI correction"] is None
+    assert g["values"]["DLSS-NR preset"] is not None and g["values"]["UI correction"] is None
+    assert g.combos["DLSS-NR preset"][0] == "Default"
+    assert g.combos["DLSS-NR preset"][1] == "Preset A (Original)"
+    assert g.combos["DLSS-NR preset"][2] == "Preset B (Faster)"
+    for preset in (1, 2, 0):
+        count = len(g.sent)
+        draw(changes={"DLSS-NR preset": preset})
+        assert len(g.sent) == count + 1 and "NrPreset=" + str(preset) in last()
+        state["request"] = state["applied_request"] = int(last().splitlines()[1])
+        state["settings"]["NrPreset"] = preset
+        receive(state)
+        draw()
+        assert g["values"]["DLSS-NR preset"] == preset, "Preset acknowledgement was not retained"
     state["nr_details"]["hdr_input"] = False
     receive(state)
     draw()
