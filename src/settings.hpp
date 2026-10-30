@@ -10,6 +10,19 @@
 
 namespace cheeky::foveated_dlss {
 
+inline constexpr std::uint32_t max_nr_passes = 3U;
+
+// Tuning for a later DLSS-NR pass, which refines the previous pass's model
+// output inside the same region. A negative value inherits pass 1. Local tone
+// defaults to zero so broad lighting edits do not compound across passes.
+struct NrExtraPass {
+    std::int32_t style{-1};
+    float intensity{-1.0F};
+    float local_structure_strength{-1.0F};
+    float local_tone_strength{0.0F};
+    bool operator==(const NrExtraPass&) const = default;
+};
+
 // Up to four requested regions (two eyes, fresh and filtered gaze). Bounds
 // are normalized to the complete eye image, independently of the allocation.
 struct FoveationMask {
@@ -155,7 +168,24 @@ struct Settings {
     std::uint32_t nr_depth_convention{};
     float nr_motion_scale_x_multiplier{1.0F};
     float nr_motion_scale_y_multiplier{1.0F};
+    // Model passes per frame. Each pass keeps its own feature and history.
+    std::uint32_t nr_passes{1U};
+    std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{};
 };
+
+// Model settings for one pass; pass 0 is the configured first pass. Inputs
+// that describe the game (depth, motion, HDR transfer) always follow pass 1.
+[[nodiscard]] inline Settings nr_pass_settings(const Settings& settings, const std::uint32_t pass) noexcept {
+    auto result = settings;
+    if (pass == 0U || pass > settings.nr_extra_passes.size()) return result;
+    const auto& extra = settings.nr_extra_passes[pass - 1U];
+    if (extra.style >= 0) result.nr_style = static_cast<std::uint32_t>(extra.style);
+    if (extra.intensity >= 0.0F) result.nr_intensity = extra.intensity;
+    if (extra.local_structure_strength >= 0.0F)
+        result.nr_local_structure_strength = extra.local_structure_strength;
+    if (extra.local_tone_strength >= 0.0F) result.nr_local_tone_strength = extra.local_tone_strength;
+    return result;
+}
 
 inline bool uses_coordinated_center(const Settings& settings) noexcept {
     return settings.auto_stereo_alignment || settings.center_mode != FoveationCenterMode::fixed;

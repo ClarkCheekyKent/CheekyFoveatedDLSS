@@ -602,6 +602,33 @@ void verify_nr_reset_isolation(void (*command)(const char*), bool lower_hook) {
         readback->Unmap(0,nullptr);
         require(unchanged, "SDR NR round trip changed paper white, alpha, or working-scale edge sampling");
     }
+    // Chained passes stay in the encoded proxy space and decode once: an
+    // identity model round-trips unchanged, with one evaluation per pass.
+    const auto nr_evaluates = proc<Counter>(nr, "CheekyFakeEvaluates");
+    for (unsigned passes : {2U, 3U, 1U}) {
+        command(("1\n96\nset\nNrPaperWhiteScale=1\nNrWorkingScale=1\nNrHdrTransferStrength=1\nNrPasses=" +
+            std::to_string(passes)).c_str()); evaluate(0);
+        const auto evaluations = nr_evaluates(); evaluate(0);
+        require(nr_evaluates() - evaluations == passes, "NR did not evaluate each requested model pass once");
+        require(sr_inputs.size() == 1 && sr_inputs[0].color != f.textures12[0].Get(), "Multipass NR did not substitute input");
+        auto readback=make_buffer(256,D3D12_HEAP_TYPE_READBACK);
+        D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+        from.pResource=sr_inputs[0].color; from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get(); to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        to.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16B16A16_FLOAT,1,1,1,256};
+        const D3D12_BOX pixel{0,0,0,1,1,1};
+        transition_resource(from.pResource,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        f.list->CopyTextureRegion(&to,0,0,0,&from,&pixel);
+        transition_resource(from.pResource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        f.finish_gpu(); check(readback->Map(0,nullptr,&mapped), "Map multipass NR result");
+        const auto* result = static_cast<const DirectX::PackedVector::HALF*>(mapped);
+        const bool unchanged = DirectX::PackedVector::XMConvertHalfToFloat(result[0]) == 0.F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[1]) == 0.F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[2]) == 0.75F &&
+            DirectX::PackedVector::XMConvertHalfToFloat(result[3]) == 0.25F;
+        readback->Unmap(0,nullptr);
+        require(unchanged, "Multipass NR compounded the codec instead of decoding once");
+    }
     command("1\n96\nset\nNrPaperWhiteScale=1\nNrWorkingScale=1\nNrHdrTransferStrength=1"); evaluate(0);
     // Saturated HDR must keep its original chroma with an identity model.
     // The old luminance-ratio reconstruction turned (4,2,.75) into grey.

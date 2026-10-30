@@ -52,6 +52,22 @@ std::atomic<bool> manual_stereo_mapping{false};
 std::atomic<bool> manual_stereo_right_first{false};
 std::atomic<bool> quad_manual_assignment{false},quad_show_numbers{false};
 std::array<unsigned,8> quad_saved_roles{};unsigned quad_saved_source_count{}; // settings_mutex
+std::uint32_t nr_passes{1U}; // settings_mutex
+std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{}; // settings_mutex
+
+// Negative values mean "inherit pass 1"; anything else is clamped like pass 1.
+NrExtraPass sanitized_extra_pass(const NrExtraPass& pass) noexcept {
+    const auto tuning = [](float value, float hi) {
+        if (!std::isfinite(value)) return -1.0F;
+        return value < 0.0F ? -1.0F : (std::min)(value, hi);
+    };
+    return {
+        pass.style < 0 ? -1 : (std::min)(pass.style, 2),
+        tuning(pass.intensity, 1.0F),
+        tuning(pass.local_structure_strength, 2.0F),
+        tuning(pass.local_tone_strength, 2.0F),
+    };
+}
 std::atomic<bool> independent_openxr_gaze{false};
 
 std::atomic<std::uint32_t> simulation_pattern{};
@@ -165,6 +181,8 @@ Settings configured_settings() noexcept {
     std::lock_guard lock(settings_mutex);
     Settings settings{};
     settings.fg = fg_settings;
+    settings.nr_passes = nr_passes;
+    settings.nr_extra_passes = nr_extra_passes;
     settings.enabled = enabled.load(std::memory_order_acquire);
     settings.d3d12_lower_hook = d3d12_lower_hook.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
@@ -262,6 +280,9 @@ Settings current_settings() noexcept {
 void update_settings(const Settings& settings) noexcept {
     std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
+    nr_passes = std::clamp(settings.nr_passes, 1U, max_nr_passes);
+    for (std::size_t i = 0; i < nr_extra_passes.size(); ++i)
+        nr_extra_passes[i] = sanitized_extra_pass(settings.nr_extra_passes[i]);
     if(!cheeky::fg::valid_dlssg_preset(fg_settings.dlssg_preset))fg_settings.dlssg_preset=3;
     reflex_override::requested.store(settings.fg.force_reflex_off,std::memory_order_release);
     fg_settings.multiplier=std::clamp(fg_settings.multiplier,2u,4u);

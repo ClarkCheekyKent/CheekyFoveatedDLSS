@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <string>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -961,6 +962,19 @@ void load_settings_from_reshade() noexcept {
         nullptr, config_section, "NrMotionScaleYMultiplier",
         settings.nr_motion_scale_y_multiplier
     ));
+    static_cast<void>(reshade::get_config_value(
+        nullptr, config_section, "NrPasses", settings.nr_passes
+    ));
+    for (std::size_t i = 0; i < settings.nr_extra_passes.size(); ++i) {
+        auto& pass = settings.nr_extra_passes[i];
+        const auto key = [i](const char* name) { return "NrPass" + std::to_string(i + 2U) + name; };
+        static_cast<void>(reshade::get_config_value(nullptr, config_section, key("Style").c_str(), pass.style));
+        static_cast<void>(reshade::get_config_value(nullptr, config_section, key("Intensity").c_str(), pass.intensity));
+        static_cast<void>(reshade::get_config_value(nullptr, config_section,
+            key("LocalStructureStrength").c_str(), pass.local_structure_strength));
+        static_cast<void>(reshade::get_config_value(nullptr, config_section,
+            key("LocalToneStrength").c_str(), pass.local_tone_strength));
+    }
     update_settings(settings);
 }
 
@@ -1139,6 +1153,17 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
         nullptr, config_section, "NrMotionScaleYMultiplier",
         settings.nr_motion_scale_y_multiplier
     );
+    reshade::set_config_value(nullptr, config_section, "NrPasses", settings.nr_passes);
+    for (std::size_t i = 0; i < settings.nr_extra_passes.size(); ++i) {
+        const auto& pass = settings.nr_extra_passes[i];
+        const auto key = [i](const char* name) { return "NrPass" + std::to_string(i + 2U) + name; };
+        reshade::set_config_value(nullptr, config_section, key("Style").c_str(), pass.style);
+        reshade::set_config_value(nullptr, config_section, key("Intensity").c_str(), pass.intensity);
+        reshade::set_config_value(nullptr, config_section,
+            key("LocalStructureStrength").c_str(), pass.local_structure_strength);
+        reshade::set_config_value(nullptr, config_section,
+            key("LocalToneStrength").c_str(), pass.local_tone_strength);
+    }
 }
 
 void draw_sr_controls(Settings& settings, bool& changed) {
@@ -1490,6 +1515,68 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     }
 }
 
+// A later pass either follows a pass 1 value (negative) or overrides it.
+// Commit on release: each tuning change recreates that pass's NGX feature.
+void pass_override_slider(const char* const label, float& value, const float pass1,
+        const float high, bool& changed) {
+    static ImGuiID editing{};
+    static float draft{};
+    ImGui::PushID(label);
+    bool same = value < 0.0F;
+    if (ImGui::Checkbox("Same as pass 1", &same)) {
+        value = same ? -1.0F : pass1;
+        changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(same);
+    const auto id = ImGui::GetID("value");
+    float shown = editing == id ? draft : same ? pass1 : value;
+    if (ImGui::SliderFloat(label, &shown, 0.0F, high, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+        draft = shown;
+        editing = id;
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit() && editing == id) {
+        value = draft;
+        editing = 0;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::PopID();
+}
+
+void draw_nr_pass_controls(Settings& settings, bool& changed) {
+    ImGui::SeparatorText("Model passes");
+    int passes = static_cast<int>(std::clamp(settings.nr_passes, 1U, max_nr_passes)) - 1;
+    if (ImGui::Combo("Model passes", &passes, "1\0" "2\0" "3\0")) {
+        settings.nr_passes = static_cast<std::uint32_t>(passes) + 1U;
+        changed = true;
+    }
+    ImGui::TextDisabled("Each extra pass refines the previous one and costs about one more NR evaluation.");
+    if (settings.nr_passes < 2U) return;
+    static int edited_pass = 2;
+    edited_pass = std::clamp(edited_pass, 2, static_cast<int>(settings.nr_passes));
+    if (settings.nr_passes > 2U) {
+        int index = edited_pass - 2;
+        if (ImGui::Combo("Edit pass", &index, "Pass 2\0Pass 3\0")) edited_pass = index + 2;
+    } else {
+        ImGui::TextDisabled("Pass 2 tuning");
+    }
+    auto& pass = settings.nr_extra_passes[static_cast<std::size_t>(edited_pass - 2)];
+    ImGui::PushID(edited_pass);
+    int style = pass.style + 1;
+    if (ImGui::Combo("DLSS-NR style", &style, "Same as pass 1\0Standard\0Natural\0Cinematic\0")) {
+        pass.style = style - 1;
+        changed = true;
+    }
+    pass_override_slider("Intensity", pass.intensity, settings.nr_intensity, 1.0F, changed);
+    pass_override_slider("Local structure strength", pass.local_structure_strength,
+        settings.nr_local_structure_strength, 2.0F, changed);
+    pass_override_slider("Local tone strength", pass.local_tone_strength,
+        settings.nr_local_tone_strength, 2.0F, changed);
+    ImGui::TextDisabled("Local tone starts at 0 so lighting changes do not stack.");
+    ImGui::PopID();
+}
+
 void draw_nr_controls(Settings& settings, bool& changed) {
     const bool quad=quad_view_snapshot().active!=0;
     struct GeometryDrafts {
@@ -1666,6 +1753,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         );
         ImGui::TreePop();
     }
+    draw_nr_pass_controls(settings, changed);
     if (ImGui::Button("Reset DLSS-NR history / retry runtime")) {
         reset_dlss_nr();
     }
@@ -1699,6 +1787,8 @@ void draw_nr_controls(Settings& settings, bool& changed) {
             defaults.nr_motion_scale_x_multiplier;
         settings.nr_motion_scale_y_multiplier =
             defaults.nr_motion_scale_y_multiplier;
+        settings.nr_passes = defaults.nr_passes;
+        settings.nr_extra_passes = defaults.nr_extra_passes;
         drafts.width = defaults.nr_width;
         drafts.height = defaults.nr_height;
         drafts.working_scale = defaults.nr_working_scale;

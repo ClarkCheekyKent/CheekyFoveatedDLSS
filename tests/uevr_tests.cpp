@@ -210,6 +210,17 @@ void settings_tests(const std::filesystem::path& root) {
     s.height = s.nr_width = s.nr_height = .2F;
     s.enabled = false; s.nr_motion_scale_x_multiplier = -1.25f;
     require(set_named_setting(s, "NrStyle", "2"), "Parse Cinematic style");
+    require(set_named_setting(s, "NrPasses", "3") && set_named_setting(s, "NrPass2Intensity", "0.5") &&
+        set_named_setting(s, "NrPass3Style", "1"), "Parse NR pass settings");
+    {
+        Settings p; p.nr_intensity = .8F; p.nr_style = 2U; p.nr_local_tone_strength = 1.5F;
+        p.nr_extra_passes[0].intensity = .25F;
+        const auto first = nr_pass_settings(p, 0U), second = nr_pass_settings(p, 1U);
+        require(first.nr_intensity == .8F && first.nr_local_tone_strength == 1.5F &&
+            second.nr_intensity == .25F && second.nr_style == 2U && second.nr_local_tone_strength == 0.F &&
+            second.nr_local_structure_strength == p.nr_local_structure_strength,
+            "Later NR passes inherit pass 1 except overrides and local tone");
+    }
     require(set_named_setting(s, "AfwManualCoverage", "true") && set_named_setting(s, "AfwWarpMargin", "0.125"),
         "Parse AFW manual coverage settings");
     require(set_named_setting(s, "AfwAutomaticCoverage", "true"), "Parse AFW automatic coverage setting");
@@ -223,6 +234,9 @@ void settings_tests(const std::filesystem::path& root) {
     Settings r; require(read_settings_file(path, r, error), "Read settings");
     require(r.fix_motion_blur && r.center_preset == 10U && r.peripheral_dlaa_preset == 10U,
         "Preset J and motion blur fix survive settings roundtrip");
+    require(r.nr_passes == 3U && r.nr_extra_passes[0].intensity == .5F && r.nr_extra_passes[0].style == -1 &&
+        r.nr_extra_passes[1].style == 1 && r.nr_extra_passes[1].local_tone_strength == 0.F,
+        "NR pass settings survive settings roundtrip");
     require(r.manual_stereo_mapping && r.manual_stereo_right_first && r.independent_openxr_gaze,
         "Gaze opt-ins survive per-application settings roundtrip");
     auto reset_gaze = r;

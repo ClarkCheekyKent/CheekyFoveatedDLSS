@@ -135,6 +135,8 @@ struct GpuResources {
     ID3D12Resource* original_output{};
     ID3D12Resource* color_proxy{};
     ID3D12Resource* neural_output{};
+    // Alternate model output, created only once a frame chains model passes.
+    ID3D12Resource* pass_output{};
     ID3D12DescriptorHeap* descriptors{};
     ID3D12RootSignature* root_signature{};
     ID3D12PipelineState* encode_pipeline{};
@@ -159,6 +161,8 @@ struct ViewState {
     NrLifetime uses;
     bool retired{};
     DlssViewId view_id{};
+    // Model pass within the frame; later passes share the view's codec.
+    std::uint32_t pass{};
     NgxParameters* parameters{};
     NgxHandle* handle{};
     FeatureKey key{};
@@ -196,6 +200,7 @@ void release_gpu(GpuResources& gpu) noexcept {
     release(gpu.encode_pipeline);
     release(gpu.root_signature);
     release(gpu.descriptors);
+    release(gpu.pass_output);
     release(gpu.neural_output);
     release(gpu.color_proxy);
     release(gpu.original_output);
@@ -359,12 +364,13 @@ void evict_retired_features(ViewState& view) noexcept {
     return true;
 }
 
-[[nodiscard]] ViewState& find_or_create_view(const DlssViewId view_id) {
+[[nodiscard]] ViewState& find_or_create_view(const DlssViewId view_id, const std::uint32_t pass = 0U) {
     for (auto& view : views) {
-        if (view.view_id == view_id && !view.retired) return view;
+        if (view.view_id == view_id && view.pass == pass && !view.retired) return view;
     }
     views.push_back(ViewState{});
     views.back().view_id = view_id;
+    views.back().pass = pass;
     return views.back();
 }
 
@@ -865,6 +871,37 @@ void evict_retired_features(ViewState& view) noexcept {
 }
 
 
+[[nodiscard]] bool ensure_pass_output(
+    GpuResources& gpu,
+    ID3D12GraphicsCommandList* const command_list
+) noexcept {
+    if (gpu.pass_output != nullptr) return true;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    auto result = command_list->GetDevice(IID_PPV_ARGS(&device));
+    if (SUCCEEDED(result)) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1U;
+        heap.VisibleNodeMask = 1U;
+        const auto texture = gpu.neural_output->GetDesc();
+        result = device->CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            &texture,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            nullptr,
+            IID_PPV_ARGS(&gpu.pass_output)
+        );
+    }
+    if (FAILED(result)) {
+        gpu.pass_output = nullptr;
+        trace_event("DLSS-NR pass output creation failed hr=0x%08X; running one pass", result);
+        return false;
+    }
+    gpu.pass_output->SetName(L"Cheeky DLSS-NR pass output");
+    return true;
+}
+
 void transition(
     ID3D12GraphicsCommandList* const command_list,
     ID3D12Resource* const resource,
@@ -1023,7 +1060,8 @@ bool evaluate_dlss_nr(
         bool succeeded{};
         ~HistoryGuard() {
             if (succeeded) return;
-            view.was_enabled = false;
+            // Every model pass of this view loses the frame together.
+            for (auto& other : views) if (other.view_id == view.view_id) other.was_enabled = false;
             const auto count = diagnostics.failed_calls;
             if (count <= 8U || (count & (count - 1U)) == 0U)
                 trace_event("DLSS-NR rejected view=%llu state=%s reason=%s result=0x%X failures=%llu",
@@ -1163,7 +1201,6 @@ bool evaluate_dlss_nr(
             processing_height
         );
 
-    auto* const parameters = view.parameters;
     const auto signature = dlss_nr_history_signature(nr_settings_signature(settings, region), {
         frame.input_width, frame.input_height, frame.output_width, frame.output_height,
         processing_width, processing_height,
@@ -1273,6 +1310,38 @@ bool evaluate_dlss_nr(
             frame.has_center ? "yes" : "no", frame.center.u, frame.center.v);
     }
 
+    // Later passes refine the previous pass's model output in the encoded
+    // proxy space, each with its own feature and history, and the codec
+    // decodes once against the original. Count only a contiguous run of ready
+    // features: borrowing another pass's feature would advance its history
+    // twice in one game frame.
+    struct ModelPass {
+        ViewState* view{};
+        Settings settings;
+        std::uint64_t signature{};
+        bool reset{};
+    };
+    std::array<ModelPass, max_nr_passes> passes{};
+    passes[0] = {&view, settings, signature, reset};
+    std::uint32_t pass_count = 1U;
+    const auto requested_passes = std::clamp(settings.nr_passes, 1U, max_nr_passes);
+    for (std::uint32_t pass = 1U; pass < requested_passes; ++pass) {
+        auto& pass_view = find_or_create_view(frame.view_id, pass);
+        auto pass_settings = nr_pass_settings(settings, pass);
+        if (!record_use(pass_view, frame.command_list) ||
+            !create_feature(pass_view, frame, pass_settings, working_width, working_height)) break;
+        // Chain the signature so a change to an earlier pass resets later ones.
+        const auto pass_signature = (passes[pass - 1U].signature * 1099511628211ULL) ^
+            nr_settings_signature(pass_settings, region);
+        const bool pass_reset = reset || !pass_view.was_enabled ||
+            pass_view.settings_signature != pass_signature;
+        passes[pass] = {&pass_view, std::move(pass_settings), pass_signature, pass_reset};
+        ++pass_count;
+    }
+    if (pass_count > 1U && !ensure_pass_output(*gpu, frame.command_list)) pass_count = 1U;
+    diagnostics.requested_passes = requested_passes;
+    diagnostics.active_passes = pass_count;
+
     uav_barrier(frame.command_list, frame.color);
     transition(
         frame.command_list,
@@ -1304,51 +1373,76 @@ bool evaluate_dlss_nr(
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
 
-    parameters->Set("DLSSNR.Color", gpu->color_proxy);
-    parameters->Set("DLSSNR.Output", gpu->neural_output);
-    parameters->Set("DLSSNR.MVec", motion_vectors);
-    parameters->Set("DLSSNR.Depth", gpu->guides.depth.Get());
-    parameters->Set("DLSSNR.ColorSubrectBaseX", 0U);
-    parameters->Set("DLSSNR.ColorSubrectBaseY", 0U);
-    parameters->Set("DLSSNR.ColorSubrectWidth", working_width);
-    parameters->Set("DLSSNR.ColorSubrectHeight", working_height);
-    parameters->Set("DLSSNR.OutputSubrectBaseX", 0U);
-    parameters->Set("DLSSNR.OutputSubrectBaseY", 0U);
-    parameters->Set("DLSSNR.OutputSubrectWidth", working_width);
-    parameters->Set("DLSSNR.OutputSubrectHeight", working_height);
-    parameters->Set("DLSSNR.DepthSubrectBaseX", 0U);
-    parameters->Set("DLSSNR.DepthSubrectBaseY", 0U);
-    parameters->Set("DLSSNR.DepthSubrectWidth", working_width);
-    parameters->Set("DLSSNR.DepthSubrectHeight", working_height);
-    parameters->Set("DLSSNR.MVecSubrectBaseX", 0U);
-    parameters->Set("DLSSNR.MVecSubrectBaseY", 0U);
-    parameters->Set("DLSSNR.MVecSubrectWidth", working_width);
-    parameters->Set("DLSSNR.MVecSubrectHeight", working_height);
-    parameters->Set(
-        "DLSSNR.MVecScaleX",
-        static_cast<float>(working_width)
-    );
-    parameters->Set(
-        "DLSSNR.MVecScaleY",
-        static_cast<float>(working_height)
-    );
+    // Alternate model outputs so the last pass always writes neural_output,
+    // which the decode descriptors read. Outputs start as UAVs.
+    D3D12_RESOURCE_STATES neural_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    D3D12_RESOURCE_STATES pass_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const auto move_model_output = [&](ID3D12Resource* const resource,
+            const D3D12_RESOURCE_STATES state) noexcept {
+        auto& current = resource == gpu->neural_output ? neural_state : pass_state;
+        transition(frame.command_list, resource, current, state);
+        current = state;
+    };
     const bool depth_inverted = settings.nr_depth_convention == 1U
         ? false
         : settings.nr_depth_convention == 2U ? true : frame.depth_inverted;
-    parameters->Set("DLSSNR.DepthInverted", depth_inverted ? 1U : 0U);
-    parameters->Set("DLSSNR.Enabled", 1U);
-    parameters->Set("DLSSNR.Reset", reset ? 1U : 0U);
-    parameters->Set("DLSSNR.ScalingRatio", 1.0F);
-    parameters->Set("DLSSNR.Scale", 1.0F);
-    parameters->Set("DLSSNR.Upscaling", 0U);
-    set_model_tuning(parameters, settings);
+    NgxResult result{};
+    std::uint32_t failed_pass{};
+    ID3D12Resource* pass_input = gpu->color_proxy;
+    for (std::uint32_t pass = 0U; pass < pass_count; ++pass) {
+        const auto& model = passes[pass];
+        auto* const output = ((pass_count - 1U - pass) & 1U) == 0U
+            ? gpu->neural_output : gpu->pass_output;
+        move_model_output(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        auto* const parameters = model.view->parameters;
+        parameters->Set("DLSSNR.Color", pass_input);
+        parameters->Set("DLSSNR.Output", output);
+        parameters->Set("DLSSNR.MVec", motion_vectors);
+        parameters->Set("DLSSNR.Depth", gpu->guides.depth.Get());
+        parameters->Set("DLSSNR.ColorSubrectBaseX", 0U);
+        parameters->Set("DLSSNR.ColorSubrectBaseY", 0U);
+        parameters->Set("DLSSNR.ColorSubrectWidth", working_width);
+        parameters->Set("DLSSNR.ColorSubrectHeight", working_height);
+        parameters->Set("DLSSNR.OutputSubrectBaseX", 0U);
+        parameters->Set("DLSSNR.OutputSubrectBaseY", 0U);
+        parameters->Set("DLSSNR.OutputSubrectWidth", working_width);
+        parameters->Set("DLSSNR.OutputSubrectHeight", working_height);
+        parameters->Set("DLSSNR.DepthSubrectBaseX", 0U);
+        parameters->Set("DLSSNR.DepthSubrectBaseY", 0U);
+        parameters->Set("DLSSNR.DepthSubrectWidth", working_width);
+        parameters->Set("DLSSNR.DepthSubrectHeight", working_height);
+        parameters->Set("DLSSNR.MVecSubrectBaseX", 0U);
+        parameters->Set("DLSSNR.MVecSubrectBaseY", 0U);
+        parameters->Set("DLSSNR.MVecSubrectWidth", working_width);
+        parameters->Set("DLSSNR.MVecSubrectHeight", working_height);
+        parameters->Set(
+            "DLSSNR.MVecScaleX",
+            static_cast<float>(working_width)
+        );
+        parameters->Set(
+            "DLSSNR.MVecScaleY",
+            static_cast<float>(working_height)
+        );
+        parameters->Set("DLSSNR.DepthInverted", depth_inverted ? 1U : 0U);
+        parameters->Set("DLSSNR.Enabled", 1U);
+        parameters->Set("DLSSNR.Reset", model.reset ? 1U : 0U);
+        parameters->Set("DLSSNR.ScalingRatio", 1.0F);
+        parameters->Set("DLSSNR.Scale", 1.0F);
+        parameters->Set("DLSSNR.Upscaling", 0U);
+        set_model_tuning(parameters, model.settings);
 
-    const auto result = runtime.evaluate_feature(
-        frame.command_list,
-        view.handle,
-        parameters,
-        nullptr
-    );
+        result = runtime.evaluate_feature(
+            frame.command_list,
+            model.view->handle,
+            parameters,
+            nullptr
+        );
+        if (!ngx_succeeded(result)) { failed_pass = pass; break; }
+        if (pass + 1U < pass_count) {
+            move_model_output(output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            pass_input = output;
+        }
+    }
     diagnostics.last_result = result;
     diagnostics.output_width = frame.output_width;
     diagnostics.output_height = frame.output_height;
@@ -1360,8 +1454,12 @@ bool evaluate_dlss_nr(
     diagnostics.working_height = working_height;
     diagnostics.intermediate_vram_bytes =
         static_cast<std::uint64_t>(region.width) * region.height * 8U +
-        static_cast<std::uint64_t>(working_width) * working_height * 28U;
+        static_cast<std::uint64_t>(working_width) * working_height *
+            (gpu->pass_output ? 36U : 28U);
     if (!ngx_succeeded(result)) {
+        // All or nothing: a partial chain never reaches the game image.
+        move_model_output(gpu->neural_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (gpu->pass_output) move_model_output(gpu->pass_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         transition(
             frame.command_list,
             gpu->original_output,
@@ -1380,23 +1478,19 @@ bool evaluate_dlss_nr(
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             frame.color_state
         );
-        view.was_enabled = false;
         diagnostics.state = DlssNrState::evaluation_failed;
         ++diagnostics.failed_calls;
         trace_event(
-            "DLSS-NR feature 18 evaluation failed view=%llu result=0x%08X",
+            "DLSS-NR feature 18 evaluation failed view=%llu pass=%u/%u result=0x%08X",
             static_cast<unsigned long long>(frame.view_id),
+            failed_pass + 1U,
+            pass_count,
             result
         );
         return false;
     }
 
-    transition(
-        frame.command_list,
-        gpu->neural_output,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-    );
+    move_model_output(gpu->neural_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(
         frame.command_list,
         frame.color,
@@ -1431,12 +1525,8 @@ bool evaluate_dlss_nr(
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
-    transition(
-        frame.command_list,
-        gpu->neural_output,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    );
+    move_model_output(gpu->neural_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (gpu->pass_output) move_model_output(gpu->pass_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     ++diagnostics.evaluation_calls;
     view.history = history;
     view.last_region = region; view.last_order = settings.nr_processing_order;
@@ -1446,13 +1536,20 @@ bool evaluate_dlss_nr(
     view.settings_signature = signature;
     view.reset_generation = reset_generation;
     view.was_enabled = true;
+    for (std::uint32_t pass = 1U; pass < pass_count; ++pass) {
+        passes[pass].view->settings_signature = passes[pass].signature;
+        passes[pass].view->was_enabled = true;
+    }
+    // A requested pass that was not ready this frame has a gap in its history.
+    for (auto& other : views)
+        if (other.view_id == view.view_id && other.pass >= pass_count) other.was_enabled = false;
     history_guard.succeeded = true;
     diagnostics.state = DlssNrState::active;
     if (diagnostics.evaluation_calls == 1U ||
         diagnostics.evaluation_calls % 300U == 0U) {
         trace_event(
             "DLSS-NR active route=%s view=%llu region=%ux%u@%u,%u "
-            "working=%ux%u evaluations=%llu",
+            "working=%ux%u passes=%u/%u evaluations=%llu",
             dlss_nr_route_name(frame.route),
             static_cast<unsigned long long>(frame.view_id),
             region.width,
@@ -1461,6 +1558,8 @@ bool evaluate_dlss_nr(
             region.base_y,
             working_width,
             working_height,
+            pass_count,
+            requested_passes,
             static_cast<unsigned long long>(diagnostics.evaluation_calls)
         );
     }
@@ -1484,7 +1583,7 @@ void draw_dlss_nr_border(const DlssNrFrame& input_frame, const Settings& input_s
     if (settings.eye_independent_coverage) {
         // Before NR already sampled gaze. Draw the region actually processed,
         // even if inference took long enough for the gaze publication to age.
-        const auto found = std::find_if(views.begin(), views.end(), [&](const auto& v) { return v.view_id == frame.view_id; });
+        const auto found = std::find_if(views.begin(), views.end(), [&](const auto& v) { return v.view_id == frame.view_id && v.pass == 0U; });
         if (found == views.end() || !found->was_enabled || found->last_order != NrProcessingOrder::before_upscaling) return;
         region = found->last_region;
     }

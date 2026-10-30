@@ -239,6 +239,47 @@ void draw_gaze(Settings& s) {
     }
 }
 
+// A later pass either follows a pass 1 value (negative) or overrides it.
+void pass_override_slider(const char* label, float& value, float pass1, float high) {
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    bool same = value < 0.0F;
+    if (ImGui::Checkbox("Same as pass 1", &same)) value = same ? -1.0F : pass1;
+    ImGui::BeginDisabled(same);
+    float shown = same ? pass1 : value;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::SliderFloat("##value", &shown, 0.0F, high, "%.2f", ImGuiSliderFlags_AlwaysClamp)) value = shown;
+    ImGui::EndDisabled();
+    ImGui::PopID();
+}
+
+void draw_nr_passes(Settings& s) {
+    ImGui::SeparatorText("Model passes");
+    auto index = std::clamp(s.nr_passes, 1U, max_nr_passes) - 1U;
+    combo("Model passes", index, "1\0" "2\0" "3\0");
+    s.nr_passes = index + 1U;
+    ImGui::TextWrapped("Each extra pass refines the previous one and costs about one more NR evaluation.");
+    if (s.nr_passes < 2U) return;
+    static int edited_pass = 2;
+    edited_pass = std::clamp(edited_pass, 2, static_cast<int>(s.nr_passes));
+    if (s.nr_passes > 2U) {
+        int pass_index = edited_pass - 2;
+        combo("Edit pass", pass_index, "Pass 2\0Pass 3\0");
+        edited_pass = pass_index + 2;
+    }
+    auto& pass = s.nr_extra_passes[static_cast<std::size_t>(edited_pass - 2)];
+    ImGui::PushID(edited_pass);
+    int style = pass.style + 1;
+    combo("DLSS-NR style", style, "Same as pass 1\0Standard\0Natural\0Cinematic\0");
+    pass.style = style - 1;
+    pass_override_slider("Intensity", pass.intensity, s.nr_intensity, 1.0F);
+    pass_override_slider("Local structure strength", pass.local_structure_strength,
+        s.nr_local_structure_strength, 2.0F);
+    pass_override_slider("Local tone strength", pass.local_tone_strength, s.nr_local_tone_strength, 2.0F);
+    ImGui::TextDisabled("Local tone starts at 0 so lighting changes do not stack.");
+    ImGui::PopID();
+}
+
 void draw_nr(Settings& s, bool quad) {
     ImGui::Checkbox(quad?"Enable DLSS-NR on center views":"Enable DLSS-NR", &s.nr_enabled);
     if(quad)ImGui::TextWrapped("NR covers each assigned center view in full. Peripheral views do not run NR. D3D11 requires DX12 Transport.");
@@ -279,6 +320,7 @@ void draw_nr(Settings& s, bool quad) {
         slider("Motion scale Y multiplier", s.nr_motion_scale_y_multiplier, -4.0F, 4.0F);
         ImGui::TreePop();
     }
+    draw_nr_passes(s);
 }
 
 void diagnostic_line(std::string_view object, const char* label, const char* key) {

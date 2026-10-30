@@ -160,6 +160,19 @@ local function combo(label, key, values, order)
     if changed then draft[key], dirty[key], ready_edits[key] = value, value, value end
 end
 local function text(s) imgui.text(tostring(s)) end
+-- A later NR pass either follows a pass 1 value (negative) or overrides it.
+local function pass_override(label, key, base_key, maximum)
+    local same = draft[key] == nil or draft[key] < 0
+    local changed, value = imgui.checkbox("Same as pass 1##" .. key, same)
+    if changed then
+        local v = value and -1 or (draft[base_key] or 1)
+        draft[key], dirty[key], ready_edits[key] = v, v, v
+        same = value
+    end
+    if same then text(label .. ": same as pass 1")
+    else slider(label .. "##" .. key, key, 0, maximum) end
+end
+local nr_edit_pass = 2
 local function fg_optical(method)
     return method ~= nil and method >= 5 and method <= 12
 end
@@ -995,6 +1008,26 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
                     slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
                     imgui.tree_pop()
+                end
+                if status.settings.NrPasses ~= nil then
+                    section("Model passes")
+                    combo("Model passes", "NrPasses", {[1]="1",[2]="2",[3]="3"}, {1, 2, 3})
+                    text("Each extra pass refines the previous one and costs about one more NR evaluation.")
+                    local passes = draft.NrPasses or 1
+                    if passes >= 2 then
+                        if passes < nr_edit_pass then nr_edit_pass = 2 end
+                        if passes > 2 then
+                            local changed, value = imgui.combo("Edit pass", nr_edit_pass - 1, {"Pass 2", "Pass 3"})
+                            if changed then nr_edit_pass = value + 1 end
+                        end
+                        local p = "NrPass" .. nr_edit_pass
+                        combo("DLSS-NR style##" .. p, p .. "Style",
+                            {[-1]="Same as pass 1",[0]="Standard",[1]="Natural",[2]="Cinematic"}, {-1, 0, 1, 2})
+                        pass_override("Intensity", p .. "Intensity", "NrIntensity", 1)
+                        pass_override("Local structure", p .. "LocalStructureStrength", "NrLocalStructureStrength", 2)
+                        pass_override("Local tone", p .. "LocalToneStrength", "NrLocalToneStrength", 2)
+                        text("Local tone starts at 0 so lighting changes do not stack.")
+                    end
                 end
             end
             if imgui.button("Reset NR history / retry") then send("reset_nr") end

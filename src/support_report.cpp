@@ -144,6 +144,12 @@ std::string settings_text(const Settings& s) {
     out << "nr_depth_convention=" << s.nr_depth_convention << '\n';
     out << "nr_motion_scale_x_multiplier=" << s.nr_motion_scale_x_multiplier << '\n';
     out << "nr_motion_scale_y_multiplier=" << s.nr_motion_scale_y_multiplier << '\n';
+    out << "nr_passes=" << s.nr_passes << '\n';
+    for (std::size_t i = 0; i < s.nr_extra_passes.size(); ++i) {
+        const auto& pass = s.nr_extra_passes[i];
+        out << "nr_pass" << i + 2U << "=style:" << pass.style << " intensity:" << pass.intensity
+            << " structure:" << pass.local_structure_strength << " tone:" << pass.local_tone_strength << '\n';
+    }
     return out.str();
 }
 
@@ -293,6 +299,7 @@ std::string diagnostics_text() {
     out << "processing_width=" << nr.processing_width << '\n';
     out << "processing_height=" << nr.processing_height << '\n';
     out << "working_width=" << nr.working_width << '\n';
+    out << "passes=" << nr.active_passes << '/' << nr.requested_passes << '\n';
     out << "working_height=" << nr.working_height << '\n';
     out << "intermediate_vram_bytes=" << nr.intermediate_vram_bytes << '\n';
     return out.str();
