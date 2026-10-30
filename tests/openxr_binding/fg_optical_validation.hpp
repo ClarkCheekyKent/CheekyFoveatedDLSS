@@ -254,14 +254,18 @@ inline void fg_optical_cache_validation(bool options=false){
     auto a=upload11(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4),b=upload11(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4),z=upload11(DXGI_FORMAT_R32_FLOAT,depth.data(),4);
     ComPtr<ID3D11ShaderResourceView> depth_view;check(SUCCEEDED(device11->CreateShaderResourceView(z.Get(),nullptr,&depth_view)),"Cache depth view");
     auto views=shader11_fixture::eye_views(XrSwapchain(1),XrSwapchain(2));for(auto& v:views)v.subImage.imageRect.extent={edge,edge};
+    constexpr float fractions[]{.25f,.5f,.75f};
+    std::vector<unsigned> methods{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth};
+    // Private-device flow (shared fences) and the game-context fallback.
+    for(bool private_flow:{true,false}){
     Backend11 native;check(native.initialize(device11.Get(),7,nullptr),native.diagnostic);
+    if(private_flow)check(native.flow_device!=nullptr,native.flow_reason);else native.use_game_context_flow();
+    const char* path=private_flow?"private device":"game context";
     std::array<Image,2> previous,current;std::array<std::shared_ptr<Backend11::Guides>,2> guides;
     for(unsigned eye=0;eye<2;++eye){previous[eye]=native.copy(a.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);current[eye]=native.copy(b.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
         guides[eye]=std::make_shared<Backend11::Guides>();guides[eye]->depth_srv=depth_view;
         auto& g=guides[eye]->source.meta;g.width=g.height=edge;g.focus_width=g.focus_height=1;g.peripheral_method=cheeky_fg_previous;g.optical.center_grid=4;
     }
-    constexpr float fractions[]{.25f,.5f,.75f};
-    std::vector<unsigned> methods{cheeky_fg_optical_flow,cheeky_fg_optical_fast,cheeky_fg_optical_depth,cheeky_fg_optical_fast_depth};
     for(unsigned method:methods)for(unsigned validation=0;validation<(options?3u:1u);++validation){
         std::array<std::vector<std::uint32_t>,3> reference;
         for(bool replay:{false,true})for(unsigned phase=0;phase<3;++phase){
@@ -274,6 +278,8 @@ inline void fg_optical_cache_validation(bool options=false){
     }
     D3D11_TEXTURE2D_DESC input_desc{};native.optical[0][0].textures[0]->GetDesc(&input_desc);
     check(input_desc.Format==optical::input_format(),"D3D11 estimation input remains RGB for every method");
+    check(bool(native.optical[0][0].own_inputs[0])==private_flow&&bool(input_desc.MiscFlags&D3D11_RESOURCE_MISC_SHARED_NTHANDLE)==private_flow,
+        "Private flow shares the RGB inputs; the fallback keeps them on the game device");
     // Four optical jobs, three live deferred phases. Publish in reverse order
     // after further generation, so accidental pool reuse cannot hide behind
     // immediate readback or phase order.
@@ -292,6 +298,12 @@ inline void fg_optical_cache_validation(bool options=false){
     const auto warmed_allocations=allocations11();
     for(unsigned phase=0;phase<3;++phase)check(native.generate(previous,current,guides,guides,views,views,extra11,false,fractions[phase]),native.diagnostic);
     check(allocations11()==warmed_allocations,"Steady-state optical generation reuses texture/SRV/UAV allocations");
+    // A newer pair (reversed motion) is estimated while the older phases are
+    // unpublished: it must not overwrite the vectors they reconstruct from.
+    {std::array<Image,2> later,newer;for(unsigned eye=0;eye<2;++eye)later[eye]=native.copy(a.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+        check(native.generate(current,later,guides,guides,views,views,newer,true),native.diagnostic);
+        const auto& sets=native.optical[0][0].sets;
+        if(private_flow)check(std::count_if(sets.begin(),sets.end(),[](const auto& s){return s.use_count()>1;})==2,"Private flow estimates a newer pair into a second flow set");}
     std::array<ComPtr<ID3D11Texture2D>,3> targets11;
     D3D11_TEXTURE2D_DESC target_desc{};a->GetDesc(&target_desc);target_desc.BindFlags|=D3D11_BIND_RENDER_TARGET;
     for(auto& target:targets11)check(SUCCEEDED(device11->CreateTexture2D(&target_desc,nullptr,&target)),"Batched publication destination");
@@ -302,7 +314,8 @@ inline void fg_optical_cache_validation(bool options=false){
         near_equal(old,read11(device11.Get(),context.Get(),targets11[2].Get()));
     }
     deferred11={};
-    std::cout<<"PASS D3D11 batched four-pass optical flow, pooled live G1/G2/G3 and stereo/auxiliary publication\n";
+    std::cout<<"PASS D3D11 batched four-pass optical flow ("<<path<<"), pooled live G1/G2/G3 and stereo/auxiliary publication\n";
+    }
     ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;check(SUCCEEDED(device11.As(&dxgi))&&SUCCEEDED(dxgi->GetAdapter(&adapter)),"Cache adapter");
     fg_parity::D3D12 gpu(adapter.Get());
     auto old12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4,edge),now12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4,edge);

@@ -6,8 +6,11 @@
 #include "fg_matrices.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "../shared/cheeky_fg_shader11.hpp"
+#include <d3d11_4.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <mutex>
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -105,6 +108,45 @@ inline bool compile(const char* entry,const char* profile,ComPtr<ID3DBlob>& code
     if(bytes.empty()||FAILED(D3DCreateBlob(bytes.size(),&code)))return false;
     std::memcpy(code->GetBufferPointer(),bytes.data(),bytes.size());return true;
 }
+// Private D3D11 device for the optical-flow engine. Flow queued on the game's
+// device counted toward its frame-latency throttle (its Present blocked until
+// our OFA work retired) and ordered the game's next frame after it. The game
+// context and this device order their work through two shared fences.
+struct FlowDevice11 {
+    ComPtr<ID3D11Device5> device;ComPtr<ID3D11DeviceContext4> context,game_context;ComPtr<ID3D11Device1> game_device;
+    ComPtr<ID3D11Fence> game_fence,game_view; // Signaled by the game context; game_view is this device's handle.
+    ComPtr<ID3D11Fence> flow_fence,flow_view; // Signaled by this context; flow_view is the game device's handle.
+    std::uint64_t game_value{}; // Game immediate-context guard.
+    std::uint64_t flow_value{}; // mx.
+    std::mutex mx; // This device's immediate context. Taken after, never before, the game context guard.
+    char reason[160]{};
+    bool create(ID3D11Device* dev,ID3D11DeviceContext* ctx) noexcept {
+        auto fail=[&](const char* what,HRESULT hr){snprintf(reason,sizeof(reason),"%s (0x%08lx)",what,static_cast<unsigned long>(hr));
+            game_fence.Reset();game_view.Reset();flow_fence.Reset();flow_view.Reset();context.Reset();device.Reset();return false;};
+        ComPtr<ID3D11Device5> game5;HRESULT hr=dev->QueryInterface(IID_PPV_ARGS(&game5));if(FAILED(hr))return fail("game device has no D3D11 fences",hr);
+        if(FAILED(hr=ctx->QueryInterface(IID_PPV_ARGS(&game_context)))||FAILED(hr=game5.As(&game_device)))return fail("game context has no D3D11 fences",hr);
+        ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;
+        if(FAILED(hr=dev->QueryInterface(IID_PPV_ARGS(&dxgi)))||FAILED(hr=dxgi->GetAdapter(&adapter)))return fail("adapter lookup",hr);
+        const D3D_FEATURE_LEVEL level=D3D_FEATURE_LEVEL_11_0;ComPtr<ID3D11Device> created;ComPtr<ID3D11DeviceContext> immediate;
+        if(FAILED(hr=D3D11CreateDevice(adapter.Get(),D3D_DRIVER_TYPE_UNKNOWN,nullptr,0,&level,1,D3D11_SDK_VERSION,&created,nullptr,&immediate)))return fail("private device",hr);
+        if(FAILED(hr=created.As(&device))||FAILED(hr=immediate.As(&context)))return fail("private device has no D3D11 fences",hr);
+        auto open=[&](ID3D11Device5* owner,ID3D11Device5* other,ComPtr<ID3D11Fence>& fence,ComPtr<ID3D11Fence>& view){HANDLE handle{};
+            HRESULT result=owner->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&fence));
+            if(SUCCEEDED(result))result=fence->CreateSharedHandle(nullptr,GENERIC_ALL,nullptr,&handle);
+            if(SUCCEEDED(result)){result=other->OpenSharedFence(handle,IID_PPV_ARGS(&view));CloseHandle(handle);}
+            return result;};
+        if(FAILED(hr=open(game5.Get(),device.Get(),game_fence,game_view)))return fail("shared game fence",hr);
+        if(FAILED(hr=open(device.Get(),game5.Get(),flow_fence,flow_view)))return fail("shared flow fence",hr);
+        return true;
+    }
+    // A texture of this device and the game device's view of the same memory.
+    bool shared(D3D11_TEXTURE2D_DESC d,ComPtr<ID3D11Texture2D>& own,ComPtr<ID3D11Texture2D>& game) noexcept {
+        d.MiscFlags|=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;ComPtr<IDXGIResource1> resource;HANDLE handle{};
+        if(FAILED(device->CreateTexture2D(&d,nullptr,&own))||FAILED(own.As(&resource))||
+           FAILED(resource->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,nullptr,&handle)))return false;
+        const bool ok=SUCCEEDED(game_device->OpenSharedResource1(handle,IID_PPV_ARGS(&game)));CloseHandle(handle);return ok;
+    }
+};
 struct Error {
     char diagnostic[384]{"NVIDIA Optical Flow: waiting for color history"};
     bool fail(const char* stage,unsigned status=0){sprintf_s(diagnostic,"NVIDIA Optical Flow: %s (0x%x); native presentation continues",stage,status);return false;}
@@ -130,6 +172,41 @@ struct Session11 : Error {
     bool cache_ready{};unsigned cache_builds{};
     unsigned width{},height{},preset{},grid{4};std::uint64_t old_id{},new_id{};
     float crop[4]{};bool history{},initialized{};
+    // Private flow (flow set): the engine runs on flow->device. textures[0..1]
+    // are the game device's views of shared inputs; vectors live in flow sets.
+    FlowDevice11* flow{};
+    ComPtr<ID3D11Texture2D> own_inputs[2];
+    std::atomic<std::uint64_t> inputs_consumed{}; // Flow fence value after the engine read the inputs.
+    // One pair's vectors/costs. The game context reads a set at publication
+    // while the engine already estimates the next pair into another one.
+    struct FlowSet {
+        std::array<ComPtr<ID3D11Texture2D>,4> own,textures;std::array<ComPtr<ID3D11ShaderResourceView>,4> views;
+        std::array<NvOFGPUBufferHandle,4> buffers{};
+        std::array<ComPtr<ID3D11Texture2D>,2> cache;std::array<ComPtr<ID3D11ShaderResourceView>,2> cache_views;
+        std::array<ComPtr<ID3D11UnorderedAccessView>,2> cache_uavs;
+        bool cache_ready{}; // Game context guard; reset only while no draw holds the set.
+        std::atomic<std::uint64_t> ready{},released{}; // Flow fence after estimation; game fence after the last read.
+    };
+    std::vector<std::shared_ptr<FlowSet>> sets;
+    std::shared_ptr<FlowSet> current;
+    // Created by initialize() (game guard, then flow->mx): game-device calls
+    // never run while only flow->mx is held. Current pair, a newer pair and two
+    // pairs with unpublished phases.
+    static constexpr unsigned flow_sets=4;
+    bool create_set(){
+        auto s=std::make_shared<FlowSet>();
+        for(unsigned i=0;i<4;++i){D3D11_TEXTURE2D_DESC d{};d.Width=(width+grid-1)/grid;d.Height=(height+grid-1)/grid;d.ArraySize=d.MipLevels=1;d.SampleDesc.Count=1;
+            d.Format=i<2?DXGI_FORMAT_R16G16_SINT:DXGI_FORMAT_R8_UINT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+            if(!flow->shared(d,s->own[i],s->textures[i])||FAILED(device->CreateShaderResourceView(s->textures[i].Get(),nullptr,&s->views[i])))return fail("shared flow buffer");
+            if(const auto status=api.nvOFRegisterResourceD3D11(handle,s->own[i].Get(),&s->buffers[i])){
+                for(unsigned j=0;j<i;++j)api.nvOFUnregisterResourceD3D11(s->buffers[j]);return fail("flow buffer registration",status);}
+        }
+        sets.push_back(std::move(s));return true;
+    }
+    std::shared_ptr<FlowSet> acquire_set(){
+        for(auto& s:sets)if(s.use_count()==1)return s;
+        fail("every flow set is still held by unpublished frames");return {};
+    }
     // Rebuilding a session (driver init, registrations, shader compiles)
     // stalls generation for seconds. The current session samples any flow
     // window at its own size; it is rebuilt only once a different size has
@@ -142,21 +219,26 @@ struct Session11 : Error {
     }
     Session11()=default;Session11(const Session11&)=delete;Session11& operator=(const Session11&)=delete;
     ~Session11(){reset();}
+    // Hold flow->mx when flow is set. Draws keep their sets' game views alive.
     void reset(){
         for(auto& b:buffers)if(b){api.nvOFUnregisterResourceD3D11(b);b=nullptr;}
+        for(auto& s:sets)for(auto& b:s->buffers)if(b){api.nvOFUnregisterResourceD3D11(b);b=nullptr;}
         if(handle){api.nvOFDestroy(handle);handle=nullptr;}
+        sets.clear();current.reset();for(auto& t:own_inputs)t.Reset();inputs_consumed=0;
         for(auto& t:textures)t.Reset();for(auto& v:views)v.Reset();for(auto& v:input_uavs)v.Reset();for(auto& v:cache_uavs)v.Reset();
         cache_shader.Reset();cache_ready=false;cache_builds=0;constants_buffer.Reset();outputs.clear();
         device.Reset();prepare_shader.Reset();interpolate_shader.Reset();sampler.Reset();old_id=new_id=0;history=false;initialized=false;
     }
     bool initialize(ID3D11Device* dev,ID3D11DeviceContext* context,unsigned w,unsigned h,unsigned quality,unsigned cells){
         if(initialized&&device.Get()==dev&&preset==quality&&grid==cells&&keep_size(w,h))return true;
+        std::unique_lock<std::mutex> engine;if(flow)engine=std::unique_lock(flow->mx);
         if(initialized)++rebuilds;size_mismatch=0;
         reset();auto dll=module();if(!dll)return fail("driver API unavailable",GetLastError());
         using Create=decltype(&NvOFAPICreateInstanceD3D11);auto create=reinterpret_cast<Create>(GetProcAddress(dll,"NvOFAPICreateInstanceD3D11"));
         if(!create)return fail("D3D11 API unavailable");
         auto status=create(NV_OF_API_VERSION,&api);if(status)return fail("D3D11 API version",status);
-        status=api.nvCreateOpticalFlowD3D11(dev,context,&handle);if(status)return fail("D3D11 device unsupported",status);
+        status=flow?api.nvCreateOpticalFlowD3D11(flow->device.Get(),flow->context.Get(),&handle):api.nvCreateOpticalFlowD3D11(dev,context,&handle);
+        if(status)return fail("D3D11 device unsupported",status);
         device=dev;width=w;height=h;preset=quality;grid=cells;
         if(!supported(handle,api.nvOFGetCaps,w,h))return fail("flow dimensions unsupported");
         if(!supports_grid(handle,api.nvOFGetCaps,cells))return fail("vector grid unsupported by this GPU; use 4x4",cells);
@@ -167,10 +249,15 @@ struct Session11 : Error {
             D3D11_TEXTURE2D_DESC d{};d.Width=i<2?w:(w+cells-1)/cells;d.Height=i<2?h:(h+cells-1)/cells;d.ArraySize=d.MipLevels=1;d.SampleDesc.Count=1;
             d.Format=i<2?format:i<4?DXGI_FORMAT_R16G16_SINT:DXGI_FORMAT_R8_UINT;
             d.BindFlags=D3D11_BIND_SHADER_RESOURCE|(i<2?D3D11_BIND_UNORDERED_ACCESS:0);
+            if(flow){if(i>=2)continue;
+                if(!flow->shared(d,own_inputs[i],textures[i])||FAILED(dev->CreateShaderResourceView(textures[i].Get(),nullptr,&views[i]))||
+                   FAILED(dev->CreateUnorderedAccessView(textures[i].Get(),nullptr,&input_uavs[i])))return fail("shared input");
+                status=api.nvOFRegisterResourceD3D11(handle,own_inputs[i].Get(),&buffers[i]);if(status)return fail("buffer registration",status);continue;}
             if(FAILED(dev->CreateTexture2D(&d,nullptr,&textures[i]))||FAILED(dev->CreateShaderResourceView(textures[i].Get(),nullptr,&views[i])))return fail("buffer allocation");
             if(i<2&&FAILED(dev->CreateUnorderedAccessView(textures[i].Get(),nullptr,&input_uavs[i])))return fail("input view");
             status=api.nvOFRegisterResourceD3D11(handle,textures[i].Get(),&buffers[i]);if(status)return fail("buffer registration",status);
         }
+        if(flow)for(unsigned i=0;i<flow_sets;++i)if(!create_set())return false;
         ComPtr<ID3DBlob> code;if(!compile("Prepare","cs_5_0",code)||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&prepare_shader)))return fail("input shader");
         code.Reset();if(!compile("Interpolate","cs_5_0",code)||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&interpolate_shader)))return fail("interpolation shader");
         D3D11_SAMPLER_DESC s{};s.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;s.AddressU=s.AddressV=s.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;s.MaxLOD=D3D11_FLOAT32_MAX;
@@ -193,6 +280,8 @@ struct Session11 : Error {
         needed=old_id!=previous_id||new_id!=current_id;
         if(needed){
             cache_ready=false;
+            // The engine may still read the previous pair's inputs.
+            if(flow)flow->game_context->Wait(flow->flow_view.Get(),inputs_consumed.load());
             if(!bind(ctx,c))return false;
             ID3D11ShaderResourceView* srvs[]{old,now};ID3D11UnorderedAccessView* uavs[]{input_uavs[0].Get(),input_uavs[1].Get()};
             ctx->CSSetShader(prepare_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,2,srvs);ctx->CSSetUnorderedAccessViews(0,2,uavs,nullptr);
@@ -207,7 +296,12 @@ struct Session11 : Error {
             // endpoint must be this interval's previous endpoint.
             in.disableTemporalHints=(!history||reset_history||new_id!=previous_id||memcmp(crop,c.flow_rect,sizeof(crop)))?NV_OF_TRUE:NV_OF_FALSE;
             NV_OF_EXECUTE_OUTPUT_PARAMS out{};out.outputBuffer=buffers[2];out.bwdOutputBuffer=buffers[3];out.outputCostBuffer=buffers[4];out.bwdOutputCostBuffer=buffers[5];
+            // Private flow (hold flow->mx): write a set no publication still reads.
+            std::shared_ptr<FlowSet> set;
+            if(flow){set=acquire_set();if(!set)return false;flow->context->Wait(flow->game_view.Get(),set->released.load());
+                out.outputBuffer=set->buffers[0];out.bwdOutputBuffer=set->buffers[1];out.outputCostBuffer=set->buffers[2];out.bwdOutputCostBuffer=set->buffers[3];}
             auto status=api.nvOFExecute(handle,&in,&out);if(status)return fail("flow execution",status);
+            if(set){set->cache_ready=false;set->ready=0;current=std::move(set);}
             old_id=previous_id;new_id=current_id;std::copy_n(c.flow_rect,4,crop);history=true;
         }
         return true;
@@ -232,27 +326,31 @@ struct Session11 : Error {
     // depth is the captured R32 depth snapshot when c.flags[2] enables it.
     bool reconstruct(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* old,ID3D11ShaderResourceView* now,ID3D11ShaderResourceView* depth,
         OpticalConstants c,float fraction,ComPtr<ID3D11Texture2D>& result,ComPtr<ID3D11ShaderResourceView>& result_view,
-        std::shared_ptr<Output>* lease=nullptr){
+        std::shared_ptr<Output>* lease=nullptr,FlowSet* set=nullptr){
         auto* dev=device.Get();
-        if(cached(c)&&!cache_ready){
+        // A flow set (private flow) carries its own vectors and packed cache.
+        auto* field_views=set?set->views.data():views.data()+2;
+        auto* cache_textures=set?set->cache.data():textures.data()+6;auto* cache_views=set?set->cache_views.data():views.data()+6;
+        auto* cache_targets=set?set->cache_uavs.data():cache_uavs;bool& packed=set?set->cache_ready:cache_ready;
+        if(cached(c)&&!packed){
             if(!cache_shader){ComPtr<ID3DBlob> code;
                 if(!compile("CacheVectors","cs_5_0",code)||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&cache_shader)))return fail("vector cache shader");}
-            for(unsigned i=0;i<2;++i)if(!textures[6+i]){
+            for(unsigned i=0;i<2;++i)if(!cache_textures[i]){
                 D3D11_TEXTURE2D_DESC d{};d.Width=(width+grid-1)/grid;d.Height=(height+grid-1)/grid;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;
                 d.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
-                if(FAILED(dev->CreateTexture2D(&d,nullptr,&textures[6+i]))||FAILED(dev->CreateShaderResourceView(textures[6+i].Get(),nullptr,&views[6+i]))||
-                   FAILED(dev->CreateUnorderedAccessView(textures[6+i].Get(),nullptr,&cache_uavs[i])))return fail("vector cache allocation");
+                if(FAILED(dev->CreateTexture2D(&d,nullptr,&cache_textures[i]))||FAILED(dev->CreateShaderResourceView(cache_textures[i].Get(),nullptr,&cache_views[i]))||
+                   FAILED(dev->CreateUnorderedAccessView(cache_textures[i].Get(),nullptr,&cache_targets[i])))return fail("vector cache allocation");
             }
             if(!bind(ctx,c))return false;
-            ID3D11ShaderResourceView* fields[]{views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get()};
-            ID3D11UnorderedAccessView* targets[]{cache_uavs[0].Get(),cache_uavs[1].Get()};
+            ID3D11ShaderResourceView* fields[]{field_views[0].Get(),field_views[1].Get(),field_views[2].Get(),field_views[3].Get()};
+            ID3D11UnorderedAccessView* targets[]{cache_targets[0].Get(),cache_targets[1].Get()};
             ctx->CSSetShader(cache_shader.Get(),nullptr,0);ctx->CSSetShaderResources(2,4,fields);ctx->CSSetUnorderedAccessViews(0,2,targets,nullptr);
-            ctx->Dispatch(((width+grid-1)/grid+7)/8,((height+grid-1)/grid+7)/8,1);unbind(ctx);cache_ready=true;++cache_builds;
+            ctx->Dispatch(((width+grid-1)/grid+7)/8,((height+grid-1)/grid+7)/8,1);unbind(ctx);packed=true;++cache_builds;
         }
         auto generated=output(unsigned(c.sizes[2]),unsigned(c.sizes[3]),lease!=nullptr);if(!generated)return false;
         result=generated->texture;result_view=generated->view;if(lease)*lease=generated;
         c.flags[0]=fraction;if(!bind(ctx,c))return false;
-        ID3D11ShaderResourceView* srvs[]{old,now,views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get(),depth,views[6].Get(),views[7].Get()};auto* uav=generated->target.Get();
+        ID3D11ShaderResourceView* srvs[]{old,now,field_views[0].Get(),field_views[1].Get(),field_views[2].Get(),field_views[3].Get(),depth,cache_views[0].Get(),cache_views[1].Get()};auto* uav=generated->target.Get();
         ctx->CSSetShader(interpolate_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,9,srvs);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
         ctx->Dispatch((generated->width+7)/8,(generated->height+7)/8,1);unbind(ctx);
         strcpy_s(diagnostic,"NVIDIA Optical Flow: generating");return true;

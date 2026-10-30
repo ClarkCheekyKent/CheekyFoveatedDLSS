@@ -10,7 +10,11 @@ inline bool BufferedPresenter::setup11(XrSession s,const XrFns& f,ID3D11Device* 
         // SINGLETHREADED devices are not free-threaded: creating resources
         // from presenter threads would then be unsafe.
         sprintf_s(message,"FG native D3D11 backend: shader interpolation with shared pacing; no D3D12 bridge or NGX; device_flags=0x%x",
-            dev->GetCreationFlags());trace(message);}
+            dev->GetCreationFlags());trace(message);
+        char path[256]{};
+        if(native11->flow_device)strcpy_s(path,"FG native D3D11 optical flow: private device (shared fences; game context converts inputs and reconstructs at publication)");
+        else sprintf_s(path,"FG native D3D11 optical flow: game context (private device unavailable: %s)",native11->flow_reason);
+        trace(path);}
     return true;
 }
 
@@ -196,11 +200,16 @@ struct BufferedBackend11 final : FrameBackend {
                 pair.submitted_at=TimingClock::now();
                 pair.generated_count=std::clamp(job->multiplier,2u,4u)-1;
                 success=true;
+                // Private optical flow reconstructs at publication, straight into the OpenXR image:
+                // a reconstruction queued now would order the game's next frame after the engine.
+                const auto& g=now[0]->source.meta;
+                const bool deferred=owner.direct11_requested.load()||(owner.native11->flow_device&&
+                    cheeky_fg_uses_flow(g.center_method,g.peripheral_method,g.focus_width<.999f||g.focus_height<.999f));
                 for(unsigned index=0;index<pair.generated_count&&success;++index){
                     pair.generated_index=index;
                     auto& output=index?pair.extra_generated[index-1]:pair.generated;
                     success=owner.native11->generate(previous->color,job->color,before,now,previous->views,job->views,output,
-                        owner.direct11_requested.load(),float(index+1)/float(pair.generated_count+1));
+                        deferred,float(index+1)/float(pair.generated_count+1));
                     if(success){
                         pair.submitted_at=TimingClock::now();
                         // announce_generated_phase reads pair.generated. Swap

@@ -22,6 +22,10 @@ namespace cheeky::fg {
 // One immediate context orders every stage, so no fences are needed: a frame
 // is "ready" as soon as its commands are queued.
 struct Backend11 {
+    // Optical flow runs on a private device when available (declared first:
+    // the sessions are destroyed before it). Otherwise on the game context.
+    std::unique_ptr<optical::FlowDevice11> flow_device;
+    char flow_reason[160]{};
     optical::Session11 optical[2][2];
     std::array<float,4> optical_quad_regions[2]; // Latched by quad capture before this frame's metadata.
     struct Guides {
@@ -101,7 +105,16 @@ struct Backend11 {
         if(FAILED(dev->CreateBuffer(&cb,nullptr,&draw_constants)))return false;
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
-        return SUCCEEDED(dev->CreateSamplerState(&sd,&sampler));
+        if(FAILED(dev->CreateSamplerState(&sd,&sampler)))return false;
+        auto flow=std::make_unique<optical::FlowDevice11>();
+        if(flow->create(dev,context.Get())){flow_device=std::move(flow);for(auto& eye:optical)for(auto& pass:eye)pass.flow=flow_device.get();}
+        else strcpy_s(flow_reason,flow->reason);
+        return true;
+    }
+    // Validation: run optical flow on the game context, as without D3D11 fences.
+    void use_game_context_flow() {
+        for(auto& eye:optical)for(auto& pass:eye){if(flow_device){std::lock_guard lock(flow_device->mx);pass.reset();}pass.flow=nullptr;}
+        flow_device.reset();strcpy_s(flow_reason,"disabled for validation");
     }
     // Copies do not change pipeline bindings. In particular, the presentation
     // thread must not switch the game's entire context state just to upload
@@ -303,12 +316,30 @@ struct Backend11 {
         Image previous,current;
         std::shared_ptr<Guides> old_guides,new_guides;
         Constants constants;
-        ComPtr<ID3D11Texture2D> optical_color[2];
-        ComPtr<ID3D11ShaderResourceView> optical_view[2];
-        std::shared_ptr<optical::Session11::Output> optical_lease[2];
+        // Private flow reconstructs right before the draw (mutable: at publication).
+        mutable ComPtr<ID3D11Texture2D> optical_color[2];
+        mutable ComPtr<ID3D11ShaderResourceView> optical_view[2];
+        mutable std::shared_ptr<optical::Session11::Output> optical_lease[2];
+        struct Region {optical::Session11* session;unsigned pass;std::shared_ptr<optical::Session11::FlowSet> set;OpticalConstants params;ComPtr<ID3D11ShaderResourceView> depth;};
+        std::vector<Region> regions;float fraction{.5f};
         D3D11_TEXTURE2D_DESC desc{};
         ShaderTimings11::Ticket timing;unsigned timing_part{};
     };
+    // Hold the context guard. Waits for the pair's vectors from the private
+    // device, then records each region's reconstruction for record_draw().
+    bool reconstruct_regions(ID3D11DeviceContext* commands,const DeferredDraw& draw) {
+        std::uint64_t ready{};for(const auto& r:draw.regions)ready=std::max(ready,r.set->ready.load());
+        if(ready)flow_device->game_context->Wait(flow_device->flow_view.Get(),ready);
+        for(const auto& r:draw.regions)if(!r.session->reconstruct(commands,draw.previous->srv11.Get(),draw.current->srv11.Get(),r.depth.Get(),r.params,draw.fraction,
+            draw.optical_color[r.pass],draw.optical_view[r.pass],&draw.optical_lease[r.pass],r.set.get())){strcpy_s(diagnostic,r.session->diagnostic);return false;}
+        return true;
+    }
+    // After recorded reads of flow sets: the engine may overwrite them once this signal passes.
+    void release_regions(const std::vector<const DeferredDraw*>& draws) {
+        if(!flow_device||std::none_of(draws.begin(),draws.end(),[](const DeferredDraw* d){return d&&!d->regions.empty();}))return;
+        const auto value=++flow_device->game_value;flow_device->game_context->Signal(flow_device->game_fence.Get(),value);
+        for(const auto* d:draws)if(d)for(const auto& r:d->regions)r.set->released=std::max(r.set->released.load(),value);
+    }
     void record_draw(ID3D11DeviceContext* commands,const DeferredDraw& draw,ID3D11RenderTargetView* target) {
         commands->UpdateSubresource(draw_constants.Get(),0,nullptr,&draw.constants,0,0);
         auto* cb=draw_constants.Get();auto* ss=sampler.Get();
@@ -392,6 +423,56 @@ struct Backend11 {
             targets[eye]=out[eye]->rtv11;
         }
         bool needs_flow=false;
+        const unsigned focused=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
+        if(!jobs.empty()&&flow_device){
+            // Private flow: the game context converts the inputs and signals;
+            // the engine runs on the private device; reconstruction waits for
+            // its signal right before each draw. Center regions first.
+            std::stable_sort(jobs.begin(),jobs.end(),[](const OpticalJob& a,const OpticalJob& b){return a.pass<b.pass;});
+            std::uint64_t inputs_ready{};
+            if(!submit_shader([&](ID3D11DeviceContext* commands){
+                optical_timing=optical_timings.reserve(device.Get(),1,draws[0]->desc.Width,draws[0]->desc.Height,focused_eyes,meta.peripheral_method,meta.configuration);
+                optical_measured=optical_timings.begin(commands,optical_timing,0);
+                const bool prepared=measure_cpu(prepare_cpu,[&]{
+                    for(auto& job:jobs){auto& session=optical[job.eye][job.pass];
+                        if(!session.prepare(commands,previous[job.eye]->srv11.Get(),current[job.eye]->srv11.Get(),
+                            previous[job.eye]->identity,current[job.eye]->identity,job.quality,job.params,job.needed)){
+                            strcpy_s(diagnostic,session.diagnostic);return false;}
+                        needs_flow|=job.needed;}
+                    return true;});
+                if(optical_measured){optical_timings.end(commands,optical_timing,0);optical_measured=false;}
+                cancel.armed=false;
+                if(prepared&&needs_flow){inputs_ready=++flow_device->game_value;
+                    flow_device->game_context->Signal(flow_device->game_fence.Get(),inputs_ready);flush_commands();}
+                return prepared;},false))return false;
+            // The engine context is never entered while the game context guard is held.
+            if(needs_flow&&!measure_cpu(flow_cpu,[&]{
+                std::lock_guard engine(flow_device->mx);auto* engine_context=flow_device->context.Get();
+                engine_context->Wait(flow_device->game_view.Get(),inputs_ready);bool executed=true;
+                for(auto& job:jobs)if(job.needed&&executed){auto& session=optical[job.eye][job.pass];
+                    if(!session.execute(previous[job.eye]->identity,current[job.eye]->identity,job.params,job.reset)){
+                        strcpy_s(diagnostic,session.diagnostic);executed=false;}}
+                // Signal even after a failure: every wait handed out must complete.
+                const auto value=++flow_device->flow_value;engine_context->Signal(flow_device->flow_fence.Get(),value);engine_context->Flush();
+                for(auto& job:jobs)if(job.needed){auto& session=optical[job.eye][job.pass];session.inputs_consumed=value;
+                    if(executed&&session.current)session.current->ready=value;}
+                return executed;}))return false;
+            for(const auto& job:jobs){auto& session=optical[job.eye][job.pass];if(!session.current){strcpy_s(diagnostic,session.diagnostic);return false;}
+                draws[job.eye]->regions.push_back({&session,job.pass,session.current,job.params,job.depth});}
+            for(auto& draw:draws)draw->fraction=fraction;
+            if(deferred_output)return submit([&](ID3D11DeviceContext*){
+                auto timing=gpu_timings.reserve(device.Get(),2,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
+                for(unsigned eye=0;eye<2;++eye){draws[eye]->timing=timing;draws[eye]->timing_part=eye;}
+                return true;},false);
+            return submit_shader([&](ID3D11DeviceContext* commands){
+                auto timing=gpu_timings.reserve(device.Get(),1,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
+                const bool measured=gpu_timings.begin(commands,timing,0);bool recorded=true;
+                for(unsigned eye=0;eye<2&&recorded;++eye){recorded=reconstruct_regions(commands,*draws[eye]);if(recorded)record_draw(commands,*draws[eye],targets[eye].Get());}
+                if(measured)gpu_timings.end(commands,timing,0);
+                release_regions({draws[0].get(),draws[1].get()});
+                for(auto& draw:draws)for(auto& lease:draw->optical_lease)lease.reset();
+                return recorded;},true);
+        }
         if(!jobs.empty()){
             // Queue every conversion before the SDK sees any of the inputs.
             if(!submit_shader([&](ID3D11DeviceContext* commands){
@@ -414,7 +495,6 @@ struct Backend11 {
                 return true;
             });},false))return false;
         }
-        const unsigned focused=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
         return submit_shader([&](ID3D11DeviceContext* commands){
             if(!jobs.empty()&&!measure_cpu(reconstruct_cpu,[&]{
                 for(const auto& job:jobs){auto& session=optical[job.eye][job.pass];auto& draw=*draws[job.eye];
@@ -447,9 +527,11 @@ struct Backend11 {
         ComPtr<ID3D11RenderTargetView> rtv;if(FAILED(device->CreateRenderTargetView(target,&view,&rtv)))return false;
         return submit_shader([&](ID3D11DeviceContext* commands){
             const bool measured=gpu_timings.begin(commands,draw->timing,draw->timing_part);
-            record_draw(commands,*draw,rtv.Get());
+            const bool recorded=draw->regions.empty()||reconstruct_regions(commands,*draw);
+            if(recorded)record_draw(commands,*draw,rtv.Get());
             if(measured)gpu_timings.end(commands,draw->timing,draw->timing_part);
-            return true;},true);
+            release_regions({draw});for(auto& lease:draw->optical_lease)lease.reset();
+            return recorded;},true);
     }
     // Copies an immutable frame into an acquired OpenXR image (presentation thread).
     bool upload(ID3D11Texture2D* target,const Image& source) {
@@ -474,14 +556,17 @@ struct Backend11 {
         }
         if(images.empty())return true;
         const auto record=[&](ID3D11DeviceContext* commands){
-            for(size_t i=0;i<images.size();++i){const auto& [target,source]=images[i];
+            std::vector<const DeferredDraw*> drawn;bool recorded=true;
+            for(size_t i=0;i<images.size()&&recorded;++i){const auto& [target,source]=images[i];
                 if(const auto* draw=deferred(source)){
-                    const bool measured=gpu_timings.begin(commands,draw->timing,draw->timing_part);
-                    record_draw(commands,*draw,targets[i].Get());
+                    const bool measured=gpu_timings.begin(commands,draw->timing,draw->timing_part);drawn.push_back(draw);
+                    recorded=draw->regions.empty()||reconstruct_regions(commands,*draw);
+                    if(recorded)record_draw(commands,*draw,targets[i].Get());
                     if(measured)gpu_timings.end(commands,draw->timing,draw->timing_part);
-                }else if(!upload_timings.measure(device.Get(),commands,0,1,[&]{commands->CopyResource(target,source->texture11.Get());return true;}))return false;
+                }else recorded=upload_timings.measure(device.Get(),commands,0,1,[&]{commands->CopyResource(target,source->texture11.Get());return true;});
             }
-            return true;
+            release_regions(drawn);for(const auto* draw:drawn)for(auto& lease:draw->optical_lease)lease.reset();
+            return recorded;
         };
         return shaders?submit_shader(record,flush):submit(record,flush);
     }

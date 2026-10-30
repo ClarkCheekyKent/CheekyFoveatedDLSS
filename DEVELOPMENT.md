@@ -436,12 +436,32 @@ default evaluation order unless roles are assigned manually.
 
 ## Native D3D11 optical scheduling
 
-The native D3D11 path batches RGB preparation across left/right center/periphery,
-flushes once when a new pair needs flow, then calls the four independent SDK
-sessions under the existing dispatch/context protection. Reconstruction for all
-regions and the final stereo draws share a submission. Subsequent generated
-phases reuse the pair's flow and packed vectors. These remain ordered immediate
-context commands; the SDK controls optical-engine synchronization.
+The SDK orders the context it was created with after the optical engine. On the
+game's device that made the game's next frame wait for our flow: in Titanfall 2
+(GPU trace, 2x, 120 Hz) the game's first packet of frame N+1 followed the last
+OFA packet of frame N by 0.2 ms in every cycle, the flat-window Present thread
+blocked in the kernel meanwhile, and the 3D engine idled about 3.5 ms per frame
+(81% of its idle time overlapped OFA), holding 55 native fps. Release points
+cannot change this.
+
+The engine therefore runs on a private D3D11 device on the same adapter
+(`optical::FlowDevice11`). The game context converts left/right center/periphery
+inputs into shared textures, signals a shared game fence and flushes once. The
+private context waits for that value, executes the regions (centers first) and
+signals a shared flow fence. Vectors and costs land in per-pair flow sets, so a
+newer pair is estimated while older phases are unpublished; a set is rewritten
+only after the game fence signaled after its last publication read. The game
+context waits for the flow fence immediately before reconstruction, and the next
+conversion waits until the engine consumed the previous inputs. The engine
+context is entered without holding the game context guard. Generated optical
+frames are therefore always deferred: reconstruction and the draw into the
+OpenXR image run at publication, regardless of `FgDirectXrOutput`. Subsequent
+generated phases reuse the pair's flow set and packed vectors.
+
+Without D3D11 fences (pre-1703 runtimes) or when the private device cannot be
+created, flow stays on the game context: preparation, the four SDK calls and
+reconstruction are ordered immediate-context commands as before. The layer log
+records the path at presenter start (`FG native D3D11 optical flow: ...`).
 
 Optical outputs pool texture/SRV/UAV sets with leases held by deferred draws.
 Unpublished G1/G2/G3 cannot share a writable allocation. Constant buffers use
@@ -465,8 +485,9 @@ the API itself, and `end_frame` includes its gate, API and post-call flush. Stag
 and publication values are CPU timings, not GPU durations. Means use independent
 60-sample windows; counters and optical allocation/reuse counts are cumulative.
 
-Validate with `--fg-optical-cache` (four optical passes, retained deferred phases,
-steady allocation reuse and mixed stereo/UI publication) and `--fg-shader11`
+Validate with `--fg-optical-cache` (both flow paths: four optical passes, retained
+deferred phases across a newer pair's estimation, steady allocation reuse and
+mixed stereo/UI publication) and `--fg-shader11`
 (pixel parity, runtime image order, partial-acquire cleanup and pacing).
 
 ## DX12 generated-frame scheduling and timing
