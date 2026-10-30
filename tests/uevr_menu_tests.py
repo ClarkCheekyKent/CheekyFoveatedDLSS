@@ -242,7 +242,7 @@ def run(engine):
             assert g["values"]["Cache optical vector/confidence data (center)"] is None
             assert g["values"]["Cache optical vector/confidence data (periphery)"] is None
             assert g["values"]["RGB optical flow input"] is None
-            assert (g["values"]["Center optical flow validation"] is not None) == (method >= 5)
+            assert g["values"]["Center optical flow validation"] is None
             assert g["values"]["Full-eye optical flow estimation"] is None
             if method >= 5:
                 assert g.tree_parents["Advanced settings"] is not None
@@ -273,9 +273,7 @@ def run(engine):
                                   ("Center optical flow resolution", "FgOpticalCenterPercent", 75),
                                   ("Periphery optical flow resolution", "FgOpticalPeripheralPercent", 25),
                                   ("Center optical flow vector grid", "FgOpticalCenterGrid", 1),
-                                  ("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", 2),
-                                  ("Center optical flow validation", "FgOpticalCenterValidation", 1),
-                                  ("Periphery optical flow validation", "FgOpticalPeripheralValidation", 2)):
+                                  ("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", 2)):
             draw(changes={label: value})
             assert f"{key}={value}" in last()
             state["request"] = state["applied_request"] = int(last().splitlines()[1])

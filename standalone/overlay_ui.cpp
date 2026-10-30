@@ -953,8 +953,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
         fg_percent("Center optical flow resolution",s.optical.center_percent);
         optical_grid("Center optical flow vector grid",s.optical.center_grid);
-        combo("Center optical flow validation",s.optical.center_validation,"Method default\0Image agreement\0Combined\0");
-        if(s.optical.center_validation)ImGui::TextWrapped("Image agreement compares the motion warp with a camera-aligned blend. Combined also retains vector confidence; depth guidance remains active when selected.");
     }
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
@@ -979,7 +977,6 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
             combo("Periphery optical flow preset",s.optical.peripheral_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
             fg_percent("Periphery optical flow resolution",s.optical.peripheral_percent);
             optical_grid("Periphery optical flow vector grid",s.optical.peripheral_grid);
-            combo("Periphery optical flow validation",s.optical.peripheral_validation,"Method default\0Image agreement\0Combined\0");
         }
         ImGui::Checkbox("Show blue FG region border", &s.show_border);
     }

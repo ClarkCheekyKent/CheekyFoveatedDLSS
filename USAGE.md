@@ -346,23 +346,19 @@ vector/cost data once per native frame pair and reuse it across generated phases
 The foveated center estimates motion over its cropped region plus a halo.
 There is no extra full-eye estimation override.
 
-The Frame Gen tab exposes independent validation choices:
-
-- **Center/Periphery optical flow validation** (`FgOpticalCenterValidation` and
-  `FgOpticalPeripheralValidation`): **Method default** (`0`) keeps the selected
-  interpolator's existing checks; **Image agreement** (`1`) compares the warped
-  frames with a camera-aligned blend, replacing cost/forward-backward confidence
-  in confidence-guided methods; **Combined** (`2`) adds that comparison to the
-  existing checks. All optical reconstruction methods support the comparison,
-  including depth variants and cached vectors. Head rotation is accounted for
-  when valid camera poses are available; otherwise the baseline is unwarped.
+Optical flow validation always uses image agreement in both regions: the warped
+frames are compared with a camera-aligned blend, replacing cost/forward-backward
+confidence in confidence-guided methods. All optical reconstruction methods use
+it, including depth variants and cached vectors. Head rotation is accounted for
+when valid camera poses are available; otherwise the baseline is unwarped.
 
 Optical presets, input resolution and vector grid remain independently selectable
 for both regions. For a controlled quality comparison, try Medium, 50%, 4x4 in
 both regions, then change one option at a time. Image validation can favor a
 camera-aligned blend where estimated motion disagrees with the colors; compare
 moving edges and occlusions in the game as well as generation time. Retired RGB,
-cache and full-eye settings in older profiles are ignored and omitted when saved.
+cache, full-eye and validation settings (`FgOpticalCenterValidation`,
+`FgOpticalPeripheralValidation`) in older profiles are ignored and omitted when saved.
 Update the runtime, menu script and OpenXR layer together.
 
 **DLSS-G preset** selects **Preset A**, **Preset B**, or **Preset C**

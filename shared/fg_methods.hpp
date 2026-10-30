@@ -43,5 +43,6 @@ struct CheekyFgOpticalSettings {
     std::uint32_t center_preset{1},peripheral_preset{2}; // 0 slow, 1 medium, 2 fast.
     std::uint32_t center_percent{100},peripheral_percent{50}; // Input dimensions, independent of FG output scale.
     std::uint32_t center_grid{4},peripheral_grid{4}; // One vector per grid x grid flow-input pixels: 1, 2 or 4.
-    std::uint32_t center_validation{},peripheral_validation{}; // 0 method default, 1 image agreement, 2 combined.
+    // Always 1 (image agreement) from the runtime; 0 method default and 2 combined remain for shader tests.
+    std::uint32_t center_validation{1},peripheral_validation{1};
 };

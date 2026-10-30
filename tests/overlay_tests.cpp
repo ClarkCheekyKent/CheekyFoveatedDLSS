@@ -194,8 +194,9 @@ void test_ui_diagnostics() {
     text=render("Frame Gen (Experimental)",false);
     require(text.find("RGB optical flow input")==text.npos&&text.find("Full-eye optical flow estimation")==text.npos&&
         text.find("Cache optical vector/confidence data")==text.npos&&
-        text.find("Center optical flow validation")!=text.npos&&text.find("Periphery optical flow validation")!=text.npos,
-        "Optical tuning remains visible with fixed RGB/cache policy and no full-eye option");
+        text.find("Center optical flow validation")==text.npos&&text.find("Periphery optical flow validation")==text.npos&&
+        text.find("Center optical flow preset")!=text.npos&&text.find("Periphery optical flow preset")!=text.npos,
+        "Optical tuning remains visible with fixed RGB/cache/validation policy and no full-eye option");
     state.draft.fg.center_method=0;state.draft.fg.peripheral_method=1;
     text=render("Frame Gen (Experimental)",false);
     require(text.find("RGB optical flow input")==text.npos&&text.find("Center optical flow validation")==text.npos,
