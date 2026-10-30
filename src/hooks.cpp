@@ -394,6 +394,9 @@ CRITICAL_SECTION streamline_evaluation_lock{};
 std::atomic<bool> streamline_hook_lock_ready{};
 std::atomic<bool> streamline_inline_mode{};
 std::atomic<bool> streamline_inline_install_failed{};
+// Which Streamline exports the inline hooks carry (kStreamlineImports bits).
+// An export whose inline hook did not install keeps its import patch.
+std::atomic<unsigned> streamline_inline_hooked{};
 InlineHook inline_sl_evaluate{};
 InlineHook inline_sl_set_tag{};
 InlineHook inline_sl_set_tag_for_frame{};
@@ -5604,6 +5607,85 @@ void bootstrap_streamline_options_hook() noexcept {
         static_cast<void>(capture_streamline_options_target(target));
 }
 
+// The Streamline exports this add-on intercepts: the import name, its detour
+// and its bit in streamline_inline_hooked.
+struct StreamlineImport {
+    const char* name;
+    const void* detour;
+    unsigned bit;
+};
+constexpr unsigned kStreamlineEvaluate = 1U, kStreamlineSetTag = 2U,
+    kStreamlineSetTagForFrame = 4U, kStreamlineSetConstants = 8U,
+    kStreamlineGetFeature = 16U;
+const StreamlineImport kStreamlineImports[] = {
+    {"slEvaluateFeature", reinterpret_cast<const void*>(&hook_sl_evaluate_feature), kStreamlineEvaluate},
+    {"slSetTag", reinterpret_cast<const void*>(&hook_sl_set_tag), kStreamlineSetTag},
+    {"slSetTagForFrame", reinterpret_cast<const void*>(&hook_sl_set_tag_for_frame), kStreamlineSetTagForFrame},
+    {"slSetConstants", reinterpret_cast<const void*>(&hook_sl_set_constants), kStreamlineSetConstants},
+    {"slGetFeatureFunction", reinterpret_cast<const void*>(&hook_sl_get_feature_function), kStreamlineGetFeature},
+};
+
+// Whether the inline hook on this export is in place, so its import slot can
+// be left to the export.
+[[nodiscard]] bool streamline_inline_carries(const char* const function_name) noexcept {
+    const auto hooked = streamline_inline_hooked.load(std::memory_order_acquire);
+    for (const auto& import : kStreamlineImports)
+        if (std::strcmp(function_name, import.name) == 0) return (hooked & import.bit) != 0U;
+    return false;
+}
+
+// Import slots patched while the inline hooks were unavailable send the host's
+// calls straight to the detours, past the exports. Once an inline hook is in
+// place it carries those calls, so that export's slots go back to the export.
+void restore_streamline_import_slots() noexcept {
+    const auto hooked = streamline_inline_hooked.load(std::memory_order_acquire);
+    unsigned restored{};
+    AcquireSRWLockExclusive(&patch_lock);
+    for (std::size_t index{}; index < patched_slot_count;) {
+        auto& patch = patched_slots[index];
+        bool ours{};
+        MEMORY_BASIC_INFORMATION memory{};
+        if (patch.slot != nullptr &&
+            VirtualQuery(patch.slot, &memory, sizeof(memory)) != 0U &&
+            memory.State == MEM_COMMIT) {
+            for (const auto& import : kStreamlineImports)
+                ours |= *patch.slot == import.detour && (hooked & import.bit) != 0U;
+        }
+        DWORD old_protection{};
+        if (!ours ||
+            !VirtualProtect(
+                patch.slot,
+                sizeof(*patch.slot),
+                PAGE_READWRITE,
+                &old_protection
+            )) {
+            ++index;
+            continue;
+        }
+        InterlockedExchangePointer(
+            reinterpret_cast<PVOID volatile*>(patch.slot),
+            patch.original
+        );
+        DWORD ignored{};
+        VirtualProtect(
+            patch.slot,
+            sizeof(*patch.slot),
+            old_protection,
+            &ignored
+        );
+        ++restored;
+        patch = patched_slots[--patched_slot_count];
+        patched_slots[patched_slot_count] = {};
+    }
+    ReleaseSRWLockExclusive(&patch_lock);
+    if (restored != 0U) {
+        trace_event(
+            "Streamline import slots restored to the exports count=%u",
+            restored
+        );
+    }
+}
+
 [[nodiscard]] bool install_streamline_inline_hooks() noexcept {
     if (streamline_inline_mode.load(std::memory_order_acquire)) return true;
     if (streamline_inline_install_failed.load(std::memory_order_acquire)) {
@@ -5675,7 +5757,13 @@ void bootstrap_streamline_options_hook() noexcept {
         set_constants ? "yes" : "no",
         get_feature ? "yes" : "no"
     );
+    streamline_inline_hooked.store(!essential ? 0U :
+        (evaluate ? kStreamlineEvaluate : 0U) | (set_tag ? kStreamlineSetTag : 0U) |
+        (set_tag_for_frame ? kStreamlineSetTagForFrame : 0U) |
+        (set_constants ? kStreamlineSetConstants : 0U) | (get_feature ? kStreamlineGetFeature : 0U),
+        std::memory_order_release);
     streamline_inline_mode.store(essential, std::memory_order_release);
+    if (essential) restore_streamline_import_slots();
     diagnostic_note_streamline_detected();
     if (essential) diagnostic_note_direct_detour(DiagnosticApi::d3d12);
     return essential;
@@ -5708,6 +5796,7 @@ void uninstall_streamline_inline_hooks() noexcept {
     }
     streamline_hook_lock_ready.store(false, std::memory_order_release);
     streamline_inline_mode.store(false, std::memory_order_release);
+    streamline_inline_hooked.store(0U, std::memory_order_release);
     streamline_inline_install_failed.store(false, std::memory_order_release);
     real_sl_evaluate_feature.store(nullptr, std::memory_order_release);
     real_sl_set_tag.store(nullptr, std::memory_order_release);
@@ -6392,6 +6481,21 @@ void remember_original(
     const bool streamline = _wcsicmp(target_name, L"sl.interposer.dll") == 0;
     if (streamline) {
         diagnostic_note_streamline_detected();
+        // With the inline hook on an sl.interposer.dll export in place, the
+        // host's calls reach the detour through that export. Leave its import
+        // slot alone: a slot pointing straight at a detour carries the call
+        // past anything hooked on the export after this add-on (OFXR Bridge
+        // reads the camera from slSetConstants that way). A slot is patched
+        // only while its export's inline hook is unavailable.
+        if (streamline_inline_carries(function_name)) {
+            static std::atomic<bool> noted{};
+            if (!noted.exchange(true, std::memory_order_acq_rel)) {
+                trace_event(
+                    "Streamline imports left unpatched; the inline export hooks carry them"
+                );
+            }
+            return original;
+        }
 #define CHEEKY_REPLACE_SL(export_name, storage, hook) \
         if (std::strcmp(function_name, export_name) == 0) { \
             remember_original( \
