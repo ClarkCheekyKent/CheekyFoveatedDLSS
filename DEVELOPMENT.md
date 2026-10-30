@@ -447,8 +447,15 @@ Optical outputs pool texture/SRV/UAV sets with leases held by deferred draws.
 Unpublished G1/G2/G3 cannot share a writable allocation. Constant buffers use
 ordered updates, and private composition targets retain their RTVs. Publication
 acquires/waits for the changed stereo/UI images, records their copies or deferred
-draws together, flushes once, then releases each image. Every runtime call retains
-its post-call flush (required for runtime fence progress when the game stops).
+draws together, releases each image, then flushes once. That flush also submits
+work the runtime queued during acquire/wait/release (required for runtime fence
+progress when the game stops). An image wait first uses a 1 ms timeout; if it
+expires the batch flushes and then waits without a timeout, so a runtime that
+frees the image through queued context work cannot deadlock. Each flush of the
+game's immediate context costs about 0.5 ms of presenter CPU, and the earlier
+per-call flushes (ten per stereo/UI publication) took about 5 ms of every
+8.3 ms 120 Hz slot, which held 2x output near 112 fps. Other runtime calls
+(chain creation, xrEndFrame) keep their post-call flush.
 
 The layer log emits `FG native11 CPU ms` every two seconds. `gate` includes the
 dispatch and immediate-context lock wait; `hold` covers submission work including

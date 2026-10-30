@@ -126,19 +126,26 @@ inline bool BufferedPresenter::upload_batch11(const std::vector<std::pair<Chain*
         if(!chain||!ensure_chain11(*chain,source)){prepared=false;break;}
         if(chain->uploaded==source->identity)continue;
         unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if(XR_FAILED(native11->runtime_submit([&]{return xr.acquire(chain->handle,&acquire,&index);}))) {prepared=false;break;}
+        if(XR_FAILED(native11->runtime_call([&]{return xr.acquire(chain->handle,&acquire,&index);}))) {prepared=false;break;}
         acquired.push_back({chain,source,index});
-        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-        const auto wait_begin=TimingClock::now();const auto result=native11->runtime_submit([&]{return xr.wait_image(chain->handle,&wait);});
+        // The image is normally free already. If a runtime needs work it queued
+        // on the context to free it, a short wait times out: flush, then block.
+        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=1000000;
+        const auto wait_begin=TimingClock::now();auto result=native11->runtime_call([&]{return xr.wait_image(chain->handle,&wait);});
+        if(result==XR_TIMEOUT_EXPIRED){native11->flush();wait.timeout=XR_INFINITE_DURATION;
+            result=native11->runtime_call([&]{return xr.wait_image(chain->handle,&wait);});}
         {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-        if(XR_FAILED(result)||index>=chain->images11.size()){prepared=false;break;}
+        if(XR_FAILED(result)||result==XR_TIMEOUT_EXPIRED||index>=chain->images11.size()){prepared=false;break;}
         destinations.emplace_back(chain->images11[index].texture,source);
     }
-    const bool copied=prepared&&native11->publish_images(destinations);bool released=true;
+    const bool copied=prepared&&native11->publish_images(destinations,false);bool released=true;
     // Release every acquired image even when a later eye failed. A failed batch
     // never advances uploaded identities; retry must copy the complete stereo set.
     for(auto& image:acquired){XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        const bool ok=XR_SUCCEEDED(native11->runtime_submit([&]{return xr.release(image.chain->handle,&release);}));released&=ok;}
+        const bool ok=XR_SUCCEEDED(native11->runtime_call([&]{return xr.release(image.chain->handle,&release);}));released&=ok;}
+    // One flush submits the draws/copies and any runtime work queued by the
+    // acquire/wait/release calls, so runtime fences progress if the game stops.
+    if(!acquired.empty())native11->flush();
     if(copied&&released)for(const auto& image:acquired){image.chain->uploaded=image.source->identity;image.chain->last_uploaded_index=image.index;}
     return copied&&released;
 }

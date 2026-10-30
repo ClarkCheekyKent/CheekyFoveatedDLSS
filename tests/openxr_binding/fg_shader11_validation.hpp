@@ -442,8 +442,8 @@ void fg_shader11_validation(bool hardware=false){
         Runtime::upload_submission=&presenter.native11->submissions;Runtime::required_submission=submissions+1;
         const std::vector<std::pair<BufferedPresenter::Chain*,Image>> batch{{&chains[0],a},{&chains[1],b},{&chains[2],a}};
         check(presenter.upload_batch11(batch),"Publish native11 stereo/UI");
-        check(presenter.native11->submissions==submissions+1&&presenter.native11->flushes==flushes+10,
-            "One copy batch and all nine runtime-call flushes are retained");
+        check(presenter.native11->submissions==submissions+1&&presenter.native11->flushes==flushes+1,
+            "One copy batch and one flush after the runtime image calls");
         check(pixel(chains[0].images11[0].texture,32,32)[0]>250&&pixel(chains[1].images11[0].texture,32,32)[2]>250,"Stereo batch keeps distinct eye pixels");
         const auto unchanged=presenter.native11->flushes;
         check(presenter.upload_batch11(batch)&&presenter.native11->flushes==unchanged,"Repeated native11 images issue no uploads or runtime calls");

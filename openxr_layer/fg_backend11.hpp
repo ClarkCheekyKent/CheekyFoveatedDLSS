@@ -137,11 +137,14 @@ struct Backend11 {
     // it. Our threads are not the application, so flush here: otherwise the
     // runtime's next xrWaitFrame can wait forever once the game stops
     // submitting (disabling frame generation hung DCS on Virtual Desktop).
-    template<class Submit> auto runtime_submit(Submit&& submit) {
+    template<class Submit> auto runtime_submit(Submit&& submit) {auto result=runtime_call(submit);flush();return result;}
+    // Gated runtime call whose caller owns the trailing flush. Each flush of the
+    // game's immediate context costs ~0.5 ms; a batch flushes once before it returns.
+    template<class Submit> auto runtime_call(Submit&& submit) {
         const auto wait_start=TimingClock::now();
         std::unique_lock<std::recursive_mutex> serialized;if(dispatch)serialized=std::unique_lock(*dispatch);
         sample_cpu(runtime_gate,elapsed_ms(wait_start));const auto start=TimingClock::now();
-        auto result=submit();sample_cpu(runtime_cpu,elapsed_ms(start));flush();return result;
+        auto result=submit();sample_cpu(runtime_cpu,elapsed_ms(start));return result;
     }
     void flush_commands(){const auto start=TimingClock::now();context->Flush();sample_cpu(flush_cpu,elapsed_ms(start));}
     void flush() noexcept {if(context&&protection){const auto start=TimingClock::now();Guard guard(protection.Get());sample_cpu(flush_gate,elapsed_ms(start));flush_commands();}}
@@ -455,8 +458,8 @@ struct Backend11 {
             c->CopyResource(target,source->texture11.Get());return true;});},true);
     }
     // Publish stereo and auxiliary images with one context entry and one flush.
-    // Runtime acquire/wait/release calls retain their own required flushes.
-    bool publish_images(const std::vector<std::pair<ID3D11Texture2D*,Image>>& images){
+    // upload_batch11 passes flush=false and flushes once after releasing the images.
+    bool publish_images(const std::vector<std::pair<ID3D11Texture2D*,Image>>& images,bool flush=true){
         std::vector<ComPtr<ID3D11RenderTargetView>> targets(images.size());bool shaders=false;
         for(size_t i=0;i<images.size();++i){auto* target=images[i].first;const auto& source=images[i].second;
             if(!target||!source)return false;
@@ -480,7 +483,7 @@ struct Backend11 {
             }
             return true;
         };
-        return shaders?submit_shader(record,true):submit(record,true);
+        return shaders?submit_shader(record,flush):submit(record,flush);
     }
 };
 }
