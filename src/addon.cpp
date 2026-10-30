@@ -968,6 +968,7 @@ void load_settings_from_reshade() noexcept {
     for (std::size_t i = 0; i < settings.nr_extra_passes.size(); ++i) {
         auto& pass = settings.nr_extra_passes[i];
         const auto key = [i](const char* name) { return "NrPass" + std::to_string(i + 2U) + name; };
+        static_cast<void>(reshade::get_config_value(nullptr, config_section, key("SameAsPass1").c_str(), pass.same_as_pass1));
         static_cast<void>(reshade::get_config_value(nullptr, config_section, key("Style").c_str(), pass.style));
         static_cast<void>(reshade::get_config_value(nullptr, config_section, key("Intensity").c_str(), pass.intensity));
         static_cast<void>(reshade::get_config_value(nullptr, config_section,
@@ -1157,6 +1158,7 @@ void save_settings_to_reshade(const Settings& settings) noexcept {
     for (std::size_t i = 0; i < settings.nr_extra_passes.size(); ++i) {
         const auto& pass = settings.nr_extra_passes[i];
         const auto key = [i](const char* name) { return "NrPass" + std::to_string(i + 2U) + name; };
+        reshade::set_config_value(nullptr, config_section, key("SameAsPass1").c_str(), pass.same_as_pass1);
         reshade::set_config_value(nullptr, config_section, key("Style").c_str(), pass.style);
         reshade::set_config_value(nullptr, config_section, key("Intensity").c_str(), pass.intensity);
         reshade::set_config_value(nullptr, config_section,
@@ -1515,22 +1517,12 @@ void draw_sr_controls(Settings& settings, bool& changed) {
     }
 }
 
-// A later pass either follows a pass 1 value (negative) or overrides it.
 // Commit on release: each tuning change recreates that pass's NGX feature.
-void pass_override_slider(const char* const label, float& value, const float pass1,
-        const float high, bool& changed) {
+void pass_slider(const char* const label, float& value, const float high, bool& changed) {
     static ImGuiID editing{};
     static float draft{};
-    ImGui::PushID(label);
-    bool same = value < 0.0F;
-    if (ImGui::Checkbox("Same as pass 1", &same)) {
-        value = same ? -1.0F : pass1;
-        changed = true;
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(same);
-    const auto id = ImGui::GetID("value");
-    float shown = editing == id ? draft : same ? pass1 : value;
+    const auto id = ImGui::GetID(label);
+    float shown = editing == id ? draft : value;
     if (ImGui::SliderFloat(label, &shown, 0.0F, high, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
         draft = shown;
         editing = id;
@@ -1540,8 +1532,32 @@ void pass_override_slider(const char* const label, float& value, const float pas
         editing = 0;
         changed = true;
     }
+}
+
+void draw_nr_extra_pass(Settings& settings, const std::uint32_t number, bool& changed) {
+    auto& pass = settings.nr_extra_passes[number - 2U];
+    const auto label = "Pass " + std::to_string(number) + " settings";
+    if (!ImGui::TreeNode(label.c_str())) return;
+    if (ImGui::Checkbox("Same as pass 1", &pass.same_as_pass1)) {
+        // Start editing from pass 1's values.
+        if (!pass.same_as_pass1) pass = {false, settings.nr_style, settings.nr_intensity,
+            settings.nr_local_structure_strength, settings.nr_local_tone_strength};
+        changed = true;
+    }
+    const bool same = pass.same_as_pass1;
+    auto shown = same ? nr_pass1_tuning(settings) : pass;
+    ImGui::BeginDisabled(same);
+    int style = static_cast<int>(shown.style);
+    if (ImGui::Combo("DLSS-NR style", &style, "Standard\0Natural\0Cinematic\0")) {
+        shown.style = static_cast<std::uint32_t>(style);
+        changed = true;
+    }
+    pass_slider("Intensity", shown.intensity, 1.0F, changed);
+    pass_slider("Local structure strength", shown.local_structure_strength, 2.0F, changed);
+    pass_slider("Local tone strength", shown.local_tone_strength, 2.0F, changed);
     ImGui::EndDisabled();
-    ImGui::PopID();
+    if (!same) pass = shown;
+    ImGui::TreePop();
 }
 
 void draw_nr_pass_controls(Settings& settings, bool& changed) {
@@ -1552,29 +1568,8 @@ void draw_nr_pass_controls(Settings& settings, bool& changed) {
         changed = true;
     }
     ImGui::TextDisabled("Each extra pass refines the previous one and costs about one more NR evaluation.");
-    if (settings.nr_passes < 2U) return;
-    static int edited_pass = 2;
-    edited_pass = std::clamp(edited_pass, 2, static_cast<int>(settings.nr_passes));
-    if (settings.nr_passes > 2U) {
-        int index = edited_pass - 2;
-        if (ImGui::Combo("Edit pass", &index, "Pass 2\0Pass 3\0")) edited_pass = index + 2;
-    } else {
-        ImGui::TextDisabled("Pass 2 tuning");
-    }
-    auto& pass = settings.nr_extra_passes[static_cast<std::size_t>(edited_pass - 2)];
-    ImGui::PushID(edited_pass);
-    int style = pass.style + 1;
-    if (ImGui::Combo("DLSS-NR style", &style, "Same as pass 1\0Standard\0Natural\0Cinematic\0")) {
-        pass.style = style - 1;
-        changed = true;
-    }
-    pass_override_slider("Intensity", pass.intensity, settings.nr_intensity, 1.0F, changed);
-    pass_override_slider("Local structure strength", pass.local_structure_strength,
-        settings.nr_local_structure_strength, 2.0F, changed);
-    pass_override_slider("Local tone strength", pass.local_tone_strength,
-        settings.nr_local_tone_strength, 2.0F, changed);
-    ImGui::TextDisabled("Local tone starts at 0 so lighting changes do not stack.");
-    ImGui::PopID();
+    for (std::uint32_t number = 2U; number <= settings.nr_passes; ++number)
+        draw_nr_extra_pass(settings, number, changed);
 }
 
 void draw_nr_controls(Settings& settings, bool& changed) {
@@ -1705,7 +1700,7 @@ void draw_nr_controls(Settings& settings, bool& changed) {
         0.0F, 1.0F, "%.2f"
     );
     ImGui::TextDisabled("0 = no model edit, 1 = full model edit.");
-    if (ImGui::TreeNode("Advanced DLSS-NR tuning")) {
+    if (ImGui::TreeNode("Additional settings")) {
         deferred_slider(
             "Local tone strength", settings.nr_local_tone_strength, drafts.local_tone, drafts.editing_local_tone,
             0.0F, 2.0F, "%.2f"

@@ -13,13 +13,13 @@ namespace cheeky::foveated_dlss {
 inline constexpr std::uint32_t max_nr_passes = 3U;
 
 // Tuning for a later DLSS-NR pass, which refines the previous pass's model
-// output inside the same region. A negative value inherits pass 1. Local tone
-// defaults to zero so broad lighting edits do not compound across passes.
+// output inside the same region. By default it uses pass 1's tuning.
 struct NrExtraPass {
-    std::int32_t style{-1};
-    float intensity{-1.0F};
-    float local_structure_strength{-1.0F};
-    float local_tone_strength{0.0F};
+    bool same_as_pass1{true};
+    std::uint32_t style{};
+    float intensity{1.0F};
+    float local_structure_strength{1.0F};
+    float local_tone_strength{1.0F};
     bool operator==(const NrExtraPass&) const = default;
 };
 
@@ -173,17 +173,23 @@ struct Settings {
     std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{};
 };
 
+// Pass 1's tuning in the form a later pass stores it.
+[[nodiscard]] inline NrExtraPass nr_pass1_tuning(const Settings& settings) noexcept {
+    return {true, settings.nr_style, settings.nr_intensity,
+        settings.nr_local_structure_strength, settings.nr_local_tone_strength};
+}
+
 // Model settings for one pass; pass 0 is the configured first pass. Inputs
 // that describe the game (depth, motion, HDR transfer) always follow pass 1.
 [[nodiscard]] inline Settings nr_pass_settings(const Settings& settings, const std::uint32_t pass) noexcept {
     auto result = settings;
     if (pass == 0U || pass > settings.nr_extra_passes.size()) return result;
     const auto& extra = settings.nr_extra_passes[pass - 1U];
-    if (extra.style >= 0) result.nr_style = static_cast<std::uint32_t>(extra.style);
-    if (extra.intensity >= 0.0F) result.nr_intensity = extra.intensity;
-    if (extra.local_structure_strength >= 0.0F)
-        result.nr_local_structure_strength = extra.local_structure_strength;
-    if (extra.local_tone_strength >= 0.0F) result.nr_local_tone_strength = extra.local_tone_strength;
+    if (extra.same_as_pass1) return result;
+    result.nr_style = extra.style;
+    result.nr_intensity = extra.intensity;
+    result.nr_local_structure_strength = extra.local_structure_strength;
+    result.nr_local_tone_strength = extra.local_tone_strength;
     return result;
 }
 

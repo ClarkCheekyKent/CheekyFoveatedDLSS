@@ -55,17 +55,17 @@ std::array<unsigned,8> quad_saved_roles{};unsigned quad_saved_source_count{}; //
 std::uint32_t nr_passes{1U}; // settings_mutex
 std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{}; // settings_mutex
 
-// Negative values mean "inherit pass 1"; anything else is clamped like pass 1.
+// Clamp a later pass's tuning to pass 1's ranges.
 NrExtraPass sanitized_extra_pass(const NrExtraPass& pass) noexcept {
-    const auto tuning = [](float value, float hi) {
-        if (!std::isfinite(value)) return -1.0F;
-        return value < 0.0F ? -1.0F : (std::min)(value, hi);
+    const auto tuning = [](float value, float hi, float fallback) {
+        return std::isfinite(value) ? std::clamp(value, 0.0F, hi) : fallback;
     };
     return {
-        pass.style < 0 ? -1 : (std::min)(pass.style, 2),
-        tuning(pass.intensity, 1.0F),
-        tuning(pass.local_structure_strength, 2.0F),
-        tuning(pass.local_tone_strength, 2.0F),
+        pass.same_as_pass1,
+        (std::min)(pass.style, 2U),
+        tuning(pass.intensity, 1.0F, 1.0F),
+        tuning(pass.local_structure_strength, 2.0F, 1.0F),
+        tuning(pass.local_tone_strength, 2.0F, 1.0F),
     };
 }
 std::atomic<bool> independent_openxr_gaze{false};

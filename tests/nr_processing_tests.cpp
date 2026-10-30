@@ -76,14 +76,14 @@ int run_nr_processing_tests() {
         {
             auto settings = saved_settings;
             settings.nr_passes = 9U;
-            settings.nr_extra_passes[0] = {7, 5.0F, -0.5F, 1.25F};
-            settings.nr_extra_passes[1] = {-4, std::nanf(""), 3.0F, -2.0F};
+            settings.nr_extra_passes[0] = {false, 7U, 5.0F, -0.5F, 1.25F};
+            settings.nr_extra_passes[1] = {true, 1U, std::nanf(""), 3.0F, -2.0F};
             update_settings(settings);
             const auto actual = current_settings();
             update_settings(saved_settings);
-            const NrExtraPass second{2, 1.0F, -1.0F, 1.25F}, third{-1, -1.0F, 2.0F, -1.0F};
+            const NrExtraPass second{false, 2U, 1.0F, 0.0F, 1.25F}, third{true, 1U, 1.0F, 2.0F, 0.0F};
             require(actual.nr_passes == max_nr_passes && actual.nr_extra_passes[0] == second &&
-                actual.nr_extra_passes[1] == third, "NR pass settings were not clamped or kept inherit markers");
+                actual.nr_extra_passes[1] == third, "NR pass settings were not clamped");
         }
         // A static point moves only by its raster jitter in Before color.
         // Verify all four color/MV domain combinations, including signed axes.

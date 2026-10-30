@@ -147,7 +147,7 @@ std::string settings_text(const Settings& s) {
     out << "nr_passes=" << s.nr_passes << '\n';
     for (std::size_t i = 0; i < s.nr_extra_passes.size(); ++i) {
         const auto& pass = s.nr_extra_passes[i];
-        out << "nr_pass" << i + 2U << "=style:" << pass.style << " intensity:" << pass.intensity
+        out << "nr_pass" << i + 2U << "=same_as_pass1:" << pass.same_as_pass1 << " style:" << pass.style << " intensity:" << pass.intensity
             << " structure:" << pass.local_structure_strength << " tone:" << pass.local_tone_strength << '\n';
     }
     return out.str();

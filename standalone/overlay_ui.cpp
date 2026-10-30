@@ -239,18 +239,22 @@ void draw_gaze(Settings& s) {
     }
 }
 
-// A later pass either follows a pass 1 value (negative) or overrides it.
-void pass_override_slider(const char* label, float& value, float pass1, float high) {
-    ImGui::PushID(label);
-    ImGui::TextUnformatted(label);
-    bool same = value < 0.0F;
-    if (ImGui::Checkbox("Same as pass 1", &same)) value = same ? -1.0F : pass1;
+void draw_nr_extra_pass(Settings& s, std::uint32_t number) {
+    auto& pass = s.nr_extra_passes[number - 2U];
+    const auto label = "Pass " + std::to_string(number) + " settings";
+    if (!ImGui::TreeNode(label.c_str())) return;
+    if (ImGui::Checkbox("Same as pass 1", &pass.same_as_pass1) && !pass.same_as_pass1)
+        pass = {false, s.nr_style, s.nr_intensity, s.nr_local_structure_strength, s.nr_local_tone_strength};
+    const bool same = pass.same_as_pass1;
+    auto shown = same ? nr_pass1_tuning(s) : pass;
     ImGui::BeginDisabled(same);
-    float shown = same ? pass1 : value;
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::SliderFloat("##value", &shown, 0.0F, high, "%.2f", ImGuiSliderFlags_AlwaysClamp)) value = shown;
+    combo("DLSS-NR style", shown.style, "Standard\0Natural\0Cinematic\0");
+    slider("Intensity", shown.intensity, 0.0F, 1.0F);
+    slider("Local structure strength", shown.local_structure_strength, 0.0F, 2.0F);
+    slider("Local tone strength", shown.local_tone_strength, 0.0F, 2.0F);
     ImGui::EndDisabled();
-    ImGui::PopID();
+    if (!same) pass = shown;
+    ImGui::TreePop();
 }
 
 void draw_nr_passes(Settings& s) {
@@ -259,25 +263,7 @@ void draw_nr_passes(Settings& s) {
     combo("Model passes", index, "1\0" "2\0" "3\0");
     s.nr_passes = index + 1U;
     ImGui::TextWrapped("Each extra pass refines the previous one and costs about one more NR evaluation.");
-    if (s.nr_passes < 2U) return;
-    static int edited_pass = 2;
-    edited_pass = std::clamp(edited_pass, 2, static_cast<int>(s.nr_passes));
-    if (s.nr_passes > 2U) {
-        int pass_index = edited_pass - 2;
-        combo("Edit pass", pass_index, "Pass 2\0Pass 3\0");
-        edited_pass = pass_index + 2;
-    }
-    auto& pass = s.nr_extra_passes[static_cast<std::size_t>(edited_pass - 2)];
-    ImGui::PushID(edited_pass);
-    int style = pass.style + 1;
-    combo("DLSS-NR style", style, "Same as pass 1\0Standard\0Natural\0Cinematic\0");
-    pass.style = style - 1;
-    pass_override_slider("Intensity", pass.intensity, s.nr_intensity, 1.0F);
-    pass_override_slider("Local structure strength", pass.local_structure_strength,
-        s.nr_local_structure_strength, 2.0F);
-    pass_override_slider("Local tone strength", pass.local_tone_strength, s.nr_local_tone_strength, 2.0F);
-    ImGui::TextDisabled("Local tone starts at 0 so lighting changes do not stack.");
-    ImGui::PopID();
+    for (std::uint32_t number = 2U; number <= s.nr_passes; ++number) draw_nr_extra_pass(s, number);
 }
 
 void draw_nr(Settings& s, bool quad) {
@@ -305,7 +291,7 @@ void draw_nr(Settings& s, bool quad) {
     slider("Working scale", s.nr_working_scale, .1F, 1.0F);
     combo("DLSS-NR style", s.nr_style, "Standard\0Natural\0Cinematic\0");
     slider("Intensity", s.nr_intensity, 0.0F, 1.0F);
-    if (ImGui::TreeNode("Advanced neural rendering")) {
+    if (ImGui::TreeNode("Additional settings")) {
         slider("Local tone strength", s.nr_local_tone_strength, 0.0F, 2.0F);
         slider("Local structure strength", s.nr_local_structure_strength, 0.0F, 2.0F);
         ImGui::Checkbox("Automatic mask", &s.nr_automatic_mask);
