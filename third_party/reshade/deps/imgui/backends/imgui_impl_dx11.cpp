@@ -442,7 +442,7 @@ bool    ImGui_ImplDX11_CreateDeviceObjects()
 
     // Create the vertex shader
     {
-        static const char* vertexShader =
+        static constexpr char vertexShader[] =
             "cbuffer vertexBuffer : register(b0) \
             {\
               float4x4 ProjectionMatrix; \
@@ -471,7 +471,8 @@ bool    ImGui_ImplDX11_CreateDeviceObjects()
             }";
 
         ID3DBlob* vertexShaderBlob;
-        if (FAILED(D3DCompile(vertexShader, strlen(vertexShader), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, &vertexShaderBlob, nullptr)))
+        static_assert(cheeky::fg::bytecode::source_hash(vertexShader)==cheeky::fg::bytecode::overlay_vertex11_source_hash);
+        if (FAILED(cheeky_overlay_vertex11_blob(&vertexShaderBlob)))
             return false; // NB: Pass ID3DBlob* pErrorBlob to D3DCompile() to get error showing in (const char*)pErrorBlob->GetBufferPointer(). Make sure to Release() the blob!
         if (bd->pd3dDevice->CreateVertexShader(vertexShaderBlob->GetBufferPointer(), vertexShaderBlob->GetBufferSize(), nullptr, &bd->pVertexShader) != S_OK)
         {
@@ -507,7 +508,7 @@ bool    ImGui_ImplDX11_CreateDeviceObjects()
 
     // Create the pixel shader
     {
-        static const std::string pixelShader = std::string(cheeky_overlay_color_shader) +
+        static constexpr char pixelShader[] = CHEEKY_OVERLAY_COLOR_HLSL
             "struct PS_INPUT\
             {\
             float4 pos : SV_POSITION;\
@@ -524,9 +525,8 @@ bool    ImGui_ImplDX11_CreateDeviceObjects()
             }";
 
         ID3DBlob* pixelShaderBlob;
-        const char* color_mode = cheeky_overlay_color_mode == 1 ? "1" : cheeky_overlay_color_mode == 2 ? "2" : cheeky_overlay_color_mode == 3 ? "3" : "0";
-        const D3D_SHADER_MACRO color_macros[] = {{"CHEEKY_COLOR_MODE", color_mode}, {nullptr, nullptr}};
-        if (FAILED(D3DCompile(pixelShader.c_str(), pixelShader.size(), nullptr, color_macros, nullptr, "main", "ps_4_0", 0, 0, &pixelShaderBlob, nullptr)))
+        static_assert(cheeky::fg::bytecode::source_hash(pixelShader)==cheeky::fg::bytecode::overlay_pixel11_source_hash);
+        if (FAILED(cheeky_overlay_pixel11_blob(cheeky_overlay_color_mode,&pixelShaderBlob)))
             return false; // NB: Pass ID3DBlob* pErrorBlob to D3DCompile() to get error showing in (const char*)pErrorBlob->GetBufferPointer(). Make sure to Release() the blob!
         if (bd->pd3dDevice->CreatePixelShader(pixelShaderBlob->GetBufferPointer(), pixelShaderBlob->GetBufferSize(), nullptr, &bd->pPixelShader) != S_OK)
         {

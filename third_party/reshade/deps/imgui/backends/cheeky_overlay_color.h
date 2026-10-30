@@ -4,7 +4,7 @@
 #pragma once
 #include <string>
 extern thread_local int cheeky_overlay_color_mode;
-inline constexpr char cheeky_overlay_color_shader[] = R"(
+#define CHEEKY_OVERLAY_COLOR_HLSL R"HLSL(
 float3 CheekyOverlayColor(float3 color) {
 #if CHEEKY_COLOR_MODE == 0
     return color;
@@ -26,4 +26,28 @@ float3 CheekyOverlayColor(float3 color) {
 #endif
 #endif
 }
-)";
+)HLSL"
+
+#include "../../../../../shared/fg_precompiled.hpp"
+inline HRESULT cheeky_overlay_vertex11_blob(ID3DBlob** output) {
+    return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_vertex11_main_vs_4_0,output);
+}
+inline HRESULT cheeky_overlay_pixel11_blob(int mode,ID3DBlob** output) {
+    switch(mode){
+    case 1: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel11_main_ps_4_0_color1,output);
+    case 2: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel11_main_ps_4_0_color2,output);
+    case 3: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel11_main_ps_4_0_color3,output);
+    default: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel11_main_ps_4_0_color0,output);
+    }
+}
+inline HRESULT cheeky_overlay_vertex12_blob(ID3DBlob** output) {
+    return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_vertex12_main_vs_5_0,output);
+}
+inline HRESULT cheeky_overlay_pixel12_blob(int mode,ID3DBlob** output) {
+    switch(mode){
+    case 1: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel12_main_ps_5_0_color1,output);
+    case 2: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel12_main_ps_5_0_color2,output);
+    case 3: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel12_main_ps_5_0_color3,output);
+    default: return cheeky::fg::bytecode::blob(cheeky::fg::bytecode::overlay_pixel12_main_ps_5_0_color0,output);
+    }
+}

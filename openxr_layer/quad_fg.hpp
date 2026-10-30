@@ -1,4 +1,5 @@
 #pragma once
+#include "../shared/fg_precompiled.hpp"
 #include "../shared/cheeky_quad_fg.hpp"
 #include "../shared/cheeky_quad_views.h"
 #include "../shared/fg_guide_layout.hpp"
@@ -74,7 +75,8 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
             if(FAILED(context.As(&context1))||FAILED(device.As(&device1))||
                FAILED(device1->CreateDeviceContextState(0,&level,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),nullptr,&state)))return false;}
         for(unsigned i=0;i<2;++i){auto& shader=i?atlas_shader:snapshot_shader;if(shader)continue;Ptr<ID3DBlob> code;
-            if(FAILED(D3DCompile(shaders,sizeof(shaders)-1,nullptr,nullptr,nullptr,i?"Atlas":"Snapshot","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,nullptr))||
+            static_assert(fg::bytecode::source_hash(shaders)==fg::bytecode::quad_fg_source_hash);
+            if(FAILED(i?fg::bytecode::blob(fg::bytecode::quad_fg_atlas_cs_5_0,&code):fg::bytecode::blob(fg::bytecode::quad_fg_snapshot_cs_5_0,&code))||
                 FAILED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shader)))return false;}
         if(!constants){D3D11_BUFFER_DESC b{};b.ByteWidth=sizeof(Constants);b.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
             if(FAILED(device->CreateBuffer(&b,nullptr,&constants)))return false;}

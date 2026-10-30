@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_color_format.hpp"
+#include "../shared/fg_precompiled.hpp"
 #include "../shared/fg_compact.hpp"
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -49,9 +50,10 @@ float4 PS(V v):SV_Target{
  }
  return c;
 })HLSL";
+        static_assert(bytecode::source_hash(shader)==bytecode::color_draw_source_hash);
         Ptr<ID3DBlob> error;
-        if(!vertex&&FAILED(D3DCompile(shader,strlen(shader),nullptr,nullptr,nullptr,"VS","vs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vertex,&error)))return false;
-        if(!pixel&&FAILED(D3DCompile(shader,strlen(shader),nullptr,nullptr,nullptr,"PS","ps_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&pixel,&error)))return false;
+        if(!vertex&&FAILED(bytecode::blob(bytecode::color_draw_vs_vs_5_1,&vertex)))return false;
+        if(!pixel&&FAILED(bytecode::blob(bytecode::color_draw_ps_ps_5_1,&pixel)))return false;
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0,0,0};
         D3D12_ROOT_PARAMETER params[2]{};params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;params[0].DescriptorTable={1,&range};
         params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;params[1].Constants={0,0,sizeof(Constants)/4};

@@ -1,6 +1,7 @@
 #pragma once
 #include "d3d12_native.hpp"
 #include "../shared/fg_guide_layout.hpp"
+#include "../shared/fg_precompiled.hpp"
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -65,15 +66,14 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         if(!root&&(FAILED(D3D12SerializeRootSignature(&desc,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error))||
             FAILED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)))))return false;
         if(!pipeline){
-            const D3D_SHADER_MACRO defines[]={{"DEPTH_ARRAY","0"},{nullptr,nullptr}};
-            if(FAILED(D3DCompile(shader,strlen(shader),nullptr,defines,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return false;
+            static_assert(fg::bytecode::source_hash(shader)==fg::bytecode::prepared_guides_source_hash);
+            if(FAILED(fg::bytecode::blob(fg::bytecode::prepared_guides_main_cs_5_1_depth0,&code)))return false;
             D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};
             if(FAILED(device->CreateComputePipelineState(&ps,IID_PPV_ARGS(&pipeline))))return false;
         }
         if(need_depth_array&&!pipeline_depth_array){
             code.Reset();error.Reset();
-            const D3D_SHADER_MACRO defines[]={{"DEPTH_ARRAY","1"},{nullptr,nullptr}};
-            if(FAILED(D3DCompile(shader,strlen(shader),nullptr,defines,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return false;
+            if(FAILED(fg::bytecode::blob(fg::bytecode::prepared_guides_main_cs_5_1_depth1,&code)))return false;
             D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};
             if(FAILED(device->CreateComputePipelineState(&ps,IID_PPV_ARGS(&pipeline_depth_array))))return false;
         }

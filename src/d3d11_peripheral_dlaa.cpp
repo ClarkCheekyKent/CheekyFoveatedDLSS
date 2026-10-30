@@ -6,6 +6,7 @@
 #include "d3d11_write_bindings.hpp"
 
 #include "d3d_shaders.hpp"
+#include "../shared/fg_precompiled.hpp"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
@@ -1592,8 +1593,9 @@ float4 Load(int2 p){return Source.Load(int3(clamp(p,int2(0,0),int2(SourceSize)-1
  float2 p=(float2(id.xy)+.5)*float2(SourceSize)/float2(DestSize)-.5;int2 b=int2(floor(p));float2 f=frac(p);
  Target[DestBase+id.xy]=lerp(lerp(Load(b),Load(b+int2(1,0)),f.x),lerp(Load(b+int2(0,1)),Load(b+1),f.x),f.y);
 })";
+        static_assert(fg::bytecode::source_hash(shader)==fg::bytecode::peripheral_full_source_hash);
         ComPtr<ID3DBlob> code;
-        if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"Main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,nullptr))||
+        if(FAILED(fg::bytecode::blob(fg::bytecode::peripheral_full_main_cs_5_0,&code))||
             FAILED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&state.full_shader)))return false;
     }
     if(!state.full_constants){D3D11_BUFFER_DESC buffer{};buffer.ByteWidth=32;buffer.BindFlags=D3D11_BIND_CONSTANT_BUFFER;

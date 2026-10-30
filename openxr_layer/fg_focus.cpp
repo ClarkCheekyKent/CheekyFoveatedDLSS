@@ -1,4 +1,5 @@
 #include "fg_focus.hpp"
+#include "../shared/fg_precompiled.hpp"
 #include "../shared/fg_interpolation_shader.hpp"
 #include "fg_color_format.hpp"
 #include "fg_timing.hpp"
@@ -142,12 +143,14 @@ bool FocusPipeline::initialize(ID3D12Device* dev){
  D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=2;rs.pParameters=params;rs.NumStaticSamplers=1;rs.pStaticSamplers=&sampler;
  ComPtr<ID3DBlob> blob,error;
  if(!root&&(FAILED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error))||FAILED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)))))return false;
- auto compile=[&](const char* source,ComPtr<ID3D12PipelineState>& target,const char* entry="Main"){ComPtr<ID3DBlob> code,errors;
+ static_assert(bytecode::source_hash(prepare_shader)==bytecode::focus_prepare_source_hash);
+ static_assert(bytecode::source_hash(compose_shader)==bytecode::focus_compose_source_hash);
+ static_assert(bytecode::source_hash(pack_shader)==bytecode::focus_pack_source_hash);
+ static_assert(bytecode::source_hash(recenter_shader)==bytecode::focus_recenter_source_hash);
+ auto compile=[&](std::span<const unsigned char> code,ComPtr<ID3D12PipelineState>& target){
   if(target)return true;
-  if(FAILED(D3DCompile(source,strlen(source),nullptr,nullptr,nullptr,entry,"cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors))){
-   if(errors)std::fprintf(stderr,"FG shader %s: %s\n",entry,static_cast<const char*>(errors->GetBufferPointer()));return false;}
-  D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};return SUCCEEDED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(&target)));};
- if(!compile(interpolation_shader,center_shader,"CenterMain")||!compile(prepare_shader,prepare)||!compile(interpolation_shader,peripheral)||!compile(compose_shader,compose)||!compile(pack_shader,pack)||!compile(recenter_shader,recenter))return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code.data(),code.size()};return SUCCEEDED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(&target)));};
+ if(!compile(bytecode::interpolation_centermain_cs_5_1,center_shader)||!compile(bytecode::focus_prepare_main_cs_5_1,prepare)||!compile(bytecode::interpolation_main_cs_5_1,peripheral)||!compile(bytecode::focus_compose_main_cs_5_1,compose)||!compile(bytecode::focus_pack_main_cs_5_1,pack)||!compile(bytecode::focus_recenter_main_cs_5_1,recenter))return false;
  D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;heap.NumDescriptors=3*126;heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
  if(FAILED(dev->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&descriptors))))return false;
  stride=dev->GetDescriptorHandleIncrementSize(heap.Type);return true;

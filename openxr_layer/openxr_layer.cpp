@@ -471,11 +471,11 @@ bool initialize_menu_converter11(SessionState::Menu& menu, ID3D11Device* device)
         float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             return source_texture.Sample(source_sampler, uv);
         })";
+    static_assert(cheeky::fg::bytecode::source_hash(vertex_shader)==cheeky::fg::bytecode::menu_vertex_source_hash);
+    static_assert(cheeky::fg::bytecode::source_hash(pixel_shader)==cheeky::fg::bytecode::menu_pixel_source_hash);
     Microsoft::WRL::ComPtr<ID3DBlob> vertex, pixel, errors;
-    if (FAILED(D3DCompile(vertex_shader, sizeof(vertex_shader) - 1, nullptr, nullptr, nullptr,
-            "main", "vs_5_0", 0, 0, &vertex, &errors)) ||
-        FAILED(D3DCompile(pixel_shader, sizeof(pixel_shader) - 1, nullptr, nullptr, nullptr,
-            "main", "ps_5_0", 0, 0, &pixel, &errors)) ||
+    if (FAILED(cheeky::fg::bytecode::blob(cheeky::fg::bytecode::menu_vertex_main_vs_5_0,&vertex)) ||
+        FAILED(cheeky::fg::bytecode::blob(cheeky::fg::bytecode::menu_pixel_main_ps_5_0,&pixel)) ||
         FAILED(device->CreateDeferredContext(0, &menu.convert_context11)) ||
         FAILED(device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(),
             nullptr, &menu.convert_vertex11)) ||
@@ -584,12 +584,12 @@ bool initialize_menu_converter12(SessionState::Menu& menu, ID3D12Device* device)
         float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             return source_texture.Sample(source_sampler, uv);
         })";
+    static_assert(cheeky::fg::bytecode::source_hash(vertex_shader)==cheeky::fg::bytecode::menu_vertex_source_hash);
+    static_assert(cheeky::fg::bytecode::source_hash(pixel_shader)==cheeky::fg::bytecode::menu_pixel_source_hash);
     Microsoft::WRL::ComPtr<ID3DBlob> vertex, pixel, errors, root_blob;
-    auto result = D3DCompile(vertex_shader, sizeof(vertex_shader) - 1, nullptr, nullptr, nullptr,
-        "main", "vs_5_1", 0, 0, &vertex, &errors);
+    auto result = cheeky::fg::bytecode::blob(cheeky::fg::bytecode::menu_vertex_main_vs_5_1,&vertex);
     if (FAILED(result)) return fail("vertex shader", result);
-    result = D3DCompile(pixel_shader, sizeof(pixel_shader) - 1, nullptr, nullptr, nullptr,
-        "main", "ps_5_1", 0, 0, &pixel, &errors);
+    result = cheeky::fg::bytecode::blob(cheeky::fg::bytecode::menu_pixel_main_ps_5_1,&pixel);
     if (FAILED(result)) return fail("pixel shader", result);
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;

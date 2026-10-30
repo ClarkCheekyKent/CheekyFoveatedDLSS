@@ -109,10 +109,11 @@ struct Compositor11 {
         device->GetImmediateContext(&immediate);
         if(FAILED(immediate.As(&multithread)))return false;
         multithread->SetMultithreadProtected(TRUE);
+        static_assert(fg::bytecode::source_hash(shader_source)==fg::bytecode::quad_capture_source_hash);
         ComPtr<ID3DBlob> vertex,pixel,error;
         if(FAILED(device->CreateDeferredContext(0,&deferred))||
-           FAILED(D3DCompile(shader_source,sizeof(shader_source)-1,nullptr,nullptr,nullptr,"VS","vs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vertex,&error))||
-           FAILED(D3DCompile(shader_source,sizeof(shader_source)-1,nullptr,nullptr,nullptr,"PS","ps_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&pixel,&error))||
+           FAILED(fg::bytecode::blob(fg::bytecode::quad_capture_vs_vs_5_0,&vertex))||
+           FAILED(fg::bytecode::blob(fg::bytecode::quad_capture_ps_ps_5_0,&pixel))||
            FAILED(device->CreatePixelShader(pixel->GetBufferPointer(),pixel->GetBufferSize(),nullptr,&ps)))return false;
         D3D11_BUFFER_DESC buffer{};buffer.ByteWidth=64;buffer.Usage=D3D11_USAGE_DEFAULT;buffer.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
         D3D11_SAMPLER_DESC sample{};sample.Filter=D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -263,10 +264,10 @@ struct Compositor {
                FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,r.allocator.Get(),nullptr,IID_PPV_ARGS(&r.list)))||
                FAILED(r.list->Close()))return false;
         if(FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))))return false;
-        const auto& shader=shader_source;
+        static_assert(fg::bytecode::source_hash(shader_source)==fg::bytecode::quad_capture_source_hash);
         ComPtr<ID3DBlob> error,blob;
-        if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"VS","vs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vs,&error))||
-           FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"PS","ps_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&ps,&error)))return false;
+        if(FAILED(fg::bytecode::blob(fg::bytecode::quad_capture_vs_vs_5_1,&vs))||
+           FAILED(fg::bytecode::blob(fg::bytecode::quad_capture_ps_ps_5_1,&ps)))return false;
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0};
         D3D12_ROOT_PARAMETER p[2]{};p[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;p[0].DescriptorTable={1,&range};
         p[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;p[1].Constants={0,0,16};

@@ -1,5 +1,6 @@
 #pragma once
 #include "fg_color_format.hpp"
+#include "../shared/fg_precompiled.hpp"
 #include "../shared/fg_compact.hpp"
 #include <d3d12.h>
 #include <d3dcompiler.h>
@@ -63,7 +64,8 @@ cbuffer Params:register(b0){float4 SourceCrop;float4 SourceSpans;float4 SourceTe
         if(!root&&(FAILED(D3D12SerializeRootSignature(&signature,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,&error))||
             FAILED(device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&root)))))return false;
         if(!pipeline){
-            if(FAILED(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"Main","cs_5_1",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return false;
+            static_assert(bytecode::source_hash(shader)==bytecode::ngx_fallback_source_hash);
+            if(FAILED(bytecode::blob(bytecode::ngx_fallback_main_cs_5_1,&code)))return false;
             D3D12_COMPUTE_PIPELINE_STATE_DESC state{};state.pRootSignature=root.Get();state.CS={code->GetBufferPointer(),code->GetBufferSize()};
             if(FAILED(device->CreateComputePipelineState(&state,IID_PPV_ARGS(&pipeline))))return false;
         }

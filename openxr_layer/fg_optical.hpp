@@ -2,6 +2,7 @@
 #include "../third_party/nvof/nvOpticalFlowD3D11.h"
 #include "../third_party/nvof/nvOpticalFlowD3D12.h"
 #include "../shared/fg_optical_shader.hpp"
+#include "../shared/fg_precompiled.hpp"
 #include "fg_matrices.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "../shared/cheeky_fg_shader11.hpp"
@@ -96,9 +97,12 @@ inline void pose_mapping(OpticalConstants& c,const XrPosef& previous,const XrFov
     for(float v:a)if(!std::isfinite(v))return;for(float v:b)if(!std::isfinite(v))return;
     std::copy_n(a,4,c.now_to_old);std::copy_n(b,4,c.mid_to_now);c.texel[1]=float(options|1u);
 }
+// Fixed optical shaders ship as DXBC. Creating a session (including while the
+// D3D11 context is held) must never invoke the HLSL optimizer on the game thread.
 inline bool compile(const char* entry,const char* profile,ComPtr<ID3DBlob>& code){
-    ComPtr<ID3DBlob> errors;const auto hr=D3DCompile(optical_shader,strlen(optical_shader),nullptr,nullptr,nullptr,entry,profile,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
-    if(FAILED(hr)&&errors)std::fprintf(stderr,"Optical flow shader: %s\n",static_cast<const char*>(errors->GetBufferPointer()));return SUCCEEDED(hr);
+    code.Reset();const auto bytes=bytecode::optical(entry,profile);
+    if(bytes.empty()||FAILED(D3DCreateBlob(bytes.size(),&code)))return false;
+    std::memcpy(code->GetBufferPointer(),bytes.data(),bytes.size());return true;
 }
 struct Error {
     char diagnostic[384]{"NVIDIA Optical Flow: waiting for color history"};

@@ -39,20 +39,6 @@ struct Backend11 {
         unsigned depth_base[2]{},depth_size[2]{},motion_base[2]{},motion_size[2]{},size[2]{};
         float scale[2]{},jitter[2]{},flip[2]{},crop[4]{};
     };
-    static constexpr char snapshot_hlsl[]=R"(
-Texture2D<float> Depth:register(t0);Texture2D<float2> Motion:register(t1);
-RWTexture2D<float> OutDepth:register(u0);RWTexture2D<float2> OutMotion:register(u1);
-cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uint2 MotionSize;uint2 Size;
- float2 Scale;float2 Jitter;float2 Flip;float4 Crop;};
-[numthreads(8,8,1)] void Main(uint3 id:SV_DispatchThreadID){
- if(any(id.xy>=Size))return;float2 uv=(float2(id.xy)+.5)/Size;
- if(Flip.x>.5)uv.y=1-uv.y;uv=Crop.xy+uv*Crop.zw;
- OutDepth[id.xy]=Depth.Load(int3(DepthBase+min(uint2(uv*DepthSize),DepthSize-1),0));
- float2 mv=Motion.Load(int3(MotionBase+min(uint2(uv*MotionSize),MotionSize-1),0));
- bool valid=all(isfinite(mv))&&all(abs(mv)<65504);
- mv=(mv*Scale-Jitter)/Crop.zw;if(Flip.x>.5)mv.y=-mv.y;
- OutMotion[id.xy]=valid?mv:float2(65504,65504);
-})";
     struct Guard {ID3D11Multithread* p;explicit Guard(ID3D11Multithread* value):p(value){p->Enter();}~Guard(){p->Leave();}};
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
@@ -84,14 +70,11 @@ cbuffer Params:register(b0){uint2 DepthBase;uint2 DepthSize;uint2 MotionBase;uin
         ComPtr<ID3D11Device1> device1;const auto level=dev->GetFeatureLevel();
         if(FAILED(context.As(&context1))||FAILED(dev->QueryInterface(IID_PPV_ARGS(&device1)))||
            FAILED(device1->CreateDeviceContextState(0,&level,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),nullptr,&state)))return false;
-        ComPtr<ID3DBlob> code,error;
-        auto compile=[&](const char* source,const char* entry,const char* profile){
-            code.Reset();error.Reset();
-            if(SUCCEEDED(D3DCompile(source,strlen(source),nullptr,nullptr,nullptr,entry,profile,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&error)))return true;
-            if(error)strncpy_s(diagnostic,static_cast<const char*>(error->GetBufferPointer()),_TRUNCATE);return false;};
-        if(!compile(snapshot_hlsl,"Main","cs_5_0")||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&snapshot)))return false;
-        if(!compile(interpolation_shader,"RegionsVS","vs_5_0")||FAILED(dev->CreateVertexShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&vertex)))return false;
-        if(!compile(interpolation_shader,"RegionsPS","ps_5_0")||FAILED(dev->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&pixel)))return false;
+        // Fixed shader programs are compiled when the shipped bytecode is
+        // regenerated, rather than whenever a setting replaces the presenter.
+        if(FAILED(dev->CreateComputeShader(bytecode::snapshot_main_cs_5_0,sizeof(bytecode::snapshot_main_cs_5_0),nullptr,&snapshot)))return false;
+        if(FAILED(dev->CreateVertexShader(bytecode::interpolation_regionsvs_vs_5_0,sizeof(bytecode::interpolation_regionsvs_vs_5_0),nullptr,&vertex)))return false;
+        if(FAILED(dev->CreatePixelShader(bytecode::interpolation_regionsps_ps_5_0,sizeof(bytecode::interpolation_regionsps_ps_5_0),nullptr,&pixel)))return false;
         D3D11_RASTERIZER_DESC rd{};rd.FillMode=D3D11_FILL_SOLID;rd.CullMode=D3D11_CULL_NONE;rd.DepthClipEnable=TRUE;
         if(FAILED(dev->CreateRasterizerState(&rd,&rasterizer)))return false;
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
