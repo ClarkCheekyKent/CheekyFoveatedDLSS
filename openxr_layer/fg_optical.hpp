@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdio>
 #include <vector>
+#include <memory>
 namespace cheeky::fg {
 namespace optical {
 using Microsoft::WRL::ComPtr;
@@ -113,6 +114,15 @@ struct Session11 : Error {
     NV_OF_D3D11_API_FUNCTION_LIST api{};NvOFHandle handle{};
     ComPtr<ID3D11Device> device;ComPtr<ID3D11ComputeShader> prepare_shader,interpolate_shader,cache_shader;
     ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11Buffer> constants_buffer;
+    struct Output {
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> view;
+        ComPtr<ID3D11UnorderedAccessView> target;
+        unsigned width{},height{};
+    };
+    std::vector<std::shared_ptr<Output>> outputs;
+    std::atomic<unsigned> output_allocations{},output_reuses{};
     std::array<ComPtr<ID3D11Texture2D>,8> textures;
     std::array<ComPtr<ID3D11ShaderResourceView>,8> views;
     std::array<NvOFGPUBufferHandle,6> buffers{};
@@ -136,7 +146,7 @@ struct Session11 : Error {
         for(auto& b:buffers)if(b){api.nvOFUnregisterResourceD3D11(b);b=nullptr;}
         if(handle){api.nvOFDestroy(handle);handle=nullptr;}
         for(auto& t:textures)t.Reset();for(auto& v:views)v.Reset();for(auto& v:input_uavs)v.Reset();for(auto& v:cache_uavs)v.Reset();
-        cache_shader.Reset();cache_ready=false;cache_builds=0;
+        cache_shader.Reset();cache_ready=false;cache_builds=0;constants_buffer.Reset();outputs.clear();
         device.Reset();prepare_shader.Reset();interpolate_shader.Reset();sampler.Reset();old_id=new_id=0;history=false;initialized=false;
     }
     bool initialize(ID3D11Device* dev,ID3D11DeviceContext* context,unsigned w,unsigned h,unsigned quality,unsigned cells){
@@ -167,24 +177,31 @@ struct Session11 : Error {
         if(FAILED(dev->CreateSamplerState(&s,&sampler)))return fail("sampler");initialized=true;return true;
     }
     bool bind(ID3D11DeviceContext* ctx,const OpticalConstants& c){
-        D3D11_BUFFER_DESC d{};d.ByteWidth=sizeof(c);d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;D3D11_SUBRESOURCE_DATA data{&c};
-        ComPtr<ID3D11Buffer> cb;if(FAILED(device->CreateBuffer(&d,&data,&cb)))return fail("constants");
-        auto* b=cb.Get();auto* s=sampler.Get();ctx->CSSetConstantBuffers(0,1,&b);ctx->CSSetSamplers(0,1,&s);return true;
+        if(!constants_buffer){D3D11_BUFFER_DESC d{};d.ByteWidth=sizeof(c);d.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+            if(FAILED(device->CreateBuffer(&d,nullptr,&constants_buffer)))return fail("constants");}
+        // UpdateSubresource captures each value in immediate-context order.
+        ctx->UpdateSubresource(constants_buffer.Get(),0,nullptr,&c,0,0);
+        auto* b=constants_buffer.Get();auto* s=sampler.Get();ctx->CSSetConstantBuffers(0,1,&b);ctx->CSSetSamplers(0,1,&s);return true;
     }
     static void unbind(ID3D11DeviceContext* ctx){ID3D11ShaderResourceView* srv[9]{};ID3D11UnorderedAccessView* uav[2]{};ctx->CSSetShaderResources(0,9,srv);ctx->CSSetUnorderedAccessViews(0,2,uav,nullptr);}
-    // depth is the captured R32 depth snapshot when c.flags[2] enables it.
-    bool render(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* old,ID3D11ShaderResourceView* now,ID3D11ShaderResourceView* depth,
-        std::uint64_t previous_id,std::uint64_t current_id,unsigned quality,OpticalConstants c,float fraction,bool reset_history,
-        ComPtr<ID3D11Texture2D>& output,ComPtr<ID3D11ShaderResourceView>& output_view){
+    // Prepare all eye/region inputs before flushing once and executing flow.
+    bool prepare(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* old,ID3D11ShaderResourceView* now,
+        std::uint64_t previous_id,std::uint64_t current_id,unsigned quality,OpticalConstants& c,bool& needed){
         ID3D11Device* dev{};ctx->GetDevice(&dev);ComPtr<ID3D11Device> owned;owned.Attach(dev);
         if(!initialize(dev,ctx,unsigned(c.sizes[0]),unsigned(c.sizes[1]),quality,unsigned(c.texel[0])))return false;
         c.sizes[0]=float(width);c.sizes[1]=float(height);
-        if(old_id!=previous_id||new_id!=current_id){
+        needed=old_id!=previous_id||new_id!=current_id;
+        if(needed){
             cache_ready=false;
             if(!bind(ctx,c))return false;
             ID3D11ShaderResourceView* srvs[]{old,now};ID3D11UnorderedAccessView* uavs[]{input_uavs[0].Get(),input_uavs[1].Get()};
             ctx->CSSetShader(prepare_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,2,srvs);ctx->CSSetUnorderedAccessViews(0,2,uavs,nullptr);
-            ctx->Dispatch((width+7)/8,(height+7)/8,1);unbind(ctx);ctx->Flush();
+            ctx->Dispatch((width+7)/8,(height+7)/8,1);unbind(ctx);
+        }
+        return true;
+    }
+    bool execute(std::uint64_t previous_id,std::uint64_t current_id,const OpticalConstants& c,bool reset_history){
+        if(old_id!=previous_id||new_id!=current_id){
             NV_OF_EXECUTE_INPUT_PARAMS in{};in.inputFrame=buffers[0];in.referenceFrame=buffers[1];
             // Temporal hints describe the preceding interval, whose current
             // endpoint must be this interval's previous endpoint.
@@ -193,6 +210,30 @@ struct Session11 : Error {
             auto status=api.nvOFExecute(handle,&in,&out);if(status)return fail("flow execution",status);
             old_id=previous_id;new_id=current_id;std::copy_n(c.flow_rect,4,crop);history=true;
         }
+        return true;
+    }
+    // A lease protects deferred G1/G2/G3 consumers from output reuse. Once a
+    // draw is enqueued, the immediate context orders its reads before reuse.
+    std::shared_ptr<Output> output(unsigned w,unsigned h,bool pooled){
+        if(pooled)for(auto& p:outputs)if(p.use_count()==1&&p->width==w&&p->height==h){++output_reuses;return p;}
+        auto p=std::make_shared<Output>();p->width=w;p->height=h;
+        D3D11_TEXTURE2D_DESC d{};d.Width=w;d.Height=h;d.ArraySize=d.MipLevels=d.SampleDesc.Count=1;
+        d.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
+        if(FAILED(device->CreateTexture2D(&d,nullptr,&p->texture))||FAILED(device->CreateShaderResourceView(p->texture.Get(),nullptr,&p->view))||
+           FAILED(device->CreateUnorderedAccessView(p->texture.Get(),nullptr,&p->target))){fail("generated image");return {};}
+        ++output_allocations;
+        if(pooled){
+            if(outputs.size()>=12){const auto free=std::find_if(outputs.begin(),outputs.end(),[](const auto& p){return p.use_count()==1;});
+                if(free!=outputs.end())outputs.erase(free);}
+            if(outputs.size()<12)outputs.push_back(p);
+        }
+        return p;
+    }
+    // depth is the captured R32 depth snapshot when c.flags[2] enables it.
+    bool reconstruct(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* old,ID3D11ShaderResourceView* now,ID3D11ShaderResourceView* depth,
+        OpticalConstants c,float fraction,ComPtr<ID3D11Texture2D>& result,ComPtr<ID3D11ShaderResourceView>& result_view,
+        std::shared_ptr<Output>* lease=nullptr){
+        auto* dev=device.Get();
         if(cached(c)&&!cache_ready){
             if(!cache_shader){ComPtr<ID3DBlob> code;
                 if(!compile("CacheVectors","cs_5_0",code)||FAILED(dev->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&cache_shader)))return fail("vector cache shader");}
@@ -208,15 +249,21 @@ struct Session11 : Error {
             ctx->CSSetShader(cache_shader.Get(),nullptr,0);ctx->CSSetShaderResources(2,4,fields);ctx->CSSetUnorderedAccessViews(0,2,targets,nullptr);
             ctx->Dispatch(((width+grid-1)/grid+7)/8,((height+grid-1)/grid+7)/8,1);unbind(ctx);cache_ready=true;++cache_builds;
         }
-        D3D11_TEXTURE2D_DESC d{};d.Width=unsigned(c.sizes[2]);d.Height=unsigned(c.sizes[3]);d.ArraySize=d.MipLevels=1;d.SampleDesc.Count=1;
-        d.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;d.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
-        ComPtr<ID3D11UnorderedAccessView> target;
-        if(FAILED(dev->CreateTexture2D(&d,nullptr,&output))||FAILED(dev->CreateShaderResourceView(output.Get(),nullptr,&output_view))||FAILED(dev->CreateUnorderedAccessView(output.Get(),nullptr,&target)))return fail("generated image");
+        auto generated=output(unsigned(c.sizes[2]),unsigned(c.sizes[3]),lease!=nullptr);if(!generated)return false;
+        result=generated->texture;result_view=generated->view;if(lease)*lease=generated;
         c.flags[0]=fraction;if(!bind(ctx,c))return false;
-        ID3D11ShaderResourceView* srvs[]{old,now,views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get(),depth,views[6].Get(),views[7].Get()};auto* uav=target.Get();
+        ID3D11ShaderResourceView* srvs[]{old,now,views[2].Get(),views[3].Get(),views[4].Get(),views[5].Get(),depth,views[6].Get(),views[7].Get()};auto* uav=generated->target.Get();
         ctx->CSSetShader(interpolate_shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,9,srvs);ctx->CSSetUnorderedAccessViews(0,1,&uav,nullptr);
-        ctx->Dispatch((d.Width+7)/8,(d.Height+7)/8,1);unbind(ctx);
+        ctx->Dispatch((generated->width+7)/8,(generated->height+7)/8,1);unbind(ctx);
         strcpy_s(diagnostic,"NVIDIA Optical Flow: generating");return true;
+    }
+    bool render(ID3D11DeviceContext* ctx,ID3D11ShaderResourceView* old,ID3D11ShaderResourceView* now,ID3D11ShaderResourceView* depth,
+        std::uint64_t previous_id,std::uint64_t current_id,unsigned quality,OpticalConstants c,float fraction,bool reset_history,
+        ComPtr<ID3D11Texture2D>& result,ComPtr<ID3D11ShaderResourceView>& result_view){
+        bool needed{};
+        if(!prepare(ctx,old,now,previous_id,current_id,quality,c,needed))return false;
+        if(needed){ctx->Flush();if(!execute(previous_id,current_id,c,reset_history))return false;}
+        return reconstruct(ctx,old,now,depth,c,fraction,result,result_view);
     }
 };
 struct Session12 : Error {

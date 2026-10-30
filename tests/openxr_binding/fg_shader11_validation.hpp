@@ -19,6 +19,9 @@ struct Runtime {
     static inline std::atomic<unsigned> waits{},ends{},scenes{},errors{},stalls{};
     static inline DWORD frame_thread{};
     static inline unsigned generated_run{},longest_generated_run{};
+    static inline XrSwapchain fail_acquire{};
+    static inline const std::uint64_t* upload_submission{};
+    static inline std::uint64_t required_submission{};
     static void error(){++errors;}
     static XrResult XRAPI_CALL create(XrSession,const XrSwapchainCreateInfo* info,XrSwapchain* out){
         D3D11_TEXTURE2D_DESC d{};d.Width=info->width;d.Height=info->height;d.MipLevels=1;d.ArraySize=info->arraySize;d.SampleDesc.Count=1;
@@ -33,13 +36,15 @@ struct Runtime {
             reinterpret_cast<XrSwapchainImageD3D11KHR*>(images)[0].texture=chains.at(chain).texture.Get();}return XR_SUCCESS;
     }
     static XrResult XRAPI_CALL acquire(XrSwapchain chain,const XrSwapchainImageAcquireInfo*,unsigned* index){
-        std::lock_guard lock(m);auto& c=chains.at(chain);if(c.acquired)error();c.acquired=true;c.waited=false;*index=0;return XR_SUCCESS;
+        std::lock_guard lock(m);if(chain==fail_acquire){fail_acquire={};return XR_ERROR_RUNTIME_FAILURE;}
+        auto& c=chains.at(chain);if(c.acquired)error();c.acquired=true;c.waited=false;*index=0;return XR_SUCCESS;
     }
     static XrResult XRAPI_CALL wait_image(XrSwapchain chain,const XrSwapchainImageWaitInfo*){
         std::lock_guard lock(m);auto& c=chains.at(chain);if(!c.acquired)error();c.waited=true;return XR_SUCCESS;
     }
     static XrResult XRAPI_CALL release(XrSwapchain chain,const XrSwapchainImageReleaseInfo*){
-        std::lock_guard lock(m);auto& c=chains.at(chain);if(!c.acquired||!c.waited)error();c.acquired=c.waited=false;return XR_SUCCESS;
+        std::lock_guard lock(m);auto& c=chains.at(chain);if(!c.acquired||!c.waited)error();
+        if(upload_submission&&*upload_submission<required_submission)error();c.acquired=c.waited=false;return XR_SUCCESS;
     }
     static XrResult XRAPI_CALL wait_frame(XrSession,const XrFrameWaitInfo*,XrFrameState* state){
         Sleep(4);std::unique_lock lock(m);
@@ -61,7 +66,8 @@ struct Runtime {
         cheeky::fg::XrFns fn;fn.create=create;fn.destroy=destroy;fn.enumerate=enumerate;fn.acquire=acquire;fn.wait_image=wait_image;
         fn.release=release;fn.wait_frame=wait_frame;fn.begin_frame=begin;fn.end_frame=end;return fn;
     }
-    static void reset(){std::lock_guard lock(m);chains.clear();begun=ended=0;clock_time=0;frame_thread=0;waits=ends=scenes=errors=stalls=0;generated_run=longest_generated_run=0;}
+    static void reset(){std::lock_guard lock(m);chains.clear();begun=ended=0;clock_time=0;frame_thread=0;waits=ends=scenes=errors=stalls=0;generated_run=longest_generated_run=0;
+        fail_acquire={};upload_submission=nullptr;required_submission=0;}
 };
 inline ComPtr<ID3D11Texture2D> texture(DXGI_FORMAT f,const std::array<float,4>& color,unsigned size=64){
     D3D11_TEXTURE2D_DESC d{};d.Width=d.Height=size;d.MipLevels=d.ArraySize=d.SampleDesc.Count=1;
@@ -187,7 +193,10 @@ inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2,bool 
             XrCompositionLayerProjection scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION};scene.space=reinterpret_cast<XrSpace>(1);scene.views=views.data();scene.viewCount=2;
             const auto* layer=reinterpret_cast<const XrCompositionLayerBaseHeader*>(&scene);XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
             end.displayTime=time;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=1;end.layers=&layer;
-            Sleep(automatic&&n<30?14:3); // Measured render work; separate from Wait/Begin pacing.
+            // Exceed two measured runtime slots even when Windows rounds the
+            // fake runtime's Sleep(4) up to a coarse timer tick. A 14 ms load
+            // did not reliably overload 2x on hardware and could leave Auto at 2.
+            Sleep(automatic&&n<30?40:3); // Work is separate from Wait/Begin pacing.
             if(XR_FAILED(p.end_frame(&end,{},&scene)))++app_errors;
         }
     });
@@ -199,16 +208,18 @@ inline void fg_backend11_pipelined(bool direct=false,unsigned multiplier=2,bool 
     // Disable exactly as xrWaitFrame does, while the render thread may still
     // own the last frame: finish application frames, then drain.
     std::uint64_t generated{},native{};CheekyFgPerformance gpu;CheekyFgOverhead overhead;CheekyFgCadence cadence;
+    bool auto_changed=true;
     {std::lock_guard lock(p.mx);generated=p.generated_count;native=p.native_count;
         gpu=p.performance();overhead=p.overhead();cadence=p.cadence();
         if(automatic){const auto status=p.automatic_status();
-            check(status.enabled&&status.valid&&status.samples&&status.switches&&status.selected>=3&&p.epoch==0,
-                "Real DX11 Auto timings drive a live count change without resetting frame history");}}
+            auto_changed=status.enabled&&status.valid&&status.samples&&status.switches&&status.selected>=3&&p.epoch==0;
+            if(!auto_changed)std::cerr<<"backend11 auto direct="<<direct<<" valid="<<status.valid<<" samples="<<status.samples<<" switches="<<status.switches<<" selected="<<status.selected<<" epoch="<<p.epoch<<"\n";}}
     auto disable=std::async(std::launch::async,[&]{p.finish_application_frame();p.invalidate_temporal();});
     const bool disabled=disable.wait_for(std::chrono::seconds(5))==std::future_status::ready;
     if(!disabled){std::cerr<<"backend11 disable hung\n";std::_Exit(3);}
     {std::lock_guard lock(handoff);done=true;}ready.notify_all();render.join();
     p.reset();
+    check(auto_changed,"Real DX11 Auto timings drive a live count change without resetting frame history");
     if(Runtime::stalls||Runtime::errors||app_errors||generated<frames/4)
         std::cerr<<"backend11 pipelined stalls="<<Runtime::stalls<<" errors="<<Runtime::errors<<" app_errors="<<app_errors
             <<" native="<<native<<" generated="<<generated<<" runtime_ends="<<Runtime::ends<<" scenes="<<Runtime::scenes<<"\n";
@@ -420,6 +431,30 @@ void fg_shader11_validation(bool hardware=false){
     fg_backend11_interrupted_wait();
     if(hardware)fg_backend11_fence_stress();
     else fg_backend11_pixels();
+    {
+        using namespace cheeky::fg;Runtime::reset();BufferedPresenter presenter;
+        check(presenter.setup11(reinterpret_cast<XrSession>(1),Runtime::functions(),device.Get(),7,nullptr),"Batched native11 presenter");
+        auto red=texture(DXGI_FORMAT_R8G8B8A8_UNORM,{1,0,0,1}),blue=texture(DXGI_FORMAT_R8G8B8A8_UNORM,{0,0,1,1});
+        auto a=presenter.native11->copy(red.Get(),DXGI_FORMAT_R8G8B8A8_UNORM),b=presenter.native11->copy(blue.Get(),DXGI_FORMAT_R8G8B8A8_UNORM);
+        std::array<BufferedPresenter::Chain,3> chains;
+        for(auto& chain:chains)check(presenter.ensure_chain11(chain,a),"Preallocate stereo/UI runtime images");
+        const auto submissions=presenter.native11->submissions,flushes=presenter.native11->flushes;
+        Runtime::upload_submission=&presenter.native11->submissions;Runtime::required_submission=submissions+1;
+        const std::vector<std::pair<BufferedPresenter::Chain*,Image>> batch{{&chains[0],a},{&chains[1],b},{&chains[2],a}};
+        check(presenter.upload_batch11(batch),"Publish native11 stereo/UI");
+        check(presenter.native11->submissions==submissions+1&&presenter.native11->flushes==flushes+10,
+            "One copy batch and all nine runtime-call flushes are retained");
+        check(pixel(chains[0].images11[0].texture,32,32)[0]>250&&pixel(chains[1].images11[0].texture,32,32)[2]>250,"Stereo batch keeps distinct eye pixels");
+        const auto unchanged=presenter.native11->flushes;
+        check(presenter.upload_batch11(batch)&&presenter.native11->flushes==unchanged,"Repeated native11 images issue no uploads or runtime calls");
+        Runtime::upload_submission=nullptr;Runtime::fail_acquire=chains[1].handle;
+        check(!presenter.upload_batch11({{&chains[0],b},{&chains[1],a}}),"Failed second-eye acquire rejects the batch");
+        check(chains[0].uploaded==a->identity&&chains[1].uploaded==b->identity,"Failed batch retains prior content identities");
+        check(!Runtime::chains.at(chains[0].handle).acquired&&!Runtime::chains.at(chains[1].handle).acquired&&!Runtime::errors,"Failed batch releases earlier acquired eye without call-order errors");
+        check(presenter.upload_batch11({{&chains[0],b},{&chains[1],a}}),"Retry after partial acquisition succeeds");
+        for(auto& chain:chains)presenter.destroy_private_chain(chain.handle);
+        std::cout<<"PASS native11 stereo/UI batch, repeat suppression and partial-acquire cleanup\n";
+    }
     fg_backend11_pipelined();
     fg_backend11_pipelined(true);
     for(unsigned multiplier:{3u,4u}){fg_backend11_pipelined(false,multiplier);fg_backend11_pipelined(true,multiplier);}

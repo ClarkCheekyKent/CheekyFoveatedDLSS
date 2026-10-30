@@ -434,6 +434,34 @@ presents them as an ordinary stereo frame. Guides use the same periphery pair
 submitted views. D3D12 quad has no automatic role proof yet, so it uses the
 default evaluation order unless roles are assigned manually.
 
+## Native D3D11 optical scheduling
+
+The native D3D11 path batches RGB preparation across left/right center/periphery,
+flushes once when a new pair needs flow, then calls the four independent SDK
+sessions under the existing dispatch/context protection. Reconstruction for all
+regions and the final stereo draws share a submission. Subsequent generated
+phases reuse the pair's flow and packed vectors. These remain ordered immediate
+context commands; the SDK controls optical-engine synchronization.
+
+Optical outputs pool texture/SRV/UAV sets with leases held by deferred draws.
+Unpublished G1/G2/G3 cannot share a writable allocation. Constant buffers use
+ordered updates, and private composition targets retain their RTVs. Publication
+acquires/waits for the changed stereo/UI images, records their copies or deferred
+draws together, flushes once, then releases each image. Every runtime call retains
+its post-call flush (required for runtime fence progress when the game stops).
+
+The layer log emits `FG native11 CPU ms` every two seconds. `gate` includes the
+dispatch and immediate-context lock wait; `hold` covers submission work including
+query collection and its flush. `flush_gate` is the context wait after runtime
+calls; `runtime_gate` is the dispatch wait before those calls. `runtime` measures
+the API itself, and `end_frame` includes its gate, API and post-call flush. Stage
+and publication values are CPU timings, not GPU durations. Means use independent
+60-sample windows; counters and optical allocation/reuse counts are cumulative.
+
+Validate with `--fg-optical-cache` (four optical passes, retained deferred phases,
+steady allocation reuse and mixed stereo/UI publication) and `--fg-shader11`
+(pixel parity, runtime image order, partial-acquire cleanup and pacing).
+
 ## DX12 generated-frame scheduling and timing
 
 The buffered shader/optical path submits RGB input preparation for the independent

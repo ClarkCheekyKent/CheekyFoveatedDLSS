@@ -22,6 +22,8 @@
                  DXGI_FORMAT declared=DXGI_FORMAT_UNKNOWN) noexcept override;
     bool ensure_chain(Chain& chain,const Image& image,bool scene=false);
     bool upload11(Chain& chain,const Image& source);
+    bool ensure_chain11(Chain& chain,const Image& source);
+    bool upload_batch11(const std::vector<std::pair<Chain*,Image>>& requests);
     bool upload_image(Chain& chain,const Image& source,bool scene=false);
     bool upload_batch(const std::vector<std::pair<Chain*,Image>>& requests);
     void note_direct_failure_locked(CheekyFgDirectReason reason,unsigned eye=0,const DirectRequest* request=nullptr,

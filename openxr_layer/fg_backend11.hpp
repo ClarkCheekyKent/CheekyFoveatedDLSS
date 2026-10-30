@@ -55,6 +55,26 @@ struct Backend11 {
     ComPtr<ID3D11PixelShader> pixel;
     ComPtr<ID3D11RasterizerState> rasterizer;
     ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11Buffer> draw_constants;
+    enum CpuStage {gate_wait,context_hold,flush_cpu,flush_gate,prepare_cpu,flow_cpu,reconstruct_cpu,runtime_gate,runtime_cpu,publication_cpu,end_frame_cpu,cpu_stage_count};
+    std::mutex cpu_mutex;
+    std::array<TimingAverage,cpu_stage_count> cpu;
+    std::uint64_t submissions{},flushes{},runtime_calls{},publications{};
+    TimingClock::time_point last_cpu_trace{};
+    void sample_cpu(CpuStage stage,double ms){std::lock_guard lock(cpu_mutex);cpu[stage].add(ms);
+        if(stage==context_hold)++submissions;else if(stage==flush_cpu)++flushes;
+        else if(stage==runtime_cpu)++runtime_calls;else if(stage==publication_cpu)++publications;}
+    template<class Call> bool measure_cpu(CpuStage stage,Call&& call){const auto start=TimingClock::now();
+        const bool result=call();sample_cpu(stage,elapsed_ms(start));return result;}
+    bool cpu_trace(char* message,size_t size){
+        std::lock_guard lock(cpu_mutex);if(elapsed_ms(last_cpu_trace)<2000)return false;last_cpu_trace=TimingClock::now();
+        unsigned allocations{},reuses{};for(auto& eye:optical)for(auto& pass:eye){allocations+=pass.output_allocations.load();reuses+=pass.output_reuses.load();}
+        snprintf(message,size,"FG native11 CPU ms: gate=%.3f hold=%.3f flush=%.3f flush_gate=%.3f prepare=%.3f flow=%.3f reconstruct=%.3f runtime_gate=%.3f runtime=%.3f publish=%.3f end_frame=%.3f; totals submit=%llu flush=%llu runtime=%llu publish=%llu optical_alloc=%u reuse=%u",
+            cpu[gate_wait].mean(),cpu[context_hold].mean(),cpu[flush_cpu].mean(),cpu[flush_gate].mean(),cpu[prepare_cpu].mean(),cpu[flow_cpu].mean(),cpu[reconstruct_cpu].mean(),
+            cpu[runtime_gate].mean(),cpu[runtime_cpu].mean(),cpu[publication_cpu].mean(),cpu[end_frame_cpu].mean(),
+            static_cast<unsigned long long>(submissions),static_cast<unsigned long long>(flushes),static_cast<unsigned long long>(runtime_calls),static_cast<unsigned long long>(publications),allocations,reuses);
+        return true;
+    }
     std::uint64_t session_generation{};
     std::mutex pool_mutex;
     std::vector<Image> pool;
@@ -77,6 +97,8 @@ struct Backend11 {
         if(FAILED(dev->CreatePixelShader(bytecode::interpolation_regionsps_ps_5_0,sizeof(bytecode::interpolation_regionsps_ps_5_0),nullptr,&pixel)))return false;
         D3D11_RASTERIZER_DESC rd{};rd.FillMode=D3D11_FILL_SOLID;rd.CullMode=D3D11_CULL_NONE;rd.DepthClipEnable=TRUE;
         if(FAILED(dev->CreateRasterizerState(&rd,&rasterizer)))return false;
+        D3D11_BUFFER_DESC cb{};cb.ByteWidth=sizeof(Constants);cb.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        if(FAILED(dev->CreateBuffer(&cb,nullptr,&draw_constants)))return false;
         D3D11_SAMPLER_DESC sd{};sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sd.MaxLOD=D3D11_FLOAT32_MAX;
         return SUCCEEDED(dev->CreateSamplerState(&sd,&sampler));
@@ -85,13 +107,16 @@ struct Backend11 {
     // thread must not switch the game's entire context state just to upload
     // a texture. Keep the dispatch and immediate-context protection for all work.
     template<class Record> bool submit(Record&& record,bool flush) {
+        const auto wait_start=TimingClock::now();
         std::unique_lock<std::recursive_mutex> serialized;if(dispatch)serialized=std::unique_lock(*dispatch);
         Guard guard(protection.Get());
+        const auto hold_start=TimingClock::now();sample_cpu(gate_wait,elapsed_ms(wait_start));
         gpu_timings.collect(context.Get());
         optical_timings.collect(context.Get());
         capture_timings.collect(context.Get());guide_timings.collect(context.Get());upload_timings.collect(context.Get());
         const bool recorded=record(context.Get());
-        if(flush)context->Flush();
+        if(flush)flush_commands();
+        sample_cpu(context_hold,elapsed_ms(hold_start));
         return recorded&&SUCCEEDED(device->GetDeviceRemovedReason());
     }
     // Only draws/dispatches need private shader state. Restore before submit()
@@ -113,10 +138,13 @@ struct Backend11 {
     // runtime's next xrWaitFrame can wait forever once the game stops
     // submitting (disabling frame generation hung DCS on Virtual Desktop).
     template<class Submit> auto runtime_submit(Submit&& submit) {
+        const auto wait_start=TimingClock::now();
         std::unique_lock<std::recursive_mutex> serialized;if(dispatch)serialized=std::unique_lock(*dispatch);
-        auto result=submit();flush();return result;
+        sample_cpu(runtime_gate,elapsed_ms(wait_start));const auto start=TimingClock::now();
+        auto result=submit();sample_cpu(runtime_cpu,elapsed_ms(start));flush();return result;
     }
-    void flush() noexcept {if(context&&protection){Guard guard(protection.Get());context->Flush();}}
+    void flush_commands(){const auto start=TimingClock::now();context->Flush();sample_cpu(flush_cpu,elapsed_ms(start));}
+    void flush() noexcept {if(context&&protection){const auto start=TimingClock::now();Guard guard(protection.Get());sample_cpu(flush_gate,elapsed_ms(start));flush_commands();}}
     void cancel_gpu_timing() {submit([&](ID3D11DeviceContext* commands){gpu_timings.cancel(commands);return true;},false);}
     // The single immediate context retains every referenced texture until its
     // queued GPU work finishes, so an image is reusable once only the pool owns it.
@@ -271,14 +299,16 @@ struct Backend11 {
     struct DeferredDraw {
         Image previous,current;
         std::shared_ptr<Guides> old_guides,new_guides;
-        ComPtr<ID3D11Buffer> constants;
+        Constants constants;
         ComPtr<ID3D11Texture2D> optical_color[2];
         ComPtr<ID3D11ShaderResourceView> optical_view[2];
+        std::shared_ptr<optical::Session11::Output> optical_lease[2];
         D3D11_TEXTURE2D_DESC desc{};
         ShaderTimings11::Ticket timing;unsigned timing_part{};
     };
     void record_draw(ID3D11DeviceContext* commands,const DeferredDraw& draw,ID3D11RenderTargetView* target) {
-        auto* cb=draw.constants.Get();auto* ss=sampler.Get();
+        commands->UpdateSubresource(draw_constants.Get(),0,nullptr,&draw.constants,0,0);
+        auto* cb=draw_constants.Get();auto* ss=sampler.Get();
         ID3D11ShaderResourceView* srvs[]{draw.previous->srv11.Get(),draw.current->srv11.Get(),
             draw.new_guides->motion_srv.Get(),draw.new_guides->depth_srv.Get(),draw.old_guides->depth_srv.Get(),nullptr,
             draw.optical_view[0].Get(),draw.optical_view[1].Get()};
@@ -303,13 +333,12 @@ struct Backend11 {
         std::array<Image,2>& out,bool deferred_output=false,float fraction=.5f) {
         // Prepare both eyes first; then issue all commands in one submission.
         std::array<std::shared_ptr<DeferredDraw>,2> draws;std::array<ComPtr<ID3D11RenderTargetView>,2> targets;
+        struct OpticalJob {unsigned eye,pass,quality;OpticalConstants params;ID3D11ShaderResourceView* depth;bool reset,needed{};};
+        std::vector<OpticalJob> jobs; // Left/right, center/periphery; one submission per stage.
         const auto& meta=new_guides[0]->source.meta;
         const unsigned focused_eyes=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
         const bool uses_flow=cheeky_fg_uses_flow(meta.center_method,meta.peripheral_method,focused_eyes!=0);
         ShaderTimings11::Ticket optical_timing;bool optical_measured=false;
-        if(uses_flow){D3D11_TEXTURE2D_DESC d{};current[0]->texture11->GetDesc(&d);
-            submit([&](ID3D11DeviceContext* c){optical_timing=optical_timings.reserve(device.Get(),1,d.Width,d.Height,focused_eyes,meta.peripheral_method,meta.configuration);
-                optical_measured=optical_timings.begin(c,optical_timing,0);return true;},false);}
         struct CancelMeasurement {Backend11& backend;bool armed;~CancelMeasurement(){if(armed)backend.submit([&](ID3D11DeviceContext* c){backend.optical_timings.cancel(c);return true;},false);}} cancel{*this,uses_flow};
         for(unsigned eye=0;eye<2;++eye){
             const auto& now=*new_guides[eye];const auto& g=now.source.meta;
@@ -343,35 +372,61 @@ struct Backend11 {
                 if(cheeky_fg_depth(method)&&!depth){strcpy_s(diagnostic,"NVIDIA Optical Flow + depth: waiting for depth guides");return false;}
                 params.flags[2]=depth?1.f:0.f;params.flags[3]=float(g.depth_inverted);
                 optical::pose_mapping(params,previous_views[eye].pose,previous_views[eye].fov,current_views[eye].pose,current_views[eye].fov,fraction);
-                if(!submit_shader([&](ID3D11DeviceContext* context){
-                    return optical[eye][pass].render(context,previous[eye]->srv11.Get(),current[eye]->srv11.Get(),depth,
-                        previous[eye]->identity,current[eye]->identity,quality,params,fraction,g.reset!=0,
-                        draw->optical_color[pass],draw->optical_view[pass]);},true)){
-                    strcpy_s(diagnostic,optical[eye][pass].diagnostic);return false;
-                }
+                jobs.push_back({eye,pass,quality,params,depth,g.reset!=0});
             }
             // Render-target output works for every swapchain color format,
             // including BGRA and sRGB, which typed UAVs do not.
             D3D11_TEXTURE2D_DESC e{};e.Width=d.Width;e.Height=d.Height;e.MipLevels=e.ArraySize=1;e.Format=d.Format;e.SampleDesc.Count=1;
             e.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET;draw->desc=e;
-            D3D11_BUFFER_DESC b{};b.ByteWidth=sizeof(c);b.BindFlags=D3D11_BIND_CONSTANT_BUFFER;D3D11_SUBRESOURCE_DATA initial{&c};
-            if(FAILED(device->CreateBuffer(&b,&initial,&draw->constants)))return false;
+            draw->constants=c;
             if(deferred_output){
                 static std::atomic<std::uint64_t> next_identity{1ull<<62};
                 out[eye]=std::make_shared<TransportImage>();out[eye]->identity=++next_identity;out[eye]->pending11=draw;
                 continue;
             }
             out[eye]=image(e,true);if(!out[eye])return false;
-            if(FAILED(device->CreateRenderTargetView(out[eye]->texture11.Get(),nullptr,&targets[eye])))return false;
+            if(!out[eye]->rtv11&&FAILED(device->CreateRenderTargetView(out[eye]->texture11.Get(),nullptr,&out[eye]->rtv11)))return false;
+            targets[eye]=out[eye]->rtv11;
         }
-        if(optical_measured)submit([&](ID3D11DeviceContext* c){optical_timings.end(c,optical_timing,0);return true;},false);
-        cancel.armed=false;
+        bool needs_flow=false;
+        if(!jobs.empty()){
+            // Queue every conversion before the SDK sees any of the inputs.
+            if(!submit_shader([&](ID3D11DeviceContext* commands){
+                optical_timing=optical_timings.reserve(device.Get(),1,draws[0]->desc.Width,draws[0]->desc.Height,focused_eyes,meta.peripheral_method,meta.configuration);
+                optical_measured=optical_timings.begin(commands,optical_timing,0);
+                return measure_cpu(prepare_cpu,[&]{
+                for(auto& job:jobs){auto& session=optical[job.eye][job.pass];
+                    if(!session.prepare(commands,previous[job.eye]->srv11.Get(),current[job.eye]->srv11.Get(),
+                        previous[job.eye]->identity,current[job.eye]->identity,job.quality,job.params,job.needed)){
+                        strcpy_s(diagnostic,session.diagnostic);return false;}
+                    needs_flow|=job.needed;}
+                if(needs_flow)flush_commands();return true;
+            });},false))return false;
+            // The SDK is not thread safe and shares the immediate context.
+            // Keep the same gate; independent engines may overlap queued work.
+            if(needs_flow&&!submit_shader([&](ID3D11DeviceContext*){return measure_cpu(flow_cpu,[&]{
+                for(auto& job:jobs)if(job.needed){auto& session=optical[job.eye][job.pass];
+                    if(!session.execute(previous[job.eye]->identity,current[job.eye]->identity,job.params,job.reset)){
+                        strcpy_s(diagnostic,session.diagnostic);return false;}}
+                return true;
+            });},false))return false;
+        }
         const unsigned focused=(meta.focus_width<.999f||meta.focus_height<.999f)?2u:0u;
-        if(deferred_output)return submit([&](ID3D11DeviceContext*){
-            auto timing=gpu_timings.reserve(device.Get(),2,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
-            for(unsigned eye=0;eye<2;++eye){draws[eye]->timing=timing;draws[eye]->timing_part=eye;}
-            return true;},false);
         return submit_shader([&](ID3D11DeviceContext* commands){
+            if(!jobs.empty()&&!measure_cpu(reconstruct_cpu,[&]{
+                for(const auto& job:jobs){auto& session=optical[job.eye][job.pass];auto& draw=*draws[job.eye];
+                    if(!session.reconstruct(commands,previous[job.eye]->srv11.Get(),current[job.eye]->srv11.Get(),job.depth,job.params,fraction,
+                        draw.optical_color[job.pass],draw.optical_view[job.pass],&draw.optical_lease[job.pass])){
+                        strcpy_s(diagnostic,session.diagnostic);return false;}}
+                return true;
+            }))return false;
+            if(optical_measured)optical_timings.end(commands,optical_timing,0);
+            cancel.armed=false;
+            if(deferred_output){
+                auto timing=gpu_timings.reserve(device.Get(),2,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
+                for(unsigned eye=0;eye<2;++eye){draws[eye]->timing=timing;draws[eye]->timing_part=eye;}
+                return true;
+            }
             auto timing=gpu_timings.reserve(device.Get(),1,draws[0]->desc.Width,draws[0]->desc.Height,focused,meta.peripheral_method,meta.configuration);
             const bool measured=gpu_timings.begin(commands,timing,0);
             for(unsigned eye=0;eye<2;++eye)record_draw(commands,*draws[eye],targets[eye].Get());
@@ -398,6 +453,34 @@ struct Backend11 {
         if(!target||!source||!source->texture11)return false;
         return submit([&](ID3D11DeviceContext* c){return upload_timings.measure(device.Get(),c,0,1,[&]{
             c->CopyResource(target,source->texture11.Get());return true;});},true);
+    }
+    // Publish stereo and auxiliary images with one context entry and one flush.
+    // Runtime acquire/wait/release calls retain their own required flushes.
+    bool publish_images(const std::vector<std::pair<ID3D11Texture2D*,Image>>& images){
+        std::vector<ComPtr<ID3D11RenderTargetView>> targets(images.size());bool shaders=false;
+        for(size_t i=0;i<images.size();++i){auto* target=images[i].first;const auto& source=images[i].second;
+            if(!target||!source)return false;
+            if(const auto* draw=deferred(source)){
+                D3D11_TEXTURE2D_DESC d{};target->GetDesc(&d);
+                if(d.Width!=draw->desc.Width||d.Height!=draw->desc.Height||!(d.BindFlags&D3D11_BIND_RENDER_TARGET))return false;
+                D3D11_RENDER_TARGET_VIEW_DESC view{};view.Format=draw->desc.Format;
+                view.ViewDimension=d.ArraySize>1?D3D11_RTV_DIMENSION_TEXTURE2DARRAY:D3D11_RTV_DIMENSION_TEXTURE2D;
+                if(d.ArraySize>1)view.Texture2DArray.ArraySize=1;
+                if(FAILED(device->CreateRenderTargetView(target,&view,&targets[i])))return false;shaders=true;
+            }else if(!source->texture11)return false;
+        }
+        if(images.empty())return true;
+        const auto record=[&](ID3D11DeviceContext* commands){
+            for(size_t i=0;i<images.size();++i){const auto& [target,source]=images[i];
+                if(const auto* draw=deferred(source)){
+                    const bool measured=gpu_timings.begin(commands,draw->timing,draw->timing_part);
+                    record_draw(commands,*draw,targets[i].Get());
+                    if(measured)gpu_timings.end(commands,draw->timing,draw->timing_part);
+                }else if(!upload_timings.measure(device.Get(),commands,0,1,[&]{commands->CopyResource(target,source->texture11.Get());return true;}))return false;
+            }
+            return true;
+        };
+        return shaders?submit_shader(record,true):submit(record,true);
     }
 };
 }

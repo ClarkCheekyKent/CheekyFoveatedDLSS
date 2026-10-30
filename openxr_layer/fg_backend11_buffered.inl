@@ -89,7 +89,7 @@ inline bool BufferedPresenter::prepare_native11(Native& job,const XrCompositionL
     return true;
 }
 
-inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {
+inline bool BufferedPresenter::ensure_chain11(Chain& chain,const Image& source) {
     // A deferred interpolation pass renders straight into the OpenXR image.
     const auto* draw=Backend11::deferred(source);
     if(!source||(!source->texture11&&!draw))return false;
@@ -113,18 +113,34 @@ inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {
             destroy_chain(chain.handle);chain={};return false;}
         chain.desc.Width=d.Width;chain.desc.Height=d.Height;chain.desc.Format=d.Format;chain.desc.DepthOrArraySize=UINT16(d.ArraySize);
     }
-    if(chain.uploaded==source->identity)return true;
-    unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if(XR_FAILED(native11->runtime_submit([&]{return xr.acquire(chain.handle,&acquire,&index);})))return false;
-    XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
-    const auto wait_begin=TimingClock::now();const auto wait_result=native11->runtime_submit([&]{return xr.wait_image(chain.handle,&wait);});
-    {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
-    const bool copied=XR_SUCCEEDED(wait_result)&&index<chain.images11.size()&&
-        (draw?native11->draw_into(chain.images11[index].texture,source):native11->upload(chain.images11[index].texture,source));
-    XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    const bool released=XR_SUCCEEDED(native11->runtime_submit([&]{return xr.release(chain.handle,&release);}));
-    if(released&&copied){chain.uploaded=source->identity;chain.last_uploaded_index=index;}
-    return released&&copied;
+    return true;
+}
+inline bool BufferedPresenter::upload11(Chain& chain,const Image& source) {return upload_batch11({{&chain,source}});}
+inline bool BufferedPresenter::upload_batch11(const std::vector<std::pair<Chain*,Image>>& requests) {
+    const auto begin=TimingClock::now();
+    struct Measure {Backend11& gpu;TimingClock::time_point begin;~Measure(){gpu.sample_cpu(Backend11::publication_cpu,elapsed_ms(begin));}} measure{*native11,begin};
+    struct Acquired {Chain* chain;Image source;unsigned index;};
+    std::vector<Acquired> acquired;std::vector<std::pair<ID3D11Texture2D*,Image>> destinations;
+    bool prepared=true;
+    for(const auto& [chain,source]:requests){
+        if(!chain||!ensure_chain11(*chain,source)){prepared=false;break;}
+        if(chain->uploaded==source->identity)continue;
+        unsigned index{};XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if(XR_FAILED(native11->runtime_submit([&]{return xr.acquire(chain->handle,&acquire,&index);}))) {prepared=false;break;}
+        acquired.push_back({chain,source,index});
+        XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wait.timeout=XR_INFINITE_DURATION;
+        const auto wait_begin=TimingClock::now();const auto result=native11->runtime_submit([&]{return xr.wait_image(chain->handle,&wait);});
+        {std::lock_guard lock(mx);present_image_wait.add(elapsed_ms(wait_begin));}
+        if(XR_FAILED(result)||index>=chain->images11.size()){prepared=false;break;}
+        destinations.emplace_back(chain->images11[index].texture,source);
+    }
+    const bool copied=prepared&&native11->publish_images(destinations);bool released=true;
+    // Release every acquired image even when a later eye failed. A failed batch
+    // never advances uploaded identities; retry must copy the complete stereo set.
+    for(auto& image:acquired){XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        const bool ok=XR_SUCCEEDED(native11->runtime_submit([&]{return xr.release(image.chain->handle,&release);}));released&=ok;}
+    if(copied&&released)for(const auto& image:acquired){image.chain->uploaded=image.source->identity;image.chain->last_uploaded_index=image.index;}
+    return copied&&released;
 }
 
 struct BufferedBackend11 final : FrameBackend {
@@ -200,12 +216,15 @@ struct BufferedBackend11 final : FrameBackend {
     }
     bool publish(const BufferedPair& pair,const std::array<Image,2>& images,
         std::array<XrCompositionLayerProjectionView,2>& views,FrameLayers& layers,bool) override {
+        std::vector<std::pair<Chain*,Image>> requests;
+        for(unsigned eye=0;eye<2;++eye)requests.emplace_back(&owner.scene_chains[eye],images[eye]);
+        for(const auto& a:pair.auxiliary)requests.emplace_back(&owner.auxiliary_chains[a.source],a.image);
+        if(!owner.upload_batch11(requests)){owner.native11->cancel_gpu_timing();return false;}
         for(unsigned eye=0;eye<2;++eye){
-            auto& chain=owner.scene_chains[eye];if(!owner.upload11(chain,images[eye])){owner.native11->cancel_gpu_timing();return false;}
+            auto& chain=owner.scene_chains[eye];
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
             views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
         }
-        for(const auto& a:pair.auxiliary)if(!owner.upload11(owner.auxiliary_chains[a.source],a.image))return false;
         if(!owner.subimages(layers,[&](XrSwapchainSubImage& sub){const auto i=owner.auxiliary_chains.find(sub.swapchain);
             if(i==owner.auxiliary_chains.end())return false;sub.swapchain=i->second.handle;return true;}))return false;
         return true;
@@ -233,7 +252,11 @@ struct BufferedBackend11 final : FrameBackend {
         performance.total_ms+=optical.total_ms;performance.total_last_ms+=optical.total_last_ms;
     }
     XrResult end_frame(const XrFrameEndInfo* end) override {
-        return owner.native11->runtime_submit([&]{return owner.xr.end_frame(owner.session,end);});
+        const auto start=TimingClock::now();
+        const auto result=owner.native11->runtime_submit([&]{return owner.xr.end_frame(owner.session,end);});
+        owner.native11->sample_cpu(Backend11::end_frame_cpu,elapsed_ms(start));
+        char message[768];if(owner.trace&&owner.native11->cpu_trace(message,sizeof(message)))owner.trace(message);
+        return result;
     }
     bool service_direct_output(double,BufferedPair&) override {return false;}
     bool supports_direct_output() const override {return false;}

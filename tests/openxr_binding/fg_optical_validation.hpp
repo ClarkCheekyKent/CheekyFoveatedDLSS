@@ -274,6 +274,35 @@ inline void fg_optical_cache_validation(bool options=false){
     }
     D3D11_TEXTURE2D_DESC input_desc{};native.optical[0][0].textures[0]->GetDesc(&input_desc);
     check(input_desc.Format==optical::input_format(),"D3D11 estimation input remains RGB for every method");
+    // Four optical jobs, three live deferred phases. Publish in reverse order
+    // after further generation, so accidental pool reuse cannot hide behind
+    // immediate readback or phase order.
+    for(auto& guide:guides){auto& g=guide->source.meta;g.center_method=g.peripheral_method=cheeky_fg_optical_fast;
+        g.focus_width=g.focus_height=.5f;g.resolution_percent=100;g.peripheral_percent=50;g.optical.peripheral_grid=4;}
+    std::array<std::array<std::vector<std::uint32_t>,2>,3> reference11;
+    std::array<std::array<Image,2>,3> deferred11;
+    for(unsigned phase=0;phase<3;++phase){std::array<Image,2> out;
+        check(native.generate(previous,current,guides,guides,views,views,out,false,fractions[phase]),native.diagnostic);
+        for(unsigned eye=0;eye<2;++eye)reference11[phase][eye]=read11(device11.Get(),context.Get(),out[eye]->texture11.Get());
+    }
+    for(unsigned phase=0;phase<3;++phase)check(native.generate(previous,current,guides,guides,views,views,deferred11[phase],true,fractions[phase]),native.diagnostic);
+    auto allocations11=[&]{unsigned total{};for(auto& eye:native.optical)for(auto& pass:eye)total+=pass.output_allocations.load();return total;};
+    // Warm the extra working slot while all deferred outputs remain leased.
+    std::array<Image,2> extra11;check(native.generate(previous,current,guides,guides,views,views,extra11,false),native.diagnostic);
+    const auto warmed_allocations=allocations11();
+    for(unsigned phase=0;phase<3;++phase)check(native.generate(previous,current,guides,guides,views,views,extra11,false,fractions[phase]),native.diagnostic);
+    check(allocations11()==warmed_allocations,"Steady-state optical generation reuses texture/SRV/UAV allocations");
+    std::array<ComPtr<ID3D11Texture2D>,3> targets11;
+    D3D11_TEXTURE2D_DESC target_desc{};a->GetDesc(&target_desc);target_desc.BindFlags|=D3D11_BIND_RENDER_TARGET;
+    for(auto& target:targets11)check(SUCCEEDED(device11->CreateTexture2D(&target_desc,nullptr,&target)),"Batched publication destination");
+    for(int phase=2;phase>=0;--phase){const auto submits=native.submissions,flushes=native.flushes;
+        check(native.publish_images({{targets11[0].Get(),deferred11[phase][0]},{targets11[1].Get(),deferred11[phase][1]},{targets11[2].Get(),previous[0]}}),"Mixed stereo draw and auxiliary copy batch");
+        check(native.submissions==submits+1&&native.flushes==flushes+1,"Stereo and auxiliary publication use one context entry and flush");
+        for(unsigned eye=0;eye<2;++eye)near_equal(reference11[phase][eye],read11(device11.Get(),context.Get(),targets11[eye].Get()));
+        near_equal(old,read11(device11.Get(),context.Get(),targets11[2].Get()));
+    }
+    deferred11={};
+    std::cout<<"PASS D3D11 batched four-pass optical flow, pooled live G1/G2/G3 and stereo/auxiliary publication\n";
     ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;check(SUCCEEDED(device11.As(&dxgi))&&SUCCEEDED(dxgi->GetAdapter(&adapter)),"Cache adapter");
     fg_parity::D3D12 gpu(adapter.Get());
     auto old12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,old.data(),4,edge),now12=gpu.texture(DXGI_FORMAT_R8G8B8A8_UNORM,now.data(),4,edge);
