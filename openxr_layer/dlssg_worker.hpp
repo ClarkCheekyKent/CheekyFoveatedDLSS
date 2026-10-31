@@ -52,6 +52,10 @@ struct Worker {
     // replace this pass's own; interpolation keeps its own output region.
     std::array<bool,2> shared_center_flow{};
     std::array<OpticalConstants,2> shared_center_constants{};
+    // Likewise the periphery flow, in focus.borrowed_optical[eye][1], but
+    // still pending: this worker consumes it right before its reader.
+    std::array<bool,2> shared_peripheral_flow{};
+    std::array<OpticalConstants,2> shared_peripheral_constants{};
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;

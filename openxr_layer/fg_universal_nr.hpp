@@ -7,7 +7,9 @@
 // become the next interval's FG history. The captured eyes are kept for the
 // next optical flow, which therefore never compares NR output with raw color.
 // When FG's center also uses optical flow, FG borrows this flow instead of
-// estimating it again (Worker::shared_center_flow).
+// estimating it again (Worker::shared_center_flow). FG's periphery flow is
+// estimated here too, so the flow engine runs it during DLSS-NR instead of
+// after it (Worker::shared_peripheral_flow).
 #include "fg_optical.hpp"
 #include "fg_transport.hpp"
 #include "fg_color_format.hpp"
@@ -37,14 +39,21 @@ struct UniversalNr12 {
         std::array<Image,2> previous_copy; // Previous native as the same image format, when it had none.
         std::array<bool,2> evaluated{},shared{};
         std::array<OpticalConstants,2> flow_constants{};
+        std::array<bool,2> periphery_shared{}; // FG's periphery flow, still to be consumed.
+        std::array<OpticalConstants,2> periphery_constants{};
         bool game_motion{},game_depth{};
         const char* reason{};
     };
 
-    optical::Session12 flow[2];
+    optical::Session12 flow[2],periphery[2];
     ComPtr<ID3D12Resource> vectors[2];
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
+    // Lists, in submission order: image copies (run while the optical flow
+    // engine estimates), then each eye's vectors and DLSS-NR, each after only
+    // that eye's flow. Eye 0's NR then overlaps eye 1's flow.
+    static constexpr unsigned list_count=3;
+    ComPtr<ID3D12CommandAllocator> allocators[list_count];ComPtr<ID3D12GraphicsCommandList> lists[list_count];
+    ID3D12GraphicsCommandList* list{}; // The list being recorded.
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{};
     UniversalNr12()=default;UniversalNr12(const UniversalNr12&)=delete;UniversalNr12& operator=(const UniversalNr12&)=delete;
     ~UniversalNr12(){wait();if(event)CloseHandle(event);}
@@ -83,17 +92,22 @@ struct UniversalNr12 {
     }
     bool commands(ID3D12Device* dev,ID3D12CommandQueue* q) noexcept {
         if(device.Get()!=dev||queue.Get()!=q){
-            wait();allocator.Reset();list.Reset();fence.Reset();serial=0;device=dev;queue=q;
+            wait();for(auto& a:allocators)a.Reset();for(auto& l:lists)l.Reset();list=nullptr;fence.Reset();serial=0;device=dev;queue=q;
             for(auto& v:vectors)v.Reset();
         }
         if(!event&&!(event=CreateEventW(nullptr,FALSE,FALSE,nullptr)))return false;
         if(!fence&&FAILED(dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))))return false;
-        if(!allocator&&(FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||
-           FAILED(dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)))||
-           FAILED(list->Close())))return false;
-        // Only this stage's previous list must retire before its allocator is reused.
-        return wait()&&SUCCEEDED(allocator->Reset())&&SUCCEEDED(list->Reset(allocator.Get(),nullptr));
+        for(unsigned i=0;i<list_count;++i)if(!allocators[i]&&(FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocators[i])))||
+           FAILED(dev->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocators[i].Get(),nullptr,IID_PPV_ARGS(&lists[i])))||
+           FAILED(lists[i]->Close())))return false;
+        // Only this stage's previous lists must retire before their allocators
+        // are reused; the next pair normally arrives long after.
+        if(!wait())return false;
+        for(unsigned i=0;i<list_count;++i)if(FAILED(allocators[i]->Reset())||FAILED(lists[i]->Reset(allocators[i].Get(),nullptr))){close_all();return false;}
+        list=lists[0].Get();return true;
     }
+    // A failed run leaves no list recording, so the next commands() can reset.
+    void close_all() noexcept {for(auto& l:lists)if(l)l->Close();}
     bool vector_texture(unsigned eye,unsigned w,unsigned h) noexcept {
         if(vectors[eye]){const auto d=vectors[eye]->GetDesc();if(d.Width==w&&d.Height==h)return true;vectors[eye].Reset();}
         D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
@@ -108,13 +122,13 @@ struct UniversalNr12 {
     Image copy_image(Transport& pool,const Image& source,DXGI_FORMAT format,unsigned w,unsigned h) noexcept {
         auto desc=source->texture->GetDesc();desc.Width=w;desc.Height=h;desc.DepthOrArraySize=desc.MipLevels=1;desc.Format=format;
         auto image=pool.image(desc,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);if(!image)return {};
-        transition(list.Get(),source->texture.Get(),source->state,D3D12_RESOURCE_STATE_COPY_SOURCE);
-        transition(list.Get(),image->texture.Get(),image->state,D3D12_RESOURCE_STATE_COPY_DEST);
+        transition(list,source->texture.Get(),source->state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(list,image->texture.Get(),image->state,D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=source->texture.Get();to.pResource=image->texture.Get();
         from.Type=to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;const D3D12_BOX box{0,0,0,w,h,1};
         list->CopyTextureRegion(&to,0,0,0,&from,&box);
-        transition(list.Get(),image->texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_GENERIC_READ);
-        transition(list.Get(),source->texture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,source->state);
+        transition(list,image->texture.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_GENERIC_READ);
+        transition(list,source->texture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,source->state);
         image->state=D3D12_RESOURCE_STATE_GENERIC_READ;image->layout=source->layout;image->fg_border=source->fg_border;
         image->presentation_feather=source->presentation_feather;
         const auto captured=source->texture->GetDesc().Format;
@@ -191,58 +205,86 @@ struct UniversalNr12 {
             auto flow_eye=g;flow_eye.width=e.w;flow_eye.height=e.h;
             if(share)rect=bounds(rect,fg_center(g,e.w,e.h));
             else{flow_eye.optical.center_preset=opts.optical_preset;flow_eye.optical.center_percent=opts.optical_percent;flow_eye.optical.center_grid=opts.optical_grid;}
-            if(!vector_texture(eye,std::max(64u,(e.w+1)/2),std::max(64u,(e.h+1)/2))){out.reason="Universal DLSS 5 vector allocation failed";out.shared={};list->Close();return false;}
+            if(!vector_texture(eye,std::max(64u,(e.w+1)/2),std::max(64u,(e.h+1)/2))){out.reason="Universal DLSS 5 vector allocation failed";out.shared={};close_all();return false;}
             const auto vd=vectors[eye]->GetDesc();
             e.c=optical::constants(flow_eye,0,rect.data(),in.previous_raw[eye]->layout,raw->layout,unsigned(vd.Width),vd.Height);
             e.c.texel[3]=0; // Fast mode, no vector cache; FG builds its own cache if it borrows.
             if(in.cameras[eye].valid)optical::pose_mapping(e.c,in.cameras[eye].previous_pose,in.cameras[eye].previous_fov,
                 in.cameras[eye].pose,in.cameras[eye].view_fov,.5f);
             const auto old_format=in.previous_raw[eye]->texture->GetDesc().Format,now_format=raw->texture->GetDesc().Format;
-            // Submits its input preparation and the flow; the queue then waits for the flow.
+            // Submits its input preparation and the flow. The queue waits for it
+            // only right before this eye's vectors, so both eyes' flows run
+            // back-to-back on the optical flow engine.
             if(!flow[eye].prepare(in.device,in.queue,in.previous_raw[eye]->texture.Get(),raw->texture.Get(),
-                share?g.optical.center_preset:opts.optical_preset,e.c,in.reset||g.reset!=0,D3D12_RESOURCE_STATE_GENERIC_READ,old_format,now_format)){
+                share?g.optical.center_preset:opts.optical_preset,e.c,in.reset||g.reset!=0,D3D12_RESOURCE_STATE_GENERIC_READ,old_format,now_format,true)){
                 out.reason="Universal DLSS 5 optical flow failed";continue;
             }
             e.flow=true;out.shared[eye]=share;out.flow_constants[eye]=e.c;
             out.flow_constants[eye].sizes[0]=float(flow[eye].width);out.flow_constants[eye].sizes[1]=float(flow[eye].height);
             e.motion=vectors[eye].Get();e.motion_rect[2]=unsigned(vd.Width);e.motion_rect[3]=vd.Height;
         }
+        // FG's periphery flows queue behind both NR flows on the flow engine
+        // and finish while DLSS-NR runs. FG consumes them before its reader.
+        for(unsigned eye=0;eye<2&&opts.share_optical;++eye){
+            const auto& g=in.guides->eyes[eye];
+            if(!cheeky_fg_optical(g.peripheral_method)||(g.focus_width>=.999f&&g.focus_height>=.999f))continue;
+            const float full[]{0,0,1,1};
+            auto c=optical::constants(g,1,full,in.previous_raw[eye]->layout,in.current_raw[eye]->layout,
+                std::max(32u,(work[eye].w*g.peripheral_percent+50)/100),std::max(32u,(work[eye].h*g.peripheral_percent+50)/100));
+            if(in.cameras[eye].valid)optical::pose_mapping(c,in.cameras[eye].previous_pose,in.cameras[eye].previous_fov,
+                in.cameras[eye].pose,in.cameras[eye].view_fov,.5f);
+            const auto& old_image=in.previous_raw[eye]->texture;const auto& now_image=in.current_raw[eye]->texture;
+            if(!periphery[eye].prepare(in.device,in.queue,old_image.Get(),now_image.Get(),g.optical.peripheral_preset,c,in.reset||g.reset!=0,
+                D3D12_RESOURCE_STATE_GENERIC_READ,old_image->GetDesc().Format,now_image->GetDesc().Format,true))continue;
+            out.periphery_shared[eye]=true;out.periphery_constants[eye]=c;
+            out.periphery_constants[eye].sizes[0]=float(periphery[eye].width);out.periphery_constants[eye].sizes[1]=float(periphery[eye].height);
+        }
+        // List 0: image copies only; it runs on 3D while the flows estimate.
         for(unsigned eye=0;eye<2&&in.convert_previous;++eye){
             const auto& p=in.previous_raw[eye];
             out.previous_copy[eye]=copy_image(*in.pool,p,format,p->layout.width?p->layout.width:unsigned(p->texture->GetDesc().Width),
                 p->layout.height?p->layout.height:p->texture->GetDesc().Height);
         }
-        // The flow's queue waits precede this list.
-        for(unsigned eye=0;eye<2;++eye)if(work[eye].flow&&!flow[eye].nr_vectors(list.Get(),vectors[eye].Get(),work[eye].c,false)){
-            work[eye].flow=false;work[eye].motion=nullptr;out.shared[eye]=false;out.reason="Universal DLSS 5 vector conversion failed";}
         for(unsigned eye=0;eye<2;++eye){
-            if(work[eye].flow)transition(list.Get(),vectors[eye].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             out.color[eye]=copy_image(*in.pool,in.current_raw[eye],format,work[eye].w,work[eye].h);
             if(!out.color[eye]){out.reason="Universal DLSS 5 image allocation failed";break;}
         }
         bool good=out.color[0]&&out.color[1]&&(!in.convert_previous||(out.previous_copy[0]&&out.previous_copy[1]));
-        for(unsigned eye=0;eye<2&&good;++eye){
-            const auto& e=work[eye];if(!e.motion)continue;
-            CheekyNrUniversalEyeV1 nr;nr.list=list.Get();nr.eye=eye;nr.reset=in.reset||in.guides->eyes[eye].reset?1u:0u;
-            nr.color=out.color[eye]->texture.Get();nr.color_state=D3D12_RESOURCE_STATE_GENERIC_READ;nr.width=e.w;nr.height=e.h;
-            nr.hdr=format==DXGI_FORMAT_R16G16B16A16_FLOAT?1u:0u;
-            nr.motion=e.motion;nr.motion_state=e.game_motion?D3D12_RESOURCE_STATE_COMMON:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            nr.motion_x=e.motion_rect[0];nr.motion_y=e.motion_rect[1];nr.motion_width=e.motion_rect[2];nr.motion_height=e.motion_rect[3];
-            nr.motion_uv_scale_x=e.motion_scale[0];nr.motion_uv_scale_y=e.motion_scale[1];
-            if(e.depth){nr.depth=e.depth;nr.depth_state=D3D12_RESOURCE_STATE_COMMON;nr.depth_x=e.depth_rect[0];nr.depth_y=e.depth_rect[1];
-                nr.depth_width=e.depth_rect[2];nr.depth_height=e.depth_rect[3];nr.depth_inverted=e.depth_inverted?1u:0u;}
-            nr.has_center=e.has_center?1u:0u;nr.center_u=e.center[0];nr.center_v=e.center[1];
-            nr.game_motion=e.game_motion?1u:0u;nr.shared_flow=out.shared[eye]?1u:0u;
-            out.evaluated[eye]=evaluate(&nr);
-            out.game_motion|=e.game_motion;out.game_depth|=e.game_depth&&out.evaluated[eye];
-            if(!out.evaluated[eye]&&!out.reason)out.reason="DLSS-NR rejected this eye; see the DLSS-NR runtime state";
+        bool submitted=true;
+        const auto submit=[&](unsigned index){
+            if(FAILED(lists[index]->Close())){submitted=false;return;}
+            ID3D12CommandList* l[]{lists[index].Get()};in.queue->ExecuteCommandLists(1,l);
+        };
+        submit(0);
+        // Lists 1 and 2: each eye after only its own flow.
+        for(unsigned eye=0;eye<2;++eye){
+            auto& e=work[eye];list=lists[1+eye].Get();
+            if(e.flow&&!flow[eye].consume()){e.flow=false;e.motion=nullptr;out.shared[eye]=false;out.reason="Universal DLSS 5 optical flow wait failed";}
+            if(e.flow&&!flow[eye].nr_vectors(list,vectors[eye].Get(),e.c,false)){
+                e.flow=false;e.motion=nullptr;out.shared[eye]=false;out.reason="Universal DLSS 5 vector conversion failed";}
+            if(e.flow)transition(list,vectors[eye].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            if(good&&e.motion){
+                CheekyNrUniversalEyeV1 nr;nr.list=list;nr.eye=eye;nr.reset=in.reset||in.guides->eyes[eye].reset?1u:0u;
+                nr.color=out.color[eye]->texture.Get();nr.color_state=D3D12_RESOURCE_STATE_GENERIC_READ;nr.width=e.w;nr.height=e.h;
+                nr.hdr=format==DXGI_FORMAT_R16G16B16A16_FLOAT?1u:0u;
+                nr.motion=e.motion;nr.motion_state=e.game_motion?D3D12_RESOURCE_STATE_COMMON:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                nr.motion_x=e.motion_rect[0];nr.motion_y=e.motion_rect[1];nr.motion_width=e.motion_rect[2];nr.motion_height=e.motion_rect[3];
+                nr.motion_uv_scale_x=e.motion_scale[0];nr.motion_uv_scale_y=e.motion_scale[1];
+                if(e.depth){nr.depth=e.depth;nr.depth_state=D3D12_RESOURCE_STATE_COMMON;nr.depth_x=e.depth_rect[0];nr.depth_y=e.depth_rect[1];
+                    nr.depth_width=e.depth_rect[2];nr.depth_height=e.depth_rect[3];nr.depth_inverted=e.depth_inverted?1u:0u;}
+                nr.has_center=e.has_center?1u:0u;nr.center_u=e.center[0];nr.center_v=e.center[1];
+                nr.game_motion=e.game_motion?1u:0u;nr.shared_flow=out.shared[eye]?1u:0u;
+                out.evaluated[eye]=evaluate(&nr);
+                out.game_motion|=e.game_motion;out.game_depth|=e.game_depth&&out.evaluated[eye];
+                if(!out.evaluated[eye]&&!out.reason)out.reason="DLSS-NR rejected this eye; see the DLSS-NR runtime state";
+            }
+            if(e.flow)transition(list,vectors[eye].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+            submit(1+eye);
         }
-        for(unsigned eye=0;eye<2;++eye)if(work[eye].flow)
-            transition(list.Get(),vectors[eye].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
-        if(FAILED(list->Close())){out={};out.reason="Universal DLSS 5 recording failed";return false;}
-        ID3D12CommandList* lists[]{list.Get()};in.queue->ExecuteCommandLists(1,lists);
+        list=lists[0].Get();
         if(FAILED(in.queue->Signal(fence.Get(),++serial))){--serial;}
-        if(!good){out.color={};out.previous_copy={};for(auto& s:out.shared)s=false;}
+        if(!submitted){out={};out.reason="Universal DLSS 5 recording failed";return false;}
+        if(!good){out.color={};out.previous_copy={};out.shared={};out.periphery_shared={};}
         return good;
     }
 };

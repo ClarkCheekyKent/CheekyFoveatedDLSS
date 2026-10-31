@@ -535,8 +535,8 @@ struct BufferedBackend12 final : FrameBackend {
     void universal_nr(const std::shared_ptr<BufferedNative>& previous,const std::shared_ptr<BufferedNative>& job,
         BufferedPair& pair,const FrameGuides12& guides,bool fg_reset) noexcept {
         auto& worker=owner.worker;
-        worker.shared_center_flow={};
-        for(unsigned eye=0;eye<2;++eye)worker.focus.borrowed_optical[eye][0]=nullptr;
+        worker.shared_center_flow={};worker.shared_peripheral_flow={};
+        for(auto& eye:worker.focus.borrowed_optical)for(auto& session:eye)session=nullptr;
         CheekyNrUniversalOptionsV1 options;
         if(!UniversalNr12::options(options)){universal_was_active=false;return;}
         CheekyNrUniversalStatusV1 status;
@@ -568,6 +568,10 @@ struct BufferedBackend12 final : FrameBackend {
                 if(output.shared[eye]){
                     worker.shared_center_flow[eye]=true;worker.shared_center_constants[eye]=output.flow_constants[eye];
                     worker.focus.borrowed_optical[eye][0]=&universal.flow[eye];status.shared_flow=1u;
+                }
+                if(output.periphery_shared[eye]){
+                    worker.shared_peripheral_flow[eye]=true;worker.shared_peripheral_constants[eye]=output.periphery_constants[eye];
+                    worker.focus.borrowed_optical[eye][1]=&universal.periphery[eye];status.shared_flow=1u;
                 }
             }
             job->universal_nr=true;
