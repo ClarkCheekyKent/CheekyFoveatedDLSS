@@ -85,6 +85,7 @@ struct DlssNrUniversalStatus {
     bool layer_reporting{}; // The layer reported within the last second.
     bool evaluated[2]{};
     bool game_motion{}, game_depth{}, shared_flow{};
+    bool projection_alignment{};
     std::uint64_t evaluations{}, fallbacks{}, resets{};
     float flow_ms{}, vectors_ms{};
     const char* reason{};

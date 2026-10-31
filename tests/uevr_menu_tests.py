@@ -971,6 +971,11 @@ def run(engine):
     assert g["values"]["Motion vectors"] == state["settings"]["NrUniversalMotion"]
     assert any("Using FG optical flow" in t for t in g.drawn.values())
     assert g["values"]["NR optical flow preset"] is None
+    state["nr_details"]["universal"].update(layer_reporting=True, projection_alignment=True)
+    receive(state)
+    draw()
+    assert "Stereo alignment: OpenXR projection" in g.drawn.values()
+    state["nr_details"]["universal"].update(layer_reporting=False, projection_alignment=False)
     state["settings"]["NrOpticalShare"] = False
     receive(state)
     draw()

@@ -11,6 +11,7 @@ namespace cheeky::fg {
 // Each command allocator and every referenced image stays leased until its
 // fence retires. The producer only polls for a free context; it never waits.
 struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;float presentation_feather{-1};
+    std::array<BorderRect,2> alignment_borders{}; // Red SR and green NR bounding boxes, drawn only on upload.
     // Native D3D11 backend images (Backend11); texture stays null for these.
     ComPtr<ID3D11Texture2D> texture11;ComPtr<ID3D11ShaderResourceView> srv11;ComPtr<ID3D11RenderTargetView> rtv11;
     std::shared_ptr<void> pending11; // Backend11 deferred interpolation pass (direct OpenXR output).
@@ -137,7 +138,7 @@ struct Transport {
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
             if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
-               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->fg_border={};p->presentation_feather=-1;p->identity=++next_identity;p->last_used_tick=now;return p;}
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->fg_border={};p->alignment_borders={};p->presentation_feather=-1;p->identity=++next_identity;p->last_used_tick=now;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
@@ -240,6 +241,29 @@ struct Transport {
         c.images.push_back(destination);c.borrowed.emplace_back(source);++region_copies;
         return good?destination:Image{};
     }
+    bool record_alignment_borders(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT format,D3D12_RESOURCE_STATES state) {
+        if(!source->alignment_borders[0].visible&&!source->alignment_borders[1].visible)return true;
+        if(c.bindings.used>=32)return false;
+        if(!c.bindings.rtv){D3D12_DESCRIPTOR_HEAP_DESC heap{};heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;heap.NumDescriptors=32;
+            if(FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&c.bindings.rtv))))return false;}
+        auto rtv=c.bindings.rtv->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr+=c.bindings.used++*device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        D3D12_RENDER_TARGET_VIEW_DESC view{};view.Format=format;view.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+        device->CreateRenderTargetView(target,&view,rtv);
+        const auto desc=target->GetDesc();const LONG width=LONG(desc.Width),height=LONG(desc.Height);
+        color_transition(c.list.Get(),target,state,D3D12_RESOURCE_STATE_RENDER_TARGET);
+        for(unsigned region=0;region<2;++region){const auto& box=source->alignment_borders[region];if(!box.visible)continue;
+            const LONG x=std::clamp(LONG(std::lround(box.x*width)),0L,width),y=std::clamp(LONG(std::lround(box.y*height)),0L,height);
+            const LONG right=std::clamp(LONG(std::lround((box.x+box.w)*width)),x,width);
+            const LONG bottom=std::clamp(LONG(std::lround((box.y+box.h)*height)),y,height);
+            const LONG dx=std::min(3L,right-x),dy=std::min(3L,bottom-y);
+            if(dx<=0||dy<=0)continue;
+            const D3D12_RECT edges[]{{x,y,right,y+dy},{x,bottom-dy,right,bottom},{x,y,x+dx,bottom},{right-dx,y,right,bottom}};
+            const float color[]{region?0.f:1.f,region?1.f:0.f,0.f,1.f};
+            c.list->ClearRenderTargetView(rtv,color,4,edges);
+        }
+        color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_RENDER_TARGET,state);return true;
+    }
     bool record_upload(Context& c,const Image& source,ID3D12Resource* target,DXGI_FORMAT target_format=DXGI_FORMAT_UNKNOWN,bool linear_target=false,D3D12_RESOURCE_STATES target_state=D3D12_RESOURCE_STATE_RENDER_TARGET) {
         if(!source||!target||target==source->texture.Get())return false;
         const auto a=source->texture->GetDesc(),b=target->GetDesc();
@@ -263,7 +287,8 @@ struct Transport {
                 D3D12_VIEWPORT{0,0,float(width),float(height),0,1},constants);
             color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_RENDER_TARGET,target_state);
             color_transition(c.list.Get(),source->texture.Get(),readable,source->state);
-            c.images.push_back(source);c.borrowed.emplace_back(target);++upload_copies;return good;
+            c.images.push_back(source);c.borrowed.emplace_back(target);++upload_copies;
+            return good&&record_alignment_borders(c,source,target,target_format,target_state);
         }
         if(a.Width!=b.Width||a.Height!=b.Height||a.DepthOrArraySize!=b.DepthOrArraySize||a.MipLevels!=b.MipLevels)return false;
         const auto read_state=(source->state&D3D12_RESOURCE_STATE_COPY_SOURCE)?source->state:D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -272,7 +297,8 @@ struct Transport {
         c.list->CopyResource(target,source->texture.Get());++upload_copies;
         color_transition(c.list.Get(),target,D3D12_RESOURCE_STATE_COPY_DEST,target_state);
         color_transition(c.list.Get(),source->texture.Get(),read_state,source->state);
-        c.images.push_back(source);c.borrowed.emplace_back(target);return true;
+        c.images.push_back(source);c.borrowed.emplace_back(target);
+        return record_alignment_borders(c,source,target,target_format,target_state);
     }
     void freeze(Context& c,const Image& image) {
         color_transition(c.list.Get(),image->texture.Get(),image->state,D3D12_RESOURCE_STATE_GENERIC_READ);

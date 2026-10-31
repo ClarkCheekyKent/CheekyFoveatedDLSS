@@ -1899,6 +1899,7 @@ void report_universal_nr(const CheekyNrUniversalStatusV1& status) noexcept {
     u.game_motion = status.game_motion != 0U;
     u.game_depth = status.game_depth != 0U;
     u.shared_flow = status.shared_flow != 0U;
+    u.projection_alignment = false; // Older layers do not report direct placement.
     u.evaluations += (u.evaluated[0] ? 1U : 0U) + (u.evaluated[1] ? 1U : 0U);
     u.fallbacks += status.fallback ? 1U : 0U;
     u.resets += status.reset ? 1U : 0U;
@@ -1912,7 +1913,8 @@ void report_universal_nr(const CheekyNrUniversalStatusV1& status) noexcept {
 
 extern "C" __declspec(dllexport) bool __cdecl CheekyNR_GetUniversalOptionsV1(CheekyNrUniversalOptionsV1* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if (!out || out->abi != CHEEKY_NR_UNIVERSAL_ABI || out->size != sizeof(*out)) return false;
+    if (!out || !((out->abi == 2 && out->size == sizeof(*out)) ||
+        (out->abi == 1 && out->size == CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE))) return false;
     const auto s = universal_nr_settings();
     out->enabled = nr_universal_active(s) ? 1U : 0U;
     out->motion = s.nr_universal.motion;
@@ -1921,6 +1923,10 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyNR_GetUniversalOptionsV1(Che
     out->optical_preset = s.nr_universal.optical_preset;
     out->optical_percent = s.nr_universal.optical_percent;
     out->optical_grid = s.nr_universal.optical_grid;
+    if (out->abi == 2) {
+        out->automatic_alignment = s.auto_stereo_alignment ? 1U : 0U;
+        out->aligned_height_offset = s.aligned_height_offset;
+    }
     // FG's guide/color metadata carries SR placement and gaze when it matches SR.
     out->center_from_fg = s.fg.foveated && s.fg.match_sr_region && s.nr_foveated && s.nr_use_sr_foveation ? 1U : 0U;
     out->foveated = s.nr_foveated ? 1U : 0U;
@@ -1940,4 +1946,11 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyNR_EvaluateUniversalV1(const
 extern "C" __declspec(dllexport) void __cdecl CheekyNR_ReportUniversalV1(const CheekyNrUniversalStatusV1* status) noexcept {
     if (!status || status->abi != CHEEKY_NR_UNIVERSAL_ABI || status->size != sizeof(*status)) return;
     cheeky::foveated_dlss::report_universal_nr(*status);
+}
+extern "C" __declspec(dllexport) void __cdecl CheekyNR_ReportUniversalAlignmentV1(const CheekyNrUniversalAlignmentV1* status) noexcept {
+    using namespace cheeky::foveated_dlss;
+    if (!status || status->abi != 1 || status->size != sizeof(*status)) return;
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    std::lock_guard lock(nr_mutex);
+    universal_status.projection_alignment = status->projection_alignment != 0U;
 }

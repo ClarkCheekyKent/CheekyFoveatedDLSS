@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_transport.hpp"
 #include "fg_frame_backend.hpp"
+#include "stereo_alignment.hpp"
 
 namespace cheeky::fg {
 // Owned frame records. Pacing uses their identities, poses, timestamps and
@@ -18,6 +19,7 @@ struct BufferedNative {
     // history) and keeps the captured eyes here for the next optical flow.
     std::array<Image,2> raw_color;
     bool universal_nr{};
+    StereoAlignment alignment;
     std::array<ColorReady,2> color_ready;
     ColorReady final_color_ready; // GPU end of the combined native-eye crop/assembly batch.
     std::array<XrCompositionLayerProjectionView,2> views;

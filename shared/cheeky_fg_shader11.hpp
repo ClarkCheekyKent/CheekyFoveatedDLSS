@@ -1,5 +1,6 @@
 #pragma once
 #include "cheeky_fg_bridge.hpp"
+#include <cstddef>
 struct ID3D11DeviceContext;
 struct ID3D11Texture2D;
 // Optional native D3D11 ABI. Resources are borrowed for the duration of observe().
@@ -21,8 +22,13 @@ inline bool cheeky_fg_shader_only(unsigned center,unsigned periphery,bool foveat
 }
 // Color-only metadata comes from settings, rather than a captured NGX evaluation.
 struct CheekyFgColorOptionsV1 {
-    unsigned abi{2},size{sizeof(CheekyFgColorOptionsV1)},enabled{},foveated{};
+    unsigned abi{3},size{sizeof(CheekyFgColorOptionsV1)},enabled{},foveated{};
     CheekyFgEye eyes[2];
     unsigned queue_priority{2},release_point{3};
+    // Only settings-derived, SR-matched centers need direct XR alignment.
+    // Cached centers from intercepted rendering already carry placement/gaze.
+    unsigned automatic_alignment_mask{};
+    float aligned_height_offset{};
 };
+constexpr unsigned CHEEKY_FG_COLOR_OPTIONS_V2_SIZE = offsetof(CheekyFgColorOptionsV1, automatic_alignment_mask);
 using CheekyFgColorOptionsFn=bool(__cdecl*)(CheekyFgColorOptionsV1*);

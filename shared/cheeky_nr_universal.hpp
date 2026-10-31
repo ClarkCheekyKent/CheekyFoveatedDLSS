@@ -4,6 +4,7 @@
 // through the runtime's NGX feature cache, codec and per-view history.
 // Both exports are optional; an older runtime simply leaves Universal off.
 #include <cstdint>
+#include <cstddef>
 struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
 
@@ -11,7 +12,7 @@ constexpr std::uint32_t CHEEKY_NR_UNIVERSAL_ABI = 1;
 
 // Read once per native stereo pair.
 struct CheekyNrUniversalOptionsV1 {
-    std::uint32_t abi{CHEEKY_NR_UNIVERSAL_ABI};
+    std::uint32_t abi{2}; // Options v2; eye/status ABI stays v1.
     std::uint32_t size{sizeof(CheekyNrUniversalOptionsV1)};
     std::uint32_t enabled{}; // DLSS-NR on, NR source Universal, processing allowed.
     std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (optical flow when unavailable).
@@ -24,7 +25,10 @@ struct CheekyNrUniversalOptionsV1 {
     std::uint32_t foveated{};
     float width{1}, height{1};
     float center_u[2]{.5f, .5f}, center_v[2]{.5f, .5f};
+    std::uint32_t automatic_alignment{};
+    float aligned_height_offset{};
 };
+constexpr std::uint32_t CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE = offsetof(CheekyNrUniversalOptionsV1, automatic_alignment);
 
 // One eye. The runtime records guides, NR and codec passes on `list`; the
 // caller executes it. `color` is the full eye image, UAV-capable, and is
@@ -73,3 +77,10 @@ struct CheekyNrUniversalStatusV1 {
 using CheekyNrGetUniversalOptionsV1Fn = bool(__cdecl*)(CheekyNrUniversalOptionsV1*);
 using CheekyNrEvaluateUniversalV1Fn = bool(__cdecl*)(const CheekyNrUniversalEyeV1*);
 using CheekyNrReportUniversalV1Fn = void(__cdecl*)(const CheekyNrUniversalStatusV1*);
+
+// Optional placement diagnostic, separate from the existing status ABI.
+struct CheekyNrUniversalAlignmentV1 {
+    std::uint32_t abi{1},size{sizeof(CheekyNrUniversalAlignmentV1)};
+    std::uint32_t projection_alignment{}; // Both evaluated eye centers match direct XR alignment.
+};
+using CheekyNrReportUniversalAlignmentV1Fn = void(__cdecl*)(const CheekyNrUniversalAlignmentV1*);

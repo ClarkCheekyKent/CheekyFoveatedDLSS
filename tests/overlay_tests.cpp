@@ -330,6 +330,14 @@ void test_ui_diagnostics() {
     require(render("Stereo / Gaze").find("no active OpenXR layer") == std::string::npos, "Inactive features should not report tracking failure");
     state.draft.nr_enabled = true;
     require(render("Stereo / Gaze").find("no active OpenXR layer") != std::string::npos, "NR-only foveation still requires tracking warnings");
+    state.draft.center_mode=FoveationCenterMode::fixed;state.draft.auto_stereo_alignment=true;
+    state.draft.nr_processing_order=NrProcessingOrder::universal;
+    state.snapshot=R"({"gaze":{"layer":true,"views":2,"alignment":0},"nr_details":{"universal":{"layer_reporting":true,"projection_alignment":true}}})";
+    require(render("Stereo / Gaze").find("no usable projection or eye mapping")==std::string::npos,
+        "Direct Universal alignment must not warn that missing DLSS eye mapping caused manual fallback");
+    state.snapshot=R"({"gaze":{"layer":true,"views":2,"alignment":0},"nr_details":{"universal":{"layer_reporting":false,"projection_alignment":true}}})";
+    require(render("Stereo / Gaze").find("no usable projection or eye mapping")!=std::string::npos,
+        "Stale Universal alignment diagnostics cannot suppress the manual fallback warning");
     // Physical polling must not release a VR trigger between controller events.
     input.window = reinterpret_cast<HWND>(1);
     input.enabled = true; input.open = true;

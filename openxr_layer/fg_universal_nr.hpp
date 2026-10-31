@@ -14,6 +14,7 @@
 #include "fg_transport.hpp"
 #include "fg_color_format.hpp"
 #include "fg_matrices.hpp"
+#include "stereo_alignment.hpp"
 #include "../shared/cheeky_nr_universal.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
 #include <array>
@@ -28,6 +29,7 @@ struct UniversalNr12 {
         Transport* pool{}; // Allocates the NR images.
         std::array<Image,2> previous_raw,current_raw; // GENERIC_READ captured eyes.
         std::array<Camera,2> cameras;
+        StereoAlignment alignment;
         const CheekyFgPair* guides{};
         bool reset{};
         // The previous native frame has no NR image: also copy it into NR's
@@ -42,6 +44,7 @@ struct UniversalNr12 {
         std::array<bool,2> periphery_shared{}; // FG's periphery flow, still to be consumed.
         std::array<OpticalConstants,2> periphery_constants{};
         bool game_motion{},game_depth{};
+        bool projection_alignment{};
         const char* reason{};
     };
 
@@ -61,12 +64,22 @@ struct UniversalNr12 {
     static bool options(CheekyNrUniversalOptionsV1& out) noexcept {
         const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
         const auto get=runtime?reinterpret_cast<CheekyNrGetUniversalOptionsV1Fn>(GetProcAddress(runtime,"CheekyNR_GetUniversalOptionsV1")):nullptr;
-        return get&&get(&out)&&out.enabled;
+        if(!get)return false;
+        if(!get(&out)){
+            out={};out.abi=1;out.size=CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE;
+            if(!get(&out))return false;
+        }
+        return out.enabled!=0;
     }
-    static void report(const CheekyNrUniversalStatusV1& status) noexcept {
+    static void report(const CheekyNrUniversalStatusV1& status,const Output& output) noexcept {
         const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
         const auto put=runtime?reinterpret_cast<CheekyNrReportUniversalV1Fn>(GetProcAddress(runtime,"CheekyNR_ReportUniversalV1")):nullptr;
         if(put)put(&status);
+        const auto alignment=runtime?reinterpret_cast<CheekyNrReportUniversalAlignmentV1Fn>(
+            GetProcAddress(runtime,"CheekyNR_ReportUniversalAlignmentV1")):nullptr;
+        if(alignment){CheekyNrUniversalAlignmentV1 value;
+            value.projection_alignment=output.projection_alignment&&status.evaluated[0]&&status.evaluated[1]&&!status.fallback?1u:0u;
+            alignment(&value);}
     }
     // The non-sRGB member of the captured format's family, if DLSS-NR can
     // write it through a UAV. Copies between family members keep the bits.
@@ -131,6 +144,7 @@ struct UniversalNr12 {
         transition(list,source->texture.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,source->state);
         image->state=D3D12_RESOURCE_STATE_GENERIC_READ;image->layout=source->layout;image->fg_border=source->fg_border;
         image->presentation_feather=source->presentation_feather;
+        image->alignment_borders=source->alignment_borders;
         const auto captured=source->texture->GetDesc().Format;
         image->presentation_format=source->presentation_format!=DXGI_FORMAT_UNKNOWN?source->presentation_format:
             srgb_color(captured)?captured:DXGI_FORMAT_UNKNOWN;
@@ -174,13 +188,15 @@ struct UniversalNr12 {
             unsigned motion_rect[4]{},depth_rect[4]{};float motion_scale[2]{1,1};bool game_motion{},game_depth{},depth_inverted{};
             bool has_center{};float center[2]{.5f,.5f};};
         std::array<EyeWork,2> work{};
+        out.projection_alignment=opts.automatic_alignment&&in.alignment.valid;
         for(unsigned eye=0;eye<2;++eye){
             auto& e=work[eye];const auto& raw=in.current_raw[eye];const auto& g=in.guides->eyes[eye];
             e.w=raw->layout.width?raw->layout.width:unsigned(raw->texture->GetDesc().Width);
             e.h=raw->layout.height?raw->layout.height:raw->texture->GetDesc().Height;
-            if(opts.center_from_fg&&(g.focus_width<.999f||g.focus_height<.999f)){
-                e.has_center=true;e.center[0]=std::clamp(.5f+g.focus_x,0.f,1.f);e.center[1]=std::clamp(.5f+g.focus_y,0.f,1.f);
-            }else{e.center[0]=opts.center_u[eye];e.center[1]=opts.center_v[eye];}
+            const auto center=universal_eye_center(opts,g,in.alignment,eye);
+            e.has_center=true;e.center[0]=center[0];e.center[1]=center[1];
+            if(out.projection_alignment){const auto projected=aligned_eye_center(in.alignment,eye,opts.aligned_height_offset);
+                out.projection_alignment=std::abs(center[0]-projected[0])<1.e-5f&&std::abs(center[1]-projected[1])<1.e-5f;}
             // Raw game guides are snapshots of the eye's DLSS inputs (full eye <-> active rect).
             const bool raw_guides=!g.prepared_guides;
             if(opts.motion==1&&raw_guides&&g.motion){

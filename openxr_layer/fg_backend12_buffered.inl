@@ -479,6 +479,7 @@ struct BufferedBackend12 final : FrameBackend {
                 if(inference_slot&&tokens_match&&expected_token)job->guide_state=CheekyFgState::guide_frame_mismatch;
             }
             if(color_only&&inference_slot){
+                align_color_options(color_options,job->alignment);
                 auto payload=std::make_shared<FrameGuides12>();
                 for(unsigned eye=0;eye<2;++eye){auto g=color_options.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
                     const auto& layout=job->color[eye]->layout;g.width=layout.width?layout.width:unsigned(d.Width);g.height=layout.height?layout.height:d.Height;
@@ -548,7 +549,8 @@ struct BufferedBackend12 final : FrameBackend {
             input.cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.pair.eyes[eye].depth_inverted!=0);
         }
         input.guides=&guides.pair;
-        input.reset=fg_reset||!previous_nr||!universal_was_active;
+        input.alignment=job->alignment;
+        input.reset=fg_reset||!previous_nr||!universal_was_active||previous->alignment.valid!=job->alignment.valid;
         input.convert_previous=!previous_nr;
         // GPU-side only: the capture (and any game guides on another queue)
         // precede optical flow and NR on the generation queue.
@@ -577,7 +579,7 @@ struct BufferedBackend12 final : FrameBackend {
             job->universal_nr=true;
             status.game_motion=output.game_motion?1u:0u;status.game_depth=output.game_depth?1u:0u;
         }
-        UniversalNr12::report(status);
+        UniversalNr12::report(status,output);
         if(owner.trace&&(!good||!output.evaluated[0]||!output.evaluated[1])){
             static std::uint64_t failures{};const auto count=++failures;
             if(count<=4||(count&(count-1))==0){char message[256]{};
@@ -709,7 +711,8 @@ struct BufferedBackend12 final : FrameBackend {
                 bool available=true;
                 // Debug border is drawn by the final OpenXR upload. Avoid
                 // bypassing that upload via experimental direct XR output.
-                const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;});
+                const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;})||
+                    std::any_of(job->color.begin(),job->color.end(),[](const auto& image){return image->alignment_borders[0].visible||image->alignment_borders[1].visible;});
                 const bool blocked_direct=job->direct_output_mode&&(border_upload||owner.direct_blocked_target==owner.direct_target_key(owner.worker.width,owner.worker.height,owner.worker.focus.color_format));
                 if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;}
                 if(camera_pair_valid&&pair.generated_count==1&&job->direct_output_mode&&!blocked_direct){
@@ -734,6 +737,7 @@ struct BufferedBackend12 final : FrameBackend {
                     pair.generated[eye]=owner.output.image(publication,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
                     if(!pair.generated[eye]){available=false;break;}
                     pair.generated[eye]->layout=layout;
+                    pair.generated[eye]->alignment_borders=job->color[eye]->alignment_borders;
                     pair.generated[eye]->fg_border=fg_border_rect(owner.worker.width,owner.worker.height,g.focus_width,g.focus_height,
                         g.focus_x,g.focus_y,g.show_foveation_border!=0);
                     copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};

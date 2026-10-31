@@ -25,7 +25,12 @@ using Microsoft::WRL::ComPtr;
 inline bool color_options(CheekyFgColorOptionsV1& options){
     const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
     const auto get=runtime?reinterpret_cast<CheekyFgColorOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetColorOptionsV1")):nullptr;
-    return get&&get(&options)&&options.enabled;
+    if(!get)return false;
+    if(!get(&options)){
+        options={};options.abi=2;options.size=CHEEKY_FG_COLOR_OPTIONS_V2_SIZE;
+        if(!get(&options))return false; // Older runtimes retain static placement.
+    }
+    return options.enabled!=0;
 }
 // Sessions rebuilt after their first initialization (each stalls generation).
 inline std::atomic<std::uint64_t> rebuilds{};

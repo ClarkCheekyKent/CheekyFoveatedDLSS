@@ -786,11 +786,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
         job->color={};job->raw_color={};job->universal_nr=false;job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->policy={};job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
+        job->alignment={};
         if(!projection||!job->layers.prepare(end,projection)||!job->layers.retain_spaces(session,xr.retain_space)){
             if(inference_slot&&hookless_complete)hookless_complete(0);
             result=passthrough(end,"unsupported OpenXR projection/layers");
         }
         else {
+            // Runtime space lookup may call back into the layer. Resolve before
+            // taking the capture lock and retain the result on this frame.
+            if(xr.stereo_alignment&&!external)job->alignment=xr.stereo_alignment(session,end->displayTime,projection);
             std::unique_lock capture_lock(capture_mutex);
             job->id=id;
             job->multiplier=multiplier.load();
@@ -802,6 +806,15 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const bool good=capture_result==CaptureOutcome::captured;
             if(!good){capture_lock.unlock();result=passthrough(end,"incomplete native color capture / changed swapchain layout");}
             else {
+                // Query the border controls directly: no game DLSS evaluation
+                // exists to draw them in Universal mode. Keep history clean.
+                CheekyXrBorderOptionsV1 borders;
+                const auto border_options=fg_runtime?reinterpret_cast<CheekyXrGetBorderOptionsV1Fn>(
+                    GetProcAddress(fg_runtime,"CheekyOpenXR_GetBorderOptionsV1")):nullptr;
+                const bool show_borders=border_options&&border_options(&borders)&&borders.enabled;
+                for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
+                    job->color[eye]->alignment_borders=show_borders?xr_alignment_borders(borders,job->alignment,eye,
+                        unsigned(sub.imageRect.extent.width),unsigned(sub.imageRect.extent.height)):std::array<BorderRect,2>{};}
                 job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();frame_trace(id).handed_off=job->handed_off_at;
                 // Keep the debug overlay on native submissions too. Native

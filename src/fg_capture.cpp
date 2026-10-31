@@ -4,6 +4,7 @@
 #include "fg_source_lifecycle.hpp"
 #include "quad_view_bridge.hpp"
 #include "../shared/cheeky_quad_fg.hpp"
+#include "../shared/cheeky_xr_borders.hpp"
 #include <d3d11.h>
 #include "../shared/fg_uevr_mode.hpp"
 #include "gaze_foveation.hpp"
@@ -643,16 +644,19 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyFgColorOptionsV1* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if(!out||out->abi!=2||out->size!=sizeof(*out))return false;
+    if(!out||!((out->abi==3&&out->size==sizeof(*out))||
+        (out->abi==2&&out->size==CHEEKY_FG_COLOR_OPTIONS_V2_SIZE)))return false;
     const auto s=current_settings();const auto& f=s.fg;const auto key=configuration(s);
     out->enabled=enabled()&&cheeky_fg_image_only(f.center_method,f.peripheral_method,f.foveated);
     out->foveated=f.foveated;out->queue_priority=f.queue_priority;out->release_point=f.release_point;
+    if(out->abi==3){out->automatic_alignment_mask=0;out->aligned_height_offset=s.aligned_height_offset;}
     std::lock_guard lock(mutex);
     for(unsigned eye=0;eye<2;++eye){
         auto& g=out->eyes[eye];g={};
         const auto& cached=color_metadata[eye];
         if(cached.configuration==key&&GetTickCount64()-cached.time<500)g=cached.eye;
         else {
+            if(out->abi==3&&s.auto_stereo_alignment&&f.match_sr_region)out->automatic_alignment_mask|=1u<<eye;
             g.focus_width=f.foveated?(f.match_sr_region?s.width:f.width):1.f;
             g.focus_height=f.foveated?(f.match_sr_region?s.height:f.height):1.f;
             g.focus_feather=f.match_sr_region?s.transition_width:f.feather;
@@ -663,6 +667,23 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyF
         g.center_method=f.center_method;g.peripheral_method=f.peripheral_method;g.optical=f.optical;
         g.resolution_percent=f.resolution_percent;g.peripheral_percent=f.peripheral_percent;
         g.show_foveation_border=f.foveated&&f.show_border;g.configuration=key;
+    }
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXR_GetBorderOptionsV1(CheekyXrBorderOptionsV1* out) noexcept {
+    using namespace cheeky::foveated_dlss;
+    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    const auto s=universal_nr_settings();
+    out->enabled=enabled()&&nr_universal_active(s);
+    out->show_sr=s.alignment_border_enabled;out->show_nr=s.nr_foveated&&s.nr_alignment_border_enabled;
+    out->automatic_alignment=s.auto_stereo_alignment;out->aligned_height_offset=s.aligned_height_offset;
+    out->width[0]=s.width;out->height[0]=s.height;
+    out->width[1]=s.nr_use_sr_foveation?s.width:s.nr_width;
+    out->height[1]=s.nr_use_sr_foveation?s.height:s.nr_height;
+    for(unsigned eye=0;eye<2;++eye){
+        const float sx=(bool(eye==1)!=s.invert_stereo_x_offset)?-s.x_offset:s.x_offset;
+        out->center_u[eye]=fg_fallback_center(s.width,sx);
+        out->center_v[eye]=fg_fallback_center(s.height,s.height_offset);
     }
     return true;
 }

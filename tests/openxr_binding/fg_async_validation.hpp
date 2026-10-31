@@ -709,8 +709,12 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
             const auto exp=p.experiments();
             if(models)check(exp.latency_enabled&&exp.latency_valid&&exp.latency_samples>0&&exp.gpu_ready_samples>0&&exp.predicted_samples>0,
                 "Physical FG records valid GPU-ready ages and calibrated timelines");}
-        check(p.direct_eye_copies>direct_before,"Live projection learns direct eye capture layout");
-        std::cout<<"PASS direct eye capture with batched uploads\n";
+        // This fixture submits the exact same image rectangle for both eyes.
+        // It deliberately uses a full capture: one shared region cannot own
+        // two independently packed physical-eye layouts.
+        check(p.direct_eye_copies==direct_before&&p.capture_plans.at(h<XrSwapchain>(200)).full_required,
+            "Shared left/right image rectangle must retain full capture");
+        std::cout<<"PASS shared eye rectangle preserves full capture with batched uploads\n";
     }
     if(models&&method<=2){
         Runtime::guides.release_point=3;
@@ -762,16 +766,20 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     }
     if(!models){
         const auto raw_before=Runtime::raw_frames.load();
+        const auto crops_before=p.eye_crop_copies.load();
         views[1].subImage.imageRect.extent.width=int(width/2);
         check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Changed-layout frame");
+        end.displayTime=state.predictedDisplayTime;
         check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
             p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
-            XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Changed projection uses original native passthrough safely");
-        check(Runtime::raw_frames>raw_before,"Uncaptured eye viewport never displays stale pixels");
+            XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Changed viewport is cropped from the full native capture");
+        check(Runtime::raw_frames==raw_before&&p.eye_crop_copies>crops_before,
+            "Full capture supplies a changed eye viewport without stale packed pixels or native passthrough");
         views[1].subImage.imageRect.extent.width=int(width);
         // First restored frame also falls back, then the learned layout works.
         for(unsigned frame=0;frame<3;++frame){
             check(XR_SUCCEEDED(p.wait_frame(&wait,&state))&&XR_SUCCEEDED(p.begin_frame(&begin)),"Restored-layout frame");
+            end.displayTime=state.predictedDisplayTime;
             check(p.capture(h<XrSwapchain>(200),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
                 p.capture(h<XrSwapchain>(201),0,color.Get(),width,width,1,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)&&
                 XR_SUCCEEDED(p.end_frame(&end,{},&scene)),"Restored projection layout recovers direct capture");

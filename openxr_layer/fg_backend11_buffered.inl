@@ -68,6 +68,7 @@ inline bool BufferedPresenter::prepare_native11(Native& job,const XrCompositionL
     if(inference_slot){
         CheekyFgColorOptionsV1 options;
         if(optical::color_options(options)){
+            align_color_options(options,job.alignment);
             auto payload=std::make_shared<FrameGuides11>();
             for(unsigned eye=0;eye<2;++eye){auto guide=std::make_shared<Backend11::Guides>();
                 guide->source.meta=options.eyes[eye];D3D11_TEXTURE2D_DESC d{};job.color[eye]->texture11->GetDesc(&d);

@@ -3,6 +3,7 @@
 #include "fg_layers.hpp"
 #include "fg_color_format.hpp"
 #include "fg_d3d11.hpp"
+#include "stereo_alignment.hpp"
 #include <openxr/openxr_platform.h>
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ struct XrFns {
     PFN_xrLocateSpace locate_space{};
     RetainFrameSpace retain_space{};
     PFN_xrGetDisplayRefreshRateFB get_refresh_rate{};
+    StereoAlignment (*stereo_alignment)(XrSession,XrTime,const XrCompositionLayerProjection*){};
 };
 struct ColorCopy {
     XrSwapchain source{XR_NULL_HANDLE};

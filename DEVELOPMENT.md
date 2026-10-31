@@ -30,6 +30,13 @@ independent-input test runs in its own process to exercise the restart latch.
 
 ## Build
 
+`CheekyOpenXRBindingTests --openxr-stereo-alignment` checks direct OpenXR
+placement for Universal DLSS 5 and settings-derived, SR-matched FG regions.
+It covers asymmetric submitted FOVs, canted eye rotations, display-time matching,
+reference-space conversion, buffered ownership, manual fallback and height bias.
+`CheekyUEVRTests --fg-controls` also checks the placement options exported by
+the runtime, including compatibility with older layer option layouts.
+
 ### Precompiled FG shaders
 
 FG, optical-flow, quad-view composition, OpenXR menu conversion, ImGui's four

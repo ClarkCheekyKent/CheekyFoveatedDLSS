@@ -11,6 +11,10 @@ if(NOT TARGET CheekyOpenXRLayer)
 endif()
 add_executable(CheekyOpenXRBindingTests binding_tests.cpp "${root}/shared/gaze_math.cpp"
     "${root}/openxr_layer/dlssg_worker.cpp" "${root}/openxr_layer/fg_focus.cpp")
+if(MSVC)
+    # Buffered timing fixtures keep several production presenters on the stack.
+    target_link_options(CheekyOpenXRBindingTests PRIVATE /STACK:8388608)
+endif()
 foreach(target ${binding_layer_target} CheekyOpenXRBindingTests)
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -25,6 +29,7 @@ endforeach()
 set_target_properties(CheekyOpenXRBindingTests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/$<CONFIG>")
 add_test(NAME OpenXRHostBindings COMMAND CheekyOpenXRBindingTests)
+add_test(NAME OpenXRStereoAlignment COMMAND CheekyOpenXRBindingTests --openxr-stereo-alignment)
 add_test(NAME OpenXRMenuNonblocking COMMAND CheekyOpenXRBindingTests --menu-nonblocking)
 add_test(NAME OpenXRMenuLiveCursor COMMAND CheekyOpenXRBindingTests --menu-live-cursor)
 add_test(NAME OpenXRQuadD3D11 COMMAND CheekyOpenXRBindingTests --quad-d3d11)

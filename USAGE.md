@@ -100,6 +100,16 @@ Additional notes:
 
 ### Eye tracking (experimental)
 
+Universal DLSS 5 uses the OpenXR submission's per-eye projection for automatic
+stereo alignment. With **Automatic stereo alignment** enabled, its fixed region
+and an SR-matched FG region align without intercepted game DLSS calls or marker
+calibration. **Height offset** applies to this placement too. Missing frame or
+projection geometry falls back to the saved manual placement. This provides
+fixed forward alignment; it does not enable eye tracking.
+The red SR and green NR bounding-box controls also work in Universal mode,
+including games without DLSS. Boxes appear on native and generated OpenXR
+frames and follow the same per-eye alignment and height offset.
+
 Eye tracking uses the OpenXR layer installed in the [main installation steps](README.md#installation).
 It requires an eye-tracked headset and a runtime that supplies usable gaze input.
 Automatic stereo alignment works without eye tracking; Quest 3 users should use

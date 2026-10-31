@@ -460,6 +460,8 @@ const char* gaze_warning(const Settings& s, std::string_view snapshot) {
 
 const char* alignment_warning(const Settings& s, std::string_view snapshot) {
     if (!s.auto_stereo_alignment || (!s.enabled && !(s.nr_enabled && s.nr_foveated))) return nullptr;
+    const auto universal = member(member(snapshot, "nr_details"), "universal");
+    if (nr_universal_active(s) && flag(universal, "layer_reporting") && flag(universal, "projection_alignment")) return nullptr;
     const auto gaze = member(snapshot, "gaze");
     if (gaze.empty()) return "Waiting for automatic stereo alignment diagnostics.";
     // Fixed foveation in an ordinary flat game does not require stereo data.
@@ -979,6 +981,7 @@ void draw_nr_performance(std::string_view snapshot, const Settings& s) {
             else {
                 ImGui::TextWrapped("Universal DLSS 5 eyes: left %s, right %s", flag(u, "evaluated_left") ? "on" : "off",
                     flag(u, "evaluated_right") ? "on" : "off");
+                if (flag(u, "projection_alignment")) ImGui::TextUnformatted("Stereo alignment: OpenXR projection");
                 ImGui::TextWrapped("Motion: %s%s. Depth: %s.", flag(u, "game_motion") ? "game DLSS vectors" : "optical flow",
                     flag(u, "shared_flow") ? " (shared with FG)" : "", flag(u, "game_depth") ? "game DLSS" : "flat");
             }

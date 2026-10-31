@@ -1085,6 +1085,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         combo("NR optical flow vector grid", "NrOpticalGrid", {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"})
                     end
                     local u = (status.nr_details or {}).universal or {}
+                    if u.layer_reporting and u.projection_alignment then text("Stereo alignment: OpenXR projection") end
                     if u.requested then
                         if not u.layer_reporting then text("Universal DLSS 5: waiting for the OpenXR layer")
                         else

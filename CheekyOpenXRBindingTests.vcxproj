@@ -3,7 +3,8 @@
   <PropertyGroup Label="Globals"><ProjectGuid>{21418C6A-92A3-4FD6-9D85-733611452106}</ProjectGuid><RootNamespace>CheekyOpenXRBindingTests</RootNamespace></PropertyGroup>
   <PropertyGroup><NgxDebugSuffix Condition="'$(Configuration)'=='Debug'">_dbg</NgxDebugSuffix><ConfigurationType>Application</ConfigurationType><TargetName>CheekyOpenXRBindingTests</TargetName><CheekyLibraries>$(MSBuildThisFileDirectory)third_party\ngx-sdk\nvsdk_ngx_s$(NgxDebugSuffix).lib;d3d11.lib;d3d12.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;version.lib</CheekyLibraries></PropertyGroup>
   <Import Project="standalone\build.props" />
-  <ItemDefinitionGroup><ClCompile><AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\third_party\openxr\include;$(MSBuildProjectDirectory)\third_party\reshade\deps\minhook\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile></ItemDefinitionGroup>
+  <!-- Buffered timing fixtures keep several production presenters on the stack. -->
+  <ItemDefinitionGroup><ClCompile><AdditionalIncludeDirectories>$(MSBuildProjectDirectory)\third_party\openxr\include;$(MSBuildProjectDirectory)\third_party\reshade\deps\minhook\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile><Link><StackReserveSize>8388608</StackReserveSize></Link></ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="tests\openxr_binding\binding_tests.cpp" />
     <ClCompile Include="shared\gaze_math.cpp" />

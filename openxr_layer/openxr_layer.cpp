@@ -3508,6 +3508,33 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
     return result;
 }
 
+// Capture placement from the tracked views for THIS display time. A later
+// xrLocateViews or a recenter must not move an already buffered native frame.
+cheeky::fg::StereoAlignment resolve_stereo_alignment(XrSession session,XrTime time,
+    const XrCompositionLayerProjection* projection) {
+    if(!projection||projection->viewCount!=2||!projection->views)return {};
+    SessionState::LocatedProjection located{};
+    PFN_xrLocateSpace locate{};
+    {
+        std::lock_guard lock(state_mutex);
+        const auto owner=sessions.find(session);
+        if(owner==sessions.end())return {};
+        for(const auto& candidate:owner->second.located_history)
+            if(candidate.valid&&candidate.time==time)located=candidate;
+        const auto* instance=find_instance_for_session_locked(session);
+        if(instance)locate=instance->dispatch.locate_space;
+    }
+    if(!located.valid)return {};
+    XrQuaternionf projection_from_tracked{0,0,0,1};
+    if(located.space!=projection->space){
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION};
+        if(!locate||XR_FAILED(locate(located.space,projection->space,time,&location))||
+            !(location.locationFlags&XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))return {};
+        projection_from_tracked=location.pose.orientation;
+    }
+    return cheeky::fg::project_stereo_alignment(projection,located.poses,projection_from_tracked);
+}
+
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSwapchain(
     const XrSession session,
     const XrSwapchainCreateInfo* const create_info,
@@ -3853,6 +3880,7 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
         cheeky::fg::XrFns fn{};
         fn.time_instance=owner.instance;fn.time_to_qpc=d.time_to_qpc;fn.locate_space=d.locate_space;fn.retain_space=retain_frame_space;
         fn.get_refresh_rate=d.get_refresh_rate;
+        fn.stereo_alignment=resolve_stereo_alignment;
         fn.create=d.create_swapchain;fn.destroy=d.destroy_swapchain;
         fn.enumerate=d.enumerate_swapchain_images;fn.acquire=d.acquire_swapchain_image;
         fn.wait_image=d.wait_swapchain_image;fn.release=d.release_swapchain_image;

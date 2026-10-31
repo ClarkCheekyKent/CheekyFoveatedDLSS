@@ -7,6 +7,7 @@
 #include "gpu_memory.hpp"
 #include "support_bundle.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
+#include "../shared/cheeky_nr_universal.hpp"
 #include "mock_ngx_parameters.hpp"
 #include <uevr/API.h>
 #include <d3d12.h>
@@ -258,7 +259,7 @@ void settings_tests(const std::filesystem::path& root) {
     require(r.eye_calibration_method == EyeCalibrationMethod::full && r.eye_calibration_learned_method == 2 &&
         r.eye_calibration_learned_signature == 0xfedcba9876543210ULL && r.eye_calibration_learned_sessions == 2,
         "Persist learned calibration without losing 64-bit signature precision");
-    for (const auto order : {"0", "1"}) {
+    for (const auto order : {"0", "1", "2"}) {
         require(set_named_setting(s, "NrProcessingOrder", order), "Parse NR rendering order");
         s.nr_working_scale = 0.37f;
         require(write_settings_file(path, s, error) && read_settings_file(path, r, error), "Persist NR order");
@@ -268,7 +269,7 @@ void settings_tests(const std::filesystem::path& root) {
             "Runtime/support settings omit rendering order");
         require(serialize_settings(r).find("SchemaVersion=1\n") != std::string::npos, "Additive key changed schema");
     }
-    for (const auto value : {"-1", "2", "3", "1.5", "nan", "invalid"}) {
+    for (const auto value : {"-1", "3", "1.5", "nan", "invalid"}) {
         const auto before = serialize_settings(r);
         require(!set_named_setting(r, "NrProcessingOrder", value) && serialize_settings(r) == before,
             "Invalid rendering order changed settings");
@@ -648,7 +649,47 @@ int main(int argc, char** argv) {
             options=CheekyFgTransportOptions{};require(transport_fn(&options)&&options.latency_diagnostics==0&&
                 snapshot(get).find("\"FgReleasePoint\":3")!=std::string::npos,"Tested defaults reset live settings");
             require(control_fn(&control) && !control.enabled,"FG reset restores live opt-out");
-            std::puts("PASS FG protocol, control ABI, host detach/re-enable and FG group reset");
+            // No DLSS evaluations are submitted here: these exports must expose
+            // direct OpenXR placement without waiting for marker calibration.
+            command("1\n940\nset\nFgEnabled=true\nFgCenterMethod=7\nFgFoveated=true\nFgMatchSrRegion=true\nAutoStereoAlignment=true\nAlignedHeightOffset=0.12\nNrEnabled=true\nNrProcessingOrder=2");
+            color_options={};
+            require(color_fn(&color_options)&&color_options.automatic_alignment_mask==3&&
+                std::abs(color_options.aligned_height_offset-.12f)<1.e-5f,
+                "Hook-free FG settings fallback requests direct OpenXR alignment and height bias");
+            const auto nr_fn=reinterpret_cast<CheekyNrGetUniversalOptionsV1Fn>(GetProcAddress(runtime,"CheekyNR_GetUniversalOptionsV1"));
+            CheekyNrUniversalOptionsV1 nr_options;
+            require(nr_fn&&nr_fn(&nr_options)&&nr_options.enabled&&nr_options.automatic_alignment&&
+                std::abs(nr_options.aligned_height_offset-.12f)<1.e-5f,
+                "Universal NR alignment settings are available without intercepted DLSS");
+            command("1\n941\nset\nAutoStereoAlignment=false");
+            require(color_fn(&color_options)&&!color_options.automatic_alignment_mask&&nr_fn(&nr_options)&&!nr_options.automatic_alignment,
+                "Automatic alignment can be disabled for both direct OpenXR consumers");
+            command("1\n942\nset\nAutoStereoAlignment=true\nFgMatchSrRegion=false");
+            require(color_fn(&color_options)&&!color_options.automatic_alignment_mask,
+                "Custom FG placement does not inherit SR automatic alignment");
+            // Older layers supply only the original prefix. A canary in the
+            // extension verifies the new runtime does not write past it.
+            color_options.abi=2;color_options.size=CHEEKY_FG_COLOR_OPTIONS_V2_SIZE;color_options.automatic_alignment_mask=0x12345678;
+            require(color_fn(&color_options)&&color_options.automatic_alignment_mask==0x12345678,
+                "Color options retain ABI v2 prefix compatibility");
+            nr_options.abi=1;nr_options.size=CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE;nr_options.automatic_alignment=0x12345678;
+            require(nr_fn(&nr_options)&&nr_options.automatic_alignment==0x12345678,
+                "Universal options retain ABI v1 prefix compatibility");
+            nr_options.size=0;require(!nr_fn(&nr_options),"Universal options reject invalid prefix sizes");
+            const auto report_nr=reinterpret_cast<CheekyNrReportUniversalV1Fn>(GetProcAddress(runtime,"CheekyNR_ReportUniversalV1"));
+            const auto report_alignment=reinterpret_cast<CheekyNrReportUniversalAlignmentV1Fn>(
+                GetProcAddress(runtime,"CheekyNR_ReportUniversalAlignmentV1"));
+            require(report_nr&&report_alignment,"Universal placement reporting exports");
+            CheekyNrUniversalStatusV1 nr_status;nr_status.evaluated[0]=nr_status.evaluated[1]=1;report_nr(&nr_status);
+            CheekyNrUniversalAlignmentV1 placement;placement.projection_alignment=1;report_alignment(&placement);
+            require(snapshot(get).find("\"projection_alignment\":true")!=std::string::npos,
+                "Direct OpenXR alignment is visible independently of DLSS eye calibration");
+            placement.size=0;placement.projection_alignment=0;report_alignment(&placement);
+            require(snapshot(get).find("\"projection_alignment\":true")!=std::string::npos,"Invalid placement ABI cannot overwrite diagnostics");
+            report_nr(&nr_status);
+            require(snapshot(get).find("\"projection_alignment\":false")!=std::string::npos,
+                "A later status without direct alignment cannot retain stale placement proof");
+            std::puts("PASS FG protocol, control ABI, host detach/re-enable, group reset and direct OpenXR alignment options");
             return 0;
         }
         if (mode == "--loader-lifecycle" || mode == "--loader-missing") {
@@ -858,7 +899,7 @@ int main(int argc, char** argv) {
             "After rendering order changed working scale");
         const auto order_revision = field(received,"revision");
         const auto order_ack = field(received,"applied_request");
-        for (const auto value : {"-1", "2", "3", "1.5", "nan"}) {
+        for (const auto value : {"-1", "3", "1.5", "nan"}) {
             const auto invalid = std::string("1\n85\nset\nNrWorkingScale=0.5\nNrProcessingOrder=") + value;
             command(invalid.c_str());
             require(field(received,"revision") == order_revision && field(received,"applied_request") == order_ack &&
