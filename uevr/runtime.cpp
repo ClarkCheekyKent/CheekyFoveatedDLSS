@@ -410,7 +410,18 @@ std::string snapshot_locked(State& s) {
         << ",\"codec_creations\":" << nr.codec_creations
         << ",\"border_creations\":" << nr.border_creations
         << ",\"resource_rebinds\":" << nr.resource_rebinds
-        << ",\"vram_bytes\":" << nr.intermediate_vram_bytes << "}"
+        << ",\"vram_bytes\":" << nr.intermediate_vram_bytes
+        << ",\"universal\":{\"requested\":" << (nr.universal.requested ? "true" : "false")
+        << ",\"layer_reporting\":" << (nr.universal.layer_reporting ? "true" : "false")
+        << ",\"evaluated_left\":" << (nr.universal.evaluated[0] ? "true" : "false")
+        << ",\"evaluated_right\":" << (nr.universal.evaluated[1] ? "true" : "false")
+        << ",\"game_motion\":" << (nr.universal.game_motion ? "true" : "false")
+        << ",\"game_depth\":" << (nr.universal.game_depth ? "true" : "false")
+        << ",\"shared_flow\":" << (nr.universal.shared_flow ? "true" : "false")
+        << ",\"evaluations\":" << nr.universal.evaluations << ",\"fallbacks\":" << nr.universal.fallbacks
+        << ",\"resets\":" << nr.universal.resets << ",\"flow_ms\":" << nr.universal.flow_ms
+        << ",\"vectors_ms\":" << nr.universal.vectors_ms
+        << ",\"reason\":\"" << json_escape(nr.universal.reason ? nr.universal.reason : "") << "\"}}"
         << ",\"nvidia_override_status\":\"" << diagnostic_dlss_override_status() << "\",\"apis\":[";
     for (unsigned index = 0; index < 2; ++index) {
         const auto d = diagnostic_snapshot(index ? DiagnosticApi::d3d12 : DiagnosticApi::d3d11);

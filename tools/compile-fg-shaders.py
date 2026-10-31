@@ -103,6 +103,7 @@ def main():
         fxc = candidates[-1]
     variants = [("optical", entry, profile) for profile in ("cs_5_0", "cs_5_1")
                 for entry in ("Prepare", "Interpolate", "CacheVectors")]
+    variants += [("optical", "NrVectors", "cs_5_1")]
     variants += [("snapshot", "Main", "cs_5_0"),
                  ("interpolation", "RegionsVS", "vs_5_0"),
                  ("interpolation", "RegionsPS", "ps_5_0")]

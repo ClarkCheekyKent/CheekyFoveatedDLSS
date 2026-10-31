@@ -19,6 +19,7 @@
 #include "gaze_foveation.hpp"
 #include "d3d12_ngx_dispatch.hpp"
 #include "ngx_runtime_discovery.hpp"
+#include "../shared/cheeky_nr_universal.hpp"
 
 #include <Windows.h>
 #include <d3dcompiler.h>
@@ -34,6 +35,7 @@
 #include <deque>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -188,6 +190,8 @@ RuntimeState runtime;
 std::deque<ViewState> views;
 
 DlssNrSnapshot diagnostics;
+DlssNrUniversalStatus universal_status; // nr_mutex
+std::uint64_t universal_reported_ms{}; // nr_mutex
 // One active feature plus one alternate for full/foveated toggling. Pending
 // recordings count against this budget too; exhausted caches fall back to SR.
 constexpr std::size_t retired_feature_capacity = 1U;
@@ -281,6 +285,9 @@ void evict_retired_features(ViewState& view) noexcept {
         return false;
     }
     if (runtime.state == 2U || runtime.state == 3U || device == nullptr) {
+        // Keep the menu on the load failure, even after DLSS-NR was toggled.
+        if (runtime.state == 2U) diagnostics.state = DlssNrState::runtime_missing;
+        else if (runtime.state == 3U) diagnostics.state = DlssNrState::runtime_failed;
         return false;
     }
 
@@ -317,8 +324,18 @@ void evict_retired_features(ViewState& view) noexcept {
         runtime.module,
         "NVSDK_NGX_D3D12_ReleaseFeature"
     ));
+    // Parameter allocation lives in NVIDIA's NGX core. DLSS games load it; for
+    // games without DLSS (Universal DLSS 5) load it from the display driver.
+    NgxInitExtFn core_initialize{};
+    using NgxCoreInitFn = NgxResult (*)(unsigned long long, const wchar_t*, ID3D12Device*, const void*, std::uint32_t);
+    NgxCoreInitFn core_initialize_basic{};
     if (allocate == nullptr || destroy == nullptr) {
-        const auto core = find_loaded_ngx_core_runtime();
+        auto core = find_loaded_ngx_core_runtime();
+        if (core == nullptr && (core = load_ngx_core_runtime()) != nullptr) {
+            core_initialize = reinterpret_cast<NgxInitExtFn>(GetProcAddress(core, "NVSDK_NGX_D3D12_Init_Ext"));
+            if (!core_initialize)
+                core_initialize_basic = reinterpret_cast<NgxCoreInitFn>(GetProcAddress(core, "NVSDK_NGX_D3D12_Init"));
+        }
         if (core != nullptr) {
             allocate = reinterpret_cast<NgxAllocateParametersFn>(GetProcAddress(
                 core,
@@ -335,12 +352,21 @@ void evict_retired_features(ViewState& view) noexcept {
         runtime.release_feature == nullptr) {
         runtime.state = 3U;
         diagnostics.state = DlssNrState::runtime_failed;
-        trace_event("DLSS-NR runtime has an incomplete NGX export set");
+        trace_event("DLSS-NR runtime has an incomplete NGX export set init=%u allocate=%u destroy=%u create=%u evaluate=%u release=%u",
+            initialize != nullptr, allocate != nullptr, destroy != nullptr, runtime.create_feature != nullptr,
+            runtime.evaluate_feature != nullptr, runtime.release_feature != nullptr);
         return false;
     }
 
     constexpr unsigned long long application_id = 0x0876232cULL;
     constexpr std::uint32_t ngx_sdk_version = 0x15U;
+    if (core_initialize != nullptr || core_initialize_basic != nullptr) {
+        // A game that uses DLSS has initialized its core; do the same for ours.
+        const auto core_result = core_initialize
+            ? core_initialize(application_id, directory.data(), device, ngx_sdk_version, nullptr)
+            : core_initialize_basic(application_id, directory.data(), device, nullptr, ngx_sdk_version);
+        trace_event("DLSS-NR NGX core init result=0x%08X", core_result);
+    }
     const auto result = initialize(
         application_id,
         directory.data(),
@@ -1028,6 +1054,9 @@ bool evaluate_dlss_nr(
     const DlssNrFrame& input_frame,
     const Settings& input_settings
 ) noexcept {
+    // Universal DLSS 5 owns NR. The game's passes must neither evaluate it nor
+    // overwrite its diagnostics and per-eye history.
+    if (input_frame.route != DlssNrRoute::universal && universal_nr_requested()) return false;
     auto frame = input_frame;
     auto settings = input_settings;
     if (!resolve_afw_nr_coverage(frame, settings)) { skip_dlss_nr_history(frame.view_id); return false; }
@@ -1619,7 +1648,7 @@ void note_dlss_nr_skipped(DlssNrRoute route, const Settings& settings, const cha
 void collect_dlss_nr_submissions() noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
-    const bool disabled = !current_settings().nr_enabled;
+    const bool disabled = !current_settings().nr_enabled && !universal_nr_requested();
     if (disabled)
         for (auto& view : views) view.retired = true;
     collect_retired_views();
@@ -1660,7 +1689,7 @@ void reset_dlss_nr() noexcept {
     requested_nr_reset_generation.fetch_add(1U, std::memory_order_acq_rel);
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
-    if (runtime.state == 2U) runtime.state = 0U;
+    if (runtime.state == 2U || runtime.state == 3U) runtime.state = 0U;
     for (auto& view : views) {
         view.was_enabled = false;
         view.feature_failed = false;
@@ -1672,7 +1701,25 @@ void reset_dlss_nr() noexcept {
 DlssNrSnapshot dlss_nr_snapshot() noexcept {
     std::lock_guard execution_lock(calibration12_execution_mutex());
     std::lock_guard lock(nr_mutex);
-    return diagnostics;
+    auto snapshot = diagnostics;
+    auto& u = snapshot.universal;
+    u = universal_status;
+    u.requested = universal_nr_requested();
+    u.layer_reporting = u.requested && universal_reported_ms && GetTickCount64() - universal_reported_ms < 1000U;
+    if (!u.layer_reporting) {
+        u.evaluated[0] = u.evaluated[1] = false;
+        u.reason = !u.requested ? nullptr : !configured_settings().fg.enabled
+            ? "Universal DLSS 5 runs in the OpenXR Frame Generation pipeline; enable Frame Generation"
+            : "Waiting for the OpenXR layer (update it and re-run OpenXR setup if this persists)";
+    }
+    if (u.requested) {
+        snapshot.processing_order = NrProcessingOrder::universal;
+        if (!u.layer_reporting || (!u.evaluated[0] && !u.evaluated[1])) {
+            if (snapshot.route != DlssNrRoute::universal || !u.layer_reporting) snapshot.state = DlssNrState::waiting;
+            if (u.reason) snapshot.skip_reason = u.reason;
+        }
+    }
+    return snapshot;
 }
 
 const char* dlss_nr_state_name(const DlssNrState state) noexcept {
@@ -1696,8 +1743,201 @@ const char* dlss_nr_route_name(const DlssNrRoute route) noexcept {
     case DlssNrRoute::d3d12_native: return "Direct3D 12";
     case DlssNrRoute::d3d11_transport: return "DX11 -> DX12 Transport";
     case DlssNrRoute::streamline: return "Streamline / Direct3D 12";
+    case DlssNrRoute::universal: return "OpenXR layer (Universal DLSS 5)";
     }
     return "Unknown";
 }
 
+
+namespace {
+// Universal DLSS 5 has no game depth in most games. NR's guide pass resamples
+// whatever depth it is given, so a tiny constant far-plane texture is enough.
+// Whether the model benefits from real depth here is unverified.
+struct FlatDepth {
+    ID3D12Device* device{};
+    ID3D12Resource* texture{};
+    ID3D12Resource* upload{};
+    bool recorded{};
+};
+std::mutex flat_depth_mutex;
+FlatDepth flat_depth; // flat_depth_mutex
+std::vector<FlatDepth> retired_flat_depth; // Possibly still referenced by in-flight lists.
+constexpr std::uint32_t flat_depth_extent = 8U;
+
+ID3D12Resource* record_flat_depth(ID3D12GraphicsCommandList* list) noexcept {
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    if (FAILED(list->GetDevice(IID_PPV_ARGS(&device)))) return nullptr;
+    std::lock_guard lock(flat_depth_mutex);
+    if (flat_depth.device != device.Get() && flat_depth.texture) {
+        retired_flat_depth.push_back(flat_depth);
+        flat_depth = {};
+    }
+    if (!flat_depth.texture) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = desc.Height = flat_depth_extent;
+        desc.DepthOrArraySize = desc.MipLevels = 1U;
+        desc.Format = DXGI_FORMAT_R32_FLOAT;
+        desc.SampleDesc.Count = 1U;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&flat_depth.texture)))) return nullptr;
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT * flat_depth_extent;
+        buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1U;
+        buffer.SampleDesc.Count = 1U;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        void* mapped{};
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&flat_depth.upload))) ||
+            FAILED(flat_depth.upload->Map(0U, nullptr, &mapped))) {
+            release(flat_depth.texture);
+            release(flat_depth.upload);
+            return nullptr;
+        }
+        auto* bytes = static_cast<unsigned char*>(mapped);
+        for (std::uint32_t row = 0; row < flat_depth_extent; ++row)
+            for (std::uint32_t column = 0; column < flat_depth_extent; ++column) {
+                const float far_plane = 1.0F; // DepthInverted=0.
+                std::memcpy(bytes + row * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT + column * 4U, &far_plane, 4U);
+            }
+        flat_depth.upload->Unmap(0U, nullptr);
+        flat_depth.device = device.Get();
+        flat_depth.recorded = false;
+    }
+    if (!flat_depth.recorded) {
+        // The first list that uses it uploads it; later lists are ordered after it.
+        D3D12_TEXTURE_COPY_LOCATION source{}, destination{};
+        source.pResource = flat_depth.upload;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, flat_depth_extent, flat_depth_extent, 1U,
+            D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+        destination.pResource = flat_depth.texture;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
+        transition(list, flat_depth.texture, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        flat_depth.recorded = true;
+    }
+    return flat_depth.texture;
+}
+
+constexpr DlssViewId universal_view_base = 0x43554E5200000000ULL; // "CUNR", never a user-space handle.
+
+// Static SR placement in eye UV, mirrored for the second eye as SR does.
+FoveationCenter universal_static_center(const Settings& settings, std::uint32_t eye) noexcept {
+    const float sx = (eye == 1U) != settings.invert_stereo_x_offset ? -settings.x_offset : settings.x_offset;
+    return {.5F + .5F * sx * (1.0F - settings.width), .5F + .5F * settings.height_offset * (1.0F - settings.height)};
+}
+}  // namespace
+
+bool evaluate_universal_nr(const CheekyNrUniversalEyeV1& eye) noexcept {
+    if (eye.eye > 1U || !eye.list || !eye.color || !eye.motion || !eye.width || !eye.height) return false;
+    auto settings = universal_nr_settings();
+    if (!nr_universal_active(settings)) return false;
+    settings.nr_alignment_border_enabled = false;
+    settings.eye_independent_coverage = false;
+    DlssNrFrame frame{};
+    frame.view_id = universal_view_base | (eye.eye + 1U);
+    frame.route = DlssNrRoute::universal;
+    frame.command_list = eye.list;
+    frame.color = eye.color;
+    frame.color_state = static_cast<D3D12_RESOURCE_STATES>(eye.color_state);
+    frame.input_width = frame.output_width = eye.width;
+    frame.input_height = frame.output_height = eye.height;
+    frame.create_flags = eye.hdr ? 1U : 0U;
+    frame.reset = eye.reset != 0U;
+    frame.motion_vectors = eye.motion;
+    frame.motion_state = static_cast<D3D12_RESOURCE_STATES>(eye.motion_state);
+    frame.motion_base_x = eye.motion_x;
+    frame.motion_base_y = eye.motion_y;
+    frame.motion_width = eye.motion_width;
+    frame.motion_height = eye.motion_height;
+    frame.motion_uv_scale_x = eye.motion_uv_scale_x;
+    frame.motion_uv_scale_y = eye.motion_uv_scale_y;
+    frame.motion_vectors_jittered = eye.motion_jittered != 0U;
+    frame.jitter_uv_x = eye.jitter_uv_x;
+    frame.jitter_uv_y = eye.jitter_uv_y;
+    if (eye.depth) {
+        frame.depth = eye.depth;
+        frame.depth_state = static_cast<D3D12_RESOURCE_STATES>(eye.depth_state);
+        frame.depth_base_x = eye.depth_x;
+        frame.depth_base_y = eye.depth_y;
+        frame.depth_width = eye.depth_width;
+        frame.depth_height = eye.depth_height;
+        frame.depth_inverted = eye.depth_inverted != 0U;
+    } else {
+        frame.depth = record_flat_depth(eye.list);
+        frame.depth_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        frame.depth_width = frame.depth_height = flat_depth_extent;
+        frame.depth_inverted = false;
+        settings.nr_depth_convention = 1U; // Normal depth, matching the constant.
+        if (!frame.depth) {
+            note_dlss_nr_skipped(DlssNrRoute::universal, settings, "Universal DLSS 5 flat depth allocation failed");
+            return false;
+        }
+    }
+    if (eye.has_center && std::isfinite(eye.center_u) && std::isfinite(eye.center_v)) {
+        frame.center = {std::clamp(eye.center_u, 0.0F, 1.0F), std::clamp(eye.center_v, 0.0F, 1.0F)};
+        frame.has_center = true;
+    } else if (settings.nr_foveated) {
+        frame.center = universal_static_center(settings, eye.eye);
+        frame.has_center = true;
+    }
+    return evaluate_dlss_nr(frame, settings);
+}
+
+void report_universal_nr(const CheekyNrUniversalStatusV1& status) noexcept {
+    std::lock_guard execution_lock(calibration12_execution_mutex());
+    std::lock_guard lock(nr_mutex);
+    auto& u = universal_status;
+    u.evaluated[0] = status.evaluated[0] != 0U;
+    u.evaluated[1] = status.evaluated[1] != 0U;
+    u.game_motion = status.game_motion != 0U;
+    u.game_depth = status.game_depth != 0U;
+    u.shared_flow = status.shared_flow != 0U;
+    u.evaluations += (u.evaluated[0] ? 1U : 0U) + (u.evaluated[1] ? 1U : 0U);
+    u.fallbacks += status.fallback ? 1U : 0U;
+    u.resets += status.reset ? 1U : 0U;
+    if (status.flow_ms > 0.0F) u.flow_ms = status.flow_ms;
+    if (status.vectors_ms > 0.0F) u.vectors_ms = status.vectors_ms;
+    u.reason = status.reason;
+    universal_reported_ms = GetTickCount64();
+}
+
 }  // namespace cheeky::foveated_dlss
+
+extern "C" __declspec(dllexport) bool __cdecl CheekyNR_GetUniversalOptionsV1(CheekyNrUniversalOptionsV1* out) noexcept {
+    using namespace cheeky::foveated_dlss;
+    if (!out || out->abi != CHEEKY_NR_UNIVERSAL_ABI || out->size != sizeof(*out)) return false;
+    const auto s = universal_nr_settings();
+    out->enabled = nr_universal_active(s) ? 1U : 0U;
+    out->motion = s.nr_universal.motion;
+    out->depth = s.nr_universal.depth;
+    out->share_optical = s.nr_universal.share_optical ? 1U : 0U;
+    out->optical_preset = s.nr_universal.optical_preset;
+    out->optical_percent = s.nr_universal.optical_percent;
+    out->optical_grid = s.nr_universal.optical_grid;
+    // FG's guide/color metadata carries SR placement and gaze when it matches SR.
+    out->center_from_fg = s.fg.foveated && s.fg.match_sr_region && s.nr_foveated && s.nr_use_sr_foveation ? 1U : 0U;
+    out->foveated = s.nr_foveated ? 1U : 0U;
+    out->width = std::clamp(s.nr_use_sr_foveation ? s.width : s.nr_width, 0.0F, 1.0F);
+    out->height = std::clamp(s.nr_use_sr_foveation ? s.height : s.nr_height, 0.0F, 1.0F);
+    for (std::uint32_t eye = 0; eye < 2U; ++eye) {
+        const auto center = universal_static_center(s, eye);
+        out->center_u[eye] = center.u;
+        out->center_v[eye] = center.v;
+    }
+    return true;
+}
+extern "C" __declspec(dllexport) bool __cdecl CheekyNR_EvaluateUniversalV1(const CheekyNrUniversalEyeV1* eye) noexcept {
+    if (!eye || eye->abi != CHEEKY_NR_UNIVERSAL_ABI || eye->size != sizeof(*eye)) return false;
+    return cheeky::foveated_dlss::evaluate_universal_nr(*eye);
+}
+extern "C" __declspec(dllexport) void __cdecl CheekyNR_ReportUniversalV1(const CheekyNrUniversalStatusV1* status) noexcept {
+    if (!status || status->abi != CHEEKY_NR_UNIVERSAL_ABI || status->size != sizeof(*status)) return;
+    cheeky::foveated_dlss::report_universal_nr(*status);
+}

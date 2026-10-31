@@ -784,7 +784,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         // In hook-free mode only the completed xrEndFrame can claim a pair.
         if(!inference_slot&&hookless_complete)hookless_complete(0);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
-        job->color={};job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->policy={};job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
+        job->color={};job->raw_color={};job->universal_nr=false;job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->policy={};job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         if(!projection||!job->layers.prepare(end,projection)||!job->layers.retain_spaces(session,xr.retain_space)){
             if(inference_slot&&hookless_complete)hookless_complete(0);

@@ -330,6 +330,13 @@ bool Worker::generate(const CheekyFgPair& guides,const std::array<ID3D12Resource
             auto c=optical::constants(g,pass,rect,previous_layouts[eye],color_layouts[eye],
                 std::max(32u,(rw*scale+50)/100),std::max(32u,(rh*scale+50)/100));
             optical::pose_mapping(c,cameras[eye].previous_pose,cameras[eye].previous_fov,cameras[eye].pose,cameras[eye].view_fov,fraction);
+            if(!pass&&shared_center_flow[eye]&&phase_focus.borrowed_optical[eye][0]&&phase_focus.borrowed_optical[eye][0]->handle){
+                // Estimated once by Universal DLSS 5 and already consumed on this queue.
+                const auto& shared=shared_center_constants[eye];
+                std::copy_n(shared.flow_rect,4,c.flow_rect);
+                c.sizes[0]=shared.sizes[0];c.sizes[1]=shared.sizes[1];c.texel[0]=shared.texel[0];
+                phase_focus.optical_constants[eye][pass]=c;optical_pending[eye][pass]=false;continue;
+            }
             phase_focus.optical_constants[eye][pass]=c;
             if(!optical_timing_started){
                 // A dedicated list, retired by the previous frame's completion

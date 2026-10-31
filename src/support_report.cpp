@@ -129,6 +129,9 @@ std::string settings_text(const Settings& s) {
     out << "nr_roundness=" << s.nr_roundness << '\n';
     out << "nr_transition_width=" << s.nr_transition_width << '\n';
     out << "nr_processing_order=" << nr_processing_order_name(s.nr_processing_order) << '\n';
+    out << "nr_universal=motion:" << s.nr_universal.motion << " depth:" << s.nr_universal.depth
+        << " share_optical:" << s.nr_universal.share_optical << " optical:" << s.nr_universal.optical_preset
+        << '/' << s.nr_universal.optical_percent << '/' << s.nr_universal.optical_grid << '\n';
     out << "nr_working_scale=" << s.nr_working_scale << '\n';
     out << "nr_preset=" << s.nr_preset << '\n';
     out << "nr_style=" << s.nr_style << '\n';

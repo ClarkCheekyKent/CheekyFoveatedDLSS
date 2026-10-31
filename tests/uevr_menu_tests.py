@@ -22,9 +22,9 @@ baseline = json.loads(baseline_path.read_text())
 assert baseline['eye_calibration']['backend'] == 'Waiting for VR'
 assert not baseline['eye_calibration']['active']
 assert 'corrections' in baseline['eye_calibration']
-assert baseline['settings']['NrProcessingOrder'] in (0, 1)
+assert baseline['settings']['NrProcessingOrder'] in (0, 1, 2)
 assert baseline['setting_groups']['NrProcessingOrder'] == 'nr'
-assert {'processing_order', 'processing_width', 'processing_height', 'skip_reason'} <= baseline['nr_details'].keys()
+assert {'processing_order', 'processing_width', 'processing_height', 'skip_reason', 'universal'} <= baseline['nr_details'].keys()
 for api in baseline['apis']:
     assert {'before_nr_full_ms', 'before_nr_foveated_ms', 'before_pipeline_ms',
             'after_pipeline_ms', 'nr_full_ms', 'nr_foveated_ms'} <= api.keys()
@@ -632,7 +632,7 @@ def run(engine):
     afw["settings"].update(NrEnabled=True, NrFoveated=True, NrUseSrFoveation=False)
     receive(afw)
     draw()
-    assert "Rendering order" in g["values"] and "NR width" in g["values"]
+    assert "NR source" in g["values"] and "NR width" in g["values"]
     assert "NR roundness" in g["values"] and "NR working scale" in g["values"]
     assert not any("after AFW motion preparation" in t for t in g.drawn.values())
     for label in ("Fovea width", "Fovea height", "NR width", "NR height"):
@@ -928,33 +928,33 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["DLSS-NR style"] == 2, "Style acknowledgement was not retained"
-    # Rendering order follows the same immediate apply and acknowledgement
+    # NR source follows the same immediate apply and acknowledgement
     # flow as the existing selectors, while preserving working scale.
     state["settings"].update(NrProcessingOrder=0, NrWorkingScale=0.37)
     receive(state)
     draw()
-    assert g.combos["Rendering order"][0] == "After upscaling"
-    assert g.combos["Rendering order"][1] == "Before upscaling"
-    assert g["values"]["Rendering order"] == 0
+    assert g.combos["NR source"][0] == "After upscaling"
+    assert g.combos["NR source"][1] == "Before upscaling"
+    assert g["values"]["NR source"] == 0
     count = len(g.sent)
-    draw(changes={"Rendering order": 1})
+    draw(changes={"NR source": 1})
     assert len(g.sent) == count + 1 and "NrProcessingOrder=1" in last()
     assert "NrWorkingScale=" not in last()
     order_request = int(last().splitlines()[1])
-    draw(changes={"Rendering order": 0})  # New edit while the first is in flight.
+    draw(changes={"NR source": 0})  # New edit while the first is in flight.
     assert len(g.sent) == count + 1
     state["request"] = state["applied_request"] = order_request
     state["settings"]["NrProcessingOrder"] = 1
     receive(state)
     draw()
     assert len(g.sent) == count + 2 and "NrProcessingOrder=0" in last()
-    assert g["values"]["Rendering order"] == 0, "Older ack overwrote a newer order draft"
+    assert g["values"]["NR source"] == 0, "Older ack overwrote a newer order draft"
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["NrProcessingOrder"] = 0
     receive(state)
     draw()
     assert len(g.sent) == count + 2 and abs(g["values"]["NR working scale"] - 0.37) < 0.0001
-    draw(changes={"Rendering order": 1})
+    draw(changes={"NR source": 1})
     state["request"] = int(last().splitlines()[1])  # Rejected: applied_request stays old.
     receive(state)
     draw("Apply changes##bottom")
@@ -962,6 +962,23 @@ def run(engine):
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["NrProcessingOrder"] = 1
     receive(state)
+    # Universal DLSS 5 shows its inputs; sharing FG's center flow hides NR's own flow controls.
+    assert g.combos["NR source"][2] == "Universal DLSS 5 (OpenXR submission)"
+    saved_fg = {k: state["settings"][k] for k in ("FgEnabled", "FgCenterMethod", "NrOpticalShare")}
+    state["settings"].update(NrProcessingOrder=2, FgEnabled=True, FgCenterMethod=7, NrOpticalShare=True)
+    receive(state)
+    draw()
+    assert g["values"]["Motion vectors"] == state["settings"]["NrUniversalMotion"]
+    assert any("Using FG optical flow" in t for t in g.drawn.values())
+    assert g["values"]["NR optical flow preset"] is None
+    state["settings"]["NrOpticalShare"] = False
+    receive(state)
+    draw()
+    assert g["values"]["NR optical flow preset"] == state["settings"]["NrOpticalPreset"]
+    state["settings"].update(NrProcessingOrder=1, **saved_fg)
+    receive(state)
+    draw()
+    assert g["values"]["Motion vectors"] is None
     # A reset clears only its group's held edits; unrelated drafts survive its acknowledgement.
     g.active_label = "Gaze smoothing (ms)"
     draw(changes={"Gaze smoothing (ms)": 35})
@@ -1003,7 +1020,7 @@ def run(engine):
     state["renderer"] = 0
     receive(state)
     draw()
-    assert any("DLSS-NR on DX11 requires DX12 transport." in t for t in g.drawn.values())
+    assert any("DLSS-NR on DX11 requires DX12 transport, except Universal DLSS 5." in t for t in g.drawn.values())
     state["settings"]["CenterMode"] = 2
     state["settings"]["AutoStereoAlignment"] = False
     receive(state)
@@ -1014,23 +1031,23 @@ def run(engine):
     state["settings"].update(NrEnabled=True, NrProcessingOrder=0)
     receive(state)
     draw()
-    assert g["values"]["Rendering order"] == 0, "NR defaults did not reset the selector"
-    draw(changes={"Rendering order": 1})
+    assert g["values"]["NR source"] == 0, "NR defaults did not reset the selector"
+    draw(changes={"NR source": 1})
     order_request = int(last().splitlines()[1])
-    draw(changes={"Rendering order": 0})
+    draw(changes={"NR source": 0})
     older = copy.deepcopy(state)
     older["settings"].pop("NrProcessingOrder")
     older["setting_groups"].pop("NrProcessingOrder")
     older["request"] = older["applied_request"] = 0  # A freshly connected older runtime.
     receive(older)
     count = len(g.sent)
-    draw("Apply changes##bottom", changes={"Rendering order": 1})
-    g.changes["Rendering order"] = None  # No such widget existed in this draw.
+    draw("Apply changes##bottom", changes={"NR source": 1})
+    g.changes["NR source"] = None  # No such widget existed in this draw.
     g.callbacks.on_frame()
     assert len(g.sent) == count, "Older runtime received an unsupported rendering-order setting"
-    assert g["values"]["Rendering order"] is None
+    assert g["values"]["NR source"] is None
     assert not any("Waiting for settings acknowledgement" in t for t in g.drawn.values()), "Unsupported in-flight order blocked reconnect"
-    assert any("Rendering order: Unavailable in this runtime" in t for t in g.drawn.values())
+    assert any("NR source: Unavailable in this runtime" in t for t in g.drawn.values())
     receive({"protocol": 999, "settings": {}})
     draw()
     assert any("version mismatch" in t for t in g.drawn.values())
@@ -1045,7 +1062,7 @@ def run(engine):
     receive(state)
     count = len(g.sent)
     draw()
-    assert g["values"]["Rendering order"] == 1 and g["values"]["NR working scale"] == 0.37
+    assert g["values"]["NR source"] == 1 and g["values"]["NR working scale"] == 0.37
     assert len(g.sent) == count, "Reconnect resent a discarded rendering-order edit"
     state["renderer"] = 0
     state["revision"] += 1
@@ -1053,7 +1070,7 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["DX11 -> DX12 transport"] is False
-    assert g["values"]["Enable DLSS-NR"] is None
+    assert g["values"]["Enable DLSS-NR"] is False, "Universal DLSS 5 needs no DX12 transport"
     draw(changes={"DX11 -> DX12 transport": True})
     assert "D3D11D3D12Transport=true" in last()
     state["request"] = state["applied_request"] = int(last().splitlines()[1])

@@ -99,6 +99,8 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
 // presenter uses this key to retire the old pipeline at the next xrWaitFrame.
 std::uint64_t configuration(const Settings& s) noexcept {
     auto hash=fg_sr_mode_configuration(configuration(s.fg),s.enabled);
+    // Universal DLSS 5 changes capture storage (full eyes) and the D3D11 backend.
+    if(universal_nr_requested())hash=(hash^0x554E52u)*1099511628211ull;
     if(s.fg.foveated)hash=(hash^unsigned(s.center_mode))*1099511628211ull;
     if(s.fg.match_sr_region&&s.fg.foveated){
         // SR's static region can change independently of FG. Gaze placement is
@@ -287,7 +289,8 @@ void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,co
 }catch(...){}
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetShaderOptionsV1(CheekyFgShaderOptionsV1* out) noexcept {
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
-    const auto s=current_settings();out->enabled=enabled();out->center_method=s.fg.center_method;
+    // Universal DLSS 5 needs the layer's D3D12 bridge, not the native D3D11 shader path.
+    const auto s=current_settings();out->enabled=enabled()&&!universal_nr_requested();out->center_method=s.fg.center_method;
     out->peripheral_method=s.fg.peripheral_method;out->foveated=s.fg.foveated;return true;
 }
 void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* p) noexcept try {
@@ -633,7 +636,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
     // color history. No additional full-resolution history copy is allocated.
     out->compact=s.foveated&&!cheeky_fg_image_only(s.center_method,s.peripheral_method,s.foveated)&&
         settings.center_mode==cheeky::foveated_dlss::FoveationCenterMode::fixed &&
-        !settings.eye_calibration_continuous;
+        !settings.eye_calibration_continuous &&
+        !cheeky::foveated_dlss::universal_nr_requested(); // NR needs full-resolution eye images.
     out->peripheral_percent=s.peripheral_percent;
     out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
 }

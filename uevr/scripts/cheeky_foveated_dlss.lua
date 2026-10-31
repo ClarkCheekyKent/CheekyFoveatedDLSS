@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "NrUniversalMotion", "NrUniversalDepth", "NrOpticalShare", "NrOpticalPreset", "NrOpticalPercent", "NrOpticalGrid", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -190,6 +190,16 @@ local function nr_extra_pass(number)
 end
 local function fg_optical(method)
     return method ~= nil and method >= 5 and method <= 12
+end
+-- Any hooked DLSS call means the game's own vectors and depth exist.
+local function game_dlss()
+    for _, api in ipairs(status.apis or {}) do
+        if (api.creates or 0) > 0 or (api.evaluations or 0) > 0 then return true end
+    end
+    return false
+end
+local function universal_nr()
+    return draft.NrEnabled == true and draft.NrProcessingOrder == 2
 end
 -- Type and method share one saved ID: 0 DLSS-G, 1-4 DLSS vectors,
 -- 5-8 optical flow, 9-12 optical flow + depth, 13 previous frame.
@@ -715,7 +725,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
             end
             local dx11 = status.renderer == 0
-            local native_shader11 = dx11 and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) ~= 0)
+            local universal = universal_nr()
+            local native_shader11 = dx11 and not universal and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) ~= 0)
             local percent = {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"}
             section("Foveation")
             if draft.FgCenterMethod ~= nil then
@@ -733,6 +744,14 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
                 if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
                 if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
+                if universal and draft.NrOpticalShare then text("Center optical flow is shared with DLSS-NR. Its area also covers the NR region.") end
+            end
+            if not game_dlss() and draft.FgCenterMethod ~= nil and draft.FgCenterMethod <= 4 then
+                text("DLSS-G and DLSS Vectors need game DLSS. Use Optiflow in games without it.")
+            end
+            if universal then
+                text("Input frames: Universal DLSS 5 output (NR-enhanced).")
+                if dx11 then text("D3D11: Universal DLSS 5 uses the layer's DX12 bridge.") end
             end
             if draft.FgResolutionPercent ~= nil then combo("FG scale", "FgResolutionPercent", percent) end
             check("Foveated frame generation", "FgFoveated")
@@ -978,9 +997,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     if imgui.tree_node("DLSS-NR (experimental)") then
         if status.renderer == 0 then
             check("DX11 -> DX12 transport", "D3D11D3D12Transport")
-            text("DLSS-NR on DX11 requires DX12 transport.")
+            text("DLSS-NR on DX11 requires DX12 transport, except Universal DLSS 5.")
         end
-        if status.renderer ~= 0 or draft.D3D11D3D12Transport then
+        local universal_supported = status.settings.NrUniversalMotion ~= nil
+        if status.renderer ~= 0 or draft.D3D11D3D12Transport or universal_supported then
             check("Enable DLSS-NR", "NrEnabled")
             text("Alt+Shift+> (period key): toggle DLSS-NR")
             if draft.NrEnabled then
@@ -1001,11 +1021,19 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A (Original)",[2]="Preset B (Faster)"})
                 text("Shared by all model passes. Preset B requires NR 310.9.16 or newer.")
                 if status.settings.NrProcessingOrder ~= nil then
-                    combo("Rendering order", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
+                    if universal_supported then
+                        combo("NR source", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling",[2]="Universal DLSS 5 (OpenXR submission)"})
+                    else
+                        combo("NR source", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
+                    end
+                    if draft.NrProcessingOrder ~= 2 and not game_dlss() and universal_supported then
+                        text("After and Before upscaling need game DLSS. Use Universal DLSS 5 in games without it.")
+                    end
                 else
-                    text("Rendering order: Unavailable in this runtime")
+                    text("NR source: Unavailable in this runtime")
                 end
                 slider("NR working scale", "NrWorkingScale", 0.1, 1)
+                if universal_nr() then text("Universal DLSS 5 runs at headset resolution.") end
                 combo("DLSS-NR style", "NrStyle", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
                 slider("NR intensity", "NrIntensity", 0, 1)
                 text("Intensity: 0 = no model edit, 1 = full model edit.")
@@ -1031,6 +1059,42 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     combo("Model passes", "NrPasses", {[1]="1",[2]="2",[3]="3"}, {1, 2, 3})
                     text("Each extra pass refines the previous one and costs about one more NR evaluation.")
                     for number = 2, draft.NrPasses or 1 do nr_extra_pass(number) end
+                end
+                if universal_nr() and universal_supported then
+                    section("Universal DLSS 5 inputs")
+                    if not draft.FgEnabled then text("Universal DLSS 5 runs in the Frame Generation presenter. Enable Frame Generation.") end
+                    text("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it.")
+                    local game = game_dlss()
+                    combo("Motion vectors", "NrUniversalMotion", {[0]="Optical flow",[1]="Game DLSS vectors"})
+                    combo("Depth", "NrUniversalDepth", {[0]="Automatic",[1]="Game DLSS depth",[2]="None (flat)"})
+                    if not game and (draft.NrUniversalMotion == 1 or draft.NrUniversalDepth == 1) then
+                        text("No game DLSS detected: optical flow and flat depth are used instead.")
+                    end
+                    check("Share optical flow with Frame Generation", "NrOpticalShare")
+                    if draft.NrOpticalShare and draft.FgEnabled and fg_optical(draft.FgCenterMethod) then
+                        local presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
+                        local grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
+                        text(string.format("Using FG optical flow: %s, %d%%, %s. Change it under Frame Gen.",
+                            presets[draft.FgOpticalCenterPreset or 1] or "Medium", draft.FgOpticalCenterPercent or 50,
+                            grids[draft.FgOpticalCenterGrid or 2] or "2x2 blocks"))
+                        text("The flow area covers both the NR region and the FG center.")
+                    else
+                        if draft.NrOpticalShare then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
+                        combo("NR optical flow preset", "NrOpticalPreset", {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"})
+                        combo("NR optical flow resolution", "NrOpticalPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
+                        combo("NR optical flow vector grid", "NrOpticalGrid", {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"})
+                    end
+                    local u = (status.nr_details or {}).universal or {}
+                    if u.requested then
+                        if not u.layer_reporting then text("Universal DLSS 5: waiting for the OpenXR layer")
+                        else
+                            text(string.format("Eyes: left %s, right %s. Motion: %s%s. Depth: %s.",
+                                u.evaluated_left and "on" or "off", u.evaluated_right and "on" or "off",
+                                u.game_motion and "game DLSS vectors" or "optical flow", u.shared_flow and " (shared with FG)" or "",
+                                u.game_depth and "game DLSS" or "flat"))
+                        end
+                        if u.reason and u.reason ~= "" then text("Universal skipped: " .. tostring(u.reason)) end
+                    end
                 end
             end
             if imgui.button("Reset NR history / retry") then send("reset_nr") end

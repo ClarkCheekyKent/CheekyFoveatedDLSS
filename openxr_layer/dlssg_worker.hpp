@@ -47,6 +47,11 @@ struct Worker {
     std::array<ComPtr<ID3D12CommandAllocator>,4> optical_consumer_allocators;
     std::array<ComPtr<ID3D12GraphicsCommandList>,4> optical_consumer_lists;
     bool optical_pending[2][2]{};
+    // Universal DLSS 5 already estimated this eye's center flow, on this queue,
+    // into focus.borrowed_optical[eye][0]. Its flow window, size and grid
+    // replace this pass's own; interpolation keeps its own output region.
+    std::array<bool,2> shared_center_flow{};
+    std::array<OpticalConstants,2> shared_center_constants{};
     ComPtr<ID3D12Fence> fence;HANDLE event{};std::uint64_t serial{},prepared_serial{};
     std::array<Feature,2> features{},peripheral_features{};
     FocusPipeline focus;

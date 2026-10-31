@@ -266,8 +266,95 @@ void draw_nr_passes(Settings& s) {
     for (std::uint32_t number = 2U; number <= s.nr_passes; ++number) draw_nr_extra_pass(s, number);
 }
 
-void draw_nr(Settings& s, bool quad) {
+std::string_view array_object(std::string_view array, unsigned index);
+double number(std::string_view object, const char* key);
+bool flag(std::string_view object, const char* key);
+void warning(const char* text);
+
+// Any hooked D3D11 or D3D12 DLSS call means the game's own NR inputs exist.
+bool game_dlss_seen(std::string_view snapshot) {
+    const auto apis = member(snapshot, "apis");
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto api = array_object(apis, i);
+        if (number(api, "creates") > 0 || number(api, "evaluations") > 0) return true;
+    }
+    return false;
+}
+
+// Items that need the game's DLSS stay visible but cannot be picked without it.
+void game_combo(const char* label, std::uint32_t& value, std::initializer_list<std::pair<const char*, bool>> items, bool game_dlss) {
+    std::string selected;
+    std::uint32_t i{};
+    for (const auto& [name, needs_game] : items) if (i++ == value) selected = name;
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##value", selected.c_str())) {
+        i = 0;
+        for (const auto& [name, needs_game] : items) {
+            const bool unavailable = needs_game && !game_dlss;
+            const auto text = unavailable ? std::string(name) + " (needs game DLSS)" : std::string(name);
+            if (ImGui::Selectable(text.c_str(), i == value, unavailable ? ImGuiSelectableFlags_Disabled : 0)) value = i;
+            ++i;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::PopID();
+    test_control(label);
+}
+
+void draw_nr_universal(Settings& s, bool quad, bool game_dlss) {
+    auto& u = s.nr_universal;
+    ImGui::SeparatorText("Universal DLSS 5 inputs");
+    if (quad) ImGui::TextWrapped("Universal DLSS 5 runs on stereo OpenXR submissions; quad-view sessions keep the game's NR route.");
+    if (!s.fg.enabled) warning("Universal DLSS 5 runs in the Frame Generation presenter. Enable Frame Generation.");
+    ImGui::TextWrapped("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it. D3D11 games use the layer's DX12 bridge.");
+    game_combo("Motion vectors", u.motion, {{"Optical flow", false}, {"Game DLSS vectors", true}}, game_dlss);
+    game_combo("Depth", u.depth, {{"Automatic", false}, {"Game DLSS depth", true}, {"None (flat)", false}}, game_dlss);
+    if (u.depth == 0) ImGui::TextDisabled(game_dlss ? "Automatic uses the game's DLSS depth." : "Automatic uses flat depth without game DLSS.");
+    ImGui::Checkbox("Share optical flow with Frame Generation", &u.share_optical);
+    test_control("NrOpticalShare");
+    if (u.motion == 1 && game_dlss) {
+        ImGui::TextWrapped("Optical flow is used only when the game's vectors are unavailable.");
+    }
+    if (u.share_optical && s.fg.enabled && cheeky_fg_optical(s.fg.center_method)) {
+        constexpr const char* presets[]{"Slow (quality)", "Medium", "Fast (performance)"};
+        const auto grid = s.fg.optical.center_grid;
+        ImGui::TextWrapped("Using FG optical flow: %s, %u%%, %s. Change it in the Frame Gen tab.",
+            presets[std::min(s.fg.optical.center_preset, 2U)], s.fg.optical.center_percent,
+            grid == 1 ? "1x1 (per pixel)" : grid == 2 ? "2x2 blocks" : "4x4 blocks");
+        ImGui::TextWrapped("The flow area covers both the NR region and the FG center.");
+        return;
+    }
+    if (u.share_optical) ImGui::TextWrapped("FG's center does not use optical flow, so DLSS-NR runs its own.");
+    combo("NR optical flow preset", u.optical_preset, "Slow (quality)\0Medium\0Fast (performance)\0");
+    int percent = static_cast<int>(u.optical_percent / 25) - 1;
+    ImGui::PushID("NR optical flow resolution");
+    ImGui::TextUnformatted("NR optical flow resolution");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##value", &percent, "25%\0" "50%\0" "75%\0" "100% native\0"))
+        u.optical_percent = static_cast<std::uint32_t>(percent + 1) * 25;
+    ImGui::PopID();
+    int grid = u.optical_grid == 1 ? 2 : u.optical_grid == 2 ? 1 : 0;
+    ImGui::PushID("NR optical flow vector grid");
+    ImGui::TextUnformatted("NR optical flow vector grid");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##value", &grid, "4x4 blocks\0" "2x2 blocks\0" "1x1 (per pixel)\0"))
+        u.optical_grid = grid == 2 ? 1U : grid == 1 ? 2U : 4U;
+    ImGui::PopID();
+}
+
+void draw_nr(Settings& s, bool quad, std::string_view snapshot) {
     ImGui::Checkbox(quad?"Enable DLSS-NR on center views":"Enable DLSS-NR", &s.nr_enabled);
+    const bool game_dlss = game_dlss_seen(snapshot);
+    auto source = static_cast<std::uint32_t>(s.nr_processing_order);
+    game_combo("NR source", source, {{"After upscaling", true}, {"Before upscaling (experimental)", true},
+        {"Universal DLSS 5 (OpenXR submission)", false}}, game_dlss);
+    s.nr_processing_order = nr_processing_order(source);
+    const bool universal = s.nr_processing_order == NrProcessingOrder::universal;
+    if (!game_dlss && !universal)
+        ImGui::TextWrapped("No game DLSS detected. Choose Universal DLSS 5 to run DLSS-NR on the headset image.");
+    if (universal) draw_nr_universal(s, quad, game_dlss);
     if(quad)ImGui::TextWrapped("NR covers each assigned center view in full. Peripheral views do not run NR. D3D11 requires DX12 Transport.");
     if(!quad){
     ImGui::SeparatorText("Size and shape");
@@ -290,8 +377,8 @@ void draw_nr(Settings& s, bool quad) {
     combo("DLSS-NR preset", s.nr_preset, "Default\0Preset A (Original)\0Preset B (Faster)\0");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Shared by all model passes. Preset B requires NR 310.9.16 or newer.");
-    combo("Rendering order", s.nr_processing_order, "After upscaling\0Before upscaling (experimental)\0");
     slider("Working scale", s.nr_working_scale, .1F, 1.0F);
+    if (universal) ImGui::TextDisabled("Universal DLSS 5 runs at headset resolution.");
     combo("DLSS-NR style", s.nr_style, "Standard\0Natural\0Cinematic\0");
     slider("Intensity", s.nr_intensity, 0.0F, 1.0F);
     if (ImGui::TreeNode("Additional settings")) {
@@ -885,7 +972,20 @@ void draw_nr_performance(std::string_view snapshot, const Settings& s) {
         diagnostic_line(nr, "Failures", "failures");
         if (!member(nr, "result").empty())
             ImGui::Text("Last NGX result: 0x%08X", static_cast<std::uint32_t>(number(nr, "result")));
-        ImGui::TextWrapped("Rendering order: %s", number(nr, "processing_order") == 1 ? "Before upscaling" : "After upscaling");
+        const auto order = number(nr, "processing_order");
+        ImGui::TextWrapped("NR source: %s", order == 2 ? "Universal DLSS 5" : order == 1 ? "Before upscaling" : "After upscaling");
+        if (const auto u = member(nr, "universal"); flag(u, "requested")) {
+            if (!flag(u, "layer_reporting")) ImGui::TextUnformatted("Universal DLSS 5: waiting for the OpenXR layer");
+            else {
+                ImGui::TextWrapped("Universal DLSS 5 eyes: left %s, right %s", flag(u, "evaluated_left") ? "on" : "off",
+                    flag(u, "evaluated_right") ? "on" : "off");
+                ImGui::TextWrapped("Motion: %s%s. Depth: %s.", flag(u, "game_motion") ? "game DLSS vectors" : "optical flow",
+                    flag(u, "shared_flow") ? " (shared with FG)" : "", flag(u, "game_depth") ? "game DLSS" : "flat");
+            }
+            if (!plain(member(u, "reason")).empty()) diagnostic_line(u, "Universal skipped", "reason");
+            ImGui::Text("Universal evaluations: %.0f, native fallbacks: %.0f, history resets: %.0f",
+                number(u, "evaluations"), number(u, "fallbacks"), number(u, "resets"));
+        }
         resolution_line(nr, "Processing resolution", "processing_width", "processing_height");
         resolution_line(nr, "DLSS-SR output", "output_width", "output_height");
         region_line(nr, nr, "DLSS-NR region", "region_width", "region_height", "region_x", "region_y",
@@ -916,7 +1016,9 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     const bool quad=flag(member(snapshot,"quad_views"),"active")&&!outer_guides;
     if(quad&&settings.fg.peripheral_method==0)settings.fg.peripheral_method=2;
     auto& s = settings.fg;
-    const auto native_shader11=[&]{return dx11&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
+    // Universal DLSS 5 routes D3D11 FG through the layer's DX12 bridge.
+    const bool universal=nr_universal_active(settings);
+    const auto native_shader11=[&]{return dx11&&!universal&&cheeky_fg_shader_only(s.center_method,s.peripheral_method,s.foveated||quad);};
     const auto fg = member(snapshot, "fg");
     ImGui::Checkbox("Enable Frame Generation", &s.enabled);
     test_control("FgEnabled");
@@ -951,7 +1053,8 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
     ImGui::SeparatorText(quad?"Quad view quality":"Foveation");
     // Type and method share one saved ID: 0 DLSS-G, 1-4 DLSS vectors,
     // 5-8 optical flow, 9-12 optical flow + depth, 13 previous frame.
-    const auto method_combo=[](const char* prefix,unsigned& method,bool periphery,bool quad_view){
+    const bool game_dlss=game_dlss_seen(snapshot);
+    const auto method_combo=[game_dlss](const char* prefix,unsigned& method,bool periphery,bool quad_view){
         constexpr const char* types[]{"DLSS-G","DLSS Vectors","Optiflow","Optiflow + Depth","Previous frame"};
         constexpr const char* methods[]{"Simple Warping","Bidirectional Interpolation",
             "Confidence-Guided Interpolation","Confidence-Guided Interpolation (Fast)"};
@@ -960,9 +1063,22 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         const int interpolation=cheeky_fg_shader(method)?int((method-1)%4):2;
         char label[64]{};
         sprintf_s(label,"%s type",prefix);
-        int selected=type_of(method)-first;
-        if(ImGui::Combo(label,&selected,types+first,count-first)&&selected+first!=type_of(method)){
-            const int type=selected+first;
+        // DLSS-G and DLSS vectors read the game's DLSS guides.
+        const int current=type_of(method);
+        int selected=current;
+        char shown[64]{};
+        sprintf_s(shown,"%s%s",types[current],current<2&&!game_dlss?" (needs game DLSS)":"");
+        if(ImGui::BeginCombo(label,shown)){
+            for(int type=first;type<count;++type){
+                const bool unavailable=type<2&&!game_dlss;
+                char item[64]{};
+                sprintf_s(item,"%s%s",types[type],unavailable?" (needs game DLSS)":"");
+                if(ImGui::Selectable(item,type==current,unavailable?ImGuiSelectableFlags_Disabled:0))selected=type;
+            }
+            ImGui::EndCombo();
+        }
+        if(selected!=current){
+            const int type=selected;
             method=type==0?0u:type==4?cheeky_fg_previous:unsigned((type-1)*4+interpolation+1);
         }
         test_control(label);
@@ -984,6 +1100,12 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         combo("Center optical flow preset",s.optical.center_preset,"Slow (quality)\0Medium\0Fast (performance)\0");
         fg_percent("Center optical flow resolution",s.optical.center_percent);
         optical_grid("Center optical flow vector grid",s.optical.center_grid);
+        if(universal&&settings.nr_universal.share_optical)
+            ImGui::TextWrapped("Center optical flow is shared with DLSS-NR. Its area also covers the NR region.");
+    }
+    if(universal){
+        ImGui::TextWrapped("Input frames: Universal DLSS 5 output (NR-enhanced).");
+        if(dx11)ImGui::TextWrapped("D3D11: Universal DLSS 5 uses the layer's DX12 bridge.");
     }
     fg_percent(quad?"Center FG scale":"FG scale", s.resolution_percent);
     if(!quad){
@@ -1406,7 +1528,7 @@ void draw_overlay_ui(OverlayUiState& r,const OverlayRuntime& runtime,InputState&
                     const auto reason = plain(member(member(r.snapshot, "nr_details"), "skip_reason"));
                     if (!reason.empty()) warning(reason.c_str());
                 }
-                draw_nr(r.draft,flag(member(r.snapshot,"quad_views"),"active"));
+                draw_nr(r.draft,flag(member(r.snapshot,"quad_views"),"active"),r.snapshot);
                 if (ImGui::Button("Reset NR history / retry")) command(r, runtime, "reset_nr");
                 ImGui::SameLine();
                 if (ImGui::Button("Reset NR defaults")) command(r, runtime, "defaults_nr");

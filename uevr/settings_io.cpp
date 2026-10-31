@@ -18,7 +18,7 @@ template<class T> bool parse(std::string_view s, T& value) {
         return false;
     } else if constexpr (std::is_enum_v<T>) {
         std::uint32_t n{};
-        constexpr auto maximum = std::is_same_v<T, EyeCalibrationMethod> ? 3U : std::is_same_v<T, NrProcessingOrder> ? 1U : 2U;
+        constexpr auto maximum = std::is_same_v<T, EyeCalibrationMethod> ? 3U : 2U;
         if (!parse(s, n) || n > maximum) return false;
         value = static_cast<T>(n); return true;
     } else {
@@ -47,6 +47,11 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     if(key=="FgOpticalCenterPreset"||key=="FgOpticalPeripheralPreset") {unsigned n{};if(!parse(value,n)||n>2)return false;(key=="FgOpticalCenterPreset"?s.fg.optical.center_preset:s.fg.optical.peripheral_preset)=n;return true;}
     if(key=="FgOpticalCenterPercent"||key=="FgOpticalPeripheralPercent") {unsigned n{};if(!parse(value,n)||(n!=25&&n!=50&&n!=75&&n!=100))return false;(key=="FgOpticalCenterPercent"?s.fg.optical.center_percent:s.fg.optical.peripheral_percent)=n;return true;}
     if(key=="FgOpticalCenterGrid"||key=="FgOpticalPeripheralGrid") {unsigned n{};if(!parse(value,n)||(n!=1&&n!=2&&n!=4))return false;(key=="FgOpticalCenterGrid"?s.fg.optical.center_grid:s.fg.optical.peripheral_grid)=n;return true;}
+    if(key=="NrUniversalMotion"){unsigned n{};if(!parse(value,n)||n>1)return false;s.nr_universal.motion=n;return true;}
+    if(key=="NrUniversalDepth"){unsigned n{};if(!parse(value,n)||n>2)return false;s.nr_universal.depth=n;return true;}
+    if(key=="NrOpticalPreset"){unsigned n{};if(!parse(value,n)||n>2)return false;s.nr_universal.optical_preset=n;return true;}
+    if(key=="NrOpticalPercent"){unsigned n{};if(!parse(value,n)||(n!=25&&n!=50&&n!=75&&n!=100))return false;s.nr_universal.optical_percent=n;return true;}
+    if(key=="NrOpticalGrid"){unsigned n{};if(!parse(value,n)||(n!=1&&n!=2&&n!=4))return false;s.nr_universal.optical_grid=n;return true;}
     if(key=="QuadSavedSourceCount"){unsigned count{};if(!parse(value,count)||count>8)return false;s.quad_saved_source_count=count;return true;}
     if(key.size()==13&&key.starts_with("QuadView")&&key.ends_with("Role")&&key[8]>='1'&&key[8]<='8'){
         unsigned role{};if(!parse(value,role)||role>4)return false;s.quad_saved_roles[key[8]-'1']=role;return true;}
@@ -159,6 +164,7 @@ bool read_settings_file(const std::filesystem::path& path, Settings& s, std::str
     // over a currently configured Before setting. Commit only after validation.
     candidate.nr_processing_order = NrProcessingOrder::after_upscaling;
     candidate.nr_style = 0U; // Older files used the hardcoded Standard style.
+    candidate.nr_universal = NrUniversalSettings{}; // Older files predate Universal DLSS 5.
     candidate.afw_manual_coverage = false; // Older AFW builds used the centered safety region.
     candidate.afw_automatic_coverage = false;
     candidate.afw_warp_margin = Settings{}.afw_warp_margin;

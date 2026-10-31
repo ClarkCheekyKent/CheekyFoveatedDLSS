@@ -39,17 +39,33 @@ enum class FoveationCenterMode : std::uint32_t {
 enum class NrProcessingOrder : std::uint32_t {
     after_upscaling = 0U,
     before_upscaling = 1U,
+    // Universal DLSS 5: the OpenXR layer evaluates NR on each submitted eye
+    // image, with optical-flow (or game) vectors. No game DLSS pass is used.
+    universal = 2U,
 };
 
 inline NrProcessingOrder nr_processing_order(std::uint32_t value) noexcept {
     return value == 1U ? NrProcessingOrder::before_upscaling
+         : value == 2U ? NrProcessingOrder::universal
                        : NrProcessingOrder::after_upscaling;
 }
 
 inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
-    return order == NrProcessingOrder::before_upscaling
-        ? "Before upscaling" : "After upscaling";
+    return order == NrProcessingOrder::before_upscaling ? "Before upscaling"
+         : order == NrProcessingOrder::universal ? "Universal DLSS 5"
+                                                 : "After upscaling";
 }
+
+// Inputs of Universal DLSS 5. Preset, style and the rest are shared NR settings.
+struct NrUniversalSettings {
+    std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (falls back to optical flow).
+    std::uint32_t depth{}; // 0 automatic, 1 game DLSS depth, 2 none (flat depth).
+    bool share_optical{true}; // Reuse FG's center optical flow when FG computes one.
+    // NR's own flow, used when nothing is shared: 0 slow, 1 medium, 2 fast;
+    // 25/50/75/100 percent input; one vector per 1, 2 or 4 pixels.
+    std::uint32_t optical_preset{1}, optical_percent{50}, optical_grid{2};
+    bool operator==(const NrUniversalSettings&) const = default;
+};
 
 struct Settings {
     struct FrameGeneration {
@@ -171,7 +187,12 @@ struct Settings {
     // Model passes per frame. Each pass keeps its own feature and history.
     std::uint32_t nr_passes{1U};
     std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{};
+    NrUniversalSettings nr_universal;
 };
+
+[[nodiscard]] inline bool nr_universal_active(const Settings& settings) noexcept {
+    return settings.nr_enabled && settings.nr_processing_order == NrProcessingOrder::universal;
+}
 
 // Pass 1's tuning in the form a later pass stores it.
 [[nodiscard]] inline NrExtraPass nr_pass1_tuning(const Settings& settings) noexcept {
@@ -270,7 +291,12 @@ void set_eye_calibration_learning(unsigned method, std::uint64_t signature, unsi
 std::uint64_t eye_calibration_learning_revision() noexcept;
 void clear_stereo_calibration() noexcept;
 
+// Settings for the game's DLSS passes. With Universal DLSS 5 selected, NR
+// reads as disabled here; the OpenXR layer evaluates it instead.
 [[nodiscard]] Settings current_settings() noexcept;
+// Like current_settings(), without hiding Universal DLSS 5's NR.
+[[nodiscard]] Settings universal_nr_settings() noexcept;
+[[nodiscard]] bool universal_nr_requested() noexcept;
 [[nodiscard]] Settings configured_settings() noexcept;
 void update_settings(const Settings& settings) noexcept;
 // A host can stop processing on detach without taking locks under DllMain.

@@ -222,6 +222,22 @@ float quality(float2 p,float2 other,float4 v,float4 reverse,float2 residual){
  else c=t<.5&&within(oldUV(uv))?packed(Old,oldUV(uv),OldCrop,OldSpans):packed(Now,uv,Crop,Spans);
  Result[id.xy]=encodeOutput(validateImage(uv,a,b,t,c));
 }
+// Universal DLSS 5 motion vectors: current-to-previous displacement in eye UV,
+// one texel per Sizes.zw cell of the whole eye (R32G32_FLOAT). Backward flow is
+// measured against the pose-compensated previous frame, so the head rotation
+// is added back through oldUV(). Outside the flow rectangle only the head
+// rotation is known; Flags.x>0.5 leaves those texels to an earlier dispatch.
+[numthreads(8,8,1)]void NrVectors(uint3 id:SV_DispatchThreadID){
+ if(any(id.xy>=uint2(Sizes.zw)))return;
+ float2 uv=(float2(id.xy)+.5)/Sizes.zw;
+ float2 q=(uv-FlowRect.xy)/FlowRect.zw;
+ bool inside=all(q>=0)&&all(q<=1);
+ if(!inside&&Flags.x>.5)return;
+ float2 previous=inside?oldUV(FlowRect.xy+(q+vectorAt(Backward,q))*FlowRect.zw):oldUV(uv);
+ // rotateView() returns -10 for rays behind the previous camera.
+ bool valid=all(isfinite(previous))&&all(previous>-9);
+ Result[id.xy]=float4(valid?previous-uv:float2(0,0),0,0);
+}
 )HLSL";
 struct OpticalConstants {
     float flow_rect[4]{0,0,1,1},output_rect[4]{0,0,1,1},sizes[4]{},flags[4]{};

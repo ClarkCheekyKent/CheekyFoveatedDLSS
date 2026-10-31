@@ -3,7 +3,10 @@
 #include "runtime.hpp"
 #include <cstddef>
 #include <cstring>
+#include <cwchar>
+#include <string>
 #include <mutex>
+#pragma comment(lib, "advapi32.lib")
 namespace cheeky::foveated_dlss {
 namespace {
 using GetModuleFileNameWFn=DWORD(WINAPI*)(HMODULE,LPWSTR,DWORD);
@@ -168,5 +171,40 @@ NrRuntimeModule load_nr_runtime_module() noexcept {
         reinterpret_cast<LPCWSTR>(cached.module),&pinned);
     cached.error=0;
     return cached;
+}
+
+HMODULE load_ngx_core_runtime() noexcept {
+    static std::mutex mutex;
+    static HMODULE cached{};
+    std::lock_guard lock(mutex);
+    if (cached) return cached;
+    if ((cached = GetModuleHandleW(L"_nvngx.dll"))) return cached;
+    const auto try_directory = [](const wchar_t* directory) -> HMODULE {
+        if (!directory || !*directory) return nullptr;
+        std::wstring path(directory);
+        if (path.back() != L'\\' && path.back() != L'/') path += L'\\';
+        path += L"_nvngx.dll";
+        const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        trace_event("DLSS-NR NGX core search path=%ls error=%lu", path.c_str(),
+            static_cast<unsigned long>(module ? 0U : GetLastError()));
+        return module;
+    };
+    // The driver registers its NGX core folder.
+    std::array<wchar_t, 32768U> registered{};
+    DWORD bytes = static_cast<DWORD>(sizeof(wchar_t) * (registered.size() - 1U));
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath",
+            RRF_RT_REG_SZ, nullptr, registered.data(), &bytes) == ERROR_SUCCESS &&
+        (cached = try_directory(registered.data()))) return cached;
+    // Otherwise the driver store folder of the loaded NVIDIA D3D user-mode driver.
+    for (const auto name : {L"nvwgf2umx.dll", L"nvldumdx.dll"}) {
+        const auto driver = GetModuleHandleW(name);
+        if (!driver) continue;
+        std::array<wchar_t, 32768U> folder{};
+        const auto length = GetModuleFileNameW(driver, folder.data(), static_cast<DWORD>(folder.size()));
+        if (!length || length >= folder.size()) continue;
+        if (auto* slash = std::wcsrchr(folder.data(), L'\\')) *slash = L'\0'; else continue;
+        if ((cached = try_directory(folder.data()))) return cached;
+    }
+    return nullptr;
 }
 }

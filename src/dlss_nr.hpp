@@ -14,6 +14,7 @@ enum class DlssNrRoute : std::uint32_t {
     d3d12_native,
     d3d11_transport,
     streamline,
+    universal, // OpenXR layer, Universal DLSS 5.
 };
 
 enum class DlssNrState : std::uint32_t {
@@ -78,6 +79,17 @@ struct DlssNrFrame {
     std::uint32_t view_output_base_x{}, view_output_base_y{}; // Retained when Before NR switches color to input space.
 };
 
+// Universal DLSS 5 as last reported by the OpenXR layer.
+struct DlssNrUniversalStatus {
+    bool requested{}; // NR on with source Universal.
+    bool layer_reporting{}; // The layer reported within the last second.
+    bool evaluated[2]{};
+    bool game_motion{}, game_depth{}, shared_flow{};
+    std::uint64_t evaluations{}, fallbacks{}, resets{};
+    float flow_ms{}, vectors_ms{};
+    const char* reason{};
+};
+
 struct DlssNrSnapshot {
     NrProcessingOrder processing_order{NrProcessingOrder::after_upscaling};
     std::uint32_t processing_width{}, processing_height{};
@@ -100,6 +112,7 @@ struct DlssNrSnapshot {
     std::uint64_t intermediate_vram_bytes{};
     std::uint64_t codec_creations{}, border_creations{}, resource_rebinds{};
     std::uint32_t requested_passes{1U}, active_passes{};
+    DlssNrUniversalStatus universal{};
 };
 
 [[nodiscard]] bool evaluate_dlss_nr(

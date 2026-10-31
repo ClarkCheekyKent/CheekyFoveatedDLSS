@@ -14,6 +14,10 @@ struct BufferedNative {
     unsigned direct_output_mode{};bool latency_diagnostics{};
     TimingClock::time_point captured_at{},handed_off_at{};
     std::array<Image,2> color;
+    // Universal DLSS 5 replaces color with its NR output (also the next FG
+    // history) and keeps the captured eyes here for the next optical flow.
+    std::array<Image,2> raw_color;
+    bool universal_nr{};
     std::array<ColorReady,2> color_ready;
     ColorReady final_color_ready; // GPU end of the combined native-eye crop/assembly batch.
     std::array<XrCompositionLayerProjectionView,2> views;

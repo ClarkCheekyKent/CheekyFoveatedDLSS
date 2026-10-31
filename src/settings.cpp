@@ -54,6 +54,17 @@ std::atomic<bool> quad_manual_assignment{false},quad_show_numbers{false};
 std::array<unsigned,8> quad_saved_roles{};unsigned quad_saved_source_count{}; // settings_mutex
 std::uint32_t nr_passes{1U}; // settings_mutex
 std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{}; // settings_mutex
+NrUniversalSettings nr_universal{}; // settings_mutex
+
+NrUniversalSettings sanitized_universal(NrUniversalSettings u) noexcept {
+    if (u.motion > 1U) u.motion = 0U;
+    if (u.depth > 2U) u.depth = 0U;
+    if (u.optical_preset > 2U) u.optical_preset = 1U;
+    if (u.optical_percent != 25U && u.optical_percent != 50U && u.optical_percent != 75U && u.optical_percent != 100U)
+        u.optical_percent = 50U;
+    if (u.optical_grid != 1U && u.optical_grid != 2U && u.optical_grid != 4U) u.optical_grid = 2U;
+    return u;
+}
 
 // Clamp a later pass's tuning to pass 1's ranges.
 NrExtraPass sanitized_extra_pass(const NrExtraPass& pass) noexcept {
@@ -183,6 +194,7 @@ Settings configured_settings() noexcept {
     settings.fg = fg_settings;
     settings.nr_passes = nr_passes;
     settings.nr_extra_passes = nr_extra_passes;
+    settings.nr_universal = nr_universal;
     settings.enabled = enabled.load(std::memory_order_acquire);
     settings.d3d12_lower_hook = d3d12_lower_hook.load(std::memory_order_acquire);
     settings.d3d11_use_d3d12_transport =
@@ -267,7 +279,7 @@ Settings configured_settings() noexcept {
     return settings;
 }
 
-Settings current_settings() noexcept {
+Settings universal_nr_settings() noexcept {
     auto settings = configured_settings();
     if (!processing_allowed.load(std::memory_order_acquire)) {
         settings.enabled = false;
@@ -277,12 +289,27 @@ Settings current_settings() noexcept {
     return settings;
 }
 
+bool universal_nr_requested() noexcept {
+    return processing_allowed.load(std::memory_order_acquire) &&
+        nr_enabled.load(std::memory_order_acquire) &&
+        nr_order.load(std::memory_order_acquire) == NrProcessingOrder::universal;
+}
+
+Settings current_settings() noexcept {
+    auto settings = universal_nr_settings();
+    // Universal DLSS 5 runs in the OpenXR layer. The game's DLSS passes see
+    // NR as off, so they neither evaluate it nor require DX12 transport for it.
+    if (nr_universal_active(settings)) settings.nr_enabled = false;
+    return settings;
+}
+
 void update_settings(const Settings& settings) noexcept {
     std::unique_lock lock(settings_mutex);
     fg_settings = settings.fg;
     nr_passes = std::clamp(settings.nr_passes, 1U, max_nr_passes);
     for (std::size_t i = 0; i < nr_extra_passes.size(); ++i)
         nr_extra_passes[i] = sanitized_extra_pass(settings.nr_extra_passes[i]);
+    nr_universal = sanitized_universal(settings.nr_universal);
     if(!cheeky::fg::valid_dlssg_preset(fg_settings.dlssg_preset))fg_settings.dlssg_preset=3;
     reflex_override::requested.store(settings.fg.force_reflex_off,std::memory_order_release);
     fg_settings.multiplier=std::clamp(fg_settings.multiplier,2u,4u);

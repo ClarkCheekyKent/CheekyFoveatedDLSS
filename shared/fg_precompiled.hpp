@@ -38,6 +38,7 @@ inline std::span<const unsigned char> optical(std::string_view entry,std::string
         if(entry=="Prepare")return optical_prepare_cs_5_1;
         if(entry=="Interpolate")return optical_interpolate_cs_5_1;
         if(entry=="CacheVectors")return optical_cachevectors_cs_5_1;
+        if(entry=="NrVectors")return optical_nrvectors_cs_5_1;
     }
     return {};
 }

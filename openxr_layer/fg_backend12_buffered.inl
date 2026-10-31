@@ -1,6 +1,7 @@
 // D3D12 capture, interpolation and publication behind the shared pacing core.
 #include "fg_application_timing.hpp"
 #include "../src/d3d12_native.hpp"
+#include "fg_universal_nr.hpp"
 namespace cheeky::fg {
 inline bool BufferedPresenter::accept_guide_queue(const CheekyFgPair& guides,FrameGuides12& payload,bool hookless) noexcept {
     if(cheeky::foveated_dlss::same_d3d12_queue(guides.producer_queue,queue.Get()))return true;
@@ -525,6 +526,61 @@ struct BufferedBackend12 final : FrameBackend {
         if(!total.success)owner.worker.wait_idle();
         return total;
     }
+    // Universal DLSS 5 for one native stereo pair (first generated phase only).
+    // On success the job's color becomes the NR output: presented as this
+    // native frame and used as the next interval's FG history. On any failure
+    // the job keeps its captured color (unmodified native presentation).
+    UniversalNr12 universal;
+    bool universal_was_active{};
+    void universal_nr(const std::shared_ptr<BufferedNative>& previous,const std::shared_ptr<BufferedNative>& job,
+        BufferedPair& pair,const FrameGuides12& guides,bool fg_reset) noexcept {
+        auto& worker=owner.worker;
+        worker.shared_center_flow={};
+        for(unsigned eye=0;eye<2;++eye)worker.focus.borrowed_optical[eye][0]=nullptr;
+        CheekyNrUniversalOptionsV1 options;
+        if(!UniversalNr12::options(options)){universal_was_active=false;return;}
+        CheekyNrUniversalStatusV1 status;
+        const bool previous_nr=previous->universal_nr;
+        UniversalNr12::Input input;input.device=owner.device.Get();input.queue=owner.generation_queue.Get();input.pool=&owner.output;
+        for(unsigned eye=0;eye<2;++eye){
+            input.current_raw[eye]=job->color[eye];
+            input.previous_raw[eye]=previous_nr&&previous->raw_color[eye]?previous->raw_color[eye]:previous->color[eye];
+            input.cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.pair.eyes[eye].depth_inverted!=0);
+        }
+        input.guides=&guides.pair;
+        input.reset=fg_reset||!previous_nr||!universal_was_active;
+        input.convert_previous=!previous_nr;
+        // GPU-side only: the capture (and any game guides on another queue)
+        // precede optical flow and NR on the generation queue.
+        HRESULT ready=owner.generation_queue->Wait(owner.producer.fence.Get(),job->ready);
+        if(SUCCEEDED(ready)&&guides.sync_value)ready=owner.generation_queue->Wait(guides.sync_fence.Get(),guides.sync_value);
+        UniversalNr12::Output output;
+        const bool good=SUCCEEDED(ready)&&universal.run(input,options,output);
+        universal_was_active=good;
+        status.reason=SUCCEEDED(ready)?output.reason:"Universal DLSS 5 capture dependency failed";
+        status.fallback=good?0u:1u;status.reset=input.reset?1u:0u;
+        if(good){
+            if(input.convert_previous)for(unsigned eye=0;eye<2;++eye){previous->raw_color[eye]=previous->color[eye];previous->color[eye]=output.previous_copy[eye];}
+            previous->universal_nr=true;
+            for(unsigned eye=0;eye<2;++eye){
+                job->raw_color[eye]=job->color[eye];job->color[eye]=output.color[eye];pair.current[eye]=output.color[eye];
+                status.evaluated[eye]=output.evaluated[eye]?1u:0u;
+                if(output.shared[eye]){
+                    worker.shared_center_flow[eye]=true;worker.shared_center_constants[eye]=output.flow_constants[eye];
+                    worker.focus.borrowed_optical[eye][0]=&universal.flow[eye];status.shared_flow=1u;
+                }
+            }
+            job->universal_nr=true;
+            status.game_motion=output.game_motion?1u:0u;status.game_depth=output.game_depth?1u:0u;
+        }
+        UniversalNr12::report(status);
+        if(owner.trace&&(!good||!output.evaluated[0]||!output.evaluated[1])){
+            static std::uint64_t failures{};const auto count=++failures;
+            if(count<=4||(count&(count-1))==0){char message[256]{};
+                sprintf_s(message,"Universal DLSS 5 frame=%llu nr=%u,%u fallback=%u reason=%s",static_cast<unsigned long long>(job->id),
+                    unsigned(output.evaluated[0]),unsigned(output.evaluated[1]),unsigned(!good),status.reason?status.reason:"none");owner.trace(message);}
+        }
+    }
     GenerationOutcome generate_one(const std::shared_ptr<BufferedNative>& previous,
         const std::shared_ptr<BufferedNative>& job,BufferedPair& pair,
         bool& reset_history,std::uint64_t& logged_samples,
@@ -579,7 +635,13 @@ struct BufferedBackend12 final : FrameBackend {
                     owner.trace(msg);
                 }
             }
-            auto d=job->color[0]->texture->GetDesc();owner.worker.trace=owner.trace;owner.worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
+            // Universal DLSS 5 runs before FG, so FG and the presenter see its output.
+            if(pair.generated_index==0)universal_nr(previous,job,pair,*job_guides,reset_history);
+            auto d=job->color[0]->texture->GetDesc();
+            // Universal DLSS 5 images hold the capture's bits in a non-sRGB format;
+            // FG and the presenter must still treat them as the captured format.
+            if(job->universal_nr&&job->color[0]->presentation_format!=DXGI_FORMAT_UNKNOWN)d.Format=job->color[0]->presentation_format;
+            owner.worker.trace=owner.trace;owner.worker.input_color_state=D3D12_RESOURCE_STATE_GENERIC_READ;
             const auto& color_layout=job->color[0]->layout;
             if(owner.worker.initialize(owner.device.Get(),owner.generation_queue.Get(),color_layout.width?color_layout.width:unsigned(d.Width),color_layout.height?color_layout.height:d.Height,d.Format,cheeky_fg_needs_ngx(job_guides->pair))) {
                 for(unsigned eye=0;eye<2;++eye){owner.worker.color_layouts[eye]=job->color[eye]->layout;owner.worker.previous_layouts[eye]=previous->color[eye]->layout;}
@@ -749,7 +811,7 @@ struct BufferedBackend12 final : FrameBackend {
         return true;
     }
     void retire() override {
-        owner.producer.drain();owner.output.drain();owner.uploads.drain();owner.worker.wait_idle();
+        owner.producer.drain();owner.output.drain();owner.uploads.drain();owner.worker.wait_idle();universal.wait();
         application_timer.reset(owner.producer);
     }
     void discard_captures(bool session) override {

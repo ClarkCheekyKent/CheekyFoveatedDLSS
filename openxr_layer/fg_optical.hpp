@@ -369,7 +369,7 @@ struct Session12 : Error {
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Fence> fence;std::uint64_t serial{};HANDLE event{};
-    ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> prepare_shader,interpolate_shader,cache_shader;
+    ComPtr<ID3D12RootSignature> root;ComPtr<ID3D12PipelineState> prepare_shader,interpolate_shader,cache_shader,nr_shader;
     ComPtr<ID3D12DescriptorHeap> heap;unsigned stride{};
     std::array<ComPtr<ID3D12Resource>,8> textures;std::array<NvOFGPUBufferHandle,6> buffers{};
     unsigned width{},height{},preset{},grid{4};float crop[4]{};bool history{},initialized{};
@@ -395,7 +395,7 @@ struct Session12 : Error {
         // The driver faults when a registered texture outlives nvOFDestroy.
         for(auto& t:textures)t.Reset();
         if(handle){api.nvOFDestroy(handle);handle=nullptr;}
-        device.Reset();queue.Reset();allocator.Reset();list.Reset();fence.Reset();root.Reset();heap.Reset();prepare_shader.Reset();interpolate_shader.Reset();cache_shader.Reset();cache_ready=false;cache_builds=0;
+        device.Reset();queue.Reset();allocator.Reset();list.Reset();fence.Reset();root.Reset();heap.Reset();prepare_shader.Reset();interpolate_shader.Reset();cache_shader.Reset();nr_shader.Reset();cache_ready=false;cache_builds=0;
         if(event)CloseHandle(event);event=nullptr;serial=0;history=false;initialized=false;
     }
     static void barrier(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
@@ -433,16 +433,17 @@ struct Session12 : Error {
         D3D12_ROOT_SIGNATURE_DESC rs{};rs.NumParameters=2;rs.pParameters=rp;rs.NumStaticSamplers=1;rs.pStaticSamplers=&s;
         ComPtr<ID3DBlob> blob,error;if(FAILED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error))||FAILED(dev->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))))return fail("root signature");
         for(unsigned i=0;i<2;++i){ComPtr<ID3DBlob> code;if(!compile(i?"Interpolate":"Prepare","cs_5_1",code))return fail("shader compilation");D3D12_COMPUTE_PIPELINE_STATE_DESC ps{};ps.pRootSignature=root.Get();ps.CS={code->GetBufferPointer(),code->GetBufferSize()};if(FAILED(dev->CreateComputePipelineState(&ps,IID_PPV_ARGS(i?&interpolate_shader:&prepare_shader))))return fail("compute pipeline");}
-        D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=11*5;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=11*6;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if(FAILED(dev->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap))))return fail("descriptor heap");stride=dev->GetDescriptorHandleIncrementSize(hd.Type);initialized=true;return true;
     }
-    // Eleven descriptors per set: nine SRVs and two UAVs. Set four owns cache preparation.
-    void bind(ID3D12GraphicsCommandList* commands,unsigned base,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* output,OpticalConstants c,bool preparing,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ID3D12Resource* depth=nullptr,bool caching=false){
+    // Eleven descriptors per set: nine SRVs and two UAVs. Set four owns cache
+    // preparation and set five the Universal DLSS 5 motion vectors.
+    void bind(ID3D12GraphicsCommandList* commands,unsigned base,ID3D12Resource* old,ID3D12Resource* now,ID3D12Resource* output,OpticalConstants c,bool preparing,DXGI_FORMAT old_format,DXGI_FORMAT now_format,ID3D12Resource* depth=nullptr,bool caching=false,ID3D12PipelineState* pipeline=nullptr){
         auto cpu=heap->GetCPUDescriptorHandleForHeapStart();cpu.ptr+=base*stride;
         ID3D12Resource* resources[]{old,now,textures[2].Get(),textures[3].Get(),textures[4].Get(),textures[5].Get(),depth,(caching||preparing)?nullptr:textures[6].Get(),(caching||preparing)?nullptr:textures[7].Get()};
         for(unsigned i=0;i<9;++i){D3D12_SHADER_RESOURCE_VIEW_DESC v{};v.Format=i==0?old_format:i==1?now_format:i<4?DXGI_FORMAT_R16G16_SINT:i<6?DXGI_FORMAT_R8_UINT:i==6?DXGI_FORMAT_R32_FLOAT:DXGI_FORMAT_R32G32B32A32_FLOAT;v.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;v.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;v.Texture2D.MipLevels=1;device->CreateShaderResourceView(resources[i],&v,cpu);cpu.ptr+=stride;}
         for(unsigned i=0;i<2;++i){auto* r=caching?textures[6+i].Get():preparing?textures[i].Get():i==0?output:nullptr;D3D12_UNORDERED_ACCESS_VIEW_DESC v{};v.Format=r?r->GetDesc().Format:DXGI_FORMAT_R8G8B8A8_UNORM;v.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;device->CreateUnorderedAccessView(r,nullptr,&v,cpu);cpu.ptr+=stride;}
-        auto* h=heap.Get();commands->SetDescriptorHeaps(1,&h);commands->SetComputeRootSignature(root.Get());commands->SetPipelineState(caching?cache_shader.Get():preparing?prepare_shader.Get():interpolate_shader.Get());auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=base*stride;commands->SetComputeRootDescriptorTable(0,gpu);commands->SetComputeRoot32BitConstants(1,sizeof(c)/4,&c,0);
+        auto* h=heap.Get();commands->SetDescriptorHeaps(1,&h);commands->SetComputeRootSignature(root.Get());commands->SetPipelineState(caching?cache_shader.Get():preparing?prepare_shader.Get():pipeline?pipeline:interpolate_shader.Get());auto gpu=heap->GetGPUDescriptorHandleForHeapStart();gpu.ptr+=base*stride;commands->SetComputeRootDescriptorTable(0,gpu);commands->SetComputeRoot32BitConstants(1,sizeof(c)/4,&c,0);
     }
     bool prepare(ID3D12Device* dev,ID3D12CommandQueue* q,ID3D12Resource* old,ID3D12Resource* now,unsigned quality,OpticalConstants c,bool reset_history,
         D3D12_RESOURCE_STATES color_state,DXGI_FORMAT old_format,DXGI_FORMAT now_format,bool defer_completion=false){
@@ -484,6 +485,25 @@ struct Session12 : Error {
         for(unsigned i=6;i<8;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
         for(unsigned i=2;i<6;++i)barrier(commands,textures[i].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         cache_ready=true;++cache_builds;return true;
+    }
+    // Universal DLSS 5: write current-to-previous eye-UV displacement for
+    // DLSS-NR into `output` (R32G32_FLOAT, COMMON before and after), from this
+    // pair's backward field. Queue after consume(). c is the flow's own
+    // constants with pose mapping; inside_only keeps texels outside the flow rect.
+    bool nr_vectors(ID3D12GraphicsCommandList* commands,ID3D12Resource* output,OpticalConstants c,bool inside_only){
+        if(!handle||!output)return false;
+        if(!nr_shader){ComPtr<ID3DBlob> code;if(!compile("NrVectors","cs_5_1",code))return fail("NR vector shader");
+            D3D12_COMPUTE_PIPELINE_STATE_DESC p{};p.pRootSignature=root.Get();p.CS={code->GetBufferPointer(),code->GetBufferSize()};
+            if(FAILED(device->CreateComputePipelineState(&p,IID_PPV_ARGS(&nr_shader))))return fail("NR vector pipeline");}
+        const auto d=output->GetDesc();
+        c.sizes[0]=float(width);c.sizes[1]=float(height);c.sizes[2]=float(d.Width);c.sizes[3]=float(d.Height);c.flags[0]=inside_only?1.f:0.f;
+        barrier(commands,textures[3].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        barrier(commands,output,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        bind(commands,55,nullptr,nullptr,output,c,false,DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM,nullptr,false,nr_shader.Get());
+        commands->Dispatch((unsigned(d.Width)+7)/8,(d.Height+7)/8,1);
+        barrier(commands,output,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON);
+        barrier(commands,textures[3].Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+        return true;
     }
     // GPU-side dependency only. The caller first submits earlier independent
     // work, then consumes this result immediately before recording its reader.
