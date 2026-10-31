@@ -417,7 +417,7 @@ struct BufferedBackend12 final : FrameBackend {
             auto acquire=owner.guide_acquire?owner.guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
             auto release=owner.guide_release?owner.guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
             CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
-            CheekyFgColorOptionsV1 color_options;const bool color_only=optical::color_options(color_options);
+            CheekyFgColorOptionsV1 color_options;const bool color_only=!owner.native_nr_only&&optical::color_options(color_options);
             const bool acquired=!color_only&&inference_slot&&tokens_match&&expected_token&&
                 (external?(guides=*external,true):(acquire&&release&&acquire(&guides)));
             // render_frame is deliberately zero for hook-free mode 3.
@@ -541,17 +541,19 @@ struct BufferedBackend12 final : FrameBackend {
         CheekyNrUniversalOptionsV1 options;
         if(!UniversalNr12::options(options)){universal_was_active=false;return;}
         CheekyNrUniversalStatusV1 status;
-        const bool previous_nr=previous->universal_nr;
+        if(owner.native_nr_only){options.share_optical=0;options.center_from_fg=0;}
+        const bool previous_nr=previous&&previous->universal_nr;
+        const auto& old=previous?previous:job;
         UniversalNr12::Input input;input.device=owner.device.Get();input.queue=owner.generation_queue.Get();input.pool=&owner.output;
         for(unsigned eye=0;eye<2;++eye){
             input.current_raw[eye]=job->color[eye];
-            input.previous_raw[eye]=previous_nr&&previous->raw_color[eye]?previous->raw_color[eye]:previous->color[eye];
-            input.cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.pair.eyes[eye].depth_inverted!=0);
+            input.previous_raw[eye]=previous_nr&&old->raw_color[eye]?old->raw_color[eye]:old->color[eye];
+            input.cameras[eye]=camera(job->views[eye],previous?&previous->views[eye]:nullptr,guides.pair.eyes[eye].depth_inverted!=0);
         }
         input.guides=&guides.pair;
         input.alignment=job->alignment;
-        input.reset=fg_reset||!previous_nr||!universal_was_active||previous->alignment.valid!=job->alignment.valid;
-        input.convert_previous=!previous_nr;
+        input.reset=fg_reset||!previous_nr||!universal_was_active||(previous&&previous->alignment.valid!=job->alignment.valid);
+        input.convert_previous=previous&&!previous_nr&&!owner.native_nr_only;
         // GPU-side only: the capture (and any game guides on another queue)
         // precede optical flow and NR on the generation queue.
         HRESULT ready=owner.generation_queue->Wait(owner.producer.fence.Get(),job->ready);
@@ -563,7 +565,7 @@ struct BufferedBackend12 final : FrameBackend {
         status.fallback=good?0u:1u;status.reset=input.reset?1u:0u;
         if(good){
             if(input.convert_previous)for(unsigned eye=0;eye<2;++eye){previous->raw_color[eye]=previous->color[eye];previous->color[eye]=output.previous_copy[eye];}
-            previous->universal_nr=true;
+            if(previous&&!owner.native_nr_only)previous->universal_nr=true;
             for(unsigned eye=0;eye<2;++eye){
                 job->raw_color[eye]=job->color[eye];job->color[eye]=output.color[eye];pair.current[eye]=output.color[eye];
                 status.evaluated[eye]=output.evaluated[eye]?1u:0u;
@@ -586,6 +588,20 @@ struct BufferedBackend12 final : FrameBackend {
                 sprintf_s(message,"Universal DLSS 5 frame=%llu nr=%u,%u fallback=%u reason=%s",static_cast<unsigned long long>(job->id),
                     unsigned(output.evaluated[0]),unsigned(output.evaluated[1]),unsigned(!good),status.reason?status.reason:"none");owner.trace(message);}
         }
+    }
+    bool process_native(const std::shared_ptr<BufferedNative>& previous,
+        const std::shared_ptr<BufferedNative>& job,BufferedPair& pair) override {
+        FrameGuides12 fallback;
+        fallback.pair.producer_queue=owner.queue.Get();
+        for(unsigned eye=0;eye<2;++eye){auto& g=fallback.pair.eyes[eye];
+            g.width=unsigned(job->color[eye]->texture->GetDesc().Width);g.height=job->color[eye]->texture->GetDesc().Height;
+            g.focus_width=g.focus_height=1;g.peripheral_method=cheeky_fg_previous;}
+        const auto* guides=guides12(*job);if(!guides)guides=&fallback;
+        bool history=previous&&previous->id+1==job->id&&previous->space==job->space;
+        for(unsigned eye=0;eye<2&&history;++eye){const auto a=previous->color[eye]->texture->GetDesc(),b=job->color[eye]->texture->GetDesc();
+            history=a.Width==b.Width&&a.Height==b.Height&&compatible_color(a.Format,b.Format);}
+        universal_nr(history?previous:std::shared_ptr<BufferedNative>{},job,pair,*guides,!history);
+        return job->universal_nr;
     }
     GenerationOutcome generate_one(const std::shared_ptr<BufferedNative>& previous,
         const std::shared_ptr<BufferedNative>& job,BufferedPair& pair,
@@ -825,7 +841,7 @@ struct BufferedBackend12 final : FrameBackend {
     void discard_captures(bool session) override {
         owner.direct_captures.clear();if(session){owner.capture_plans.clear();owner.captured_descs.clear();}
     }
-    void finish_generation() override {owner.worker.wait_idle();owner.output.drain();}
+    void finish_generation() override {owner.worker.wait_idle();universal.wait();owner.output.drain();}
     void reset_generation() override {owner.worker.reset();owner.worker.failed=false;}
     void retire_guides(BufferedNative& frame) override {
         if(!owner.worker.fence||owner.worker.fence->GetCompletedValue()>=owner.worker.serial)frame.clear_guides();

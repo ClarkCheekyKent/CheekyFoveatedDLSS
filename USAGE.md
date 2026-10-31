@@ -100,6 +100,15 @@ Additional notes:
 
 ### Eye tracking (experimental)
 
+Universal DLSS 5 works with Frame Generation disabled. Enable DLSS-NR and
+select **Universal DLSS 5**; it processes each native stereo frame at the
+application's normal cadence. D3D11 sessions use the layer's DX12 bridge.
+Its own optical flow defaults to **Fast, 25%, 4×4**. With Frame Generation on,
+**Share optical flow with Frame Generation** can reuse FG's flow instead.
+**Motion vectors > None (zero vectors)** skips motion estimation and supplies a
+constant zero-motion field to DLSS-NR. Existing saved optical-flow overrides
+remain unchanged.
+
 Universal DLSS 5 uses the OpenXR submission's per-eye projection for automatic
 stereo alignment. With **Automatic stereo alignment** enabled, its fixed region
 and an SR-matched FG region align without intercepted game DLSS calls or marker

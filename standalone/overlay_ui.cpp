@@ -307,11 +307,15 @@ void draw_nr_universal(Settings& s, bool quad, bool game_dlss) {
     auto& u = s.nr_universal;
     ImGui::SeparatorText("Universal DLSS 5 inputs");
     if (quad) ImGui::TextWrapped("Universal DLSS 5 runs on stereo OpenXR submissions; quad-view sessions keep the game's NR route.");
-    if (!s.fg.enabled) warning("Universal DLSS 5 runs in the Frame Generation presenter. Enable Frame Generation.");
+    ImGui::TextWrapped("Works with Frame Generation off. When enabled, Frame Generation uses the processed native images.");
     ImGui::TextWrapped("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it. D3D11 games use the layer's DX12 bridge.");
-    game_combo("Motion vectors", u.motion, {{"Optical flow", false}, {"Game DLSS vectors", true}}, game_dlss);
+    game_combo("Motion vectors", u.motion, {{"Optical flow", false}, {"Game DLSS vectors", true}, {"None (zero vectors)", false}}, game_dlss);
     game_combo("Depth", u.depth, {{"Automatic", false}, {"Game DLSS depth", true}, {"None (flat)", false}}, game_dlss);
     if (u.depth == 0) ImGui::TextDisabled(game_dlss ? "Automatic uses the game's DLSS depth." : "Automatic uses flat depth without game DLSS.");
+    if (u.motion == 2) {
+        ImGui::TextWrapped("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.");
+        return;
+    }
     ImGui::Checkbox("Share optical flow with Frame Generation", &u.share_optical);
     test_control("NrOpticalShare");
     if (u.motion == 1 && game_dlss) {
@@ -326,7 +330,8 @@ void draw_nr_universal(Settings& s, bool quad, bool game_dlss) {
         ImGui::TextWrapped("The flow area covers both the NR region and the FG center.");
         return;
     }
-    if (u.share_optical) ImGui::TextWrapped("FG's center does not use optical flow, so DLSS-NR runs its own.");
+    if (!s.fg.enabled) ImGui::TextWrapped("Frame Generation is off; DLSS-NR uses its own optical flow.");
+    else if (u.share_optical) ImGui::TextWrapped("FG's center does not use optical flow, so DLSS-NR runs its own.");
     combo("NR optical flow preset", u.optical_preset, "Slow (quality)\0Medium\0Fast (performance)\0");
     int percent = static_cast<int>(u.optical_percent / 25) - 1;
     ImGui::PushID("NR optical flow resolution");
@@ -982,7 +987,7 @@ void draw_nr_performance(std::string_view snapshot, const Settings& s) {
                 ImGui::TextWrapped("Universal DLSS 5 eyes: left %s, right %s", flag(u, "evaluated_left") ? "on" : "off",
                     flag(u, "evaluated_right") ? "on" : "off");
                 if (flag(u, "projection_alignment")) ImGui::TextUnformatted("Stereo alignment: OpenXR projection");
-                ImGui::TextWrapped("Motion: %s%s. Depth: %s.", flag(u, "game_motion") ? "game DLSS vectors" : "optical flow",
+                ImGui::TextWrapped("Motion: %s%s. Depth: %s.", flag(u, "no_motion") ? "none (zero vectors)" : flag(u, "game_motion") ? "game DLSS vectors" : "optical flow",
                     flag(u, "shared_flow") ? " (shared with FG)" : "", flag(u, "game_depth") ? "game DLSS" : "flat");
             }
             if (!plain(member(u, "reason")).empty()) diagnostic_line(u, "Universal skipped", "reason");

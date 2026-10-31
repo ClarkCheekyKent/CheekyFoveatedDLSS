@@ -980,6 +980,15 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["NR optical flow preset"] == state["settings"]["NrOpticalPreset"]
+    saved_motion = state["settings"]["NrUniversalMotion"]
+    state["settings"].update(FgEnabled=False, NrUniversalMotion=2)
+    receive(state)
+    draw()
+    assert g.combos["Motion vectors"][2] == "None (zero vectors)"
+    assert g["values"]["NR optical flow preset"] is None
+    assert g["values"]["Share optical flow with Frame Generation"] is None
+    assert not any("Enable Frame Generation" in t for t in g.drawn.values())
+    state["settings"]["NrUniversalMotion"] = saved_motion
     state["settings"].update(NrProcessingOrder=1, **saved_fg)
     receive(state)
     draw()

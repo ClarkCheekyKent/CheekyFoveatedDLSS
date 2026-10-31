@@ -63,6 +63,9 @@ struct FrameBackend {
         const std::shared_ptr<BufferedNative>& current,BufferedPair& result,
         bool& reset_history,std::uint64_t& logged_samples,
         std::shared_ptr<BufferedDirectRequest>& direct)=0;
+    // Native-cadence NR: no generated phases, FG features or presenter worker.
+    virtual bool process_native(const std::shared_ptr<BufferedNative>&,
+        const std::shared_ptr<BufferedNative>&,BufferedPair&) {return false;}
     virtual bool publish(const BufferedPair& pair,const std::array<Image,2>& images,
         std::array<XrCompositionLayerProjectionView,2>& views,FrameLayers& layers,bool generated)=0;
     virtual void retire()=0;

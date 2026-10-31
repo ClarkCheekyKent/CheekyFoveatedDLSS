@@ -416,6 +416,7 @@ std::string snapshot_locked(State& s) {
         << ",\"evaluated_left\":" << (nr.universal.evaluated[0] ? "true" : "false")
         << ",\"evaluated_right\":" << (nr.universal.evaluated[1] ? "true" : "false")
         << ",\"game_motion\":" << (nr.universal.game_motion ? "true" : "false")
+        << ",\"no_motion\":" << (nr.universal.no_motion ? "true" : "false")
         << ",\"game_depth\":" << (nr.universal.game_depth ? "true" : "false")
         << ",\"shared_flow\":" << (nr.universal.shared_flow ? "true" : "false")
         << ",\"projection_alignment\":" << (nr.universal.projection_alignment ? "true" : "false")

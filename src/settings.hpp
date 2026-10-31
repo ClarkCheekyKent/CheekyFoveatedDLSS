@@ -58,12 +58,12 @@ inline const char* nr_processing_order_name(NrProcessingOrder order) noexcept {
 
 // Inputs of Universal DLSS 5. Preset, style and the rest are shared NR settings.
 struct NrUniversalSettings {
-    std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (falls back to optical flow).
+    std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (falls back to optical flow), 2 none (zero vectors).
     std::uint32_t depth{}; // 0 automatic, 1 game DLSS depth, 2 none (flat depth).
     bool share_optical{true}; // Reuse FG's center optical flow when FG computes one.
     // NR's own flow, used when nothing is shared: 0 slow, 1 medium, 2 fast;
     // 25/50/75/100 percent input; one vector per 1, 2 or 4 pixels.
-    std::uint32_t optical_preset{1}, optical_percent{50}, optical_grid{2};
+    std::uint32_t optical_preset{2}, optical_percent{25}, optical_grid{4};
     bool operator==(const NrUniversalSettings&) const = default;
 };
 

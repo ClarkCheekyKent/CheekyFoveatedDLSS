@@ -3862,9 +3862,9 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrReleaseSwapchainImage(
 
 // Caller holds state_mutex; returned resources retire outside that lock.
 std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
-    SessionState& owner, const Dispatch& d, bool requested,bool native_shader11=false) {
-    const bool supported=owner.running && (owner.graphics_api==12 || owner.graphics_api==11) &&
-        (owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || owner.quad_capture);
+    SessionState& owner, const Dispatch& d, bool requested,bool native_shader11=false,bool native_nr_only=false) {
+    const bool supported=owner.running && (!native_nr_only||!owner.quad_capture) && (owner.graphics_api==12 || owner.graphics_api==11) &&
+        (owner.view_configuration==XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || (!native_nr_only&&owner.quad_capture));
     if(owner.quad_capture&&owner.quad_capture->d3d11&&owner.quad_capture->d3d11->fg_guides)
         owner.quad_capture->d3d11->fg_guides->enable(requested&&supported&&bool(owner.fg));
     if (!requested || !supported) {
@@ -3907,6 +3907,7 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
             return {};
         }
         auto candidate=std::make_shared<cheeky::fg::BufferedPresenter>();
+        candidate->native_nr_only=native_nr_only;
         // D3D12 quad presents the composed eyes as stereo; only the D3D11
         // bridge sends raw quad planes.
         candidate->quad_input=bool(owner.quad_capture)&&owner.graphics_api==11;
@@ -3927,7 +3928,7 @@ std::shared_ptr<cheeky::fg::Presenter> update_fg_at_frame_boundary(
             candidate->set_native_frame_pending(owner.native_waits_pending!=0||owner.native_frame_begun);
             owner.fg=std::move(candidate);
             owner.fg_state=CheekyFgState::waiting_for_history;
-            log_startup("DLSS-FG presenter initialized session=%p\n",owner.session);
+            log_startup("%s presenter initialized session=%p\n",native_nr_only?"Universal DLSS 5 native":"DLSS-FG",owner.session);
         } else {
             owner.fg_requested=false;
             owner.fg_state=CheekyFgState::presenter_failed;
@@ -3961,6 +3962,8 @@ XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const in
     const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
     const auto get_control=runtime?reinterpret_cast<CheekyFgControlFn>(GetProcAddress(runtime,"CheekyFG_GetControl")):nullptr;
     const bool requested=get_control && get_control(&control) && control.enabled;
+    CheekyNrUniversalOptionsV1 nr_options;
+    const bool nr_requested=cheeky::fg::UniversalNr12::options(nr_options);
     CheekyFgShaderOptionsV1 shader_options;
     const auto get_shader_options=runtime?reinterpret_cast<CheekyFgShaderOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetShaderOptionsV1")):nullptr;
     const bool native_shader11=get_shader_options&&get_shader_options(&shader_options)&&shader_options.enabled&&
@@ -3978,14 +3981,18 @@ XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const in
     // Also gate on V2, in case V1 and V2 were read during a transition.
     const bool mode_allows_fg=!mode_epoch_valid ||
         (uevr_mode_v2.known && uevr_mode_v2.mode==0);
-    const bool fg_requested_now=requested && mode_allows_fg;
+    const bool use_native_nr=nr_requested&&!requested;
+    const bool fg_requested_now=(requested && mode_allows_fg)||use_native_nr;
     std::shared_ptr<cheeky::fg::BufferedPresenter> finishing_quad;
     {
         std::lock_guard lock(state_mutex);const auto found=sessions.find(session);
-        if(found!=sessions.end()&&found->second.quad_capture&&found->second.fg){
+        if(found!=sessions.end()&&found->second.fg){
             const auto& active=found->second.fg;std::lock_guard fg_lock(active->mx);
-            if(!fg_requested_now||cheeky::fg::replace_presenter_for_configuration(requested,active->configuration,control.configuration))
-                finishing_quad=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(active);
+            const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(active);
+            if((found->second.quad_capture||(buffered&&buffered->native_nr_only))&&
+                (!fg_requested_now||(buffered&&buffered->native_nr_only!=use_native_nr)||
+                    cheeky::fg::replace_presenter_for_configuration(fg_requested_now,active->configuration,control.configuration)))
+                finishing_quad=buffered;
         }
     }
     // Keep the old owner visible to the render thread until its pipelined
@@ -4049,8 +4056,9 @@ XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const in
                     std::lock_guard fg_lock(owner.fg->mx);
                     active_configuration=owner.fg->configuration;
                 }
-                if (cheeky::fg::replace_presenter_for_configuration(
-                        requested,active_configuration,control.configuration)) {
+                const auto active_buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(owner.fg);
+                if ((active_buffered&&active_buffered->native_nr_only!=use_native_nr)||cheeky::fg::replace_presenter_for_configuration(
+                        fg_requested_now,active_configuration,control.configuration)) {
                     log_startup("DLSS-FG source configuration changed 0x%llx -> 0x%llx: replacing presenter at xrWaitFrame (keeping FG enabled)\n",
                         static_cast<unsigned long long>(active_configuration),
                         static_cast<unsigned long long>(control.configuration));
@@ -4061,7 +4069,7 @@ XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const in
                 }
             }
             if (state) {
-                auto disabled=update_fg_at_frame_boundary(owner,instance->dispatch,fg_requested_now,native_shader11);
+                auto disabled=update_fg_at_frame_boundary(owner,instance->dispatch,fg_requested_now,native_shader11&&!use_native_nr,use_native_nr);
                 if(disabled && !retired)retired=std::move(disabled);
                 if((paused_for_uevr_mode || (mode_epoch_valid && !mode_allows_fg)) && !fg_requested_now)
                     owner.fg_state=CheekyFgState::paused_rendering_mode;
@@ -4096,7 +4104,10 @@ XrResult wait_frame_once(const XrSession session,const XrFrameWaitInfo* const in
         else retired->invalidate_temporal();
     }
     retired.reset();
-    if (presenter) {presenter->configure(control.configuration);const auto r=presenter->wait_frame(info,state);
+    if (presenter) {
+        if(const auto native=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(presenter);native&&native->native_nr_only)
+            native->native_nr_time_floor=std::max(native->native_nr_time_floor,native_time_floor);
+        presenter->configure(control.configuration);const auto r=presenter->wait_frame(info,state);
         if(trace_transition())log_startup("FG-TRANSITION xrWaitFrame presenter thread=%lu result=%d\n",GetCurrentThreadId(),int(r));
         // Another thread retired or reset this presenter while the application
         // waited in it. That is not a session failure: wait again against the

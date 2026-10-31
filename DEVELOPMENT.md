@@ -30,6 +30,12 @@ independent-input test runs in its own process to exercise the restart latch.
 
 ## Build
 
+`CheekyOpenXRBindingTests --nr-native` checks native-cadence Universal NR frame
+ownership with a backend fixture: one application Wait/Begin/End sequence,
+preserved display time and auxiliary layers, no interpolation/pacing workers,
+and original-frame fallback on processing failure. `CheekyUEVRTests --fg-controls`
+checks NR remains requested with FG off and that the no-motion option persists.
+
 `CheekyOpenXRBindingTests --openxr-stereo-alignment` checks direct OpenXR
 placement for Universal DLSS 5 and settings-derived, SR-matched FG regions.
 It covers asymmetric submitted FOVs, canted eye rotations, display-time matching,

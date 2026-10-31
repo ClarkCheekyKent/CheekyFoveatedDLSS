@@ -91,6 +91,14 @@ void wait_gpu(ID3D12Device* device, ID3D12CommandQueue* queue) {
 }
 void settings_tests(const std::filesystem::path& root) {
     {
+        Settings nr;
+        require(nr.nr_universal.optical_preset==2&&nr.nr_universal.optical_percent==25&&nr.nr_universal.optical_grid==4,
+            "Universal NR owns Fast/25%/4x4 defaults independently of FG");
+        require(set_named_setting(nr,"NrUniversalMotion","2")&&nr.nr_universal.motion==2,
+            "Universal NR accepts no-motion input");
+        require(!set_named_setting(nr,"NrUniversalMotion","3"),"Universal NR rejects unknown motion input");
+    }
+    {
         Settings fg;
         require(fg.fg.dlssg_preset==3,"DLSS-G preset defaults to C");
         for(const auto preset:{"1","2","3"})require(set_named_setting(fg,"FgDlssgPreset",preset),"DLSS-G preset accepts A/B/C");
@@ -689,6 +697,15 @@ int main(int argc, char** argv) {
             report_nr(&nr_status);
             require(snapshot(get).find("\"projection_alignment\":false")!=std::string::npos,
                 "A later status without direct alignment cannot retain stale placement proof");
+            command("1\n943\nset\nFgEnabled=false\nNrUniversalMotion=2");
+            nr_options={};
+            require(control_fn(&control)&&!control.enabled&&nr_fn(&nr_options)&&nr_options.enabled&&nr_options.motion==2,
+                "Universal NR remains enabled with zero vectors while FG stays disabled");
+            command("1\n944\nsave");
+            Settings native_nr_saved;std::string native_nr_error;
+            require(read_settings_file(root/"CheekyFoveatedDLSS.ini",native_nr_saved,native_nr_error)&&
+                native_nr_saved.nr_universal.motion==2&&!native_nr_saved.fg.enabled,
+                "Native NR and no-motion preference persist independently of FG");
             std::puts("PASS FG protocol, control ABI, host detach/re-enable, group reset and direct OpenXR alignment options");
             return 0;
         }

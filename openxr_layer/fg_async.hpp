@@ -18,6 +18,11 @@ namespace cheeky::fg {
 // Three native leases and two ready pairs bound latency and texture ownership.
 struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unique_ptr<FrameBackend> backend;
+    bool native_nr_only{}; // Latched when the layer creates this frame owner.
+    bool native_nr_ending{}; // Protected by mx; native EndFrame owns private chains until return.
+    XrTime native_nr_time_floor{}; // Catch up once when leaving FG's advanced application clock.
+    std::shared_ptr<BufferedNative> native_nr_previous,native_nr_inflight;
+    XrResult end_native_nr_frame(const XrFrameEndInfo*,const XrCompositionLayerProjection*) noexcept;
     BufferedPresenter();
     inline static thread_local const CheekyFgPair* quad_pair_for_call{};
     std::function<XrResult()> quad_native_fallback;
@@ -307,7 +312,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     void finish_application_frame() noexcept {
         // A following xrWaitFrame may overlap the preceding xrEndFrame.
         // Preserve its presenter until every accepted application frame ends.
-        std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||waited==ended;});
+        std::unique_lock lock(mx);changed.wait(lock,[&]{return stopping||(native_nr_only?!native_nr_ending:waited==ended);});
     }
     void runtime_failure(const char* stage,XrResult result) noexcept {
         std::lock_guard lock(mx);
@@ -497,17 +502,19 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         for(auto& job:pending)job->clear_guides();pending.clear();
     }
     void stop() noexcept {
-        {std::lock_guard lock(mx);stopping=true;stop_in_progress=true;changed.notify_all();}
+        {std::unique_lock lock(mx);stopping=true;stop_in_progress=true;changed.notify_all();
+            if(native_nr_only)changed.wait(lock,[&]{return !native_nr_ending;});}
         if(presentation_thread.joinable())presentation_thread.join();
         if(generation_thread.joinable())generation_thread.join();
         if(release_thread.joinable())release_thread.join();
         std::lock_guard capture_lock(capture_mutex);
         backend->retire();
+        native_nr_previous.reset();native_nr_inflight.reset();
         std::lock_guard lock(mx);discard_pending();ready.clear();latest_native.reset();last_fg_borders={};slots={};
         captured.clear();backend->discard_captures(true);capture_tokens.clear();capture_frames.clear();capture_times.clear();capture_ready.clear();color_stamp_frame=color_stamp_token=0;capture_overflow=false;capture_cpu_accumulator=0;started=false;credits=0;fg_active=pacing_active=false;
         if(raw)raw_result=XR_FAILED(terminal)?terminal:XR_ERROR_SESSION_NOT_RUNNING;
         raw=nullptr;raw_done=true;passthrough_events=history_reset_events=0;
-        waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
+        waited=begun=ended=0;ticks=transition_until=0;degraded=false;app_display_time=0;native_nr_time_floor=0;predicted={XR_TYPE_FRAME_STATE};++epoch;
         app_image_wait={};present_image_wait={};runtime_begin={};runtime_end={};present_cpu={};app_calls={};cadence_window={};
         clock_late={};credit_deferral={};begin_gate_wait={};presenter_content_wait={};
         native_xr_end={};generated_xr_end={};credit_deferred_since={};release_delay_until={};last_generated_submit_tick=0;
@@ -560,6 +567,24 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         return true;
     }
     XrResult wait_frame(const XrFrameWaitInfo* info,XrFrameState* frame) noexcept override {
+        if(native_nr_only){
+            // Runtime waits can block until another thread ends a frame; do
+            // not hold the D3D11 submission gate across that wait.
+            auto result=xr.wait_frame(session,info,frame);
+            for(unsigned skipped=0;XR_SUCCEEDED(result)&&frame&&native_nr_time_floor&&
+                    frame->predictedDisplayTime<=native_nr_time_floor;++skipped){
+                XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};result=runtime_dispatch([&]{return xr.begin_frame(session,&begin);});
+                if(XR_FAILED(result))break;
+                XrFrameEndInfo empty{XR_TYPE_FRAME_END_INFO};empty.displayTime=frame->predictedDisplayTime;
+                empty.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;result=backend->end_frame(&empty);
+                if(XR_FAILED(result))break;
+                result=xr.wait_frame(session,info,frame);
+                if(trace&&skipped==0)trace("Universal DLSS 5 native clock catching up after disabling frame generation");
+            }
+            if(XR_SUCCEEDED(result)&&frame){std::lock_guard lock(mx);predicted=*frame;app_display_time=frame->predictedDisplayTime;
+                native_nr_time_floor=0;++waited;}
+            return result;
+        }
         if(bypass)return xr.wait_frame(session,info,frame);
         if(!frame||(info&&info->next))return XR_ERROR_VALIDATION_FAILURE;
         const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
@@ -677,6 +702,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         app_display_time=frame->predictedDisplayTime;return XR_SUCCESS;
     }
     XrResult begin_frame(const XrFrameBeginInfo* info) noexcept override {
+        if(native_nr_only){
+            const auto result=runtime_dispatch([&]{return xr.begin_frame(session,info);});
+            if(XR_SUCCEEDED(result)){std::lock_guard lock(mx);if(result==XR_FRAME_DISCARDED)ended=begun;++begun;}
+            return result;
+        }
         if(bypass)return xr.begin_frame(session,info);
         if(info&&info->next)return XR_ERROR_VALIDATION_FAILURE;
         std::unique_lock capture_lock(capture_mutex);
@@ -747,6 +777,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     }
     XrResult end_frame(const XrFrameEndInfo* end,const std::array<unsigned,2>&,
                        const XrCompositionLayerProjection* projection) noexcept override {
+        if(native_nr_only)return end_native_nr_frame(end,projection);
         const auto* external=quad_pair_for_call;
         if(bypass)return xr.end_frame(session,end);
         if(!end)return XR_ERROR_VALIDATION_FAILURE;
@@ -1579,3 +1610,4 @@ std::unique_ptr<FrameBackend> make_frame_backend11(BufferedPresenter&);
 #include "fg_backend12_buffered.inl"
 #include "fg_backend11_buffered.inl"
 #include "fg_buffered_backend.inl"
+#include "nr_native_present.inl"

@@ -89,6 +89,8 @@ foreach ($gazeMode in @('--manual-gaze', '--openxr-independent-on', '--openxr-in
 if ($LASTEXITCODE -ne 0) { throw "OpenXR binding and pointer regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --openxr-stereo-alignment
 if ($LASTEXITCODE -ne 0) { throw "Direct OpenXR stereo alignment regressions failed." }
+& (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --nr-native
+if ($LASTEXITCODE -ne 0) { throw "Native-cadence OpenXR NR regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-gpu-validation
 if ($LASTEXITCODE -ne 0) { throw "FG OpenXR image state and software GPU copy regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-shader11

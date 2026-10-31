@@ -47,7 +47,7 @@ bool set_named_setting(Settings& s, std::string_view key, std::string_view value
     if(key=="FgOpticalCenterPreset"||key=="FgOpticalPeripheralPreset") {unsigned n{};if(!parse(value,n)||n>2)return false;(key=="FgOpticalCenterPreset"?s.fg.optical.center_preset:s.fg.optical.peripheral_preset)=n;return true;}
     if(key=="FgOpticalCenterPercent"||key=="FgOpticalPeripheralPercent") {unsigned n{};if(!parse(value,n)||(n!=25&&n!=50&&n!=75&&n!=100))return false;(key=="FgOpticalCenterPercent"?s.fg.optical.center_percent:s.fg.optical.peripheral_percent)=n;return true;}
     if(key=="FgOpticalCenterGrid"||key=="FgOpticalPeripheralGrid") {unsigned n{};if(!parse(value,n)||(n!=1&&n!=2&&n!=4))return false;(key=="FgOpticalCenterGrid"?s.fg.optical.center_grid:s.fg.optical.peripheral_grid)=n;return true;}
-    if(key=="NrUniversalMotion"){unsigned n{};if(!parse(value,n)||n>1)return false;s.nr_universal.motion=n;return true;}
+    if(key=="NrUniversalMotion"){unsigned n{};if(!parse(value,n)||n>2)return false;s.nr_universal.motion=n;return true;}
     if(key=="NrUniversalDepth"){unsigned n{};if(!parse(value,n)||n>2)return false;s.nr_universal.depth=n;return true;}
     if(key=="NrOpticalPreset"){unsigned n{};if(!parse(value,n)||n>2)return false;s.nr_universal.optical_preset=n;return true;}
     if(key=="NrOpticalPercent"){unsigned n{};if(!parse(value,n)||(n!=25&&n!=50&&n!=75&&n!=100))return false;s.nr_universal.optical_percent=n;return true;}

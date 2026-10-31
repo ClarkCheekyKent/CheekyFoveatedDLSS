@@ -1705,12 +1705,11 @@ DlssNrSnapshot dlss_nr_snapshot() noexcept {
     auto& u = snapshot.universal;
     u = universal_status;
     u.requested = universal_nr_requested();
+    u.no_motion = configured_settings().nr_universal.motion == 2U;
     u.layer_reporting = u.requested && universal_reported_ms && GetTickCount64() - universal_reported_ms < 1000U;
     if (!u.layer_reporting) {
         u.evaluated[0] = u.evaluated[1] = false;
-        u.reason = !u.requested ? nullptr : !configured_settings().fg.enabled
-            ? "Universal DLSS 5 runs in the OpenXR Frame Generation pipeline; enable Frame Generation"
-            : "Waiting for the OpenXR layer (update it and re-run OpenXR setup if this persists)";
+        u.reason = !u.requested ? nullptr : "Waiting for the OpenXR layer (update it and re-run OpenXR setup if this persists)";
     }
     if (u.requested) {
         snapshot.processing_order = NrProcessingOrder::universal;

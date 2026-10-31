@@ -1062,14 +1062,18 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 end
                 if universal_nr() and universal_supported then
                     section("Universal DLSS 5 inputs")
-                    if not draft.FgEnabled then text("Universal DLSS 5 runs in the Frame Generation presenter. Enable Frame Generation.") end
+                    text("Works with Frame Generation off. When enabled, Frame Generation uses the processed native images.")
                     text("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it.")
                     local game = game_dlss()
-                    combo("Motion vectors", "NrUniversalMotion", {[0]="Optical flow",[1]="Game DLSS vectors"})
+                    combo("Motion vectors", "NrUniversalMotion", {[0]="Optical flow",[1]="Game DLSS vectors",[2]="None (zero vectors)"})
                     combo("Depth", "NrUniversalDepth", {[0]="Automatic",[1]="Game DLSS depth",[2]="None (flat)"})
                     if not game and (draft.NrUniversalMotion == 1 or draft.NrUniversalDepth == 1) then
-                        text("No game DLSS detected: optical flow and flat depth are used instead.")
+                        text(draft.NrUniversalMotion == 2 and "No game DLSS detected: flat depth is used instead." or
+                            "No game DLSS detected: optical flow and flat depth are used instead.")
                     end
+                    if draft.NrUniversalMotion == 2 then
+                        text("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.")
+                    else
                     check("Share optical flow with Frame Generation", "NrOpticalShare")
                     if draft.NrOpticalShare and draft.FgEnabled and fg_optical(draft.FgCenterMethod) then
                         local presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
@@ -1079,10 +1083,12 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                             grids[draft.FgOpticalCenterGrid or 2] or "2x2 blocks"))
                         text("The flow area covers both the NR region and the FG center.")
                     else
-                        if draft.NrOpticalShare then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
+                        if not draft.FgEnabled then text("Frame Generation is off; DLSS-NR uses its own optical flow.")
+                        elseif draft.NrOpticalShare then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
                         combo("NR optical flow preset", "NrOpticalPreset", {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"})
                         combo("NR optical flow resolution", "NrOpticalPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                         combo("NR optical flow vector grid", "NrOpticalGrid", {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"})
+                    end
                     end
                     local u = (status.nr_details or {}).universal or {}
                     if u.layer_reporting and u.projection_alignment then text("Stereo alignment: OpenXR projection") end
@@ -1091,7 +1097,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         else
                             text(string.format("Eyes: left %s, right %s. Motion: %s%s. Depth: %s.",
                                 u.evaluated_left and "on" or "off", u.evaluated_right and "on" or "off",
-                                u.game_motion and "game DLSS vectors" or "optical flow", u.shared_flow and " (shared with FG)" or "",
+                                u.no_motion and "none (zero vectors)" or u.game_motion and "game DLSS vectors" or "optical flow", u.shared_flow and " (shared with FG)" or "",
                                 u.game_depth and "game DLSS" or "flat"))
                         end
                         if u.reason and u.reason ~= "" then text("Universal skipped: " .. tostring(u.reason)) end

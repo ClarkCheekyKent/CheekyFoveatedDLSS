@@ -1,7 +1,7 @@
 #pragma once
-// Universal DLSS 5: DLSS-NR on each submitted eye image, inside the buffered
-// D3D12 frame-generation pipeline. Per native stereo pair, on the generation
-// queue and before frame generation:
+// Universal DLSS 5: DLSS-NR on each submitted eye image, at native cadence or
+// inside the buffered D3D12 frame-generation pipeline. Per native stereo pair,
+// on the processing queue and before optional frame generation:
 //   captured eyes -> optical flow -> motion vectors -> DLSS-NR -> FG -> submit.
 // The NR outputs replace the pair's native color, so they are presented and
 // become the next interval's FG history. The captured eyes are kept for the
@@ -20,6 +20,7 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 namespace cheeky::fg {
 
 struct UniversalNr12 {
@@ -50,6 +51,10 @@ struct UniversalNr12 {
 
     optical::Session12 flow[2],periphery[2];
     ComPtr<ID3D12Resource> vectors[2];
+    ComPtr<ID3D12Resource> zero_motion,zero_motion_upload;
+    bool zero_motion_initialized{};
+    unsigned last_motion_mode{~0u};
+    std::array<Image,4> retained_raw; // Keep both flow inputs alive through this stage's fence.
     ComPtr<ID3D12Device> device;ComPtr<ID3D12CommandQueue> queue;
     // Lists, in submission order: image copies (run while the optical flow
     // engine estimates), then each eye's vectors and DLSS-NR, each after only
@@ -107,6 +112,7 @@ struct UniversalNr12 {
         if(device.Get()!=dev||queue.Get()!=q){
             wait();for(auto& a:allocators)a.Reset();for(auto& l:lists)l.Reset();list=nullptr;fence.Reset();serial=0;device=dev;queue=q;
             for(auto& v:vectors)v.Reset();
+            zero_motion.Reset();zero_motion_upload.Reset();zero_motion_initialized=false;last_motion_mode=~0u;retained_raw={};
         }
         if(!event&&!(event=CreateEventW(nullptr,FALSE,FALSE,nullptr)))return false;
         if(!fence&&FAILED(dev->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))))return false;
@@ -127,6 +133,29 @@ struct UniversalNr12 {
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=w;d.Height=h;d.DepthOrArraySize=d.MipLevels=1;
         d.Format=DXGI_FORMAT_R32G32_FLOAT;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         return SUCCEEDED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&vectors[eye])));
+    }
+    bool prepare_zero_motion() noexcept {
+        if(zero_motion_initialized)return true;
+        if(!zero_motion){
+            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=d.Height=d.DepthOrArraySize=d.MipLevels=d.SampleDesc.Count=1;
+            d.Format=DXGI_FORMAT_R32G32_FLOAT;
+            if(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&zero_motion))))return false;
+        }
+        if(!zero_motion_upload){
+            D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;d.Width=D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            d.Height=d.DepthOrArraySize=d.MipLevels=d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if(FAILED(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&zero_motion_upload))))return false;
+            void* data{};if(FAILED(zero_motion_upload->Map(0,nullptr,&data))){zero_motion_upload.Reset();return false;}
+            std::memset(data,0,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);zero_motion_upload->Unmap(0,nullptr);
+        }
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=zero_motion_upload.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        from.PlacedFootprint.Footprint={DXGI_FORMAT_R32G32_FLOAT,1,1,1,D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+        to.pResource=zero_motion.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        transition(list,zero_motion.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_GENERIC_READ);
+        return true;
     }
     static void transition(ID3D12GraphicsCommandList* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b) noexcept {
         optical::Session12::barrier(l,r,a,b);
@@ -184,6 +213,9 @@ struct UniversalNr12 {
         const auto format=nr_format(in.device,captured.Format);
         if(format==DXGI_FORMAT_UNKNOWN){out.reason="Universal DLSS 5 cannot write this headset image format";return false;}
         if(!commands(in.device,in.queue)){out.reason="Universal DLSS 5 command allocation failed";return false;}
+        retained_raw={in.previous_raw[0],in.previous_raw[1],in.current_raw[0],in.current_raw[1]};
+        const bool reset=in.reset||last_motion_mode!=opts.motion;
+        if(opts.motion==2&&!prepare_zero_motion()){out.reason="Universal DLSS 5 zero-vector allocation failed";close_all();return false;}
         struct EyeWork {unsigned w{},h{};OpticalConstants c{};bool flow{};ID3D12Resource* motion{};ID3D12Resource* depth{};
             unsigned motion_rect[4]{},depth_rect[4]{};float motion_scale[2]{1,1};bool game_motion{},game_depth{},depth_inverted{};
             bool has_center{};float center[2]{.5f,.5f};};
@@ -213,6 +245,7 @@ struct UniversalNr12 {
                 if(dw&&dh){e.game_depth=true;e.depth=g.depth;e.depth_rect[0]=g.depth_base_x;e.depth_rect[1]=g.depth_base_y;
                     e.depth_rect[2]=dw;e.depth_rect[3]=dh;e.depth_inverted=g.depth_inverted!=0;}
             }
+            if(opts.motion==2){e.motion=zero_motion.Get();e.motion_rect[2]=e.motion_rect[3]=1;continue;}
             if(e.game_motion)continue;
             // Flow window: the NR region (with the usual halo), widened to FG's
             // center when FG shares this flow.
@@ -232,7 +265,7 @@ struct UniversalNr12 {
             // only right before this eye's vectors, so both eyes' flows run
             // back-to-back on the optical flow engine.
             if(!flow[eye].prepare(in.device,in.queue,in.previous_raw[eye]->texture.Get(),raw->texture.Get(),
-                share?g.optical.center_preset:opts.optical_preset,e.c,in.reset||g.reset!=0,D3D12_RESOURCE_STATE_GENERIC_READ,old_format,now_format,true)){
+                share?g.optical.center_preset:opts.optical_preset,e.c,reset||g.reset!=0,D3D12_RESOURCE_STATE_GENERIC_READ,old_format,now_format,true)){
                 out.reason="Universal DLSS 5 optical flow failed";continue;
             }
             e.flow=true;out.shared[eye]=share;out.flow_constants[eye]=e.c;
@@ -241,7 +274,7 @@ struct UniversalNr12 {
         }
         // FG's periphery flows queue behind both NR flows on the flow engine
         // and finish while DLSS-NR runs. FG consumes them before its reader.
-        for(unsigned eye=0;eye<2&&opts.share_optical;++eye){
+        for(unsigned eye=0;eye<2&&opts.share_optical&&opts.motion!=2;++eye){
             const auto& g=in.guides->eyes[eye];
             if(!cheeky_fg_optical(g.peripheral_method)||(g.focus_width>=.999f&&g.focus_height>=.999f))continue;
             const float full[]{0,0,1,1};
@@ -250,7 +283,7 @@ struct UniversalNr12 {
             if(in.cameras[eye].valid)optical::pose_mapping(c,in.cameras[eye].previous_pose,in.cameras[eye].previous_fov,
                 in.cameras[eye].pose,in.cameras[eye].view_fov,.5f);
             const auto& old_image=in.previous_raw[eye]->texture;const auto& now_image=in.current_raw[eye]->texture;
-            if(!periphery[eye].prepare(in.device,in.queue,old_image.Get(),now_image.Get(),g.optical.peripheral_preset,c,in.reset||g.reset!=0,
+            if(!periphery[eye].prepare(in.device,in.queue,old_image.Get(),now_image.Get(),g.optical.peripheral_preset,c,reset||g.reset!=0,
                 D3D12_RESOURCE_STATE_GENERIC_READ,old_image->GetDesc().Format,now_image->GetDesc().Format,true))continue;
             out.periphery_shared[eye]=true;out.periphery_constants[eye]=c;
             out.periphery_constants[eye].sizes[0]=float(periphery[eye].width);out.periphery_constants[eye].sizes[1]=float(periphery[eye].height);
@@ -272,6 +305,8 @@ struct UniversalNr12 {
             ID3D12CommandList* l[]{lists[index].Get()};in.queue->ExecuteCommandLists(1,l);
         };
         submit(0);
+        if(!submitted){close_all();out.reason="Universal DLSS 5 copy submission failed";return false;}
+        if(submitted&&opts.motion==2)zero_motion_initialized=true;
         // Lists 1 and 2: each eye after only its own flow.
         for(unsigned eye=0;eye<2;++eye){
             auto& e=work[eye];list=lists[1+eye].Get();
@@ -280,10 +315,11 @@ struct UniversalNr12 {
                 e.flow=false;e.motion=nullptr;out.shared[eye]=false;out.reason="Universal DLSS 5 vector conversion failed";}
             if(e.flow)transition(list,vectors[eye].Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             if(good&&e.motion){
-                CheekyNrUniversalEyeV1 nr;nr.list=list;nr.eye=eye;nr.reset=in.reset||in.guides->eyes[eye].reset?1u:0u;
+                CheekyNrUniversalEyeV1 nr;nr.list=list;nr.eye=eye;nr.reset=reset||in.guides->eyes[eye].reset?1u:0u;
                 nr.color=out.color[eye]->texture.Get();nr.color_state=D3D12_RESOURCE_STATE_GENERIC_READ;nr.width=e.w;nr.height=e.h;
                 nr.hdr=format==DXGI_FORMAT_R16G16B16A16_FLOAT?1u:0u;
-                nr.motion=e.motion;nr.motion_state=e.game_motion?D3D12_RESOURCE_STATE_COMMON:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                nr.motion=e.motion;nr.motion_state=e.game_motion?D3D12_RESOURCE_STATE_COMMON:
+                    opts.motion==2?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 nr.motion_x=e.motion_rect[0];nr.motion_y=e.motion_rect[1];nr.motion_width=e.motion_rect[2];nr.motion_height=e.motion_rect[3];
                 nr.motion_uv_scale_x=e.motion_scale[0];nr.motion_uv_scale_y=e.motion_scale[1];
                 if(e.depth){nr.depth=e.depth;nr.depth_state=D3D12_RESOURCE_STATE_COMMON;nr.depth_x=e.depth_rect[0];nr.depth_y=e.depth_rect[1];
@@ -301,6 +337,7 @@ struct UniversalNr12 {
         if(FAILED(in.queue->Signal(fence.Get(),++serial))){--serial;}
         if(!submitted){out={};out.reason="Universal DLSS 5 recording failed";return false;}
         if(!good){out.color={};out.previous_copy={};out.shared={};out.periphery_shared={};}
+        if(good)last_motion_mode=opts.motion;
         return good;
     }
 };

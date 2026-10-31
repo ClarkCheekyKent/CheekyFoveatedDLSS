@@ -79,7 +79,7 @@ void synchronize_capture_enabled_locked(bool requested) {
         [](const auto& p){return p->pending_submissions();});
 }
 bool enabled() noexcept {
-    return current_settings().fg.enabled &&
+    return (current_settings().fg.enabled || universal_nr_requested()) &&
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
@@ -102,6 +102,7 @@ std::uint64_t configuration(const Settings& s) noexcept {
     auto hash=fg_sr_mode_configuration(configuration(s.fg),s.enabled);
     // Universal DLSS 5 changes capture storage (full eyes) and the D3D11 backend.
     if(universal_nr_requested())hash=(hash^0x554E52u)*1099511628211ull;
+    hash=(hash^unsigned(s.fg.enabled))*1099511628211ull; // Native NR <-> FG changes the frame owner.
     if(s.fg.foveated)hash=(hash^unsigned(s.center_mode))*1099511628211ull;
     if(s.fg.match_sr_region&&s.fg.foveated){
         // SR's static region can change independently of FG. Gaze placement is

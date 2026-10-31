@@ -86,6 +86,7 @@ struct DlssNrUniversalStatus {
     bool evaluated[2]{};
     bool game_motion{}, game_depth{}, shared_flow{};
     bool projection_alignment{};
+    bool no_motion{};
     std::uint64_t evaluations{}, fallbacks{}, resets{};
     float flow_ms{}, vectors_ms{};
     const char* reason{};

@@ -57,12 +57,12 @@ std::array<NrExtraPass, max_nr_passes - 1U> nr_extra_passes{}; // settings_mutex
 NrUniversalSettings nr_universal{}; // settings_mutex
 
 NrUniversalSettings sanitized_universal(NrUniversalSettings u) noexcept {
-    if (u.motion > 1U) u.motion = 0U;
+    if (u.motion > 2U) u.motion = 0U;
     if (u.depth > 2U) u.depth = 0U;
-    if (u.optical_preset > 2U) u.optical_preset = 1U;
+    if (u.optical_preset > 2U) u.optical_preset = 2U;
     if (u.optical_percent != 25U && u.optical_percent != 50U && u.optical_percent != 75U && u.optical_percent != 100U)
-        u.optical_percent = 50U;
-    if (u.optical_grid != 1U && u.optical_grid != 2U && u.optical_grid != 4U) u.optical_grid = 2U;
+        u.optical_percent = 25U;
+    if (u.optical_grid != 1U && u.optical_grid != 2U && u.optical_grid != 4U) u.optical_grid = 4U;
     return u;
 }
 

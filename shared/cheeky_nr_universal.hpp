@@ -15,7 +15,7 @@ struct CheekyNrUniversalOptionsV1 {
     std::uint32_t abi{2}; // Options v2; eye/status ABI stays v1.
     std::uint32_t size{sizeof(CheekyNrUniversalOptionsV1)};
     std::uint32_t enabled{}; // DLSS-NR on, NR source Universal, processing allowed.
-    std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (optical flow when unavailable).
+    std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (optical flow when unavailable), 2 none (zero vectors).
     std::uint32_t depth{}; // 0 automatic, 1 game DLSS depth, 2 none (flat depth).
     std::uint32_t share_optical{}; // Reuse FG's center optical flow when FG computes one.
     std::uint32_t optical_preset{}, optical_percent{}, optical_grid{}; // NR's own flow.
