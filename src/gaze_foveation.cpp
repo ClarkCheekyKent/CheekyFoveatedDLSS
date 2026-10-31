@@ -6,10 +6,16 @@
 #include "libovr_gaze.hpp"
 #include "native_gaze_selection.hpp"
 #include "afw_gaze.hpp"
+#include "cheeky_gaze_provider.h"
+#include "eye_calibration_policy.hpp"
+#include "settings.hpp"
 
 #include <Windows.h>
+#include <psapi.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -104,9 +110,103 @@ std::uint64_t qpc_frequency{};
     return value;
 }
 
+// A VR mod that owns the headset session can provide gaze and its eye views
+// from its own DLL (shared/cheeky_gaze_provider.h). The provider is retained
+// while its exports are cached and released by reset_gaze_foveation().
+struct GazeProvider {
+    HMODULE module{};
+    CheekyGazeProviderGetGazeSnapshotFn snapshot{};
+    CheekyGazeProviderGetEyeViewsFn eye_views{};
+};
+std::mutex provider_mutex;
+GazeProvider provider{};
+ULONGLONG provider_scan_ms{};
+DWORD provider_scan_bytes{};
+
+[[nodiscard]] GazeProvider find_gaze_provider() noexcept {
+    std::lock_guard lock(provider_mutex);
+    if (provider.module != nullptr) return provider;
+    // Scan at most twice a second, and only when modules were loaded or
+    // unloaded since the last scan.
+    const auto now = GetTickCount64();
+    if (provider_scan_ms != 0U && now - provider_scan_ms < 500U) return {};
+    provider_scan_ms = now;
+    HMODULE modules[1024]{};
+    DWORD bytes{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes) ||
+            bytes == provider_scan_bytes) {
+        return {};
+    }
+    provider_scan_bytes = bytes;
+    const auto count = (std::min<size_t>)(bytes / sizeof(HMODULE), ARRAYSIZE(modules));
+    for (size_t i = 0; i < count; ++i) {
+        // Take a reference before looking inside: another thread may unload it.
+        HMODULE module{};
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(modules[i]), &module)) {
+            continue;
+        }
+        const auto snapshot = reinterpret_cast<CheekyGazeProviderGetGazeSnapshotFn>(
+            GetProcAddress(module, CHEEKY_GAZE_PROVIDER_SNAPSHOT_EXPORT));
+        if (snapshot == nullptr) {
+            static_cast<void>(FreeLibrary(module));
+            continue;
+        }
+        provider = {module, snapshot, reinterpret_cast<CheekyGazeProviderGetEyeViewsFn>(
+            GetProcAddress(module, CHEEKY_GAZE_PROVIDER_EYE_VIEWS_EXPORT))};
+        wchar_t path[MAX_PATH]{};
+        GetModuleFileNameW(module, path, ARRAYSIZE(path));
+        trace_event("Gaze provider found: %ls (eye views %s)", path, provider.eye_views ? "provided" : "not provided");
+        return provider;
+    }
+    return {};
+}
+
+void release_gaze_provider() noexcept {
+    std::lock_guard lock(provider_mutex);
+    if (provider.module != nullptr) static_cast<void>(FreeLibrary(provider.module));
+    provider = {};
+    provider_scan_ms = 0U;
+    provider_scan_bytes = 0U;
+}
+
+// The provider's eye views, re-published as a calibrated stereo pair with a
+// full-image mapping every 250 ms (a published calibration stays verified for
+// 2.5 s). Marker calibration cannot tell alternating single-eye renders apart
+// on D3D12; the provider knows them exactly.
+void refresh_provider_eye_assignment() noexcept {
+    if (GetModuleHandleW(L"CheekyOpenXRLayer.dll") != nullptr) return;
+    const auto found = find_gaze_provider();
+    if (found.eye_views == nullptr) return;
+    static std::atomic<ULONGLONG> last_ms{};
+    static std::atomic<std::uint64_t> sequence{};
+    const auto now = GetTickCount64();
+    auto last = last_ms.load();
+    if (now - last < 250U || !last_ms.compare_exchange_strong(last, now)) return;
+    CheekyGazeProviderEyeViewsV1 views{};
+    views.structure_size = sizeof(views);
+    if (found.eye_views(&views) == 0U || views.version != CHEEKY_GAZE_PROVIDER_EYE_VIEWS_VERSION ||
+            views.left_view == 0U || views.right_view == 0U || views.left_view == views.right_view) {
+        return;
+    }
+    const auto left_generation = stereo_view_generation(views.left_view);
+    const auto right_generation = stereo_view_generation(views.right_view);
+    if (left_generation == 0U || right_generation == 0U) return;
+    std::array<StereoSourceCrop, 2> crops{};
+    for (auto& crop : crops) crop = {0.F, 0.F, 1.F, 1.F, views.output_width, views.output_height, true};
+    // Sequences far above any marker calibration's, so the provider's
+    // assignment is accepted over an older marker result.
+    static_cast<void>(publish_stereo_calibration(views.left_view, views.right_view, left_generation,
+        right_generation, (1ULL << 40U) + ++sequence, now, nullptr, views.session_generation, false, false,
+        &crops, EyeCalibrationMethod::full));
+}
+
 [[nodiscard]] bool load_snapshot(
     CheekyGazeSnapshotV1& snapshot
 ) noexcept {
+    if (snapshot_function == nullptr && GetModuleHandleW(L"CheekyOpenXRLayer.dll") == nullptr) {
+        snapshot_function = find_gaze_provider().snapshot;
+    }
     if (snapshot_function == nullptr) {
         HMODULE module{};
         if (GetModuleHandleExW(0U, L"CheekyOpenXRLayer.dll", &module)) {
@@ -471,6 +571,7 @@ bool calculate_coordinated_crop(
     reset_history = false;
     const auto fixed_settings = settings_for_view(settings, view_id);
     if (resolved_center) *resolved_center = fixed_center(fixed_settings, render_width, render_height);
+    refresh_provider_eye_assignment();
     const auto eye_assignment = stereo_eye_assignment(view_id);
     if (const auto module = GetModuleHandleW(L"CheekyOpenXRLayer.dll")) {
         using SetSimulationFn = void(__cdecl*)(std::uint32_t);
@@ -1170,6 +1271,7 @@ void reset_gaze_foveation() noexcept {
         static_cast<void>(FreeLibrary(snapshot_module));
         snapshot_module = nullptr;
     }
+    release_gaze_provider();
 }
 
 void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept {

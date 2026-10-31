@@ -1674,6 +1674,56 @@ void test_auto_alignment() {
     );
 }
 
+// Runs in its own process (--gaze-provider): once loaded, the provider fixture
+// would supply gaze to every later test in the process.
+void test_gaze_provider() {
+    using namespace cheeky::foveated_dlss;
+    wchar_t path[32768]{};
+    GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    *(wcsrchr(path, L'\\') + 1) = L'\0';
+    wcscat_s(path, L"test-fixtures\\CheekyFakeGazeProvider.dll");
+    constexpr std::uint64_t left = 0x7101, right = 0x7102;
+
+    reset_gaze_foveation();
+    expect(run_openxr_gaze_lookup() && !gaze_diagnostics().layer_present,
+        "no gaze source before a provider is loaded");
+    const auto fixture = LoadLibraryW(path);
+    expect(fixture != nullptr, "test loads the gaze provider fixture");
+    if (fixture == nullptr) return;
+    Sleep(600); // Provider scans are throttled to twice a second.
+    expect(run_openxr_gaze_lookup() && gaze_diagnostics().layer_present && gaze_diagnostics().abi_compatible &&
+        std::strcmp(gaze_diagnostics().runtime_name, "Cheeky test gaze provider") == 0,
+        "a provider loaded after startup supplies the gaze snapshot");
+
+    register_stereo_view(left); register_stereo_view(right);
+    Sleep(300); // Eye views are re-published every 250 ms.
+    expect(run_openxr_gaze_lookup(), "lookup publishes the provider's eye views");
+    auto l = stereo_eye_assignment(left), r = stereo_eye_assignment(right);
+    expect(l.assigned && l.calibrated && l.eye_index == 0 && r.assigned && r.calibrated && r.eye_index == 1,
+        "the provider's eye views become a calibrated stereo pair");
+    for (const auto& crop : l.source_crops)
+        expect(crop.valid && crop.x == 0.F && crop.y == 0.F && crop.width == 1.F && crop.height == 1.F &&
+            crop.source_width == 2000U && crop.source_height == 1600U,
+            "provider eye views map the full DLSS output");
+    using SetEyeViewsFn = void(__cdecl*)(std::uint64_t, std::uint64_t);
+    const auto set_eye_views = reinterpret_cast<SetEyeViewsFn>(GetProcAddress(fixture, "CheekyFakeGazeProvider_SetEyeViews"));
+    expect(set_eye_views != nullptr, "fixture exports its test control");
+    if (set_eye_views != nullptr) {
+        set_eye_views(right, left);
+        Sleep(300);
+        expect(run_openxr_gaze_lookup(), "lookup publishes swapped eye views");
+        l = stereo_eye_assignment(left); r = stereo_eye_assignment(right);
+        expect(l.eye_index == 1 && r.eye_index == 0, "the provider's latest eye views replace its earlier assignment");
+    }
+
+    expect(FreeLibrary(fixture) != FALSE, "test releases its fixture reference");
+    expect(GetModuleHandleW(path) != nullptr, "the cached provider is retained");
+    unregister_stereo_view(left); unregister_stereo_view(right);
+    clear_stereo_calibration();
+    reset_gaze_foveation();
+    expect(GetModuleHandleW(path) == nullptr, "gaze shutdown releases the provider");
+}
+
 void test_openxr_layer_is_retained_while_snapshot_export_is_cached() {
     using namespace cheeky::foveated_dlss;
     constexpr wchar_t layer_name[] = L"CheekyOpenXRLayer.dll";
@@ -2906,6 +2956,11 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::strcmp(argv[1], "--hook-path") == 0) {
         test_selectable_d3d12_hook_path();
+        return failures ? 1 : 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--gaze-provider") == 0) {
+        test_gaze_provider();
+        if (!failures) std::cout << "PASS gaze provider: late discovery, eye views, retention and release\n";
         return failures ? 1 : 0;
     }
     extern int run_retained_calibration_tests();
