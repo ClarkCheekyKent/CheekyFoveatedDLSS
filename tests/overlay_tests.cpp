@@ -116,6 +116,7 @@ void test_ui_diagnostics() {
     InputState input;
     state.draft.center_mode = FoveationCenterMode::openxr_gaze;
     const OverlayRuntime runtime{};
+    const OverlayRuntime* ui_runtime=&runtime;
     const char* render_api="D3D12";
     auto render = [&](const char* tab, bool expand_details = true) {
         if (context->TabBars.GetAliveCount()) {
@@ -127,7 +128,7 @@ void test_ui_diagnostics() {
         ImGui::NewFrame();
         ImGui::Begin("Diagnostic capture");
         ImGui::LogToBuffer(expand_details ? 8 : 0);
-        draw_overlay_ui(state, runtime, input, render_api, "Ready", open);
+        draw_overlay_ui(state, *ui_runtime, input, render_api, "Ready", open);
         const std::string text = context->LogBuffer.c_str();
         ImGui::LogFinish();
         ImGui::End();
@@ -338,6 +339,125 @@ void test_ui_diagnostics() {
     state.snapshot=R"({"gaze":{"layer":true,"views":2,"alignment":0},"nr_details":{"universal":{"layer_reporting":false,"projection_alignment":true}}})";
     require(render("Stereo / Gaze").find("no usable projection or eye mapping")!=std::string::npos,
         "Stale Universal alignment diagnostics cannot suppress the manual fallback warning");
+    // Menus follow the runtime's shared game DLSS state; hidden settings keep their values.
+    {
+        const auto saved_draft=state.draft;const auto saved_snapshot=state.snapshot;
+        state.draft.enabled=true;state.draft.fg.enabled=true;state.draft.fg.foveated=true;state.draft.fg.match_sr_region=true;
+        state.draft.fg.center_method=0;state.draft.fg.peripheral_method=1;state.draft.nr_enabled=true;state.draft.nr_foveated=true;
+        state.draft.nr_processing_order=NrProcessingOrder::before_upscaling;state.draft.auto_stereo_alignment=true;
+        state.snapshot=R"({"game_dlss":{"state":"intercepted"},"gaze":{"layer":true,"views":2,"alignment":0}})";
+        render("General");text=render("General");
+        require(text.find("Game DLSS: hooked, waiting for a DLSS call")!=text.npos,"Header shows the intercepted game DLSS state");
+        require(context->TabBars.GetByIndex(0)->Tabs.Size==6,"Intercepted game DLSS keeps the DLSS-SR tab");
+        state.snapshot=R"({"game_dlss":{"state":"not_used"},"gaze":{"layer":true,"views":2,"alignment":0}})";
+        render("General");render("General");text=render("General");
+        require(text.find("Game DLSS: not detected - DLSS-SR, DLSS-G and game-input options are hidden")!=text.npos,"Header names the hidden options");
+        require(context->TabBars.GetByIndex(0)->Tabs.Size==5,"DLSS-SR tab is hidden without game DLSS");
+        // Until the runtime's one-time switch arrives, the menu says what runs instead.
+        render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
+        require(text.find("Using Optiflow: DLSS-G needs game DLSS")!=text.npos&&
+            text.find("Using Optiflow: DLSS Vectors needs game DLSS")!=text.npos&&
+            text.find("Frame Generation inactive")==text.npos&&text.find("Choose Optiflow")==text.npos&&
+            text.find("DLSS-G preset")==text.npos&&text.find("Match DLSS-SR foveation region")!=text.npos&&
+            text.find("Shared region width")!=text.npos&&text.find("Shared transition width")!=text.npos,
+            "FG says a saved game-only method runs as Optiflow and keeps the shared region editable");
+        require(text.find("FG center method")!=text.npos&&text.find("Center optical flow preset")!=text.npos&&
+            text.find("Center optical flow vector grid")!=text.npos&&text.find("FG periphery method")!=text.npos&&
+            text.find("Periphery optical flow preset")!=text.npos&&text.find("Periphery optical flow vector grid")!=text.npos&&
+            state.draft.fg.center_method==cheeky_fg_dlss&&state.draft.fg.peripheral_method==cheeky_fg_dlss_vectors_simple,
+            "FG draws the Optiflow controls it runs before the switch lands and leaves the saved methods alone");
+        // Sharing needs FG on, Universal DLSS 5 (here the NR fallback) and NR motion estimation.
+        require(text.find("Center optical flow is shared with DLSS-NR")!=text.npos,"Shared center flow is noted while it applies");
+        render("DLSS-NR");text=render("DLSS-NR");
+        require(text.find("Using FG optical flow")!=text.npos&&text.find("NR optical flow preset")==text.npos,
+            "NR uses FG's flow while FG runs a fallback Optiflow center");
+        state.draft.fg.enabled=false;
+        render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
+        require(text.find("Center optical flow is shared with DLSS-NR")==text.npos&&text.find("Center optical flow preset")!=text.npos,
+            "With FG off the center flow is not shared, and FG keeps its flow settings");
+        render("DLSS-NR");text=render("DLSS-NR");
+        require(text.find("Frame Generation is off; DLSS-NR uses its own optical flow.")!=text.npos&&
+            text.find("NR optical flow preset")!=text.npos,"With FG off NR shows its own flow settings");
+        state.draft.fg.enabled=true;state.draft.nr_universal.motion=2;
+        render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
+        require(text.find("Center optical flow is shared with DLSS-NR")==text.npos,"Zero NR vectors share no flow");
+        state.draft.nr_universal.motion=0;state.draft.nr_enabled=false;
+        render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
+        require(text.find("Center optical flow is shared with DLSS-NR")==text.npos,"NR off shares no flow");
+        state.draft.nr_enabled=true;
+        render("DLSS-NR");text=render("DLSS-NR");
+        require(text.find("Applied at: Headset output (Universal DLSS 5) - Game, before upscaling needs game DLSS")!=text.npos&&
+            text.find("DLSS-NR inactive")==text.npos&&text.find("Apply at headset output")==text.npos&&
+            text.find("Depth convention")==text.npos&&
+            text.find("Motion scale X multiplier")==text.npos&&text.find("Use DLSS-SR size and shape")==text.npos,
+            "NR hides game inputs and says it runs at the headset output");
+        state.draft.fg.center_method=cheeky_fg_optical_flow;state.draft.fg.peripheral_method=cheeky_fg_optical_simple;
+        render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
+        require(text.find("Using Optiflow")==text.npos,"Switched FG methods need no note");
+        state.draft.nr_processing_order=NrProcessingOrder::universal;state.draft.nr_universal.motion=1;
+        render("DLSS-NR");text=render("DLSS-NR");
+        require(text.find("Applied at: Headset output (Universal DLSS 5)")!=text.npos&&
+            text.find("Inputs: optical flow motion vectors, flat depth.")!=text.npos&&text.find("Game DLSS depth")==text.npos,
+            "Universal DLSS 5 describes its fallback inputs without game DLSS");
+        render("Stereo / Gaze");text=render("Stereo / Gaze");
+        require(text.find("Mapping method")==text.npos&&text.find("Automatic stereo alignment")!=text.npos&&
+            text.find("Foveation center")!=text.npos,"Stereo / Gaze keeps gaze controls and hides DLSS eye mapping");
+        render("Diagnostics");text=render("Diagnostics");
+        require(text.find("Eye calibration diagnostics")==text.npos,"Calibration diagnostics are hidden without game DLSS");
+        state.snapshot=R"({"game_dlss":{"state":"unknown","fg_fallback":true,"nr_fallback":true,"notes":[{"text":"Using Optiflow this session: game DLSS was loaded before Cheeky attached"},{"text":"Applying DLSS-NR at Headset output this session: game DLSS was loaded before Cheeky attached"}]}})";
+        render("General");text=render("General");
+        require(text.find("Game DLSS: not detected (attached late) - DLSS-SR, DLSS-G and game-input options are hidden")!=text.npos,
+            "Late attachment is reported separately");
+        require(text.find("Using Optiflow this session: game DLSS was loaded before Cheeky attached")!=text.npos&&
+            text.find("Applying DLSS-NR at Headset output this session: game DLSS was loaded before Cheeky attached")!=text.npos,
+            "A late attach reports its session-only fallback");
+        // A game resolution the layer cannot pair hides only the game-data FG types.
+        state.draft.fg.center_method=cheeky_fg_dlss;state.draft.nr_processing_order=NrProcessingOrder::after_upscaling;
+        state.snapshot=R"({"game_dlss":{"state":"active","d3d12":true,"fg_fallback":true,"nr_fallback":false,"notes":[{"text":"Switched Frame Gen to Optiflow: game render resolution 1920x1080 differs from OpenXR eye resolution 2448x2448"}]},"apis":[{},{"creates":1}]})";
+        render("General");render("General");text=render("General");
+        require(text.find("game render resolution 1920x1080 differs from OpenXR eye resolution 2448x2448")!=text.npos&&
+            context->TabBars.GetByIndex(0)->Tabs.Size==6,"A resolution mismatch keeps DLSS-SR and shows its note");
+        render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
+        require(text.find("Using Optiflow: DLSS-G needs game DLSS")!=text.npos&&text.find("DLSS-G preset")==text.npos&&
+            text.find("Shared region width")==text.npos,"A resolution mismatch hides DLSS-G only");
+        render("DLSS-NR");text=render("DLSS-NR");
+        require(text.find("Applied at: Headset output")==text.npos,"A resolution mismatch does not move NR");
+        state.snapshot=R"({"game_dlss":{"state":"active","d3d11":false,"d3d12":true}})";
+        render("General");render("General");text=render("General");
+        require(text.find("Game DLSS: active (D3D12)")!=text.npos&&context->TabBars.GetByIndex(0)->Tabs.Size==6,
+            "Active game DLSS restores the DLSS-SR tab");
+        // The runtime's switch reaches the menu as an ordinary settings revision:
+        // the draft reloads it, and the menu never sends a method back.
+        static Settings live;static unsigned sets;static std::string game;
+        const OverlayRuntime fixture{1,
+            [](std::uint64_t,const char* command){if(std::string_view(command).find("\nset\n")!=std::string_view::npos)++sets;return true;},
+            [](char* output,std::uint32_t capacity){
+                const auto text="{\"game_dlss\":"+game+",\"settings\":"+settings_json(live)+"}";
+                return strcpy_s(output,capacity,text.c_str())==0;},"Test"};
+        live=state.draft;live.fg.enabled=true;live.fg.foveated=true;live.fg.match_sr_region=true;
+        live.fg.center_method=cheeky_fg_dlss;live.fg.peripheral_method=cheeky_fg_dlss_vectors_simple;
+        live.nr_enabled=true;live.nr_processing_order=NrProcessingOrder::before_upscaling;
+        game=R"({"state":"not_used","fg_fallback":true,"nr_fallback":true})";
+        ui_runtime=&fixture;sets=0;
+        state.next_snapshot=0;render("Frame Gen (Experimental)",false);
+        state.next_snapshot=0;text=render("Frame Gen (Experimental)",false);
+        require(state.draft.fg.center_method==cheeky_fg_dlss&&text.find("Center optical flow preset")!=text.npos&&
+            text.find("Periphery optical flow preset")!=text.npos&&text.find("Using Optiflow: DLSS-G needs game DLSS")!=text.npos&&sets==0,
+            "Before the switch lands the menu draws Optiflow from the reloaded draft and sends nothing");
+        live.fg.center_method=cheeky_fg_optical_flow;live.fg.peripheral_method=cheeky_fg_optical_simple;
+        live.nr_processing_order=NrProcessingOrder::universal;
+        game=R"({"state":"not_used","fg_fallback":true,"nr_fallback":true,"notes":[{"text":"Switched Frame Gen to Optiflow: DLSS-G and DLSS Vectors need game DLSS"}]})";
+        state.next_snapshot=0;render("Frame Gen (Experimental)",false);
+        state.next_snapshot=0;text=render("Frame Gen (Experimental)",false);
+        require(state.draft.fg.center_method==cheeky_fg_optical_flow&&state.draft.fg.peripheral_method==cheeky_fg_optical_simple&&
+            state.draft.nr_processing_order==NrProcessingOrder::universal&&text.find("Using Optiflow")==text.npos&&
+            text.find("Switched Frame Gen to Optiflow: DLSS-G and DLSS Vectors need game DLSS")!=text.npos&&
+            text.find("Center optical flow preset")!=text.npos&&sets==0,
+            "The draft reloads the runtime's switch, keeps only its note and echoes nothing");
+        ui_runtime=&runtime;
+        state.draft=saved_draft;state.snapshot=saved_snapshot;
+        render("General");render("General");
+    }
     // Physical polling must not release a VR trigger between controller events.
     input.window = reinterpret_cast<HWND>(1);
     input.enabled = true; input.open = true;

@@ -36,9 +36,14 @@
 #include <sstream>
 #include <charconv>
 #include <chrono>
+#include <cmath>
+#include <Psapi.h>
+#include "ngx_runtime_discovery.hpp"
 
 namespace cheeky::foveated_dlss {
 namespace {
+// The game's DLSS output for each eye against the OpenXR layer's submitted eye rect.
+struct GameResolution { bool known{}, match{true}; unsigned game_width{}, game_height{}, eye_width{}, eye_height{}; };
 // Intentionally process-resident: workers and game detours never reference the
 // unloadable host adapter, nor call into Lua or UEVR.
 struct State {
@@ -53,6 +58,17 @@ struct State {
     std::uint64_t revision{}, saved_revision{}, request{}, applied_request{};
     std::uint64_t attachment_sequence{};
     FrameCadence cadence;
+    // Game DLSS detection: API bits latch once a create or evaluation is seen,
+    // and a DLSS module that loads after the hooks latches as intercepted.
+    ULONGLONG first_frame_tick{};
+    unsigned game_dlss_apis{};
+    bool dlss_loaded_before_hooks{}, dlss_module_seen{}, not_used_seen{}, dlss_return_noted{};
+    // Saved choices the game cannot feed are switched whenever they appear,
+    // with one note per fallback. A session-only fallback keeps the ini.
+    GameResolution resolution;
+    ULONGLONG next_game_input_check{}, resolution_since{};
+    bool resolution_mismatch{}, fg_fallback{}, nr_fallback{}, game_inputs_session_only{}, fg_noted{}, nr_noted{};
+    std::vector<std::string> game_input_notes;
     GpuMemory memory;
     CheekyFgMemory fg_memory;
     std::uint64_t next_fg_memory_sample{};
@@ -110,6 +126,98 @@ const char* host_label(CheekyRuntimeHost host) noexcept {
     case CheekyRuntimeHost::optiscaler: return "OptiScaler integration";
     }
     return "Unknown host";
+}
+
+// The game DLSS modules the hooks target: named or OTA SR and RR snippets, and
+// Streamline's DLSS plugins. _nvngx.dll is left out because DLSS-NR loads it too.
+bool game_dlss_module_loaded() {
+    for (const auto name : {L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"sl.dlss.dll", L"sl.dlss_d.dll"})
+        if (GetModuleHandleW(name)) return true;
+    std::array<HMODULE, 2048> modules{};
+    DWORD required{};
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &required)) return false;
+    for (std::size_t i = 0; i < (std::min<std::size_t>)(modules.size(), required / sizeof(HMODULE)); ++i) {
+        std::array<wchar_t, 2048> path{};
+        const auto length = GetModuleFileNameW(modules[i], path.data(), static_cast<DWORD>(path.size()));
+        if (length && length < path.size() &&
+            (is_dlss_sr_runtime_path({path.data(), length}) || is_dlss_rr_runtime_path({path.data(), length}))) return true;
+    }
+    return false;
+}
+
+// Shared by every menu. Active latches on any create or evaluation. A DLSS
+// module that loaded after the hooks is intercepted and never falls back,
+// however long the game goes without a call (menus, some views). Unknown means
+// one was already loaded when the hooks went in; not_used means none loaded.
+// The first 2 s of frames count as intercepted, so startup loads are seen.
+const char* game_dlss_state(State& s) {
+    for (unsigned index = 0; index < 2; ++index) {
+        const auto d = diagnostic_snapshot(index ? DiagnosticApi::d3d12 : DiagnosticApi::d3d11);
+        if (d.create_calls || d.evaluate_calls) s.game_dlss_apis |= 1U << index;
+    }
+    if (vulkan_backend_status().calls) s.game_dlss_apis |= 4U;
+    if (s.game_dlss_apis) return "active";
+    if (s.dlss_module_seen) return "intercepted";
+    const bool settled = s.started && s.first_frame_tick && GetTickCount64() - s.first_frame_tick >= 2000;
+    return !settled ? "intercepted" : s.dlss_loaded_before_hooks ? "unknown" : "not_used";
+}
+
+// Our NGX detours on a DLSS runtime, or Streamline's DLSS exports, are in place.
+bool game_dlss_hooked() {
+    for (const auto api : {DiagnosticApi::d3d11, DiagnosticApi::d3d12}) {
+        const auto d = diagnostic_snapshot(api);
+        if (d.hook_discovered || d.direct_detour_installed) return true;
+    }
+    return false;
+}
+
+// The layer pairs DLSS guides only with an eye image of the same size. A
+// calibrated crop (one DLSS output feeding both eyes) is applied first, and
+// 2 px absorbs its rounding. Unknown sizes count as a match.
+GameResolution game_resolution() {
+    GameResolution r;
+    const auto gaze = gaze_diagnostics();
+    if (!gaze.layer_present || !fg_status().layer_present || quad_view_snapshot().active) return r;
+    const auto details = stereo_view_details();
+    const auto within_2px = [](unsigned a, unsigned b) { return (a > b ? a - b : b - a) <= 2U; };
+    bool all = true;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        const auto& xr = gaze.views[eye];
+        if (!xr.xr_width || !xr.xr_height) continue;
+        if (!r.eye_width) { r.eye_width = xr.xr_width; r.eye_height = xr.xr_height; }
+        bool matched = false;
+        for (const auto& v : details) {
+            if (!v.recently_evaluated || v.quad_region || !v.evaluation_output_width || !v.evaluation_output_height) continue;
+            auto w = v.evaluation_output_width, h = v.evaluation_output_height;
+            const auto a = stereo_eye_assignment(v.view_id);
+            if (a.calibrated && (a.shared_source || a.eye_index == eye) && a.source_crops[eye].valid) {
+                w = static_cast<unsigned>(std::lround(w * a.source_crops[eye].width));
+                h = static_cast<unsigned>(std::lround(h * a.source_crops[eye].height));
+            }
+            if (!r.game_width) { r.game_width = w; r.game_height = h; }
+            if (within_2px(w, xr.xr_width) && within_2px(h, xr.xr_height)) matched = true;
+        }
+        all = all && matched;
+    }
+    r.known = r.eye_width && r.game_width;
+    r.match = !r.known || all;
+    return r;
+}
+
+std::string game_dlss_json(State& s) {
+    const auto elapsed = s.first_frame_tick ? GetTickCount64() - s.first_frame_tick : 0;
+    const auto effective = universal_nr_settings();
+    std::ostringstream out; out << std::boolalpha;
+    out << "{\"state\":\"" << game_dlss_state(s) << "\",\"d3d11\":" << bool(s.game_dlss_apis & 1U) << ",\"d3d12\":" << bool(s.game_dlss_apis & 2U)
+        << ",\"vulkan\":" << bool(s.game_dlss_apis & 4U) << ",\"late_attach\":" << s.dlss_loaded_before_hooks
+        << ",\"module_loaded\":" << (s.dlss_loaded_before_hooks || s.dlss_module_seen) << ",\"hooked\":" << game_dlss_hooked()
+        << ",\"grace_ms\":2000,\"elapsed_ms\":" << elapsed
+        << ",\"fg_fallback\":" << s.fg_fallback << ",\"nr_fallback\":" << s.nr_fallback
+        << ",\"effective\":{\"fg_center_method\":" << effective.fg.center_method << ",\"fg_peripheral_method\":" << effective.fg.peripheral_method
+        << ",\"nr_processing_order\":" << static_cast<unsigned>(effective.nr_processing_order) << "},\"notes\":[";
+    for (std::size_t i = 0; i < s.game_input_notes.size(); ++i) out << (i ? "," : "") << "{\"text\":\"" << json_escape(s.game_input_notes[i]) << "\"}";
+    out << "]}";
+    return out.str();
 }
 
 std::string snapshot_locked(State& s) {
@@ -188,6 +296,9 @@ std::string snapshot_locked(State& s) {
         << ",\"cpu_game_percent\":" << load.cpu_process << ",\"gpu_busy_percent\":" << load.gpu_busy
         << ",\"gpu_game_percent\":" << load.gpu_game << ",\"gpu_encode_percent\":" << load.gpu_encode << ",\"gpu_engine\":\"" << json_escape(load.gpu_engine) << "\"}"
         << ",\"fg\":{\"layer_present\":" << bool(fg.layer_present)
+        << ",\"game_resolution_match\":{\"known\":" << s.resolution.known << ",\"match\":" << !s.resolution_mismatch
+        << ",\"game_width\":" << s.resolution.game_width << ",\"game_height\":" << s.resolution.game_height
+        << ",\"eye_width\":" << s.resolution.eye_width << ",\"eye_height\":" << s.resolution.eye_height << '}'
         << ",\"controls_supported\":" << bool(fg.controls_supported)
         << ",\"compatible_session\":" << bool(fg.compatible_session)
         << ",\"active\":" << bool(fg.active)
@@ -363,6 +474,7 @@ std::string snapshot_locked(State& s) {
         << ",\"options_seen\":" << attach.streamline_options_seen
         << ",\"native_fallback\":" << attach.streamline_native_fallback
         << ",\"fallback_calls\":" << attach.streamline_fallback_calls << '}'
+        << ",\"game_dlss\":" << game_dlss_json(s)
         << ",\"observer\":{\"ready\":" << observer.ready << ",\"submissions\":" << observer.submissions
         << ",\"copies\":" << observer.copies << ",\"resets\":" << observer.resets << ",\"destroyed\":" << observer.destroyed << '}'
         << ",\"gaze\":{\"layer\":" << gaze.layer_present << ",\"abi\":" << gaze.abi_compatible
@@ -561,6 +673,76 @@ DWORD WINAPI persistence_worker(void*) {
     }
 }
 void request_save(State& s) { s.save_requested = true; SetEvent(s.save_event); }
+
+const char* fg_type_name(unsigned method) {
+    return method == cheeky_fg_dlss ? "DLSS-G" : cheeky_fg_dlss_vectors(method) ? "DLSS Vectors" : "Optiflow + Depth";
+}
+
+// Sets the effective fallback every check and rewrites the saved choices like
+// a menu edit whenever they hold a game-only value: at the transition, and
+// again after a reset or an edited ini brings one back (commands map their
+// transaction too). The note goes out once per fallback. A late attach
+// (unknown) likely missed a DLSS game's calls, so it keeps the ini. A DLSS
+// module loading after not_used restores the options, not the saved values.
+void update_game_inputs(State& s) {
+    const auto now = GetTickCount64();
+    if (now < s.next_game_input_check) return;
+    s.next_game_input_check = now + 250;
+    if (s.started && !s.dlss_loaded_before_hooks && !s.dlss_module_seen && !s.game_dlss_apis)
+        s.dlss_module_seen = game_dlss_module_loaded();
+    const std::string_view state = game_dlss_state(s);
+    const bool absent = state == "not_used" || state == "unknown";
+    if (state == "not_used") s.not_used_seen = true;
+    else if (!absent && s.not_used_seen && !s.dlss_return_noted) {
+        s.dlss_return_noted = true;
+        s.game_input_notes.push_back("Game DLSS loaded: DLSS-G options available again");
+        trace_event("%s", s.game_input_notes.back().c_str());
+    }
+    s.resolution = state == "active" ? game_resolution() : GameResolution{};
+    // Either direction must hold for 5 s, so a loading screen cannot flip FG.
+    const bool mismatch = s.resolution.known && !s.resolution.match;
+    if (mismatch == s.resolution_mismatch) s.resolution_since = 0;
+    else if (!s.resolution_since) s.resolution_since = now;
+    else if (now - s.resolution_since >= 5000) { s.resolution_mismatch = mismatch; s.resolution_since = 0; }
+    const bool fg = absent || s.resolution_mismatch, nr = absent;
+    set_game_input_fallback(fg, nr);
+    if (!fg) s.fg_noted = false;
+    if (!nr) s.nr_noted = false;
+    s.fg_fallback = fg; s.nr_fallback = nr;
+    s.game_inputs_session_only = state == "unknown";
+    const auto saved = configured_settings();
+    const auto switched = without_game_inputs(saved, fg, nr);
+    std::string needs;
+    unsigned count{};
+    for (const auto method : {saved.fg.center_method, saved.fg.peripheral_method}) {
+        if (!fg || !cheeky_fg_needs_game(method) || needs.find(fg_type_name(method)) != std::string::npos) continue;
+        needs += (needs.empty() ? "" : " and ") + std::string(fg_type_name(method)); ++count;
+    }
+    const bool nr_switch = switched.nr_processing_order != saved.nr_processing_order;
+    if (needs.empty() && !nr_switch) return;
+    const bool note_fg = !needs.empty() && !s.fg_noted, note_nr = nr_switch && !s.nr_noted;
+    s.fg_noted = s.fg_noted || !needs.empty(); s.nr_noted = s.nr_noted || nr_switch;
+    if (s.game_inputs_session_only) {
+        const char* reason = ": game DLSS was loaded before Cheeky attached";
+        if (note_fg) s.game_input_notes.push_back(std::string("Using Optiflow this session") + reason);
+        if (note_nr) s.game_input_notes.push_back(std::string("Applying DLSS-NR at Headset output this session") + reason);
+        if (note_fg || note_nr) trace_event("%s", s.game_input_notes.back().c_str());
+        return;
+    }
+    if (note_fg) {
+        const auto& r = s.resolution;
+        s.game_input_notes.push_back(absent ? "Switched Frame Gen to Optiflow: " + needs + (count > 1 ? " need" : " needs") + " game DLSS" :
+            "Switched Frame Gen to Optiflow: game render resolution " + std::to_string(r.game_width) + 'x' + std::to_string(r.game_height) +
+            " differs from OpenXR eye resolution " + std::to_string(r.eye_width) + 'x' + std::to_string(r.eye_height));
+        trace_event("%s", s.game_input_notes.back().c_str());
+    }
+    if (note_nr) {
+        s.game_input_notes.push_back("Switched DLSS-NR to Headset output: game DLSS not detected");
+        trace_event("%s", s.game_input_notes.back().c_str());
+    }
+    if (!note_fg && !note_nr) trace_event("Game input fallback: switched a restored game-only choice again");
+    update_settings(switched); ++s.revision; request_save(s);
+}
 bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* queue) {
     const auto previous_renderer = s.renderer;
     s.renderer = renderer;
@@ -658,6 +840,8 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
             if (!worker) { s.failed = true; s.message = "Could not create persistence worker"; return false; }
             CloseHandle(worker);
             enable_openvr_late_recovery(s.host != CheekyRuntimeHost::uevr);
+            // A DLSS feature may already exist when hooks arrive; its create call is then missed.
+            s.dlss_loaded_before_hooks = game_dlss_module_loaded();
             if (!start_interception()) { s.failed = true; s.message = "NGX interception initialization failed"; return false; }
             s.started = true;
         }
@@ -739,6 +923,8 @@ extern "C" __declspec(dllexport) void CheekyRuntime_Tick(std::uint64_t attachmen
             saved_learning_revision = learning_revision; ++s.revision; request_save(s);
         }
         set_processing_allowed(s.started && s.graphics_ready);
+        if (s.graphics_ready && !s.first_frame_tick) s.first_frame_tick = GetTickCount64();
+        update_game_inputs(s);
         if (s.graphics_ready) {
             const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
             const auto enabled = current_settings().enabled;
@@ -923,6 +1109,8 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Command(std::uint64_t attach
             }
             if (!count) return false;
         } else { s.message = "Unknown command"; return false; }
+        // A reset or a stale menu value cannot bring back a choice the game cannot feed.
+        if (!s.game_inputs_session_only) settings = without_game_inputs(settings, s.fg_fallback, s.nr_fallback);
         update_settings(settings);
         if (was_manual_mapping != settings.manual_stereo_mapping)
             eye_calibration_enable(!settings.manual_stereo_mapping);

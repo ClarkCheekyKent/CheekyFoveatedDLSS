@@ -194,6 +194,18 @@ struct Settings {
     return settings.nr_enabled && settings.nr_processing_order == NrProcessingOrder::universal;
 }
 
+// What runs when the game's DLSS inputs cannot be used: FG methods that read
+// game guides become plain optical flow, and game NR locations run at the
+// headset output (Universal DLSS 5). Saved settings keep their values.
+[[nodiscard]] inline Settings without_game_inputs(Settings settings, const bool fg, const bool nr) noexcept {
+    if (fg) {
+        settings.fg.center_method = cheeky_fg_without_game(settings.fg.center_method);
+        settings.fg.peripheral_method = cheeky_fg_without_game(settings.fg.peripheral_method);
+    }
+    if (nr) settings.nr_processing_order = NrProcessingOrder::universal;
+    return settings;
+}
+
 // Pass 1's tuning in the form a later pass stores it.
 [[nodiscard]] inline NrExtraPass nr_pass1_tuning(const Settings& settings) noexcept {
     return {true, settings.nr_style, settings.nr_intensity,
@@ -302,6 +314,9 @@ void update_settings(const Settings& settings) noexcept;
 // A host can stop processing on detach without taking locks under DllMain.
 // User preferences remain intact; snapshots consumed by rendering are gated.
 void set_processing_allowed(bool allowed) noexcept;
+// Set by a host that detects missing game DLSS (fg and nr) or a game output
+// size the OpenXR layer cannot pair with its eye images (fg only).
+void set_game_input_fallback(bool fg, bool nr) noexcept;
 
 void register_stereo_view(std::uint64_t view_id) noexcept;
 void unregister_stereo_view(std::uint64_t view_id) noexcept;

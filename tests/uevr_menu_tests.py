@@ -632,7 +632,7 @@ def run(engine):
     afw["settings"].update(NrEnabled=True, NrFoveated=True, NrUseSrFoveation=False)
     receive(afw)
     draw()
-    assert "NR source" in g["values"] and "NR width" in g["values"]
+    assert "Apply at" in g["values"] and "NR width" in g["values"]
     assert "NR roundness" in g["values"] and "NR working scale" in g["values"]
     assert not any("after AFW motion preparation" in t for t in g.drawn.values())
     for label in ("Fovea width", "Fovea height", "NR width", "NR height"):
@@ -928,33 +928,34 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["DLSS-NR style"] == 2, "Style acknowledgement was not retained"
-    # NR source follows the same immediate apply and acknowledgement
+    # "Apply at" follows the same immediate apply and acknowledgement
     # flow as the existing selectors, while preserving working scale.
     state["settings"].update(NrProcessingOrder=0, NrWorkingScale=0.37)
     receive(state)
     draw()
-    assert g.combos["NR source"][0] == "After upscaling"
-    assert g.combos["NR source"][1] == "Before upscaling"
-    assert g["values"]["NR source"] == 0
+    # Display order is before, after, headset output; saved values stay 1, 0, 2.
+    assert g.combos["Apply at"][1] == "Game, before upscaling"
+    assert g.combos["Apply at"][2] == "Game, after upscaling"
+    assert g["values"]["Apply at"] == 2
     count = len(g.sent)
-    draw(changes={"NR source": 1})
+    draw(changes={"Apply at": 1})
     assert len(g.sent) == count + 1 and "NrProcessingOrder=1" in last()
     assert "NrWorkingScale=" not in last()
     order_request = int(last().splitlines()[1])
-    draw(changes={"NR source": 0})  # New edit while the first is in flight.
+    draw(changes={"Apply at": 2})  # New edit while the first is in flight.
     assert len(g.sent) == count + 1
     state["request"] = state["applied_request"] = order_request
     state["settings"]["NrProcessingOrder"] = 1
     receive(state)
     draw()
     assert len(g.sent) == count + 2 and "NrProcessingOrder=0" in last()
-    assert g["values"]["NR source"] == 0, "Older ack overwrote a newer order draft"
+    assert g["values"]["Apply at"] == 2, "Older ack overwrote a newer order draft"
     state["request"] = state["applied_request"] = int(last().splitlines()[1])
     state["settings"]["NrProcessingOrder"] = 0
     receive(state)
     draw()
     assert len(g.sent) == count + 2 and abs(g["values"]["NR working scale"] - 0.37) < 0.0001
-    draw(changes={"NR source": 1})
+    draw(changes={"Apply at": 1})
     state["request"] = int(last().splitlines()[1])  # Rejected: applied_request stays old.
     receive(state)
     draw("Apply changes##bottom")
@@ -963,7 +964,7 @@ def run(engine):
     state["settings"]["NrProcessingOrder"] = 1
     receive(state)
     # Universal DLSS 5 shows its inputs; sharing FG's center flow hides NR's own flow controls.
-    assert g.combos["NR source"][2] == "Universal DLSS 5 (OpenXR submission)"
+    assert g.combos["Apply at"][3] == "Headset output (Universal DLSS 5)"
     saved_fg = {k: state["settings"][k] for k in ("FgEnabled", "FgCenterMethod", "NrOpticalShare")}
     state["settings"].update(NrProcessingOrder=2, FgEnabled=True, FgCenterMethod=7, NrOpticalShare=True)
     receive(state)
@@ -1045,23 +1046,23 @@ def run(engine):
     state["settings"].update(NrEnabled=True, NrProcessingOrder=0)
     receive(state)
     draw()
-    assert g["values"]["NR source"] == 0, "NR defaults did not reset the selector"
-    draw(changes={"NR source": 1})
+    assert g["values"]["Apply at"] == 2, "NR defaults did not reset the selector"
+    draw(changes={"Apply at": 1})
     order_request = int(last().splitlines()[1])
-    draw(changes={"NR source": 0})
+    draw(changes={"Apply at": 2})
     older = copy.deepcopy(state)
     older["settings"].pop("NrProcessingOrder")
     older["setting_groups"].pop("NrProcessingOrder")
     older["request"] = older["applied_request"] = 0  # A freshly connected older runtime.
     receive(older)
     count = len(g.sent)
-    draw("Apply changes##bottom", changes={"NR source": 1})
-    g.changes["NR source"] = None  # No such widget existed in this draw.
+    draw("Apply changes##bottom", changes={"Apply at": 1})
+    g.changes["Apply at"] = None  # No such widget existed in this draw.
     g.callbacks.on_frame()
     assert len(g.sent) == count, "Older runtime received an unsupported rendering-order setting"
-    assert g["values"]["NR source"] is None
+    assert g["values"]["Apply at"] is None
     assert not any("Waiting for settings acknowledgement" in t for t in g.drawn.values()), "Unsupported in-flight order blocked reconnect"
-    assert any("NR source: Unavailable in this runtime" in t for t in g.drawn.values())
+    assert any("Apply at: Unavailable in this runtime" in t for t in g.drawn.values())
     receive({"protocol": 999, "settings": {}})
     draw()
     assert any("version mismatch" in t for t in g.drawn.values())
@@ -1076,7 +1077,7 @@ def run(engine):
     receive(state)
     count = len(g.sent)
     draw()
-    assert g["values"]["NR source"] == 1 and g["values"]["NR working scale"] == 0.37
+    assert g["values"]["Apply at"] == 1 and g["values"]["NR working scale"] == 0.37
     assert len(g.sent) == count, "Reconnect resent a discarded rendering-order edit"
     state["renderer"] = 0
     state["revision"] += 1
@@ -1102,6 +1103,163 @@ def run(engine):
     draw()
     assert g["values"]["DX11 -> DX12 transport"] is None
     assert g["values"]["Enable DLSS-NR"] is True
+    # Menus follow the runtime's shared game DLSS state. Intercepted keeps every option.
+    game = copy.deepcopy(state)
+    game["afw_experiment"]["enabled"] = False
+    game["settings"].update(Enabled=True, FgEnabled=True, FgFoveated=True, FgMatchSrRegion=True, FgCenterMethod=0,
+                            FgPeripheralMethod=1, NrEnabled=True, NrProcessingOrder=1, NrFoveated=True,
+                            NrUseSrFoveation=False, AutoStereoAlignment=True, CenterMode=0,
+                            NrOpticalShare=True, NrUniversalMotion=0)
+    game["game_dlss"] = {"state": "intercepted"}
+    receive(game)
+    draw()
+    assert "Game DLSS: hooked, waiting for a DLSS call" in g.drawn.values()
+    assert g.trees["DLSS-SR"] and g.trees["Stereo Eye Mapping"] and "Automatic stereo alignment" in g["values"]
+    assert g["values"]["DLSS-G preset"] is not None and g["values"]["Match DLSS-SR foveation region"] is True
+    assert g["values"]["Apply at"] == 1 and g["values"]["Depth convention"] is not None
+    assert g["values"]["Shared region width"] is None, "The SR tree owns the shared region while it is visible"
+    assert list(g.combos["FG center type"].values()) == ["DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"]
+    # Without game DLSS the runtime falls back. A late attach keeps the saved choices
+    # for the session; not_used switches them, and until that edit arrives the menu
+    # draws what runs instead. Older snapshots without the flags still hide.
+    shared = "Center optical flow is shared with DLSS-NR. Its area also covers the NR region."
+    late = [{"text": "Using Optiflow this session: game DLSS was loaded before Cheeky attached"},
+            {"text": "Applying DLSS-NR at Headset output this session: game DLSS was loaded before Cheeky attached"}]
+    notes = [{"text": "Switched Frame Gen to Optiflow: DLSS-G and DLSS Vectors need game DLSS"},
+             {"text": "Switched DLSS-NR to Headset output: game DLSS not detected"}]
+    count = len(g.sent)
+    for name, line, flags in (("not_used", "Game DLSS: not detected - DLSS-SR, DLSS-G and game-input options are hidden", {}),
+                              ("unknown", "Game DLSS: not detected (attached late) - DLSS-SR, DLSS-G and game-input options are hidden",
+                               {"fg_fallback": True, "nr_fallback": True, "notes": late}),
+                              ("not_used", "Game DLSS: not detected - DLSS-SR, DLSS-G and game-input options are hidden",
+                               {"fg_fallback": True, "nr_fallback": True, "notes": notes})):
+        game["game_dlss"] = dict({"state": name}, **flags)
+        receive(game)
+        draw()
+        drawn = list(g.drawn.values())
+        assert line in drawn
+        assert all(note["text"] in drawn for note in flags.get("notes", [])), "Switch notes must be shown"
+        assert "DLSS-SR" not in g.trees and "DLSS-RR" not in g.trees, "DLSS-SR must be hidden without game DLSS"
+        assert g.trees["DLSS hook"] and g["values"]["Use lower DLSS hook (DX12)"] is True, "Hook choice must stay reachable"
+        assert "Not available without game DLSS" in drawn
+        assert g["values"]["DLSS-G preset"] is None and g["values"]["Match DLSS-SR foveation region"] is True
+        assert g["values"]["Shared region width"] == game["settings"]["Width"], "Shared region must stay editable under Frame Gen"
+        assert g["values"]["Shared transition width"] == game["settings"]["TransitionWidth"]
+        assert list(g.combos["FG center type"].values()) == ["Optiflow"], "Game-data FG types must leave the list"
+        assert list(g.combos["FG periphery type"].values()) == ["Optiflow", "Previous frame"]
+        assert "Using Optiflow: DLSS-G needs game DLSS" in drawn and "Using Optiflow: DLSS Vectors needs game DLSS" in drawn
+        # Dependent controls follow the Optiflow method that runs.
+        assert g["values"]["FG center type"] == 1 and g["values"]["FG center method"] == 3
+        assert g["values"]["FG periphery type"] == 1 and g["values"]["FG periphery method"] == 1
+        for label in ("Center optical flow preset", "Center optical flow resolution", "Center optical flow vector grid",
+                      "Periphery optical flow preset", "Periphery optical flow resolution", "Periphery optical flow vector grid"):
+            assert g["values"][label] is not None, label + " must show while a saved game-only method runs as Optiflow"
+        # NR's fallback runs Universal DLSS 5, which shares that Optiflow center.
+        assert shared in drawn and any("Using FG optical flow" in t for t in drawn) and g["values"]["NR optical flow preset"] is None
+        assert not any("Frame Generation inactive" in t or "Choose Optiflow" in t for t in drawn)
+        assert g["values"]["Automatic stereo alignment"] is True, "OpenXR projection alignment works without game DLSS"
+        assert "Invert stereo eye order" not in g["values"] and "Stereo Eye Mapping" not in g.trees
+        assert g["values"]["Apply at"] is None
+        assert "Applied at: Headset output (Universal DLSS 5) - Game, before upscaling needs game DLSS" in drawn
+        assert not any("DLSS-NR inactive" in t for t in drawn) and g["values"]["Apply at headset output (Universal DLSS 5)"] is None
+        assert g["values"]["Use SR size and shape"] is None
+        assert g["values"]["Depth convention"] is None and g["values"]["Motion scale X"] is None
+        assert "Frame rate comparison" not in drawn and "GPU time (250 ms average)" not in drawn
+        assert len(g.sent) == count, "The menu must not rewrite saved choices itself"
+    draw(changes={"Shared region width": 0.6})
+    assert "\nWidth=0.6" in last(), "Shared region edits write the DLSS-SR width"
+    game["request"] = game["applied_request"] = int(last().splitlines()[1])
+    game["settings"]["Width"] = 0.6
+    receive(game)
+    # The center flow is shared only while FG runs and NR estimates motion; FG
+    # keeps its flow settings, which drive the shared flow.
+    for key, value in (("FgEnabled", False), ("NrUniversalMotion", 2), ("NrEnabled", False)):
+        game["settings"][key] = value
+        receive(game)
+        draw()
+        drawn = list(g.drawn.values())
+        assert shared not in drawn and g["values"]["Center optical flow preset"] is not None, key + " must stop the sharing note"
+        if key == "FgEnabled":
+            assert "Frame Generation is off; DLSS-NR uses its own optical flow." in drawn
+            assert g["values"]["NR optical flow preset"] is not None, "NR shows its own flow settings with FG off"
+        game["settings"][key] = {"FgEnabled": True, "NrUniversalMotion": 0, "NrEnabled": True}[key]
+    receive(game)
+    # An edit before the switch lands writes the Optiflow method that runs, never the saved one.
+    draw(changes={"FG center method": 1})
+    assert "FgCenterMethod=5" in last() and "FgPeripheralMethod" not in last()
+    game["request"] = game["applied_request"] = int(last().splitlines()[1])
+    game["settings"]["FgCenterMethod"] = 5
+    receive(game)
+    draw()
+    assert not any("Using Optiflow: DLSS-G" in t for t in g.drawn.values())
+    assert "Using Optiflow: DLSS Vectors needs game DLSS" in g.drawn.values()
+    count = len(g.sent)
+    # The runtime's switch arrives as an ordinary settings revision.
+    game["revision"] += 1
+    game["settings"].update(FgCenterMethod=7, FgPeripheralMethod=5, NrProcessingOrder=2, NrUniversalMotion=1, NrUniversalDepth=1)
+    receive(game)
+    draw()
+    drawn = list(g.drawn.values())
+    assert len(g.sent) == count, "The runtime's switch must not be echoed back"
+    assert g["values"]["FG center type"] == 1 and g["values"]["FG periphery type"] == 1
+    assert g["values"]["FG center method"] == 3 and g["values"]["FG periphery method"] == 1, "Optiflow keeps the interpolation"
+    assert not any(t.startswith("Using Optiflow") for t in drawn)
+    assert "Applied at: Headset output (Universal DLSS 5)" in drawn and g["values"]["Apply at"] is None
+    assert list(g.combos["Motion vectors"].values()) == ["Optical flow", "None (zero vectors)"]
+    assert g["values"]["Motion vectors"] == 1 and g["values"]["Depth"] is None
+    assert "Inputs: optical flow motion vectors, flat depth." in drawn
+    assert all(note["text"] in drawn for note in notes), "Only the switch notes remain"
+    preset = 0 if game["settings"]["FgOpticalCenterPreset"] else 2
+    draw(changes={"Center optical flow preset": preset})
+    assert len(g.sent) == count + 1 and f"FgOpticalCenterPreset={preset}" in last() and "FgCenterMethod" not in last(), \
+        "Later edits never send a method back"
+    game["request"] = game["applied_request"] = int(last().splitlines()[1])
+    game["settings"]["FgOpticalCenterPreset"] = preset
+    receive(game)
+    count = len(g.sent)
+    draw(changes={"FG periphery type": 2})
+    assert len(g.sent) == count + 1 and "FgPeripheralMethod=13" in last(), "Previous frame stays selectable"
+    game["request"] = game["applied_request"] = int(last().splitlines()[1])
+    game["settings"]["FgPeripheralMethod"] = 13
+    receive(game)
+    draw(changes={"Motion vectors": 2})
+    assert "NrUniversalMotion=2" in last(), "Zero vectors stay selectable without game DLSS"
+    game["request"] = game["applied_request"] = int(last().splitlines()[1])
+    game["settings"]["NrUniversalMotion"] = 2
+    # A DLSS module loading later brings the game-data options back; the switched
+    # saved values stay as they are.
+    back = "Game DLSS loaded: DLSS-G options available again"
+    game["game_dlss"] = {"state": "intercepted", "fg_fallback": False, "nr_fallback": False,
+                         "notes": notes + [{"text": back}]}
+    receive(game)
+    count = len(g.sent)
+    draw()
+    drawn = list(g.drawn.values())
+    assert "Game DLSS: hooked, waiting for a DLSS call" in drawn and back in drawn and g.trees["DLSS-SR"]
+    assert list(g.combos["FG center type"].values()) == ["DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"]
+    assert g["values"]["FG center method"] == 3, "Saved Optiflow choice stays after game DLSS loads"
+    assert "Applied at: Headset output (Universal DLSS 5)" not in drawn and g["values"]["Apply at"] == 3, \
+        "NR keeps its switched headset output as an ordinary choice"
+    assert len(g.sent) == count, "Options returning must not rewrite saved choices"
+    # A game resolution the layer cannot pair hides only the game-data FG types.
+    resolution = "Switched Frame Gen to Optiflow: game render resolution 1920x1080 differs from OpenXR eye resolution 2448x2448"
+    game["game_dlss"] = {"state": "active", "d3d11": False, "d3d12": True, "vulkan": False,
+                         "fg_fallback": True, "nr_fallback": False, "notes": [{"text": resolution}]}
+    game["settings"]["FgCenterMethod"] = 0
+    receive(game)
+    draw()
+    drawn = list(g.drawn.values())
+    assert "Game DLSS: active (D3D12)" in drawn and resolution in drawn and g.trees["DLSS-SR"]
+    assert list(g.combos["FG center type"].values()) == ["Optiflow"] and g["values"]["DLSS-G preset"] is None
+    assert "Using Optiflow: DLSS-G needs game DLSS" in drawn
+    assert g["values"]["Apply at"] == 3 and g["values"]["Depth"] == 1, "NR keeps its game choices at a resolution mismatch"
+    assert g["values"]["Shared region width"] is None, "The SR tree owns the shared region while it is visible"
+    game["game_dlss"] = {"state": "active", "d3d11": False, "d3d12": True, "vulkan": False,
+                         "fg_fallback": False, "nr_fallback": False, "notes": [{"text": resolution}]}
+    receive(game)
+    draw()
+    assert list(g.combos["FG center type"].values()) == ["DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"]
+    assert g["values"]["DLSS-G preset"] is not None
     print(engine + ": menu, protocol, drafts, acknowledgements, slider release and reconnect passed")
 
 

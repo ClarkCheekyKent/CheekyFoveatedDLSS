@@ -36,6 +36,12 @@ inline bool cheeky_fg_image_only(unsigned center,unsigned periphery,bool foveate
     return cheeky_fg_optical(center)&&!cheeky_fg_depth(center)&&
         (!foveated||periphery==cheeky_fg_previous||(cheeky_fg_optical(periphery)&&!cheeky_fg_depth(periphery)));
 }
+// DLSS-G, DLSS vectors and depth read the game's DLSS guides at its output size.
+inline bool cheeky_fg_needs_game(unsigned m) noexcept {return m<=4||(m>=9&&m<=12);}
+// Plain optical flow with the same interpolation; DLSS-G takes the menu default.
+inline unsigned cheeky_fg_without_game(unsigned m) noexcept {
+    return m==cheeky_fg_dlss?cheeky_fg_optical_flow:cheeky_fg_dlss_vectors(m)?m+4:m>=9&&m<=12?m-4:m;
+}
 inline bool cheeky_fg_uses_flow(unsigned center,unsigned periphery,bool foveated) noexcept {
     return cheeky_fg_optical(center)||(foveated&&cheeky_fg_optical(periphery));
 }

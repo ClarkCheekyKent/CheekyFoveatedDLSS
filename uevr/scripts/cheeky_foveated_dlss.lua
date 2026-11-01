@@ -198,25 +198,86 @@ local function game_dlss()
     end
     return false
 end
+-- The runtime's shared game DLSS state. Older runtimes only report the raw
+-- counters, so nothing is hidden until the state is known.
+local function game_dlss_state()
+    local state = (status.game_dlss or {}).state
+    if state then return state end
+    return game_dlss() and "active" or "intercepted"
+end
+-- Options that read the game's DLSS inputs are hidden only once it is not detected.
+local function game_hidden()
+    local state = game_dlss_state()
+    return state == "not_used" or state == "unknown"
+end
+-- The runtime's fallbacks: FG also falls back when the game's DLSS output size
+-- differs from the OpenXR eye. It switches the saved choices; until that edit
+-- arrives (or all session after a late attach) the draft may still hold one.
+local function fallback(name)
+    local value = (status.game_dlss or {})[name]
+    if value == nil then return game_hidden() end
+    return value == true
+end
+-- The FG method the runtime runs (cheeky_fg_without_game): plain optical flow
+-- with the same interpolation; DLSS-G takes the menu default. Controls that
+-- depend on a method are drawn from it, so they match before the switch lands.
+local function fg_runs(method)
+    if method == nil or not fallback("fg_fallback") then return method end
+    if method == 0 then return 7 elseif method >= 1 and method <= 4 then return method + 4
+    elseif method >= 9 and method <= 12 then return method - 4 end
+    return method
+end
+local function game_dlss_status()
+    local state = game_dlss_state()
+    if state == "active" then
+        local g, apis = status.game_dlss, {}
+        for index, name in ipairs({"D3D11", "D3D12", "Vulkan"}) do
+            local api = (status.apis or {})[index] or {}
+            if g and g[name:lower()] or not g and ((api.creates or 0) > 0 or (api.evaluations or 0) > 0) then apis[#apis + 1] = name end
+        end
+        return "Game DLSS: active" .. (#apis > 0 and " (" .. table.concat(apis, " + ") .. ")" or "")
+    elseif state == "not_used" then return "Game DLSS: not detected - DLSS-SR, DLSS-G and game-input options are hidden"
+    elseif state == "unknown" then return "Game DLSS: not detected (attached late) - DLSS-SR, DLSS-G and game-input options are hidden" end
+    return "Game DLSS: hooked, waiting for a DLSS call"
+end
 local function universal_nr()
-    return draft.NrEnabled == true and draft.NrProcessingOrder == 2
+    return draft.NrEnabled == true and (draft.NrProcessingOrder == 2 or
+        draft.NrProcessingOrder ~= nil and fallback("nr_fallback"))
 end
 -- Type and method share one saved ID: 0 DLSS-G, 1-4 DLSS vectors,
 -- 5-8 optical flow, 9-12 optical flow + depth, 13 previous frame.
 local function fg_method_combo(prefix, key, periphery)
-    local method = draft[key]
+    -- A saved game-only method draws as the Optiflow it runs as and is written
+    -- only when an edit changes it.
+    local method = fg_runs(draft[key])
     if method == nil then return end
     local function set(value) draft[key], dirty[key], ready_edits[key] = value, value, value end
-    local types = {"DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"}
-    if periphery then types[5] = "Previous frame" end
+    local names = {"DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth", "Previous frame"}
+    local kinds = periphery and {1, 2, 3, 4, 5} or {1, 2, 3, 4}
+    local function kind_of(m) return m == 0 and 1 or m == 13 and 5 or math.floor((m - 1) / 4) + 2 end
+    -- DLSS-G, DLSS vectors and depth read the game's DLSS guides.
+    local function needs_game(k) return k <= 2 or k == 4 end
     local shader = method >= 1 and method <= 12
-    local kind = method == 0 and 1 or method == 13 and 5 or math.floor((method - 1) / 4) + 2
+    local kind = kind_of(method)
     local interpolation = shader and (method - 1) % 4 + 1 or 3
-    local changed, value = imgui.combo(prefix .. " type", kind, types)
-    if changed and value ~= kind then
+    local hidden = fallback("fg_fallback")
+    if hidden then
+        -- Unavailable types leave the list.
+        kinds = periphery and {3, 5} or {3}
+    end
+    local types, selected = {}, 1
+    for index, k in ipairs(kinds) do
+        types[index] = names[k]
+        if k == kind then selected = index end
+    end
+    local changed, value = imgui.combo(prefix .. " type", selected, types)
+    if changed and kinds[value] ~= kind then
+        value = kinds[value]
         if value == 1 then set(0) elseif value == 5 then set(13) else set((value - 2) * 4 + interpolation) end
     end
-    method = draft[key]
+    -- Until the runtime's switch lands, say which saved type runs on optical flow.
+    if hidden and needs_game(kind_of(draft[key])) then text("Using Optiflow: " .. names[kind_of(draft[key])] .. " needs game DLSS") end
+    method = fg_runs(draft[key])
     if method >= 1 and method <= 12 then
         local methods = {"Simple Warping", "Bidirectional Interpolation",
             "Confidence-Guided Interpolation", "Confidence-Guided Interpolation (Fast)"}
@@ -417,6 +478,8 @@ end
 
 local function performance(d, f)
     gpu_memory("performance")
+    -- SR comparisons and DLSS timings exist only for the game's own DLSS.
+    if game_hidden() then return end
     section("Frame rate comparison")
     rows("fps", {{"SR enabled", fps(f.sr_enabled_ms)}, {"SR disabled", fps(f.sr_disabled_ms)},
         {"Frame time savings", saving(f.sr_disabled_ms, f.sr_enabled_ms)}})
@@ -522,6 +585,10 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         text("Cheeky " .. tostring(status.version))
         imgui.same_line(); donate_button()
     end
+    text(game_dlss_status())
+    -- One line per saved choice the runtime switched this session.
+    for _, note in ipairs((status.game_dlss or {}).notes or {}) do text(note.text) end
+    local hide_game, fg_hidden, nr_hidden = game_hidden(), fallback("fg_fallback"), fallback("nr_fallback")
     local message = tostring(status.message or "")
     if message ~= "" and message ~= "Settings applied" and not message:match("^Ready%.") then text(message) end
     local afw = status.afw_experiment or {}
@@ -543,7 +610,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             string.format("Generating (%.1f FG FPS)",fg_cadence.generated_fps or 0) or "No recent generated frames"
     end
     rows("overview", {{"Renderer", status.renderer == 1 and "DX12" or "DX11 direct"},
-        {"SR status", d.state or "Waiting"}, {"NR status", status.nr or "Waiting"},
+        {"SR status", hide_game and "Not available without game DLSS" or d.state or "Waiting"}, {"NR status", status.nr or "Waiting"},
         {"DLSS-FG status", fg_status_text},
         {"UEVR present cadence", fps(f.present_ms)}})
     if afw.enabled then rows("afw_overview", {{"AFW", afw_mode(afw)}}) end
@@ -567,9 +634,9 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         else
             check("Automatic stereo alignment", "AutoStereoAlignment")
             if not draft.AutoStereoAlignment then slider("Manual stereo X offset", "XOffset", -1, 1) end
-            if not draft.AutoStereoAlignment then check("Invert stereo eye order", "InvertStereoXOffset") end
+            if not draft.AutoStereoAlignment and not hide_game then check("Invert stereo eye order", "InvertStereoXOffset") end
         end
-        if imgui.tree_node("Stereo Eye Mapping") then
+        if not hide_game and imgui.tree_node("Stereo Eye Mapping") then
             local c = status.eye_calibration or {}
             if status.settings.EyeCalibrationMethod ~= nil then
                 local methods = {[0]="Auto",[1]="Standard corners",[2]="Timing tolerant corners",[3]="Full crop search",[4]="Manual"}
@@ -651,13 +718,20 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
     end
 
     local rr = d.reconstruction_feature == 13
-    if imgui.tree_node(rr and "DLSS-RR" or "DLSS-SR") then
-        if draft.D3D12LowerHook ~= nil then
-            check("Use lower DLSS hook (DX12)", "D3D12LowerHook")
-            text("Off selects the higher call. Restart the game after changing this.")
-            text("Active DLSS hook: " .. (status.d3d12_lower_hook_active and "Lower" or "Higher"))
-            if status.d3d12_hook_restart_required then text("DLSS hook change saved for next game restart.") end
-        end
+    local function lower_hook()
+        if draft.D3D12LowerHook == nil then return end
+        check("Use lower DLSS hook (DX12)", "D3D12LowerHook")
+        text("Off selects the higher call. Restart the game after changing this.")
+        text("Active DLSS hook: " .. (status.d3d12_lower_hook_active and "Lower" or "Higher"))
+        if status.d3d12_hook_restart_required then text("DLSS hook change saved for next game restart.") end
+    end
+    -- The hook choice can decide whether game DLSS is seen, so it stays reachable.
+    if hide_game and draft.D3D12LowerHook ~= nil and imgui.tree_node("DLSS hook") then
+        lower_hook()
+        imgui.tree_pop()
+    end
+    if not hide_game and imgui.tree_node(rr and "DLSS-RR" or "DLSS-SR") then
+        lower_hook()
         check("Enable foveated DLSS-SR", "Enabled")
         if draft.Enabled then
             section("Center")
@@ -726,13 +800,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             end
             local dx11 = status.renderer == 0
             local universal = universal_nr()
-            local native_shader11 = dx11 and not universal and (draft.FgCenterMethod or 0) > 0 and (not draft.FgFoveated or (draft.FgPeripheralMethod or 1) ~= 0)
+            local native_shader11 = dx11 and not universal and (fg_runs(draft.FgCenterMethod) or 0) > 0 and (not draft.FgFoveated or (fg_runs(draft.FgPeripheralMethod) or 1) ~= 0)
             local percent = {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"}
             section("Foveation")
             if draft.FgCenterMethod ~= nil then
                 fg_method_combo("FG center", "FgCenterMethod", false)
             end
-            if draft.FgDlssgPreset ~= nil and ((draft.FgCenterMethod or 0) == 0 or
+            if draft.FgDlssgPreset ~= nil and not fg_hidden and ((draft.FgCenterMethod or 0) == 0 or
                     (draft.FgFoveated and draft.FgPeripheralMethod == 0)) then
                 combo("DLSS-G preset", "FgDlssgPreset", {[1]="Preset A", [2]="Preset B", [3]="Preset C"})
                 if draft.FgDlssgPreset == 2 then text("Preset B needs separate scene and HUD inputs; without them it behaves like Preset A.") end
@@ -740,13 +814,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
             end
             local optical_presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
             local optical_grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
-            if fg_optical(draft.FgCenterMethod) then
+            if fg_optical(fg_runs(draft.FgCenterMethod)) then
                 if draft.FgOpticalCenterPreset ~= nil then combo("Center optical flow preset", "FgOpticalCenterPreset", optical_presets) end
                 if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
                 if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
-                if universal and draft.NrOpticalShare then text("Center optical flow is shared with DLSS-NR. Its area also covers the NR region.") end
+                -- The layer shares it only while FG runs and NR estimates motion.
+                if draft.FgEnabled and universal and draft.NrOpticalShare and draft.NrUniversalMotion ~= 2 then
+                    text("Center optical flow is shared with DLSS-NR. Its area also covers the NR region.")
+                end
             end
-            if not game_dlss() and draft.FgCenterMethod ~= nil and draft.FgCenterMethod <= 4 then
+            if not fg_hidden and not game_dlss() and draft.FgCenterMethod ~= nil and draft.FgCenterMethod <= 4 then
                 text("DLSS-G and DLSS Vectors need game DLSS. Use Optiflow in games without it.")
             end
             if universal then
@@ -759,6 +836,13 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgMatchSrRegion ~= nil then check("Match DLSS-SR foveation region", "FgMatchSrRegion") end
                 if draft.FgMatchSrRegion then
                     text("Uses SR size, transition and per-eye placement, including gaze when available.")
+                    -- Without game DLSS the SR tree is hidden; edit the shared region here.
+                    if hide_game then
+                        slider("Shared region width", "Width", 0.2, 1)
+                        slider("Shared region height", "Height", 0.2, 1)
+                        slider("Shared transition width", "TransitionWidth", 0, 0.3)
+                        text("Shared with DLSS-SR. Placement and height offset are under Stereo and gaze.")
+                    end
                 else
                     slider("FG region width", "FgWidth", 0.2, 1)
                     slider("FG region height", "FgHeight", 0.2, 1)
@@ -769,7 +853,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgPeripheralPercent ~= nil then
                     combo("FG periphery scale", "FgPeripheralPercent", percent)
                     fg_method_combo("FG periphery", "FgPeripheralMethod", true)
-                    if fg_optical(draft.FgPeripheralMethod) then
+                    if fg_optical(fg_runs(draft.FgPeripheralMethod)) then
                         if draft.FgOpticalPeripheralPreset ~= nil then combo("Periphery optical flow preset", "FgOpticalPeripheralPreset", optical_presets) end
                         if draft.FgOpticalPeripheralPercent ~= nil then combo("Periphery optical flow resolution", "FgOpticalPeripheralPercent", percent) end
                         if draft.FgOpticalPeripheralGrid ~= nil then combo("Periphery optical flow vector grid", "FgOpticalPeripheralGrid", optical_grids) end
@@ -813,8 +897,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if native_shader11 then
                     text("Native D3D11 records every stage on the game's immediate context, so the separate DX12 GPU queues do not apply.")
                 elseif draft.FgQueuePriority ~= nil then
-                    local flow_queue = fg_optical(draft.FgCenterMethod) or
-                        (draft.FgFoveated and fg_optical(draft.FgPeripheralMethod))
+                    local flow_queue = fg_optical(fg_runs(draft.FgCenterMethod)) or
+                        (draft.FgFoveated and fg_optical(fg_runs(draft.FgPeripheralMethod)))
                     if flow_queue then
                         combo("FG GPU queue", "FgQueuePriority", {[2]="Shared game queue", [1]="Separate HIGH queue"})
                     else
@@ -1007,7 +1091,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 check("Foveated NR", "NrFoveated")
                 if draft.NrFoveated then
                     text("Uses Stereo and gaze settings, even with SR disabled.")
-                    check("Use SR size and shape", "NrUseSrFoveation")
+                    if not hide_game then check("Use SR size and shape", "NrUseSrFoveation")
+                    elseif draft.NrUseSrFoveation then text("Size and shape follow the saved DLSS-SR settings (Use SR size and shape is on).") end
                     if not draft.NrUseSrFoveation then
                         slider("NR width", "NrWidth", 0.2, 1)
                         slider("NR height", "NrHeight", 0.2, 1)
@@ -1020,17 +1105,22 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 section("Neural rendering")
                 combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A (Original)",[2]="Preset B (Faster)"})
                 text("Shared by all model passes. Preset B requires NR 310.9.16 or newer.")
-                if status.settings.NrProcessingOrder ~= nil then
+                local locations = {[0]="Game, after upscaling",[1]="Game, before upscaling",[2]="Headset output (Universal DLSS 5)"}
+                if status.settings.NrProcessingOrder ~= nil and nr_hidden then
+                    -- Headset output is the only location without game DLSS.
+                    if draft.NrProcessingOrder == 2 then text("Applied at: " .. locations[2])
+                    else text("Applied at: " .. locations[2] .. " - " .. (locations[draft.NrProcessingOrder] or locations[0]) .. " needs game DLSS") end
+                elseif status.settings.NrProcessingOrder ~= nil then
                     if universal_supported then
-                        combo("NR source", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling",[2]="Universal DLSS 5 (OpenXR submission)"})
+                        combo("Apply at", "NrProcessingOrder", locations, {1, 0, 2})
                     else
-                        combo("NR source", "NrProcessingOrder", {[0]="After upscaling",[1]="Before upscaling"})
+                        combo("Apply at", "NrProcessingOrder", {[0]=locations[0],[1]=locations[1]}, {1, 0})
                     end
                     if draft.NrProcessingOrder ~= 2 and not game_dlss() and universal_supported then
-                        text("After and Before upscaling need game DLSS. Use Universal DLSS 5 in games without it.")
+                        text("Game locations need game DLSS. Use Headset output (Universal DLSS 5) in games without it.")
                     end
                 else
-                    text("NR source: Unavailable in this runtime")
+                    text("Apply at: Unavailable in this runtime")
                 end
                 slider("NR working scale", "NrWorkingScale", 0.1, 1)
                 if universal_nr() then text("Universal DLSS 5 runs at headset resolution.") end
@@ -1049,9 +1139,11 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     end
                     slider("Transfer strength", "NrHdrTransferStrength", 0, 2)
                     slider("Color strength", "NrColorStrength", 0, 2)
-                    combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
-                    slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
-                    slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
+                    if not hide_game then
+                        combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
+                        slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
+                        slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
+                    end
                     imgui.tree_pop()
                 end
                 if status.settings.NrPasses ~= nil then
@@ -1065,9 +1157,20 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     text("Works with Frame Generation off. When enabled, Frame Generation uses the processed native images.")
                     text("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it.")
                     local game = game_dlss()
+                    if hide_game then
+                        -- Saved game inputs fall back in the layer: optical flow and flat depth.
+                        local zero = draft.NrUniversalMotion == 2
+                        local changed, value = imgui.combo("Motion vectors", zero and 2 or 1, {"Optical flow", "None (zero vectors)"})
+                        if changed and (value == 2) ~= zero then
+                            value = value == 2 and 2 or 0
+                            draft.NrUniversalMotion, dirty.NrUniversalMotion, ready_edits.NrUniversalMotion = value, value, value
+                        end
+                        text("Inputs: " .. (draft.NrUniversalMotion == 2 and "zero motion vectors" or "optical flow motion vectors") .. ", flat depth.")
+                    else
                     combo("Motion vectors", "NrUniversalMotion", {[0]="Optical flow",[1]="Game DLSS vectors",[2]="None (zero vectors)"})
                     combo("Depth", "NrUniversalDepth", {[0]="Automatic",[1]="Game DLSS depth",[2]="None (flat)"})
-                    if not game and (draft.NrUniversalMotion == 1 or draft.NrUniversalDepth == 1) then
+                    end
+                    if not game and not hide_game and (draft.NrUniversalMotion == 1 or draft.NrUniversalDepth == 1) then
                         text(draft.NrUniversalMotion == 2 and "No game DLSS detected: flat depth is used instead." or
                             "No game DLSS detected: optical flow and flat depth are used instead.")
                     end
@@ -1075,7 +1178,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         text("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.")
                     else
                     check("Share optical flow with Frame Generation", "NrOpticalShare")
-                    if draft.NrOpticalShare and draft.FgEnabled and fg_optical(draft.FgCenterMethod) then
+                    if draft.NrOpticalShare and draft.FgEnabled and fg_optical(fg_runs(draft.FgCenterMethod)) then
                         local presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
                         local grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
                         text(string.format("Using FG optical flow: %s, %d%%, %s. Change it under Frame Gen.",

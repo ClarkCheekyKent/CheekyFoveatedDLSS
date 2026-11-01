@@ -17,6 +17,8 @@ namespace {
 std::mutex settings_mutex;
 Settings::FrameGeneration fg_settings;
 std::atomic<bool> processing_allowed{true};
+// Missing game DLSS inputs (see set_game_input_fallback); never persisted.
+std::atomic<bool> game_fg_fallback{false}, game_nr_fallback{false};
 
 std::atomic<bool> enabled{true};
 std::atomic<bool> d3d12_lower_hook{true};
@@ -280,7 +282,8 @@ Settings configured_settings() noexcept {
 }
 
 Settings universal_nr_settings() noexcept {
-    auto settings = configured_settings();
+    auto settings = without_game_inputs(configured_settings(),
+        game_fg_fallback.load(std::memory_order_acquire), game_nr_fallback.load(std::memory_order_acquire));
     if (!processing_allowed.load(std::memory_order_acquire)) {
         settings.enabled = false;
         settings.nr_enabled = false;
@@ -292,7 +295,8 @@ Settings universal_nr_settings() noexcept {
 bool universal_nr_requested() noexcept {
     return processing_allowed.load(std::memory_order_acquire) &&
         nr_enabled.load(std::memory_order_acquire) &&
-        nr_order.load(std::memory_order_acquire) == NrProcessingOrder::universal;
+        (nr_order.load(std::memory_order_acquire) == NrProcessingOrder::universal ||
+         game_nr_fallback.load(std::memory_order_acquire));
 }
 
 Settings current_settings() noexcept {
@@ -503,6 +507,11 @@ void update_settings(const Settings& settings) noexcept {
 void set_processing_allowed(bool allowed) noexcept {
     processing_allowed.store(allowed, std::memory_order_release);
     reflex_override::processing.store(allowed,std::memory_order_release);
+}
+
+void set_game_input_fallback(const bool fg, const bool nr) noexcept {
+    game_fg_fallback.store(fg, std::memory_order_release);
+    game_nr_fallback.store(nr, std::memory_order_release);
 }
 
 void register_stereo_view(const std::uint64_t view_id) noexcept {

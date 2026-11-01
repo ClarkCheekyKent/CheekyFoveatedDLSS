@@ -246,6 +246,39 @@ int run_nr_processing_tests() {
         settings.nr_processing_order = NrProcessingOrder::before_upscaling;
         update_settings(settings);
         require(current_settings().nr_working_scale == 0.37F, "Order update changed saved scale");
+        {
+            // Without game DLSS inputs the effective settings fall back; saved ones do not change.
+            auto fallback = settings;
+            fallback.nr_enabled = true;
+            fallback.fg.center_method = cheeky_fg_dlss;
+            fallback.fg.peripheral_method = cheeky_fg_dlss_vectors_simple;
+            update_settings(fallback);
+            require(!universal_nr_requested() && current_settings().nr_enabled, "Game NR location fell back without a host request");
+            set_game_input_fallback(true, true);
+            const auto effective = universal_nr_settings();
+            require(universal_nr_requested() && nr_universal_active(effective) && !current_settings().nr_enabled,
+                "Missing game DLSS must run NR at the headset output and idle the game NR paths");
+            require(effective.fg.center_method == cheeky_fg_optical_flow &&
+                effective.fg.peripheral_method == cheeky_fg_optical_simple,
+                "Game-guide FG methods must run on plain optical flow");
+            const auto saved = configured_settings();
+            require(saved.nr_processing_order == NrProcessingOrder::before_upscaling &&
+                saved.fg.center_method == cheeky_fg_dlss && saved.fg.peripheral_method == cheeky_fg_dlss_vectors_simple,
+                "The fallback changed saved settings");
+            set_game_input_fallback(true, false);
+            require(!universal_nr_requested() && universal_nr_settings().fg.center_method == cheeky_fg_optical_flow,
+                "A resolution fallback must not move NR");
+            set_game_input_fallback(false, false);
+            require(!universal_nr_requested() && universal_nr_settings().fg.center_method == cheeky_fg_dlss,
+                "Clearing the fallback must restore the saved choices");
+            for (unsigned m = 0; m <= cheeky_fg_previous; ++m)
+                require(cheeky_fg_needs_game(cheeky_fg_without_game(m)) == false &&
+                    (cheeky_fg_without_game(m) == m) == !cheeky_fg_needs_game(m) &&
+                    (!cheeky_fg_shader(m) || !cheeky_fg_shader(cheeky_fg_without_game(m)) ||
+                        m == cheeky_fg_dlss || cheeky_fg_interpolation(m) == cheeky_fg_interpolation(cheeky_fg_without_game(m))),
+                    "Optical flow fallback must keep the interpolation");
+            update_settings(settings);
+        }
         for (auto order : {NrProcessingOrder::before_upscaling, NrProcessingOrder::after_upscaling}) {
             const auto resolution = dlss_nr_processing_resolution(order, 1600U, 1200U, 3200U, 2400U);
             require(resolution.width == (order == NrProcessingOrder::before_upscaling ? 1600U : 3200U),
