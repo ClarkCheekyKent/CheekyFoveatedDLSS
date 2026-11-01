@@ -229,8 +229,12 @@ struct Settings {
 inline bool uses_coordinated_center(const Settings& settings) noexcept {
     return settings.auto_stereo_alignment || settings.center_mode != FoveationCenterMode::fixed;
 }
+[[nodiscard]] bool universal_nr_requested() noexcept;
+// Universal DLSS 5 forces the layer's D3D12 bridge, so a DX11 game's DLSS
+// guides must reach D3D12 even for shader-only FG methods.
 inline bool fg_requires_d3d12(const Settings& settings) noexcept {
-    return settings.fg.enabled&&!cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated);
+    return settings.fg.enabled&&(universal_nr_requested()||
+        !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated));
 }
 
 using CropGeometry = FoveationGeometry;

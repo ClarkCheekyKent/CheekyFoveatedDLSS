@@ -203,7 +203,8 @@ void fg_forget_feature(const NgxHandle* handle) noexcept try {
 void fg_publish_shader11(ID3D11DeviceContext* context,const NgxHandle* handle,const NgxParameters* p) noexcept try {
     if(!enabled()||!context||!handle||!p)return;
     const auto settings=current_settings();
-    if(!cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
+    // With Universal DLSS 5 the layer uses the D3D12 bridge; guides go through the transport.
+    if(universal_nr_requested()||!cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
     const auto layer=quad_view_module();const auto observe=layer?reinterpret_cast<CheekyFgShaderObserve11Fn>(GetProcAddress(layer,"CheekyFG_ObserveShaderD3D11V1")):nullptr;
     if(!observe)return;
     unsigned flags{};bool known{};

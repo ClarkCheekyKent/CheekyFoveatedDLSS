@@ -1908,8 +1908,9 @@ bool evaluate_d3d11_via_d3d12(
     // Shader-only FG on a D3D11 game runs natively in the OpenXR layer and
     // takes its guides from fg_publish_shader11. Sharing DLSS-G guides through
     // this transport too (on with DLSS-NR) was pure overhead every frame.
-    const bool dlss_fg=settings.fg.enabled&&
-        !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated);
+    // Universal DLSS 5 disables the native D3D11 FG backend (it needs the D3D12
+    // bridge), so DLSS-vector methods then take their guides from here too.
+    const bool dlss_fg=fg_requires_d3d12(settings);
     // Shared guides: the peripheral DLAA full-frame depth/motion below are the
     // same depth conversion and MV box as the FG (and NR-before) guides.
     const bool share_guides=settings.peripheral_dlaa_enabled;
