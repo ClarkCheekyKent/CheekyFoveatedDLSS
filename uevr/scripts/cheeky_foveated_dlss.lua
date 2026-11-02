@@ -240,9 +240,13 @@ local function game_dlss_status()
     elseif state == "unknown" then return "Game DLSS: not detected (attached late) - DLSS-SR, DLSS-G and game-input options are hidden" end
     return "Game DLSS: hooked, waiting for a DLSS call"
 end
+-- Headset output is selected (or the only location without game DLSS),
+-- whether or not DLSS-NR is enabled yet.
+local function universal_location()
+    return draft.NrProcessingOrder == 2 or draft.NrProcessingOrder ~= nil and fallback("nr_fallback")
+end
 local function universal_nr()
-    return draft.NrEnabled == true and (draft.NrProcessingOrder == 2 or
-        draft.NrProcessingOrder ~= nil and fallback("nr_fallback"))
+    return draft.NrEnabled == true and universal_location()
 end
 -- Type and method share one saved ID: 0 DLSS-G, 1-4 DLSS vectors,
 -- 5-8 optical flow, 9-12 optical flow + depth, 13 previous frame.
@@ -1088,133 +1092,133 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
         if status.renderer ~= 0 or draft.D3D11D3D12Transport or universal_supported then
             check("Enable DLSS-NR", "NrEnabled")
             text("Alt+Shift+> (period key): toggle DLSS-NR")
-            if draft.NrEnabled then
-                check("Foveated NR", "NrFoveated")
-                if draft.NrFoveated then
-                    text("Uses Stereo and gaze settings, even with SR disabled.")
-                    if not hide_game then check("Use SR size and shape", "NrUseSrFoveation")
-                    elseif draft.NrUseSrFoveation then text("Size and shape follow the saved DLSS-SR settings (Use SR size and shape is on).") end
-                    if not draft.NrUseSrFoveation then
-                        slider("NR width", "NrWidth", 0.2, 1)
-                        slider("NR height", "NrHeight", 0.2, 1)
-                        slider("NR roundness", "NrRoundness", 0, 1)
-                        text("Cosmetic only; no performance impact.")
-                        slider("NR transition", "NrTransitionWidth", 0, 0.3)
-                    end
-                    check("Show NR alignment border", "NrAlignmentBorder")
-                end
-                section("Neural rendering")
-                combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A (Original)",[2]="Preset B (Faster)"})
-                text("Shared by all model passes. Preset B requires NR 310.9.16 or newer.")
-                local locations = {[0]="Game, after upscaling",[1]="Game, before upscaling",[2]="Headset output (Universal DLSS 5)"}
-                if status.settings.NrProcessingOrder ~= nil and nr_hidden then
-                    -- Headset output is the only location without game DLSS.
-                    if draft.NrProcessingOrder == 2 then text("Applied at: " .. locations[2])
-                    else text("Applied at: " .. locations[2] .. " - " .. (locations[draft.NrProcessingOrder] or locations[0]) .. " needs game DLSS") end
-                elseif status.settings.NrProcessingOrder ~= nil then
-                    if universal_supported then
-                        combo("Apply at", "NrProcessingOrder", locations, {1, 0, 2})
-                    else
-                        combo("Apply at", "NrProcessingOrder", {[0]=locations[0],[1]=locations[1]}, {1, 0})
-                    end
-                    if draft.NrProcessingOrder ~= 2 and not game_dlss() and universal_supported then
-                        text("Game locations need game DLSS. Use Headset output (Universal DLSS 5) in games without it.")
-                    end
+            -- Same order as the standalone F8 menu; settings stay editable while DLSS-NR is off.
+            local locations = {[0]="Game, after upscaling",[1]="Game, before upscaling",[2]="Headset output (Universal DLSS 5)"}
+            if status.settings.NrProcessingOrder ~= nil and nr_hidden then
+                -- Headset output is the only location without game DLSS.
+                if draft.NrProcessingOrder == 2 then text("Applied at: " .. locations[2])
+                else text("Applied at: " .. locations[2] .. " - " .. (locations[draft.NrProcessingOrder] or locations[0]) .. " needs game DLSS") end
+            elseif status.settings.NrProcessingOrder ~= nil then
+                if universal_supported then
+                    combo("Apply at", "NrProcessingOrder", locations, {1, 0, 2})
                 else
-                    text("Apply at: Unavailable in this runtime")
+                    combo("Apply at", "NrProcessingOrder", {[0]=locations[0],[1]=locations[1]}, {1, 0})
                 end
-                slider("NR working scale", "NrWorkingScale", 0.1, 1)
-                if universal_nr() then text("Universal DLSS 5 runs at headset resolution.") end
-                combo("DLSS-NR style", "NrStyle", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
-                slider("NR intensity", "NrIntensity", 0, 1)
-                text("Intensity: 0 = no model edit, 1 = full model edit.")
-                if imgui.tree_node("Additional settings") then
-                    slider("Local tone", "NrLocalToneStrength", 0, 2)
-                    slider("Local structure", "NrLocalStructureStrength", 0, 2)
-                    check("Automatic mask", "NrAutomaticMask")
-                    if draft.NrAutomaticMask == true then
-                        slider("Skin structure", "NrSkinStructureStrength", 0, 2)
-                    end
-                    if (status.nr_details or {}).hdr_input == true then
-                        slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
-                    end
-                    slider("Transfer strength", "NrHdrTransferStrength", 0, 2)
-                    slider("Color strength", "NrColorStrength", 0, 2)
-                    if not hide_game then
-                        combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
-                        slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
-                        slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
-                    end
-                    imgui.tree_pop()
+                if draft.NrProcessingOrder ~= 2 and not game_dlss() and universal_supported then
+                    text("Game locations need game DLSS. Use Headset output (Universal DLSS 5) in games without it.")
                 end
-                if status.settings.NrPasses ~= nil then
-                    section("Model passes")
-                    combo("Model passes", "NrPasses", {[1]="1",[2]="2",[3]="3"}, {1, 2, 3})
-                    text("Each extra pass refines the previous one and costs about one more NR evaluation.")
-                    for number = 2, draft.NrPasses or 1 do nr_extra_pass(number) end
+            else
+                text("Apply at: Unavailable in this runtime")
+            end
+            if universal_location() and universal_supported then
+                section("Universal DLSS 5 inputs")
+                text("Works with Frame Generation off. When enabled, Frame Generation uses the processed native images.")
+                text("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it.")
+                local game = game_dlss()
+                if hide_game then
+                    -- Saved game inputs fall back in the layer: optical flow and flat depth.
+                    local zero = draft.NrUniversalMotion == 2
+                    local changed, value = imgui.combo("Motion vectors", zero and 2 or 1, {"Optical flow", "None (zero vectors)"})
+                    if changed and (value == 2) ~= zero then
+                        value = value == 2 and 2 or 0
+                        draft.NrUniversalMotion, dirty.NrUniversalMotion, ready_edits.NrUniversalMotion = value, value, value
+                    end
+                    text("Inputs: " .. (draft.NrUniversalMotion == 2 and "zero motion vectors" or "optical flow motion vectors") .. ", flat depth.")
+                else
+                combo("Motion vectors", "NrUniversalMotion", {[0]="Optical flow",[1]="Game DLSS vectors",[2]="None (zero vectors)"})
+                combo("Depth", "NrUniversalDepth", {[0]="Automatic",[1]="Game DLSS depth",[2]="None (flat)"})
                 end
-                if universal_nr() and universal_supported then
-                    section("Universal DLSS 5 inputs")
-                    text("Works with Frame Generation off. When enabled, Frame Generation uses the processed native images.")
-                    text("Runs in the OpenXR layer on each submitted eye image, so games without DLSS can use it.")
-                    local game = game_dlss()
-                    if hide_game then
-                        -- Saved game inputs fall back in the layer: optical flow and flat depth.
-                        local zero = draft.NrUniversalMotion == 2
-                        local changed, value = imgui.combo("Motion vectors", zero and 2 or 1, {"Optical flow", "None (zero vectors)"})
-                        if changed and (value == 2) ~= zero then
-                            value = value == 2 and 2 or 0
-                            draft.NrUniversalMotion, dirty.NrUniversalMotion, ready_edits.NrUniversalMotion = value, value, value
-                        end
-                        text("Inputs: " .. (draft.NrUniversalMotion == 2 and "zero motion vectors" or "optical flow motion vectors") .. ", flat depth.")
+                if not game and not hide_game and (draft.NrUniversalMotion == 1 or draft.NrUniversalDepth == 1) then
+                    text(draft.NrUniversalMotion == 2 and "No game DLSS detected: flat depth is used instead." or
+                        "No game DLSS detected: optical flow and flat depth are used instead.")
+                end
+                local live_vectors = (((status.nr_details or {}).universal or {}).game_motion) == true
+                -- Sharing only exists while FG runs and its center estimates optical flow.
+                local fg_flow = draft.FgEnabled and fg_optical(fg_runs(draft.FgCenterMethod))
+                if draft.NrUniversalMotion == 2 then
+                    text("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.")
+                elseif draft.NrUniversalMotion == 1 and live_vectors then
+                    text("Using the game's DLSS motion vectors. Optical flow is not used.")
+                else
+                if draft.NrUniversalMotion == 1 and game then
+                    text("The game's vectors are not reaching DLSS-NR right now, so it uses optical flow.")
+                end
+                if fg_flow then check("Share optical flow with Frame Generation", "NrOpticalShare") end
+                if draft.NrOpticalShare and fg_flow then
+                    local presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
+                    local grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
+                    text(string.format("Using FG optical flow: %s, %d%%, %s. Change it under Frame Gen.",
+                        presets[draft.FgOpticalCenterPreset or 1] or "Medium", draft.FgOpticalCenterPercent or 50,
+                        grids[draft.FgOpticalCenterGrid or 2] or "2x2 blocks"))
+                    text("The flow area covers both the NR region and the FG center.")
+                else
+                    if not draft.FgEnabled then text("Frame Generation is off; DLSS-NR uses its own optical flow.")
+                    elseif not fg_flow then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
+                    combo("NR optical flow preset", "NrOpticalPreset", {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"})
+                    combo("NR optical flow resolution", "NrOpticalPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
+                    combo("NR optical flow vector grid", "NrOpticalGrid", {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"})
+                end
+                end
+                local u = (status.nr_details or {}).universal or {}
+                if u.layer_reporting and u.projection_alignment then text("Stereo alignment: OpenXR projection") end
+                if u.requested then
+                    if not u.layer_reporting then text("Universal DLSS 5: waiting for the OpenXR layer")
                     else
-                    combo("Motion vectors", "NrUniversalMotion", {[0]="Optical flow",[1]="Game DLSS vectors",[2]="None (zero vectors)"})
-                    combo("Depth", "NrUniversalDepth", {[0]="Automatic",[1]="Game DLSS depth",[2]="None (flat)"})
+                        text(string.format("Eyes: left %s, right %s. Motion: %s%s. Depth: %s.",
+                            u.evaluated_left and "on" or "off", u.evaluated_right and "on" or "off",
+                            u.no_motion and "none (zero vectors)" or u.game_motion and "game DLSS vectors" or "optical flow", u.shared_flow and " (shared with FG)" or "",
+                            u.game_depth and "game DLSS" or "flat"))
                     end
-                    if not game and not hide_game and (draft.NrUniversalMotion == 1 or draft.NrUniversalDepth == 1) then
-                        text(draft.NrUniversalMotion == 2 and "No game DLSS detected: flat depth is used instead." or
-                            "No game DLSS detected: optical flow and flat depth are used instead.")
-                    end
-                    local live_vectors = (((status.nr_details or {}).universal or {}).game_motion) == true
-                    -- Sharing only exists while FG runs and its center estimates optical flow.
-                    local fg_flow = draft.FgEnabled and fg_optical(fg_runs(draft.FgCenterMethod))
-                    if draft.NrUniversalMotion == 2 then
-                        text("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.")
-                    elseif draft.NrUniversalMotion == 1 and live_vectors then
-                        text("Using the game's DLSS motion vectors. Optical flow is not used.")
-                    else
-                    if draft.NrUniversalMotion == 1 and game then
-                        text("The game's vectors are not reaching DLSS-NR right now, so it uses optical flow.")
-                    end
-                    if fg_flow then check("Share optical flow with Frame Generation", "NrOpticalShare") end
-                    if draft.NrOpticalShare and fg_flow then
-                        local presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
-                        local grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
-                        text(string.format("Using FG optical flow: %s, %d%%, %s. Change it under Frame Gen.",
-                            presets[draft.FgOpticalCenterPreset or 1] or "Medium", draft.FgOpticalCenterPercent or 50,
-                            grids[draft.FgOpticalCenterGrid or 2] or "2x2 blocks"))
-                        text("The flow area covers both the NR region and the FG center.")
-                    else
-                        if not draft.FgEnabled then text("Frame Generation is off; DLSS-NR uses its own optical flow.")
-                        elseif not fg_flow then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
-                        combo("NR optical flow preset", "NrOpticalPreset", {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"})
-                        combo("NR optical flow resolution", "NrOpticalPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
-                        combo("NR optical flow vector grid", "NrOpticalGrid", {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"})
-                    end
-                    end
-                    local u = (status.nr_details or {}).universal or {}
-                    if u.layer_reporting and u.projection_alignment then text("Stereo alignment: OpenXR projection") end
-                    if u.requested then
-                        if not u.layer_reporting then text("Universal DLSS 5: waiting for the OpenXR layer")
-                        else
-                            text(string.format("Eyes: left %s, right %s. Motion: %s%s. Depth: %s.",
-                                u.evaluated_left and "on" or "off", u.evaluated_right and "on" or "off",
-                                u.no_motion and "none (zero vectors)" or u.game_motion and "game DLSS vectors" or "optical flow", u.shared_flow and " (shared with FG)" or "",
-                                u.game_depth and "game DLSS" or "flat"))
-                        end
-                        if u.reason and u.reason ~= "" then text("Universal skipped: " .. tostring(u.reason)) end
-                    end
+                    if u.reason and u.reason ~= "" then text("Universal skipped: " .. tostring(u.reason)) end
                 end
+            end
+            section("Size and shape")
+            check("Foveated NR", "NrFoveated")
+            if draft.NrFoveated then
+                text("Uses Stereo and gaze settings, even with SR disabled.")
+                if not hide_game then check("Use SR size and shape", "NrUseSrFoveation")
+                elseif draft.NrUseSrFoveation then text("Size and shape follow the saved DLSS-SR settings (Use SR size and shape is on).") end
+                if not draft.NrUseSrFoveation then
+                    slider("NR width", "NrWidth", 0.2, 1)
+                    slider("NR height", "NrHeight", 0.2, 1)
+                    slider("NR roundness", "NrRoundness", 0, 1)
+                    text("Cosmetic only; no performance impact.")
+                    slider("NR transition", "NrTransitionWidth", 0, 0.3)
+                end
+                check("Show NR alignment border", "NrAlignmentBorder")
+            end
+            section("Neural rendering")
+            combo("DLSS-NR preset", "NrPreset", {[0]="Default",[1]="Preset A (Original)",[2]="Preset B (Faster)"})
+            text("Shared by all model passes. Preset B requires NR 310.9.16 or newer.")
+            slider("NR working scale", "NrWorkingScale", 0.1, 1)
+            if universal_location() then text("Universal DLSS 5 runs at headset resolution.") end
+            combo("DLSS-NR style", "NrStyle", {[0]="Standard",[1]="Natural",[2]="Cinematic"})
+            slider("NR intensity", "NrIntensity", 0, 1)
+            text("Intensity: 0 = no model edit, 1 = full model edit.")
+            if imgui.tree_node("Additional settings") then
+                slider("Local tone", "NrLocalToneStrength", 0, 2)
+                slider("Local structure", "NrLocalStructureStrength", 0, 2)
+                check("Automatic mask", "NrAutomaticMask")
+                if draft.NrAutomaticMask == true then
+                    slider("Skin structure", "NrSkinStructureStrength", 0, 2)
+                end
+                if (status.nr_details or {}).hdr_input == true then
+                    slider("Paper white", "NrPaperWhiteScale", 0.01, 8)
+                end
+                slider("Transfer strength", "NrHdrTransferStrength", 0, 2)
+                slider("Color strength", "NrColorStrength", 0, 2)
+                if not hide_game then
+                    combo("Depth convention", "NrDepthConvention", {[0]="Game/default",[1]="Normal",[2]="Reversed"})
+                    slider("Motion scale X", "NrMotionScaleXMultiplier", -4, 4)
+                    slider("Motion scale Y", "NrMotionScaleYMultiplier", -4, 4)
+                end
+                imgui.tree_pop()
+            end
+            if status.settings.NrPasses ~= nil then
+                section("Model passes")
+                combo("Model passes", "NrPasses", {[1]="1",[2]="2",[3]="3"}, {1, 2, 3})
+                text("Each extra pass refines the previous one and costs about one more NR evaluation.")
+                for number = 2, draft.NrPasses or 1 do nr_extra_pass(number) end
             end
             if imgui.button("Reset NR history / retry") then send("reset_nr") end
             text("nvngx_dlssnr.dll: beside the runtime DLL, or beside the running game executable.")

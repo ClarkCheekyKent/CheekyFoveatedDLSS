@@ -876,7 +876,9 @@ def run(engine):
     receive(state)
     draw()
     assert g.trees["DLSS-SR"] and g.trees["Performance"]
-    assert g["values"]["Fovea width"] is None and g["values"]["NR intensity"] is None
+    assert g["values"]["Fovea width"] is None
+    # Like the standalone menu, DLSS-NR settings stay editable before enabling it.
+    assert g["values"]["NR intensity"] is not None and g["values"]["Foveated NR"] is not None
     state["settings"].update(Enabled=True, NrEnabled=True, NrFoveated=False, NrAutomaticMask=False)
     receive(state)
     draw()
