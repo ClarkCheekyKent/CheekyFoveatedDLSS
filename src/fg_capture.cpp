@@ -83,6 +83,13 @@ bool enabled() noexcept {
     return (current_settings().fg.enabled || universal_nr_requested()) &&
         cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
 }
+// The guide producer runs for FG, and with FG off for Universal DLSS 5 when it
+// reads the game's vectors or depth. Every caller must agree, or the producer
+// flips generations each frame and never keeps a capture.
+bool capture_enabled() noexcept {
+    return (current_settings().fg.enabled || universal_nr_wants_game_guides()) &&
+        cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
+}
 std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // Pacing policy is NOT a texture/NGX feature configuration. Hashing
     // release_point here stopped FG, invalidated stereo snapshots and reset
@@ -137,14 +144,14 @@ void fg_uevr_mode_published(std::uint32_t mode) noexcept try {
     // OpenXR presenter may not have observed while it was not being called.
     const auto epoch=uevr_fg_mode_epoch.fetch_add(1,std::memory_order_acq_rel)+1;
     std::lock_guard lock(mutex);
-    synchronize_capture_enabled_locked(enabled());
+    synchronize_capture_enabled_locked(capture_enabled());
     trace_event("FG UEVR rendering mode changed %d -> %d epoch=%llu: %s (FgEnabled preference preserved)",
         previous,next,static_cast<unsigned long long>(epoch),cheeky::fg::uevr_mode_supports_fg(next)?"Native Stereo / FG allowed":"FG paused; non-native/unknown mode");
 } catch(...) {}
 void fg_uevr_mode_detached() noexcept { fg_uevr_mode_published(0xFFFFFFFFu); }
 void fg_set_uevr_queue(ID3D12CommandQueue* q) noexcept try {
     std::lock_guard lock(mutex);
-    synchronize_capture_enabled_locked(enabled());
+    synchronize_capture_enabled_locked(capture_enabled());
     if(!enabled()){store().collect();return;}
     // D3D11/OpenComposite has no D3D12 presentation queue. Its private
     // transport publishes the actual guide queue on each evaluation.
@@ -168,7 +175,7 @@ void fg_note_submission(ID3D12CommandQueue* q,ID3D12GraphicsCommandList* list) n
     pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
         [](const auto& p){return p->pending_submissions();});
 } catch(...) {}
-void fg_retire_snapshots() noexcept try {std::lock_guard lock(mutex);synchronize_capture_enabled_locked(enabled());store().collect();} catch(...) {}
+void fg_retire_snapshots() noexcept try {std::lock_guard lock(mutex);synchronize_capture_enabled_locked(capture_enabled());store().collect();} catch(...) {}
 void fg_note_reset(ID3D12GraphicsCommandList* list) noexcept try {
     std::lock_guard lock(mutex);for(auto& p:store().generations)p->reset(list);
     pending_submissions=std::any_of(store().generations.begin(),store().generations.end(),
@@ -479,12 +486,15 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     // Universal DLSS 5 reading the game's vectors or depth needs captured
     // guides even when FG's own methods are image-only. Its region sits on the
     // SR/gaze center FG's box uses, without FG's own manual offset.
-    const auto nr_request=nr_guide_request(.5f+m.focus_x-(settings.fg.foveated&&settings.fg.match_sr_region?0.f:settings.fg.x),
+    auto nr_request=nr_guide_request(.5f+m.focus_x-(settings.fg.foveated&&settings.fg.match_sr_region?0.f:settings.fg.x),
                                            .5f+m.focus_y-(settings.fg.foveated&&settings.fg.match_sr_region?0.f:settings.fg.y));
     const bool nr_guides=nr_request.motion||nr_request.depth;
+    // With FG off only NR's grid is prepared.
+    nr_request.fg_reads=settings.fg.enabled;
     std::lock_guard lock(mutex);
-    synchronize_capture_enabled_locked(settings.fg.enabled);
-    if(!settings.fg.enabled)return;
+    const bool capture=settings.fg.enabled||nr_guides;
+    synchronize_capture_enabled_locked(capture);
+    if(!capture)return;
     // Capture the source revision under the SAME lock as release/create and
     // snapshot recording. A stereo pair spanning a DLSS quality change is
     // rejected by FgSnapshots::acquire rather than mixing old/new guides.
@@ -575,7 +585,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     {
         using namespace cheeky::foveated_dlss;
         std::lock_guard lock(mutex);
-        synchronize_capture_enabled_locked(bool(out->enabled));
+        synchronize_capture_enabled_locked(capture_enabled());
         static bool previous{};
         static std::uint64_t previous_configuration{};
         if (previous != bool(out->enabled)||previous_configuration!=out->configuration) {
@@ -782,7 +792,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetGuideMemoryV1(CheekyFg
     if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
     using namespace cheeky::foveated_dlss;
     *out=CheekyFgMemory{};std::lock_guard lock(mutex);
-    synchronize_capture_enabled_locked(enabled());
+    synchronize_capture_enabled_locked(capture_enabled());
     store().collect();
     cheeky::fg_memory::Collector collect;
     for(const auto& generation:store().generations)generation->memory(*out,collect);

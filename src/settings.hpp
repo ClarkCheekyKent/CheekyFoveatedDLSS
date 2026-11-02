@@ -234,10 +234,12 @@ inline bool uses_coordinated_center(const Settings& settings) noexcept {
 // captures full-resolution guides for it, whatever FG's own methods read.
 [[nodiscard]] bool universal_nr_wants_game_guides() noexcept;
 // Universal DLSS 5 forces the layer's D3D12 bridge, so a DX11 game's DLSS
-// guides must reach D3D12 even for shader-only FG methods.
+// guides must reach D3D12 even for shader-only FG methods, and with FG off
+// when Universal DLSS 5 reads the game's vectors or depth.
 inline bool fg_requires_d3d12(const Settings& settings) noexcept {
-    return settings.fg.enabled&&(universal_nr_requested()||
-        !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated));
+    return (settings.fg.enabled&&(universal_nr_requested()||
+        !cheeky_fg_shader_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated)))||
+        universal_nr_wants_game_guides();
 }
 
 using CropGeometry = FoveationGeometry;

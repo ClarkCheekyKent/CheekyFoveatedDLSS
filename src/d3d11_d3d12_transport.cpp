@@ -1511,7 +1511,7 @@ bool evaluate_d3d11_via_d3d12(
     // re-enter the backend while its non-recursive view mutex is held.
     D3D12NgxInterceptionScope private_dx12_scope;
     result = 0xBAD00005U;
-    if ((!settings.enabled && !settings.nr_enabled && !settings.fg.enabled) || context == nullptr ||
+    if ((!settings.enabled && !settings.nr_enabled && !settings.fg.enabled && !fg_requires_d3d12(settings)) || context == nullptr ||
         game_handle == nullptr ||
         parameters == nullptr) {
         return reject_transport(D3D11TransportStatus::unsupported_context);
@@ -1751,7 +1751,7 @@ bool evaluate_d3d11_via_d3d12(
         ? scaled_capacity(nr_geometry.height, nr_motion_height, nr_processing_height) : 0U;
     if (!in_bounds(mv_x + mv_crop_x, mv_width, motion_desc.Width) ||
         !in_bounds(mv_y + mv_crop_y, mv_height, motion_desc.Height) ||
-        ((settings.peripheral_dlaa_enabled || settings.fg.enabled) && (
+        ((settings.peripheral_dlaa_enabled || settings.fg.enabled || fg_requires_d3d12(settings)) && (
             !in_bounds(mv_x, nr_motion_width, motion_desc.Width) ||
             !in_bounds(mv_y, nr_motion_height, motion_desc.Height)
         )) ||

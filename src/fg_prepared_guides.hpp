@@ -14,6 +14,7 @@ namespace cheeky::foveated_dlss {
 struct FgNrGuideRequest {
     bool motion{},depth{};
     float box[4]{0,0,1,1};
+    bool fg_reads{true}; // FG reads guides too; off, only NR's grid is prepared.
 };
 // Recorded at the end of NGX evaluation, inside NGX's existing command-state
 // invalidation boundary. The engine restores its bindings after EvaluateFeature.
@@ -134,6 +135,7 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         if(!dw||!dh||!mw||!mh)return false;
         std::array<cheeky::fg::GuideGrid,3> grids{cheeky::fg::guide_grid(g,dw,dh,mw,mh,0),cheeky::fg::guide_grid(g,dw,dh,mw,mh,1),
             nr_grid(g,dw,dh,mw,mh,nr_request)};
+        if(!nr_request.fg_reads)grids[0]=grids[1]={};
         const bool nr_shares_center=nr_reuses(grids[0],grids[2],g);
         if(nr_shares_center)grids[2]={};
         // Complete all fallible allocation/validation before altering the list.
