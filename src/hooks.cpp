@@ -4645,8 +4645,19 @@ NgxResult hook_core_create_d3d12(
     detect_afw_runtime();
     if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
-        // Let the lower create hook track its own handle and output contract.
-        return traced_feature_create(original, command_list, feature, parameters, handle, 3);
+        // The lower create hook tracks its own handle and output contract. It
+        // is installed only after its runtime is seen stable, so a game that
+        // creates features as nvngx_dlss.dll loads (Assetto Corsa EVO) is
+        // missed: record the created output here when nothing has, so
+        // evaluation can normalize OutWidth/OutHeight. Same handle either way.
+        const bool game = parameters != nullptr && is_dlss_feature(feature) && !d3d12_ngx_interception_active();
+        const NgxOutputExtent output_extent{game ? get_ui(parameters, "OutWidth") : 0U,
+            game ? get_ui(parameters, "OutHeight") : 0U};
+        const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 3);
+        if (game && ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
+            d3d12_game_output_extent(*handle).width == 0U)
+            remember_d3d12_game_view(*handle, feature, output_extent);
+        return result;
     }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
