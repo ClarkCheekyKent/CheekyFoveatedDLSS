@@ -35,6 +35,15 @@ struct CheekyFgEye {
     ID3D12Resource* peripheral_depth{};
     ID3D12Resource* peripheral_motion{};
 };
+// Universal DLSS 5 guides for one physical eye: the game's DLSS depth and
+// vectors over one eye-UV box, normalized like FG's prepared grids (stored
+// vector times the box size = eye-UV displacement, jitter removed). Either
+// texture may alias FG's own center grid when that already covers the box.
+struct CheekyFgNrGuides {
+    ID3D12Resource* depth{};
+    ID3D12Resource* motion{};
+    float rect[4]{0,0,1,1}; // Eye UV x,y,w,h covered by the whole textures.
+};
 struct CheekyFgPair {
     std::uint32_t abi{CHEEKY_FG_PAIR_ABI};
     std::uint32_t size{sizeof(CheekyFgPair)};
@@ -45,6 +54,7 @@ struct CheekyFgPair {
     std::uint64_t render_frame{}; // Producer frame serial (quad views); 0 for pairs matched at xrEndFrame.
     std::uint32_t fg_queue_priority{2}; // 1 separate HIGH (optical flow only); 2 shared game queue. Legacy 0 maps to shared.
     std::uint32_t release_point{}; // 0 submission, 1 GPU preparation, 2 completion, 3 generated XR, 4 submission + 4ms, 5 capacity, 6/7 generated XR, 8 capture GPU completion.
+    CheekyFgNrGuides nr[2]{}; // Physical eye order; empty unless DLSS-NR Universal reads game guides.
 };
 inline bool cheeky_fg_needs_ngx(const CheekyFgPair& pair) noexcept {
     for(const auto& g:pair.eyes)

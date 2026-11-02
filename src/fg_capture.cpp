@@ -18,6 +18,7 @@
 #include <mutex>
 #include <utility>
 #include <bit>
+#include <cmath>
 #include <unordered_map>
 
 using Microsoft::WRL::ComPtr;
@@ -327,6 +328,22 @@ void fg_publish_quad11(ID3D11DeviceContext* context,const NgxHandle* handle,cons
     source.queue_priority=settings.fg.queue_priority;source.release_point=settings.fg.release_point;
     observe(&source);
 }catch(...){}
+// Universal DLSS 5's guide box around its region centered at (u,v). NR takes
+// FG's center exactly when both follow SR; otherwise the layer places NR on
+// the same gaze or alignment a frame later, so the box keeps some slack.
+static FgNrGuideRequest nr_guide_request(float u,float v) noexcept {
+    FgNrGuideRequest r;
+    if(!universal_nr_wants_game_guides())return r;
+    const auto s=universal_nr_settings();
+    r.motion=s.nr_universal.motion==1U;r.depth=s.nr_universal.depth!=2U;
+    if(!s.nr_foveated||!std::isfinite(u)||!std::isfinite(v))return r; // Whole eye.
+    const bool from_fg=s.fg.foveated&&s.fg.match_sr_region&&s.nr_use_sr_foveation;
+    const float margin=from_fg?0.f:.03f;
+    const float w=std::clamp((s.nr_use_sr_foveation?s.width:s.nr_width)+2*margin,0.01f,1.f);
+    const float h=std::clamp((s.nr_use_sr_foveation?s.height:s.nr_height)+2*margin,0.01f,1.f);
+    r.box[0]=std::clamp(u-w*.5f,0.f,1.f-w);r.box[1]=std::clamp(v-h*.5f,0.f,1.f-h);r.box[2]=w;r.box[3]=h;
+    return r;
+}
 void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
                     const NgxParameters* p,NgxResult result) noexcept try {
     if(!enabled()||!cmd||!p||!handle||!ngx_succeeded(result))return;
@@ -459,6 +476,12 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     // Include the primary foveated-SR ON/OFF state, even if the game keeps
     // both NGX-SR feature handles alive while the mod changes rendering paths.
     const auto settings_configuration=configuration(settings);
+    // Universal DLSS 5 reading the game's vectors or depth needs captured
+    // guides even when FG's own methods are image-only. Its region sits on the
+    // SR/gaze center FG's box uses, without FG's own manual offset.
+    const auto nr_request=nr_guide_request(.5f+m.focus_x-(settings.fg.foveated&&settings.fg.match_sr_region?0.f:settings.fg.x),
+                                           .5f+m.focus_y-(settings.fg.foveated&&settings.fg.match_sr_region?0.f:settings.fg.y));
+    const bool nr_guides=nr_request.motion||nr_request.depth;
     std::lock_guard lock(mutex);
     synchronize_capture_enabled_locked(settings.fg.enabled);
     if(!settings.fg.enabled)return;
@@ -468,14 +491,14 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     m.configuration=fg_source_configuration(settings_configuration,game_sr_revision);
     if(identity.eye<2){auto meta=m;meta.depth=meta.motion=meta.peripheral_depth=meta.peripheral_motion=nullptr;
         color_metadata[identity.eye]={meta,settings_configuration,GetTickCount64()};}
-    if(cheeky_fg_image_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
+    if(!nr_guides&&cheeky_fg_image_only(settings.fg.center_method,settings.fg.peripheral_method,settings.fg.foveated))return;
     static std::uint64_t logged_mapping{};
     if(logged_mapping!=identity.mapping_revision){
         logged_mapping=identity.mapping_revision;
         trace_event("FG stereo identity revision=%llu calibrated=%u view=%llu physical_eye=%u (next complete pair resets history)",
             identity.mapping_revision,unsigned(assignment.calibrated),static_cast<unsigned long long>(view_id),identity.eye);
     }
-    const bool recorded=snapshots().record(cmd,m,identity);
+    const bool recorded=snapshots().record(cmd,m,identity,nr_request);
     if(!recorded)quad_skip("guide snapshot recording failed",dd.DepthOrArraySize,m.depth_width,m.depth_height);
     if(recorded){
         pending_submissions=true;++captured_guides;
@@ -654,11 +677,20 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyF
         (out->abi==2&&out->size==CHEEKY_FG_COLOR_OPTIONS_V2_SIZE)))return false;
     const auto s=current_settings();const auto& f=s.fg;const auto key=configuration(s);
     out->enabled=enabled()&&cheeky_fg_image_only(f.center_method,f.peripheral_method,f.foveated);
+    const bool nr_guides=out->enabled&&universal_nr_wants_game_guides();
     out->foveated=f.foveated;out->queue_priority=f.queue_priority;out->release_point=f.release_point;
     if(out->abi>=3){out->automatic_alignment_mask=0;out->aligned_height_offset=s.aligned_height_offset;}
     if(out->abi>=4)out->gaze_mask=0;
     const bool follow_gaze=f.foveated&&s.center_mode!=FoveationCenterMode::fixed;
     std::lock_guard lock(mutex);
+    if(nr_guides){
+        // While the game evaluates DLSS for both eyes, its guides are being
+        // captured for Universal DLSS 5, so FG takes the captured pairs
+        // instead of color-only frames. Without DLSS, FG stays color-only.
+        const auto now=GetTickCount64();bool live=true;
+        for(const auto& cached:color_metadata)live&=cached.configuration==key&&now-cached.time<500;
+        if(live)out->enabled=0;
+    }
     for(unsigned eye=0;eye<2;++eye){
         auto& g=out->eyes[eye];g={};
         const auto& cached=color_metadata[eye];
@@ -781,6 +813,7 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_AcquirePair(CheekyFgPair*
 extern "C" __declspec(dllexport) void __cdecl CheekyFG_ReleasePair(CheekyFgPair* p) noexcept {
     if(!p||p->abi!=CHEEKY_FG_PAIR_ABI)return;
     for(auto& eye:p->eyes){for(auto* resource:{eye.depth,eye.motion,eye.peripheral_depth,eye.peripheral_motion})if(resource)resource->Release();eye={};}
+    for(auto& nr:p->nr){for(auto* resource:{nr.depth,nr.motion})if(resource)resource->Release();nr={};}
     if(p->producer_queue)p->producer_queue->Release();p->producer_queue=nullptr;
     if(p->lease)p->lease->Release();p->lease=nullptr;
 }

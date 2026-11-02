@@ -230,6 +230,9 @@ inline bool uses_coordinated_center(const Settings& settings) noexcept {
     return settings.auto_stereo_alignment || settings.center_mode != FoveationCenterMode::fixed;
 }
 [[nodiscard]] bool universal_nr_requested() noexcept;
+// Universal DLSS 5 reads the game's DLSS motion vectors or depth. FG then
+// captures full-resolution guides for it, whatever FG's own methods read.
+[[nodiscard]] bool universal_nr_wants_game_guides() noexcept;
 // Universal DLSS 5 forces the layer's D3D12 bridge, so a DX11 game's DLSS
 // guides must reach D3D12 even for shader-only FG methods.
 inline bool fg_requires_d3d12(const Settings& settings) noexcept {

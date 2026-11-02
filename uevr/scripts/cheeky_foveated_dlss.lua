@@ -819,7 +819,8 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgOpticalCenterPercent ~= nil then combo("Center optical flow resolution", "FgOpticalCenterPercent", percent) end
                 if draft.FgOpticalCenterGrid ~= nil then combo("Center optical flow vector grid", "FgOpticalCenterGrid", optical_grids) end
                 -- The layer shares it only while FG runs and NR estimates motion.
-                if draft.FgEnabled and universal and draft.NrOpticalShare and draft.NrUniversalMotion ~= 2 then
+                local nr_vectors = draft.NrUniversalMotion == 1 and (((status.nr_details or {}).universal or {}).game_motion) == true
+                if draft.FgEnabled and universal and draft.NrOpticalShare and draft.NrUniversalMotion ~= 2 and not nr_vectors then
                     text("Center optical flow is shared with DLSS-NR. Its area also covers the NR region.")
                 end
             end
@@ -1174,11 +1175,19 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         text(draft.NrUniversalMotion == 2 and "No game DLSS detected: flat depth is used instead." or
                             "No game DLSS detected: optical flow and flat depth are used instead.")
                     end
+                    local live_vectors = (((status.nr_details or {}).universal or {}).game_motion) == true
+                    -- Sharing only exists while FG runs and its center estimates optical flow.
+                    local fg_flow = draft.FgEnabled and fg_optical(fg_runs(draft.FgCenterMethod))
                     if draft.NrUniversalMotion == 2 then
                         text("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.")
+                    elseif draft.NrUniversalMotion == 1 and live_vectors then
+                        text("Using the game's DLSS motion vectors. Optical flow is not used.")
                     else
-                    check("Share optical flow with Frame Generation", "NrOpticalShare")
-                    if draft.NrOpticalShare and draft.FgEnabled and fg_optical(fg_runs(draft.FgCenterMethod)) then
+                    if draft.NrUniversalMotion == 1 and game then
+                        text("The game's vectors are not reaching DLSS-NR right now, so it uses optical flow.")
+                    end
+                    if fg_flow then check("Share optical flow with Frame Generation", "NrOpticalShare") end
+                    if draft.NrOpticalShare and fg_flow then
                         local presets = {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"}
                         local grids = {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"}
                         text(string.format("Using FG optical flow: %s, %d%%, %s. Change it under Frame Gen.",
@@ -1187,7 +1196,7 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                         text("The flow area covers both the NR region and the FG center.")
                     else
                         if not draft.FgEnabled then text("Frame Generation is off; DLSS-NR uses its own optical flow.")
-                        elseif draft.NrOpticalShare then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
+                        elseif not fg_flow then text("FG's center does not use optical flow, so DLSS-NR runs its own.") end
                         combo("NR optical flow preset", "NrOpticalPreset", {[0]="Slow (quality)", [1]="Medium", [2]="Fast (performance)"})
                         combo("NR optical flow resolution", "NrOpticalPercent", {[25]="25%", [50]="50%", [75]="75%", [100]="100% native"})
                         combo("NR optical flow vector grid", "NrOpticalGrid", {[4]="4x4 blocks", [2]="2x2 blocks", [1]="1x1 (per pixel)"})

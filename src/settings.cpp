@@ -299,6 +299,15 @@ bool universal_nr_requested() noexcept {
          game_nr_fallback.load(std::memory_order_acquire));
 }
 
+bool universal_nr_wants_game_guides() noexcept {
+    // Without usable game DLSS inputs there are no guides to capture.
+    if (game_fg_fallback.load(std::memory_order_acquire) ||
+        game_nr_fallback.load(std::memory_order_acquire)) return false;
+    const auto settings = universal_nr_settings();
+    return nr_universal_active(settings) &&
+        (settings.nr_universal.motion == 1U || settings.nr_universal.depth != 2U);
+}
+
 Settings current_settings() noexcept {
     auto settings = universal_nr_settings();
     // Universal DLSS 5 runs in the OpenXR layer. The game's DLSS passes see

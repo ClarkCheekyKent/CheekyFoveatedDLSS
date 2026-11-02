@@ -677,6 +677,13 @@ int main(int argc, char** argv) {
             command("1\n942\nset\nAutoStereoAlignment=true\nFgMatchSrRegion=false");
             require(color_fn(&color_options)&&!color_options.automatic_alignment_mask,
                 "Custom FG placement does not inherit SR automatic alignment");
+            // Universal NR asks for the game's guides (automatic depth), but
+            // nothing evaluates DLSS here, so image-only FG stays color-only.
+            command("1\n947\nset\nFgPeripheralMethod=13");
+            color_options={};
+            require(color_fn(&color_options)&&color_options.enabled,
+                "Without game DLSS, image-only FG stays color-only while Universal NR wants game guides");
+            command("1\n948\nset\nFgPeripheralMethod=2");
             // Older layers supply only the original prefix. A canary in the
             // extension verifies the new runtime does not write past it.
             color_options.abi=2;color_options.size=CHEEKY_FG_COLOR_OPTIONS_V2_SIZE;color_options.automatic_alignment_mask=0x12345678;

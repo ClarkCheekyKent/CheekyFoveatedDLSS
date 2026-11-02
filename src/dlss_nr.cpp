@@ -1230,6 +1230,7 @@ bool evaluate_dlss_nr(
             processing_height
         );
 
+    const bool universal_route = frame.route == DlssNrRoute::universal;
     const auto signature = dlss_nr_history_signature(nr_settings_signature(settings, region), {
         frame.input_width, frame.input_height, frame.output_width, frame.output_height,
         processing_width, processing_height,
@@ -1237,7 +1238,10 @@ bool evaluate_dlss_nr(
         frame.color_base_x, frame.color_base_y, frame.depth_base_x, frame.depth_base_y,
         frame.motion_base_x, frame.motion_base_y,
         frame.motion_full_width, frame.motion_full_height, frame.depth_full_width, frame.depth_full_height,
-        frame.motion_copy_x, frame.motion_copy_y, frame.depth_copy_x, frame.depth_copy_y,
+        // Universal guide boxes follow the moving region; crop motion
+        // compensation covers that, so their origin is not history geometry.
+        universal_route ? 0U : frame.motion_copy_x, universal_route ? 0U : frame.motion_copy_y,
+        universal_route ? 0U : frame.depth_copy_x, universal_route ? 0U : frame.depth_copy_y,
         frame.motion_vectors_jittered, frame.color_is_region});
     const auto reset_generation = requested_nr_reset_generation.load(
         std::memory_order_acquire
@@ -1879,6 +1883,27 @@ bool evaluate_universal_nr(const CheekyNrUniversalEyeV1& eye) noexcept {
             return false;
         }
     }
+    // A guide texture covering only a box of the eye: describe the whole eye
+    // in its texels and where the box starts. The guide shader samples whole-
+    // eye positions relative to that origin.
+    const auto cover = [](const float* rect, std::uint32_t width, std::uint32_t height,
+        std::uint32_t& full_width, std::uint32_t& full_height, std::uint32_t& x, std::uint32_t& y) noexcept {
+        if (rect[0] == 0.0F && rect[1] == 0.0F && rect[2] == 1.0F && rect[3] == 1.0F) return true;
+        for (unsigned i = 0; i < 4U; ++i) if (!std::isfinite(rect[i])) return false;
+        if (rect[2] <= 0.0F || rect[3] <= 0.0F || rect[0] < 0.0F || rect[1] < 0.0F) return false;
+        full_width = (std::max)(width, static_cast<std::uint32_t>(std::lround(width / rect[2])));
+        full_height = (std::max)(height, static_cast<std::uint32_t>(std::lround(height / rect[3])));
+        x = (std::min)(full_width - width, static_cast<std::uint32_t>(std::lround(rect[0] * full_width)));
+        y = (std::min)(full_height - height, static_cast<std::uint32_t>(std::lround(rect[1] * full_height)));
+        return true;
+    };
+    if (!cover(eye.motion_cover, frame.motion_width, frame.motion_height, frame.motion_full_width,
+            frame.motion_full_height, frame.motion_copy_x, frame.motion_copy_y) ||
+        (eye.depth && !cover(eye.depth_cover, frame.depth_width, frame.depth_height, frame.depth_full_width,
+            frame.depth_full_height, frame.depth_copy_x, frame.depth_copy_y))) {
+        note_dlss_nr_skipped(DlssNrRoute::universal, settings, "Universal DLSS 5 guide box invalid");
+        return false;
+    }
     if (eye.has_center && std::isfinite(eye.center_u) && std::isfinite(eye.center_v)) {
         frame.center = {std::clamp(eye.center_u, 0.0F, 1.0F), std::clamp(eye.center_v, 0.0F, 1.0F)};
         frame.has_center = true;
@@ -1943,7 +1968,15 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyNR_GetUniversalOptionsV1(Che
     return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyNR_EvaluateUniversalV1(const CheekyNrUniversalEyeV1* eye) noexcept {
-    if (!eye || eye->abi != CHEEKY_NR_UNIVERSAL_ABI || eye->size != sizeof(*eye)) return false;
+    if (!eye || eye->abi != CHEEKY_NR_UNIVERSAL_ABI ||
+        (eye->size != sizeof(*eye) && eye->size != CHEEKY_NR_UNIVERSAL_EYE_V1_SIZE)) return false;
+    if (eye->size != sizeof(*eye)) {
+        // An older layer: its guides cover the whole eye (the defaults).
+        CheekyNrUniversalEyeV1 whole_eye{};
+        std::memcpy(&whole_eye, eye, CHEEKY_NR_UNIVERSAL_EYE_V1_SIZE);
+        whole_eye.size = sizeof(whole_eye);
+        return cheeky::foveated_dlss::evaluate_universal_nr(whole_eye);
+    }
     return cheeky::foveated_dlss::evaluate_universal_nr(*eye);
 }
 extern "C" __declspec(dllexport) void __cdecl CheekyNR_ReportUniversalV1(const CheekyNrUniversalStatusV1* status) noexcept {

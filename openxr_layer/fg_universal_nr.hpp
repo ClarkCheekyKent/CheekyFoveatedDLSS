@@ -221,6 +221,7 @@ struct UniversalNr12 {
         if(opts.motion==2&&!prepare_zero_motion()){out.reason="Universal DLSS 5 zero-vector allocation failed";close_all();return false;}
         struct EyeWork {unsigned w{},h{};OpticalConstants c{};bool flow{};ID3D12Resource* motion{};ID3D12Resource* depth{};
             unsigned motion_rect[4]{},depth_rect[4]{};float motion_scale[2]{1,1};bool game_motion{},game_depth{},depth_inverted{};
+            float motion_cover[4]{0,0,1,1},depth_cover[4]{0,0,1,1}; // Eye UV the motion/depth rects cover.
             bool has_center{};float center[2]{.5f,.5f};};
         std::array<EyeWork,2> work{};
         out.projection_alignment=opts.automatic_alignment&&in.alignment.valid;
@@ -248,6 +249,16 @@ struct UniversalNr12 {
                 if(dw&&dh){e.game_depth=true;e.depth=g.depth;e.depth_rect[0]=g.depth_base_x;e.depth_rect[1]=g.depth_base_y;
                     e.depth_rect[2]=dw;e.depth_rect[3]=dh;e.depth_inverted=g.depth_inverted!=0;}
             }
+            // With prepared guides, the runtime prepares NR's own box (or lends
+            // FG's center grid when it already covers it). Those vectors are
+            // normalized to the box with jitter removed.
+            const auto& box=in.guides->nr[eye];
+            if(opts.motion==1&&!raw_guides&&box.motion){const auto d=box.motion->GetDesc();
+                e.game_motion=true;e.motion=box.motion;e.motion_rect[2]=unsigned(d.Width);e.motion_rect[3]=d.Height;
+                e.motion_scale[0]=box.rect[2];e.motion_scale[1]=box.rect[3];std::copy_n(box.rect,4,e.motion_cover);}
+            if(opts.depth!=2&&!raw_guides&&box.depth){const auto d=box.depth->GetDesc();
+                e.game_depth=true;e.depth=box.depth;e.depth_rect[2]=unsigned(d.Width);e.depth_rect[3]=d.Height;
+                e.depth_inverted=g.depth_inverted!=0;std::copy_n(box.rect,4,e.depth_cover);}
             if(opts.motion==2){e.motion=zero_motion.Get();e.motion_rect[2]=e.motion_rect[3]=1;continue;}
             if(e.game_motion)continue;
             // Flow window: the NR region (with the usual halo), widened to FG's
@@ -326,6 +337,7 @@ struct UniversalNr12 {
                     opts.motion==2?D3D12_RESOURCE_STATE_GENERIC_READ:D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 nr.motion_x=e.motion_rect[0];nr.motion_y=e.motion_rect[1];nr.motion_width=e.motion_rect[2];nr.motion_height=e.motion_rect[3];
                 nr.motion_uv_scale_x=e.motion_scale[0];nr.motion_uv_scale_y=e.motion_scale[1];
+                std::copy_n(e.motion_cover,4,nr.motion_cover);std::copy_n(e.depth_cover,4,nr.depth_cover);
                 if(e.depth){nr.depth=e.depth;nr.depth_state=D3D12_RESOURCE_STATE_COMMON;nr.depth_x=e.depth_rect[0];nr.depth_y=e.depth_rect[1];
                     nr.depth_width=e.depth_rect[2];nr.depth_height=e.depth_rect[3];nr.depth_inverted=e.depth_inverted?1u:0u;}
                 nr.has_center=e.has_center?1u:0u;nr.center_u=e.center[0];nr.center_v=e.center[1];

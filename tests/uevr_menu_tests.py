@@ -981,6 +981,36 @@ def run(engine):
     receive(state)
     draw()
     assert g["values"]["NR optical flow preset"] == state["settings"]["NrOpticalPreset"]
+    # With game DLSS, an FG center without optical flow has nothing to share:
+    # no share checkbox, NR's own flow settings stay.
+    saved_game, saved_universal = copy.deepcopy(state.get("game_dlss")), copy.deepcopy(state["nr_details"]["universal"])
+    saved_nr_motion = state["settings"]["NrUniversalMotion"]
+    state["game_dlss"] = {"state": "active"}
+    state["settings"].update(FgCenterMethod=1, NrOpticalShare=True, NrUniversalMotion=0)
+    receive(state)
+    draw()
+    assert g["values"]["Share optical flow with Frame Generation"] is None
+    assert "FG's center does not use optical flow, so DLSS-NR runs its own." in g.drawn.values()
+    assert g["values"]["NR optical flow preset"] == state["settings"]["NrOpticalPreset"]
+    # Game DLSS vectors reaching NR replace optical flow: no flow or share controls.
+    state["settings"].update(FgCenterMethod=7, NrUniversalMotion=1)
+    state["nr_details"]["universal"]["game_motion"] = True
+    receive(state)
+    draw()
+    assert "Using the game's DLSS motion vectors. Optical flow is not used." in g.drawn.values()
+    assert g["values"]["Share optical flow with Frame Generation"] is None and g["values"]["NR optical flow preset"] is None
+    assert not any(t.startswith("Center optical flow is shared with DLSS-NR") for t in g.drawn.values())
+    # Selected but not reaching NR: say so, and show the optical flow it falls back to.
+    state["nr_details"]["universal"]["game_motion"] = False
+    receive(state)
+    draw()
+    assert "Using the game's DLSS motion vectors. Optical flow is not used." not in g.drawn.values()
+    assert g["values"]["Share optical flow with Frame Generation"] is True
+    if saved_game is None: state.pop("game_dlss", None)
+    else: state["game_dlss"] = saved_game
+    state["nr_details"]["universal"] = saved_universal
+    state["settings"]["NrUniversalMotion"] = saved_nr_motion
+    receive(state)
     saved_motion = state["settings"]["NrUniversalMotion"]
     state["settings"].update(FgEnabled=False, NrUniversalMotion=2)
     receive(state)

@@ -367,7 +367,7 @@ void game_combo(const char* label, std::uint32_t& value, std::initializer_list<G
     test_control(label);
 }
 
-void draw_nr_universal(Settings& s, const Settings& effective, bool quad, bool game_dlss, bool hidden) {
+void draw_nr_universal(Settings& s, const Settings& effective, bool quad, bool game_dlss, bool hidden, bool game_vectors_live) {
     auto& u = s.nr_universal;
     ImGui::SeparatorText("Universal DLSS 5 inputs");
     if (quad) ImGui::TextWrapped("Universal DLSS 5 runs on stereo OpenXR submissions; quad-view sessions keep the game's NR route.");
@@ -388,12 +388,20 @@ void draw_nr_universal(Settings& s, const Settings& effective, bool quad, bool g
         ImGui::TextWrapped("No motion estimation. DLSS-NR receives zero vectors; optical-flow sharing and tuning are unused.");
         return;
     }
-    ImGui::Checkbox("Share optical flow with Frame Generation", &u.share_optical);
-    test_control("NrOpticalShare");
-    if (u.motion == 1 && game_dlss) {
-        ImGui::TextWrapped("Optical flow is used only when the game's vectors are unavailable.");
+    // Game vectors reaching the layer replace optical flow entirely: nothing to tune or share.
+    if (u.motion == 1 && game_vectors_live) {
+        ImGui::TextWrapped("Using the game's DLSS motion vectors. Optical flow is not used.");
+        return;
     }
-    if (u.share_optical && s.fg.enabled && cheeky_fg_optical(effective.fg.center_method)) {
+    if (u.motion == 1 && game_dlss)
+        ImGui::TextWrapped("The game's vectors are not reaching DLSS-NR right now, so it uses optical flow.");
+    // Sharing only exists while FG runs and its center estimates optical flow.
+    const bool fg_flow = s.fg.enabled && cheeky_fg_optical(effective.fg.center_method);
+    if (fg_flow) {
+        ImGui::Checkbox("Share optical flow with Frame Generation", &u.share_optical);
+        test_control("NrOpticalShare");
+    }
+    if (u.share_optical && fg_flow) {
         constexpr const char* presets[]{"Slow (quality)", "Medium", "Fast (performance)"};
         const auto grid = s.fg.optical.center_grid;
         ImGui::TextWrapped("Using FG optical flow: %s, %u%%, %s. Change it in the Frame Gen tab.",
@@ -403,7 +411,7 @@ void draw_nr_universal(Settings& s, const Settings& effective, bool quad, bool g
         return;
     }
     if (!s.fg.enabled) ImGui::TextWrapped("Frame Generation is off; DLSS-NR uses its own optical flow.");
-    else if (u.share_optical) ImGui::TextWrapped("FG's center does not use optical flow, so DLSS-NR runs its own.");
+    else if (!fg_flow) ImGui::TextWrapped("FG's center does not use optical flow, so DLSS-NR runs its own.");
     combo("NR optical flow preset", u.optical_preset, "Slow (quality)\0Medium\0Fast (performance)\0");
     int percent = static_cast<int>(u.optical_percent / 25) - 1;
     ImGui::PushID("NR optical flow resolution");
@@ -439,7 +447,8 @@ void draw_nr(Settings& s, bool quad, std::string_view snapshot) {
     const bool universal = nr_hidden || s.nr_processing_order == NrProcessingOrder::universal;
     if (!game_dlss && !hidden && !universal)
         ImGui::TextWrapped("No game DLSS detected. Choose Headset output (Universal DLSS 5) to run DLSS-NR on the headset image.");
-    if (universal) draw_nr_universal(s, effective_settings(s, snapshot), quad, game_dlss, hidden);
+    if (universal) draw_nr_universal(s, effective_settings(s, snapshot), quad, game_dlss, hidden,
+        flag(member(member(snapshot, "nr_details"), "universal"), "game_motion"));
     if(quad)ImGui::TextWrapped("NR covers each assigned center view in full. Peripheral views do not run NR. D3D11 requires DX12 Transport.");
     if(!quad){
     ImGui::SeparatorText("Size and shape");
@@ -1208,7 +1217,8 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         fg_percent("Center optical flow resolution",s.optical.center_percent);
         optical_grid("Center optical flow vector grid",s.optical.center_grid);
         // The layer shares it only while FG runs and NR estimates motion.
-        if(s.enabled&&universal&&settings.nr_universal.share_optical&&settings.nr_universal.motion!=2)
+        if(s.enabled&&universal&&settings.nr_universal.share_optical&&settings.nr_universal.motion!=2&&
+            !(settings.nr_universal.motion==1&&flag(member(member(snapshot,"nr_details"),"universal"),"game_motion")))
             ImGui::TextWrapped("Center optical flow is shared with DLSS-NR. Its area also covers the NR region.");
     }
     if(universal){

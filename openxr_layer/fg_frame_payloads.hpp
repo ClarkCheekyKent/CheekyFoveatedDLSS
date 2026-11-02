@@ -10,7 +10,7 @@ namespace cheeky::fg {
 struct FrameGuides12 final : FrameGuides {
     CheekyFgPair pair;
     ComPtr<IUnknown> lease;
-    std::array<ComPtr<ID3D12Resource>,2> depth,motion,peripheral_depth,peripheral_motion;
+    std::array<ComPtr<ID3D12Resource>,2> depth,motion,peripheral_depth,peripheral_motion,nr_depth,nr_motion;
     // Only hook-free split-queue captures use this GPU-side dependency.
     // The producer queue signals it after the NGX guide command lists.
     ComPtr<ID3D12Fence> sync_fence;
@@ -18,7 +18,8 @@ struct FrameGuides12 final : FrameGuides {
     void retain(const CheekyFgPair& source) noexcept {
         pair=source;lease=source.lease;
         for(unsigned eye=0;eye<2;++eye){depth[eye]=source.eyes[eye].depth;motion[eye]=source.eyes[eye].motion;
-            peripheral_depth[eye]=source.eyes[eye].peripheral_depth;peripheral_motion[eye]=source.eyes[eye].peripheral_motion;}
+            peripheral_depth[eye]=source.eyes[eye].peripheral_depth;peripheral_motion[eye]=source.eyes[eye].peripheral_motion;
+            nr_depth[eye]=source.nr[eye].depth;nr_motion[eye]=source.nr[eye].motion;}
         // Explicit members own the returned references. The metadata copy
         // must never be passed to the bridge's ReleasePair function.
         pair.lease=nullptr;pair.producer_queue=nullptr;

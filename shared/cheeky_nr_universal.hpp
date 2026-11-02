@@ -64,7 +64,12 @@ struct CheekyNrUniversalEyeV1 {
     float center_u{.5f}, center_v{.5f};
     // Reported in the menu only.
     std::uint32_t game_motion{}, shared_flow{};
+    // Eye UV rectangle (x,y,w,h) the motion and depth texel rects cover. A
+    // guide texture may hold only a box around the NR region.
+    float motion_cover[4]{0, 0, 1, 1}, depth_cover[4]{0, 0, 1, 1};
 };
+// Layers built before the cover rectangles send the whole-eye prefix.
+inline constexpr std::size_t CHEEKY_NR_UNIVERSAL_EYE_V1_SIZE = offsetof(CheekyNrUniversalEyeV1, motion_cover);
 
 // Layer status for the menu, reported once per native stereo pair.
 struct CheekyNrUniversalStatusV1 {

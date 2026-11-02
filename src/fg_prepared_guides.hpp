@@ -9,6 +9,12 @@
 #include <cstring>
 
 namespace cheeky::foveated_dlss {
+// What Universal DLSS 5 reads: the game's vectors and/or depth over an eye-UV
+// box (x,y,w,h) around its region.
+struct FgNrGuideRequest {
+    bool motion{},depth{};
+    float box[4]{0,0,1,1};
+};
 // Recorded at the end of NGX evaluation, inside NGX's existing command-state
 // invalidation boundary. The engine restores its bindings after EvaluateFeature.
 // NGX command-state contract: https://docs.nvidia.com/ngx/latest/pdf/Programming-Guide.pdf
@@ -18,7 +24,7 @@ struct FgPreparedGuides {
     template<class T> using Ptr=Microsoft::WRL::ComPtr<T>;
     struct Buffers {
         struct Pass {Ptr<ID3D12Resource> depth,motion;};
-        std::array<Pass,2> passes;
+        std::array<Pass,3> passes; // FG center, FG periphery, Universal DLSS 5.
         Ptr<ID3D12DescriptorHeap> descriptors;
         void clear(){passes={};descriptors.Reset();}
     };
@@ -86,11 +92,36 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Format=format;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         return SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&out)));
     }
+    // Universal DLSS 5's grid: its box at the guides' render resolution, the
+    // resolution FG's center grid has at 100%.
+    static cheeky::fg::GuideGrid nr_grid(const CheekyFgEye& g,unsigned dw,unsigned dh,unsigned mw,unsigned mh,const FgNrGuideRequest& nr) noexcept {
+        if(!g.width||!g.height||(!nr.motion&&!nr.depth))return {};
+        cheeky::fg::GuideGrid r;
+        r.w=std::clamp(unsigned(std::lround(nr.box[2]*g.width)),1u,g.width);
+        r.h=std::clamp(unsigned(std::lround(nr.box[3]*g.height)),1u,g.height);
+        r.x=unsigned(std::clamp(std::lround(nr.box[0]*g.width),0l,long(g.width-r.w)));
+        r.y=unsigned(std::clamp(std::lround(nr.box[1]*g.height),0l,long(g.height-r.h)));
+        r.depth=nr.depth;r.motion=nr.motion;
+        const unsigned sw=std::min(dw,mw),sh=std::min(dh,mh);
+        r.width=r.color_width=std::clamp(unsigned(std::lround(double(sw)*r.w/g.width)),1u,sw);
+        r.height=r.color_height=std::clamp(unsigned(std::lround(double(sh)*r.h/g.height)),1u,sh);
+        return r;
+    }
+    // FG's center grid serves NR too when it holds what NR reads, contains
+    // NR's box (to a percent of the eye) and is not reduced in resolution.
+    static bool nr_reuses(const cheeky::fg::GuideGrid& center,const cheeky::fg::GuideGrid& nr,const CheekyFgEye& g) noexcept {
+        if(!nr.width||(nr.motion&&!center.motion)||(nr.depth&&!center.depth))return false;
+        const unsigned tx=g.width/100,ty=g.height/100;
+        return center.x<=nr.x+tx&&center.y<=nr.y+ty&&center.x+center.w+tx>=nr.x+nr.w&&center.y+center.h+ty>=nr.y+nr.h&&
+            double(center.width)/center.w>=.98*double(nr.width)/nr.w&&double(center.height)/center.h>=.98*double(nr.height)/nr.h;
+    }
     static void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* texture,D3D12_RESOURCE_STATES from,D3D12_RESOURCE_STATES to) {
         if(!texture||from==to)return;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition={texture,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,from,to};list->ResourceBarrier(1,&b);
     }
-    bool record(ID3D12Device* device,ID3D12GraphicsCommandList* list,CheekyFgEye& g,Buffers& buffers) {
+    bool record(ID3D12Device* device,ID3D12GraphicsCommandList* list,CheekyFgEye& g,Buffers& buffers,
+                const FgNrGuideRequest& nr_request,CheekyFgNrGuides& nr_out) {
+        nr_out={};
         const auto depth=native_d3d12_interface(g.depth),motion=native_d3d12_interface(g.motion);
         if(!depth||!motion)return false;
         const auto dd=depth->GetDesc(),md=motion->GetDesc();
@@ -101,18 +132,21 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         const unsigned dw=active(unsigned(dd.Width),g.depth_base_x,g.depth_width),dh=active(dd.Height,g.depth_base_y,g.depth_height),
             mw=active(unsigned(md.Width),g.motion_base_x,g.motion_width),mh=active(md.Height,g.motion_base_y,g.motion_height);
         if(!dw||!dh||!mw||!mh)return false;
-        const std::array<cheeky::fg::GuideGrid,2> grids{cheeky::fg::guide_grid(g,dw,dh,mw,mh,0),cheeky::fg::guide_grid(g,dw,dh,mw,mh,1)};
+        std::array<cheeky::fg::GuideGrid,3> grids{cheeky::fg::guide_grid(g,dw,dh,mw,mh,0),cheeky::fg::guide_grid(g,dw,dh,mw,mh,1),
+            nr_grid(g,dw,dh,mw,mh,nr_request)};
+        const bool nr_shares_center=nr_reuses(grids[0],grids[2],g);
+        if(nr_shares_center)grids[2]={};
         // Complete all fallible allocation/validation before altering the list.
-        for(unsigned pass=0;pass<2;++pass){const auto& grid=grids[pass];auto& p=buffers.passes[pass];
+        for(unsigned pass=0;pass<3;++pass){const auto& grid=grids[pass];auto& p=buffers.passes[pass];
             if(!grid.depth)p.depth.Reset();if(!grid.motion)p.motion.Reset();
             if((grid.depth&&!allocate(device,p.depth,grid.width,grid.height,DXGI_FORMAT_R32_FLOAT))||
                (grid.motion&&!allocate(device,p.motion,grid.width,grid.height,DXGI_FORMAT_R32G32_FLOAT)))return false;
         }
-        if(!buffers.descriptors){D3D12_DESCRIPTOR_HEAP_DESC desc{};desc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;desc.NumDescriptors=8;desc.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if(!buffers.descriptors){D3D12_DESCRIPTOR_HEAP_DESC desc{};desc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;desc.NumDescriptors=12;desc.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             if(FAILED(device->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&buffers.descriptors))))return false;}
         const unsigned stride=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto cpu=buffers.descriptors->GetCPUDescriptorHandleForHeapStart();
-        for(unsigned pass=0;pass<2;++pass){const auto& p=buffers.passes[pass];
+        for(unsigned pass=0;pass<3;++pass){const auto& p=buffers.passes[pass];
             for(unsigned input=0;input<2;++input){D3D12_SHADER_RESOURCE_VIEW_DESC view{};view.Format=input?mf:df;
                 view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
                 if(!input&&dd.DepthOrArraySize>1){
@@ -134,7 +168,7 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         ID3D12DescriptorHeap* heaps[]{buffers.descriptors.Get()};list->SetDescriptorHeaps(1,heaps);
         list->SetComputeRootSignature(root.Get());
         list->SetPipelineState(dd.DepthOrArraySize>1?pipeline_depth_array.Get():pipeline.Get());
-        for(unsigned pass=0;pass<2;++pass){const auto& grid=grids[pass];const auto& p=buffers.passes[pass];if(!grid.motion&&!grid.depth)continue;
+        for(unsigned pass=0;pass<3;++pass){const auto& grid=grids[pass];const auto& p=buffers.passes[pass];if(!grid.motion&&!grid.depth)continue;
             Constants c;c.rect[0]=float(grid.x)/g.width;c.rect[1]=float(grid.y)/g.height;c.rect[2]=float(grid.w)/g.width;c.rect[3]=float(grid.h)/g.height;
             c.offset[0]=float(g.depth_base_x);c.offset[1]=float(g.depth_base_y);c.offset[2]=float(g.motion_base_x);c.offset[3]=float(g.motion_base_y);
             c.dimensions[0]=float(dw);c.dimensions[1]=float(dh);c.dimensions[2]=float(mw);c.dimensions[3]=float(mh);
@@ -149,6 +183,12 @@ cbuffer Params:register(b0){float4 Rect;float4 GuideOffset;float4 Dimensions;flo
         g.depth_width=dw;g.depth_height=dh;g.motion_width=mw;g.motion_height=mh;
         g.depth=buffers.passes[0].depth.Get();g.motion=buffers.passes[0].motion.Get();
         g.peripheral_depth=buffers.passes[1].depth.Get();g.peripheral_motion=buffers.passes[1].motion.Get();
+        if(nr_request.motion||nr_request.depth){
+            const auto& grid=nr_shares_center?grids[0]:grids[2];const auto& p=buffers.passes[nr_shares_center?0:2];
+            nr_out.depth=nr_request.depth?p.depth.Get():nullptr;nr_out.motion=nr_request.motion?p.motion.Get():nullptr;
+            nr_out.rect[0]=float(grid.x)/g.width;nr_out.rect[1]=float(grid.y)/g.height;
+            nr_out.rect[2]=float(grid.w)/g.width;nr_out.rect[3]=float(grid.h)/g.height;
+        }
         g.prepared_guides=1;return true;
     }
 };

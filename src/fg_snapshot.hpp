@@ -25,6 +25,7 @@ class FgSnapshots {
     struct Shot {
         ComPtr<ID3D12Resource> depth,motion,source_depth,source_motion;
         FgPreparedGuides::Buffers prepared;
+        CheekyFgNrGuides nr; // Universal DLSS 5's view into `prepared`.
         D3D12_RESOURCE_DESC raw_depth_desc{},raw_motion_desc{};
         ComPtr<ID3D12GraphicsCommandList> list;
         CheekyFgEye meta;
@@ -311,7 +312,7 @@ public:
         }
         gpu_cost.commit();
     }
-    bool record(ID3D12GraphicsCommandList* commands,CheekyFgEye meta,FgGuideIdentity identity={}) {
+    bool record(ID3D12GraphicsCommandList* commands,CheekyFgEye meta,FgGuideIdentity identity={},const FgNrGuideRequest& nr={}) {
         const auto id=++ordinal; // Failed/dropped captures must leave a gap.
         if(!queue||!fence||!commands||!meta.depth||!meta.motion){failed_record=id;return false;}
         const auto recording=tag_recording(commands);if(!recording){failed_record=id;return false;}
@@ -365,14 +366,15 @@ public:
         tag_recording(commands);
         if(timestamp_frequency)slot->gpu_span.begin(device.Get(),commands);
         // Raw snapshots are only the fallback for guides preparation cannot handle.
-        const bool prepared=preparation.record(device.Get(),commands,meta,slot->prepared);
+        // Universal DLSS 5 then reads the raw guides directly.
+        const bool prepared=preparation.record(device.Get(),commands,meta,slot->prepared,nr,slot->nr);
         if(prepared){slot->depth.Reset();slot->motion.Reset();++prepared_captures;}
         else {
             // Never silently pass a multi-slice raw depth texture to the FG
             // consumer, which expects one 2D guide per physical eye.
             if(meta.depth->GetDesc().DepthOrArraySize>1){failed_record=id;return false;}
             ++preparation_fallbacks;
-            slot->prepared.clear();
+            slot->prepared.clear();slot->nr={};
             if(!allocate(meta.depth,slot->depth,dr)||!allocate(meta.motion,slot->motion,mr)){failed_record=id;return false;}
             copy(commands,meta.depth,slot->depth.Get(),dr);copy(commands,meta.motion,slot->motion.Get(),mr);++raw_captures;
         }
@@ -486,7 +488,7 @@ public:
         const auto first_eye=a->identity.eye;
         if(first_eye==1)std::swap(a,b);
         auto* lease=new(std::nothrow) Lease(a,b);if(!lease)return false;
-        out.eyes[0]=a->meta;out.eyes[1]=b->meta;
+        out.eyes[0]=a->meta;out.eyes[1]=b->meta;out.nr[0]=a->nr;out.nr[1]=b->nr;
         // Keep both NGX and peripheral histories tied to physical eyes. Even
         // unjittered native motion must reset after a calibration/order switch.
         const bool reset=!history_valid||history_mapping!=a->identity.mapping_revision||history_first_eye!=first_eye||
@@ -496,6 +498,7 @@ public:
         history_valid=true;history_mapping=a->identity.mapping_revision;history_first_eye=first_eye;
         history_features[0]=a->meta.feature;history_features[1]=b->meta.feature;
         for(auto& e:out.eyes)for(auto* resource:{e.depth,e.motion,e.peripheral_depth,e.peripheral_motion})if(resource)resource->AddRef();
+        for(auto& n:out.nr)for(auto* resource:{n.depth,n.motion})if(resource)resource->AddRef();
         out.producer_queue=queue.Get();out.producer_queue->AddRef();out.lease=lease;
         consumed=expected;
         std::erase_if(latched,[&](const Latch& l){return l.token<=consumed;});return true;
