@@ -22,13 +22,17 @@ inline bool cheeky_fg_shader_only(unsigned center,unsigned periphery,bool foveat
 }
 // Color-only metadata comes from settings, rather than a captured NGX evaluation.
 struct CheekyFgColorOptionsV1 {
-    unsigned abi{3},size{sizeof(CheekyFgColorOptionsV1)},enabled{},foveated{};
+    unsigned abi{4},size{sizeof(CheekyFgColorOptionsV1)},enabled{},foveated{};
     CheekyFgEye eyes[2];
     unsigned queue_priority{2},release_point{3};
     // Only settings-derived, SR-matched centers need direct XR alignment.
     // Cached centers from intercepted rendering already carry placement/gaze.
     unsigned automatic_alignment_mask{};
     float aligned_height_offset{};
+    // v4: settings-derived centers the layer replaces with the frame's
+    // projected gaze (eye tracking or simulated gaze, no intercepted DLSS).
+    unsigned gaze_mask{};
 };
 constexpr unsigned CHEEKY_FG_COLOR_OPTIONS_V2_SIZE = offsetof(CheekyFgColorOptionsV1, automatic_alignment_mask);
+constexpr unsigned CHEEKY_FG_COLOR_OPTIONS_V3_SIZE = offsetof(CheekyFgColorOptionsV1, gaze_mask);
 using CheekyFgColorOptionsFn=bool(__cdecl*)(CheekyFgColorOptionsV1*);

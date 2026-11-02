@@ -535,6 +535,9 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetControl(CheekyFgContro
     if (!out || out->abi != CHEEKY_FG_CONTROL_ABI || out->size != sizeof(*out)) return false;
     using namespace cheeky::foveated_dlss;
     const auto settings=current_settings();
+    // The layer calls this every xrWaitFrame, so simulated/OpenXR gaze also
+    // reaches it in games without an intercepted DLSS evaluation.
+    sync_openxr_gaze_settings(settings);
     out->enabled=settings.fg.enabled && cheeky::fg::uevr_mode_supports_fg(uevr_fg_rendering_mode.load(std::memory_order_acquire));
     out->configuration=configuration(settings);
     // This transition does not require users to uncheck/recheck FG. The
@@ -646,19 +649,24 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyFgColorOptionsV1* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if(!out||!((out->abi==3&&out->size==sizeof(*out))||
+    if(!out||!((out->abi==4&&out->size==sizeof(*out))||
+        (out->abi==3&&out->size==CHEEKY_FG_COLOR_OPTIONS_V3_SIZE)||
         (out->abi==2&&out->size==CHEEKY_FG_COLOR_OPTIONS_V2_SIZE)))return false;
     const auto s=current_settings();const auto& f=s.fg;const auto key=configuration(s);
     out->enabled=enabled()&&cheeky_fg_image_only(f.center_method,f.peripheral_method,f.foveated);
     out->foveated=f.foveated;out->queue_priority=f.queue_priority;out->release_point=f.release_point;
-    if(out->abi==3){out->automatic_alignment_mask=0;out->aligned_height_offset=s.aligned_height_offset;}
+    if(out->abi>=3){out->automatic_alignment_mask=0;out->aligned_height_offset=s.aligned_height_offset;}
+    if(out->abi>=4)out->gaze_mask=0;
+    const bool follow_gaze=f.foveated&&s.center_mode!=FoveationCenterMode::fixed;
     std::lock_guard lock(mutex);
     for(unsigned eye=0;eye<2;++eye){
         auto& g=out->eyes[eye];g={};
         const auto& cached=color_metadata[eye];
         if(cached.configuration==key&&GetTickCount64()-cached.time<500)g=cached.eye;
         else {
-            if(out->abi==3&&s.auto_stereo_alignment&&f.match_sr_region)out->automatic_alignment_mask|=1u<<eye;
+            if(out->abi>=3&&s.auto_stereo_alignment&&f.match_sr_region)out->automatic_alignment_mask|=1u<<eye;
+            // No intercepted evaluation carries gaze: the layer projects it per frame.
+            if(out->abi>=4&&follow_gaze)out->gaze_mask|=1u<<eye;
             g.focus_width=f.foveated?(f.match_sr_region?s.width:f.width):1.f;
             g.focus_height=f.foveated?(f.match_sr_region?s.height:f.height):1.f;
             g.focus_feather=f.match_sr_region?s.transition_width:f.feather;
@@ -674,9 +682,22 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyF
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyOpenXR_GetBorderOptionsV1(CheekyXrBorderOptionsV1* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if(!out||out->abi!=1||out->size!=sizeof(*out))return false;
+    if(!out||!((out->abi==2&&out->size==sizeof(*out))||(out->abi==1&&out->size==CHEEKY_XR_BORDER_OPTIONS_V1_SIZE)))return false;
     const auto s=universal_nr_settings();
     out->enabled=enabled()&&nr_universal_active(s);
+    if(out->abi>=2){
+        // Boxes follow the same per-frame gaze the layer uses for FG focus and NR.
+        out->gaze_mask=0;
+        if(s.center_mode!=FoveationCenterMode::fixed){
+            const auto key=configuration(current_settings());bool intercepted{};
+            {std::lock_guard lock(mutex);const auto now=GetTickCount64();
+                for(const auto& cached:color_metadata)intercepted|=cached.configuration==key&&now-cached.time<500;}
+            const bool sr_gaze=!intercepted;
+            const bool nr_from_fg=s.fg.enabled&&s.fg.foveated&&s.fg.match_sr_region&&s.nr_foveated&&s.nr_use_sr_foveation;
+            if(sr_gaze)out->gaze_mask|=1u;
+            if(!nr_from_fg||sr_gaze)out->gaze_mask|=2u;
+        }
+    }
     out->show_sr=s.alignment_border_enabled;out->show_nr=s.nr_foveated&&s.nr_alignment_border_enabled;
     out->automatic_alignment=s.auto_stereo_alignment;out->aligned_height_offset=s.aligned_height_offset;
     out->width[0]=s.width;out->height[0]=s.height;

@@ -71,8 +71,11 @@ struct UniversalNr12 {
         const auto get=runtime?reinterpret_cast<CheekyNrGetUniversalOptionsV1Fn>(GetProcAddress(runtime,"CheekyNR_GetUniversalOptionsV1")):nullptr;
         if(!get)return false;
         if(!get(&out)){
-            out={};out.abi=1;out.size=CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE;
-            if(!get(&out))return false;
+            out={};out.abi=2;out.size=CHEEKY_NR_UNIVERSAL_OPTIONS_V2_SIZE;
+            if(!get(&out)){
+                out={};out.abi=1;out.size=CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE;
+                if(!get(&out))return false;
+            }
         }
         return out.enabled!=0;
     }
@@ -297,6 +300,7 @@ struct UniversalNr12 {
         for(unsigned eye=0;eye<2;++eye){
             out.color[eye]=copy_image(*in.pool,in.current_raw[eye],format,work[eye].w,work[eye].h);
             if(!out.color[eye]){out.reason="Universal DLSS 5 image allocation failed";break;}
+            if(opts.foveated)center_border(out.color[eye]->alignment_borders[1],work[eye].center[0],work[eye].center[1]);
         }
         bool good=out.color[0]&&out.color[1]&&(!in.convert_previous||(out.previous_copy[0]&&out.previous_copy[1]));
         bool submitted=true;

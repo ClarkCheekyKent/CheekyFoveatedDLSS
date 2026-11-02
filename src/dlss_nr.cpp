@@ -1912,7 +1912,8 @@ void report_universal_nr(const CheekyNrUniversalStatusV1& status) noexcept {
 
 extern "C" __declspec(dllexport) bool __cdecl CheekyNR_GetUniversalOptionsV1(CheekyNrUniversalOptionsV1* out) noexcept {
     using namespace cheeky::foveated_dlss;
-    if (!out || !((out->abi == 2 && out->size == sizeof(*out)) ||
+    if (!out || !((out->abi == 3 && out->size == sizeof(*out)) ||
+        (out->abi == 2 && out->size == CHEEKY_NR_UNIVERSAL_OPTIONS_V2_SIZE) ||
         (out->abi == 1 && out->size == CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE))) return false;
     const auto s = universal_nr_settings();
     out->enabled = nr_universal_active(s) ? 1U : 0U;
@@ -1922,10 +1923,13 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyNR_GetUniversalOptionsV1(Che
     out->optical_preset = s.nr_universal.optical_preset;
     out->optical_percent = s.nr_universal.optical_percent;
     out->optical_grid = s.nr_universal.optical_grid;
-    if (out->abi == 2) {
+    if (out->abi >= 2) {
         out->automatic_alignment = s.auto_stereo_alignment ? 1U : 0U;
         out->aligned_height_offset = s.aligned_height_offset;
     }
+    // Eye tracking or simulated gaze: the layer centers NR's own region on the
+    // frame's projected gaze, with or without the game's DLSS views.
+    if (out->abi >= 3) out->follow_gaze = s.nr_foveated && s.center_mode != FoveationCenterMode::fixed ? 1U : 0U;
     // FG's guide/color metadata carries SR placement and gaze when it matches SR.
     out->center_from_fg = s.fg.foveated && s.fg.match_sr_region && s.nr_foveated && s.nr_use_sr_foveation ? 1U : 0U;
     out->foveated = s.nr_foveated ? 1U : 0U;

@@ -249,9 +249,15 @@ struct SessionState {
         XrSpace space{XR_NULL_HANDLE};
         std::array<XrPosef, 2> poses{};
         bool valid{};
+        // Eye tracking or simulated gaze at this display time, in `space`.
+        XrQuaternionf gaze{0, 0, 0, 1};
+        bool gaze_valid{};
     };
     std::array<LocatedProjection, 8> located_history{};
     unsigned located_cursor{};
+    // Last projected per-eye gaze, held briefly across blinks and tracking gaps.
+    std::array<float, 2> held_gaze_u{}, held_gaze_v{};
+    XrTime held_gaze_time{};
     std::array<XrFovf, 2> submitted_fov{};
     std::array<XrQuaternionf, 2> submitted_rotation_delta{};
     XrTime submitted_projection_time{};
@@ -3338,12 +3344,14 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
     // rotation to the current tracked poses; never reuse an old absolute pose.
     std::array<XrView, 2> effective_views{views[0], views[1]};
     bool submitted_projection{};
+    std::size_t located_slot{};
     {
         std::lock_guard lock(state_mutex);
         auto it = sessions.find(session);
         if (it != sessions.end()) {
             auto& state = it->second;
-            auto& located = state.located_history[state.located_cursor++ % state.located_history.size()];
+            located_slot = state.located_cursor++ % state.located_history.size();
+            auto& located = state.located_history[located_slot];
             if (cheeky::openxr_calibration::observe_pose) {
                 const auto& q = motion_views[0].pose.orientation;
                 const float xyzw[]{q.x, q.y, q.z, q.w};
@@ -3353,6 +3361,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
             }
             located.time = locate_info->displayTime;
             located.space = locate_info->space;
+            located.gaze_valid = false;
             located.poses = {views[0].pose, views[1].pose};
             located.valid = view_state && (view_state->viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
             submitted_projection = state.submitted_projection_valid &&
@@ -3502,6 +3511,15 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrLocateViews(
                 state.center_u = projected_u;
                 state.center_v = projected_v;
             }
+            // The frame owner projects this gaze onto the views it submits for
+            // this display time (Universal NR, FG focus, borders), with or
+            // without the game's DLSS views.
+            auto& located = state.located_history[located_slot];
+            if (located.time == locate_info->displayTime && located.space == locate_info->space) {
+                located.gaze = gaze_location.pose.orientation;
+                located.gaze_valid = action_active && orientation_valid &&
+                    !state.unsupported_view_configuration;
+            }
             publish_snapshot_locked(&state);
         }
     }
@@ -3532,7 +3550,23 @@ cheeky::fg::StereoAlignment resolve_stereo_alignment(XrSession session,XrTime ti
             !(location.locationFlags&XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))return {};
         projection_from_tracked=location.pose.orientation;
     }
-    return cheeky::fg::project_stereo_alignment(projection,located.poses,projection_from_tracked);
+    auto alignment=cheeky::fg::project_stereo_alignment(projection,located.poses,projection_from_tracked);
+    if(located.gaze_valid)cheeky::fg::project_stereo_gaze(projection,located.gaze,projection_from_tracked,alignment);
+    // Hold the last projected gaze through blinks and short tracking gaps
+    // (400 ms, the runtime's default gaze hold) instead of snapping to the
+    // static center and back.
+    constexpr XrTime gaze_hold_ns=400000000;
+    std::lock_guard lock(state_mutex);
+    const auto owner=sessions.find(session);
+    if(owner!=sessions.end()){
+        auto& state=owner->second;
+        if(alignment.gaze_valid){
+            state.held_gaze_u=alignment.gaze_u;state.held_gaze_v=alignment.gaze_v;state.held_gaze_time=time;
+        }else if(state.held_gaze_time&&time>=state.held_gaze_time&&time-state.held_gaze_time<=gaze_hold_ns){
+            alignment.gaze_u=state.held_gaze_u;alignment.gaze_v=state.held_gaze_v;alignment.gaze_valid=true;
+        }
+    }
+    return alignment;
 }
 
 extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrCreateSwapchain(

@@ -429,6 +429,23 @@ bool calculate_afw_crop(const Settings& settings, DlssViewId view_id, IUnknown* 
 
 }  // namespace
 
+void sync_openxr_gaze_settings(const Settings& settings) noexcept {
+    if (const auto module = GetModuleHandleW(L"CheekyOpenXRLayer.dll")) {
+        using SetSimulationFn = void(__cdecl*)(std::uint32_t);
+        const auto set_simulation = reinterpret_cast<SetSimulationFn>(
+            GetProcAddress(module, "CheekyOpenXR_SetSimulatedGaze"));
+        const auto set_pattern = reinterpret_cast<SetSimulationFn>(
+            GetProcAddress(module, "CheekyOpenXR_SetSimulationPattern"));
+        const auto set_independent = reinterpret_cast<SetSimulationFn>(
+            GetProcAddress(module, "CheekyOpenXR_SetIndependentGaze"));
+        if (set_independent) set_independent(settings.independent_openxr_gaze ? 1U : 0U);
+        if (set_pattern != nullptr) set_pattern(settings.simulation_pattern);
+        if (set_simulation != nullptr) {
+            set_simulation(settings.center_mode == FoveationCenterMode::simulated_gaze ? 1U : 0U);
+        }
+    }
+}
+
 thread_local const ScopedCoordinatedCrop* coordinated_crop_override{};
 ScopedCoordinatedCrop::ScopedCoordinatedCrop(DlssViewId view, const CropGeometry& value,
     bool reset_history, const FoveationCenter* resolved_center) noexcept : view_id(view), crop(value), reset(reset_history),
@@ -472,20 +489,7 @@ bool calculate_coordinated_crop(
     const auto fixed_settings = settings_for_view(settings, view_id);
     if (resolved_center) *resolved_center = fixed_center(fixed_settings, render_width, render_height);
     const auto eye_assignment = stereo_eye_assignment(view_id);
-    if (const auto module = GetModuleHandleW(L"CheekyOpenXRLayer.dll")) {
-        using SetSimulationFn = void(__cdecl*)(std::uint32_t);
-        const auto set_simulation = reinterpret_cast<SetSimulationFn>(
-            GetProcAddress(module, "CheekyOpenXR_SetSimulatedGaze"));
-        const auto set_pattern = reinterpret_cast<SetSimulationFn>(
-            GetProcAddress(module, "CheekyOpenXR_SetSimulationPattern"));
-        const auto set_independent = reinterpret_cast<SetSimulationFn>(
-            GetProcAddress(module, "CheekyOpenXR_SetIndependentGaze"));
-        if (set_independent) set_independent(settings.independent_openxr_gaze ? 1U : 0U);
-        if (set_pattern != nullptr) set_pattern(settings.simulation_pattern);
-        if (set_simulation != nullptr) {
-            set_simulation(settings.center_mode == FoveationCenterMode::simulated_gaze ? 1U : 0U);
-        }
-    }
+    sync_openxr_gaze_settings(settings);
     if (settings.eye_independent_coverage) {
         return calculate_afw_crop(settings, view_id, output_resource, render_width, render_height,
             output_width, output_height, output_origin_x, output_origin_y, crop, reset_history, supplied_snapshot, resolved_center);

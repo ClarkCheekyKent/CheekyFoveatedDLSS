@@ -27,8 +27,11 @@ inline bool color_options(CheekyFgColorOptionsV1& options){
     const auto get=runtime?reinterpret_cast<CheekyFgColorOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetColorOptionsV1")):nullptr;
     if(!get)return false;
     if(!get(&options)){
-        options={};options.abi=2;options.size=CHEEKY_FG_COLOR_OPTIONS_V2_SIZE;
-        if(!get(&options))return false; // Older runtimes retain static placement.
+        options={};options.abi=3;options.size=CHEEKY_FG_COLOR_OPTIONS_V3_SIZE;
+        if(!get(&options)){
+            options={};options.abi=2;options.size=CHEEKY_FG_COLOR_OPTIONS_V2_SIZE;
+            if(!get(&options))return false; // Older runtimes retain static placement.
+        }
     }
     return options.enabled!=0;
 }

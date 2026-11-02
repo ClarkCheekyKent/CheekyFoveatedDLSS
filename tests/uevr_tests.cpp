@@ -8,6 +8,8 @@
 #include "support_bundle.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
 #include "../shared/cheeky_nr_universal.hpp"
+#include "../shared/cheeky_fg_shader11.hpp"
+#include "../shared/cheeky_xr_borders.hpp"
 #include "mock_ngx_parameters.hpp"
 #include <uevr/API.h>
 #include <d3d12.h>
@@ -684,6 +686,25 @@ int main(int argc, char** argv) {
             require(nr_fn(&nr_options)&&nr_options.automatic_alignment==0x12345678,
                 "Universal options retain ABI v1 prefix compatibility");
             nr_options.size=0;require(!nr_fn(&nr_options),"Universal options reject invalid prefix sizes");
+            // Simulated gaze without intercepted DLSS: the layer places FG focus,
+            // NR and the boxes on its own per-frame projected gaze.
+            command("1\n943\nset\nFgMatchSrRegion=true\nCenterMode=2\nNrUseSrFoveation=false");
+            color_options={};nr_options={};
+            require(color_fn(&color_options)&&color_options.gaze_mask==3&&nr_fn(&nr_options)&&nr_options.follow_gaze,
+                "Gaze center modes hand placement to the layer without game DLSS");
+            const auto border_fn=reinterpret_cast<CheekyXrGetBorderOptionsV1Fn>(GetProcAddress(runtime,"CheekyOpenXR_GetBorderOptionsV1"));
+            CheekyXrBorderOptionsV1 border_options;
+            require(border_fn&&border_fn(&border_options)&&border_options.gaze_mask==3,"Boxes follow layer gaze without game DLSS");
+            color_options={};color_options.abi=3;color_options.size=CHEEKY_FG_COLOR_OPTIONS_V3_SIZE;color_options.gaze_mask=0x12345678;
+            require(color_fn(&color_options)&&color_options.gaze_mask==0x12345678,"Color options retain ABI v3 prefix compatibility");
+            nr_options={};nr_options.abi=2;nr_options.size=CHEEKY_NR_UNIVERSAL_OPTIONS_V2_SIZE;nr_options.follow_gaze=0x12345678;
+            require(nr_fn(&nr_options)&&nr_options.follow_gaze==0x12345678,"Universal options retain ABI v2 prefix compatibility");
+            border_options={};border_options.abi=1;border_options.size=CHEEKY_XR_BORDER_OPTIONS_V1_SIZE;border_options.gaze_mask=0x12345678;
+            require(border_fn(&border_options)&&border_options.gaze_mask==0x12345678,"Border options retain ABI v1 prefix compatibility");
+            command("1\n944\nset\nCenterMode=0\nNrUseSrFoveation=true");
+            color_options={};nr_options={};border_options={};
+            require(color_fn(&color_options)&&!color_options.gaze_mask&&nr_fn(&nr_options)&&!nr_options.follow_gaze&&
+                border_fn(&border_options)&&!border_options.gaze_mask,"Fixed center mode keeps settings placement");
             const auto report_nr=reinterpret_cast<CheekyNrReportUniversalV1Fn>(GetProcAddress(runtime,"CheekyNR_ReportUniversalV1"));
             const auto report_alignment=reinterpret_cast<CheekyNrReportUniversalAlignmentV1Fn>(
                 GetProcAddress(runtime,"CheekyNR_ReportUniversalAlignmentV1"));

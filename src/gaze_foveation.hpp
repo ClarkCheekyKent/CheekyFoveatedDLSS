@@ -102,6 +102,9 @@ void apply_next_jump_preview(Settings& settings, DlssViewId view_id) noexcept;
 [[nodiscard]] std::string gaze_input_diagnostics_json(const CheekyGazeInputDiagnosticsV1& input);
 void forget_gaze_view(DlssViewId view_id) noexcept;
 void reset_gaze_foveation() noexcept;
+// Sends center mode, simulation pattern and the independent-gaze opt-in to the
+// OpenXR layer. Also called per frame without game DLSS (CheekyFG_GetControl).
+void sync_openxr_gaze_settings(const Settings& settings) noexcept;
 void record_gaze_copy(std::uint64_t command_list, GazeCopyEdge edge) noexcept;
 void submit_gaze_copies(std::uint64_t command_list) noexcept;
 void reset_gaze_copies(std::uint64_t command_list) noexcept;

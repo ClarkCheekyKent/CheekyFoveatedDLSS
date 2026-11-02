@@ -12,7 +12,7 @@ constexpr std::uint32_t CHEEKY_NR_UNIVERSAL_ABI = 1;
 
 // Read once per native stereo pair.
 struct CheekyNrUniversalOptionsV1 {
-    std::uint32_t abi{2}; // Options v2; eye/status ABI stays v1.
+    std::uint32_t abi{3}; // Options v3; eye/status ABI stays v1.
     std::uint32_t size{sizeof(CheekyNrUniversalOptionsV1)};
     std::uint32_t enabled{}; // DLSS-NR on, NR source Universal, processing allowed.
     std::uint32_t motion{}; // 0 optical flow, 1 game DLSS vectors (optical flow when unavailable), 2 none (zero vectors).
@@ -27,8 +27,12 @@ struct CheekyNrUniversalOptionsV1 {
     float center_u[2]{.5f, .5f}, center_v[2]{.5f, .5f};
     std::uint32_t automatic_alignment{};
     float aligned_height_offset{};
+    // v3: Eye tracking (real or simulated) is the center source. When NR does
+    // not reuse FG's region, the layer centers it on the frame's projected gaze.
+    std::uint32_t follow_gaze{};
 };
 constexpr std::uint32_t CHEEKY_NR_UNIVERSAL_OPTIONS_V1_SIZE = offsetof(CheekyNrUniversalOptionsV1, automatic_alignment);
+constexpr std::uint32_t CHEEKY_NR_UNIVERSAL_OPTIONS_V2_SIZE = offsetof(CheekyNrUniversalOptionsV1, follow_gaze);
 
 // One eye. The runtime records guides, NR and codec passes on `list`; the
 // caller executes it. `color` is the full eye image, UAV-capable, and is

@@ -842,7 +842,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 CheekyXrBorderOptionsV1 borders;
                 const auto border_options=fg_runtime?reinterpret_cast<CheekyXrGetBorderOptionsV1Fn>(
                     GetProcAddress(fg_runtime,"CheekyOpenXR_GetBorderOptionsV1")):nullptr;
-                const bool show_borders=border_options&&border_options(&borders)&&borders.enabled;
+                const bool show_borders=query_border_options(border_options,borders)&&borders.enabled;
                 for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
                     job->color[eye]->alignment_borders=show_borders?xr_alignment_borders(borders,job->alignment,eye,
                         unsigned(sub.imageRect.extent.width),unsigned(sub.imageRect.extent.height)):std::array<BorderRect,2>{};}
