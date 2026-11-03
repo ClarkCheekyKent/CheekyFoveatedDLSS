@@ -1229,12 +1229,13 @@ void diagnostic_lifetime_test() {
 #include "fg_shader11_nvapi_probe.hpp"
 #include "fg_pacing_simulation.hpp"
 #include "stereo_alignment_validation.hpp"
+#include "submission_diagnostics_validation.hpp"
 #include "nr_native_validation.hpp"
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
         if(argc>1&&std::string(argv[1])=="--openxr-stereo-alignment") {stereo_alignment_validation();return 0;}
-        if(argc>1&&std::string(argv[1])=="--nr-native") {native_nr_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--nr-native") {submission_diagnostics_validation();native_nr_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--menu-live-cursor") {
             for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB})menu_cursor_validation(format);
             custom_binding_menu_test();return 0;

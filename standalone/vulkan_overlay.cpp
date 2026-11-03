@@ -1,4 +1,5 @@
 #include "vulkan_overlay.hpp"
+#include "../shared/startup_diagnostics.hpp"
 #include "overlay_ui.hpp"
 #include "overlay_input.hpp"
 #include "../src/vulkan_api.hpp"
@@ -107,6 +108,9 @@ void initialize_gpu(Renderer& r) {
     init.CustomShaderFragCreateInfo={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};init.CustomShaderFragCreateInfo.codeSize=shader.size_bytes();init.CustomShaderFragCreateInfo.pCode=shader.data();
     if(!ImGui_ImplVulkan_Init(&init))throw VK_ERROR_INITIALIZATION_FAILED;
     r.ready=true;
+    static std::atomic_flag initialized{};
+    if (!initialized.test_and_set(std::memory_order_relaxed))
+        cheeky::startup::host_log("STARTUP milestone=overlay_initialized api=Vulkan");
 }
 }
 VkResult overlay_vulkan_present(const CheekyVulkanPresent& p,const OverlayRuntime& runtime) noexcept {

@@ -1,8 +1,14 @@
 // Native-cadence Universal NR. Reuses capture, NR and upload resources, but
 // forwards the application's runtime frame calls without FG pacing threads.
 namespace cheeky::fg {
+inline void BufferedPresenter::report_nr_submission_rejection(const char* reason) noexcept {
+    CheekyNrUniversalOptionsV1 options;
+    if(!UniversalNr12::options(options))return;
+    CheekyNrUniversalStatusV1 status;status.fallback=1;status.reset=1;status.reason=reason;
+    UniversalNr12::report(status,{});
+}
 inline XrResult BufferedPresenter::end_native_nr_frame(const XrFrameEndInfo* end,
-    const XrCompositionLayerProjection* projection) noexcept {
+    const XrCompositionLayerProjection* projection,const cheeky::openxr::SubmissionDiagnostic& selection_diagnostic) noexcept {
     if(!end)return XR_ERROR_VALIDATION_FAILURE;
     bool stopped{};
     {std::lock_guard lock(mx);stopped=stopping;if(!stopped)native_nr_ending=true;}
@@ -12,13 +18,15 @@ inline XrResult BufferedPresenter::end_native_nr_frame(const XrFrameEndInfo* end
     const auto submit_original=[&]{const auto result=runtime_end_frame(end);
         {std::lock_guard lock(mx);++ended;++native_count;changed.notify_all();}return result;};
     std::shared_ptr<Native> job;StereoAlignment alignment;bool prepared{};
+    auto rejection=selection_diagnostic;
+    if(!projection&&!rejection.reason)rejection.reason="OpenXR stereo projection is unavailable";
     // Space retention and projection resolution enter the layer's state lock.
     // Complete them before taking the capture lock, as in the FG frame owner.
     try {
         job=std::make_shared<Native>();
-        prepared=projection&&job->layers.prepare(end,projection)&&job->layers.retain_spaces(session,xr.retain_space);
+        prepared=projection&&job->layers.prepare(end,projection,&rejection)&&job->layers.retain_spaces(session,xr.retain_space,&rejection);
         if(prepared&&xr.stereo_alignment)alignment=xr.stereo_alignment(session,end->displayTime,projection);
-    }catch(...){return submit_original();}
+    }catch(...){rejection={};rejection.reason="Universal DLSS 5 frame preparation exception";prepared=false;}
     std::unique_lock capture_lock(capture_mutex);
     // The preceding frame's guide/input leases may retire only after its NR
     // commands complete. No game/render fence is signalled from this thread.
@@ -29,6 +37,7 @@ inline XrResult BufferedPresenter::end_native_nr_frame(const XrFrameEndInfo* end
         color_stamp_frame=color_stamp_token=0;capture_overflow=false;
     };
     const auto passthrough_native=[&](const char* reason){
+        rejection.reason=reason;note_submission_diagnostic(rejection);
         native_nr_previous.reset();cleanup();
         CheekyNrUniversalStatusV1 status;status.fallback=1;status.reset=1;status.reason=reason;
         UniversalNr12::report(status,{});
@@ -36,10 +45,11 @@ inline XrResult BufferedPresenter::end_native_nr_frame(const XrFrameEndInfo* end
         return submit_original();
     };
     try {
-        job->id=++next_id;job->epoch=epoch;
         // Unknown layer chains remain on the application's original path.
-        if(!prepared||capture_overflow)
-            return passthrough_native("Universal DLSS 5 requires a supported stereo OpenXR projection");
+        if(!prepared)return passthrough_native(rejection.reason?rejection.reason:"OpenXR stereo projection is unavailable");
+        rejection={};
+        if(capture_overflow)return passthrough_native("Universal DLSS 5 native eye capture overflow");
+        job->id=++next_id;job->epoch=epoch;
         job->alignment=alignment;
         if(backend->capture(job,projection,true,nullptr,nullptr)!=CaptureOutcome::captured)
             return passthrough_native("Universal DLSS 5 native eye capture unavailable");
@@ -67,6 +77,7 @@ inline XrResult BufferedPresenter::end_native_nr_frame(const XrFrameEndInfo* end
         auto headers=layers.replace_scene(replacement);auto submitted=*end;
         submitted.layerCount=unsigned(headers.size());submitted.layers=headers.data();
         native_nr_previous=job;cleanup();capture_lock.unlock();
+        note_submission_diagnostic({});
         const auto result=runtime_end_frame(&submitted);
         if(XR_FAILED(result))native_nr_previous.reset();
         {std::lock_guard lock(mx);++ended;++native_count;++frames;++ticks;changed.notify_all();}

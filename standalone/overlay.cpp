@@ -1,6 +1,7 @@
 #include "overlay.hpp"
 #include "overlay_ui.hpp"
 #include "overlay_input.hpp"
+#include "overlay_diagnostics.hpp"
 #include "settings_io.hpp"
 #include "version.h"
 #include "openvr_menu.hpp"
@@ -322,6 +323,9 @@ bool initialize(Renderer& r, IDXGISwapChain* swapchain, ID3D12CommandQueue* queu
     }
     r.input = attach_input(r.window);
     if (!r.input) { set_status("Unable to install the menu input handler"); return false; }
+    static std::atomic_flag initialized{};
+    if (!initialized.test_and_set(std::memory_order_relaxed))
+        log_overlay_diagnostic("STARTUP milestone=overlay_initialized");
     set_status("Menu ready (SDR, scRGB and HDR10)");
     return true;
 }

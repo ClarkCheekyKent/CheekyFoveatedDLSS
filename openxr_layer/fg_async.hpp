@@ -22,7 +22,22 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     bool native_nr_ending{}; // Protected by mx; native EndFrame owns private chains until return.
     XrTime native_nr_time_floor{}; // Catch up once when leaving FG's advanced application clock.
     std::shared_ptr<BufferedNative> native_nr_previous,native_nr_inflight;
-    XrResult end_native_nr_frame(const XrFrameEndInfo*,const XrCompositionLayerProjection*) noexcept;
+    // Accessed by the application's EndFrame owner, never by the GPU workers.
+    cheeky::openxr::SubmissionDiagnostic last_submission_diagnostic;
+    void note_submission_diagnostic(const cheeky::openxr::SubmissionDiagnostic& rejection) noexcept {
+        if(rejection.same_rejection(last_submission_diagnostic))return;
+        if(trace){
+            if(rejection.reason){char message[640]{};
+                sprintf_s(message,"OpenXR submission rejected: reason=%s layer=%d eye=%d structure_type=%d space=%p swapchain=%p view_count=%u",
+                    rejection.reason,rejection.layer,rejection.eye,int(rejection.structure_type),
+                    rejection.space,rejection.swapchain,rejection.view_count);trace(message);}
+            else if(last_submission_diagnostic.reason)trace("OpenXR submission preparation recovered");
+        }
+        last_submission_diagnostic=rejection;
+    }
+    XrResult end_native_nr_frame(const XrFrameEndInfo*,const XrCompositionLayerProjection*,
+        const cheeky::openxr::SubmissionDiagnostic&) noexcept;
+    void report_nr_submission_rejection(const char*) noexcept;
     BufferedPresenter();
     inline static thread_local const CheekyFgPair* quad_pair_for_call{};
     std::function<XrResult()> quad_native_fallback;
@@ -777,7 +792,11 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     }
     XrResult end_frame(const XrFrameEndInfo* end,const std::array<unsigned,2>&,
                        const XrCompositionLayerProjection* projection) noexcept override {
-        if(native_nr_only)return end_native_nr_frame(end,projection);
+        return end_frame(end,{},projection,{});
+    }
+    XrResult end_frame(const XrFrameEndInfo* end,const std::array<unsigned,2>&,
+        const XrCompositionLayerProjection* projection,const cheeky::openxr::SubmissionDiagnostic& selection_diagnostic) noexcept {
+        if(native_nr_only)return end_native_nr_frame(end,projection,selection_diagnostic);
         const auto* external=quad_pair_for_call;
         if(bypass)return xr.end_frame(session,end);
         if(!end)return XR_ERROR_VALIDATION_FAILURE;
@@ -795,6 +814,9 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
             const auto result=passthrough(end,"presenter degraded");std::lock_guard lock(mx);if(!stopping)++ended;changed.notify_all();return result;
         }
         {std::lock_guard capture_lock(capture_mutex);if(capture_overflow){
+            cheeky::openxr::SubmissionDiagnostic rejection;
+            rejection.reason="OpenXR native eye capture overflow";note_submission_diagnostic(rejection);
+            report_nr_submission_rejection(rejection.reason);
             if(hookless_complete)hookless_complete(0);
             capture_overflow=false;std::lock_guard lock(mx);++skipped;++ended;changed.notify_all();return XR_SUCCESS;}}
         XrResult result=XR_SUCCESS;
@@ -818,11 +840,16 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         job->color={};job->raw_color={};job->universal_nr=false;job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->policy={};job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
         job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
         job->alignment={};
-        if(!projection||!job->layers.prepare(end,projection)||!job->layers.retain_spaces(session,xr.retain_space)){
+        auto rejection=selection_diagnostic;
+        if(!projection&&!rejection.reason)rejection.reason="OpenXR stereo projection is unavailable";
+        if(!projection||!job->layers.prepare(end,projection,&rejection)||!job->layers.retain_spaces(session,xr.retain_space,&rejection)){
+            note_submission_diagnostic(rejection);
+            report_nr_submission_rejection(rejection.reason);
             if(inference_slot&&hookless_complete)hookless_complete(0);
-            result=passthrough(end,"unsupported OpenXR projection/layers");
+            result=passthrough(end,rejection.reason?rejection.reason:"unsupported OpenXR projection/layers");
         }
         else {
+            note_submission_diagnostic({});
             // Runtime space lookup may call back into the layer. Resolve before
             // taking the capture lock and retain the result on this frame.
             if(xr.stereo_alignment&&!external)job->alignment=xr.stereo_alignment(session,end->displayTime,projection);

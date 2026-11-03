@@ -1,4 +1,5 @@
 #include "overlay_input.hpp"
+#include "overlay_diagnostics.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <MinHook.h>
@@ -283,6 +284,7 @@ void poll_overlay_hotkey(InputState& input) {
 #endif
     const bool was_down = input.menu_key_down.exchange(down);
     if (down && !was_down && input.enabled && foreground(input.window)) {
+        log_first_menu_hotkey();
         // Preserve window-thread ownership of input release and cursor handling.
         // Both polling and normal key messages claim the same press edge.
         const auto message = toggle_message();
@@ -354,7 +356,10 @@ LRESULT CALLBACK overlay_wndproc(HWND window, UINT message, WPARAM wparam, LPARA
     if (input->enabled && focused && wparam == input->menu_key.load() &&
         (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_SYSKEYDOWN || message == WM_SYSKEYUP)) {
         if (key_down && !(lparam & (LPARAM{1} << 30))) {
-            if (!input->menu_key_down.exchange(true)) toggle_on_window_thread(input, window);
+            if (!input->menu_key_down.exchange(true)) {
+                log_first_menu_hotkey();
+                toggle_on_window_thread(input, window);
+            }
         }
         if (message == WM_KEYUP || message == WM_SYSKEYUP) input->menu_key_down = false;
         return 0;

@@ -2,6 +2,7 @@
 #include "vulkan_overlay.hpp"
 #include "runtime_host_api.hpp"
 #include "overlay.hpp"
+#include "../shared/startup_diagnostics.hpp"
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -22,6 +23,9 @@ HMODULE module{};
 std::mutex start_mutex, hooks_mutex, frame_mutex;
 std::mutex log_mutex;
 HANDLE host_log{INVALID_HANDLE_VALUE};
+std::once_flag host_log_once;
+std::atomic_flag first_present{};
+std::atomic_flag first_ready_present{};
 std::atomic<bool> started{};
 std::uint32_t active_host{};
 std::uint64_t attachment{};
@@ -57,19 +61,25 @@ ComPtr<ID3D12Device> observer_device;
 ComPtr<ID3D12CommandQueue> observer_queue;
 
 void log_host(const char* message) noexcept {
+    cheeky::startup::PreserveError error;
     std::lock_guard lock(log_mutex);
     OutputDebugStringA(message);
     if (host_log == INVALID_HANDLE_VALUE) return;
     SYSTEMTIME time{}; GetLocalTime(&time);
     char line[1024]{};
-    const auto count=snprintf(line,sizeof(line),"%02u:%02u:%02u.%03u %s\r\n",time.wHour,time.wMinute,time.wSecond,time.wMilliseconds,message);
+    const auto count=snprintf(line,sizeof(line),"%02u:%02u:%02u.%03u [P%lu T%lu] %s\r\n",time.wHour,time.wMinute,time.wSecond,time.wMilliseconds,GetCurrentProcessId(),GetCurrentThreadId(),message);
     if (count>0) { DWORD written{}; WriteFile(host_log,line,static_cast<DWORD>((std::min)(static_cast<std::size_t>(count),sizeof(line)-1)),&written,nullptr); }
 }
 
 void* method(void* object, unsigned slot) { return (*static_cast<void***>(object))[slot]; }
 template<class Signature,auto Handler> bool hook_method(void* object, unsigned slot) {
     const auto target = method(object, slot);
-    std::lock_guard lock(hooks_mutex);
+    // Only startup waits are logged; observing existing hooks stays quiet.
+    std::unique_lock lock(hooks_mutex, std::defer_lock);
+    if (!started) {
+        cheeky::startup::Step waiting(log_host, "graphics_hook_lock");
+        lock.lock(); waiting.end();
+    } else lock.lock();
     const auto handler=reinterpret_cast<void*>(Handler);
     for (const auto& hook : hooks) if (hook.target == target) return hook.handler==handler;
     if(hooks.size()==max_method_hooks)return false;
@@ -77,12 +87,19 @@ template<class Signature,auto Handler> bool hook_method(void* object, unsigned s
     static const auto entries=MethodEntry<Handler,Signature>::entries(std::make_index_sequence<max_method_hooks>{});
     const auto detour=reinterpret_cast<void*>(entries[index]);
     void* trampoline{};
-    if (MH_CreateHook(target, detour, &trampoline) != MH_OK) return false;
+    char detail[160]{};
+    snprintf(detail,sizeof(detail),"STARTUP hook target=%p slot=%u index=%zu",target,slot,index);
+    log_host(detail);
+    if (cheeky::startup::status(log_host,"graphics_hook_create","minhook",[&] {
+            return MH_CreateHook(target, detour, &trampoline); }) != MH_OK) return false;
     // Publish before enabling: another game thread can enter immediately.
     continuations[index].store(trampoline,std::memory_order_release);
     hooks.push_back({target, handler});
-    if (MH_EnableHook(target) == MH_OK) return true;
-    hooks.pop_back(); MH_RemoveHook(target); return false;
+    if (cheeky::startup::status(log_host,"graphics_hook_enable","minhook",[&] {
+            return MH_EnableHook(target); }) == MH_OK) return true;
+    hooks.pop_back();
+    cheeky::startup::status(log_host,"graphics_hook_remove","minhook",[&] { return MH_RemoveHook(target); });
+    return false;
 }
 ComPtr<ID3D12CommandQueue> chain_queue(IDXGISwapChain* chain) {
     ComPtr<ID3D12CommandQueue> result;
@@ -108,12 +125,17 @@ void tick(IDXGISwapChain* chain, ID3D12CommandQueue* presentation_queue) {
     } else runtime_tick(attachment, 1, d12.Get(), presentation_queue);
 }
 void present_frame(IDXGISwapChain* chain, UINT flags) noexcept {
-    if (internal || !started || (flags & DXGI_PRESENT_TEST)) return;
+    if (internal || (flags & DXGI_PRESENT_TEST)) return;
+    const bool first = !first_present.test_and_set(std::memory_order_relaxed);
+    if (first) log_host("STARTUP milestone=first_game_present");
+    if (!started) return;
+    const bool first_ready = !first_ready_present.test_and_set(std::memory_order_relaxed);
     InternalScope guard;
     try {
         std::lock_guard lock(frame_mutex);
         auto queue = chain_queue(chain);
         tick(chain, queue.Get());
+        if (first_ready) log_host("STARTUP milestone=first_game_present_tick_complete");
         UINT color{}, size=sizeof(color);
         if (SUCCEEDED(chain->GetPrivateData(color_key,&size,&color)))
             cheeky::standalone::overlay_set_color_space(chain,color);
@@ -228,23 +250,29 @@ HRESULT create_composition(CompositionFn next,IDXGIFactory2* f,IUnknown* d,const
 }
 bool install_graphics_hooks() {
     InternalScope guard;
-    const auto mh = MH_Initialize();
+    const auto hr = [](const char* stage, auto&& operation) {
+        return cheeky::startup::status(log_host, stage, "hr", operation);
+    };
+    const auto mh = cheeky::startup::status(log_host,"graphics_minhook_initialize","minhook",[] { return MH_Initialize(); });
     if (mh != MH_OK && mh != MH_ERROR_ALREADY_INITIALIZED) return false;
     // Use an absolute system module, never recursively load our dxgi proxy.
     wchar_t system[MAX_PATH]{};
-    if (!GetSystemDirectoryW(system,MAX_PATH)) return false;
-    auto dxgi = LoadLibraryExW((std::filesystem::path(system)/L"dxgi.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!cheeky::startup::win32(log_host,"graphics_system_directory",[&] { return GetSystemDirectoryW(system,MAX_PATH); })) return false;
+    auto dxgi = cheeky::startup::win32(log_host,"graphics_load_system_dxgi",[&] {
+        return LoadLibraryExW((std::filesystem::path(system)/L"dxgi.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32); });
     if (!dxgi) return false;
-    auto factory_fn = reinterpret_cast<HRESULT(WINAPI*)(REFIID,void**)>(GetProcAddress(dxgi,"CreateDXGIFactory1"));
+    auto factory_fn = reinterpret_cast<HRESULT(WINAPI*)(REFIID,void**)>(
+        cheeky::startup::win32(log_host,"graphics_resolve_factory",[&] { return GetProcAddress(dxgi,"CreateDXGIFactory1"); }));
     ComPtr<IDXGIFactory2> factory;
-    if (!factory_fn || FAILED(factory_fn(IID_PPV_ARGS(&factory)))) return false;
+    if (!factory_fn || FAILED(hr("graphics_create_factory",[&] { return factory_fn(IID_PPV_ARGS(&factory)); }))) return false;
     if (!hook_method<CreateFn,create_chain>(factory.Get(),10) ||
         !hook_method<HwndFn,create_hwnd>(factory.Get(),15) ||
         !hook_method<CoreFn,create_core>(factory.Get(),16) ||
         !hook_method<CompositionFn,create_composition>(factory.Get(),24)) return false;
     // Discover Present implementations for swapchains created before ASI attach.
     // The window is hidden, created and destroyed on this initialization thread.
-    HWND window = CreateWindowExW(0,L"STATIC",L"Cheeky graphics discovery",WS_POPUP,0,0,16,16,nullptr,nullptr,module,nullptr);
+    HWND window = cheeky::startup::win32(log_host,"graphics_create_window",[&] {
+        return CreateWindowExW(0,L"STATIC",L"Cheeky graphics discovery",WS_POPUP,0,0,16,16,nullptr,nullptr,module,nullptr); });
     if (!window) return false;
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width=16; desc.Height=16; desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -252,23 +280,31 @@ bool install_graphics_hooks() {
     desc.BufferCount=2; desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
     ComPtr<ID3D11Device> d11;
     bool observed{};
-    if (SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr)) ||
-        SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr))) {
+    if (SUCCEEDED(hr("graphics_d3d11_hardware_device",[&] { return D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr); })) ||
+        SUCCEEDED(hr("graphics_d3d11_warp_device",[&] { return D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr); }))) {
         ComPtr<IDXGISwapChain1> chain;
-        if (SUCCEEDED(factory->CreateSwapChainForHwnd(d11.Get(),window,&desc,nullptr,nullptr,&chain)))
+        if (SUCCEEDED(hr("graphics_d3d11_swapchain",[&] { return factory->CreateSwapChainForHwnd(d11.Get(),window,&desc,nullptr,nullptr,&chain); })))
             observed = observe_chain(chain.Get(),d11.Get());
+        cheeky::startup::Step release(log_host,"graphics_d3d11_swapchain_release");
+        chain.Reset(); release.end();
     }
     ComPtr<ID3D12Device> d12;
-    if (SUCCEEDED(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)))) {
+    if (SUCCEEDED(hr("graphics_d3d12_device",[&] { return D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)); }))) {
         ComPtr<ID3D12CommandQueue> queue;
         D3D12_COMMAND_QUEUE_DESC qdesc{};
-        if (SUCCEEDED(d12->CreateCommandQueue(&qdesc,IID_PPV_ARGS(&queue)))) {
+        if (SUCCEEDED(hr("graphics_d3d12_queue",[&] { return d12->CreateCommandQueue(&qdesc,IID_PPV_ARGS(&queue)); }))) {
             ComPtr<IDXGISwapChain1> chain;
-            if (SUCCEEDED(factory->CreateSwapChainForHwnd(queue.Get(),window,&desc,nullptr,nullptr,&chain)))
+            if (SUCCEEDED(hr("graphics_d3d12_swapchain",[&] { return factory->CreateSwapChainForHwnd(queue.Get(),window,&desc,nullptr,nullptr,&chain); })))
                 observed = observe_chain(chain.Get(),queue.Get()) || observed;
+            cheeky::startup::Step release(log_host,"graphics_d3d12_swapchain_release");
+            chain.Reset(); release.end();
         }
+        cheeky::startup::Step release(log_host,"graphics_d3d12_queue_release");
+        queue.Reset(); release.end();
     }
-    DestroyWindow(window);
+    cheeky::startup::win32(log_host,"graphics_destroy_window",[&] { return DestroyWindow(window); });
+    { cheeky::startup::Step release(log_host,"graphics_devices_and_factory_release");
+      d12.Reset(); d11.Reset(); factory.Reset(); release.end(); }
     return observed;
 }
 template<class T> bool load(HMODULE dll,const char* name,T& out) {
@@ -279,8 +315,6 @@ template<class T> bool load(HMODULE dll,const char* name,T& out) {
 bool start_host(std::uint32_t host,bool vulkan) {
     try {
         if (host!=1 && host!=2) return false;
-        std::lock_guard lock(start_mutex);
-        if (started) return host==active_host;
         HMODULE resident{};
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,
                 reinterpret_cast<LPCWSTR>(&start_host),&resident)) return false;
@@ -288,21 +322,42 @@ bool start_host(std::uint32_t host,bool vulkan) {
         const auto length=GetModuleFileNameW(module,path,32768);
         if (!length || length>=32768) return false;
         const auto directory=std::filesystem::path(path).parent_path();
-        if (host_log==INVALID_HANDLE_VALUE) host_log=CreateFileW((directory/L"CheekyFoveatedDLSS-Host.log").c_str(),FILE_APPEND_DATA,
-            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+        std::call_once(host_log_once,[&] {
+            host_log=CreateFileW((directory/L"CheekyFoveatedDLSS-Host.log").c_str(),FILE_APPEND_DATA,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+            cheeky::startup::identity(log_host,"host",module);
+            for (const auto* name : {L"dxgi.dll",L"version.dll",L"CheekyFoveatedDLSS.asi"}) {
+                const auto loader=GetModuleHandleW(name);
+                if (loader && GetProcAddress(loader,"CheekyBootstrap_Status")) {
+                    wchar_t path[32768]{}; GetModuleFileNameW(loader,path,32768);
+                    char detail[1024]{}; snprintf(detail,sizeof(detail),"STARTUP loader=%ls path=%ls",name,path);
+                    log_host(detail);
+                    cheeky::startup::identity(log_host,"loader",loader);
+                }
+            }
+        });
+        cheeky::startup::Step waiting(log_host,"host_start_lock");
+        std::lock_guard lock(start_mutex);
+        waiting.end();
+        if (started) return host==active_host;
         log_host(host==2 ? "Initializing OptiScaler host" : "Initializing standalone host");
-        auto runtime=LoadLibraryExW((directory/L"CheekyFoveatedDLSSRuntime.dll").c_str(),nullptr,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
+        auto runtime=cheeky::startup::win32(log_host,"host_load_runtime",[&] {
+            return LoadLibraryExW((directory/L"CheekyFoveatedDLSSRuntime.dll").c_str(),nullptr,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32); });
         CheekyRuntimeStartFn start{};
+        cheeky::startup::Step resolve(log_host,"host_resolve_runtime_api");
         if (!runtime || !load(runtime,"CheekyRuntime_Start",start) || !load(runtime,"CheekyRuntime_Tick",runtime_tick) ||
             !load(runtime,"CheekyRuntime_Command",runtime_command) || !load(runtime,"CheekyRuntime_Snapshot",runtime_snapshot) ||
-            !load(runtime,"CheekyRuntime_Detach",runtime_detach)) { log_host("Runtime missing or API incompatible"); return false; }
+            !load(runtime,"CheekyRuntime_Detach",runtime_detach)) { resolve.end("win32",GetLastError()); log_host("Runtime missing or API incompatible"); return false; }
+        resolve.end();
         CheekyRuntimeStart input;
         const auto config=directory.wstring();
         input.config_directory=config.c_str(); input.attachment=&attachment;
         input.host=static_cast<CheekyRuntimeHost>(host);
-        if (!start(&input)) { log_host("Resident runtime refused startup; see its log"); return false; }
-        if (!vulkan && !install_graphics_hooks()) { runtime_detach(attachment); attachment=0; log_host("Graphics hook discovery failed"); return false; }
+        if (!cheeky::startup::status(log_host,"host_runtime_start","success",[&] { return start(&input); })) {
+            log_host("Resident runtime refused startup; see its log"); return false; }
+        if (!vulkan && !cheeky::startup::status(log_host,"host_graphics_discovery","success",[] { return install_graphics_hooks(); })) {
+            runtime_detach(attachment); attachment=0; log_host("Graphics hook discovery failed"); return false; }
         active_host=host; started=true;
         log_host("Host ready; waiting for game graphics. F8 opens settings.");
         return true;
@@ -319,6 +374,8 @@ extern "C" __declspec(dllexport) void __cdecl CheekyOpenXRMenuLogDiagnostic(cons
 extern "C" __declspec(dllexport) bool CheekyHost_StartVulkan(std::uint32_t host) {return start_host(host,true);}
 extern "C" __declspec(dllexport) VkResult CheekyHost_VulkanPresent(const CheekyVulkanPresent* present) {
     if(!present || present->size!=sizeof(*present) || !present->next || !present->present)return VK_ERROR_INITIALIZATION_FAILED;
+    if (!first_present.test_and_set(std::memory_order_relaxed))
+        log_host("STARTUP milestone=first_game_present api=Vulkan");
     const cheeky::standalone::OverlayRuntime api{attachment,runtime_command,runtime_snapshot,active_host==2?"OptiScaler":"Standalone"};
     return cheeky::standalone::overlay_vulkan_present(*present,api);
 }

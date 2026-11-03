@@ -68,5 +68,38 @@ void native_nr_validation() {
         !p.presentation_thread.joinable()&&!p.generation_thread.joinable()&&!p.release_thread.joinable(),
         "Native NR requires neither FG features nor pacing/generation threads");
     check(views[0].subImage.swapchain==h<XrSwapchain>(900),"Native publication leaves application layer storage unchanged");
+    // Exercise the real EndFrame interceptor: selection failures must reach the
+    // native presenter without being flattened into a generic projection error.
+    reset();swapchains.clear();const auto session=h<XrSession>(2);
+    auto native=std::make_shared<BufferedPresenter>();native->native_nr_only=true;native->session=session;
+    auto rejected_backend=std::make_unique<NativeNrBackendFixture>(*native);auto* rejected_fixture=rejected_backend.get();
+    native->backend=std::move(rejected_backend);
+    native->xr.end_frame=[](XrSession,const XrFrameEndInfo* original)->XrResult{
+        check(original->layerCount==2&&original->layers[0]->type==XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+            "Rejected native frame retains the original layers");return XR_SUCCESS;};
+    instances.at(instance).dispatch.end_frame=native->xr.end_frame;
+    SessionState owner{};owner.instance=instance;owner.session=session;owner.running=true;
+    owner.view_configuration=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;owner.fg=native;
+    sessions.emplace(session,std::move(owner));
+    XrFrameEndInfo rejected{XR_TYPE_FRAME_END_INFO};rejected.layerCount=2;rejected.layers=layers;
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&native->last_submission_diagnostic.eye==0&&
+        native->last_submission_diagnostic.swapchain==h<XrSwapchain>(900)&&
+        std::strstr(native->last_submission_diagnostic.reason,"not tracked"),"Untracked swapchain reason reaches native NR");
+    SwapchainState chain;chain.session=session;swapchains.emplace(h<XrSwapchain>(900),std::move(chain));
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&
+        std::strstr(native->last_submission_diagnostic.reason,"no released image"),"Unreleased swapchain is a separate rejection");
+    swapchains.at(h<XrSwapchain>(900)).has_released=true;
+    XrBaseInStructure unsupported{XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR};projection.next=&unsupported;
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&native->last_submission_diagnostic.layer==0&&
+        native->last_submission_diagnostic.structure_type==unsupported.type&&
+        std::strstr(native->last_submission_diagnostic.reason,"layer has an unsupported extension"),
+        "Layer preparation reports the rejected extension after swapchain validation");projection.next=nullptr;
+    check(rejected_fixture->processed==0,"Rejected frames do not attempt inference");
+    native->capture_overflow=true;
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&
+        std::strstr(native->last_submission_diagnostic.reason,"capture overflow"),"Capture overflow has its own NR rejection");
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&!native->last_submission_diagnostic.reason&&
+        rejected_fixture->processed==1,"A later compatible frame processes and clears the rejection");
+    sessions.clear();swapchains.clear();
     std::cout<<"PASS native NR cadence, auxiliary layers, immutable submission and inference fallback without frame generation\n";
 }

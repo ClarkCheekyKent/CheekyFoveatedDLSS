@@ -3,6 +3,7 @@
 #include <array>
 #include <vector>
 #include <memory>
+#include "submission_diagnostics.hpp"
 
 namespace cheeky::fg {
 using RetainFrameSpace = std::shared_ptr<void> (*)(XrSession, XrSpace, XrSpace&);
@@ -38,13 +39,19 @@ struct FrameLayers {
     std::vector<std::shared_ptr<void>> space_leases;
     XrCompositionLayerFlags scene_flags{};
     void clear() {layers.clear();space_leases.clear();scene_flags=0;}
-    bool retain_spaces(XrSession session, RetainFrameSpace retain) {
+    bool retain_spaces(XrSession session, RetainFrameSpace retain,
+        cheeky::openxr::SubmissionDiagnostic* diagnostic=nullptr) {
+        if(diagnostic)*diagnostic={};
         if(!retain)return true; // Callers without asynchronous space ownership.
         for(auto& layer:layers) {
             auto* header=const_cast<XrCompositionLayerBaseHeader*>(layer.header());
             if(!header)return false;
             XrSpace replacement{};auto lease=retain(session,header->space,replacement);
-            if(!lease||!replacement){clear();return false;}
+            if(!lease||!replacement){
+                if(diagnostic){diagnostic->reason="OpenXR layer space could not be retained";
+                    diagnostic->layer=int(&layer-layers.data());diagnostic->structure_type=header->type;
+                    diagnostic->space=header->space;}
+                clear();return false;}
             header->space=replacement;space_leases.push_back(std::move(lease));
         }
         return true;
@@ -53,20 +60,34 @@ struct FrameLayers {
         for(const auto& layer:layers)if(layer.scene)return layer.projection.space;
         return XR_NULL_HANDLE;
     }
-    bool prepare(const XrFrameEndInfo* info,const XrCompositionLayerProjection* scene) {
+    bool prepare(const XrFrameEndInfo* info,const XrCompositionLayerProjection* scene,
+        cheeky::openxr::SubmissionDiagnostic* diagnostic=nullptr) {
         clear();
-        if(!info||!scene||info->next||!info->layers||!info->layerCount||info->layerCount>32)return false;
+        if(diagnostic)*diagnostic={};
+        const auto reject=[&](const char* reason,int layer=-1,int eye=-1,
+            XrStructureType type=XR_TYPE_UNKNOWN,unsigned views=0){
+            if(diagnostic){diagnostic->reason=reason;diagnostic->layer=layer;diagnostic->eye=eye;
+                diagnostic->structure_type=type;diagnostic->view_count=views;}
+            clear();return false;};
+        if(!info||!scene)return reject("OpenXR stereo projection is unavailable");
+        if(info->next)return reject("OpenXR frame has an unsupported extension chain",-1,-1,
+            static_cast<const XrBaseInStructure*>(info->next)->type);
+        if(!info->layers||!info->layerCount)return reject("OpenXR frame has no composition layers");
+        if(info->layerCount>32)return reject("OpenXR frame exceeds the supported layer count");
         bool found{};
         layers.reserve(info->layerCount);
         for(unsigned i=0;i<info->layerCount;++i) {
             const auto* input=info->layers[i];
-            if(!input||input->next) {clear();return false;}
+            if(!input)return reject("OpenXR frame contains a null layer",int(i));
+            if(input->next)return reject("OpenXR layer has an unsupported extension chain",int(i),-1,
+                static_cast<const XrBaseInStructure*>(input->next)->type);
             Layer copy;copy.type=input->type;
             if(input==reinterpret_cast<const XrCompositionLayerBaseHeader*>(scene)) {
-                if(found) {clear();return false;}
+                if(found)return reject("OpenXR scene projection is submitted more than once",int(i));
                 found=true;copy.scene=true;scene_flags=scene->layerFlags;
                 copy.projection=*scene;
-                if(scene->viewCount!=2||!scene->views) {clear();return false;}
+                if(scene->viewCount!=2||!scene->views)return reject("OpenXR scene projection has an unsupported view layout",
+                    int(i),-1,input->type,scene->viewCount);
                 for(unsigned eye=0;eye<2;++eye) {
                     copy.views[eye]=scene->views[eye];
                     // Depth describes the upstream image, and is not reused
@@ -76,9 +97,11 @@ struct FrameLayers {
             } else switch(input->type) {
             case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
                 copy.projection=*reinterpret_cast<const XrCompositionLayerProjection*>(input);
-                if(copy.projection.viewCount!=2||!copy.projection.views) {clear();return false;}
+                if(copy.projection.viewCount!=2||!copy.projection.views)return reject("OpenXR auxiliary projection has an unsupported view layout",
+                    int(i),-1,input->type,copy.projection.viewCount);
                 for(unsigned eye=0;eye<2;++eye) {
-                    if(copy.projection.views[eye].next) {clear();return false;}
+                    if(copy.projection.views[eye].next)return reject("OpenXR auxiliary view has an unsupported extension chain",int(i),int(eye),
+                        static_cast<const XrBaseInStructure*>(copy.projection.views[eye].next)->type);
                     copy.views[eye]=copy.projection.views[eye];
                 }
                 break;
@@ -88,11 +111,11 @@ struct FrameLayers {
             case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:copy.cube=*reinterpret_cast<const XrCompositionLayerCubeKHR*>(input);break;
             case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:copy.equirect=*reinterpret_cast<const XrCompositionLayerEquirectKHR*>(input);break;
             case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:copy.equirect2=*reinterpret_cast<const XrCompositionLayerEquirect2KHR*>(input);break;
-            default:clear();return false;
+            default:return reject("OpenXR composition layer type is unsupported",int(i),-1,input->type);
             }
             layers.push_back(copy);
         }
-        if(!found)clear();
+        if(!found)return reject("OpenXR selected scene is missing from the frame layers");
         return found;
     }
     std::vector<const XrCompositionLayerBaseHeader*> replace_scene(const XrCompositionLayerProjection& scene) {

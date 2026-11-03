@@ -1,11 +1,14 @@
 #pragma once
 #include "../third_party/openxr/include/openxr/openxr.h"
+#include "submission_diagnostics.hpp"
 
 namespace cheeky::openxr {
 struct ProjectionSelection {
     const XrCompositionLayerProjection* projection{};
     bool ambiguous{};
     bool unsupported{};
+    unsigned layer_index{};
+    SubmissionDiagnostic diagnostic;
 };
 
 // UEVR's Virtual Desktop timewarp workaround submits an alpha-blended
@@ -33,20 +36,32 @@ bool is_dummy_projection(const XrCompositionLayerProjection& projection,
 template <class IsDummySwapchain>
 ProjectionSelection select_projection(const XrFrameEndInfo* info, IsDummySwapchain is_dummy_swapchain) {
     ProjectionSelection selected;
-    if (!info || !info->layers) return selected;
+    if (!info || !info->layers) {
+        selected.diagnostic.reason="OpenXR frame has no composition layers";return selected;
+    }
     for (unsigned index = 0; index < info->layerCount; ++index) {
         const auto* layer = info->layers[index];
         if (!layer || layer->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
         const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(layer);
         if (projection->viewCount != 2 || !projection->views) {
+            if(!selected.unsupported){selected.diagnostic.reason="OpenXR projection has an unsupported view layout";
+                selected.diagnostic.layer=int(index);selected.diagnostic.structure_type=layer->type;
+                selected.diagnostic.view_count=projection->viewCount;}
             selected.unsupported = true;
             continue;
         }
         if (is_dummy_projection(*projection, is_dummy_swapchain)) continue;
-        if (selected.projection) selected.ambiguous = true;
+        if (selected.projection) {
+            selected.ambiguous = true;
+            if(!selected.unsupported){selected.diagnostic.reason="OpenXR frame has multiple scene projections";
+                selected.diagnostic.layer=int(index);selected.diagnostic.structure_type=layer->type;}
+        }
         selected.projection = projection;
+        selected.layer_index=index;
     }
     if (selected.ambiguous || selected.unsupported) selected.projection = nullptr;
+    if(!selected.projection&&!selected.diagnostic.reason)
+        selected.diagnostic.reason="OpenXR frame has no stereo scene projection";
     return selected;
 }
 } // namespace cheeky::openxr

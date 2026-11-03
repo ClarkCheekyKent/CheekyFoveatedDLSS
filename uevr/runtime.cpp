@@ -39,6 +39,7 @@
 #include <cmath>
 #include <Psapi.h>
 #include "ngx_runtime_discovery.hpp"
+#include "../shared/startup_diagnostics.hpp"
 
 namespace cheeky::foveated_dlss {
 namespace {
@@ -778,12 +779,13 @@ bool configure_graphics(State& s, std::uint32_t renderer, void* device, void* qu
 void set_addon_modules(HMODULE, HMODULE) noexcept {}
 void trace_event(const char* format, ...) noexcept {
     if (!format) return;
+    cheeky::startup::PreserveError error;
     auto& s = state(); std::lock_guard lock(s.log_mutex);
     if (s.log == INVALID_HANDLE_VALUE) return;
     char message[3072]{};
     va_list args; va_start(args, format); vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args); va_end(args);
     SYSTEMTIME now; GetLocalTime(&now); char line[3328]{};
-    const auto n = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u [T%lu] %s\r\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetCurrentThreadId(), message);
+    const auto n = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u [P%lu T%lu] %s\r\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, GetCurrentProcessId(), GetCurrentThreadId(), message);
     if (n > 0) { DWORD written; WriteFile(s.log, line, static_cast<DWORD>((std::min)(static_cast<std::size_t>(n), sizeof(line)-1)), &written, nullptr); }
 }
 void close_trace_log() noexcept {} // The runtime and log stay resident until process exit.
@@ -794,13 +796,24 @@ void log_error(const char* message) noexcept { log_message(1, message); }
 }
 
 using namespace cheeky::foveated_dlss;
+namespace {
+void log_runtime_startup(const char* message) noexcept {
+    trace_event("%s", message);
+    // The first lock wait precedes opening the runtime log. The standalone
+    // host already has a log, so keep that wait visible there as well.
+    cheeky::startup::host_log(message);
+}
+}
 extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeStart* input) {
     try {
         if (!input || input->size != sizeof(*input) || input->abi != cheeky_runtime_abi ||
             !input->config_directory || !*input->config_directory || !input->attachment) return false;
         *input->attachment = 0;
         if (input->renderer > 2 || static_cast<std::uint32_t>(input->host) > static_cast<std::uint32_t>(CheekyRuntimeHost::optiscaler)) return false;
-        auto& s = state(); std::lock_guard lock(s.mutex);
+        auto& s = state();
+        cheeky::startup::Step waiting(log_runtime_startup,"runtime_start_lock");
+        std::lock_guard lock(s.mutex);
+        waiting.end();
         if (adapter_attached) { log_warning("Duplicate Cheeky host attachment rejected"); return false; }
         if (s.failed) return false;
         if (s.started && (s.host != input->host || s.directory != std::filesystem::path(input->config_directory))) {
@@ -813,12 +826,14 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
             s.directory = input->config_directory;
             std::filesystem::create_directories(s.directory);
             s.config = s.directory / L"CheekyFoveatedDLSS.ini";
-            s.log = CreateFileW((s.directory / runtime_log_filename(s.host)).c_str(), FILE_APPEND_DATA,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            { std::lock_guard log_lock(s.log_mutex);
+              s.log = CreateFileW((s.directory / runtime_log_filename(s.host)).c_str(), FILE_APPEND_DATA,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); }
             HMODULE resident{};
             if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                 reinterpret_cast<LPCWSTR>(&CheekyRuntime_Start), &resident)) return false;
             trace_event("Cheeky " CHEEKY_VERSION " %s initializing; runtime remains resident until game exit", host_label(s.host));
+            cheeky::startup::identity(log_runtime_startup,"runtime",resident);
             if (GetModuleHandleW(L"CheekyFoveatedDLSS.addon64") || !(s.owner = claim_processing_owner())) {
                 s.message = "Another Cheeky integration is loaded. Keep one Cheeky integration and restart the game.";
                 s.failed = true; log_error(s.message.c_str()); return false;
@@ -842,19 +857,23 @@ extern "C" __declspec(dllexport) bool CheekyRuntime_Start(const CheekyRuntimeSta
             enable_openvr_late_recovery(s.host != CheekyRuntimeHost::uevr);
             // A DLSS feature may already exist when hooks arrive; its create call is then missed.
             s.dlss_loaded_before_hooks = game_dlss_module_loaded();
-            if (!start_interception()) { s.failed = true; s.message = "NGX interception initialization failed"; return false; }
+            if (!cheeky::startup::status(log_runtime_startup,"runtime_interception","success",[] { return start_interception(); })) {
+                s.failed = true; s.message = "NGX interception initialization failed"; return false; }
             s.started = true;
         }
-        configure_graphics(s, input->renderer, input->device, input->queue);
+        cheeky::startup::status(log_runtime_startup,"runtime_configure_graphics","ready",[&] {
+            return configure_graphics(s, input->renderer, input->device, input->queue); });
         active_attachment = ++s.attachment_sequence;
         *input->attachment = s.attachment_sequence;
         adapter_attached = true;
         if(s.host == CheekyRuntimeHost::uevr)fg_uevr_mode_attached();
         allow_afw_stereo_projection(s.host == CheekyRuntimeHost::uevr);
-        eye_calibration_enable(!configured_settings().manual_stereo_mapping);
+        { cheeky::startup::Step calibration(log_runtime_startup,"runtime_eye_calibration_enable");
+          eye_calibration_enable(!configured_settings().manual_stereo_mapping); calibration.end(); }
         s.cadence.reset();
         set_processing_allowed(s.graphics_ready);
         request_save(s);
+        log_runtime_startup("STARTUP milestone=runtime_start_complete");
         return true;
     } catch (...) { set_processing_allowed(false); return false; }
 }

@@ -2,6 +2,7 @@
 #include "late_attach_tests.hpp"
 #include "mock_ngx_parameters.hpp"
 #include "../shared/cheeky_fg_bridge.hpp"
+#include "../shared/startup_diagnostics.hpp"
 #include <Windows.h>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -34,6 +35,41 @@ void command(const char* text) { require(send(text),"Host command accepted"); }
 void frame() { check(chain->Present(0,0),"Host presentation callback"); }
 std::string snapshot(CheekyHostSnapshotFn get) {
     std::array<char,32768> out{}; require(get(out.data(),static_cast<std::uint32_t>(out.size())),"Host snapshot"); return out.data();
+}
+void verify_startup_diagnostics(const std::filesystem::path& root) {
+    std::ifstream file(root / "CheekyFoveatedDLSS-Host.log");
+    const std::string host(std::istreambuf_iterator<char>(file), {});
+    const auto count = [&](const char* marker) {
+        unsigned found{};
+        for (std::size_t at{}; (at = host.find(marker, at)) != host.npos; at += std::strlen(marker)) ++found;
+        return found;
+    };
+    require(host.find("STARTUP session=") != host.npos && host.find("component=host version=") != host.npos &&
+        host.find("component=runtime version=") != host.npos && host.find("image_timestamp=") != host.npos,
+        "Startup logs identify launch and host/runtime builds");
+    for (const char* stage : {"host_load_runtime", "host_runtime_start", "runtime_start_lock", "runtime_interception",
+            "host_graphics_discovery", "graphics_d3d11_hardware_device", "graphics_d3d12_device",
+            "graphics_devices_and_factory_release"}) {
+        const auto begin = host.find(std::string("stage=") + stage + " begin");
+        const auto end = host.find(std::string("stage=") + stage + " end", begin);
+        require(begin != host.npos && end != host.npos && begin < end,
+            "Actual host startup operations have paired begin/end checkpoints");
+    }
+    require(host.find("minhook=0x00000000 elapsed_ms=") != host.npos && host.find("hr=0x") != host.npos,
+        "Startup checkpoints include API status and elapsed time");
+    require(count("milestone=first_game_present\n") == 1 && count("milestone=first_game_present_tick_complete") == 1,
+        "Repeated Present calls emit each first-presentation milestone once");
+    std::puts("PASS: bounded startup checkpoints, return codes, launch identity and first presentation");
+}
+void verify_logging_preserves_errors() {
+    const auto noisy_log = +[](const char*) noexcept { SetLastError(ERROR_ACCESS_DENIED); };
+    const auto result = cheeky::startup::win32(noisy_log,"test_failure",[] {
+        SetLastError(ERROR_PATH_NOT_FOUND); return FALSE;
+    });
+    require(!result && GetLastError() == ERROR_PATH_NOT_FOUND,"Startup logging preserves failing Win32 error");
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    require(cheeky::startup::status(noisy_log,"test_hr","hr",[] { return E_NOINTERFACE; }) == E_NOINTERFACE &&
+        GetLastError() == ERROR_FILE_NOT_FOUND,"Startup logging preserves HRESULT and last error");
 }
 void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
     using namespace cheeky::foveated_dlss;
@@ -204,6 +240,7 @@ void verify_fg11(ID3D11Device* device) {
 }
 int main(int argc,char** argv) {
     try {
+        verify_logging_preserves_errors();
         const std::string mode=argc>1 ? argv[1] : "dx12";
         const bool dx11=mode.find("dx11")!=std::string::npos;
         const bool realvr=mode.starts_with("realvr-");
@@ -266,6 +303,7 @@ int main(int argc,char** argv) {
         check(created,"Observed game swapchain");
         if(chained_table){
             frame();check(chain->ResizeBuffers(2,400,300,DXGI_FORMAT_UNKNOWN,0),"Chained host resize");frame();
+            verify_startup_diagnostics(root);
             chain.Reset();DestroyWindow(window);
             std::puts("PASS: chained factory vtable preserves creation, presentation and resize");return 0;
         }
@@ -286,6 +324,7 @@ int main(int argc,char** argv) {
             UINT masks[]{1,1}; IUnknown* queues[]{queue.Get(),queue.Get()};
             check(chain3->ResizeBuffers1(2,320,240,DXGI_FORMAT_UNKNOWN,0,masks,queues),"ResizeBuffers1 queues"); frame();
         }
+        verify_startup_diagnostics(root);
         chain3.Reset(); chain.Reset(); DestroyWindow(window);
         std::printf("PASS: actual %s host %s processing, presentation and resize\n",host==2 ? "OptiScaler" : "standalone",mode.c_str());
         return 0;

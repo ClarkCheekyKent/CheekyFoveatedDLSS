@@ -147,6 +147,12 @@ eye tracker, use [Simulated gaze](DEVELOPMENT.md#simulated-gaze-no-eye-tracker-r
 
 ## Reporting a problem
 
+Universal DLSS 5 reports specific OpenXR submission rejection reasons in the
+DLSS-NR diagnostics and support ZIP. The OpenXR startup log records the affected
+layer/eye, rejected structure type, or space/swapchain handle when a rejection
+changes, plus a recovery message when submissions become compatible again.
+Repeated identical rejections do not produce a log entry for every frame.
+
 In the ReShade add-on panel, click **Report an issue...**. The add-on prepares a
 support ZIP in `%TEMP%\CheekySupport`, opens a GitHub bug report with a short
 game/version/graphics summary and prefilled **Diagnostics and settings**,

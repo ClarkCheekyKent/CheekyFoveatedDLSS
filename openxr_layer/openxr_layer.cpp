@@ -4449,6 +4449,7 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
     // arrives, then display A / DLSS-G(A,B) / B in chronological order.
     std::array<unsigned,2> release_indices{};
     const XrCompositionLayerProjection* fg_projection{};
+    cheeky::openxr::SubmissionDiagnostic submission_diagnostic;
     bool fg_compatible{};
     bool native_end{};
     {
@@ -4463,13 +4464,17 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
                 return ch!=swapchains.end() && ch->second.session==session &&
                     ch->second.create_info.width==4 && ch->second.create_info.height==4;
             });
+            submission_diagnostic=selected.diagnostic;
             if(selected.projection && !selected.ambiguous && !selected.unsupported &&
                frame_end_info) {
                 fg_compatible=true;
                 for(unsigned eye=0;eye<2;++eye){
                     const auto sc=selected.projection->views[eye].subImage.swapchain;
                     const auto ch=swapchains.find(sc);
-                    if(ch==swapchains.end()||!ch->second.has_released){fg_compatible=false;break;}
+                    if(ch==swapchains.end()||!ch->second.has_released){
+                        submission_diagnostic.reason=ch==swapchains.end()?"OpenXR eye swapchain is not tracked":"OpenXR eye swapchain has no released image";
+                        submission_diagnostic.layer=int(selected.layer_index);submission_diagnostic.eye=int(eye);
+                        submission_diagnostic.swapchain=sc;fg_compatible=false;break;}
                     release_indices[eye]=ch->second.released_index;
                 }
                 if(fg_compatible) {
@@ -4480,6 +4485,10 @@ extern "C" XRAPI_ATTR XrResult XRAPI_CALL cheeky_xrEndFrame(
         }
     }
     const auto downstream=[&](const XrFrameEndInfo* info){
+        if(presenter&&!fg_projection){
+            if(const auto buffered=std::dynamic_pointer_cast<cheeky::fg::BufferedPresenter>(presenter))
+                return buffered->end_frame(info,release_indices,fg_projection,submission_diagnostic);
+        }
         return presenter?presenter->end_frame(info,release_indices,fg_projection):next(session,info);};
     const auto result = menu_session ? submit_menu_frame(frame_end_info,menu_dispatch,*menu_session,bool(presenter),downstream)
                                      : downstream(frame_end_info);

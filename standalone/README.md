@@ -124,6 +124,17 @@ Settings are saved to `CheekyFoveatedDLSS.ini` inside the nested
 where runtime logs and support reports are written. Settings are shared by the
 runtime, but each installation has its own settings file.
 
+Permanent startup diagnostics are written to `CheekyFoveatedDLSS-Host.log` and
+`CheekyFoveatedDLSS-Standalone.log` (or `CheekyFoveatedDLSS-OptiScaler.log`) in
+that directory. They identify each launch, thread, loader and component build
+(including the matching PDB identifier when available), then record startup operations with begin/end markers, return
+codes and elapsed milliseconds. A begin without an end identifies an operation
+that did not return; `interrupted` identifies a scope that exited without normal
+completion. First game presentation, overlay initialization and receipt of the
+configured menu hotkey are recorded once per process. These diagnostics require
+no switch and add no continuous frame/input trace or automatic memory dumps.
+Include both logs when the menu never opens.
+
 Both hosts expose the shared settings, including D3D11 direct/transport, center
 and peripheral SR, full/foveated NR before or after upscaling, gaze, calibration,
 presets and diagnostics. D3D11 NR uses the existing D3D12 transport path.
