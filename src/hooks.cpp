@@ -3639,8 +3639,13 @@ void note_evaluation_begin(
         api == DiagnosticApi::d3d11 ? 11U : 12U, input_width, input_height,
         get_ui(parameters, "OutWidth") ? get_ui(parameters, "OutWidth") : output.width,
         get_ui(parameters, "OutHeight") ? get_ui(parameters, "OutHeight") : output.height);
-    if(api==DiagnosticApi::d3d12&&!inside_streamline_evaluation&&
-        (d3d12_game_feature(handle)==1U||d3d12_game_feature(handle)==13U)) {
+    // The game's own DLSS evaluations feed the application-composited quad registry (a game that renders and
+    // composes four views itself): D3D12 for its DLSS features, D3D11 for any but Cheeky's private ones. Without
+    // the OpenXR layer only this registry knows a D3D11 game's quad roles; with it, quad_view_observe12 defers.
+    const bool game_dlss=api==DiagnosticApi::d3d12
+        ?!inside_streamline_evaluation&&(d3d12_game_feature(handle)==1U||d3d12_game_feature(handle)==13U)
+        :!is_d3d11_private_handle(handle);
+    if(game_dlss) {
         const auto id=reinterpret_cast<std::uintptr_t>(handle);
         quad_view_observe12(id,stereo_view_generation(id),
             get_ui(parameters,"OutWidth")?get_ui(parameters,"OutWidth"):output.width,
