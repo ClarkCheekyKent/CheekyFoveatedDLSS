@@ -2,6 +2,7 @@
 #include "d3d11_peripheral_dlaa.hpp"
 
 #include "diagnostics.hpp"
+#include "runtime.hpp"
 #include "peripheral_dlaa.hpp"
 #include "d3d11_write_bindings.hpp"
 
@@ -11,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -1319,6 +1322,21 @@ struct PeripheralTimingScope {
 
 }  // namespace
 
+// Why the D3D11 periphery pass declined a view (each exit's reason and the values it checked), rate-limited: the
+// first 24, then every 600th. Without it a quad game only saw "Quad peripheral full-view DLSS rejected".
+static bool peripheral_reject(const NgxHandle* handle, const char* format, ...) noexcept {
+    static std::atomic<std::uint64_t> count{};
+    const auto n = ++count;
+    if (n > 24U && (n % 600U) != 0U) return false;
+    char why[512]{};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(why, sizeof(why), format, args);
+    va_end(args);
+    trace_event("D3D11 periphery declined handle=%p (#%llu): %s", handle, static_cast<unsigned long long>(n), why);
+    return false;
+}
+
 bool evaluate_d3d11_peripheral_dlaa(
     ID3D11DeviceContext* const context,
     const NgxHandle* const game_handle,
@@ -1334,13 +1352,18 @@ bool evaluate_d3d11_peripheral_dlaa(
         context == nullptr || game_handle == nullptr || parameters == nullptr ||
         create_feature == nullptr || evaluate_feature == nullptr ||
         release_feature == nullptr) {
-        return false;
+        return peripheral_reject(game_handle, "not enabled or no NGX entry points (enabled=%d periphery=%d create=%d "
+                                 "evaluate=%d release=%d)", settings.enabled ? 1 : 0,
+                                 settings.peripheral_dlaa_enabled ? 1 : 0, create_feature != nullptr,
+                                 evaluate_feature != nullptr, release_feature != nullptr);
     }
 
     const auto original = capture_parameters(parameters);
     if (original.color == nullptr || original.depth == nullptr ||
         original.motion == nullptr || original.output == nullptr) {
-        return false;
+        return peripheral_reject(game_handle, "an input is missing (color=%d depth=%d motion=%d output=%d)",
+                                 original.color != nullptr, original.depth != nullptr, original.motion != nullptr,
+                                 original.output != nullptr);
     }
 
     auto render_width = original.render_width;
@@ -1349,7 +1372,8 @@ bool evaluate_d3d11_peripheral_dlaa(
     if (render_height == 0U) render_height = original.height;
     if (render_width == 0U || render_height == 0U ||
         original.out_width == 0U || original.out_height == 0U) {
-        return false;
+        return peripheral_reject(game_handle, "no size (render %ux%u, out %ux%u)", render_width, render_height,
+                                 original.out_width, original.out_height);
     }
 
     ID3D11Texture2D* color_texture{};
@@ -1374,7 +1398,7 @@ bool evaluate_d3d11_peripheral_dlaa(
         release(motion_texture);
         release(depth_texture);
         release(color_texture);
-        return false;
+        return peripheral_reject(game_handle, "an input is not a Texture2D");
     }
 
     D3D11_TEXTURE2D_DESC color_desc{};
@@ -1394,7 +1418,7 @@ bool evaluate_d3d11_peripheral_dlaa(
         depth_desc.SampleDesc.Count != 1U ||
         motion_desc.SampleDesc.Count != 1U ||
         output_desc.SampleDesc.Count != 1U) {
-        return false;
+        return peripheral_reject(game_handle, "multisampled input");
     }
 
     const bool flag_says_low_res =
@@ -1428,7 +1452,9 @@ bool evaluate_d3d11_peripheral_dlaa(
         render_height,
         settings.peripheral_dlaa_scale
     );
-    if (dimensions.width < 32U || dimensions.height < 32U) return false;
+    if (dimensions.width < 32U || dimensions.height < 32U)
+        return peripheral_reject(game_handle, "working size %ux%u below 32 (render %ux%u, scale %.3f)", dimensions.width,
+                                 dimensions.height, render_width, render_height, settings.peripheral_dlaa_scale);
 
     const auto color_format = typed_resource_format(color_desc.Format);
     const auto depth_format = depth_srv_format(depth_desc.Format);
@@ -1438,7 +1464,9 @@ bool evaluate_d3d11_peripheral_dlaa(
         depth_format == DXGI_FORMAT_UNKNOWN ||
         motion_format == DXGI_FORMAT_UNKNOWN ||
         output_format == DXGI_FORMAT_UNKNOWN) {
-        return false;
+        return peripheral_reject(game_handle, "an unsupported format (color %d->%d depth %d->%d motion %d->%d output %d->%d)",
+                                 color_desc.Format, color_format, depth_desc.Format, depth_format, motion_desc.Format,
+                                 motion_format, output_desc.Format, output_format);
     }
 
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
@@ -1464,10 +1492,14 @@ bool evaluate_d3d11_peripheral_dlaa(
         motion_format,
         output_format
     );
-    if (state == nullptr) return false;
+    if (state == nullptr) return peripheral_reject(game_handle, "no state for the view");
 
     auto* mutable_parameters = const_cast<NgxParameters*>(parameters);
-    if (!ensure_feature(*state, mutable_parameters, original)) return false;
+    if (!ensure_feature(*state, mutable_parameters, original))
+        return peripheral_reject(game_handle, "its own DLAA feature could not be made (working %ux%u, render %ux%u, out "
+                                 "%ux%u, preset %u, flags 0x%x)", dimensions.width, dimensions.height, render_width,
+                                 render_height, original.out_width, original.out_height,
+                                 settings.peripheral_dlaa_preset, original.create_flags);
 
     PeripheralTimingScope timing{*state};
 
@@ -1506,7 +1538,11 @@ bool evaluate_d3d11_peripheral_dlaa(
             reduce_color,
             reduce_motion
         )) {
-        return false;
+        return peripheral_reject(game_handle, "working inputs not prepared (color at %u,%u depth at %u,%u motion at %u,%u; "
+                                 "render %ux%u, motion source %ux%u, reduce color %d motion %d)", original.color_x,
+                                 original.color_y, original.depth_x, original.depth_y, original.mv_x, original.mv_y,
+                                 render_width, render_height, mv_source_width, mv_source_height, reduce_color ? 1 : 0,
+                                 reduce_motion ? 1 : 0);
     }
 
     if (reduce_color) {
@@ -1555,7 +1591,7 @@ bool evaluate_d3d11_peripheral_dlaa(
 
     if (!ngx_succeeded(result)) {
         state->force_reset = true;
-        return false;
+        return peripheral_reject(game_handle, "its DLAA evaluation failed (0x%08x)", static_cast<unsigned>(result));
     }
 
     state->force_reset = false;
@@ -1569,17 +1605,23 @@ bool evaluate_d3d11_peripheral_dlaa(
 bool compose_d3d11_peripheral_view(ID3D11DeviceContext* context,const NgxHandle* handle,
     const NgxParameters* parameters,const D3D11PeripheralDlaaResult& output) noexcept {
     using Microsoft::WRL::ComPtr;
-    if(!context||!handle||!parameters||!output.output_srv||context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;
+    if(!context||!handle||!parameters)return false;
+    if(!output.output_srv)return false;  // the evaluate step declined, and said why
+    if(context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return peripheral_reject(handle,"compose: not the immediate context");
     const auto original=capture_parameters(parameters);
-    if(!original.output||!original.out_width||!original.out_height)return false;
+    if(!original.output||!original.out_width||!original.out_height)
+        return peripheral_reject(handle,"compose: no output (output=%d out %ux%u)",original.output!=nullptr,original.out_width,original.out_height);
     ComPtr<ID3D11Texture2D> target;
-    if(FAILED(original.output->QueryInterface(IID_PPV_ARGS(&target))))return false;
+    if(FAILED(original.output->QueryInterface(IID_PPV_ARGS(&target))))return peripheral_reject(handle,"compose: output not a Texture2D");
     D3D11_TEXTURE2D_DESC desc{};target->GetDesc(&desc);
     if(desc.SampleDesc.Count!=1||desc.ArraySize!=1||!(desc.BindFlags&D3D11_BIND_UNORDERED_ACCESS)||
-        uint64_t(original.output_x)+original.out_width>desc.Width||uint64_t(original.output_y)+original.out_height>desc.Height)return false;
+        uint64_t(original.output_x)+original.out_width>desc.Width||uint64_t(original.output_y)+original.out_height>desc.Height)
+        return peripheral_reject(handle,"compose: output %ux%u (samples %u, array %u, bind 0x%x) cannot take %ux%u at %u,%u",
+            desc.Width,desc.Height,desc.SampleDesc.Count,desc.ArraySize,desc.BindFlags,original.out_width,original.out_height,
+            original.output_x,original.output_y);
     std::lock_guard<std::recursive_mutex> lock(state_mutex);
     auto found=std::find_if(states.begin(),states.end(),[&](const auto& s){return s.game_handle==handle&&s.context==context&&s.output_srv==output.output_srv;});
-    if(found==states.end())return false;auto& state=*found;
+    if(found==states.end())return peripheral_reject(handle,"compose: no state matches the view's output");auto& state=*found;
     ComPtr<ID3D11Device> device;context->GetDevice(&device);
     if(!state.full_context&&FAILED(device->CreateDeferredContext(0,&state.full_context)))return false;
     if(!state.full_shader){
