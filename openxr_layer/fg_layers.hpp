@@ -21,24 +21,34 @@ struct FrameLayers {
         XrCompositionLayerCubeKHR cube{XR_TYPE_COMPOSITION_LAYER_CUBE_KHR};
         XrCompositionLayerEquirectKHR equirect{XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR};
         XrCompositionLayerEquirect2KHR equirect2{XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR};
+        bool has_color_scale_bias{};
+        XrCompositionLayerColorScaleBiasKHR color_scale_bias{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+        const void* extension_chain() const noexcept {
+            return has_color_scale_bias?&color_scale_bias:nullptr;
+        }
         const XrCompositionLayerBaseHeader* header() {
+            XrCompositionLayerBaseHeader* result{};
             switch(type) {
             case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
-                projection.views=views.data();return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projection);
-            case XR_TYPE_COMPOSITION_LAYER_QUAD:return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
-            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinder);
-            case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cube);
-            case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&equirect);
-            case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:return reinterpret_cast<const XrCompositionLayerBaseHeader*>(&equirect2);
+                projection.views=views.data();result=reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection);break;
+            case XR_TYPE_COMPOSITION_LAYER_QUAD:result=reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);break;
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR:result=reinterpret_cast<XrCompositionLayerBaseHeader*>(&cylinder);break;
+            case XR_TYPE_COMPOSITION_LAYER_CUBE_KHR:result=reinterpret_cast<XrCompositionLayerBaseHeader*>(&cube);break;
+            case XR_TYPE_COMPOSITION_LAYER_EQUIRECT_KHR:result=reinterpret_cast<XrCompositionLayerBaseHeader*>(&equirect);break;
+            case XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR:result=reinterpret_cast<XrCompositionLayerBaseHeader*>(&equirect2);break;
             default:return nullptr;
             }
+            // Queued frames copy/move Layer values. Rebind every borrowed
+            // pointer to this copy's storage when building a submission.
+            result->next=extension_chain();return result;
         }
     };
     std::vector<Layer> layers;
     // Copies of queued layers share ownership of their independent XR spaces.
     std::vector<std::shared_ptr<void>> space_leases;
     XrCompositionLayerFlags scene_flags{};
-    void clear() {layers.clear();space_leases.clear();scene_flags=0;}
+    XrCompositionLayerProjection replacement_scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    void clear() {layers.clear();space_leases.clear();scene_flags=0;replacement_scene={XR_TYPE_COMPOSITION_LAYER_PROJECTION};}
     bool retain_spaces(XrSession session, RetainFrameSpace retain,
         cheeky::openxr::SubmissionDiagnostic* diagnostic=nullptr) {
         if(diagnostic)*diagnostic={};
@@ -79,9 +89,16 @@ struct FrameLayers {
         for(unsigned i=0;i<info->layerCount;++i) {
             const auto* input=info->layers[i];
             if(!input)return reject("OpenXR frame contains a null layer",int(i));
-            if(input->next)return reject("OpenXR layer has an unsupported extension chain",int(i),-1,
-                static_cast<const XrBaseInStructure*>(input->next)->type);
             Layer copy;copy.type=input->type;
+            for(auto* extension=static_cast<const XrBaseInStructure*>(input->next);extension;extension=extension->next){
+                if(extension->type!=XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR)
+                    return reject("OpenXR layer has an unsupported extension chain",int(i),-1,extension->type);
+                if(copy.has_color_scale_bias)
+                    return reject("OpenXR layer repeats the color scale/bias extension",int(i),-1,extension->type);
+                copy.has_color_scale_bias=true;
+                copy.color_scale_bias=*reinterpret_cast<const XrCompositionLayerColorScaleBiasKHR*>(extension);
+                copy.color_scale_bias.next=nullptr;
+            }
             if(input==reinterpret_cast<const XrCompositionLayerBaseHeader*>(scene)) {
                 if(found)return reject("OpenXR scene projection is submitted more than once",int(i));
                 found=true;copy.scene=true;scene_flags=scene->layerFlags;
@@ -121,8 +138,13 @@ struct FrameLayers {
     std::vector<const XrCompositionLayerBaseHeader*> replace_scene(const XrCompositionLayerProjection& scene) {
         std::vector<const XrCompositionLayerBaseHeader*> result;
         result.reserve(layers.size());
-        for(auto& layer:layers) result.push_back(layer.scene?
-            reinterpret_cast<const XrCompositionLayerBaseHeader*>(&scene):layer.header());
+        replacement_scene=scene;
+        for(auto& layer:layers){
+            if(layer.scene){
+                replacement_scene.next=layer.extension_chain();
+                result.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&replacement_scene));
+            }else result.push_back(layer.header());
+        }
         return result;
     }
     std::vector<const XrCompositionLayerBaseHeader*> original() {

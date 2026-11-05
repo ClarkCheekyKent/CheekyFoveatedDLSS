@@ -914,6 +914,10 @@ void fg_copy_validation_test(bool include_buffered=true) {
         const auto* dummy=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
         const auto* scene=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[1]);
         const auto* quad=reinterpret_cast<const XrCompositionLayerQuad*>(end->layers[2]);
+        const auto* color=static_cast<const XrCompositionLayerColorScaleBiasKHR*>(scene->next);
+        check(color&&color->type==XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR&&!color->next&&
+            color->colorScale.r==.5f&&color->colorBias.b==.125f,
+            "Native, generated and original fallback submissions must preserve scene color metadata");
         check(dummy->views[1].subImage.imageRect.offset.x==2,"VD helper views must be copied");
         check(quad->size.width==1 && quad->subImage.swapchain==h<XrSwapchain>(202),"UI quad must survive the extra slot");
         const auto scene_chain=scene->views[0].subImage.swapchain;
@@ -944,6 +948,8 @@ void fg_copy_validation_test(bool include_buffered=true) {
     }
     XrCompositionLayerProjection scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     scene.space=h<XrSpace>(1);scene.viewCount=2;scene.views=scene_views.data();
+    XrCompositionLayerColorScaleBiasKHR scene_color{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+    scene_color.colorScale={.5f,1,1,1};scene_color.colorBias={0,0,.125f,0};scene.next=&scene_color;
     XrCompositionLayerProjection dummy{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     dummy.space=scene.space;dummy.viewCount=2;dummy.views=dummy_views.data();
     dummy.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
@@ -1230,12 +1236,13 @@ void diagnostic_lifetime_test() {
 #include "fg_pacing_simulation.hpp"
 #include "stereo_alignment_validation.hpp"
 #include "submission_diagnostics_validation.hpp"
+#include "color_scale_bias_validation.hpp"
 #include "nr_native_validation.hpp"
 int main(int argc,char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
         if(argc>1&&std::string(argv[1])=="--openxr-stereo-alignment") {stereo_alignment_validation();return 0;}
-        if(argc>1&&std::string(argv[1])=="--nr-native") {submission_diagnostics_validation();native_nr_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--nr-native") {submission_diagnostics_validation();color_scale_bias_validation();native_nr_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--menu-live-cursor") {
             for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB})menu_cursor_validation(format);
             custom_binding_menu_test();return 0;

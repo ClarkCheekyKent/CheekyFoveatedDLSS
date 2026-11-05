@@ -74,9 +74,18 @@ void native_nr_validation() {
     auto native=std::make_shared<BufferedPresenter>();native->native_nr_only=true;native->session=session;
     auto rejected_backend=std::make_unique<NativeNrBackendFixture>(*native);auto* rejected_fixture=rejected_backend.get();
     native->backend=std::move(rejected_backend);
+    static unsigned color_submissions;color_submissions=0;
     native->xr.end_frame=[](XrSession,const XrFrameEndInfo* original)->XrResult{
         check(original->layerCount==2&&original->layers[0]->type==XR_TYPE_COMPOSITION_LAYER_PROJECTION,
-            "Rejected native frame retains the original layers");return XR_SUCCESS;};
+            "Rejected native frame retains the original layers");
+        if(original->layers[0]->next){
+            const auto* color=static_cast<const XrCompositionLayerColorScaleBiasKHR*>(original->layers[0]->next);
+            // The earlier unknown-extension rejection is still an original passthrough.
+            if(color->type==XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR){
+                check(color->colorScale.r==.5f&&color->colorBias.b==.25f&&!color->next,
+                    "Native NR runtime submission must preserve scene color scale/bias");++color_submissions;}
+        }
+        return XR_SUCCESS;};
     instances.at(instance).dispatch.end_frame=native->xr.end_frame;
     SessionState owner{};owner.instance=instance;owner.session=session;owner.running=true;
     owner.view_configuration=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;owner.fg=native;
@@ -100,6 +109,14 @@ void native_nr_validation() {
         std::strstr(native->last_submission_diagnostic.reason,"capture overflow"),"Capture overflow has its own NR rejection");
     check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&!native->last_submission_diagnostic.reason&&
         rejected_fixture->processed==1,"A later compatible frame processes and clears the rejection");
+    XrCompositionLayerColorScaleBiasKHR color{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+    color.colorScale={.5f,1,1,1};color.colorBias={0,0,.25f,0};projection.next=&color;
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&!native->last_submission_diagnostic.reason&&
+        rejected_fixture->processed==2&&color_submissions==1&&projection.next==&color,
+        "Color scale/bias must reach native NR processing and the final runtime submission");
+    rejected_fixture->fail=true;
+    check(cheeky_xrEndFrame(session,&rejected)==XR_SUCCESS&&color_submissions==2&&projection.next==&color,
+        "Inference fallback preserves the application's original color metadata");projection.next=nullptr;
     sessions.clear();swapchains.clear();
     std::cout<<"PASS native NR cadence, auxiliary layers, immutable submission and inference fallback without frame generation\n";
 }

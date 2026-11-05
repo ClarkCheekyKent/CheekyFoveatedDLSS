@@ -9,6 +9,7 @@ struct Runtime {
     static inline std::atomic<unsigned> age_logs{};
     static inline std::atomic<unsigned> path_logs{};
     static inline std::atomic<bool> paused{},reject_private{};
+    static inline bool expect_color_metadata{}; // Set before starting the presentation owner.
     static inline DWORD owner{};
     static inline unsigned phase{},next_chain{};
     static inline ID3D12Resource* last_native{};
@@ -42,6 +43,11 @@ struct Runtime {
             if(frame->layerCount!=3){++errors;return XR_ERROR_LAYER_INVALID;}
             const auto* scene=reinterpret_cast<const XrCompositionLayerProjection*>(frame->layers[1]);
             const auto* quad=reinterpret_cast<const XrCompositionLayerQuad*>(frame->layers[2]);
+            if(expect_color_metadata){
+                const auto* color=static_cast<const XrCompositionLayerColorScaleBiasKHR*>(scene->next);
+                if(!color||color->type!=XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR||color->next||
+                    color->colorScale.r!=.5f||color->colorBias.b!=.125f)++errors;
+            }
             const auto sc=scene->views[0].subImage.swapchain;
             if(sc==h<XrSwapchain>(200)){++raw_frames;return XR_SUCCESS;}
             if(!chains.contains(sc)||quad->size.width!=1||quad->subImage.swapchain==h<XrSwapchain>(201))++errors;
@@ -650,6 +656,9 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
         helper_views[i]=views[i];helper_views[i].subImage={h<XrSwapchain>(201),{{0,0},{4,4}},0};}
     XrCompositionLayerProjection scene{XR_TYPE_COMPOSITION_LAYER_PROJECTION},helper{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     scene.space=helper.space=h<XrSpace>(1);scene.views=views.data();helper.views=helper_views.data();scene.viewCount=helper.viewCount=2;
+    XrCompositionLayerColorScaleBiasKHR scene_color{XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR};
+    scene_color.colorScale={.5f,1,1,1};scene_color.colorBias={0,0,.125f,0};scene.next=&scene_color;
+    Runtime::expect_color_metadata=true;
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};quad.space=scene.space;quad.pose.orientation.w=1;quad.size={1,1};
     quad.subImage={h<XrSwapchain>(201),{{0,0},{int(width),int(width)}},0};
     const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&helper),
@@ -1073,6 +1082,7 @@ void fg_buffered_validation(ID3D12Device* device,const wchar_t* models=nullptr,u
     check(blocked_wait&&interrupted==XR_ERROR_SESSION_NOT_RUNNING&&Runtime::errors==0&&Runtime::waits==Runtime::ends,
         "Stop must wake a blocked application wait and close the outstanding runtime frame exactly once");
     failed.reset();Runtime::reject_private=false;
+    Runtime::expect_color_metadata=false;
     Runtime::snapshots=nullptr;
     std::cout<<"PASS buffered private-swapchain failure recovery, restart, blocked application wait cancellation and balanced shutdown\n";
     fg_hookless_crossqueue_validation(device);

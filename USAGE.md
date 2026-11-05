@@ -152,6 +152,10 @@ DLSS-NR diagnostics and support ZIP. The OpenXR startup log records the affected
 layer/eye, rejected structure type, or space/swapchain handle when a rejection
 changes, plus a recovery message when submissions become compatible again.
 Repeated identical rejections do not produce a log entry for every frame.
+The OpenXR presenter preserves `XR_KHR_composition_layer_color_scale_bias` on
+scene and auxiliary layers, including native NR and generated frames. Other
+unsupported layer extension chains keep the original submission and report the
+rejected structure type.
 
 In the ReShade add-on panel, click **Report an issue...**. The add-on prepares a
 support ZIP in `%TEMP%\CheekySupport`, opens a GitHub bug report with a short
