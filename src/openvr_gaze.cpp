@@ -1,4 +1,4 @@
-#include "eye_calibration.hpp"
+﻿#include "eye_calibration.hpp"
 #include "openvr_gaze.hpp"
 #include "openvr_gaze_math.hpp"
 #include "openvr_menu.hpp"
@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace cheeky::foveated_dlss {
@@ -322,8 +323,42 @@ bool reshade_interface_owner_present() noexcept {
         if (GetProcAddress(modules[i], "ReShadeRegisterAddon") && GetProcAddress(modules[i], "ReShadeUnregisterAddon")) return true;
     return false;
 }
+// OpenComposite's openvr_api.dll (OpenVR on OpenXR) answers a compositor version it doesn't implement with a
+// fatal error box ("unknown/unsupported interface IVRCompositor_029") rather than an error code, so it must
+// never be probed for versions; the compositor the application itself requests still arms through interface_hook.
+// Recognised as the ace-quadview launcher does: the DLL names itself "OpenComposite".
+bool api_is_opencomposite() noexcept {
+    static std::atomic<int> known{-1};  // -1 not looked at yet, 0 no, 1 yes
+    const int k = known.load();
+    if (k >= 0) return k == 1;
+    bool found = false;
+    wchar_t path[32768]{};
+    if (api_module && GetModuleFileNameW(api_module, path, 32768)) {
+        const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size{};
+            if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (64LL << 20)) {
+                std::string bytes(static_cast<std::size_t>(size.QuadPart), '\0');
+                DWORD read{};
+                if (ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr))
+                    found = bytes.find("OpenComposite") != std::string::npos;
+            }
+            CloseHandle(file);
+        }
+    }
+    known.store(found ? 1 : 0);
+    return found;
+}
 void recover_cached_compositors() {
     if (!late_recovery_enabled.load() || !get_interface) return;
+    if (api_is_opencomposite()) {
+        static std::atomic<bool> reported{};
+        if (!reported.exchange(true))
+            log_info("OpenVR cached-interface recovery skipped: openvr_api.dll is OpenComposite, which treats an "
+                     "unknown compositor version as fatal; waiting for application requests");
+        return;
+    }
     const auto now = GetTickCount64();
     if (now < next_recovery_check) return;
     next_recovery_check = now + 1000;
