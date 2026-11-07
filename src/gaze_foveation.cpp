@@ -632,7 +632,7 @@ bool calculate_coordinated_crop(
     bool copy_match{};
     bool projection_match{};
     const bool openvr_snapshot = (snapshot.status_flags & CHEEKY_GAZE_STATUS_OPENVR) != 0U;
-    const bool marker_match = eye_assignment.calibrated && snapshot.view_count == 2U &&
+    bool marker_match = eye_assignment.calibrated && snapshot.view_count == 2U &&
         (openvr_snapshot ? eye_assignment.calibration_session == 0 :
             eye_assignment.calibration_session != 0 && eye_assignment.calibration_session == snapshot.session_generation);
     if (marker_match) {
@@ -642,9 +642,17 @@ bool calculate_coordinated_crop(
             (eye_assignment.shared_source && !eye_assignment.source_crops[1].valid)) {
             // Identity may outlive geometric verification. Never treat stale
             // submitted UVs as source UVs while reacquiring the crop.
-            state_for_view(view_id).temporal = {};
-            return auto_crop(nullptr);
+            if (eye_assignment.shared_source) {
+                state_for_view(view_id).temporal = {};
+                return auto_crop(nullptr);
+            }
+            // A verified stereo eye keeps the uncalibrated layout routes, which
+            // prove UVs by matching dimensions. Post-processed games (UEVR)
+            // lose markers often; the image center sits far from the optics.
+            marker_match = false;
         }
+    }
+    if (marker_match) {
         for (unsigned eye = 0; eye < 2; ++eye) {
             const auto& p = eye_assignment.source_crops[eye];
             auto& v = snapshot.views[eye];
