@@ -4645,8 +4645,19 @@ NgxResult hook_core_create_d3d12(
     detect_afw_runtime();
     if (protected_ngx_core_enabled()) {
         if (afw_reject_core_reentry()) return 0xBAD00007U;
-        // Let the lower create hook track its own handle and output contract.
-        return traced_feature_create(original, command_list, feature, parameters, handle, 3);
+        // The lower create hook tracks its own handle and output contract. It
+        // is installed only after its runtime is seen stable, so a game that
+        // creates features as nvngx_dlss.dll loads (Assetto Corsa EVO) is
+        // missed: record the created output here when nothing has, so
+        // evaluation can normalize OutWidth/OutHeight. Same handle either way.
+        const bool game = parameters != nullptr && is_dlss_feature(feature) && !d3d12_ngx_interception_active();
+        const NgxOutputExtent output_extent{game ? get_ui(parameters, "OutWidth") : 0U,
+            game ? get_ui(parameters, "OutHeight") : 0U};
+        const auto result = traced_feature_create(original, command_list, feature, parameters, handle, 3);
+        if (game && ngx_succeeded(result) && handle != nullptr && *handle != nullptr &&
+            d3d12_game_output_extent(*handle).width == 0U)
+            remember_d3d12_game_view(*handle, feature, output_extent);
+        return result;
     }
     D3D12NgxInterceptionScope scope;
     if (!scope.outermost()) {
@@ -5427,8 +5438,16 @@ NgxResult evaluate_d3d12_c_impl(
 
 NgxResult runtime_evaluate_d3d12_c(ID3D12GraphicsCommandList* list, const NgxHandle* handle,
     const NgxParameters* parameters, NgxProgressCallbackC callback) {
-    const DebugExposureScope exposure_scope{native_d3d12_exposure(parameters)};
     const bool outer = !d3d12_ngx_interception_active();
+    // As process_d3d12_evaluation(): native DLSS evaluates at the feature's
+    // created output, whatever OutWidth holds. Titles evaluating several
+    // features through one parameter bag (Assetto Corsa EVO's quad views via
+    // NGX_D3D12_EVALUATE_DLSS_EXT) leave the last-created feature's size there.
+    const bool native_dlss = outer && !inside_streamline_evaluation &&
+        recognizable_d3d12_dlss_evaluation({D3D12NgxRoute::public_runtime, list, handle, parameters, nullptr});
+    const NgxEvaluationExtentScope extent_scope(native_dlss ? parameters : nullptr,
+        native_dlss ? d3d12_game_output_extent(handle) : NgxOutputExtent{});
+    const DebugExposureScope exposure_scope{native_d3d12_exposure(parameters)};
     // The regular EvaluateFeature path publishes FG guides in
     // dispatch_d3d12_ngx_evaluation(). The _C ABI doesn't use that dispatcher:
     // without this publication a title using both entrypoints loses an eye.
