@@ -1190,6 +1190,63 @@ void test_manual_stereo_mapping() {
     clear_stereo_calibration(); reset_gaze_foveation();
 }
 
+// God of War UEVR: markers verify the eyes once, then post-processing hides
+// them. Losing crop verification must keep each eye's optical alignment.
+void test_verified_eye_without_crop() {
+    using namespace cheeky::foveated_dlss;
+    reset_gaze_foveation(); clear_stereo_calibration();
+    register_stereo_view(961U); register_stereo_view(962U);
+    Settings settings{};
+    settings.width = settings.height = 0.4F;
+    CheekyGazeSnapshotV1 snapshot{};
+    snapshot.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    snapshot.structure_size = sizeof(snapshot);
+    snapshot.view_count = 2U;
+    snapshot.swapchain_generation = 1U;
+    snapshot.session_generation = 988U;
+    snapshot.status_flags = CHEEKY_GAZE_STATUS_MAPPING_READY | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& eye = snapshot.views[i];
+        eye.view_index = i;
+        eye.flags = CHEEKY_GAZE_VIEW_RESOURCE_VALID | CHEEKY_GAZE_VIEW_FORWARD_VALID;
+        eye.image_rect_x = i * 3024;
+        eye.image_rect_width = 3024U; eye.image_rect_height = 2836U;
+        eye.resource_identity = 0x3AC4ED30820ULL;
+        eye.swapchain_identity = 200U;
+        eye.forward_u = i == 0 ? 0.62F : 0.38F;
+        eye.forward_v = 0.5F;
+    }
+    CropGeometry crops[2]{};
+    const auto frame = [&]() {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        snapshot.publication_qpc = now.QuadPart;
+        ++snapshot.predicted_display_time;
+        for (unsigned i = 0; i < 2; ++i) {
+            bool reset{};
+            expect(calculate_coordinated_crop(settings, 961U + i, nullptr,
+                1512U, 1418U, 3024U, 2836U, 0U, 0U, crops[i], reset, &snapshot),
+                "Verified stereo eye produces a coordinated crop");
+        }
+    };
+    const auto center = [&](unsigned i) { return (crops[i].input_base_x + crops[i].input_width * 0.5F) / 1512.F; };
+    std::array<StereoSourceCrop, 2> source_crops{};
+    for (auto& crop : source_crops) crop = {0.F, 0.F, 1.F, 1.F, 3024U, 2836U, true};
+    // Registration order says 961 is left; the markers prove 962 is.
+    expect(publish_stereo_calibration(962U, 961U, stereo_view_generation(962U), stereo_view_generation(961U),
+        1, GetTickCount64(), nullptr, 988U, false, false, &source_crops), "Verified stereo identity publishes");
+    frame(); frame(); frame();
+    expect_near(center(1), 0.62F, 0.001F, "Marker-verified left eye uses the left optical center");
+    expect_near(center(0), 0.38F, 0.001F, "Marker-verified right eye uses the right optical center");
+    invalidate_stereo_crop();
+    frame(); frame(); frame();
+    expect(stereo_eye_assignment(962U).calibrated, "Eye identity outlives crop verification");
+    expect_near(center(1), 0.62F, 0.001F, "Unverified crop keeps the verified left eye's optical alignment");
+    expect_near(center(0), 0.38F, 0.001F, "Unverified crop keeps the verified right eye's optical alignment");
+    expect(gaze_diagnostics().views[0].packed_stereo_mapping, "Unverified crop falls back to the packed layout route");
+    unregister_stereo_view(961U); unregister_stereo_view(962U);
+    reset_gaze_foveation(); clear_stereo_calibration();
+}
+
 void test_packed_alignment_coordinator(bool openvr = false) {
     using namespace cheeky::foveated_dlss;
     reset_gaze_foveation();
@@ -2882,6 +2939,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--manual-gaze") == 0) {
         test_fg_sr_matching_size();
         test_manual_stereo_mapping();
+        test_verified_eye_without_crop();
         test_packed_alignment_coordinator(false); test_packed_alignment_coordinator(true);
         test_libovr_coordinator(); test_mono_gaze_coordinator();
         return failures ? 1 : 0;
@@ -2973,6 +3031,7 @@ int main(int argc, char** argv) {
     }
     test_fg_sr_matching_size();
     test_manual_stereo_mapping();
+    test_verified_eye_without_crop();
     test_center_supersampling();
     test_nr_only_center(false);
     test_nr_only_center(true);
