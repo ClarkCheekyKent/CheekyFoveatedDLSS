@@ -166,6 +166,12 @@ if(CHEEKY_BUILD_UEVR)
             add_test(NAME CheekyHost-${host}-${mode} COMMAND CheekyStandaloneHostTests ${mode} ${host})
         endforeach()
     endforeach()
+    foreach(api dx11 dx12)
+        foreach(attachment early late)
+            add_test(NAME CheekySoftwareDiscovery-${api}-${attachment}
+                COMMAND CheekyStandaloneHostTests startup-${api}-${attachment})
+        endforeach()
+    endforeach()
 endif()
 
 add_library(CheekyVulkanLayer MODULE vulkan_layer/bootstrap.cpp)

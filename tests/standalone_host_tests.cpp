@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -48,7 +49,7 @@ void verify_startup_diagnostics(const std::filesystem::path& root) {
         host.find("component=runtime version=") != host.npos && host.find("image_timestamp=") != host.npos,
         "Startup logs identify launch and host/runtime builds");
     for (const char* stage : {"host_load_runtime", "host_runtime_start", "runtime_start_lock", "runtime_interception",
-            "host_graphics_discovery", "graphics_d3d11_hardware_device", "graphics_d3d12_device",
+            "host_graphics_discovery", "graphics_d3d11_warp_device", "graphics_d3d12_warp_device",
             "graphics_devices_and_factory_release"}) {
         const auto begin = host.find(std::string("stage=") + stage + " begin");
         const auto end = host.find(std::string("stage=") + stage + " end", begin);
@@ -70,6 +71,110 @@ void verify_logging_preserves_errors() {
     SetLastError(ERROR_FILE_NOT_FOUND);
     require(cheeky::startup::status(noisy_log,"test_hr","hr",[] { return E_NOINTERFACE; }) == E_NOINTERFACE &&
         GetLastError() == ERROR_FILE_NOT_FOUND,"Startup logging preserves HRESULT and last error");
+}
+unsigned hardware_discovery_calls{};
+unsigned software_discovery_calls{};
+HRESULT WINAPI discovery_device11(IDXGIAdapter* adapter, D3D_DRIVER_TYPE type, HMODULE software,
+    UINT flags, const D3D_FEATURE_LEVEL* levels, UINT level_count, UINT sdk,
+    ID3D11Device** device, D3D_FEATURE_LEVEL* level, ID3D11DeviceContext** context) {
+    if (type != D3D_DRIVER_TYPE_WARP) {
+        ++hardware_discovery_calls;
+        return E_ABORT;
+    }
+    ++software_discovery_calls;
+    return D3D11CreateDevice(adapter,type,software,flags,levels,level_count,sdk,device,level,context);
+}
+HRESULT WINAPI discovery_device12(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFIID iid, void** device) {
+    ComPtr<IDXGIAdapter1> selected;
+    DXGI_ADAPTER_DESC1 description{};
+    if (!adapter || FAILED(adapter->QueryInterface(IID_PPV_ARGS(&selected))) ||
+        FAILED(selected->GetDesc1(&description)) || !(description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+        ++hardware_discovery_calls;
+        return E_ABORT;
+    }
+    ++software_discovery_calls;
+    return D3D12CreateDevice(adapter,level,iid,device);
+}
+void replace_discovery_import(HMODULE module, const char* name, void* replacement) {
+    auto* base = reinterpret_cast<BYTE*>(module);
+    const auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    const auto* image = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    auto* imports = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base +
+        image->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    for (; imports->Name; ++imports) {
+        if (!imports->OriginalFirstThunk) continue;
+        const auto library=GetModuleHandleA(reinterpret_cast<const char*>(base+imports->Name));
+        const auto target=library ? GetProcAddress(library,name) : nullptr;
+        auto* names = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imports->OriginalFirstThunk);
+        auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + imports->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) {
+                if (!target || slots->u1.Function!=reinterpret_cast<ULONG_PTR>(target)) continue;
+            } else {
+                const auto* entry = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+                if (std::strcmp(reinterpret_cast<const char*>(entry->Name),name)) continue;
+            }
+            DWORD protection{};
+            require(VirtualProtect(&slots->u1.Function,sizeof(void*),PAGE_READWRITE,&protection),"Writable host import");
+            InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&slots->u1.Function),replacement);
+            DWORD ignored{};
+            require(VirtualProtect(&slots->u1.Function,sizeof(void*),protection,&ignored),"Restore host import protection");
+            return;
+        }
+    }
+    throw std::runtime_error(std::string("Host discovery import missing: ")+name);
+}
+void verify_software_discovery(const std::filesystem::path& root, bool dx11, bool hardware, bool late) {
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<ID3D11Device> d11;
+    ComPtr<ID3D12Device> d12;
+    ComPtr<ID3D12CommandQueue> queue;
+    HWND window{};
+    const auto create_game = [&] {
+        check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"Game factory");
+        ComPtr<IDXGIAdapter> adapter;
+        if (!hardware) check(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)),"Game WARP adapter");
+        if (dx11) {
+            check(D3D11CreateDevice(adapter.Get(),hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_UNKNOWN,
+                nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr),"Game DX11 device");
+        } else {
+            check(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)),"Game DX12 device");
+            D3D12_COMMAND_QUEUE_DESC description{};
+            check(d12->CreateCommandQueue(&description,IID_PPV_ARGS(&queue)),"Game queue");
+        }
+        window=CreateWindowExW(0,L"STATIC",L"Software discovery regression",WS_POPUP,0,0,320,240,nullptr,nullptr,nullptr,nullptr);
+        require(window!=nullptr,"Game window");
+        DXGI_SWAP_CHAIN_DESC1 description{};
+        description.Width=320; description.Height=240; description.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+        description.SampleDesc.Count=1; description.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        description.BufferCount=2; description.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        check(factory->CreateSwapChainForHwnd(dx11 ? static_cast<IUnknown*>(d11.Get()) : queue.Get(),
+            window,&description,nullptr,nullptr,&chain),"Game swapchain");
+    };
+    if (late) create_game();
+    const auto host=LoadLibraryExW((root/L"CheekyFoveatedDLSSHost.dll").c_str(),nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
+    require(host!=nullptr,"Load discovery host");
+    // A device hook can reject or stall an extra hardware device. Only the
+    // host's imports are intercepted, so the game still uses its real adapter.
+    replace_discovery_import(host,"D3D11CreateDevice",reinterpret_cast<void*>(&discovery_device11));
+    replace_discovery_import(host,"D3D12CreateDevice",reinterpret_cast<void*>(&discovery_device12));
+    const auto start=proc<CheekyHostStartFn>(host,"CheekyHost_Start");
+    bool started{};
+    std::thread initializer([&] { started=start(1); });
+    initializer.join();
+    require(started,"Start on a worker without extra hardware devices");
+    require(hardware_discovery_calls==0,"Startup discovery must not initialize hardware devices");
+    require(software_discovery_calls==2,"Discover both graphics APIs on software devices");
+    if (!late) create_game();
+    frame();
+    const auto state=snapshot(proc<CheekyHostSnapshotFn>(host,"CheekyHost_Snapshot"));
+    require(state.find("\"ready\":true")!=state.npos,"Software discovery observes game presentation");
+    check(chain->ResizeBuffers(2,400,300,DXGI_FORMAT_UNKNOWN,0),"Game resize");
+    frame();
+    chain.Reset(); DestroyWindow(window);
+    std::printf("PASS: software-only discovery, %s %s game, %s attachment, presentation and resize\n",
+        hardware ? "hardware" : "software",dx11 ? "DX11" : "DX12",late ? "late" : "early");
 }
 void verify_fg(ID3D12Device* device, ID3D12CommandQueue* queue) {
     using namespace cheeky::foveated_dlss;
@@ -255,6 +360,10 @@ int main(int argc,char** argv) {
         std::filesystem::create_directories(root);
         for (const auto* name : {L"CheekyFoveatedDLSSHost.dll",L"CheekyFoveatedDLSSRuntime.dll"})
             std::filesystem::copy_file(bin/"CheekyFoveatedDLSS"/name,root/name);
+        if (mode.starts_with("startup-")) {
+            verify_software_discovery(root,dx11,mode.find("hardware")!=mode.npos,mode.find("late")!=mode.npos);
+            return 0;
+        }
         if(!chained_table)std::filesystem::copy_file(bin/"test-fixtures"/"nvngx_dlss.dll",root/"nvngx_dlssnr.dll");
         // Exercise the direct DX11 route here. A separate suite exercises its
         // optional DX12 transport and NR; settings must not select it implicitly.

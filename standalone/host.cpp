@@ -270,6 +270,9 @@ bool install_graphics_hooks() {
         !hook_method<CoreFn,create_core>(factory.Get(),16) ||
         !hook_method<CompositionFn,create_composition>(factory.Get(),24)) return false;
     // Discover Present implementations for swapchains created before ASI attach.
+    // Software devices avoid starting the vendor driver or another injector's
+    // hardware-device path while the game's own graphics are initializing.
+    // Game-created swapchains are still observed through the factory hooks.
     // The window is hidden, created and destroyed on this initialization thread.
     HWND window = cheeky::startup::win32(log_host,"graphics_create_window",[&] {
         return CreateWindowExW(0,L"STATIC",L"Cheeky graphics discovery",WS_POPUP,0,0,16,16,nullptr,nullptr,module,nullptr); });
@@ -280,8 +283,7 @@ bool install_graphics_hooks() {
     desc.BufferCount=2; desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
     ComPtr<ID3D11Device> d11;
     bool observed{};
-    if (SUCCEEDED(hr("graphics_d3d11_hardware_device",[&] { return D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr); })) ||
-        SUCCEEDED(hr("graphics_d3d11_warp_device",[&] { return D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr); }))) {
+    if (SUCCEEDED(hr("graphics_d3d11_warp_device",[&] { return D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d11,nullptr,nullptr); }))) {
         ComPtr<IDXGISwapChain1> chain;
         if (SUCCEEDED(hr("graphics_d3d11_swapchain",[&] { return factory->CreateSwapChainForHwnd(d11.Get(),window,&desc,nullptr,nullptr,&chain); })))
             observed = observe_chain(chain.Get(),d11.Get());
@@ -289,7 +291,11 @@ bool install_graphics_hooks() {
         chain.Reset(); release.end();
     }
     ComPtr<ID3D12Device> d12;
-    if (SUCCEEDED(hr("graphics_d3d12_device",[&] { return D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)); }))) {
+    ComPtr<IDXGIFactory4> software_factory;
+    ComPtr<IDXGIAdapter> software_adapter;
+    if (SUCCEEDED(hr("graphics_query_factory4",[&] { return factory.As(&software_factory); })) &&
+        SUCCEEDED(hr("graphics_d3d12_warp_adapter",[&] { return software_factory->EnumWarpAdapter(IID_PPV_ARGS(&software_adapter)); })) &&
+        SUCCEEDED(hr("graphics_d3d12_warp_device",[&] { return D3D12CreateDevice(software_adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&d12)); }))) {
         ComPtr<ID3D12CommandQueue> queue;
         D3D12_COMMAND_QUEUE_DESC qdesc{};
         if (SUCCEEDED(hr("graphics_d3d12_queue",[&] { return d12->CreateCommandQueue(&qdesc,IID_PPV_ARGS(&queue)); }))) {
@@ -304,7 +310,7 @@ bool install_graphics_hooks() {
     }
     cheeky::startup::win32(log_host,"graphics_destroy_window",[&] { return DestroyWindow(window); });
     { cheeky::startup::Step release(log_host,"graphics_devices_and_factory_release");
-      d12.Reset(); d11.Reset(); factory.Reset(); release.end(); }
+      d12.Reset(); d11.Reset(); software_adapter.Reset(); software_factory.Reset(); factory.Reset(); release.end(); }
     return observed;
 }
 template<class T> bool load(HMODULE dll,const char* name,T& out) {

@@ -243,6 +243,9 @@ frames; actual NVIDIA inference and headset pacing need game testing.
   finish before returning the factory to the game. Recursive factory creation
   by the host bypasses that wait. Failed DXGI calls retain their original error.
 - VERSION and ASI startup are asynchronous; duplicate `InitializeASI` calls are harmless.
+  Temporary D3D11/D3D12 presentation-hook discovery uses WARP software devices
+  to avoid initializing an extra hardware device during game startup. The
+  factory hooks observe the game's actual device and swapchains independently.
   A D3D12 swap chain created before the host hooks are ready may not provide a
   usable presentation queue. In that case, restart with normal early ASI
   loading; the host must observe a supported swap-chain creation path.

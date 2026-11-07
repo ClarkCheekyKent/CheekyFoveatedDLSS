@@ -81,6 +81,12 @@ foreach ($proxy in @('reshade','streamline')) {
 }
 
 $testExecutable = Join-Path $projectRoot "bin\$Configuration\CheekyTests.exe"
+foreach ($api in @('dx11', 'dx12')) {
+    foreach ($attachment in @('early', 'late')) {
+        & (Join-Path $projectRoot "bin\$Configuration\CheekyStandaloneHostTests.exe") "startup-$api-$attachment"
+        if ($LASTEXITCODE -ne 0) { throw "Software startup discovery failed: $api $attachment" }
+    }
+}
 foreach ($gazeMode in @('--manual-gaze', '--openxr-independent-on', '--openxr-independent-off')) {
     & $testExecutable $gazeMode
     if ($LASTEXITCODE -ne 0) { throw "Gaze compatibility regression failed: $gazeMode" }
