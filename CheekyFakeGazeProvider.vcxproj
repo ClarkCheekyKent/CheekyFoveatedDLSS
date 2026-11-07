@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals"><ProjectGuid>{514AE60D-49DA-46DE-8541-4A8F45833214}</ProjectGuid><RootNamespace>CheekyFakeGazeProvider</RootNamespace></PropertyGroup>
+  <PropertyGroup><ConfigurationType>DynamicLibrary</ConfigurationType><TargetName>CheekyFakeGazeProvider</TargetName><CheekyOutputSubdir>test-fixtures\</CheekyOutputSubdir><CheekyLibraries></CheekyLibraries></PropertyGroup>
+  <Import Project="standalone\build.props" />
+  <ItemGroup><ClCompile Include="tests\fake_gaze_provider.cpp" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
