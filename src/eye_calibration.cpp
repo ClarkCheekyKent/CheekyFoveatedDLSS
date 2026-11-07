@@ -180,6 +180,7 @@ struct State {
     DWORD frame_thread{}, stamp_thread{}, submit_thread{}, tick_thread{};
     std::uint64_t continuous_epoch{};
     std::array<View, 2> continuous_views;
+    std::array<std::uint64_t, 2> continuous_seen_ms{};
     // Separate from sampled proof: never extend a capture's lifetime just to
     // mark an intervening render. Full pools skip without waiting on the GPU.
     std::array<std::shared_ptr<Calibration12Frame>, ring_size * 2> continuous12;
@@ -1261,6 +1262,9 @@ void stamp_points11(State& s, ID3D11DeviceContext* context, ID3D11Texture2D* tex
             0, s.markers[c].Get(), 0, &box);
     }
 }
+// Stereo pairs render every frame or every other frame (AER); a source unseen
+// for this long is no longer part of the submitted pair.
+constexpr std::uint64_t continuous_source_idle_ms = 500;
 unsigned continuous_candidate(State& s, std::uint64_t view) {
     if (s.continuous_epoch != s.epoch) {
         s.continuous_views = {};
@@ -1278,14 +1282,40 @@ unsigned continuous_candidate(State& s, std::uint64_t view) {
             break;
         }
     }
+    const auto now = GetTickCount64();
     for (unsigned i = 0; i < 2; ++i)
-        if (s.continuous_views[i].id == view && s.continuous_views[i].generation == generation) return i;
+        if (s.continuous_views[i].id == view && s.continuous_views[i].generation == generation) {
+            s.continuous_seen_ms[i] = now;
+            return i;
+        }
     for (unsigned i = 0; i < 2; ++i) {
         auto& v = s.continuous_views[i];
         if (!v.id || stereo_view_generation(v.id) != v.generation) {
             v.id = view; v.generation = generation;
+            s.continuous_seen_ms[i] = now;
             return i;
         }
+    }
+    // A third live view (e.g. a cutscene feature the game keeps registered)
+    // may have claimed a slot first. Once it stops rendering, hand its slot to
+    // the new source; like a replaced view, this invalidates delayed pixels.
+    for (unsigned i = 0; i < 2; ++i) {
+        if (now - s.continuous_seen_ms[i] < continuous_source_idle_ms) continue;
+        trace_event("CALIB source slot %u reassigned idle_view=%llu new_view=%llu idle_ms=%llu",
+            i, static_cast<unsigned long long>(s.continuous_views[i].id),
+            static_cast<unsigned long long>(view), static_cast<unsigned long long>(now - s.continuous_seen_ms[i]));
+        const auto kept = s.continuous_views[1 - i];
+        const auto kept_seen = s.continuous_seen_ms[1 - i];
+        ++s.epoch;
+        s.frames_until_capture = 0;
+        clear_stereo_calibration();
+        s.continuous_views = {};
+        s.continuous_epoch = s.epoch;
+        s.continuous_views[1 - i] = kept;
+        s.continuous_seen_ms[1 - i] = kept_seen;
+        s.continuous_views[i].id = view; s.continuous_views[i].generation = generation;
+        s.continuous_seen_ms[i] = now;
+        return i;
     }
     return 2;
 }
@@ -2129,6 +2159,7 @@ void eye_calibration_stop() noexcept {
     s.frame_thread = s.stamp_thread = s.submit_thread = s.tick_thread = 0;
     s.continuous_epoch = 0;
     s.continuous_views = {};
+    s.continuous_seen_ms = {};
     s.continuous12 = {};
     s.continuous12_device.Reset();
     s.continuous12_next = 0;

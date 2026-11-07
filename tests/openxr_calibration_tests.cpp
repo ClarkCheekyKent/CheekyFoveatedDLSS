@@ -1941,11 +1941,55 @@ void libovr_alternating_commits() {
     cleanup();
     std::cout << "PASS LibOVR legacy AER: alternating eye commits paired across frames\n";
 }
+// Star Wars Outlaws keeps a third DLSS view alive around cutscenes. When it is
+// the first source stamped after a reset, it must not keep a candidate slot
+// once it stops rendering, or one eye of the real pair can never be stamped.
+void libovr_idle_extra_view() {
+    roles();
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &device, nullptr, &context));
+    constexpr unsigned size = 512;
+    const std::vector<unsigned> background(size * size, 0xff404040);
+    D3D11_TEXTURE2D_DESC desc{size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+        {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    std::array<ComPtr<ID3D11Texture2D>, 3> textures;
+    for (auto& texture : textures) check(device->CreateTexture2D(&desc, nullptr, &texture));
+    const std::array<std::uint64_t, 3> views{9101, 9102, 9103};
+    register_stereo_view(views[2]);
+    constexpr std::uint64_t session = 9902;
+    const auto stamp = [&](unsigned c) {
+        context->UpdateSubresource(textures[c].Get(), 0, nullptr, background.data(), size * 4, 0);
+        eye_calibration_stamp(context.Get(), textures[c].Get(), views[c], 0, 0, size, size);
+    };
+    const auto frame = [&](bool extra) {
+        eye_calibration_frame(EyeCalibrationBackend::libovr, session, 11);
+        if (extra) stamp(2);
+        stamp(0); stamp(1);
+        for (unsigned eye = 0; eye < 2; ++eye) {
+            const auto ticket = eye_calibration_submit(textures[eye].Get(), eye, 0, 0, 1, 1, 0,
+                EyeCalibrationBackend::libovr, session);
+            if (ticket) eye_calibration_result(ticket, 0);
+        }
+        context->Flush();
+        Sleep(2); eye_calibration_tick();
+    };
+    for (unsigned i = 0; i < 3; ++i) frame(true);
+    const auto deadline = GetTickCount64() + 5000;
+    do frame(false); while (!eye_calibration_stats().crop_mapping_active && GetTickCount64() < deadline);
+    if (!eye_calibration_stats().crop_mapping_active) std::cerr << eye_calibration_json() << '\n';
+    require(eye_calibration_stats().crop_mapping_active &&
+        stereo_eye_assignment(views[0]).calibrated && stereo_eye_assignment(views[1]).calibrated,
+        "An idle extra DLSS view must release its candidate slot to the stereo pair");
+    cleanup(); unregister_stereo_view(views[2]);
+    std::cout << "PASS LibOVR idle extra DLSS view releases its calibration slot\n";
+}
 } // namespace
 int run_libovr_alternating_calibration_tests() {
-    try { libovr_alternating_commits(); return 0; }
+    try { libovr_alternating_commits(); libovr_idle_extra_view(); return 0; }
     catch (const std::exception& e) {
-        std::cerr << "LibOVR legacy AER calibration: " << e.what() << '\n'; cleanup();
+        std::cerr << "LibOVR legacy AER calibration: " << e.what() << '\n'; cleanup(); unregister_stereo_view(9103);
         auto settings = configured_settings(); settings.eye_calibration_continuous = true; update_settings(settings);
         return 1;
     }
