@@ -1113,6 +1113,48 @@ void test_fg_sr_matching_size() {
     std::cout<<"PASS FG matching-size fallback agrees with SR and preserves feature extents across missing metadata\n";
 }
 
+// God of War-style UEVR session: menu views and feature recreation left the
+// uncalibrated roles reversed, while every frame evaluates the left eye first.
+void test_fallback_eye_order() {
+    using namespace cheeky::foveated_dlss;
+    const auto spin = [](double seconds) {
+        LARGE_INTEGER frequency{}, start{}, now{};
+        QueryPerformanceFrequency(&frequency); QueryPerformanceCounter(&start);
+        do QueryPerformanceCounter(&now);
+        while (double(now.QuadPart - start.QuadPart) / double(frequency.QuadPart) < seconds);
+    };
+    clear_stereo_calibration(); reset_gaze_foveation();
+    Settings s{}; s.x_offset = .1F;
+    register_stereo_view(5401); register_stereo_view(5402);
+    (void)settings_for_view(s, 5401); (void)settings_for_view(s, 5402);
+    expect(stereo_eye_assignment(5401).eye_index == 0U, "First evaluated view starts as the left fallback eye");
+    // Back-to-back pairs, left first: repeated calls per evaluation, then a frame gap.
+    const auto frames = [&](std::uint64_t first, std::uint64_t second, unsigned count) {
+        for (unsigned frame = 0; frame < count; ++frame) {
+            for (unsigned call = 0; call < 3; ++call) (void)settings_for_view(s, first);
+            for (unsigned call = 0; call < 3; ++call) (void)settings_for_view(s, second);
+            spin(0.006);
+        }
+    };
+    frames(5401, 5402, 60);
+    expect(stereo_eye_assignment(5401).eye_index == 0U, "Matching frame order keeps the fallback roles");
+    // Earlier agreeing votes decay, so a stable reversal still wins (~130 frames).
+    frames(5402, 5401, 200);
+    expect(stereo_eye_assignment(5402).eye_index == 0U && stereo_eye_assignment(5401).eye_index == 1U,
+        "The eye evaluated first in each frame becomes the left fallback eye");
+    expect(settings_for_view(s, 5402).x_offset == s.x_offset, "Swapped roles keep the left-eye offset sign");
+    // Alternate-eye rendering has one eye per frame: no short intra-frame gap.
+    for (unsigned frame = 0; frame < 120; ++frame) {
+        (void)settings_for_view(s, frame % 2U ? 5402 : 5401);
+        spin(0.006);
+    }
+    expect(stereo_eye_assignment(5402).eye_index == 0U, "Alternate-eye rendering never reorders the roles");
+    s.manual_stereo_mapping = true;
+    frames(5401, 5402, 60);
+    expect(stereo_eye_assignment(5402).eye_index == 0U, "Manual stereo mapping keeps its explicit eye order");
+    unregister_stereo_view(5401); unregister_stereo_view(5402);
+}
+
 void test_manual_stereo_mapping() {
     using namespace cheeky::foveated_dlss;
     clear_stereo_calibration(); reset_gaze_foveation();
@@ -2939,6 +2981,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--manual-gaze") == 0) {
         test_fg_sr_matching_size();
         test_manual_stereo_mapping();
+        test_fallback_eye_order();
         test_verified_eye_without_crop();
         test_packed_alignment_coordinator(false); test_packed_alignment_coordinator(true);
         test_libovr_coordinator(); test_mono_gaze_coordinator();
@@ -3031,6 +3074,7 @@ int main(int argc, char** argv) {
     }
     test_fg_sr_matching_size();
     test_manual_stereo_mapping();
+    test_fallback_eye_order();
     test_verified_eye_without_crop();
     test_center_supersampling();
     test_nr_only_center(false);

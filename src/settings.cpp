@@ -145,6 +145,16 @@ struct EyeRole {
 };
 
 EyeRole eye_roles[2]{};
+// Uncalibrated roles follow registration order, which menus and recreated
+// features can invert. Stereo renderers evaluate both eyes back to back, left
+// first: the role entered after the long (frame) gap is the left eye.
+struct EyeOrderVotes {
+    std::uint64_t views[2]{};
+    std::size_t last_role{2U};
+    std::int64_t last_qpc{};
+    std::array<double, 2> gap_into{};
+    std::array<unsigned, 2> first{};
+} eye_order_votes;
 std::uint64_t stereo_evaluation_sequence{};
 std::uint64_t registration_generation{};
 std::uint64_t stereo_mapping_revision{1};
@@ -749,6 +759,43 @@ void note_stereo_view_geometry(
     }
 }
 
+// Called under stereo_views_mutex for each evaluation of an assigned role.
+// Returns true after swapping the roles because the second one renders first.
+bool vote_eye_order(const std::size_t role) noexcept {
+    constexpr double frame_gap_seconds = 0.002;
+    constexpr unsigned decisive_votes = 30U;
+    auto& votes = eye_order_votes;
+    if (votes.views[0] != eye_roles[0].view_id || votes.views[1] != eye_roles[1].view_id)
+        votes = {{eye_roles[0].view_id, eye_roles[1].view_id}};
+    if (!votes.views[0] || !votes.views[1]) return false;
+    static const double frequency = [] {
+        LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return double(value.QuadPart);
+    }();
+    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+    if (votes.last_role < 2U && votes.last_role != role) {
+        // Repeated calls during one evaluation extend it; the gap starts at
+        // the previous role's last call. AFR and hitches produce no 3x split.
+        const double gap = double(now.QuadPart - votes.last_qpc) / frequency;
+        const double other = votes.gap_into[1U - role];
+        if (other > 0 && gap >= frame_gap_seconds && gap >= 3 * other) ++votes.first[role];
+        votes.gap_into[role] = gap;
+    }
+    votes.last_role = role;
+    votes.last_qpc = now.QuadPart;
+    if (votes.first[0] + votes.first[1] >= 4U * decisive_votes) {
+        votes.first[0] /= 2U; votes.first[1] /= 2U;
+    }
+    if (votes.first[1] < decisive_votes || votes.first[1] < 4U * votes.first[0]) return false;
+    std::swap(eye_roles[0], eye_roles[1]);
+    for (auto& view : stereo_views) {
+        if (view.view_id == eye_roles[0].view_id) view.second_eye = false;
+        if (view.view_id == eye_roles[1].view_id) view.second_eye = true;
+    }
+    ++stereo_mapping_revision;
+    votes = {{eye_roles[0].view_id, eye_roles[1].view_id}};
+    return true;
+}
+
 Settings settings_for_view(
     const Settings& settings,
     const std::uint64_t view_id
@@ -856,6 +903,7 @@ Settings settings_for_view(
         eye_roles[role_index].view_id = view_id;
     }
     eye_roles[role_index].last_evaluation = sequence;
+    if (!settings.manual_stereo_mapping && vote_eye_order(role_index)) role_index = 1U - role_index;
     matched_view->second_eye = role_index == 1U;
     matched_view->has_eye_assignment = true;
 
