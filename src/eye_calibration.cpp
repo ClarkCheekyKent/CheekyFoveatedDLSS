@@ -986,34 +986,33 @@ void poll(State& s) {
                 // A raw template score alone supplies identity, not geometry.
                 if (!actual.valid) { rejection |= 128U; f.marker_failure=4; continue; }
                 const auto& p = actual.placement;
-                // Compare the observed marker endpoints in submitted pixels.
-                // Extrapolating a 40px marker's fitted scale to the far crop edge
-                // amplifies one pixel of recognition noise into ~40px of error.
-                const auto endpoint_error = [](double marker, double origin, double extent,
-                    double expected_origin, double expected_extent, double pixels) {
-                    return std::abs((marker-origin)/extent -
-                        (marker-expected_origin)/expected_extent) * pixels;
-                };
-                double dx{}, dy{};
                 if (p.width <= 0 || p.height <= 0) { rejection |= 128U; f.marker_failure=4; continue; }
-                for (const double offset : {0., 40.}) {
-                    dx = (std::max)(dx, endpoint_error(expected.marker.x+offset, p.x, p.width,
-                        expected.x, expected.width, f.submitted_sizes[slot][0]));
-                    dy = (std::max)(dy, endpoint_error(expected.marker.y+offset, p.y, p.height,
-                        expected.y, expected.height, f.submitted_sizes[slot][1]));
-                }
-                f.marker_error_x=(std::max)(f.marker_error_x,dx); f.marker_error_y=(std::max)(f.marker_error_y,dy);
-                geometry_changed |= dx > 32 || dy > 32;
+                const auto error = calibration_marker_fit_error(expected, p,
+                    f.submitted_sizes[slot][0], f.submitted_sizes[slot][1]);
+                f.marker_error_x=(std::max)(f.marker_error_x,error.x); f.marker_error_y=(std::max)(f.marker_error_y,error.y);
+                geometry_changed |= error.x > 32 || error.y > 32;
             }
             if (geometry_changed) { rejection |= 128U; f.marker_failure=5; }
         }
+        // Indexed by physical eye. Corner verification replaces an assumed full
+        // canvas with the native crop its tracked marker proves, then locks it.
+        std::array<CalibrationPlacement, 2> chosen{};
         std::array<StereoSourceCrop, 2> crops{};
         if (!rejection) for (unsigned eye = 0; eye < 2; ++eye) {
             const unsigned slot = eye ? right_slot : left_slot;
             const unsigned c = unsigned(eye ? right : left);
-            const auto& p = acquired ? f.search[slot]->result.placement :
-                f.placement_plans[c].for_eye(slot, unsigned(eye ? selected_right : selected));
+            const unsigned h = unsigned(eye ? selected_right : selected);
+            auto& p = chosen[eye];
+            p = acquired ? f.search[slot]->result.placement : f.placement_plans[c].for_eye(slot, h);
             const auto& view = f.views[c];
+            if (!acquired && !flipped_pair) {
+                const auto& tracked = f.tracked[4 + h * 8 + slot * 2 + c];
+                if (tracked.valid)
+                    (void)calibration_native_crop(p, tracked.placement, view.width, view.height,
+                        f.submitted_sizes[slot][0], f.submitted_sizes[slot][1], p);
+            }
+            (void)calibration_snap_native_extent(p, view.width, view.height,
+                f.submitted_sizes[slot][0], f.submitted_sizes[slot][1]);
             crops[eye] = {float(p.x/view.width), float(p.y/view.height), float(p.width/view.width),
                 float(p.height/view.height), view.width, view.height, true};
         }
@@ -1067,7 +1066,10 @@ void poll(State& s) {
                     if (acquired) {
                         const unsigned first_eye = f.search[0]->result.candidate == c ? 0U : 1U;
                         const auto corner = [&](unsigned eye) {
-                            return calibration_padded_corner(f.search[eye]->result.placement,
+                            auto placement = f.search[eye]->result.placement;
+                            (void)calibration_snap_native_extent(placement, f.views[c].width, f.views[c].height,
+                                f.submitted_sizes[eye][0], f.submitted_sizes[eye][1]);
+                            return calibration_padded_corner(placement,
                                 f.views[c].width, f.views[c].height, c, f.submitted_sizes[eye][0], f.submitted_sizes[eye][1]);
                         };
                         learned = {f.views[c], f.submitted_sizes, corner(first_eye), true, true, {}};
@@ -1077,17 +1079,17 @@ void poll(State& s) {
                     } else {
                         const auto& plan = f.placement_plans[c];
                         const unsigned eye = int(c) == left ? left_slot : right_slot;
-                        const auto chosen_for = [&](unsigned physical_eye, unsigned hypothesis) {
-                            // Verification checks a cached crop; do not let single-marker
-                            // scale noise or head motion gradually move the gaze mapping.
-                            return plan.for_eye(physical_eye, hypothesis);
-                        };
-                        const auto chosen = chosen_for(eye, unsigned(int(c) == left ? selected : selected_right));
-                        learned = {f.views[c], f.submitted_sizes, chosen, true, true, plan.eye_placements};
+                        // Verification checks a cached crop; do not let single-marker
+                        // scale noise or head motion gradually move the gaze mapping.
+                        // The native crop above is a one-time correction of a
+                        // contradicted hypothesis; once locked it is the hypothesis.
+                        const auto chosen_for = [&](unsigned slot) { return chosen[slot == left_slot ? 0 : 1]; };
+                        const auto selected_placement = chosen_for(eye);
+                        learned = {f.views[c], f.submitted_sizes, selected_placement, true, true, plan.eye_placements};
                         if (learned.per_eye) {
-                            learned.eye_placements.fill(chosen);
-                            if (int(c) == left) learned.eye_placements[left_slot] = chosen_for(left_slot, unsigned(selected));
-                            if (int(c) == right) learned.eye_placements[right_slot] = chosen_for(right_slot, unsigned(selected_right));
+                            learned.eye_placements.fill(selected_placement);
+                            if (int(c) == left) learned.eye_placements[left_slot] = chosen_for(left_slot);
+                            if (int(c) == right) learned.eye_placements[right_slot] = chosen_for(right_slot);
                         }
                     }
                 }

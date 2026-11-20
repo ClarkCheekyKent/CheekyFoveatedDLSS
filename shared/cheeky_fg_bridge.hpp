@@ -7,7 +7,12 @@ struct ID3D12Resource;
 struct ID3D12CommandQueue;
 struct IUnknown;
 
-constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464743; // Fixed RGB/caching and cropped estimation; install runtime and layer together.
+constexpr std::uint32_t CHEEKY_FG_PAIR_ABI = 0x43464744; // Full-source crop mapping; install runtime and layer together.
+struct CheekyFgSourceCrop {
+    std::uint32_t valid{};
+    float rect[4]{0,0,1,1};
+    std::uint64_t revision{};
+};
 struct CheekyFgEye {
     ID3D12Resource* depth{};
     ID3D12Resource* motion{};
@@ -34,6 +39,8 @@ struct CheekyFgEye {
     std::uint32_t prepared_guides{}; // Guides are prepared FG grids rather than raw snapshots.
     ID3D12Resource* peripheral_depth{};
     ID3D12Resource* peripheral_motion{};
+    CheekyFgSourceCrop submitted_crop;
+    std::uint32_t full_eye_crop_compatibility{},full_eye_compact_capture{};
 };
 // Universal DLSS 5 guides for one physical eye: the game's DLSS depth and
 // vectors over one eye-UV box, normalized like FG's prepared grids (stored
@@ -153,6 +160,12 @@ struct CheekyFgDiagnostic {
 using CheekyFgDiagnosticFn=bool(__cdecl*)(CheekyFgDiagnostic*);
 // Optional extension: older plugin/layer combinations retain the status ABI.
 // GPU values are milliseconds for both eyes in one generated stereo pair.
+struct CheekyFgCropEyePerformance {
+    std::uint32_t active{},compact{},source_width{},source_height{};
+    std::int32_t visible_x{},visible_y{};
+    std::uint32_t visible_width{},visible_height{};
+    std::uint64_t mapping_revision{};
+};
 struct CheekyFgPerformance {
     std::uint32_t abi{CHEEKY_FG_CONTROL_ABI},size{sizeof(CheekyFgPerformance)};
     std::uint32_t gpu_supported{},gpu_valid{},foveated_eyes{},window_samples{};
@@ -169,6 +182,8 @@ struct CheekyFgPerformance {
     std::uint64_t color_token{},guide_token{},mismatched_guides{};
     std::uint64_t color_render_frame{},guide_render_frame{};
     std::uint32_t inference_color_format{},shared_gpu_queue{};
+    std::uint32_t full_eye_requested{},full_eye_compact_requested{};
+    CheekyFgCropEyePerformance source_eye[2]{};
 };
 using CheekyFgPerformanceFn=bool(__cdecl*)(CheekyFgPerformance*);
 
@@ -292,12 +307,12 @@ struct CheekyFgDirectOutput {
 using CheekyFgDirectOutputFn=bool(__cdecl*)(CheekyFgDirectOutput*);
 // Kept separate from the existing direct-output counters/options ABI.
 enum class CheekyFgDirectReason : std::uint32_t {none,configuration,chain_missing,chain_usage,chain_extent,chain_format,
-    native_not_ready,acquire,wait,image_format,image_usage,image_extent,cancelled,generation,queue_wait,release};
+    native_not_ready,acquire,wait,image_format,image_usage,image_extent,cancelled,generation,queue_wait,release,source_crop};
 inline const char* cheeky_fg_direct_reason_name(CheekyFgDirectReason reason) noexcept {
     constexpr const char* names[]{"None","Requires foveated custom periphery","Scene swapchain missing","Scene swapchain is not writable",
         "Scene dimensions differ","Scene format differs","Preceding native frame not ready","XR image acquire failed","XR image wait failed",
         "XR backing format incompatible","XR backing image lacks writable flags","XR backing dimensions unsupported","Cancelled or hidden",
-        "Generation unavailable","Binding queue wait failed","XR image release failed"};
+        "Generation unavailable","Binding queue wait failed","XR image release failed","Full-eye crop requires private output"};
     const auto n=static_cast<std::uint32_t>(reason);return n<sizeof(names)/sizeof(*names)?names[n]:"Unknown";
 }
 struct CheekyFgDirectOutputDetails {
@@ -313,6 +328,7 @@ struct CheekyFgStorageOptions {
     std::uint32_t abi{1},size{sizeof(CheekyFgStorageOptions)};
     std::uint32_t compact{},peripheral_percent{25};
     float width{.55f},height{.45f},x{},y{},feather{.04f};
+    std::uint32_t full_eye_crop_compatibility{},full_eye_compact_capture{};
 };
 using CheekyFgStorageOptionsFn=bool(__cdecl*)(CheekyFgStorageOptions*);
 // Snapshot of the actual per-physical-eye NGX crop, published by the guide
@@ -333,6 +349,7 @@ struct CheekyFgCaptureCropsV2 {
     std::uint64_t token{},render_frame{}; // render_frame=0 in hook-free mode.
     std::uint32_t width{},height{},valid_mask{};
     CheekyFgStaticEyeCrop eye[2]{};
+    CheekyFgSourceCrop source_crop[2]{};
 };
 using CheekyFgCaptureCropsFn=bool(__cdecl*)(CheekyFgCaptureCropsV2*);
 struct CheekyFgTimingValue {double mean{},last{};};

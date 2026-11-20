@@ -43,6 +43,32 @@ inline CalibrationTrackingPatch calibration_tracking_patch(CalibrationPlacement 
     p.enabled = true;
     return p;
 }
+// Correlate every pixel of an unflipped fit with its rendered 5x5 code, at the
+// best sub-cell offset. Unlike the 4-sample bit decode, this exposes cell edges
+// misaligned by a wrong scale; the search's coarse translation is forgiven.
+inline float calibration_dense_fit(const CalibrationSearchImage& image, const CalibrationSearchResult& fit) {
+    const auto& p = fit.placement;
+    const double cw = image.width * 8. / p.width, ch = image.height * 8. / p.height;
+    const double fx = (p.marker.x - p.x) * cw / 8, fy = (p.marker.y - p.y) * ch / 8;
+    const int rx = int(cw * .5), ry = int(ch * .5);
+    float best{};
+    for (int oy = -ry; oy <= ry; ++oy) for (int ox = -rx; ox <= rx; ++ox) {
+        const double x0 = fx + ox, y0 = fy + oy;
+        double sum{}, square{}, dot{}, sign_sum{}, count{};
+        for (int y = (std::max)(0, int(std::ceil(y0))); y < (std::min)(int(image.height), int(y0 + 5 * ch)); ++y)
+            for (int x = (std::max)(0, int(std::ceil(x0))); x < (std::min)(int(image.width), int(x0 + 5 * cw)); ++x) {
+                const unsigned cx = (std::min)(4U, unsigned((x + .5 - x0) / cw)), cy = (std::min)(4U, unsigned((y + .5 - y0) / ch));
+                const double v = image.sample(unsigned(x), unsigned(y));
+                const double sign = calibration_pattern_bit(fit.candidate, cx, cy, p.marker.code) ? 1. : -1.;
+                sum += v; square += v * v; dot += v * sign; sign_sum += sign; ++count;
+            }
+        // Clipped boxes compare fewer pixels; require most of the marker.
+        if (count < 20 * cw * ch) continue;
+        const double variance = square - sum * sum / count, signs = count - sign_sum * sign_sum / count;
+        if (variance > 1e-9 && signs > 0) best = (std::max)(best, float((dot - sum * sign_sum / count) / std::sqrt(variance * signs)));
+    }
+    return best;
+}
 inline CalibrationSearchResult calibration_track_impl(const void* data, unsigned pitch, DXGI_FORMAT format,
     const CalibrationTrackingPatch& patch, CalibrationMatchDiagnostics& diagnostics) {
     if (!patch.enabled) return {};
@@ -80,6 +106,36 @@ inline CalibrationSearchResult calibration_track_impl(const void* data, unsigned
         path=3;
         options.fixed_geometry=false;
         result=calibration_search(image,targets,nullptr,options);
+    }
+    // A corner code can also decode at the compressed full-canvas scale.
+    // Test native pixels explicitly rather than trusting that coarse fit.
+    if (!patch.flip && patch.eye_width <= patch.placement.width && patch.eye_height <= patch.placement.height &&
+        (patch.placement.width / patch.eye_width > 1.1 || patch.placement.height / patch.eye_height > 1.1)) {
+        auto fixed_options = options;
+        fixed_options.fixed_geometry = true;
+        fixed_options.translation_radius = 32;
+        // Bit decoding tolerates about +-7% scale error and brightness gradients
+        // (vignette, fog, grading) can tip its score toward a wrong scale, so
+        // choose between native, hypothesized and tracked fits by how well every
+        // pixel matches the rendered code. A free-scale fit (path 3) means the
+        // hypothesized scale already failed; it is only kept as a last resort.
+        CalibrationSearchResult best;
+        float best_fit = -1;
+        const auto consider = [&](const CalibrationSearchResult& candidate) {
+            if (!candidate.valid || candidate.ambiguous || candidate.score < calibration_pattern_min_score) return;
+            const float fit = calibration_dense_fit(image, candidate);
+            if (fit > best_fit) { best = candidate; best_fit = fit; }
+        };
+        if (path != 3) consider(result);
+        fixed_options.expected_cw = fixed_options.expected_ch = 8;
+        consider(calibration_search(image, targets, nullptr, fixed_options));
+        // A hint may predict native pixels; still test the hypothesized scale.
+        if (patch.hint_valid) {
+            fixed_options.expected_cw = patch.cell_x;
+            fixed_options.expected_ch = patch.cell_y;
+            consider(calibration_search(image, targets, nullptr, fixed_options));
+        }
+        if (best_fit >= 0) { result = best; path = 2; }
     }
     result.tracking_path=path;
     if (!result.valid || result.ambiguous) { result.valid=false; return result; }

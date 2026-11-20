@@ -31,6 +31,7 @@ struct BufferedNative {
     void clear_guides() noexcept {guides.reset();}
     bool guides_valid{};
     CheekyFgState guide_state{CheekyFgState::waiting_for_guides};
+    char guide_failure[256]{};
     unsigned source_depth{},source_motion{};
     std::uint64_t guide_token{};
     std::uint64_t source_configuration{}; // Survives release of guide textures.

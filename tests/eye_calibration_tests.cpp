@@ -197,6 +197,190 @@ void test_hogwarts_tracking() {
     std::cout << "PASS Hogwarts moving-marker tracking: reported displacement, recentering, packed/reversed bounds, flip, wrong/missing code ("
         << GetTickCount64() - started << " ms)\n";
 }
+void test_uevr_native_crop() {
+    // UEVR Asymmetrical: 2694x2080 eyes, bounds 0..0.7571413 and 0.24285871..1.
+    const CalibrationPlacement left_full{0, 0, 2694, 2080, {12, 12}}, right_full{0, 0, 2694, 2080, {2642, 12}};
+    CalibrationPlacement out;
+    // Tracked fits carry a few percent of scale error; only marker positions are precise.
+    const auto observed = [](const CalibrationPlacement& p, double crop_x, double sw, double sh, double sx, double sy) {
+        CalibrationPlacement o = p;
+        o.width = sw * sx; o.height = sh * sy;
+        o.x = p.marker.x - (p.marker.x - crop_x) * sx; o.y = p.marker.y - p.marker.y * sy;
+        return o;
+    };
+    require(calibration_native_crop(left_full, observed(left_full, 0, 2039, 2080, 1.03, .98), 2694, 2080, 2039, 2080, out) &&
+        out.x == 0 && out.y == 0 && out.width == 2039 && out.height == 2080 && out.marker == left_full.marker,
+        "A 1:1 left marker must replace the contradicted full canvas with the exact native crop");
+    require(calibration_native_crop(right_full, observed(right_full, 654, 2040, 2080, .97, 1.02), 2694, 2080, 2040, 2080, out) &&
+        out.x == 654 && out.width == 2040 && out.height == 2080,
+        "Right-eye origin must come from the marker position, not extrapolated scale");
+    require(!calibration_native_crop(left_full, observed(left_full, 0, 2039, 2080, 2694. / 2039, 1), 2694, 2080, 2039, 2080, out),
+        "A genuinely scaled full canvas must keep its hypothesis");
+    require(!calibration_native_crop(left_full, observed(left_full, 0, 2039, 2080, 1.12, 1), 2694, 2080, 2039, 2080, out),
+        "Scale between hypotheses is inconclusive and must not publish a crop");
+    require(!calibration_native_crop(left_full, observed(left_full, 0, 2694, 2080, 1, 1), 2694, 2080, 2694, 2080, out),
+        "Uncropped submissions keep the full canvas");
+    const CalibrationPlacement locked{0, 0, 2039, 2080, {12, 12}};
+    require(!calibration_native_crop(locked, observed(locked, 0, 2039, 2080, 1.02, 1), 2694, 2080, 2039, 2080, out),
+        "A locked native crop must not drift with marker noise");
+    require(!calibration_native_crop(left_full, observed(left_full, 40, 2039, 2080, 1, 1), 2694, 2080, 2039, 2080, out),
+        "A crop excluding the probed marker is inconsistent");
+    // Grid search (manual Recalibrate) fits from the support ZIP: sub-pixel
+    // origin/size error that the FG layer's strict 1:1 crop check rejects.
+    CalibrationPlacement grid_left{-.315, .032, 2039.09, 2079.61, {12, 12}};
+    require(calibration_snap_native_extent(grid_left, 2694, 2080, 2039, 2080) &&
+        grid_left.x == 0 && grid_left.y == 0 && grid_left.width == 2039 && grid_left.height == 2080,
+        "A near-native left grid fit must snap to the exact submitted crop at the source edge");
+    CalibrationPlacement grid_right{653.652, .375, 2041.21, 2080.23, {2642, 12}};
+    require(calibration_snap_native_extent(grid_right, 2694, 2080, 2040, 2080) &&
+        grid_right.x == 654 && grid_right.y == 0 && grid_right.width == 2040 && grid_right.height == 2080,
+        "A near-native right grid fit must snap to the far source edge");
+    CalibrationPlacement grid_inner{299.7, 10.6, 2040.8, 2079.2, {312, 22}};
+    require(calibration_snap_native_extent(grid_inner, 2694, 2080, 2040, 2080) &&
+        grid_inner.x == 300 && grid_inner.y == 0 && grid_inner.width == 2040 && grid_inner.height == 2080,
+        "An interior near-native fit keeps its centre at an integer origin inside the source");
+    CalibrationPlacement scaled_full{0, 0, 2694, 2080, {12, 12}};
+    require(!calibration_snap_native_extent(scaled_full, 2694, 2080, 2039, 2080) && scaled_full.width == 2694,
+        "A scaled placement must not be snapped to native pixels");
+    // A 5-cell code samples each cell at 35%/65%, so fits within about +-7% of
+    // the true scale decode perfectly. Verification feeds each fit back as the
+    // next hint; an off-scale first fit must not be re-confirmed forever.
+    // Post effects model game cutscenes over the stamped corner marker:
+    // 1 vertical grading, 2 corner vignette with film grain, 3 soft blur.
+    for (unsigned left_width : {2039U, 2397U, 1616U})
+    // A near-native hint over scaled pixels models a stale native lock.
+    for (unsigned mode = 0; mode < 16; ++mode) for (unsigned eye = 0; eye < 2; ++eye) for (unsigned code = 1; code <= 33; ++code) {
+        const unsigned effect = mode / 4;
+        const bool scaled = mode & 1, hinted = mode & 2;
+        auto expected = eye ? right_full : left_full;
+        const auto base = code == 33 ? (eye ? 2543174U : 5779402U) : code * 9918158U;
+        expected.marker.code = calibration_location_code(expected.marker, 2694, eye, base);
+        const unsigned sw = left_width + eye, x0 = eye ? 2694 - sw : 0;
+        auto patch = calibration_tracking_patch(expected, eye, false, sw, 2080, 0, 0, 1, 1);
+        if (hinted) { patch.hint_valid = true; patch.hint = observed(expected, x0, sw, 2080, eye ? .94 : 1.06, 1.); }
+        const unsigned w = patch.rect[2], h = patch.rect[3];
+        std::vector<float> image(w * h, 64.F);
+        unsigned noise = code * 2654435761U + mode * 97U + eye;
+        for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x) {
+            const int sx = scaled ? int((patch.rect[0] + x + .5) * 2694 / sw) : int(patch.rect[0] + x + x0);
+            const int mx = sx - int(expected.marker.x), my = int(patch.rect[1] + y) - int(expected.marker.y);
+            float& v = image[y * w + x];
+            if (mx >= 0 && my >= 0 && mx < 40 && my < 40) {
+                const bool light = calibration_pattern_bit(eye, unsigned(mx) / 8, unsigned(my) / 8, expected.marker.code);
+                v = (light ? 221.F : 32.F) * float(effect == 1 ? .6 + .4 * my / 39. : 1.);
+            }
+            if (effect == 2) {
+                const double cx = eye ? double(sw) - (patch.rect[0] + x) : double(patch.rect[0] + x), cy = patch.rect[1] + y;
+                noise = noise * 1664525U + 1013904223U;
+                v = v * float(.35 + .65 * (std::min)(1., std::sqrt(cx * cx + cy * cy) / 180)) +
+                    25.F * (float(noise >> 8) / 8388608.F - 1.F);
+            }
+        }
+        if (effect == 3) {
+            const auto source = image;
+            for (unsigned y = 0; y < h; ++y) for (unsigned x = 0; x < w; ++x) {
+                float sum{}; unsigned count{};
+                for (unsigned yy = y ? y - 1 : 0; yy <= (std::min)(h - 1, y + 1); ++yy)
+                    for (unsigned xx = x ? x - 1 : 0; xx <= (std::min)(w - 1, x + 1); ++xx) { sum += source[yy * w + xx]; ++count; }
+                image[y * w + x] = sum / count;
+            }
+        }
+        std::vector<unsigned> pixels(w * h);
+        for (unsigned i = 0; i < w * h; ++i)
+            pixels[i] = 0xff000000U | unsigned(std::clamp(image[i], 0.F, 255.F) + .5F) * 0x010101U;
+        const auto tracked = calibration_track(pixels.data(), patch.rect[2] * 4, DXGI_FORMAT_R8G8B8A8_UNORM, patch);
+        const bool native = tracked.valid && calibration_native_crop(expected, tracked.placement, 2694, 2080, sw, 2080, out);
+        if (!(tracked.valid && (scaled ? !native : native && out.x == x0 && out.width == sw))) {
+            std::cerr << "native fit width=" << sw << " mode=" << mode << " eye=" << eye << " code=" << code << " valid=" << tracked.valid
+                << " extent=" << tracked.placement.width << 'x' << tracked.placement.height << '\n';
+            require(false, "Native crop verification must not depend on the session marker code");
+        }
+    }
+    std::cout << "PASS UEVR native crop: exact crops, graded/vignetted/grainy/blurred markers, inaccurate hints, scaled/uncropped/locked rejection\n";
+}
+// Production DX11 corner calibration through UEVR-style packing: both source
+// eyes copied 1:1 into a double-wide atlas, then submitted as truncated
+// projection-cropped sub-rectangles.
+void uevr_corner_crop11(unsigned w = 540, unsigned h = 416) {
+    const unsigned left_width = unsigned(w * .7571413);
+    const unsigned right_x = unsigned(w + w * .24285871) - w, right_width = w - right_x;
+    register_stereo_view(7301); register_stereo_view(7302);
+    Settings settings{};
+    settings.eye_calibration_continuous = true; settings.eye_calibration_method = EyeCalibrationMethod::standard;
+    update_settings(settings); set_eye_calibration_learning(0, 0, 0);
+    (void)settings_for_view(settings, 7301); (void)settings_for_view(settings, 7302);
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, &device, nullptr, &context));
+    D3D11_TEXTURE2D_DESC desc{w, h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, 0, 0, 0};
+    ComPtr<ID3D11Texture2D> a, b, packed;
+    check(device->CreateTexture2D(&desc, nullptr, &a));
+    check(device->CreateTexture2D(&desc, nullptr, &b));
+    desc.Width = w * 2;
+    check(device->CreateTexture2D(&desc, nullptr, &packed));
+    const std::vector<unsigned> gray(w * h, 0xff404040);
+    eye_calibration_reset_stats();
+    eye_calibration_enable(true);
+    const auto frame = [&] {
+        eye_calibration_frame();
+        context->UpdateSubresource(a.Get(), 0, nullptr, gray.data(), w * 4, 0);
+        context->UpdateSubresource(b.Get(), 0, nullptr, gray.data(), w * 4, 0);
+        eye_calibration_stamp(context.Get(), a.Get(), 7301, 0, 0, w, h);
+        eye_calibration_stamp(context.Get(), b.Get(), 7302, 0, 0, w, h);
+        context->CopySubresourceRegion(packed.Get(), 0, 0, 0, 0, a.Get(), 0, nullptr);
+        context->CopySubresourceRegion(packed.Get(), 0, w, 0, 0, b.Get(), 0, nullptr);
+        auto ticket = eye_calibration_submit(packed.Get(), 0, 0, 0, float(left_width) / (w * 2), 1);
+        eye_calibration_result(ticket, 0);
+        ticket = eye_calibration_submit(packed.Get(), 1, float(w + right_x) / (w * 2), 0, 1, 1);
+        eye_calibration_result(ticket, 0);
+        context->Flush();
+        Sleep(2);
+        eye_calibration_tick();
+    };
+    const auto published = [] {
+        const auto assignment = stereo_eye_assignment(7301);
+        return assignment.calibrated && assignment.source_crops[0].valid && assignment.source_crops[1].valid;
+    };
+    for (unsigned i = 0; i < 600 && !published(); ++i) frame();
+    require(published(), "UEVR-style corner calibration must publish eye identity and crops");
+    const auto check_crops = [&](const char* text) {
+        const auto crops = stereo_eye_assignment(7301).source_crops;
+        const auto px = [&](float v) { return double(v) * w; };
+        if (!(std::abs(px(crops[0].x)) < .01 && std::abs(px(crops[0].width) - left_width) < .01 &&
+              std::abs(px(crops[1].x) - right_x) < .01 && std::abs(px(crops[1].width) - right_width) < .01 &&
+              std::abs(double(crops[0].height) - 1) < 1e-6 && std::abs(double(crops[1].height) - 1) < 1e-6)) {
+            std::cerr << "crops: " << px(crops[0].x) << '+' << px(crops[0].width) << ", "
+                      << px(crops[1].x) << '+' << px(crops[1].width) << '\n';
+            require(false, text);
+        }
+    };
+    check_crops("Corner calibration must publish UEVR's native 1:1 crops, not an assumed full canvas");
+    for (unsigned i = 0; i < 120; ++i) frame();
+    require(published(), "Native crops must survive continuous verification");
+    check_crops("Locked native crops must remain stable during verification");
+    for (unsigned i = 0; i < 30; ++i) {
+        eye_calibration_frame();
+        eye_calibration_tick();
+        Sleep(2);
+    }
+    a.Reset(); b.Reset();
+    desc.Width = w;
+    check(device->CreateTexture2D(&desc, nullptr, &a));
+    check(device->CreateTexture2D(&desc, nullptr, &b));
+    eye_calibration_recalibrate();
+    for (unsigned i = 0; i < 600 && !published(); ++i) frame();
+    require(published(), "Corner calibration must recover after a no-submission interval and source recreation");
+    check_crops("Recalibration after a scene transition must recover the exact native crops");
+    eye_calibration_enable(false);
+    eye_calibration_frame();
+    context->Flush();
+    const auto deadline = GetTickCount64() + 5000;
+    while (eye_calibration_stats().in_flight && GetTickCount64() < deadline) { Sleep(1); eye_calibration_tick(); }
+    eye_calibration_stop();
+    unregister_stereo_view(7301); unregister_stereo_view(7302);
+    std::cout << "PASS UEVR corner calibration: truncated crops publish exact native geometry (" << w << 'x' << h << ")\n";
+}
 void test_cyberpunk_capture_search() {
     // Support capture 16380, sequence 42182: exact source/submitted dimensions,
     // source marker positions and epoch codes. The submitted previews show
@@ -789,7 +973,7 @@ int run_calibration_search_tests() {
     catch (const std::exception& e) { std::cerr << "Calibration search: " << e.what() << '\n'; return 1; }
 }
 int run_crop_calibration_tests() {
-    try { test_wide_search(); test_hogwarts_corner_pair(); test_hogwarts_tracking(); test_cyberpunk_capture_search(); crop_calibration11(); return 0; }
+    try { test_wide_search(); test_hogwarts_corner_pair(); test_hogwarts_tracking(); test_uevr_native_crop(); test_cyberpunk_capture_search(); crop_calibration11(); uevr_corner_crop11(); uevr_corner_crop11(2040, 2080); uevr_corner_crop11(2694, 2080); return 0; }
     catch (const std::exception& e) { std::cerr << "Crop calibration: " << e.what() << '\n'; eye_calibration_stop(); return 1; }
 }
 int run_stereo_support_tests() {
@@ -840,8 +1024,12 @@ int run_eye_calibration_tests() {
         test_grid_locator_scale();
         test_hogwarts_corner_pair();
         test_hogwarts_tracking();
+        test_uevr_native_crop();
         test_cyberpunk_capture_search();
         crop_calibration11();
+        uevr_corner_crop11();
+        uevr_corner_crop11(2040, 2080);
+        uevr_corner_crop11(2694, 2080);
         run_calibration_policy();
         require(calibration_half(0x3c00) == 1 && calibration_half(0x3800) == 0.5F,
                 "Half-float decoding failed");

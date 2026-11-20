@@ -105,6 +105,25 @@ void settings_tests(const std::filesystem::path& root) {
         require(fg.fg.dlssg_preset==3,"DLSS-G preset defaults to C");
         for(const auto preset:{"1","2","3"})require(set_named_setting(fg,"FgDlssgPreset",preset),"DLSS-G preset accepts A/B/C");
         for(const auto preset:{"0","4","-1","C","1.5"})require(!set_named_setting(fg,"FgDlssgPreset",preset)&&fg.fg.dlssg_preset==3,"Invalid DLSS-G presets preserve the selection");
+        require(!fg.fg.full_eye_crop_compatibility&&!fg.fg.full_eye_compact_capture,
+            "Full-eye crop experiments default off");
+        for(const auto key:{"FgFullEyeCropCompatibility","FgFullEyeCompactCapture"}){
+            require(set_named_setting(fg,key,"1")&&set_named_setting(fg,key,"false")&&
+                set_named_setting(fg,key,"0")&&set_named_setting(fg,key,"true")&&
+                !set_named_setting(fg,key,"invalid")&&!set_named_setting(fg,key,"2"),
+                "Full-eye crop options accept only boolean values");
+            require(setting_group(key)=="fg"&&
+                setting_groups_json().find(std::string("\"")+key+"\":\"fg\"")!=std::string::npos&&
+                settings_json(fg).find(std::string("\"")+key+"\":true")!=std::string::npos&&
+                serialize_settings(fg).find(std::string(key)+"=1\n")!=std::string::npos,
+                "Full-eye crop options participate in FG metadata, JSON and INI transport");
+        }
+        require(fg.fg.full_eye_crop_compatibility&&fg.fg.full_eye_compact_capture&&
+            fg.fg.resolution_percent==100&&fg.fg.peripheral_percent==50&&fg.peripheral_dlaa_scale==0.75f,
+            "Full-eye crop options are independent of foveated scales");
+        require(set_named_setting(fg,"FgFullEyeCropCompatibility","false")&&fg.fg.full_eye_compact_capture,
+            "Disabling compatibility preserves the compact capture preference");
+        require(set_named_setting(fg,"FgFullEyeCropCompatibility","true"),"Restore compatibility for round trip");
         require(!fg.fg.automatic_multiplier&&set_named_setting(fg,"FgAutoMultiplier","true")&&fg.fg.automatic_multiplier&&
             !set_named_setting(fg,"FgAutoMultiplier","invalid"),"Auto FG is opt-in and validates boolean values");
         require(fg.fg.multiplier==2&&set_named_setting(fg,"FgMultiplier","3")&&fg.fg.multiplier==3&&
@@ -172,6 +191,8 @@ void settings_tests(const std::filesystem::path& root) {
         require(set_named_setting(fg,"FgDlssgPreset","2"),"Select non-default preset B for persistence coverage");
         require(write_settings_file(path,fg,error),"Save FG settings");
         Settings restored;
+        require(read_settings_file(path,restored,error)&&restored.fg.full_eye_crop_compatibility&&restored.fg.full_eye_compact_capture,
+            "Full-eye crop experiments survive per-game profile round trip");
         require(read_settings_file(path,restored,error)&&restored.fg.optical.center_preset==0&&restored.fg.optical.peripheral_preset==2&&
             restored.fg.optical.center_percent==75&&restored.fg.optical.peripheral_percent==25&&restored.fg.center_method==5&&
             restored.fg.optical.center_validation==1&&restored.fg.optical.peripheral_validation==1,
@@ -182,13 +203,19 @@ void settings_tests(const std::filesystem::path& root) {
             restored.fg.release_point==3&&restored.fg.latency_diagnostics==1&&restored.fg.queue_priority==2&&restored.fg.direct_xr_output==1,
             "FG settings survive restart");
         require(reset_settings_group(restored,"sr") && restored.fg.enabled&&restored.fg.dlssg_preset==2,"SR reset must preserve FG and its DLSS-G preset");
+        require(restored.fg.full_eye_crop_compatibility&&restored.fg.full_eye_compact_capture,
+            "SR reset preserves full-eye crop experiments");
         require(reset_settings_group(restored,"fg") && !restored.fg.enabled&&restored.fg.release_point==3&&
             !restored.fg.automatic_multiplier&&restored.fg.multiplier==2&&restored.fg.dlssg_preset==3&&restored.fg.center_method==0&&restored.fg.peripheral_percent==50&&restored.fg.peripheral_method==1&&restored.fg.queue_priority==2,
             "FG reset restores the tested preset and opt-out");
+        require(!restored.fg.full_eye_crop_compatibility&&!restored.fg.full_eye_compact_capture,
+            "FG reset opts out of full-eye crop experiments");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nWidth=0.4\n";}
         restored=fg;
         require(read_settings_file(path,restored,error) && !restored.fg.enabled&&restored.fg.release_point==3&&restored.fg.dlssg_preset==3,
             "Old profiles inherit the tested FG preset and default FG off");
+        require(!restored.fg.full_eye_crop_compatibility&&!restored.fg.full_eye_compact_capture,
+            "Old profiles default both full-eye crop experiments off");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgWaitForCompletion=1\n";}
         require(read_settings_file(path,restored,error)&&restored.fg.release_point==2,"Migrate old completion checkbox with fresh-only default");
         {std::ofstream out(path);out<<"[CheekyFoveatedDLSS]\nFgReleasePoint=1\nFgWaitForCompletion=1\n";}
@@ -344,6 +371,9 @@ int main(int argc, char** argv) {
         const auto root = bin / "uevr-test-data" / run;
         std::filesystem::create_directories(root); directory = root.wstring();
         settings_tests(root);
+        if(argc>1&&std::string(argv[1])=="--settings"){
+            std::filesystem::remove_all(root);puts("UEVR settings defaults, validation, JSON/INI transport, profile round trips and reset passed");return 0;
+        }
         const auto issue = support_issue_url(L"report #&.zip", "state & details\n");
         require(issue.starts_with(L"https://github.com/ClarkCheekyKent/CheekyFoveatedDLSS/issues/new?") &&
             issue.find(L"report=report%20%23%26.zip") != issue.npos && issue.find(L"diagnostics=state%20%26%20details%0A") != issue.npos,
@@ -430,7 +460,7 @@ int main(int argc, char** argv) {
         vr_api.is_hmd_active = is_hmd_active; vr_api.get_ue_projection_matrix = get_projection;
         vr_api.get_mod_value = get_mod_value;
         vr_api.get_hmd_width = vr_api.get_hmd_height = hmd_extent;
-        if (afw || inactive_afw || mode == "--fg-controls") api.vr = &vr_api;
+        if (afw || inactive_afw || mode == "--fg-controls" || mode == "--crop-controls") api.vr = &vr_api;
         if (inactive_afw) rendering_mode = "0";
         UEVR_OpenVRData openvr_api{}; openvr_api.get_vr_compositor = get_compositor;
         void* original_wait{};
@@ -526,7 +556,7 @@ int main(int argc, char** argv) {
         const auto runtime = GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll"); require(runtime != nullptr, "Runtime dependency loaded");
         auto get = reinterpret_cast<CheekyUEVRSnapshotFn>(GetProcAddress(runtime, "CheekyUEVR_Snapshot"));
         auto start = reinterpret_cast<CheekyUEVRStartFn>(GetProcAddress(runtime, "CheekyUEVR_Start"));
-        if (mode == "--fg-controls") {
+        if (mode == "--fg-controls" || mode == "--crop-controls") {
             const auto control_fn=reinterpret_cast<CheekyFgControlFn>(GetProcAddress(runtime,"CheekyFG_GetControl"));
             require(control_fn!=nullptr,"FG controls export missing");
             CheekyFgControl control;
@@ -550,6 +580,23 @@ int main(int argc, char** argv) {
             options.size=0;require(!transport_fn(&options),"Transport options reject incorrect ABI size");
             require(control_fn(&control) && control.enabled && std::abs(field(snapshot(get),"FgWidth")-0.37)<0.00001,
                 "Lua protocol controls real FG runtime");
+            const auto storage_fn=reinterpret_cast<CheekyFgStorageOptionsFn>(GetProcAddress(runtime,"CheekyFG_GetStorageOptionsV1"));
+            CheekyFgStorageOptions storage;
+            require(storage_fn&&storage_fn(&storage)&&!storage.full_eye_crop_compatibility&&!storage.full_eye_compact_capture,
+                "Full-eye capture options default off in the runtime bridge");
+            const auto initial_configuration=control.configuration;
+            command("1\n951\nset\nFgFullEyeCropCompatibility=true\nFgFullEyeCompactCapture=true");
+            storage={};
+            require(storage_fn(&storage)&&storage.full_eye_crop_compatibility&&storage.full_eye_compact_capture&&
+                control_fn(&control)&&control.configuration!=initial_configuration&&
+                snapshot(get).find("\"FgFullEyeCropCompatibility\":true")!=std::string::npos,
+                "UEVR crop controls update runtime storage options and invalidate the FG configuration");
+            command("1\n952\nset\nFgFullEyeCropCompatibility=false\nFgFullEyeCompactCapture=false");
+            storage={};
+            require(storage_fn(&storage)&&!storage.full_eye_crop_compatibility&&!storage.full_eye_compact_capture&&
+                control_fn(&control)&&control.configuration==initial_configuration,
+                "Disabling crop controls restores the original FG configuration");
+            if(mode=="--crop-controls"){std::puts("UEVR full-eye crop runtime controls and configuration passed");return 0;}
             const auto mode_fn=reinterpret_cast<CheekyFgUevrModeFn>(GetProcAddress(runtime,"CheekyFG_GetUevrModeV1"));
             CheekyFgUevrModeV1 mode_status;
             require(mode_fn && mode_fn(&mode_status) && mode_status.attached && mode_status.known && mode_status.mode==0,
@@ -730,6 +777,9 @@ int main(int argc, char** argv) {
             require(control_fn(&control)&&!control.enabled&&nr_fn(&nr_options)&&nr_options.enabled&&nr_options.motion==2,
                 "Universal NR remains enabled with zero vectors while FG stays disabled");
             command("1\n944\nsave");
+            for(int i=0;i<500&&field(snapshot(get),"saved_revision")<field(snapshot(get),"revision");++i)Sleep(10);
+            require(field(snapshot(get),"saved_revision")>=field(snapshot(get),"revision"),
+                "Native NR settings save completes");
             Settings native_nr_saved;std::string native_nr_error;
             require(read_settings_file(root/"CheekyFoveatedDLSS.ini",native_nr_saved,native_nr_error)&&
                 native_nr_saved.nr_universal.motion==2&&!native_nr_saved.fg.enabled,
@@ -860,6 +910,17 @@ int main(int argc, char** argv) {
             // Keep the host mode fresh just as real present callbacks do.
             verify_late_attach_test(get, command, inactive_afw ? present : nullptr,
                 inactive_afw && !dx11 ? +[](unsigned mode) { rendering_mode = std::to_string(mode); } : nullptr);
+            if (mode == "--late-dx12") {
+                verify_fg_resolution_choices(root, get, command);
+                for (int i = 0; i < 500 && field(snapshot(get), "saved_revision") < field(snapshot(get), "revision"); ++i)
+                    Sleep(10);
+                require(field(snapshot(get), "saved_revision") >= field(snapshot(get), "revision"),
+                    "Resolution mismatch settings save completes");
+                Settings saved; std::string error;
+                require(read_settings_file(root / "CheekyFoveatedDLSS.ini", saved, error) &&
+                    saved.fg.center_method == cheeky_fg_dlss && saved.fg.peripheral_method == cheeky_fg_dlss_vectors_confidence,
+                    "A resolution mismatch must preserve the saved FG choices for the next launch");
+            }
             if (!late_ngx_path.empty()) require(snapshot(get).find("Active (NVIDIA cached runtime)") != std::string::npos,
                 "Native and Streamline cached evaluations publish the override source");
             return 0;

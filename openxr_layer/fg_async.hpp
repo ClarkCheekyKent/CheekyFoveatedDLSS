@@ -94,8 +94,17 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::unordered_map<XrSwapchain,std::uint64_t> capture_crop_tokens;
     std::uint64_t color_stamp_frame{},color_stamp_token{}; // Hold capture_mutex; one anchor across this native frame's eye releases.
     CheekyFgCompleteHooklessFrameV2Fn hookless_complete_v2{}; // Optional test/runtime callback; otherwise resolve the additive export.
+    CheekyFgCaptureCropsFn capture_crops_query{};
+    std::uint64_t next_crop_diagnostic{};
     std::uint64_t compact_current_lookups{},compact_current_misses{};
     std::uint64_t pose_sample_count{};
+    SourceEyeRegion capture_source_region(unsigned eye,const XrRect2Di& submitted,
+        const D3D12_RESOURCE_DESC& texture,const CheekyFgCaptureCropsV2& current) const noexcept {
+        if(!storage_options.full_eye_crop_compatibility||eye>=2||!(current.valid_mask&(1u<<eye)))return {};
+        CheekyFgEye g;g.width=current.width;g.height=current.height;
+        g.full_eye_crop_compatibility=1;g.submitted_crop=current.source_crop[eye];
+        return source_eye_region(g,submitted,texture.Width,texture.Height);
+    }
     CompactLayout eye_color_layout(unsigned eye,unsigned width,unsigned height,
                                    const CheekyFgCaptureCropsV2& current) const noexcept {
         if(quad_input)return {}; // Quad plane packing supplies its own explicit layout.
@@ -838,7 +847,7 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
         if(!inference_slot&&hookless_complete)hookless_complete(0);
         if(!job){job=std::make_shared<Native>();std::lock_guard lock(mx);++skipped;}
         job->color={};job->raw_color={};job->universal_nr=false;job->color_ready={};job->final_color_ready.reset();job->auxiliary.clear();job->clear_guides();job->policy={};job->guides_valid=false;job->guide_token=0;job->source_configuration=0;job->render_frame=0;job->captured_at={};
-        job->guide_state=CheekyFgState::waiting_for_guides;job->source_depth=job->source_motion=0;
+        job->guide_state=CheekyFgState::waiting_for_guides;job->guide_failure[0]='\0';job->source_depth=job->source_motion=0;
         job->alignment={};
         auto rejection=selection_diagnostic;
         if(!projection&&!rejection.reason)rejection.reason="OpenXR stereo projection is unavailable";
@@ -871,8 +880,10 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                     GetProcAddress(fg_runtime,"CheekyOpenXR_GetBorderOptionsV1")):nullptr;
                 const bool show_borders=query_border_options(border_options,borders)&&borders.enabled;
                 for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
+                    const auto& source=job->color[eye]->source_eye;
                     job->color[eye]->alignment_borders=show_borders?xr_alignment_borders(borders,job->alignment,eye,
-                        unsigned(sub.imageRect.extent.width),unsigned(sub.imageRect.extent.height)):std::array<BorderRect,2>{};}
+                        unsigned(source.active?source.source.extent.width:sub.imageRect.extent.width),
+                        unsigned(source.active?source.source.extent.height:sub.imageRect.extent.height)):std::array<BorderRect,2>{};}
                 job->space=job->layers.scene_space();job->blend=end->environmentBlendMode;
                 std::lock_guard lock(mx);job->id=id;job->epoch=epoch;job->handed_off_at=TimingClock::now();frame_trace(id).handed_off=job->handed_off_at;
                 // Keep the debug overlay on native submissions too. Native
@@ -1095,13 +1106,18 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
                 const auto xr_ms=telemetry.xr_wait_ms,period_ms=telemetry.xr_period_ms;
                 const auto color_token=telemetry.color_token,guide_token=telemetry.guide_token,mismatches=telemetry.mismatched_guides;
                 const auto color_frame=telemetry.color_render_frame,guide_frame=telemetry.guide_render_frame;
+                gpu_performance.full_eye_requested=telemetry.full_eye_requested;
+                gpu_performance.full_eye_compact_requested=telemetry.full_eye_compact_requested;
+                for(unsigned eye=0;eye<2;++eye)gpu_performance.source_eye[eye]=telemetry.source_eye[eye];
                 telemetry=gpu_performance;telemetry.copy_wait_ms=0;telemetry.xr_wait_ms=xr_ms;telemetry.xr_period_ms=period_ms;
                 telemetry.color_token=color_token;telemetry.guide_token=guide_token;telemetry.mismatched_guides=mismatches;
                 telemetry.color_render_frame=color_frame;telemetry.guide_render_frame=guide_frame;
                 telemetry.source_depth_format=job->source_depth;telemetry.source_motion_format=job->source_motion;
                 state=success?CheekyFgState::generating:status.failed?(status.capability_ready?CheekyFgState::generation_failed:CheekyFgState::ngx_unavailable):
                     job->guides_valid?CheekyFgState::waiting_for_history:job->guide_state;
-                if(job->guide_state==CheekyFgState::generation_failed&&!job->guides_valid)
+                if(!job->guides_valid&&job->guide_failure[0])
+                    strcpy_s(diagnostic,job->guide_failure);
+                else if(job->guide_state==CheekyFgState::generation_failed&&!job->guides_valid)
                     sprintf_s(diagnostic,"FG guide snapshot unavailable: depth=%u motion=%u; native presentation continues",job->source_depth,job->source_motion);
                 else if(job->guide_state==CheekyFgState::guide_frame_mismatch&&!job->guides_valid)
                     strcpy_s(diagnostic,"Waiting for matching color and guide frames. See the plugin frame-source diagnostics; native presentation continues.");

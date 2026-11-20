@@ -54,7 +54,9 @@ void fg_prepared_validation(ID3D12Device* device) {
         g.motion_base_x=11;g.motion_base_y=9;g.motion_width=384;g.motion_height=256;
         g.focus_width=.55f;g.focus_height=.45f;g.focus_x=.0625f;g.focus_y=-.0625f;g.resolution_percent=75;g.peripheral_percent=50;
         g.peripheral_method=method;g.motion_scale_x=2;g.motion_scale_y=-4;
-        g.jitter_correction_x=.00390625f;g.jitter_correction_y=-.0078125f;g.render_frame=77;
+        g.jitter_correction_x=.00390625f;g.jitter_correction_y=-.0078125f;g.render_frame=77;g.configuration=123;
+        g.full_eye_crop_compatibility=1;g.submitted_crop.valid=1;g.submitted_crop.revision=7;
+        g.submitted_crop.rect[2]=.75f;
         FocusPipeline reference;reference.color_format=DXGI_FORMAT_R8G8B8A8_UNORM;
         for(unsigned pass=0;pass<2;++pass){const auto grid=guide_grid(g,256,192,384,256,pass);
             FocusRect r{grid.x,grid.y,grid.w,grid.h,0,pass==0};
@@ -62,15 +64,25 @@ void fg_prepared_validation(ID3D12Device* device) {
         execute();FgSnapshots snapshots;check(snapshots.initialize(queue.Get()),"Prepared snapshot producer");
         color_transition(list.Get(),depth.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         color_transition(list.Get(),motion.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        TimingListAlias alias(list.Get());check(snapshots.record(alias.get(),g)&&snapshots.record(alias.get(),g),"Prepare both eyes at capture through opaque facade");
+        TimingListAlias alias(list.Get());auto right=g;
+        right.submitted_crop.rect[0]=.25f;right.submitted_crop.rect[2]=.75f;
+        check(snapshots.record(alias.get(),g,{0,7})&&snapshots.record(alias.get(),right,{1,7}),
+            "Prepare both mapped eyes at capture through opaque facade");
         color_transition(list.Get(),depth.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         color_transition(list.Get(),motion.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
         check(SUCCEEDED(list->Close()),"Prepared capture close");snapshots.submitted(queue.Get(),list.Get());ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
+        CheekyFgCaptureCropsV2 crops;crops.token=snapshots.token();
+        check(snapshots.peek_current_crops(crops,123)&&crops.valid_mask==3&&
+            crops.width==640&&crops.height==512&&crops.source_crop[0].rect[0]==0&&
+            crops.source_crop[1].rect[0]==.25f&&crops.source_crop[1].revision==7,
+            "Exact-interval crop query preserves source mappings separately from smaller prepared grids");
         CheekyFgPair pair;pair.capture_token=snapshots.token();pair.render_frame=77;check(snapshots.acquire(pair),"Lease exact prepared stereo pair");
         queue->Signal(fence.Get(),++serial);HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
         check(event&&SUCCEEDED(fence->SetEventOnCompletion(serial,event))&&WaitForSingleObject(event,10000)==WAIT_OBJECT_0,"Prepared capture fence");CloseHandle(event);
         allocator->Reset();list->Reset(allocator.Get(),nullptr);
         check(pair.eyes[0].prepared_guides&&pair.eyes[1].prepared_guides,"Prepared mode must actually replace raw storage");
+        check(pair.eyes[0].width==640&&pair.eyes[1].width==640&&pair.eyes[1].submitted_crop.rect[0]==.25f&&
+            pair.eyes[0].depth->GetDesc().Width<640,"Prepared guide allocation size does not replace full-source logical dimensions");
         // Reuse the engine inputs before reading either prepared representation.
         upload(depth.Get(),false,true);upload(motion.Get(),true,true);
         FocusPipeline consumer;consumer.color_format=DXGI_FORMAT_R8G8B8A8_UNORM;

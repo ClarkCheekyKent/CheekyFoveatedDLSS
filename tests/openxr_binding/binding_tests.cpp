@@ -810,6 +810,7 @@ void fg_toggle_test() {
 
 #include "fg_periphery_validation.hpp"
 #include "fg_async_validation.hpp"
+#include "fg_source_crop_validation.hpp"
 #include "fg_compact_validation.hpp"
 #include "fg_prepared_validation.hpp"
 #include "fg_snapshot_validation.hpp"
@@ -1243,6 +1244,7 @@ int main(int argc,char** argv) {
     try {
         if(argc>1&&std::string(argv[1])=="--openxr-stereo-alignment") {stereo_alignment_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--nr-native") {submission_diagnostics_validation();color_scale_bias_validation();native_nr_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-source-crop") {fg_source_crop_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--menu-live-cursor") {
             for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB})menu_cursor_validation(format);
             custom_binding_menu_test();return 0;

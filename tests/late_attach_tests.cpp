@@ -1713,3 +1713,49 @@ void verify_late_attach_test(CheekyUEVRSnapshotFn get, void (*command)(const cha
     }
     puts("Late attachment: cached exports, pre-existing feature, missing metadata, private reuse, release/recreation passed");
 }
+
+void verify_fg_resolution_choices(const std::filesystem::path& root, CheekyUEVRSnapshotFn get,
+    void (*command)(const char*)) {
+    auto& f = fixture();
+    wchar_t filename[32768]{};
+    require(GetModuleFileNameW(f.ngx, filename, 32768) != 0, "Find fake layer source");
+    const auto path = root / "CheekyOpenXRLayer.dll";
+    std::filesystem::copy_file(filename, path);
+    const auto layer = LoadLibraryW(path.c_str());
+    require(layer != nullptr, "Load fake layer for cropped eye resolutions");
+    const auto publish = proc<void(*)(const CheekyGazeSnapshotV1*)>(layer, "CheekyFakeGazeSnapshot");
+    CheekyGazeSnapshotV1 gaze{};
+    gaze.structure_size = sizeof(gaze); gaze.abi_version = CHEEKY_GAZE_ABI_VERSION;
+    gaze.view_count = 2; gaze.session_generation = gaze.swapchain_generation = 1;
+    gaze.status_flags = CHEEKY_GAZE_STATUS_LAYER_ACTIVE | CHEEKY_GAZE_STATUS_SESSION_FOCUSED;
+    for (unsigned eye = 0; eye < 2; ++eye) {
+        auto& view = gaze.views[eye]; view.structure_size = sizeof(view); view.view_index = eye;
+        view.flags = CHEEKY_GAZE_VIEW_FOV_VALID | CHEEKY_GAZE_VIEW_ORIENTATION_VALID;
+        view.fov_left = view.fov_down = -std::atan(1.F); view.fov_right = view.fov_up = std::atan(1.F);
+        view.image_rect_width = 193 + eye; view.image_rect_height = 256;
+        view.center_u = view.center_v = .5F;
+    }
+    command("1\n270\nset\nEnabled=true\nNrEnabled=false\nAutoStereoAlignment=true\nCenterMode=0\nFgEnabled=false\nFgCenterMethod=0\nFgPeripheralMethod=3\nFgFullEyeCropCompatibility=false");
+    require(ngx_succeeded(f.create12(f.list.Get(), 1, &f.params, &f.handle)), "Create mismatched-resolution feature");
+    const auto deadline = GetTickCount64() + 6000;
+    do {
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now); gaze.publication_qpc = now.QuadPart;
+        ++gaze.predicted_display_time; publish(&gaze);
+        require(ngx_succeeded(f.evaluate()), "Evaluate source with smaller submitted eyes");
+        f.finish_gpu(); command("1\n271\nget"); Sleep(50);
+    } while (GetTickCount64() < deadline);
+    const auto verify = [&] {
+        const auto text = snapshot(get);
+        require(text.find("\"game_resolution_match\":{\"known\":true,\"match\":false") != text.npos,
+            "Resolution diagnostics must retain the actual source/submission mismatch");
+        require(text.find("\"fg_fallback\":false") != text.npos &&
+            text.find("\"FgCenterMethod\":0") != text.npos && text.find("\"FgPeripheralMethod\":3") != text.npos &&
+            text.find("Switched Frame Gen to Optiflow") == text.npos,
+            "A sustained resolution mismatch must not lock or rewrite DLSS-G and DLSS Vectors");
+    };
+    verify();
+    command("1\n272\nset\nFgFullEyeCropCompatibility=true");
+    Sleep(270); command("1\n273\nget"); verify();
+    require(ngx_succeeded(f.release(f.handle)), "Release mismatched-resolution feature");
+    puts("PASS cropped OpenXR eye sizes retain FG methods with full-eye compatibility off and on");
+}

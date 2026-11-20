@@ -5,6 +5,7 @@
 #include "../shared/cheeky_nr_universal.hpp"
 #include "../shared/cheeky_xr_borders.hpp"
 #include "../shared/fg_border.hpp"
+#include "fg_source_crop.hpp"
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -20,6 +21,14 @@ struct StereoAlignment {
     std::array<float,2> gaze_u{.5f,.5f},gaze_v{.5f,.5f};
     bool gaze_valid{};
 };
+inline void source_eye_alignment(StereoAlignment& alignment,unsigned eye,const SourceEyeRegion& source) noexcept {
+    if(!source.active||eye>=2||source.source.extent.width<=0||source.source.extent.height<=0)return;
+    const auto& visible=source.visible;
+    const auto u=[&](float value){return (visible.offset.x+value*visible.extent.width)/source.source.extent.width;};
+    const auto v=[&](float value){return (visible.offset.y+value*visible.extent.height)/source.source.extent.height;};
+    if(alignment.valid){alignment.u[eye]=u(alignment.u[eye]);alignment.v[eye]=v(alignment.v[eye]);}
+    if(alignment.gaze_valid){alignment.gaze_u[eye]=u(alignment.gaze_u[eye]);alignment.gaze_v[eye]=v(alignment.gaze_v[eye]);}
+}
 inline bool alignment_rotation(XrQuaternionf& q) noexcept {
     const double n=std::sqrt(double(q.x)*q.x+double(q.y)*q.y+double(q.z)*q.z+double(q.w)*q.w);
     if(!std::isfinite(n)||n<1.e-6)return false;

@@ -155,10 +155,12 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
     CheekyFgCaptureCropsV2 current_crops;
     current_crops.token=token;
     current_crops.render_frame=stamp.render_frame;
-    const auto peek=runtime?reinterpret_cast<CheekyFgCaptureCropsFn>(
+    const auto peek=capture_crops_query?capture_crops_query:runtime?reinterpret_cast<CheekyFgCaptureCropsFn>(
         GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
-    if(storage_options.compact&&!quad_input){
-        if(!peek||!peek(&current_crops))current_crops.valid_mask=0;
+    if((storage_options.compact||storage_options.full_eye_crop_compatibility)&&!quad_input){
+        const auto anchor=current_crops.token;
+        if((storage_options.full_eye_crop_compatibility&&!anchor)||!peek||!peek(&current_crops)||
+           (storage_options.full_eye_crop_compatibility&&current_crops.token!=anchor))current_crops.valid_mask=0;
         if(current_crops.valid_mask)++compact_current_lookups;
         else ++compact_current_misses;
         const auto total=compact_current_lookups+compact_current_misses;
@@ -176,18 +178,32 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
     const auto ready_stamp=captured_cpu?producer.mark_color_ready(*c,captured_cpu):ColorReady{};
     const auto desc=original->GetDesc();captured_descs[sc]=desc;
     const auto plan=capture_plans.find(sc);
-    const bool direct=!quad_input&&plan!=capture_plans.end()&&!plan->second.full_required&&
+    bool direct=!quad_input&&plan!=capture_plans.end()&&!plan->second.full_required&&
         !plan->second.slices.empty()&&plan->second.desc.Width==desc.Width&&plan->second.desc.Height==desc.Height&&
         plan->second.desc.DepthOrArraySize==desc.DepthOrArraySize&&plan->second.desc.Format==desc.Format;
+    // Until the current interval proves its mapping, retain the whole atlas.
+    // xrEndFrame may then recover source eyes after the second guide submits.
+    if(direct&&storage_options.full_eye_crop_compatibility)
+        for(std::size_t n=0;n<plan->second.slices.size();++n){
+            const auto eye=n<plan->second.physical_eyes.size()?plan->second.physical_eyes[n]:2u;
+            if(eye>=2||!(current_crops.valid_mask&(1u<<eye))){direct=false;break;}
+            const auto& rect=plan->second.slices[n].rect;
+            if((unsigned(rect.extent.width)!=current_crops.width||unsigned(rect.extent.height)!=current_crops.height)&&
+               !capture_source_region(eye,rect,desc,current_crops).active){direct=false;break;}
+        }
     DirectCapture eyes;Image copy;
     if(direct){
         for(std::size_t n=0;n<plan->second.slices.size();++n){
             const auto slice=plan->second.slices[n];
             const unsigned eye=n<plan->second.physical_eyes.size()?plan->second.physical_eyes[n]:2u;
-            const auto layout=eye_color_layout(eye,slice.rect.extent.width,slice.rect.extent.height,current_crops);
-            auto image=layout.packed()?producer.packed_region(*c,original,xr_image_state(),slice.rect,slice.layer,format,layout):
-                producer.region_copy(*c,original,xr_image_state(),slice.rect,slice.layer,format);
+            const auto source=capture_source_region(eye,slice.rect,desc,current_crops);
+            const auto rect=source.active?source.source:slice.rect;
+            const auto layout=source.active&&!storage_options.full_eye_compact_capture?CompactLayout{}:
+                eye_color_layout(eye,rect.extent.width,rect.extent.height,current_crops);
+            auto image=layout.packed()?producer.packed_region(*c,original,xr_image_state(),rect,slice.layer,format,layout):
+                producer.region_copy(*c,original,xr_image_state(),rect,slice.layer,format);
             if(!image){capture_overflow=true;std::uint64_t discarded{};producer.execute(*c,discarded);return false;}
+            image->source_eye=source;
             eyes.eyes.push_back({slice,std::move(image)});++direct_eye_copies;
         }
     }else {
@@ -352,11 +368,21 @@ struct BufferedBackend12 final : FrameBackend {
                     // Full-swapchain capture is an ordinary full-eye
                     // fallback, never repack it using stale cached crop.
                     // The FG worker samples its full resolution directly.
-                    job->color[eye]=owner.producer.crop(*c,found->second,sub.imageRect,sub.imageArrayIndex);
+                    CheekyFgCaptureCropsV2 current;current.token=owner.capture_tokens[sub.swapchain];
+                    const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
+                    const auto peek=owner.capture_crops_query?owner.capture_crops_query:runtime?
+                        reinterpret_cast<CheekyFgCaptureCropsFn>(GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
+                    const auto anchor=current.token;
+                    if(owner.storage_options.full_eye_crop_compatibility&&
+                       (!anchor||!peek||!peek(&current)||current.token!=anchor))current.valid_mask=0;
+                    const auto source=owner.capture_source_region(eye,sub.imageRect,found->second->texture->GetDesc(),current);
+                    job->color[eye]=owner.producer.crop(*c,found->second,source.active?source.source:sub.imageRect,sub.imageArrayIndex);
+                    if(job->color[eye])job->color[eye]->source_eye=source;
                 }
                 if(job->color[eye])++owner.eye_crop_copies;
             }
             if(!job->color[eye]){good=false;break;}
+            source_eye_alignment(job->alignment,eye,job->color[eye]->source_eye);
             const auto token=owner.capture_tokens[sub.swapchain];
             const auto frame=owner.capture_frames[sub.swapchain];
             const auto captured_at=owner.capture_times[sub.swapchain];
@@ -440,7 +466,36 @@ struct BufferedBackend12 final : FrameBackend {
                     if(!g.prepared_guides&&(!g.depth||!g.motion)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
                     job->source_depth=g.depth?unsigned(g.depth->GetDesc().Format):0;job->source_motion=g.motion?unsigned(g.motion->GetDesc().Format):0;
                     const auto& layout=job->color[eye]->layout;
-                    if(g.width!=(layout.width?layout.width:d.Width)||g.height!=(layout.height?layout.height:d.Height)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;break;}
+                    const auto& source=job->color[eye]->source_eye;
+                    if(source.active){
+                        const auto& sub=projection->views[eye].subImage;
+                        const auto desc=owner.captured_descs.find(sub.swapchain);
+                        const auto verified=desc==owner.captured_descs.end()?SourceEyeRegion{}:
+                            source_eye_region(g,sub.imageRect,desc->second.Width,desc->second.Height);
+                        if(!(source==verified)){job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;
+                            strcpy_s(job->guide_failure,"FG full-eye crop mapping changed after color capture; waiting for a matching pair. Native presentation continues.");
+                            if(owner.trace&&GetTickCount64()>=owner.next_crop_diagnostic){
+                                owner.next_crop_diagnostic=GetTickCount64()+2000;
+                                owner.trace("FG full-eye crop rejected: capture/guide mapping changed; preserving native presentation");}
+                            break;}
+                    }
+                    if(g.width!=(layout.width?layout.width:d.Width)||g.height!=(layout.height?layout.height:d.Height)){
+                        job->guides_valid=false;job->guide_state=CheekyFgState::generation_failed;
+                        sprintf_s(job->guide_failure,"FG eye %u size mismatch: source=%ux%u, color=%ux%u; %s. Native presentation continues.",
+                            eye,g.width,g.height,layout.width?layout.width:unsigned(d.Width),layout.height?layout.height:d.Height,
+                            g.full_eye_crop_compatibility?"no verified matching 1:1 crop (check stereo calibration)":"full-eye crop compatibility is off");
+                        if(owner.trace&&GetTickCount64()>=owner.next_crop_diagnostic){char message[512]{};
+                            owner.next_crop_diagnostic=GetTickCount64()+2000;
+                            const auto& sub=projection->views[eye].subImage;
+                            const auto desc=owner.captured_descs.find(sub.swapchain);
+                            sprintf_s(message,"FG eye geometry rejected eye=%u guides=%ux%u color=%ux%u full_eye=%u mapping=%u crop=%.6f,%.6f %.6fx%.6f submitted=%d,%d %dx%d texture=%llux%u",
+                                eye,g.width,g.height,layout.width?layout.width:unsigned(d.Width),layout.height?layout.height:d.Height,
+                                g.full_eye_crop_compatibility,g.submitted_crop.valid,
+                                g.submitted_crop.rect[0],g.submitted_crop.rect[1],g.submitted_crop.rect[2],g.submitted_crop.rect[3],
+                                sub.imageRect.offset.x,sub.imageRect.offset.y,sub.imageRect.extent.width,sub.imageRect.extent.height,
+                                desc==owner.captured_descs.end()?0ULL:desc->second.Width,
+                                desc==owner.captured_descs.end()?0U:desc->second.Height);owner.trace(message);}
+                        break;}
                     if(layout.packed()){
                         // Metadata is published on the preceding guide evaluations.
                         // If geometry changed since capture, do not feed NGX a high-
@@ -490,6 +545,16 @@ struct BufferedBackend12 final : FrameBackend {
                 job->policy={color_options.release_point,color_options.queue_priority,true};
             }
             {std::lock_guard lock(owner.mx);owner.telemetry.color_token=expected_token;owner.telemetry.guide_token=job->guide_token;
+                owner.telemetry.full_eye_requested=owner.storage_options.full_eye_crop_compatibility;
+                owner.telemetry.full_eye_compact_requested=owner.storage_options.full_eye_compact_capture;
+                for(unsigned eye=0;eye<2;++eye){
+                    const auto& image=job->color[eye];const auto& source=image->source_eye;
+                    auto& out=owner.telemetry.source_eye[eye];out={};out.active=source.active;out.compact=image->layout.packed();
+                    if(source.active){out.source_width=unsigned(source.source.extent.width);out.source_height=unsigned(source.source.extent.height);
+                        out.visible_x=source.visible.offset.x;out.visible_y=source.visible.offset.y;
+                        out.visible_width=unsigned(source.visible.extent.width);out.visible_height=unsigned(source.visible.extent.height);
+                        out.mapping_revision=source.revision;}
+                }
                 owner.telemetry.color_render_frame=expected_frame;owner.telemetry.guide_render_frame=job->guides_valid?expected_frame:0;
                 if(inference_slot&&job->guide_state==CheekyFgState::guide_frame_mismatch)++owner.telemetry.mismatched_guides;}
             if(job->latency_diagnostics)
@@ -548,7 +613,9 @@ struct BufferedBackend12 final : FrameBackend {
         for(unsigned eye=0;eye<2;++eye){
             input.current_raw[eye]=job->color[eye];
             input.previous_raw[eye]=previous_nr&&old->raw_color[eye]?old->raw_color[eye]:old->color[eye];
-            input.cameras[eye]=camera(job->views[eye],previous?&previous->views[eye]:nullptr,guides.pair.eyes[eye].depth_inverted!=0);
+            const auto current_view=source_processing_view(job->views[eye],job->color[eye]->source_eye);
+            const auto previous_view=previous?source_processing_view(previous->views[eye],previous->color[eye]->source_eye):current_view;
+            input.cameras[eye]=camera(current_view,previous?&previous_view:nullptr,guides.pair.eyes[eye].depth_inverted!=0);
         }
         input.guides=&guides.pair;
         input.alignment=job->alignment;
@@ -609,10 +676,13 @@ struct BufferedBackend12 final : FrameBackend {
         std::shared_ptr<BufferedDirectRequest>& direct_job) {
         GenerationOutcome outcome;auto& success=outcome.success;auto& attempted=outcome.attempted;auto& history_was_reset=outcome.history_reset;
         const auto* job_guides=guides12(*job);
+        if(previous&&(!(previous->color[0]->source_eye==job->color[0]->source_eye)||
+            !(previous->color[1]->source_eye==job->color[1]->source_eye)))reset_history=true;
         if(previous&&previous->epoch==job->epoch&&previous->id+1==job->id&&previous->space==job->space&&job->guides_valid&&job_guides&&
            cheeky::foveated_dlss::fg_same_source_history(previous->source_configuration,job->source_configuration)&&
            previous->color[0]->texture->GetDesc().Width==job->color[0]->texture->GetDesc().Width&&
-           previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height) {
+           previous->color[0]->texture->GetDesc().Height==job->color[0]->texture->GetDesc().Height&&
+           previous->color[0]->source_eye==job->color[0]->source_eye&&previous->color[1]->source_eye==job->color[1]->source_eye) {
             // The snapshot is recorded on the game queue. Queue::Wait is
             // GPU-side, so neither the game nor the FG CPU worker needs to
             // block while capture finishes. It also covers the earlier
@@ -716,8 +786,11 @@ struct BufferedBackend12 final : FrameBackend {
                         owner.trace(message);
                     }
                 }
-                std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye)
-                    cameras[eye]=camera(job->views[eye],&previous->views[eye],guides.eyes[eye].depth_inverted!=0);
+                std::array<Camera,2> cameras;for(unsigned eye=0;eye<2;++eye){
+                    const auto current_view=source_processing_view(job->views[eye],job->color[eye]->source_eye);
+                    const auto previous_view=source_processing_view(previous->views[eye],previous->color[eye]->source_eye);
+                    cameras[eye]=camera(current_view,&previous_view,guides.eyes[eye].depth_inverted!=0);
+                }
                 const bool camera_pair_valid=std::all_of(cameras.begin(),cameras.end(),[](const auto& c){return c.valid;});
 
                 std::array<ID3D12Resource*,2> input{job->color[0]->texture.Get(),job->color[1]->texture.Get()},
@@ -729,8 +802,10 @@ struct BufferedBackend12 final : FrameBackend {
                 // bypassing that upload via experimental direct XR output.
                 const bool border_upload=std::any_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){return g.show_foveation_border!=0;})||
                     std::any_of(job->color.begin(),job->color.end(),[](const auto& image){return image->alignment_borders[0].visible||image->alignment_borders[1].visible;});
-                const bool blocked_direct=job->direct_output_mode&&(border_upload||owner.direct_blocked_target==owner.direct_target_key(owner.worker.width,owner.worker.height,owner.worker.focus.color_format));
-                if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;}
+                const bool source_crop=job->color[0]->source_eye.active||job->color[1]->source_eye.active;
+                const bool blocked_direct=job->direct_output_mode&&(source_crop||border_upload||owner.direct_blocked_target==owner.direct_target_key(owner.worker.width,owner.worker.height,owner.worker.focus.color_format));
+                if(blocked_direct){std::lock_guard lock(owner.mx);++owner.direct_stats.fallbacks;++owner.direct_stats.unsupported;owner.direct_stats.last_path=3;
+                    if(source_crop)owner.note_direct_failure_locked(CheekyFgDirectReason::source_crop);}
                 if(camera_pair_valid&&pair.generated_count==1&&job->direct_output_mode&&!blocked_direct){
                     const bool supported=std::all_of(std::begin(guides.eyes),std::end(guides.eyes),[](const auto& g){
                         return (g.peripheral_method==cheeky_fg_previous||cheeky_fg_shader(g.peripheral_method))&&(g.focus_width<.999f||g.focus_height<.999f);});
@@ -754,6 +829,7 @@ struct BufferedBackend12 final : FrameBackend {
                     if(!pair.generated[eye]){available=false;break;}
                     pair.generated[eye]->layout=layout;
                     pair.generated[eye]->alignment_borders=job->color[eye]->alignment_borders;
+                    pair.generated[eye]->source_eye=job->color[eye]->source_eye;
                     pair.generated[eye]->fg_border=fg_border_rect(owner.worker.width,owner.worker.height,g.focus_width,g.focus_height,
                         g.focus_x,g.focus_y,g.show_foveation_border!=0);
                     copies[eye]={pair.generated[eye]->texture.Get(),pair.generated[eye]->state,layout};
@@ -824,6 +900,7 @@ struct BufferedBackend12 final : FrameBackend {
             if(!(generated&&pair.direct_xr)){if(!owner.ensure_chain(chain,images[eye],true))return false;batch.push_back({&chain,images[eye]});}
             views[eye].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;views[eye].next=nullptr;
             views[eye].subImage={chain.handle,{{0,0},{int(chain.desc.Width),int(chain.desc.Height)}},0};
+            if(images[eye]->source_eye.active)views[eye].subImage.imageRect=images[eye]->source_eye.visible;
         }
         for(auto& a:pair.auxiliary){
             auto& chain=owner.auxiliary_chains[a.source];if(!owner.ensure_chain(chain,a.image))return false;batch.push_back({&chain,a.image});

@@ -164,6 +164,54 @@ GPU after preceding work on the game queue, so dependency time may move into
 queue-entry time; compare their sum rather than expecting both fields to fall.
 These are scheduling experiments, not an established fix for gameplay slowdown.
 
+## Experimental full-eye crop compatibility
+
+Under **Frame Generation → Advanced settings**, **UEVR full-eye crop compatibility**
+(`FgFullEyeCropCompatibility`) supports D3D12/OpenXR symmetric-projection layouts where the
+source eye is larger than the visible OpenXR submission crop. For example, a
+2040×2080 source eye can have visible left/right crops only 1544/1545 pixels wide.
+This option is experimental and off by default.
+
+Different game-render and OpenXR eye dimensions do not hide FG methods or
+automatically replace saved DLSS-G/DLSS Vectors choices with Optiflow.
+The capture path still rejects unsupported guide/color mappings and presents
+native frames. The fallback for unavailable game DLSS inputs is unchanged.
+If an older build already saved Optiflow, select your preferred FG method once;
+this change does not guess or restore the previously selected method.
+
+Enable compatibility alone first: the baseline captures the complete source eye
+and maps it to the visible submission crop. **Compact full-eye capture**
+(`FgFullEyeCompactCapture`) appears only while compatibility is enabled and is a
+separate experimental opt-in, also off by default. It packs the center/context
+atlas in full-source-eye coordinates instead of retaining an ordinary full-eye
+copy (when the existing compact-capture eligibility rules allow it). Compare the same
+scene against the baseline before using it. Both choices preserve the existing
+FG center/periphery resolution percentages and SR/NR foveated scales; they are
+capture/mapping options, not new quality scales. Preferences are saved per game;
+turning compatibility off leaves the compact preference saved but inactive.
+Universal DLSS 5 requires full-resolution eye captures, so compact capture is
+bypassed while it is active.
+**FG capture and presentation diagnostics** distinguishes requested options from
+each eye's active baseline/compact mode and reports numeric source dimensions,
+visible crop rectangles and mapping revisions in the diagnostic JSON.
+The source-to-submission mapping must come from verified stereo calibration;
+missing, stale, scaled, or flipped mappings retain the native fallback rather
+than guessing from the atlas. Run calibration with the intended UEVR projection
+mode. Direct XR output falls back to private generated images for cropped source
+eyes. This does not fix a separate NVIDIA DLSS-G evaluation failure; use the
+working DLSS Vectors method when testing that configuration.
+
+Corner calibration explicitly checks native-pixel marker geometry against the
+full-canvas hypothesis before locking a crop. This handles UEVR's unequal
+integer-truncated left/right crops without relying on a noisy free-scale fit.
+The comparison samples cell edges at both scales so uneven marker brightness
+does not require a near-perfect correlation or favor a compressed corner fit.
+The additional check uses the existing bounded marker readback on the background
+worker, not a full-eye GPU readback, and stops once the native crop is locked.
+It requires roughly 10% scale separation from the full-canvas hypothesis and
+does not correct vertically flipped mappings; unsupported crops may still fall
+back to native frames.
+
 ## Prepared FG guide capture
 
 FG guides are always captured into prepared FG layouts. Prepared capture

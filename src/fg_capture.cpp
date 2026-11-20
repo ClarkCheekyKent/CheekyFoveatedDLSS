@@ -96,7 +96,8 @@ std::uint64_t configuration(const Settings::FrameGeneration& s) noexcept {
     // both NGX histories every time a release mode was changed live.
     // The policy is still latched separately on each acquired stereo pair.
     std::uint64_t hash=1469598103934665603ull;
-    for(const auto n:{s.multiplier,s.dlssg_preset,unsigned(s.foveated),unsigned(s.match_sr_region),s.resolution_percent,s.peripheral_percent,
+    for(const auto n:{s.multiplier,s.dlssg_preset,unsigned(s.foveated),unsigned(s.match_sr_region),
+        unsigned(s.full_eye_crop_compatibility),unsigned(s.full_eye_compact_capture),s.resolution_percent,s.peripheral_percent,
         s.optical.center_preset,s.optical.peripheral_preset,s.optical.center_percent,s.optical.peripheral_percent,s.optical.center_grid,s.optical.peripheral_grid,
         s.center_method,s.peripheral_method,std::bit_cast<unsigned>(s.width),
         std::bit_cast<unsigned>(s.height),std::bit_cast<unsigned>(s.x),std::bit_cast<unsigned>(s.y),std::bit_cast<unsigned>(s.feather)})
@@ -442,6 +443,18 @@ void fg_publish_ngx(ID3D12GraphicsCommandList* cmd,const NgxHandle* handle,
     const FgGuideIdentity identity=quad_eye<2 ? FgGuideIdentity{quad_eye,(std::uint64_t(1)<<63)|quad.revision} :
         FgGuideIdentity{assignment.calibrated ? (assignment.shared_source?2u:assignment.eye_index) :
         FgGuideIdentity::unknown,assignment.mapping_revision};
+    if(quad_eye>=2){
+        m.full_eye_crop_compatibility=settings.fg.full_eye_crop_compatibility;
+        m.full_eye_compact_capture=settings.fg.full_eye_compact_capture;
+        if(assignment.calibrated&&!assignment.shared_source&&!assignment.vertical_flip&&assignment.eye_index<2){
+            const auto& crop=assignment.source_crops[assignment.eye_index];
+            if(crop.valid&&crop.source_width==w&&crop.source_height==h){
+                m.submitted_crop.valid=1;m.submitted_crop.revision=assignment.mapping_revision;
+                m.submitted_crop.rect[0]=crop.x;m.submitted_crop.rect[1]=crop.y;
+                m.submitted_crop.rect[2]=crop.width;m.submitted_crop.rect[3]=crop.height;
+            }
+        }
+    }
     const float signed_sr_x=assignment.assigned&&!assignment.shared_source
         ? ((bool(assignment.eye_index==1)!=settings.invert_stereo_x_offset) ? -settings.x_offset : settings.x_offset)
         : 0.f;
@@ -678,6 +691,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetStorageOptionsV1(Cheek
         !settings.eye_calibration_continuous &&
         !cheeky::foveated_dlss::universal_nr_requested(); // NR needs full-resolution eye images.
     out->peripheral_percent=s.peripheral_percent;
+    out->full_eye_crop_compatibility=s.full_eye_crop_compatibility;
+    out->full_eye_compact_capture=s.full_eye_compact_capture;
     out->width=s.width;out->height=s.height;out->x=s.x;out->y=s.y;out->feather=s.feather;return true;
 }
 extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyFgColorOptionsV1* out) noexcept {
@@ -760,7 +775,8 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_PeekCaptureCropsV2(Cheeky
     if(!out||out->abi!=2||out->size<sizeof(*out)||!enabled())return false;
     std::lock_guard lock(mutex);
     const auto settings=current_settings();
-    if(settings.center_mode!=FoveationCenterMode::fixed||!settings.fg.enabled||!settings.fg.foveated)
+    if(!settings.fg.enabled||(!settings.fg.full_eye_crop_compatibility&&
+        (settings.center_mode!=FoveationCenterMode::fixed||!settings.fg.foveated)))
         return false;
     CheekyFgCaptureCropsV2 sample;
     sample.token=out->token;

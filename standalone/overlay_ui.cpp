@@ -1260,6 +1260,12 @@ void draw_fg(Settings& settings, std::string_view snapshot, bool dx11) {
         ImGui::Checkbox("Show blue FG region border", &s.show_border);
     }
     if (ImGui::TreeNode("Advanced settings")) {
+        ImGui::Checkbox("UEVR full-eye crop compatibility (experimental)", &s.full_eye_crop_compatibility);
+        if(s.full_eye_crop_compatibility){
+            ImGui::TextWrapped("Maps the full source eye to UEVR's visible submission crop. Baseline captures the full source eye; foveated scales are unchanged.");
+            ImGui::Checkbox("Compact full-eye capture (experimental)", &s.full_eye_compact_capture);
+            ImGui::TextWrapped("Opt-in center/context packing in full-source-eye coordinates. Compare against baseline first.");
+        }
         ImGui::Checkbox("Force NVIDIA Reflex off", &s.force_reflex_off);
         if(s.force_reflex_off)ImGui::TextWrapped("Disables NVIDIA Reflex sleep and its frame limiter. Applies even when frame generation is off.");
         char refresh_label[32]{};if(s.target_refresh_hz)sprintf_s(refresh_label,"%u Hz",s.target_refresh_hz);else strcpy_s(refresh_label,"Automatic");

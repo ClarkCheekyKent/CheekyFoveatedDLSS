@@ -1,6 +1,7 @@
 #pragma once
 #include "fg_present.hpp"
 #include "fg_color_draw.hpp"
+#include "fg_source_crop.hpp"
 #include "../shared/fg_border.hpp"
 #include "../shared/cheeky_gpu_span.hpp"
 #include "../shared/fg_resource_memory.hpp"
@@ -12,6 +13,7 @@ namespace cheeky::fg {
 // fence retires. The producer only polls for a free context; it never waits.
 struct TransportImage {ComPtr<ID3D12Resource> texture;D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};DXGI_FORMAT presentation_format{DXGI_FORMAT_UNKNOWN};std::uint64_t last_used_tick{},identity{};CompactLayout layout;BorderRect fg_border;float presentation_feather{-1};
     std::array<BorderRect,2> alignment_borders{}; // Red SR and green NR bounding boxes, drawn only on upload.
+    SourceEyeRegion source_eye;
     // Native D3D11 backend images (Backend11); texture stays null for these.
     ComPtr<ID3D11Texture2D> texture11;ComPtr<ID3D11ShaderResourceView> srv11;ComPtr<ID3D11RenderTargetView> rtv11;
     std::shared_ptr<void> pending11; // Backend11 deferred interpolation pass (direct OpenXR output).
@@ -138,7 +140,7 @@ struct Transport {
         for(auto& p:pool)if(p.use_count()==1) {
             const auto d=p->texture->GetDesc();
             if(d.Width==desc.Width&&d.Height==desc.Height&&d.DepthOrArraySize==desc.DepthOrArraySize&&d.MipLevels==desc.MipLevels&&
-               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->fg_border={};p->alignment_borders={};p->presentation_feather=-1;p->identity=++next_identity;p->last_used_tick=now;return p;}
+               d.Format==desc.Format&&d.Flags==desc.Flags){p->presentation_format=DXGI_FORMAT_UNKNOWN;p->layout={};p->source_eye={};p->fg_border={};p->alignment_borders={};p->presentation_feather=-1;p->identity=++next_identity;p->last_used_tick=now;return p;}
         }
         // Bounded storage even if the consumer stops or shapes keep changing.
         if(pool.size()>=48) {
