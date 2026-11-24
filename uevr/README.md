@@ -197,9 +197,20 @@ visible crop rectangles and mapping revisions in the diagnostic JSON.
 The source-to-submission mapping must come from verified stereo calibration;
 missing, stale, scaled, or flipped mappings retain the native fallback rather
 than guessing from the atlas. Run calibration with the intended UEVR projection
-mode. Direct XR output falls back to private generated images for cropped source
-eyes. This does not fix a separate NVIDIA DLSS-G evaluation failure; use the
-working DLSS Vectors method when testing that configuration.
+mode. Plain Optiflow uses the recent verified color metadata instead of a guide
+token and rejects a mapping change between capture and presentation.
+Direct XR output falls back to private generated images for cropped source
+eyes. If the game initialized NGX earlier, NVIDIA may retain its previous
+feature selection. The support log lists loaded DLSS-G DLLs to help diagnose this; a
+listed DLL is not necessarily the feature selected by NGX.
+If the log shows the driver fallback DLL and DLSS-G evaluations fail, a
+possible workaround is to copy the game's own `nvngx_dlssg.dll` into the
+directory containing the actual game executable, then restart the game.
+Do not overwrite an existing DLL. Remove only the copy you added to undo this
+workaround. This has been tested with a standalone probe, not every game.
+On the same NTFS volume, a hard link in the executable directory can be used
+instead of a copy; the DLL must still remain in the plugin directory. If a
+game update replaces the plugin DLL, recreate the link to use the new file.
 
 Corner calibration explicitly checks native-pixel marker geometry against the
 full-canvas hypothesis before locking a crop. This handles UEVR's unequal

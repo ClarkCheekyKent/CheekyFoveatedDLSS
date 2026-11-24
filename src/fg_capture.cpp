@@ -707,19 +707,31 @@ extern "C" __declspec(dllexport) bool __cdecl CheekyFG_GetColorOptionsV1(CheekyF
     if(out->abi>=3){out->automatic_alignment_mask=0;out->aligned_height_offset=s.aligned_height_offset;}
     if(out->abi>=4)out->gaze_mask=0;
     const bool follow_gaze=f.foveated&&s.center_mode!=FoveationCenterMode::fixed;
-    std::lock_guard lock(mutex);
-    if(nr_guides){
-        // While the game evaluates DLSS for both eyes, its guides are being
-        // captured for Universal DLSS 5, so FG takes the captured pairs
-        // instead of color-only frames. Without DLSS, FG stays color-only.
-        const auto now=GetTickCount64();bool live=true;
-        for(const auto& cached:color_metadata)live&=cached.configuration==key&&now-cached.time<500;
-        if(live)out->enabled=0;
+    ColorMetadata metadata[2];
+    {
+        std::lock_guard lock(mutex);
+        std::copy(std::begin(color_metadata),std::end(color_metadata),std::begin(metadata));
+        if(nr_guides){
+            // While the game evaluates DLSS for both eyes, its guides are being
+            // captured for Universal DLSS 5, so FG takes the captured pairs
+            // instead of color-only frames. Without DLSS, FG stays color-only.
+            const auto now=GetTickCount64();bool live=true;
+            for(const auto& cached:metadata)live&=cached.configuration==key&&now-cached.time<500;
+            if(live)out->enabled=0;
+        }
     }
     for(unsigned eye=0;eye<2;++eye){
         auto& g=out->eyes[eye];g={};
-        const auto& cached=color_metadata[eye];
-        if(cached.configuration==key&&GetTickCount64()-cached.time<500)g=cached.eye;
+        const auto& cached=metadata[eye];
+        if(cached.configuration==key&&GetTickCount64()-cached.time<500){
+            g=cached.eye;
+            if(g.submitted_crop.valid){
+                const auto assignment=stereo_eye_assignment(g.feature);
+                if(!assignment.calibrated||assignment.shared_source||assignment.vertical_flip||
+                   assignment.eye_index!=eye||assignment.mapping_revision!=g.submitted_crop.revision)
+                    g.submitted_crop.valid=0;
+            }
+        }
         else {
             if(out->abi>=3&&s.auto_stereo_alignment&&f.match_sr_region)out->automatic_alignment_mask|=1u<<eye;
             // No intercepted evaluation carries gaze: the layer projects it per frame.

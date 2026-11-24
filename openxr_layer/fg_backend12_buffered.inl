@@ -158,15 +158,22 @@ inline bool BufferedPresenter::capture(XrSwapchain sc,unsigned,ID3D12Resource* o
     const auto peek=capture_crops_query?capture_crops_query:runtime?reinterpret_cast<CheekyFgCaptureCropsFn>(
         GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
     if((storage_options.compact||storage_options.full_eye_crop_compatibility)&&!quad_input){
-        const auto anchor=current_crops.token;
-        if((storage_options.full_eye_crop_compatibility&&!anchor)||!peek||!peek(&current_crops)||
-           (storage_options.full_eye_crop_compatibility&&current_crops.token!=anchor))current_crops.valid_mask=0;
+        CheekyFgColorOptionsV1 options;
+        const bool color_mapping=storage_options.full_eye_crop_compatibility&&!native_nr_only&&color_options(options);
+        if(color_mapping)
+            current_crops=color_source_crops(options);
+        else {
+            const auto anchor=current_crops.token;
+            if((storage_options.full_eye_crop_compatibility&&!anchor)||!peek||!peek(&current_crops)||
+               (storage_options.full_eye_crop_compatibility&&current_crops.token!=anchor))current_crops.valid_mask=0;
+        }
         if(current_crops.valid_mask)++compact_current_lookups;
         else ++compact_current_misses;
         const auto total=compact_current_lookups+compact_current_misses;
         if(trace&&(total<=2||total%240==0)){
             char message[224]{};
-            sprintf_s(message,"FG same-interval crop lookup ok=%llu fallback=%llu token=%llu eye_mask=0x%x (no prior-frame crop reuse)",
+            sprintf_s(message,"FG %s crop lookup ok=%llu fallback=%llu token=%llu eye_mask=0x%x",
+                color_mapping?"color-calibration":"same-interval",
                 static_cast<unsigned long long>(compact_current_lookups),
                 static_cast<unsigned long long>(compact_current_misses),
                 static_cast<unsigned long long>(current_crops.token),current_crops.valid_mask);
@@ -372,9 +379,14 @@ struct BufferedBackend12 final : FrameBackend {
                     const auto runtime=GetModuleHandleW(L"CheekyFoveatedDLSSRuntime.dll");
                     const auto peek=owner.capture_crops_query?owner.capture_crops_query:runtime?
                         reinterpret_cast<CheekyFgCaptureCropsFn>(GetProcAddress(runtime,"CheekyFG_PeekCaptureCropsV2")):nullptr;
-                    const auto anchor=current.token;
-                    if(owner.storage_options.full_eye_crop_compatibility&&
-                       (!anchor||!peek||!peek(&current)||current.token!=anchor))current.valid_mask=0;
+                    CheekyFgColorOptionsV1 options;
+                    if(owner.storage_options.full_eye_crop_compatibility&&!owner.native_nr_only&&owner.color_options(options))
+                        current=owner.color_source_crops(options);
+                    else {
+                        const auto anchor=current.token;
+                        if(owner.storage_options.full_eye_crop_compatibility&&
+                           (!anchor||!peek||!peek(&current)||current.token!=anchor))current.valid_mask=0;
+                    }
                     const auto source=owner.capture_source_region(eye,sub.imageRect,found->second->texture->GetDesc(),current);
                     job->color[eye]=owner.producer.crop(*c,found->second,source.active?source.source:sub.imageRect,sub.imageArrayIndex);
                     if(job->color[eye])job->color[eye]->source_eye=source;
@@ -443,7 +455,7 @@ struct BufferedBackend12 final : FrameBackend {
             auto acquire=owner.guide_acquire?owner.guide_acquire:runtime?reinterpret_cast<CheekyFgAcquireFn>(GetProcAddress(runtime,"CheekyFG_AcquirePair")):nullptr;
             auto release=owner.guide_release?owner.guide_release:runtime?reinterpret_cast<CheekyFgReleaseFn>(GetProcAddress(runtime,"CheekyFG_ReleasePair")):nullptr;
             CheekyFgPair guides;guides.capture_token=expected_token;guides.render_frame=expected_frame;
-            CheekyFgColorOptionsV1 color_options;const bool color_only=!owner.native_nr_only&&optical::color_options(color_options);
+            CheekyFgColorOptionsV1 color_options;const bool color_only=!owner.native_nr_only&&owner.color_options(color_options);
             const bool acquired=!color_only&&inference_slot&&tokens_match&&expected_token&&
                 (external?(guides=*external,true):(acquire&&release&&acquire(&guides)));
             // render_frame is deliberately zero for hook-free mode 3.
@@ -536,12 +548,24 @@ struct BufferedBackend12 final : FrameBackend {
             if(color_only&&inference_slot){
                 align_color_options(color_options,job->alignment);
                 auto payload=std::make_shared<FrameGuides12>();
+                bool compatible=true;unsigned width{},height{};
                 for(unsigned eye=0;eye<2;++eye){auto g=color_options.eyes[eye];const auto d=job->color[eye]->texture->GetDesc();
+                    const auto& source=job->color[eye]->source_eye;
+                    if(owner.storage_options.full_eye_crop_compatibility&&!owner.quad_input){
+                        const auto& sub=projection->views[eye].subImage;
+                        const auto desc=owner.captured_descs.find(sub.swapchain);
+                        const auto verified=desc==owner.captured_descs.end()?SourceEyeRegion{}:
+                            source_eye_region(g,sub.imageRect,desc->second.Width,desc->second.Height);
+                        compatible&=source==verified;
+                    }
                     const auto& layout=job->color[eye]->layout;g.width=layout.width?layout.width:unsigned(d.Width);g.height=layout.height?layout.height:d.Height;
+                    if(!eye){width=g.width;height=g.height;}else compatible&=g.width==width&&g.height==height;
                     payload->pair.eyes[eye]=g;}
                 payload->pair.capture_token=job->id*2;payload->pair.fg_queue_priority=color_options.queue_priority;payload->pair.release_point=color_options.release_point;
                 job->guides=std::move(payload);job->source_configuration=color_options.eyes[0].configuration;
-                job->guide_token=job->id*2;job->render_frame=0;job->guides_valid=true;job->guide_state=CheekyFgState::waiting_for_history;
+                job->guide_token=job->id*2;job->render_frame=0;job->guides_valid=compatible;
+                job->guide_state=compatible?CheekyFgState::waiting_for_history:CheekyFgState::generation_failed;
+                if(!compatible)strcpy_s(job->guide_failure,"FG color-only eye geometry or calibration changed; native presentation continues.");
                 job->policy={color_options.release_point,color_options.queue_priority,true};
             }
             {std::lock_guard lock(owner.mx);owner.telemetry.color_token=expected_token;owner.telemetry.guide_token=job->guide_token;

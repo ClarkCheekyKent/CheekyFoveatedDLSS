@@ -2,12 +2,14 @@
 
 namespace source_crop_test {
 inline CheekyFgCaptureCropsV2 current;
+inline CheekyFgColorOptionsV1 color;
 inline bool __cdecl peek(CheekyFgCaptureCropsV2* out){
     if(out->token&&out->token!=current.token)return false;
     *out=current;return true;
 }
+inline bool __cdecl color_options(CheekyFgColorOptionsV1* out){*out=color;return true;}
 }
-void fg_source_crop_validation() {
+void fg_source_crop_validation(bool hardware=false) {
     using namespace cheeky::fg;using Microsoft::WRL::ComPtr;
     CheekyFgEye g;g.width=2040;g.height=2080;g.full_eye_crop_compatibility=1;
     g.submitted_crop.valid=1;g.submitted_crop.revision=7;
@@ -77,9 +79,14 @@ void fg_source_crop_validation() {
     }
 
     ComPtr<IDXGIFactory4> factory;ComPtr<IDXGIAdapter> adapter;ComPtr<ID3D12Device> device;
-    check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))&&
-        SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))&&
-        SUCCEEDED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"Source crop WARP device");
+    check(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))),"Source crop DXGI factory");
+    if(hardware){
+        for(unsigned i=0;;++i){ComPtr<IDXGIAdapter1> candidate;
+            if(factory->EnumAdapters1(i,&candidate)==DXGI_ERROR_NOT_FOUND)break;
+            DXGI_ADAPTER_DESC1 desc{};candidate->GetDesc1(&desc);
+            if(desc.VendorId==0x10de&&!(desc.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)){adapter=candidate;break;}}
+    }else check(SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))),"Source crop WARP adapter");
+    check(adapter&&SUCCEEDED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))),"Source crop D3D12 device");
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Source crop queue");
     auto texture=[&](unsigned width,unsigned height,DXGI_FORMAT format){
@@ -236,6 +243,50 @@ void fg_source_crop_validation() {
     check(backend.capture(unstamped,&projection,true,nullptr,nullptr)==CaptureOutcome::captured&&!unstamped->guides_valid&&
         !unstamped->color[0]->source_eye.active&&!unstamped->color[1]->source_eye.active,
         "An unanchored crop peek never authorizes source-eye recovery");
+    p.producer.drain();
+    p.storage_options.full_eye_crop_compatibility=1;
+    p.color_options_query=source_crop_test::color_options;
+    auto& color=source_crop_test::color;color={};color.enabled=1;
+    for(unsigned eye=0;eye<2;++eye){
+        auto& e=color.eyes[eye];e=Runtime::guides.eyes[eye];e.full_eye_crop_compatibility=1;
+        e.center_method=cheeky_fg_optical_flow;e.focus_width=e.focus_height=1;
+        e.submitted_crop=source_crop_test::current.source_crop[eye];e.configuration=1;
+    }
+    std::shared_ptr<BufferedNative> previous_color;
+    for(unsigned index=0;index<2;++index){
+        check(p.capture(sc,0,atlas.Get(),4080,2080,1,DXGI_FORMAT_R8G8B8A8_UNORM),"Capture color-only source");
+        auto job=std::make_shared<BufferedNative>();job->id=9+index;
+        check(backend.capture(job,&projection,true,nullptr,nullptr)==CaptureOutcome::captured&&job->guides_valid,
+            "Color-only full-source mapping works without a guide token");
+        for(unsigned eye=0;eye<2;++eye)
+            check(job->color[eye]->source_eye.active&&job->color[eye]->texture->GetDesc().Width==2040,
+                "Color-only capture retains full source dimensions for both eyes");
+        if(hardware&&previous_color){
+            bool reset=true;std::uint64_t samples{};std::shared_ptr<BufferedDirectRequest> direct;
+            BufferedPair generated;
+            const auto outcome=backend.generate(previous_color,job,generated,reset,samples,direct);
+            check(outcome.success&&outcome.attempted,"Physical Optiflow generates full-source color-only eyes");
+            for(unsigned eye=0;eye<2;++eye)
+                check(generated.generated[eye]->source_eye==job->color[eye]->source_eye,
+                    "Physical Optiflow output retains each visible crop");
+        }
+        auto presented=views;BufferedPair pair;FrameLayers layers;
+        check(backend.publish(pair,job->color,presented,layers,false)&&
+            presented[1].subImage.imageRect.offset.x==495&&presented[1].subImage.imageRect.extent.width==1545,
+            "Color-only presentation preserves the visible crop");
+        p.producer.drain();p.uploads.drain();previous_color=job;
+    }
+    check(p.capture(sc,0,atlas.Get(),4080,2080,1,DXGI_FORMAT_R8G8B8A8_UNORM),"Capture color before calibration changes");
+    ++color.eyes[0].submitted_crop.revision;++color.eyes[1].submitted_crop.revision;
+    auto changed_color=std::make_shared<BufferedNative>();changed_color->id=11;
+    check(backend.capture(changed_color,&projection,true,nullptr,nullptr)==CaptureOutcome::captured&&!changed_color->guides_valid,
+        "Color-only direct capture rejects a changed calibration revision");
+    p.producer.drain();
+    color.eyes[0].submitted_crop.valid=0;
+    check(p.capture(sc,0,atlas.Get(),4080,2080,1,DXGI_FORMAT_R8G8B8A8_UNORM),"Capture color without verified mapping");
+    auto missing_color=std::make_shared<BufferedNative>();missing_color->id=12;
+    check(backend.capture(missing_color,&projection,true,nullptr,nullptr)==CaptureOutcome::captured&&!missing_color->guides_valid,
+        "Color-only unequal unverified eye sizes never enter generation");
     p.producer.drain();
     p.reset();check(Runtime::chains.empty(),"Crop test releases private chains");
     std::cout<<"PASS full-source crop geometry, projection, scaled guides, atlas fallback, direct/compact capture and original presentation bounds\n";

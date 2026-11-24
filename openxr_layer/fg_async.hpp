@@ -95,9 +95,24 @@ struct BufferedPresenter final : Presenter, BufferedGpuResources {
     std::uint64_t color_stamp_frame{},color_stamp_token{}; // Hold capture_mutex; one anchor across this native frame's eye releases.
     CheekyFgCompleteHooklessFrameV2Fn hookless_complete_v2{}; // Optional test/runtime callback; otherwise resolve the additive export.
     CheekyFgCaptureCropsFn capture_crops_query{};
+    CheekyFgColorOptionsFn color_options_query{};
     std::uint64_t next_crop_diagnostic{};
     std::uint64_t compact_current_lookups{},compact_current_misses{};
     std::uint64_t pose_sample_count{};
+    bool color_options(CheekyFgColorOptionsV1& options) const {
+        return color_options_query?color_options_query(&options)&&options.enabled:optical::color_options(options);
+    }
+    static CheekyFgCaptureCropsV2 color_source_crops(const CheekyFgColorOptionsV1& options) noexcept {
+        CheekyFgCaptureCropsV2 result;
+        const auto& a=options.eyes[0];const auto& b=options.eyes[1];
+        if(!a.width||!a.height||a.width!=b.width||a.height!=b.height||
+           !a.full_eye_crop_compatibility||!b.full_eye_crop_compatibility||
+           !a.submitted_crop.valid||!b.submitted_crop.valid||
+           a.submitted_crop.revision!=b.submitted_crop.revision)return result;
+        result.width=a.width;result.height=a.height;result.valid_mask=3;
+        result.source_crop[0]=a.submitted_crop;result.source_crop[1]=b.submitted_crop;
+        return result;
+    }
     SourceEyeRegion capture_source_region(unsigned eye,const XrRect2Di& submitted,
         const D3D12_RESOURCE_DESC& texture,const CheekyFgCaptureCropsV2& current) const noexcept {
         if(!storage_options.full_eye_crop_compatibility||eye>=2||!(current.valid_mask&(1u<<eye)))return {};
