@@ -177,6 +177,7 @@ struct UniversalNr12 {
         image->state=D3D12_RESOURCE_STATE_GENERIC_READ;image->layout=source->layout;image->fg_border=source->fg_border;
         image->presentation_feather=source->presentation_feather;
         image->alignment_borders=source->alignment_borders;
+        image->source_eye=source->source_eye;
         const auto captured=source->texture->GetDesc().Format;
         image->presentation_format=source->presentation_format!=DXGI_FORMAT_UNKNOWN?source->presentation_format:
             srgb_color(captured)?captured:DXGI_FORMAT_UNKNOWN;

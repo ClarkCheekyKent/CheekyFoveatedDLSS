@@ -192,7 +192,10 @@ public:
             if(!valid_pair(*l.a,*l.b)||l.a->identity.eye>=2||l.b->identity.eye>=2||
                 l.a->meta.configuration!=expected_configuration)return false;
             out.width=l.a->meta.width;out.height=l.a->meta.height;out.valid_mask=3;
-            for(const auto* s:{l.a.get(),l.b.get()})out.eye[s->identity.eye]={s->meta.focus_width,s->meta.focus_height,s->meta.focus_x,s->meta.focus_y};
+            for(const auto* s:{l.a.get(),l.b.get()}){
+                out.eye[s->identity.eye]={s->meta.focus_width,s->meta.focus_height,s->meta.focus_x,s->meta.focus_y};
+                out.source_crop[s->identity.eye]=s->meta.submitted_crop;
+            }
             return true;
         }
         if(failed_record>consumed)return false;
@@ -215,9 +218,11 @@ public:
         out.token=token;out.width=b->meta.width;out.height=b->meta.height;
         out.valid_mask=1u<<b->identity.eye;
         out.eye[b->identity.eye]={b->meta.focus_width,b->meta.focus_height,b->meta.focus_x,b->meta.focus_y};
+        out.source_crop[b->identity.eye]=b->meta.submitted_crop;
         if(a){
             out.valid_mask|=1u<<a->identity.eye;
             out.eye[a->identity.eye]={a->meta.focus_width,a->meta.focus_height,a->meta.focus_x,a->meta.focus_y};
+            out.source_crop[a->identity.eye]=a->meta.submitted_crop;
         }
         return true;
     }

@@ -7,6 +7,7 @@ struct ID3D12Device;
 struct ID3D12CommandQueue;
 void prepare_late_attach_test(const std::filesystem::path&, ID3D11Device*, ID3D12Device*, ID3D12CommandQueue*, bool c_callback, bool streamline, const std::filesystem::path& ngx_path = {});
 void verify_late_attach_test(CheekyUEVRSnapshotFn, void (*command)(const char*), void (*before_frame)() = nullptr, void (*set_mode)(unsigned) = nullptr);
+void verify_fg_resolution_choices(const std::filesystem::path&, CheekyUEVRSnapshotFn, void (*command)(const char*));
 void prepare_afw_test(const std::filesystem::path& bin, const std::filesystem::path& root, ID3D12Device*, ID3D12CommandQueue*, std::string_view mode);
 void verify_afw_test(CheekyUEVRSnapshotFn, void (*command)(const char*));
 void verify_realvr_test(CheekyUEVRSnapshotFn, void (*command)(const char*));

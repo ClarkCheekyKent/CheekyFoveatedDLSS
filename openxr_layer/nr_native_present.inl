@@ -59,8 +59,10 @@ inline XrResult BufferedPresenter::end_native_nr_frame(const XrFrameEndInfo* end
             GetProcAddress(runtime,"CheekyOpenXR_GetBorderOptionsV1")):nullptr;
         CheekyXrBorderOptionsV1 borders;const bool show_borders=query_border_options(borders_query,borders)&&borders.enabled;
         for(unsigned eye=0;eye<2;++eye){const auto& sub=projection->views[eye].subImage;
+            const auto& source=job->color[eye]->source_eye;
             job->color[eye]->alignment_borders=show_borders?xr_alignment_borders(borders,job->alignment,eye,
-                unsigned(sub.imageRect.extent.width),unsigned(sub.imageRect.extent.height)):std::array<BorderRect,2>{};}
+                unsigned(source.active?source.source.extent.width:sub.imageRect.extent.width),
+                unsigned(source.active?source.source.extent.height:sub.imageRect.extent.height)):std::array<BorderRect,2>{};}
         Pair pair;native_nr_inflight=job;
         if(!backend->process_native(native_nr_previous,job,pair))
             return passthrough_native("Universal DLSS 5 native processing unavailable; using original submission");

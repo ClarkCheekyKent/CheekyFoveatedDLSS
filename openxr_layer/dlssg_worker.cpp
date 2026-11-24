@@ -13,6 +13,7 @@
 #include <cwchar>
 #include <deque>
 #include <mutex>
+#include <tlhelp32.h>
 
 namespace cheeky::fg {
 namespace {
@@ -29,6 +30,25 @@ struct RuntimeInfo {
 std::deque<RuntimeInfo> runtime_infos;
 constexpr std::uint32_t mask=0xFFF00000;
 inline bool ok(std::uint32_t code) noexcept{return (code&mask)!=0xBAD00000U;}
+void trace_dlssg_modules(void (*trace)(const char*) noexcept) noexcept {
+    if(!trace)return;
+    const HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,GetCurrentProcessId());
+    if(snapshot==INVALID_HANDLE_VALUE){char message[128]{};sprintf_s(message,"NGX FG module snapshot failed: %lu",GetLastError());trace(message);return;}
+    MODULEENTRY32W entry{};entry.dwSize=sizeof(entry);
+    bool found=false;
+    if(Module32FirstW(snapshot,&entry)){
+        do {
+            if(_wcsicmp(entry.szModule,L"nvngx_dlssg.dll")!=0)continue;
+            char path[MAX_PATH*4]{},message[MAX_PATH*4+64]{};
+            if(WideCharToMultiByte(CP_UTF8,0,entry.szExePath,-1,path,sizeof(path),nullptr,nullptr)){
+                sprintf_s(message,"NGX FG loaded module (not necessarily selected): %s",path);trace(message);found=true;
+            }else {sprintf_s(message,"NGX FG module path conversion failed: %lu",GetLastError());trace(message);}
+        }while(Module32NextW(snapshot,&entry));
+        if(GetLastError()!=ERROR_NO_MORE_FILES){char message[128]{};sprintf_s(message,"NGX FG module enumeration failed: %lu",GetLastError());trace(message);}
+    }else {char message[128]{};sprintf_s(message,"NGX FG module enumeration failed: %lu",GetLastError());trace(message);}
+    if(!found)trace("NGX FG: no named nvngx_dlssg.dll module observed");
+    CloseHandle(snapshot);
+}
 void barrier(ID3D12GraphicsCommandList* list,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
     if(a==b)return;D3D12_RESOURCE_BARRIER t{};t.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     t.Transition.pResource=r;t.Transition.StateBefore=a;t.Transition.StateAfter=b;t.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -150,6 +170,7 @@ bool Worker::probe(ID3D12Device* dev,const wchar_t* model_directory) noexcept {
         "CheekyFoveatedDLSS",context.cache.c_str(),dev,&context.info,NVSDK_NGX_Version_API);
     report("NGX SDK initialization",result);
     if(!ok(result)){failed=true;return false;}
+    trace_dlssg_modules(trace);
     NgxParameters* caps{};result=capabilities(&caps);
     report("NGX capability parameters",result);
     if(!ok(result)||!caps){failed=true;return false;}

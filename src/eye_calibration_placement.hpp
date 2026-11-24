@@ -159,6 +159,80 @@ inline CalibrationPlacementPlan calibration_corner_pair(CalibrationPlacement out
     }
     return plan;
 }
+// Compare observed marker endpoints with a hypothesis in submitted pixels.
+// Extrapolating a 40px marker's fitted scale to the far crop edge would
+// amplify one pixel of recognition noise into ~40px of error.
+struct CalibrationMarkerFitError { double x{}, y{}; };
+inline CalibrationMarkerFitError calibration_marker_fit_error(const CalibrationPlacement& expected,
+    const CalibrationPlacement& observed, double submitted_width, double submitted_height) {
+    const auto error = [](double marker, double origin, double extent,
+        double expected_origin, double expected_extent, double pixels) {
+        return std::abs((marker - origin) / extent - (marker - expected_origin) / expected_extent) * pixels;
+    };
+    CalibrationMarkerFitError result;
+    for (const double offset : {0., 40.}) {
+        result.x = (std::max)(result.x, error(expected.marker.x + offset, observed.x, observed.width,
+            expected.x, expected.width, submitted_width));
+        result.y = (std::max)(result.y, error(expected.marker.y + offset, observed.y, observed.height,
+            expected.y, expected.height, submitted_height));
+    }
+    return result;
+}
+// Corner probes hypothesize the full canvas, which shares its corner marker
+// with any native-pixel crop anchored at that edge (for example UEVR
+// projection cropping). When the tracked marker scale decisively contradicts
+// the hypothesis and instead proves 1:1 pixels, return that native crop. Its
+// size is the exact submitted size; its origin comes from the observed marker
+// position, not the coarser fitted scale, and snaps to the source edge.
+inline bool calibration_native_crop(const CalibrationPlacement& expected, const CalibrationPlacement& observed,
+    unsigned width, unsigned height, double submitted_width, double submitted_height, CalibrationPlacement& out) {
+    constexpr double scale_tolerance = .05, edge_snap = 3;
+    const double w = width, h = height;
+    const double sw = std::round(submitted_width), sh = std::round(submitted_height);
+    if (!(expected.width > 0 && expected.height > 0 && observed.width > 0 && observed.height > 0) ||
+        !(sw >= 1 && sh >= 1 && sw <= w && sh <= h) || (sw == w && sh == h)) return false;
+    const double mx = observed.width / sw, my = observed.height / sh;
+    const double native_x = std::abs(mx - 1), native_y = std::abs(my - 1);
+    if (native_x > scale_tolerance || native_y > scale_tolerance) return false;
+    const double gap = (std::max)(std::abs(mx - expected.width / sw) - native_x,
+                                  std::abs(my - expected.height / sh) - native_y);
+    if (gap < 2 * scale_tolerance) return false;
+    const double marker_x = expected.marker.x, marker_y = expected.marker.y;
+    const auto snap = [&](double v, double limit) {
+        if (std::abs(v) <= edge_snap) return 0.;
+        if (std::abs(v - limit) <= edge_snap) return limit;
+        return std::round(v);
+    };
+    const double x = snap(marker_x - (marker_x - observed.x) * sw / observed.width, w - sw);
+    const double y = snap(marker_y - (marker_y - observed.y) * sh / observed.height, h - sh);
+    if (x < 0 || y < 0 || x > w - sw || y > h - sh ||
+        marker_x < x || marker_x + 40 > x + sw || marker_y < y || marker_y + 40 > y + sh) return false;
+    out = expected;
+    out.x = x; out.y = y; out.width = sw; out.height = sh;
+    return true;
+}
+// A grid/full-search fit measures a native-pixel crop with sub-pixel error
+// (for example x=-0.3 or width=2041.2 for a 2040px eye). FG requires an exact
+// 1:1 crop inside the source, so near-native fits become the submitted size
+// at an integer origin. Scaled fits are left untouched.
+inline bool calibration_snap_native_extent(CalibrationPlacement& p, unsigned width, unsigned height,
+    double submitted_width, double submitted_height) {
+    constexpr double size_tolerance = 3, edge_snap = 3;
+    const double w = width, h = height;
+    const double sw = std::round(submitted_width), sh = std::round(submitted_height);
+    if (!(sw >= 1 && sh >= 1 && sw <= w && sh <= h) ||
+        std::abs(p.width - sw) > size_tolerance || std::abs(p.height - sh) > size_tolerance) return false;
+    // Snap to a source edge the fit touches; otherwise keep the fitted center.
+    const auto snap = [&](double origin, double extent, double size, double canvas) {
+        if (std::abs(origin) <= edge_snap) return 0.;
+        if (std::abs(origin + extent - canvas) <= edge_snap) return canvas - size;
+        return std::clamp(std::round(origin + (extent - size) * .5), 0., canvas - size);
+    };
+    p.x = snap(p.x, p.width, sw, w);
+    p.y = snap(p.y, p.height, sh, h);
+    p.width = sw; p.height = sh;
+    return true;
+}
 inline unsigned calibration_patch_index(unsigned box, unsigned eye) {
     return 4 + (box / 4) * 8 + ((box % 4) / 2) * 4 + eye * 2 + box % 2;
 }

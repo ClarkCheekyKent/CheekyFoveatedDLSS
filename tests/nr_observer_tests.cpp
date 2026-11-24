@@ -23,6 +23,7 @@ void log_info(const char*) noexcept {}
 void log_warning(const char*) noexcept {}
 void log_error(const char*) noexcept {}
 void trace_event(const char*, ...) noexcept {}
+void sync_openxr_gaze_settings(const Settings&) noexcept {}
 unsigned observed_copy_count{};
 GazeCopyEdge observed_copy_edge{};
 void record_gaze_copy(std::uint64_t, GazeCopyEdge edge) noexcept {

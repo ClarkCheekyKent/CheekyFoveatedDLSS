@@ -105,7 +105,7 @@ if ($LASTEXITCODE -ne 0) { throw "Native D3D11 shader frame generation regressio
 if ($LASTEXITCODE -ne 0) { throw "Optical image validation shader regressions failed." }
 & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") --fg-auto
 if ($LASTEXITCODE -ne 0) { throw "Automatic frame-generation controller regressions failed." }
-foreach ($releaseCase in @('--fg-capture-release', '--fg-release-watchdog')) {
+foreach ($releaseCase in @('--fg-capture-release', '--fg-release-watchdog', '--fg-source-crop')) {
     & (Join-Path $projectRoot "bin\$Configuration\CheekyOpenXRBindingTests.exe") $releaseCase
     if ($LASTEXITCODE -ne 0) { throw "Frame-generation release gate regression failed: $releaseCase" }
 }

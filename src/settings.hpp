@@ -88,6 +88,8 @@ struct Settings {
         std::uint32_t latency_diagnostics{0}; // Sparse calibrated GPU/CPU timeline and its per-frame log; opt-in.
         std::uint32_t direct_xr_output{}; // Experimental: acquire final XR images before FG; default uses compact intermediates.
         bool native11_skip_identity_crop{false}; // Native D3D11: reuse a whole-image eye capture instead of copying it again.
+        bool full_eye_crop_compatibility{false}; // Experimental UEVR symmetric-projection source-eye mapping.
+        bool full_eye_compact_capture{false}; // Opt-in compact capture within full-eye crop compatibility.
         bool limit_gpu_ahead{false}; // Release Never: wait while the previous frame is not yet captured on the GPU.
         bool carry_missed_ticks{false}; // Retained for old settings; no timer credits are accumulated.
         bool pacing_headroom{false}; // Retained for old settings; adaptive pacing is retired.

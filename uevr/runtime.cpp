@@ -67,8 +67,8 @@ struct State {
     // Saved choices the game cannot feed are switched whenever they appear,
     // with one note per fallback. A session-only fallback keeps the ini.
     GameResolution resolution;
-    ULONGLONG next_game_input_check{}, resolution_since{};
-    bool resolution_mismatch{}, fg_fallback{}, nr_fallback{}, game_inputs_session_only{}, fg_noted{}, nr_noted{};
+    ULONGLONG next_game_input_check{};
+    bool fg_fallback{}, nr_fallback{}, game_inputs_session_only{}, fg_noted{}, nr_noted{};
     std::vector<std::string> game_input_notes;
     GpuMemory memory;
     CheekyFgMemory fg_memory;
@@ -172,9 +172,9 @@ bool game_dlss_hooked() {
     return false;
 }
 
-// The layer pairs DLSS guides only with an eye image of the same size. A
-// calibrated crop (one DLSS output feeding both eyes) is applied first, and
-// 2 px absorbs its rounding. Unknown sizes count as a match.
+// Informational source/submission size comparison, not an FG method gate.
+// Calibrated crops are applied first; 2 px absorbs rounding.
+// The capture path verifies whether mismatched dimensions are usable.
 GameResolution game_resolution() {
     GameResolution r;
     const auto gaze = gaze_diagnostics();
@@ -297,7 +297,7 @@ std::string snapshot_locked(State& s) {
         << ",\"cpu_game_percent\":" << load.cpu_process << ",\"gpu_busy_percent\":" << load.gpu_busy
         << ",\"gpu_game_percent\":" << load.gpu_game << ",\"gpu_encode_percent\":" << load.gpu_encode << ",\"gpu_engine\":\"" << json_escape(load.gpu_engine) << "\"}"
         << ",\"fg\":{\"layer_present\":" << bool(fg.layer_present)
-        << ",\"game_resolution_match\":{\"known\":" << s.resolution.known << ",\"match\":" << !s.resolution_mismatch
+        << ",\"game_resolution_match\":{\"known\":" << s.resolution.known << ",\"match\":" << s.resolution.match
         << ",\"game_width\":" << s.resolution.game_width << ",\"game_height\":" << s.resolution.game_height
         << ",\"eye_width\":" << s.resolution.eye_width << ",\"eye_height\":" << s.resolution.eye_height << '}'
         << ",\"controls_supported\":" << bool(fg.controls_supported)
@@ -343,7 +343,19 @@ std::string snapshot_locked(State& s) {
         << ",\"output_width\":" << fg_time.output_width << ",\"output_height\":" << fg_time.output_height
         << ",\"peripheral_method\":" << fg_time.peripheral_method
         << ",\"source_depth_format\":" << fg_time.source_depth_format
-        << ",\"source_motion_format\":" << fg_time.source_motion_format << "}"
+        << ",\"source_motion_format\":" << fg_time.source_motion_format
+        << ",\"full_eye_requested\":" << bool(fg_time.full_eye_requested)
+        << ",\"full_eye_compact_requested\":" << bool(fg_time.full_eye_compact_requested)
+        << ",\"source_eye\":[";
+    for(unsigned i=0;i<2;++i){
+        const auto& eye=fg_time.source_eye[i];if(i)out << ',';
+        out << "{\"active\":" << bool(eye.active) << ",\"compact\":" << bool(eye.compact)
+            << ",\"source_width\":" << eye.source_width << ",\"source_height\":" << eye.source_height
+            << ",\"visible_x\":" << eye.visible_x << ",\"visible_y\":" << eye.visible_y
+            << ",\"visible_width\":" << eye.visible_width << ",\"visible_height\":" << eye.visible_height
+            << ",\"mapping_revision\":" << eye.mapping_revision << '}';
+    }
+    out << "]}"
         << ",\"batch_timing\":{\"supported\":" << bool(fg_batch.supported) << ",\"valid\":" << bool(fg_batch.valid)
         << ",\"samples\":" << fg_batch.samples << ",\"generated_count\":" << fg_batch.generated_count
         << ",\"optical_separated\":" << bool(fg_batch.optical_separated)
@@ -700,12 +712,7 @@ void update_game_inputs(State& s) {
         trace_event("%s", s.game_input_notes.back().c_str());
     }
     s.resolution = state == "active" ? game_resolution() : GameResolution{};
-    // Either direction must hold for 5 s, so a loading screen cannot flip FG.
-    const bool mismatch = s.resolution.known && !s.resolution.match;
-    if (mismatch == s.resolution_mismatch) s.resolution_since = 0;
-    else if (!s.resolution_since) s.resolution_since = now;
-    else if (now - s.resolution_since >= 5000) { s.resolution_mismatch = mismatch; s.resolution_since = 0; }
-    const bool fg = absent || s.resolution_mismatch, nr = absent;
+    const bool fg = absent, nr = absent;
     set_game_input_fallback(fg, nr);
     if (!fg) s.fg_noted = false;
     if (!nr) s.nr_noted = false;
@@ -731,10 +738,7 @@ void update_game_inputs(State& s) {
         return;
     }
     if (note_fg) {
-        const auto& r = s.resolution;
-        s.game_input_notes.push_back(absent ? "Switched Frame Gen to Optiflow: " + needs + (count > 1 ? " need" : " needs") + " game DLSS" :
-            "Switched Frame Gen to Optiflow: game render resolution " + std::to_string(r.game_width) + 'x' + std::to_string(r.game_height) +
-            " differs from OpenXR eye resolution " + std::to_string(r.eye_width) + 'x' + std::to_string(r.eye_height));
+        s.game_input_notes.push_back("Switched Frame Gen to Optiflow: " + needs + (count > 1 ? " need" : " needs") + " game DLSS");
         trace_event("%s", s.game_input_notes.back().c_str());
     }
     if (note_nr) {

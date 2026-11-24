@@ -85,7 +85,7 @@ uevr.sdk.callbacks.on_lua_event(function(event, text)
     status = value
     -- A reconnect can reach an older runtime. Drop unsupported optional drafts
     -- before automatic flush or Apply can resend them to that runtime.
-    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "NrUniversalMotion", "NrUniversalDepth", "NrOpticalShare", "NrOpticalPreset", "NrOpticalPercent", "NrOpticalGrid", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
+    for _, key in ipairs({"FgAutoMultiplier", "FgMultiplier", "FgDlssgPreset", "FgReleasePoint", "FgPacingClock", "FgTargetRefreshHz", "FgLimitGpuAhead", "FgCarryMissedTicks", "FgPacingHeadroom", "FgExtraFrameSlots", "FgForceReflexOff", "FgFullEyeCropCompatibility", "FgFullEyeCompactCapture", "FgLatencyDiagnostics", "FgDirectXrOutput", "FgWaitForCompletion", "FgResolutionPercent", "FgPeripheralPercent", "FgPeripheralMethod", "FgCenterMethod", "FgOpticalCenterPreset", "FgOpticalPeripheralPreset", "FgOpticalCenterPercent", "FgOpticalPeripheralPercent", "FgOpticalCenterGrid", "FgOpticalPeripheralGrid", "FgEnabled", "FgFoveated", "FgMatchSrRegion", "FgShowBorder", "FgWidth", "FgHeight", "FgXOffset", "FgYOffset", "FgFeather", "FixMotionBlur", "NrProcessingOrder", "NrUniversalMotion", "NrUniversalDepth", "NrOpticalShare", "NrOpticalPreset", "NrOpticalPercent", "NrOpticalGrid", "AfwManualCoverage", "AfwAutomaticCoverage", "AfwWarpMargin", "EyeCalibrationContinuous", "EyeCalibrationMethod"}) do
         if value.settings[key] == nil then
             draft[key], dirty[key] = nil, nil
             ready_edits[key], slider_edits[key] = nil, nil
@@ -867,6 +867,16 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                 if draft.FgShowBorder ~= nil then check("Show blue FG region border", "FgShowBorder") end
             end
             if imgui.tree_node("Advanced settings") then
+                if draft.FgFullEyeCropCompatibility ~= nil then
+                    check("UEVR full-eye crop compatibility (experimental)", "FgFullEyeCropCompatibility")
+                    if draft.FgFullEyeCropCompatibility then
+                        text("D3D12/OpenXR: maps the calibrated full source eye to UEVR's visible crop. Baseline captures the full source eye; foveated scales are unchanged.")
+                        if draft.FgFullEyeCompactCapture ~= nil then
+                            check("Compact full-eye capture (experimental)", "FgFullEyeCompactCapture")
+                            text("Opt-in center/context packing in full-source-eye coordinates, when compact capture is eligible. Compare against baseline first.")
+                        end
+                    end
+                end
                 if draft.FgForceReflexOff ~= nil then
                     check("Force NVIDIA Reflex off", "FgForceReflexOff")
                     if draft.FgForceReflexOff then
@@ -1063,6 +1073,18 @@ uevr.lua.add_script_panel("Cheeky Foveated DLSS", function()
                     line("Captured guides", fg.captured_guides and string.format("%.0f", fg.captured_guides))
                     line("Guide matching", fg.match_reason)
                     line("Direct output fallback", (fg.direct_output or {}).reason_text)
+                    local crop = fg.performance or {}
+                    if crop.full_eye_requested ~= nil then
+                        line("Full-eye compatibility requested", crop.full_eye_requested)
+                        line("Compact capture requested", crop.full_eye_compact_requested)
+                        for index, eye in ipairs(crop.source_eye or {}) do
+                            local mode = eye.active and (eye.compact and "Compact visible crop" or "Full source-eye baseline") or "Inactive"
+                            line("Eye " .. index .. " capture", mode)
+                            line("Eye " .. index .. " source / visible crop", string.format("%dx%d / (%d, %d) %dx%d; mapping %.0f",
+                                eye.source_width or 0, eye.source_height or 0, eye.visible_x or 0, eye.visible_y or 0,
+                                eye.visible_width or 0, eye.visible_height or 0, eye.mapping_revision or 0))
+                        end
+                    end
                     if imgui.tree_node("CPU waits and pacing") then
                         local t = fg.pacing_timeline
                         text("Rolling averages; separate stages can overlap.")

@@ -26,7 +26,8 @@ inline NVSDK_NGX_Result NVSDK_CONV fg_probe_evaluate(ID3D12GraphicsCommandList* 
 inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bool bgra=false,bool foveated=false,
     unsigned method=2,unsigned scale=100,unsigned peripheral_scale=50,bool game_guides=false,unsigned width=512,unsigned height=512,
     bool motion_test=false,bool full_guides=false,bool compact=false,bool prepared_capture=false,bool periphery_baseline=false,bool final_xr=false,bool typeless_output=false,
-    bool crop_motion=false,unsigned crop_axis=0,bool crop_scene_motion=false) {
+    bool crop_motion=false,unsigned crop_axis=0,bool crop_scene_motion=false,
+    unsigned custom_depth_width=0,unsigned custom_depth_height=0) {
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D12CommandQueue> queue;D3D12_COMMAND_QUEUE_DESC q{};
     check(SUCCEEDED(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))),"Hardware probe queue");
@@ -40,7 +41,8 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
     auto make=[&](DXGI_FORMAT format,unsigned index,const float* clear,ComPtr<ID3D12Resource>& texture) {
         D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;d.Width=width;d.Height=height;
-        if(game_guides&&!full_guides&&(index==1||index==2)){d.Width=width/2;d.Height=height/2;}
+        if(custom_depth_width&&custom_depth_height&&index==1){d.Width=custom_depth_width;d.Height=custom_depth_height;}
+        else if(game_guides&&!full_guides&&!custom_depth_width&&(index==1||index==2)){d.Width=width/2;d.Height=height/2;}
         d.DepthOrArraySize=d.MipLevels=1;d.Format=game_guides&&index==1?DXGI_FORMAT_R32_TYPELESS:format;d.SampleDesc.Count=1;d.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         check(SUCCEEDED(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(&texture))),"Probe texture");
         auto slot=rtvs->GetCPUDescriptorHandleForHeapStart();slot.ptr+=stride*index;
@@ -67,6 +69,10 @@ inline void fg_hardware_probe(cheeky::fg::Worker& worker,ID3D12Device* device,bo
         eye.depth=depth.Get();eye.motion=motion.Get();eye.width=width;eye.height=height;
         eye.depth_width=eye.motion_width=game_guides&&!full_guides?width/2:width;
         eye.depth_height=eye.motion_height=game_guides&&!full_guides?height/2:height;
+        if(custom_depth_width&&custom_depth_height){
+            eye.depth_width=custom_depth_width;eye.depth_height=custom_depth_height;
+            eye.motion_width=width;eye.motion_height=height;
+        }
         if(foveated) {eye.focus_width=.55f;eye.focus_height=.45f;if(motion_test)eye.focus_x=.12f;}
         eye.peripheral_method=method;eye.resolution_percent=scale;eye.peripheral_percent=peripheral_scale;
         eye.depth_inverted=1;

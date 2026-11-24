@@ -1273,25 +1273,27 @@ def run(engine):
     assert "Applied at: Headset output (Universal DLSS 5)" not in drawn and g["values"]["Apply at"] == 3, \
         "NR keeps its switched headset output as an ordinary choice"
     assert len(g.sent) == count, "Options returning must not rewrite saved choices"
-    # A game resolution the layer cannot pair hides only the game-data FG types.
-    resolution = "Switched Frame Gen to Optiflow: game render resolution 1920x1080 differs from OpenXR eye resolution 2448x2448"
+    # Source/submission size differences do not hide or rewrite FG methods.
     game["game_dlss"] = {"state": "active", "d3d11": False, "d3d12": True, "vulkan": False,
-                         "fg_fallback": True, "nr_fallback": False, "notes": [{"text": resolution}]}
+                         "fg_fallback": False, "nr_fallback": False}
+    game["fg"]["game_resolution_match"] = {"known": True, "match": False, "game_width": 2694,
+                                         "game_height": 2080, "eye_width": 2039, "eye_height": 2080}
     game["settings"]["FgCenterMethod"] = 0
     receive(game)
+    count = len(g.sent)
     draw()
     drawn = list(g.drawn.values())
-    assert "Game DLSS: active (D3D12)" in drawn and resolution in drawn and g.trees["DLSS-SR"]
-    assert list(g.combos["FG center type"].values()) == ["Optiflow"] and g["values"]["DLSS-G preset"] is None
-    assert "Using Optiflow: DLSS-G needs game DLSS" in drawn
+    assert "Game DLSS: active (D3D12)" in drawn and g.trees["DLSS-SR"]
+    assert list(g.combos["FG center type"].values()) == ["DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"]
+    assert g["values"]["DLSS-G preset"] is not None and "Using Optiflow: DLSS-G needs game DLSS" not in drawn
+    assert len(g.sent) == count, "A resolution mismatch must not send a method rewrite"
     assert g["values"]["Apply at"] == 3 and g["values"]["Depth"] == 1, "NR keeps its game choices at a resolution mismatch"
     assert g["values"]["Shared region width"] is None, "The SR tree owns the shared region while it is visible"
-    game["game_dlss"] = {"state": "active", "d3d11": False, "d3d12": True, "vulkan": False,
-                         "fg_fallback": False, "nr_fallback": False, "notes": [{"text": resolution}]}
+    game["settings"]["FgCenterMethod"] = 3
     receive(game)
     draw()
     assert list(g.combos["FG center type"].values()) == ["DLSS-G", "DLSS Vectors", "Optiflow", "Optiflow + Depth"]
-    assert g["values"]["DLSS-G preset"] is not None
+    assert g["values"]["DLSS-G preset"] is None and len(g.sent) == count, "DLSS Vectors stays selected without a rewrite"
     print(engine + ": menu, protocol, drafts, acknowledgements, slider release and reconnect passed")
 
 

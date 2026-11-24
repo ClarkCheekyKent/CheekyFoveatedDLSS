@@ -411,15 +411,15 @@ void test_ui_diagnostics() {
         require(text.find("Using Optiflow this session: game DLSS was loaded before Cheeky attached")!=text.npos&&
             text.find("Applying DLSS-NR at Headset output this session: game DLSS was loaded before Cheeky attached")!=text.npos,
             "A late attach reports its session-only fallback");
-        // A game resolution the layer cannot pair hides only the game-data FG types.
+        // Source/submission size differences are diagnostic, not an FG method gate.
         state.draft.fg.center_method=cheeky_fg_dlss;state.draft.nr_processing_order=NrProcessingOrder::after_upscaling;
-        state.snapshot=R"({"game_dlss":{"state":"active","d3d12":true,"fg_fallback":true,"nr_fallback":false,"notes":[{"text":"Switched Frame Gen to Optiflow: game render resolution 1920x1080 differs from OpenXR eye resolution 2448x2448"}]},"apis":[{},{"creates":1}]})";
+        state.snapshot=R"({"game_dlss":{"state":"active","d3d12":true,"fg_fallback":false,"nr_fallback":false},"fg":{"game_resolution_match":{"known":true,"match":false,"game_width":2694,"game_height":2080,"eye_width":2039,"eye_height":2080}},"apis":[{},{"creates":1}]})";
         render("General");render("General");text=render("General");
-        require(text.find("game render resolution 1920x1080 differs from OpenXR eye resolution 2448x2448")!=text.npos&&
-            context->TabBars.GetByIndex(0)->Tabs.Size==6,"A resolution mismatch keeps DLSS-SR and shows its note");
+        require(text.find("Switched Frame Gen to Optiflow")==text.npos&&
+            context->TabBars.GetByIndex(0)->Tabs.Size==6,"A resolution mismatch keeps DLSS-SR without a method-switch note");
         render("Frame Gen (Experimental)",false);text=render("Frame Gen (Experimental)",false);
-        require(text.find("Using Optiflow: DLSS-G needs game DLSS")!=text.npos&&text.find("DLSS-G preset")==text.npos&&
-            text.find("Shared region width")==text.npos,"A resolution mismatch hides DLSS-G only");
+        require(text.find("Using Optiflow: DLSS-G needs game DLSS")==text.npos&&text.find("DLSS-G preset")!=text.npos&&
+            text.find("Shared region width")==text.npos,"A resolution mismatch keeps DLSS-G selectable");
         render("DLSS-NR");text=render("DLSS-NR");
         require(text.find("Applied at: Headset output")==text.npos,"A resolution mismatch does not move NR");
         state.snapshot=R"({"game_dlss":{"state":"active","d3d11":false,"d3d12":true}})";

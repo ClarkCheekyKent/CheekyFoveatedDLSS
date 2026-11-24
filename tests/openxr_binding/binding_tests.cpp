@@ -810,6 +810,7 @@ void fg_toggle_test() {
 
 #include "fg_periphery_validation.hpp"
 #include "fg_async_validation.hpp"
+#include "fg_source_crop_validation.hpp"
 #include "fg_compact_validation.hpp"
 #include "fg_prepared_validation.hpp"
 #include "fg_snapshot_validation.hpp"
@@ -1243,6 +1244,8 @@ int main(int argc,char** argv) {
     try {
         if(argc>1&&std::string(argv[1])=="--openxr-stereo-alignment") {stereo_alignment_validation();return 0;}
         if(argc>1&&std::string(argv[1])=="--nr-native") {submission_diagnostics_validation();color_scale_bias_validation();native_nr_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-source-crop") {fg_source_crop_validation();return 0;}
+        if(argc>1&&std::string(argv[1])=="--fg-source-crop-hardware") {fg_source_crop_validation(true);return 0;}
         if(argc>1&&std::string(argv[1])=="--menu-live-cursor") {
             for(auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB})menu_cursor_validation(format);
             custom_binding_menu_test();return 0;
@@ -1306,7 +1309,25 @@ int main(int argc,char** argv) {
                 cheeky::fg::Worker worker;worker.trace=[](const char* line) noexcept {std::cout << line << '\n';};
                 worker.force_fp16=argc>9&&std::string(argv[9])=="fp16";
                 fg_probe_legacy_mvec=argc>3&&std::string(argv[3])=="identity-mv";
-                const bool ready=worker.probe(device.Get(),directory.c_str());
+                std::wstring log_directory;NVSDK_NGX_FeatureCommonInfo info{};
+                const wchar_t* preinit_paths[]{directory.c_str()};
+                if(argc>17&&(std::string(argv[17])=="preinit"||std::string(argv[17])=="preinit-path")){
+                    check(argc>18,"Preinitialized NGX probe requires a writable log directory");
+                    const int length=MultiByteToWideChar(CP_UTF8,0,argv[18],-1,nullptr,0);
+                    check(length>0,"Convert NGX probe log directory");
+                    log_directory.resize(length);
+                    check(MultiByteToWideChar(CP_UTF8,0,argv[18],-1,log_directory.data(),length)>0,"Convert NGX probe log directory");
+                    if(std::string(argv[17])=="preinit-path"){info.PathListInfo.Path=preinit_paths;info.PathListInfo.Length=1;}
+                    info.LoggingInfo.LoggingCallback=[](const char* message,NVSDK_NGX_Logging_Level,NVSDK_NGX_Feature){
+                        if(std::strstr(message,"NGXDLSSG::Evaluate")||std::strstr(message,"NGXDLSSG::CreateFeature")||
+                           std::strstr(message,"Loaded from path"))std::cerr<<"NGX probe: "<<message<<'\n';
+                    };
+                    info.LoggingInfo.MinimumLoggingLevel=NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+                    const auto prior=NVSDK_NGX_D3D12_Init_with_ProjectID("eec05a21-0120-42fa-a51a-eafae09e4cdd",
+                        NVSDK_NGX_ENGINE_TYPE_UNREAL,"probe",log_directory.c_str(),device.Get(),&info,NVSDK_NGX_Version_API);
+                    check(NVSDK_NGX_SUCCEED(prior),"Simulate game NGX initialization before Cheeky");
+                }
+                const bool ready=worker.probe(device.Get(),std::string(argv[2])=="auto"?nullptr:directory.c_str());
                 std::cout << "Frame generation capability: " << (ready?"AVAILABLE":"UNAVAILABLE") << '\n';
                 if(ready&&std::string(argv[1])=="--fg-buffered")fg_buffered_validation(device.Get(),directory.c_str(),argc>3?unsigned(std::stoul(argv[3])):2u,argc>4&&std::string(argv[4])=="prepared");
                 if(ready&&std::string(argv[1])=="--fg-motion")fg_hardware_probe(worker,device.Get(),true,argc>3&&std::string(argv[3])=="foveated",1,100,50,false,512,512,true);
@@ -1320,7 +1341,8 @@ int main(int argc,char** argv) {
                     argc>10?unsigned(std::stoul(argv[10])):512u,argc>11?unsigned(std::stoul(argv[11])):512u,
                     false,argc>8&&std::string(argv[8])=="full-guides",argc>12&&std::string(argv[12])=="compact",argc>13&&std::string(argv[13])=="prepared",
                     argc>14&&std::string(argv[14])=="periphery-baseline",argc>14&&(std::string(argv[14])=="final-xr"||std::string(argv[14])=="final-xr-typeless"),
-                    argc>14&&std::string(argv[14])=="final-xr-typeless");
+                    argc>14&&std::string(argv[14])=="final-xr-typeless",false,0,false,
+                    argc>15?unsigned(std::stoul(argv[15])):0u,argc>16?unsigned(std::stoul(argv[16])):0u);
                 return ready?0:2;
             }
             throw std::runtime_error("No NVIDIA adapter found");
